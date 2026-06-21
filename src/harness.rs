@@ -9,7 +9,7 @@ use tokio::time::sleep;
 
 use crate::inline::{extract_inline_tool_submissions, looks_like_inline_tool_submission};
 use crate::lanes::{LaneManager, LaneRecord, LaneResult, LaneStatus, ModelFactory};
-use crate::llm::{AgentModel, GeneratedToolCall, HarnessMessage};
+use crate::llm::{AgentModel, GeneratedToolCall, HarnessMessage, StreamBuffer, StreamHandle};
 use crate::meta::{self, parse_ask_user, parse_delegate_brief};
 use crate::prompts::coding_system_prompt;
 use crate::signals::RuntimeSignal;
@@ -37,6 +37,9 @@ const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
+    /// Runaway backstop for the one-shot / lane loop (the interactive loop is
+    /// unbounded). High so deep, many-step work is never cut short — it only trips
+    /// on a genuine runaway.
     pub runtime_backstop_iterations: usize,
     pub system_prompt: String,
     pub state_path: Option<PathBuf>,
@@ -47,18 +50,22 @@ pub struct HarnessConfig {
     pub max_consecutive_recovery: usize,
     pub recovery_base_ms: u64,
     pub recovery_max_ms: u64,
+    /// Exa API key, propagated to delegated lanes so their tool set matches the
+    /// main agent's (web_search enabled only when set).
+    pub exa_api_key: Option<String>,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
-            runtime_backstop_iterations: 200,
+            runtime_backstop_iterations: 1000,
             system_prompt: coding_system_prompt(),
             state_path: None,
             resume: false,
             max_consecutive_recovery: 8,
             recovery_base_ms: 1_000,
             recovery_max_ms: 30_000,
+            exa_api_key: None,
         }
     }
 }
@@ -146,6 +153,19 @@ pub struct HarnessState {
     /// Cumulative prompt tokens served from the provider's cache this session.
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// Working-tree checkpoints taken before each turn (newest last), for `/rewind`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<CheckpointRecord>,
+}
+
+/// A working-tree snapshot the user can rewind to (a commit in the shadow repo).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CheckpointRecord {
+    /// Shadow-repo commit id.
+    pub id: String,
+    /// The user prompt this checkpoint was taken before (truncated).
+    pub label: String,
+    pub created_at: String,
 }
 
 /// Inputs the interactive driver receives from its UI.
@@ -193,27 +213,14 @@ enum RecoveryAction {
 
 #[derive(Default)]
 struct LoopVars {
-    /// Last text-only assistant reply, kept as a fallback final answer.
-    pending_text_only_reply: Option<String>,
-    /// History index of the current text-only streak's narration. Overwritten (not
-    /// re-pushed) while the streak continues so stalls don't pile up in history.
-    pending_narration_idx: Option<usize>,
     /// Tool-only steps since the agent last said something visible.
     steps_since_visible: usize,
-    /// Text-only "are you done?" nudges issued this turn (lanes only).
-    complete_nudge_count: usize,
-    /// Consecutive empty responses (no text, no tool call).
-    empty_count: usize,
     /// Signals raised this turn, drained into next turn's live context.
     pending_signals: Vec<RuntimeSignal>,
     /// Signature of the previous turn's tool calls, for loop detection.
     last_tool_signature: Option<String>,
     /// How many turns the same tool-call signature has repeated.
     repeated_tool_count: usize,
-    /// Whether the agent has run a real tool since the user's last message. Once
-    /// true, a text-only turn is mid-work narration (don't end on it), not a
-    /// finished chat reply. Reset on each new user input.
-    tool_work_done: bool,
     /// Consecutive shell-discipline nudges, for escalation.
     shell_nudge_count: usize,
     /// Consecutive note-only turns (notes with no real work).
@@ -292,7 +299,7 @@ impl CodingHarness {
             state.iterations = iteration;
             self.persist(&mut state, &lanes).await?;
 
-            match self.step(model, &mut state, &mut lanes, &mut vars, false).await {
+            match self.step(model, &mut state, &mut lanes, &mut vars, false, None).await {
                 StepResult::Continue => {
                     consecutive_errors = 0;
                 }
@@ -342,6 +349,7 @@ impl CodingHarness {
         initial_request: Option<String>,
         mut input_rx: mpsc::UnboundedReceiver<LoopInput>,
         factory: Option<ModelFactory>,
+        sink: Option<StreamHandle>,
     ) -> Result<HarnessState, ToolError> {
         let (lane_tx, mut lane_rx) = mpsc::unbounded_channel::<LaneResult>();
         let mut state = self.load_or_initialize_state(initial_request).await?;
@@ -360,9 +368,23 @@ impl CodingHarness {
         let mut lanes = self.new_lane_manager(factory, lane_tx, &state);
         let mut vars = LoopVars::default();
         let mut consecutive_errors = 0usize;
+        // Inputs that arrived while a step was running (the interrupt race consumes
+        // input_rx, so non-interrupt messages are parked here until the next turn).
+        let mut pending_inputs: Vec<LoopInput> = Vec::new();
         self.persist(&mut state, &lanes).await?;
 
         loop {
+            // Apply any input buffered during a step. A message that arrived mid- or
+            // post-turn wakes the loop so the next step addresses it.
+            if !pending_inputs.is_empty() {
+                for input in std::mem::take(&mut pending_inputs) {
+                    self.apply_input(&mut state, input);
+                }
+                if state.status != HarnessStatus::Running {
+                    state.status = HarnessStatus::Running;
+                }
+            }
+
             if state.status == HarnessStatus::Running {
                 if self.drain_pending(&mut state, &mut lanes, &mut input_rx, &mut lane_rx) {
                     state.status = HarnessStatus::Interrupted;
@@ -377,7 +399,44 @@ impl CodingHarness {
                 state.iterations += 1;
                 self.persist(&mut state, &lanes).await?;
 
-                match self.step(model, &mut state, &mut lanes, &mut vars, true).await {
+                // Race the step against the input channel so an interrupt cancels
+                // the in-flight model call immediately — otherwise the loop only
+                // notices the interrupt at the next iteration, after waiting out the
+                // whole HTTP request and its retry backoff. Non-interrupt messages
+                // that land mid-step are buffered and applied at the next loop top.
+                // The marks drop a half-written turn on interrupt so a later resume
+                // sees a clean boundary (never an unpaired assistant tool call).
+                let msg_mark = state.messages.len();
+                let evt_mark = state.events.len();
+                let outcome = {
+                    let step_fut =
+                        self.step(model, &mut state, &mut lanes, &mut vars, true, sink.as_ref());
+                    tokio::pin!(step_fut);
+                    loop {
+                        tokio::select! {
+                            result = &mut step_fut => break Some(result),
+                            msg = input_rx.recv() => match msg {
+                                Some(LoopInput::Interrupt) | None => break None,
+                                Some(other) => pending_inputs.push(other),
+                            }
+                        }
+                    }
+                };
+
+                let Some(result) = outcome else {
+                    // Interrupted mid-step: discard the partial turn and stop.
+                    state.messages.truncate(msg_mark);
+                    state.events.truncate(evt_mark);
+                    state.status = HarnessStatus::Interrupted;
+                    state.events.push(HarnessEvent::SystemDecision {
+                        step: "interrupted".to_string(),
+                        reasoning: "User interrupted the run.".to_string(),
+                    });
+                    self.persist(&mut state, &lanes).await?;
+                    break;
+                };
+
+                match result {
                     StepResult::Continue => {
                         consecutive_errors = 0;
                     }
@@ -419,6 +478,12 @@ impl CodingHarness {
                                 continue;
                             }
                             let answering = state.status == HarnessStatus::WaitingForInput;
+                            // Snapshot the workspace before acting on a NEW request, so
+                            // the whole turn (direct edits + any lane changes + bash) can
+                            // be rewound. An answer continues a turn already checkpointed.
+                            if !answering {
+                                self.checkpoint(&mut state, &text);
+                            }
                             state.pending_question = None;
                             state.messages.push(HarnessMessage::User {
                                 content: if answering {
@@ -430,14 +495,6 @@ impl CodingHarness {
                             state.events.push(HarnessEvent::UserInput { text });
                             state.status = HarnessStatus::Running;
                             vars.steps_since_visible = 0;
-                            vars.complete_nudge_count = 0;
-                            vars.empty_count = 0;
-                            vars.pending_narration_idx = None;
-                            // A brand-new request starts in "chat" mode; answering an
-                            // ask_user continues the same work, so keep work state.
-                            if !answering {
-                                vars.tool_work_done = false;
-                            }
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
                         }
@@ -462,6 +519,57 @@ impl CodingHarness {
         Ok(state)
     }
 
+    /// Stamp base64 image bytes onto `read_image` tool results so the model can
+    /// actually SEE the image. Done per-turn on the cloned request only (never
+    /// persisted), so state stays lean and images re-inline fresh each turn.
+    /// Providers turn the inlined bytes into real image blocks.
+    fn inline_images(&self, messages: &mut [HarnessMessage]) {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        // Skip absurdly large images so a request can't balloon unboundedly.
+        const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+        for message in messages.iter_mut() {
+            let HarnessMessage::ToolResult { tool_name, content, .. } = message else {
+                continue;
+            };
+            if tool_name != "read_image" {
+                continue;
+            }
+            let Some(path) = content
+                .pointer("/data/path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Ok(resolved) = self.context.resolve_workspace_path(&path) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&resolved) else {
+                continue;
+            };
+            if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+                continue;
+            }
+            let encoded = STANDARD.encode(&bytes);
+            if let Some(data) = content.get_mut("data").and_then(Value::as_object_mut) {
+                data.insert("image_base64".to_string(), Value::String(encoded));
+            }
+        }
+    }
+
+    /// Snapshot the workspace before a turn so the user can `/rewind` to it.
+    /// Best-effort — a failure (no git, etc.) is skipped, never blocking the turn.
+    fn checkpoint(&self, state: &mut HarnessState, prompt: &str) {
+        let label: String = prompt.chars().take(80).collect();
+        if let Some(id) = crate::checkpoint::snapshot(self.context.workspace_root(), &label) {
+            state.checkpoints.push(CheckpointRecord {
+                id,
+                label,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+    }
+
     fn new_lane_manager(
         &self,
         factory: Option<ModelFactory>,
@@ -480,7 +588,7 @@ impl CodingHarness {
             self.context.workspace_root().to_path_buf(),
             lane_root,
             lane_tx,
-            self.context.locks().cloned(),
+            self.config.exa_api_key.clone(),
         )
         .with_records(state.lanes.clone())
     }
@@ -496,24 +604,31 @@ impl CodingHarness {
     ) -> bool {
         let mut interrupted = false;
         while let Ok(input) = input_rx.try_recv() {
-            match input {
-                LoopInput::UserMessage(text) | LoopInput::Answer(text) => {
-                    let text = text.trim().to_string();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    state.messages.push(HarnessMessage::User {
-                        content: format!("[steer]\n{text}"),
-                    });
-                    state.events.push(HarnessEvent::Steer { text });
-                }
-                LoopInput::Interrupt => interrupted = true,
-            }
+            interrupted |= self.apply_input(state, input);
         }
         while let Ok(result) = lane_rx.try_recv() {
             self.inject_lane_result(state, lanes, &result);
         }
         interrupted
+    }
+
+    /// Apply one queued input while a run is active: a message/answer becomes a
+    /// `[steer]`, an interrupt returns `true`. Shared by the between-iteration
+    /// drain and the buffered-input drain.
+    fn apply_input(&self, state: &mut HarnessState, input: LoopInput) -> bool {
+        match input {
+            LoopInput::UserMessage(text) | LoopInput::Answer(text) => {
+                let text = text.trim().to_string();
+                if !text.is_empty() {
+                    state.messages.push(HarnessMessage::User {
+                        content: format!("[steer]\n{text}"),
+                    });
+                    state.events.push(HarnessEvent::Steer { text });
+                }
+                false
+            }
+            LoopInput::Interrupt => true,
+        }
     }
 
     fn inject_lane_result(
@@ -524,9 +639,12 @@ impl CodingHarness {
     ) {
         lanes.record_result(result);
         let body = match result.status {
+            // Prefer the full report (actions + findings + summary); fall back to
+            // the concise summary so the parent agent sees what the lane actually did.
             LaneStatus::Completed => result
-                .summary
+                .report
                 .clone()
+                .or_else(|| result.summary.clone())
                 .unwrap_or_else(|| "completed".to_string()),
             LaneStatus::Failed => format!(
                 "FAILED: {}",
@@ -557,6 +675,7 @@ impl CodingHarness {
         lanes: &mut LaneManager,
         vars: &mut LoopVars,
         conversation_mode: bool,
+        sink: Option<&StreamHandle>,
     ) -> StepResult {
         let definitions = self.definitions_for(conversation_mode);
 
@@ -565,10 +684,9 @@ impl CodingHarness {
         // spinning. Ported from wacht's `MAX_UNPRODUCTIVE_TURNS` gate.
         if vars.unproductive_turns >= MAX_UNPRODUCTIVE_TURNS {
             vars.unproductive_turns = 0;
-            let final_text = vars.pending_text_only_reply.take();
             return StepResult::TurnEnded {
                 kind: TurnEndKind::Complete,
-                final_text,
+                final_text: None,
             };
         }
 
@@ -583,16 +701,22 @@ impl CodingHarness {
         // sent to the model but never persisted into `state.messages`, so signals
         // re-ground the model each turn instead of accumulating as stale nudges.
         let mut request_messages = state.messages.clone();
+        self.inline_images(&mut request_messages);
         request_messages.push(HarnessMessage::User {
             content: build_live_context(state, vars, conversation_mode),
         });
 
-        // After a text-only stall, require a tool call so the model commits to work
-        // or `terminate_loop` instead of narrating intent again.
-        let force_tool = vars.complete_nudge_count > 0 || vars.empty_count > 0;
+        // Clear any leftover live-stream text before this turn streams into it; the
+        // sink is present only for the interactive conversation (lanes/one-shot
+        // pass None and stay buffered).
+        if let Some(sink) = sink {
+            StreamBuffer::clear(sink);
+        }
 
+        // "No tool calls = done": a plain-text turn ends the run, so we never force
+        // a tool call — the model finishes simply by replying without one.
         let mut output = match model
-            .generate(&request_messages, &definitions, force_tool)
+            .generate(&request_messages, &definitions, false, sink.cloned())
             .await
         {
             Ok(output) => output,
@@ -684,11 +808,21 @@ impl CodingHarness {
                 }
                 return StepResult::Continue;
             }
-            return self.handle_terminal_text(state, vars, progress_text);
+            // No tool calls: the turn is over and this text is the final answer
+            // ("no tool calls = done"). Render it once, in order, and end the run.
+            if let Some(text) = progress_text.clone() {
+                state.messages.push(HarnessMessage::Assistant {
+                    content: text.clone(),
+                    tool_calls: Vec::new(),
+                });
+                state.events.push(HarnessEvent::AssistantText { text });
+                vars.steps_since_visible = 0;
+            }
+            return StepResult::TurnEnded {
+                kind: TurnEndKind::Complete,
+                final_text: progress_text,
+            };
         }
-        vars.complete_nudge_count = 0;
-        vars.empty_count = 0;
-        vars.pending_narration_idx = None;
 
         // Tool-call-loop detection: if the model repeats the exact same call(s),
         // steer it next turn instead of letting it spin.
@@ -709,20 +843,10 @@ impl CodingHarness {
         }
         vars.last_tool_signature = Some(signature);
 
-        // The visible reply this turn. On a `complete` turn, a buffered reply from a
-        // prior text-only turn is the real answer and the model's complete-turn text is
-        // usually a throwaway sign-off ("I'll finalize the handoff") — so prefer the
-        // buffer; only fall back to the complete-turn text when nothing was buffered
-        // (the model put its reply *with* complete in one turn). On a non-terminal tool
-        // turn, the current progress text is the narration for this action, so prefer it.
-        let ends_turn = calls.iter().any(|call| call.tool_name == "terminate_loop");
-        let buffered = vars.pending_text_only_reply.take(); // already in history
-
-        // Give every call a stable id (provider-assigned, or synthesized for
-        // salvaged ones) and record the assistant turn natively: its visible text
-        // plus the tool calls it made. Each call is answered below by a ToolResult
-        // with the matching id, so providers see a valid tool_call/tool_result
-        // exchange.
+        // Assign every call a stable id and record the native assistant turn: the
+        // visible progress text plus the tool calls it made. Each call is answered
+        // below by a ToolResult with the matching id (valid tool_call/tool_result
+        // exchange).
         for (idx, call) in calls.iter_mut().enumerate() {
             if call.id.is_none() {
                 call.id = Some(format!("call_{}_{}", state.iterations, idx));
@@ -740,15 +864,10 @@ impl CodingHarness {
             content: progress_text.clone().unwrap_or_default(),
             tool_calls,
         });
-        let visible_text_this_turn = if ends_turn {
-            buffered.or(progress_text)
-        } else {
-            progress_text.or(buffered)
-        };
-        if let Some(text) = visible_text_this_turn.clone() {
-            state
-                .events
-                .push(HarnessEvent::AssistantText { text });
+        // Progress text on a tool turn is rendered immediately, in order — never
+        // buffered or re-delivered (that was the old duplicate-answer source).
+        if let Some(text) = progress_text {
+            state.events.push(HarnessEvent::AssistantText { text });
             vars.steps_since_visible = 0;
         } else {
             vars.steps_since_visible += 1;
@@ -768,17 +887,25 @@ impl CodingHarness {
                 arguments: call.arguments.clone(),
             });
 
-            // `terminate_loop` is always a turn-control tool; the rest are meta only
-            // in conversation mode.
-            let is_meta = tool_name == "terminate_loop"
-                || (conversation_mode && meta::is_meta_tool(&tool_name));
-
-            if is_meta {
-                if tool_name == "note" {
-                    had_note = true;
-                }
-                let (result, control) =
-                    self.dispatch_meta(state, lanes, &tool_name, &call.arguments, &visible_text_this_turn);
+            // Headless explicit completion: a lane / one-shot run ends with a
+            // structured `summary` (folded back into the caller). Not advertised to
+            // the conversation agent, which finishes by replying with no tool calls.
+            if tool_name == "terminate_loop" {
+                let summary = call
+                    .arguments
+                    .get("summary")
+                    .or_else(|| call.arguments.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let result = match summary {
+                    Some(s) => {
+                        json!({"schema_version": 1, "status": "success", "data": {"summary": s}})
+                    }
+                    None => tool_error(
+                        "`terminate_loop` requires a non-empty `summary` of what you did and found.",
+                    ),
+                };
                 state.events.push(HarnessEvent::ToolResult {
                     tool_name: tool_name.clone(),
                     result: result.clone(),
@@ -788,21 +915,35 @@ impl CodingHarness {
                     tool_name,
                     content: result,
                 });
+                if let Some(s) = summary {
+                    return StepResult::TurnEnded {
+                        kind: TurnEndKind::Complete,
+                        final_text: Some(s.to_string()),
+                    };
+                }
+                // Missing summary: the error result nudges a retry next turn.
+                continue;
+            }
+
+            let is_meta = conversation_mode && meta::is_meta_tool(&tool_name);
+
+            if is_meta {
+                if tool_name == "note" {
+                    had_note = true;
+                }
+                let (result, control) =
+                    self.dispatch_meta(state, lanes, &tool_name, &call.arguments);
+                state.events.push(HarnessEvent::ToolResult {
+                    tool_name: tool_name.clone(),
+                    result: result.clone(),
+                });
+                state.messages.push(HarnessMessage::ToolResult {
+                    tool_call_id: call_id,
+                    tool_name,
+                    content: result,
+                });
+                // ask_user pauses the run here; nothing else ends a turn now.
                 if let MetaControl::EndTurn { kind, final_text } = control {
-                    // Safety net: never end a completed turn silently. If the model
-                    // terminated without delivering any visible text this turn (and
-                    // none was buffered), surface the final_text/summary as the reply
-                    // so the user isn't left staring at tool calls with no answer.
-                    // (Ask turns already render their prompt as a UserQuestion event.)
-                    if matches!(kind, TurnEndKind::Complete)
-                        && visible_text_this_turn.is_none()
-                    {
-                        if let Some(text) = final_text.as_ref().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-                            state.events.push(HarnessEvent::AssistantText {
-                                text: text.to_string(),
-                            });
-                        }
-                    }
                     return StepResult::TurnEnded { kind, final_text };
                 }
                 continue;
@@ -836,9 +977,6 @@ impl CodingHarness {
                 continue;
             }
 
-            // A real (non-meta) tool ran: the agent is now doing work, so later
-            // text-only turns are mid-work narration, not a finished chat reply.
-            vars.tool_work_done = true;
             real_work_count += 1;
 
             // Shell discipline: nudge (never block) when `bash` does work a file
@@ -919,100 +1057,6 @@ impl CodingHarness {
         StepResult::Continue
     }
 
-    /// A response with no tool call. Ported from wacht's
-    /// `handle_terminal_text_response`. A text-only turn does NOT end the run by
-    /// itself, because "I'm done" and "I'm about to do more" look identical as bare
-    /// text — auto-completing would stop the agent exactly when it narrates intent
-    /// ("Let me read the key files…") without yet emitting the call. Instead it
-    /// raises a `CompleteRequired` signal (in next turn's live context) up to twice,
-    /// steering the model to either emit `complete` (if that text was the final
-    /// answer) or take the next concrete tool call (if it meant to keep going) —
-    /// WITHOUT repeating the already-delivered text. Only once the nudges are
-    /// exhausted does it auto-complete with the text as a fallback. The steer is a
-    /// transient signal, never appended to history, so it never piles up.
-    fn handle_terminal_text(
-        &self,
-        state: &mut HarnessState,
-        vars: &mut LoopVars,
-        progress_text: Option<String>,
-    ) -> StepResult {
-        let text = progress_text
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty());
-
-        let Some(text) = text else {
-            // Empty response: no text, no tool call. Steer a couple of times, then
-            // give up gracefully rather than spinning to the backstop.
-            vars.empty_count += 1;
-            if vars.empty_count > 2 {
-                self.debug_log("  -> empty exhausted, auto-complete");
-                return StepResult::TurnEnded {
-                    kind: TurnEndKind::Complete,
-                    final_text: vars.pending_text_only_reply.clone(),
-                };
-            }
-            self.debug_log(&format!("  -> empty_response signal (count={})", vars.empty_count));
-            vars.pending_signals.push(RuntimeSignal::EmptyResponse);
-            return StepResult::Continue;
-        };
-
-        // Overwrite this streak's narration instead of appending, so history keeps
-        // only the latest line. Display stays deferred.
-        match vars
-            .pending_narration_idx
-            .and_then(|idx| state.messages.get_mut(idx))
-        {
-            // Only reuse a pure-text narration slot; never overwrite an assistant
-            // turn that carried tool calls.
-            Some(HarnessMessage::Assistant { content, tool_calls }) if tool_calls.is_empty() => {
-                *content = text.clone()
-            }
-            _ => {
-                state.messages.push(HarnessMessage::Assistant {
-                    content: text.clone(),
-                    tool_calls: Vec::new(),
-                });
-                vars.pending_narration_idx = Some(state.messages.len() - 1);
-            }
-        }
-        vars.steps_since_visible = 0;
-        vars.complete_nudge_count += 1;
-
-        // How many consecutive text-only turns to tolerate before ending. If the
-        // agent has already run a tool this turn-sequence, it is WORKING and a
-        // text-only turn is mid-work narration ("let me read the file…") — keep going
-        // and only let `complete` end it, with a high backstop against true runaways.
-        // If it has done no work, a text-only turn is a finished chat reply — end after
-        // one grace turn. The counter resets on every tool call, so a working agent
-        // effectively never reaches the backstop.
-        let cap = if vars.tool_work_done { 8 } else { 2 };
-        if vars.complete_nudge_count >= cap {
-            self.debug_log(&format!(
-                "  -> text-only cap reached (work={}, count={}): render reply + end turn",
-                vars.tool_work_done, vars.complete_nudge_count
-            ));
-            state
-                .events
-                .push(HarnessEvent::AssistantText { text: text.clone() });
-            vars.pending_text_only_reply = None;
-            return StepResult::TurnEnded {
-                kind: TurnEndKind::Complete,
-                final_text: Some(text),
-            };
-        }
-
-        // Buffer the reply (do NOT render it yet) and give the model a grace turn to
-        // either call `complete` (done) or emit the tool call it forgot (continue).
-        // Deferring the render is what prevents duplicate replies.
-        self.debug_log(&format!(
-            "  -> text-only buffered (work={}, count={}): CompleteRequired grace nudge",
-            vars.tool_work_done, vars.complete_nudge_count
-        ));
-        vars.pending_text_only_reply = Some(text);
-        vars.pending_signals.push(RuntimeSignal::CompleteRequired);
-        StepResult::Continue
-    }
-
     /// Dispatch a conversation meta tool. Pushes any specialized events / pending
     /// state, returns the tool-result value and how the turn should proceed.
     fn dispatch_meta(
@@ -1021,7 +1065,6 @@ impl CodingHarness {
         lanes: &mut LaneManager,
         tool_name: &str,
         arguments: &Value,
-        visible_text_this_turn: &Option<String>,
     ) -> (Value, MetaControl) {
         match tool_name {
             "note" => {
@@ -1093,39 +1136,6 @@ impl CodingHarness {
                 },
                 Err(error) => (tool_error(error), MetaControl::Continue),
             },
-            "terminate_loop" => {
-                let summary = arguments
-                    .get("summary")
-                    .or_else(|| arguments.get("message"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let Some(summary) = summary else {
-                    return (
-                        tool_error(
-                            "`terminate_loop` requires a non-empty `summary` (what was accomplished, \
-                             key decisions, resulting state).",
-                        ),
-                        MetaControl::Continue,
-                    );
-                };
-                self.debug_log(&format!(
-                    "  -> terminate_loop called: summary={:?} accompanying_text={:?}",
-                    dbg_short(summary),
-                    visible_text_this_turn.as_deref().map(dbg_short),
-                ));
-                let final_text = visible_text_this_turn
-                    .clone()
-                    .or_else(|| vars_pending_reply(state))
-                    .unwrap_or_else(|| summary.to_string());
-                (
-                    json!({"schema_version": 1, "status": "success", "data": {"summary": summary}}),
-                    MetaControl::EndTurn {
-                        kind: TurnEndKind::Complete,
-                        final_text: Some(final_text),
-                    },
-                )
-            }
             other => (
                 tool_error(format!("`{other}` is not a recognized meta tool.")),
                 MetaControl::Continue,
@@ -1136,7 +1146,13 @@ impl CodingHarness {
     fn definitions_for(&self, conversation_mode: bool) -> Vec<crate::llm::NativeToolDefinition> {
         let mut definitions = self.tools.definitions();
         if conversation_mode {
+            // User-facing: meta tools (note/ask_user/delegate); no terminate tool —
+            // a plain reply ends the turn.
             definitions.extend(meta::conversation_meta_definitions());
+        } else {
+            // Headless (lanes / one-shot run): an explicit terminate_loop carries a
+            // structured summary back to the caller.
+            definitions.push(meta::terminate_loop_tool());
         }
         definitions
     }
@@ -1246,6 +1262,7 @@ impl CodingHarness {
             completion_tokens: 0,
             last_prompt_tokens: 0,
             cache_read_tokens: 0,
+            checkpoints: Vec::new(),
         };
         self.persist_state(&state).await?;
         Ok(state)
@@ -1336,24 +1353,27 @@ fn build_live_context(
     conversation_mode: bool,
 ) -> String {
     let signals = std::mem::take(&mut vars.pending_signals);
-    let mut block = String::from("[live_runtime]\n");
-    block.push_str("# per-iteration runtime block; INTERNAL plumbing, not part of the conversation. Read it and act on it, but NEVER quote, mention, or describe it (or the loop / terminate_loop) to the user.\n");
-    block.push_str(&format!("iteration = {}\n", state.iterations));
+    let mut block = String::from("<runtime_context>\n");
+    block.push_str(
+        "NOTE: this block is injected by the harness at the end of the turn — it is NOT a message \
+         from the user. The user did not write any of it. Never attribute it to the user (\"the user \
+         said / pointed out…\"), never quote or mention it, never reply to it as if the user sent it. \
+         Read it, act on it, stay silent about it.\n\n",
+    );
 
     if let Some(latest) = latest_user_input(state) {
         block.push_str("\n[most_recent_user_input]\n");
         block.push_str(&format!("text = \"{}\"\n", sanitize_one_line(&latest)));
     }
 
-    block.push_str("\n[how_to_stop]\n");
-    block.push_str("secrecy = \"this whole block is internal; never surface `terminate_loop`, 'the loop', or 'live context' in a reply — just act on it silently.\"\n");
-    block.push_str("emit = \"a single `terminate_loop` call ends the turn and hands control back to the user (summary required; any answer text beside it is delivered). A plain text reply alone does not end the run — it is treated as a progress note — but do NOT tell the user that; simply call terminate_loop when you are done.\"\n");
-    block.push_str("stop_when = \"once you have WRITTEN your answer to the user (reading/searching is not answering) and any check is done, call terminate_loop with that answer text beside it. Don't re-send an answer you already delivered — but NEVER terminate empty after work the user asked about; they'd see only tool calls and no reply.\"\n");
+    block.push_str("\n[turn]\n");
+    block.push_str("continue = \"to keep working, make tool calls — their results arrive next turn\"\n");
     if conversation_mode {
-        block.push_str("also = \"ask_user pauses for the user's answer; in-progress updates go as a short text line beside working tool calls, not as a separate turn\"\n");
+        block.push_str("finish = \"when the task is done and you have the answer, reply in plain text with NO tool calls; that delivers your answer and ends your turn\"\n");
+        block.push_str("ask = \"to ask the user something you genuinely need, call ask_user — it pauses for their reply\"\n");
+    } else {
+        block.push_str("finish = \"when the task is done, call `terminate_loop` with a `summary` of what you did and found — that is your report to the caller. Finish the real work first, then terminate_loop.\"\n");
     }
-    block.push_str("extends_turn = \"any working tool call, including note\"\n");
-    block.push_str("forbidden = \"do NOT pair terminate_loop with working tool calls — finish the work, then terminate_loop alone\"\n");
 
     if !signals.is_empty() {
         block.push_str("\n[runtime_signals]\n");
@@ -1377,6 +1397,7 @@ fn build_live_context(
         }
     }
 
+    block.push_str("</runtime_context>\n");
     block
 }
 
@@ -1447,16 +1468,6 @@ fn sanitize_one_line(text: &str) -> String {
 fn latest_user_input(state: &HarnessState) -> Option<String> {
     state.events.iter().rev().find_map(|event| match event {
         HarnessEvent::UserInput { text } | HarnessEvent::Steer { text } => Some(text.clone()),
-        _ => None,
-    })
-}
-
-/// The most recent text-only assistant reply recorded as an event, used as a
-/// final-answer fallback when `complete` carries no accompanying text.
-fn vars_pending_reply(state: &HarnessState) -> Option<String> {
-    state.events.iter().rev().find_map(|event| match event {
-        HarnessEvent::AssistantText { text } => Some(text.clone()),
-        HarnessEvent::ToolCall { .. } | HarnessEvent::ToolResult { .. } => None,
         _ => None,
     })
 }
