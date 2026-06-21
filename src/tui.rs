@@ -681,6 +681,23 @@ impl App {
         }
     }
 
+    /// Paste into the focused login-form field. Fields are single-line, so pasted
+    /// newlines and edge whitespace are stripped (a pasted key/model/URL often has
+    /// a trailing newline).
+    fn login_paste(&mut self, text: &str) {
+        let cleaned = text.replace(['\n', '\r'], "");
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            return;
+        }
+        match self.form_focus {
+            SettingsField::ApiKey => self.form_api_key.push_str(cleaned),
+            SettingsField::BaseUrl => self.form_base_url.push_str(cleaned),
+            SettingsField::Model => self.form_model.push_str(cleaned),
+            _ => {}
+        }
+    }
+
     fn login_backspace(&mut self) {
         match self.form_focus {
             SettingsField::ApiKey => {
@@ -1305,7 +1322,14 @@ async fn run_app(
                 // With the kitty protocol a key can arrive as Press/Repeat/Release;
                 // act on Press/Repeat only so a key isn't handled twice.
                 Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(&mut app, key),
-                Event::Paste(text) => app.input_paste(&text),
+                Event::Paste(text) => {
+                    // Route paste to the login form when it's open, else the prompt.
+                    if app.login_active {
+                        app.login_paste(&text);
+                    } else {
+                        app.input_paste(&text);
+                    }
+                }
                 _ => {}
             }
         }
