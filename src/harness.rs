@@ -1434,6 +1434,17 @@ fn build_live_context(
     }
 
     block.push_str("\n[turn]\n");
+    // Tell the model WHY it's being invoked again: its last tool call(s) returned,
+    // so it should read the results and move forward — not re-issue the same calls.
+    if matches!(state.messages.last(), Some(HarnessMessage::ToolResult { .. })) {
+        block.push_str(
+            "why_now = \"you are being invoked again because your previous turn's tool call(s) \
+             RETURNED — their results are in your history just above. That is the only reason for \
+             this turn. Read those results and take the NEXT step: analyse what came back, act on \
+             it, or finish. Do NOT re-issue calls you already made or re-state what you already \
+             said — each turn must move forward.\"\n",
+        );
+    }
     block.push_str("continue = \"to keep working, make tool calls — their results arrive next turn\"\n");
     if conversation_mode {
         block.push_str("finish = \"when the task is done and you have the answer, reply in plain text with NO tool calls; that delivers your answer and ends your turn\"\n");
