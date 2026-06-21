@@ -703,7 +703,7 @@ impl CodingHarness {
         let mut request_messages = state.messages.clone();
         self.inline_images(&mut request_messages);
         request_messages.push(HarnessMessage::User {
-            content: build_live_context(state, vars, conversation_mode),
+            content: build_live_context(state, vars, conversation_mode, self.context.workspace_root()),
         });
 
         // Clear any leftover live-stream text before this turn streams into it; the
@@ -858,6 +858,8 @@ impl CodingHarness {
                 id: call.id.clone().unwrap_or_default(),
                 name: call.tool_name.clone(),
                 arguments: call.arguments.clone(),
+                signature: call.signature.clone(),
+                origin_model: call.origin_model.clone(),
             })
             .collect();
         state.messages.push(HarnessMessage::Assistant {
@@ -1351,6 +1353,7 @@ fn build_live_context(
     state: &HarnessState,
     vars: &mut LoopVars,
     conversation_mode: bool,
+    workspace: &std::path::Path,
 ) -> String {
     let signals = std::mem::take(&mut vars.pending_signals);
     let mut block = String::from("<runtime_context>\n");
@@ -1359,6 +1362,15 @@ fn build_live_context(
          from the user. The user did not write any of it. Never attribute it to the user (\"the user \
          said / pointed out…\"), never quote or mention it, never reply to it as if the user sent it. \
          Read it, act on it, stay silent about it.\n\n",
+    );
+
+    block.push_str("\n[workspace]\n");
+    block.push_str(&format!("cwd = \"{}\"\n", workspace.display()));
+    block.push_str(
+        "note = \"this is your current working directory — the project you are operating on. \
+         Resolve relative paths against it, run shell commands from here, and keep file work within \
+         it unless the user points you at an absolute path elsewhere. Ground your understanding of \
+         'this folder / this project / here' in THIS path.\"\n",
     );
 
     if let Some(latest) = latest_user_input(state) {

@@ -72,6 +72,7 @@ fn extract_fenced_tool_calls(text: &str) -> InlineToolSubmission {
                 tool_name: name.to_string(),
                 arguments,
                 id: None,
+                ..Default::default()
             });
         }
         // Skip past the body and any trailing run of closer markup so it doesn't
@@ -221,6 +222,7 @@ fn salvage_qwen_xml(text: &str) -> Vec<GeneratedToolCall> {
                 tool_name: name,
                 arguments: Value::Object(arguments),
                 id: None,
+                ..Default::default()
             });
         }
         cursor = region_end;
@@ -308,6 +310,7 @@ fn salvage_glm(text: &str) -> Vec<GeneratedToolCall> {
         tool_name: name,
         arguments: Value::Object(args),
         id: None,
+        ..Default::default()
     }]
 }
 
@@ -331,6 +334,7 @@ fn salvage_deepseek(text: &str) -> Vec<GeneratedToolCall> {
                 tool_name: name,
                 arguments,
                 id: None,
+                ..Default::default()
             });
         }
         cursor = name_start + name_len;
@@ -363,6 +367,7 @@ fn collect_json_calls(value: &Value, out: &mut Vec<GeneratedToolCall>) {
                 tool_name: name.to_string(),
                 arguments,
                 id: None,
+                ..Default::default()
             });
         }
         _ => {}

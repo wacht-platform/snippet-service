@@ -150,7 +150,7 @@ impl AgentModel for GeminiModel {
             self.refresh_cache(&plan).await;
         }
 
-        Ok(map_response(parsed))
+        Ok(map_response(parsed, &self.config.model))
     }
 }
 
@@ -422,10 +422,17 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
                             "args": crate::llm::arguments_as_object(&call.arguments),
                         }
                     });
-                    // Gemini 3+ rejects a replayed functionCall without a thought
-                    // signature; we never have a real one, so attach the skip
-                    // sentinel. Gemini 2.5 doesn't require it.
-                    if !is_gemini_2_5(model) {
+                    // Replay the REAL thought signature when it came from this same
+                    // model (signatures are model-specific). Otherwise Gemini 3+
+                    // rejects a replayed functionCall without one, so attach the
+                    // skip sentinel; Gemini 2.5 needs neither.
+                    let own_signature = call
+                        .signature
+                        .as_deref()
+                        .filter(|sig| !sig.is_empty() && call.origin_model.as_deref() == Some(model));
+                    if let Some(signature) = own_signature {
+                        part["thoughtSignature"] = json!(signature);
+                    } else if !is_gemini_2_5(model) {
                         part["thoughtSignature"] = json!(SKIP_THOUGHT_SIGNATURE);
                     }
                     parts.push(part);
@@ -468,7 +475,7 @@ fn push_content(contents: &mut Vec<Value>, role: &str, mut parts: Vec<Value>) {
     contents.push(json!({ "role": role, "parts": parts }));
 }
 
-fn map_response(response: GeminiResponse) -> ModelOutput {
+fn map_response(response: GeminiResponse, model: &str) -> ModelOutput {
     let mut content_text = String::new();
     let mut calls = Vec::new();
     for candidate in &response.candidates {
@@ -483,6 +490,10 @@ fn map_response(response: GeminiResponse) -> ModelOutput {
                     // Gemini has no call ids; synthesize one so the harness can
                     // pair the tool_result (functionResponse matches by name).
                     id: Some(uuid::Uuid::new_v4().to_string()),
+                    // Capture the thought signature + the model it came from so it
+                    // can be replayed next turn (Gemini 3 reasoning continuity).
+                    signature: part.thought_signature.clone(),
+                    origin_model: Some(model.to_string()),
                 });
             }
         }
@@ -582,6 +593,8 @@ struct CandidatePart {
     text: Option<String>,
     #[serde(rename = "functionCall", default)]
     function_call: Option<GeminiFunctionCall>,
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

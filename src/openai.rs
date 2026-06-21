@@ -87,6 +87,7 @@ impl AgentModel for OpenAiCompatibleModel {
                     tool_name: function.name,
                     arguments,
                     id,
+                    ..Default::default()
                 })
             })
             .collect();
@@ -387,6 +388,7 @@ async fn parse_openai_sse(
             arguments: serde_json::from_str::<Value>(&call.args)
                 .unwrap_or(Value::String(call.args)),
             id: (!call.id.is_empty()).then_some(call.id),
+            ..Default::default()
         })
         .collect();
 
@@ -866,6 +868,7 @@ impl AgentModel for GithubCopilotModel {
                     tool_name: function.name,
                     arguments,
                     id,
+                    ..Default::default()
                 })
             })
             .collect();

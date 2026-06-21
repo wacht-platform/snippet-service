@@ -35,6 +35,7 @@ impl StreamBuffer {
         }
     }
 
+    /// Clear text + thinking — fresh per turn/step so thinking never accumulates.
     pub fn clear(handle: &StreamHandle) {
         if let Ok(mut buf) = handle.lock() {
             buf.text.clear();
@@ -93,6 +94,14 @@ pub struct GeneratedToolCall {
     /// an id so the native tool_call/tool_result pairing stays valid.
     #[serde(default)]
     pub id: Option<String>,
+    /// Gemini `thoughtSignature` for this call (opaque reasoning handle). Replayed
+    /// on the next turn so Gemini 3 keeps its chain-of-thought across tool calls.
+    #[serde(default)]
+    pub signature: Option<String>,
+    /// Model the call (and its `signature`) originated on. Signatures are
+    /// model-specific, so we only replay one when the current model matches.
+    #[serde(default)]
+    pub origin_model: Option<String>,
 }
 
 /// One native tool call recorded on an assistant turn, paired with a
@@ -103,6 +112,12 @@ pub struct ToolCallRecord {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
+    /// Gemini thought signature + originating model, persisted so it can be
+    /// replayed on later turns (see `GeneratedToolCall`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_model: Option<String>,
 }
 
 /// Coerce tool-call arguments to a JSON object for the wire. Providers require

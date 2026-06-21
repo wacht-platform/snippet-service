@@ -66,6 +66,7 @@ impl AgentModel for AnthropicModel {
                         tool_name: name,
                         arguments: input,
                         id: Some(id),
+                        ..Default::default()
                     });
                 }
             }
@@ -397,6 +398,7 @@ async fn parse_anthropic_sse(
             tool_name: tool.name,
             arguments: serde_json::from_str(&tool.partial).unwrap_or_else(|_| json!({})),
             id: Some(tool.id),
+            ..Default::default()
         })
         .collect();
 
