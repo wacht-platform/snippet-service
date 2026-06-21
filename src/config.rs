@@ -9,9 +9,12 @@ use crate::tools::ToolError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnippetConfig {
-    #[serde(default = "default_workspace")]
+    // Workspace + state are per-launch (derived from the cwd), never read from or
+    // written to the global config — so snippet operates on whatever folder you
+    // launch it in. `skip` keeps them out of config.toml entirely.
+    #[serde(skip)]
     pub workspace: PathBuf,
-    #[serde(default = "default_state_path")]
+    #[serde(skip)]
     pub state_path: PathBuf,
     #[serde(default)]
     pub resume_on_start: bool,
@@ -127,33 +130,35 @@ impl SnippetConfig {
         Ok(config)
     }
 
+    /// Pin the workspace to the current working directory (where snippet was
+    /// launched) and derive a per-workspace state location, so each folder gets
+    /// its own scoped conversation history and snippet never operates on a stale
+    /// pinned path.
     fn resolve_relative_paths(&mut self, _config_path: &Path) {
-        if self.workspace.is_relative() {
-            if let Ok(cwd) = std::env::current_dir() {
-                self.workspace = cwd.join(&self.workspace);
-            }
+        if let Ok(cwd) = std::env::current_dir() {
+            self.workspace = cwd;
+        } else if self.workspace.as_os_str().is_empty() {
+            self.workspace = PathBuf::from(".");
         }
-        if self.state_path.is_relative() {
-            let workspace_hash = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                self.workspace.hash(&mut hasher);
-                hasher.finish()
-            };
-            let workspace_name = self.workspace.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("workspace");
-            
-            let home = std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            
-            self.state_path = home.join(format!(
-                ".snippet/workspaces/{}-{:x}/state.json",
-                workspace_name,
-                workspace_hash
-            ));
-        }
+
+        let workspace_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            self.workspace.hash(&mut hasher);
+            hasher.finish()
+        };
+        let workspace_name = self
+            .workspace
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.state_path = home.join(format!(
+            ".snippet/workspaces/{}-{:x}/state.json",
+            workspace_name, workspace_hash
+        ));
     }
 }
 
