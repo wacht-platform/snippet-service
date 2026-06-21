@@ -187,7 +187,6 @@ impl ModelConfig {
                     max_retries: self.max_retries,
                     initial_retry_ms: self.initial_retry_ms,
                     max_retry_ms: self.max_retry_ms,
-                    cache_prompt: self.cache_prompt,
                 }))
             }
             "anthropic" => {

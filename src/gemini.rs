@@ -46,8 +46,6 @@ pub struct GeminiConfig {
     pub max_retries: u32,
     pub initial_retry_ms: u64,
     pub max_retry_ms: u64,
-    /// Enable explicit prompt caching (mirrors the Anthropic `cache_prompt` flag).
-    pub cache_prompt: bool,
 }
 
 /// Live explicit-cache handle, held across the session (the model is reused).
@@ -136,12 +134,9 @@ impl AgentModel for GeminiModel {
         let body = Value::Object(body);
 
         // Plan explicit caching (reduces the send payload to a cache ref + delta
-        // when reusable); None when caching is off or the prefix is too small.
-        let plan = if self.config.cache_prompt {
-            self.build_cache_plan(&body)
-        } else {
-            None
-        };
+        // when reusable). Always on; `build_cache_plan` returns None when the
+        // prefix is below the worthwhile-token minimum.
+        let plan = self.build_cache_plan(&body);
         let send_body = plan
             .as_ref()
             .map(|plan| plan.send_payload.clone())
