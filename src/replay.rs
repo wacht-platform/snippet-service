@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::llm::{AgentModel, HarnessMessage, ModelOutput, NativeToolDefinition};
+use crate::llm::{AgentModel, HarnessMessage, ModelOutput, NativeToolDefinition, StreamHandle};
 use crate::tools::ToolError;
 
 pub struct ReplayModel {
@@ -31,9 +31,16 @@ impl AgentModel for ReplayModel {
         _messages: &[HarnessMessage],
         _tools: &[NativeToolDefinition],
         _force_tool: bool,
+        sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
         if let Some(message) = &self.error {
             return Err(ToolError::msg(message.clone()));
+        }
+        // Replay the recorded text through the sink so a streamed UI sees it too.
+        if let (Some(sink), Some(output)) = (&sink, self.outputs.front()) {
+            if let Some(text) = &output.content_text {
+                crate::llm::StreamBuffer::append(sink, text);
+            }
         }
         self.outputs
             .pop_front()

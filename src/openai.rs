@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
 
 use crate::llm::{
-    AgentModel, GeneratedToolCall, HarnessMessage, ModelOutput, NativeToolDefinition,
+    AgentModel, GeneratedToolCall, HarnessMessage, ModelOutput, NativeToolDefinition, StreamBuffer,
+    StreamHandle, TokenUsage,
 };
 use crate::tools::ToolError;
 
@@ -42,12 +43,28 @@ impl AgentModel for OpenAiCompatibleModel {
         messages: &[HarnessMessage],
         tools: &[NativeToolDefinition],
         force_tool: bool,
+        sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        let body = self.build_chat_request(messages, tools, force_tool);
+        if let Some(sink) = sink {
+            let body = self.build_chat_request(messages, tools, force_tool, true);
+            let headers = vec![("authorization", format!("Bearer {}", self.config.api_key))];
+            return stream_chat_with_retries(
+                &self.client,
+                &url,
+                &headers,
+                &body,
+                &sink,
+                self.config.max_retries,
+                self.config.initial_retry_ms,
+                self.config.max_retry_ms,
+            )
+            .await;
+        }
+        let body = self.build_chat_request(messages, tools, force_tool, false);
         let bytes = self.send_with_retries(&url, &body).await?;
 
         let response: ChatResponse = serde_json::from_slice(&bytes)?;
@@ -95,14 +112,11 @@ impl OpenAiCompatibleModel {
         messages: &[HarnessMessage],
         tools: &[NativeToolDefinition],
         force_tool: bool,
+        stream: bool,
     ) -> ChatRequest {
         ChatRequest {
             model: self.config.model.clone(),
-            messages: messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| chat_message_from_harness(index, message))
-                .collect(),
+            messages: build_chat_messages(messages),
             tools: tools.iter().map(chat_tool_from_definition).collect(),
             temperature: self.config.temperature,
             // `required` needs tools to choose from, else providers reject it.
@@ -113,6 +127,9 @@ impl OpenAiCompatibleModel {
                 .base_url
                 .contains("openrouter")
                 .then_some(UsageRequest { include: true }),
+            stream: stream.then_some(true),
+            // Streaming usage only arrives with include_usage on stream_options.
+            stream_options: stream.then_some(StreamOptions { include_usage: true }),
         }
     }
 
@@ -213,14 +230,209 @@ fn retry_delay(
     )
 }
 
-fn chat_message_from_harness(index: usize, message: &HarnessMessage) -> ChatMessage {
+/// Send a streaming chat request (with per-provider headers) and assemble the
+/// `ModelOutput` from the SSE response, pushing text deltas to `sink` as they
+/// arrive. Retries mirror `send_with_retries`; each attempt clears the sink so a
+/// retry doesn't double-render already-streamed text.
+async fn stream_chat_with_retries(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &[(&str, String)],
+    body: &ChatRequest,
+    sink: &StreamHandle,
+    max_retries: u32,
+    initial_ms: u64,
+    max_ms: u64,
+) -> Result<ModelOutput, ToolError> {
+    let max_attempts = max_retries.saturating_add(1).max(1);
+    let mut last_error = String::new();
+
+    for attempt in 1..=max_attempts {
+        StreamBuffer::clear(sink);
+        let mut request = client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .json(body);
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+
+        match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return parse_openai_sse(response, sink).await;
+                }
+                let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
+                let response_body = response.text().await.unwrap_or_default();
+                last_error = format!("HTTP {status}: {response_body}");
+                if !is_retryable_status(status) || attempt == max_attempts {
+                    break;
+                }
+                sleep(retry_delay(attempt, retry_after, initial_ms, max_ms)).await;
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                if !is_retryable_transport_error(&error) || attempt == max_attempts {
+                    break;
+                }
+                sleep(retry_delay(attempt, None, initial_ms, max_ms)).await;
+            }
+        }
+    }
+
+    StreamBuffer::clear(sink);
+    Err(ToolError::msg(format!(
+        "model streaming request failed after {} attempt(s): {}",
+        max_attempts, last_error
+    )))
+}
+
+/// Consume an OpenAI-style `chat.completions` SSE stream and assemble a
+/// `ModelOutput`. Content deltas push to `sink` live; tool-call deltas accumulate
+/// by index (id/name once, arguments fragment by fragment) and parse at the end.
+async fn parse_openai_sse(
+    response: reqwest::Response,
+    sink: &StreamHandle,
+) -> Result<ModelOutput, ToolError> {
+    struct PendingCall {
+        id: String,
+        name: String,
+        args: String,
+    }
+    let mut text = String::new();
+    let mut calls: std::collections::BTreeMap<u64, PendingCall> = std::collections::BTreeMap::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<TokenUsage> = None;
+
+    crate::sse::for_each_event(response, |data| {
+        if data == "[DONE]" {
+            return;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
+            usage = Some(TokenUsage {
+                prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+                total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
+                cache_read_tokens: u
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                ..Default::default()
+            });
+        }
+        let Some(choice) = chunk.get("choices").and_then(|c| c.get(0)) else {
+            return;
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            finish_reason = Some(reason.to_string());
+        }
+        let delta = choice.get("delta");
+        // Reasoning tokens, when the model emits them (OpenRouter: `reasoning`;
+        // DeepSeek and others: `reasoning_content`) — shown dimmed, not part of
+        // the answer text.
+        if let Some(reasoning) = delta
+            .and_then(|d| d.get("reasoning").or_else(|| d.get("reasoning_content")))
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            StreamBuffer::append_thinking(sink, reasoning);
+        }
+        if let Some(content) = delta
+            .and_then(|d| d.get("content"))
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+        {
+            text.push_str(content);
+            StreamBuffer::append(sink, content);
+        }
+        if let Some(tool_calls) = delta
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(Value::as_array)
+        {
+            for call in tool_calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let entry = calls.entry(index).or_insert_with(|| PendingCall {
+                    id: String::new(),
+                    name: String::new(),
+                    args: String::new(),
+                });
+                if let Some(id) = call.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    entry.id = id.to_string();
+                }
+                if let Some(name) = call
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    entry.name.push_str(name);
+                }
+                if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                    entry.args.push_str(args);
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|error| ToolError::msg(format!("model stream error: {error}")))?;
+
+    let calls = calls
+        .into_values()
+        .filter(|call| !call.name.is_empty())
+        .map(|call| GeneratedToolCall {
+            tool_name: call.name,
+            arguments: serde_json::from_str::<Value>(&call.args)
+                .unwrap_or(Value::String(call.args)),
+            id: (!call.id.is_empty()).then_some(call.id),
+        })
+        .collect();
+
+    Ok(ModelOutput {
+        calls,
+        content_text: (!text.is_empty()).then_some(text),
+        usage,
+        finish_reason,
+    })
+}
+
+/// Build the wire message list. Image messages (from read_image results) are held
+/// and flushed only after the contiguous run of `tool` messages ends — OpenAI
+/// requires every tool result to immediately follow the assistant tool-call turn
+/// with no other message interleaved.
+fn build_chat_messages(messages: &[HarnessMessage]) -> Vec<ChatMessage> {
+    let mut out: Vec<ChatMessage> = Vec::new();
+    let mut pending_images: Vec<ChatMessage> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        for chat_message in chat_messages_from_harness(index, message) {
+            let is_image =
+                chat_message.role == "user" && matches!(chat_message.content, Some(Value::Array(_)));
+            if is_image {
+                pending_images.push(chat_message);
+            } else if chat_message.role == "tool" {
+                out.push(chat_message);
+            } else {
+                out.append(&mut pending_images);
+                out.push(chat_message);
+            }
+        }
+    }
+    out.append(&mut pending_images);
+    out
+}
+
+fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<ChatMessage> {
     match message {
-        HarnessMessage::System { content } if index == 0 => ChatMessage::text("system", content),
-        HarnessMessage::System { content } => ChatMessage::text(
+        HarnessMessage::System { content } if index == 0 => {
+            vec![ChatMessage::text("system", content)]
+        }
+        HarnessMessage::System { content } => vec![ChatMessage::text(
             "user",
             &format!("[runtime_signal]\n{content}\n[/runtime_signal]"),
-        ),
-        HarnessMessage::User { content } => ChatMessage::text("user", content),
+        )],
+        HarnessMessage::User { content } => vec![ChatMessage::text("user", content)],
         HarnessMessage::Assistant { content, tool_calls } => {
             let out_calls = tool_calls
                 .iter()
@@ -229,29 +441,40 @@ fn chat_message_from_harness(index: usize, message: &HarnessMessage) -> ChatMess
                     call_type: "function",
                     function: OutToolCallFunction {
                         name: call.name.clone(),
-                        arguments: serde_json::to_string(&call.arguments)
-                            .unwrap_or_else(|_| "{}".to_string()),
+                        // Must be a stringified JSON OBJECT — coerce non-object
+                        // arguments so strict providers (Cohere) don't 400.
+                        arguments: serde_json::to_string(&crate::llm::arguments_as_object(
+                            &call.arguments,
+                        ))
+                        .unwrap_or_else(|_| "{}".to_string()),
                     },
                 })
                 .collect();
-            ChatMessage::assistant(content, out_calls)
+            vec![ChatMessage::assistant(content, out_calls)]
         }
         HarnessMessage::ToolResult {
             tool_call_id,
             tool_name,
             content,
         } => {
+            let (cleaned, image) = crate::llm::split_inlined_image(content);
             let body =
-                serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string());
+                serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
             if tool_call_id.is_empty() {
                 // Legacy state written before native function calling — render as
                 // a text block so old sessions still load.
-                ChatMessage::text(
+                vec![ChatMessage::text(
                     "user",
                     &format!("[tool_result]\ntool = \"{tool_name}\"\noutput = {body}\n[/tool_result]"),
-                )
+                )]
             } else {
-                ChatMessage::tool(tool_call_id, &body)
+                // Tool messages can't carry images, so an inlined image follows as
+                // a separate user message with an image_url data URL.
+                let mut out = vec![ChatMessage::tool(tool_call_id, &body)];
+                if let Some((mime, base64)) = image {
+                    out.push(ChatMessage::user_image(&mime, &base64));
+                }
+                out
             }
         }
     }
@@ -281,6 +504,10 @@ struct ChatRequest {
     // prompt_tokens_details.cached_tokens) when usage accounting is opted into.
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<UsageRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,12 +516,18 @@ struct UsageRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
+    // A plain string for text, or an array of content parts (for image_url).
     // Assistant messages that carry only tool calls send `content: null`, so it
     // must be omittable.
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<OutToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -305,7 +538,7 @@ impl ChatMessage {
     fn text(role: &str, content: &str) -> Self {
         Self {
             role: role.to_string(),
-            content: Some(content.to_string()),
+            content: Some(Value::String(content.to_string())),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -316,7 +549,7 @@ impl ChatMessage {
         let content = if content.is_empty() && !tool_calls.is_empty() {
             None
         } else {
-            Some(content.to_string())
+            Some(Value::String(content.to_string()))
         };
         Self {
             role: "assistant".to_string(),
@@ -329,9 +562,23 @@ impl ChatMessage {
     fn tool(tool_call_id: &str, content: &str) -> Self {
         Self {
             role: "tool".to_string(),
-            content: Some(content.to_string()),
+            content: Some(Value::String(content.to_string())),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.to_string()),
+        }
+    }
+
+    /// A user message carrying a single inline image as an `image_url` data URL —
+    /// how OpenAI-style APIs accept images (tool messages can't hold them).
+    fn user_image(mime: &str, base64: &str) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: Some(json!([{
+                "type": "image_url",
+                "image_url": { "url": format!("data:{mime};base64,{base64}") }
+            }])),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 }
@@ -478,19 +725,18 @@ impl GithubCopilotModel {
         messages: &[HarnessMessage],
         tools: &[NativeToolDefinition],
         force_tool: bool,
+        stream: bool,
     ) -> ChatRequest {
         ChatRequest {
             model: self.config.model.clone(),
-            messages: messages
-                .iter()
-                .enumerate()
-                .map(|(index, message)| chat_message_from_harness(index, message))
-                .collect(),
+            messages: build_chat_messages(messages),
             tools: tools.iter().map(chat_tool_from_definition).collect(),
             temperature: self.config.temperature,
             // `required` needs tools to choose from, else providers reject it.
             tool_choice: (force_tool && !tools.is_empty()).then_some("required"),
             usage: None,
+            stream: stream.then_some(true),
+            stream_options: stream.then_some(StreamOptions { include_usage: true }),
         }
     }
 
@@ -571,9 +817,33 @@ impl AgentModel for GithubCopilotModel {
         messages: &[HarnessMessage],
         tools: &[NativeToolDefinition],
         force_tool: bool,
+        sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
         let url = "https://api.githubcopilot.com/chat/completions";
-        let body = self.build_chat_request(messages, tools, force_tool);
+        if let Some(sink) = sink {
+            let session_token = self.get_copilot_token().await?;
+            let body = self.build_chat_request(messages, tools, force_tool, true);
+            let headers = vec![
+                ("authorization", format!("Bearer {session_token}")),
+                ("editor-version", "vscode/1.99.0".to_string()),
+                ("editor-plugin-version", "copilot-chat/0.26.7".to_string()),
+                ("user-agent", "GitHubCopilotChat/0.26.7".to_string()),
+                ("copilot-integration-id", "vscode-chat".to_string()),
+                ("x-github-api-version", "2025-04-01".to_string()),
+            ];
+            return stream_chat_with_retries(
+                &self.client,
+                url,
+                &headers,
+                &body,
+                &sink,
+                self.config.max_retries,
+                self.config.initial_retry_ms,
+                self.config.max_retry_ms,
+            )
+            .await;
+        }
+        let body = self.build_chat_request(messages, tools, force_tool, false);
         let bytes = self.send_with_retries(url, &body).await?;
 
         let response: ChatResponse = serde_json::from_slice(&bytes)?;

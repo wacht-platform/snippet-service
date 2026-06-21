@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
 
 use crate::llm::{
-    AgentModel, GeneratedToolCall, HarnessMessage, ModelOutput, NativeToolDefinition,
+    AgentModel, GeneratedToolCall, HarnessMessage, ModelOutput, NativeToolDefinition, StreamBuffer,
+    StreamHandle, TokenUsage,
 };
 use crate::tools::ToolError;
 
@@ -42,9 +43,13 @@ impl AgentModel for AnthropicModel {
         messages: &[HarnessMessage],
         tools: &[NativeToolDefinition],
         force_tool: bool,
+        sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
         let url = "https://api.anthropic.com/v1/messages";
-        let body = self.build_anthropic_request(messages, tools, force_tool);
+        if let Some(sink) = sink {
+            return self.generate_streaming(url, messages, tools, force_tool, &sink).await;
+        }
+        let body = self.build_anthropic_request(messages, tools, force_tool, false);
         let bytes = self.send_with_retries(url, &body).await?;
 
         let response: AnthropicResponse = serde_json::from_slice(&bytes)?;
@@ -89,6 +94,7 @@ impl AnthropicModel {
         messages: &[HarnessMessage],
         tools: &[NativeToolDefinition],
         force_tool: bool,
+        stream: bool,
     ) -> AnthropicRequest {
         let (system_prompt, mut anthropic_messages) = prepare_messages(messages);
         let system = system_prompt.map(|prompt| vec![AnthropicSystemContent {
@@ -134,7 +140,79 @@ impl AnthropicModel {
             tools: anthropic_tools,
             temperature: self.config.temperature,
             tool_choice,
+            stream: stream.then_some(true),
         }
+    }
+
+    /// Streaming counterpart of `generate`: opens an SSE response and assembles
+    /// the same `ModelOutput`, pushing visible text deltas into `sink` as they
+    /// arrive. Retries mirror `send_with_retries`; each attempt clears the sink so
+    /// a retry doesn't double-render already-streamed text.
+    async fn generate_streaming(
+        &self,
+        url: &str,
+        messages: &[HarnessMessage],
+        tools: &[NativeToolDefinition],
+        force_tool: bool,
+        sink: &StreamHandle,
+    ) -> Result<ModelOutput, ToolError> {
+        let body = self.build_anthropic_request(messages, tools, force_tool, true);
+        let max_attempts = self.config.max_retries.saturating_add(1).max(1);
+        let mut last_error = String::new();
+
+        for attempt in 1..=max_attempts {
+            StreamBuffer::clear(sink);
+            let response = self
+                .client
+                .post(url)
+                .header("x-api-key", &self.config.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header(CONTENT_TYPE, "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match response {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        return parse_anthropic_sse(response, sink).await;
+                    }
+                    let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
+                    let response_body = response.text().await.unwrap_or_default();
+                    last_error = format!("HTTP {status}: {response_body}");
+                    if !is_retryable_status(status) || attempt == max_attempts {
+                        break;
+                    }
+                    sleep(retry_delay(
+                        attempt,
+                        retry_after,
+                        self.config.initial_retry_ms,
+                        self.config.max_retry_ms,
+                    ))
+                    .await;
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    if !is_retryable_transport_error(&error) || attempt == max_attempts {
+                        break;
+                    }
+                    sleep(retry_delay(
+                        attempt,
+                        None,
+                        self.config.initial_retry_ms,
+                        self.config.max_retry_ms,
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        StreamBuffer::clear(sink);
+        Err(ToolError::msg(format!(
+            "anthropic streaming request failed after {} attempt(s): {}",
+            max_attempts, last_error
+        )))
     }
 
     async fn send_with_retries(&self, url: &str, body: &AnthropicRequest) -> Result<Vec<u8>, ToolError> {
@@ -201,6 +279,141 @@ impl AnthropicModel {
     }
 }
 
+/// Consume Anthropic's `message_stream` SSE and assemble a `ModelOutput`. Text
+/// deltas are pushed to `sink` live; tool_use blocks accumulate their streamed
+/// `input_json_delta` fragments and are parsed when the response ends.
+async fn parse_anthropic_sse(
+    response: reqwest::Response,
+    sink: &StreamHandle,
+) -> Result<ModelOutput, ToolError> {
+    // Tool-use blocks indexed by their content-block position; text is gathered
+    // separately. `partial` holds the streamed argument JSON until block stop.
+    struct PendingTool {
+        id: String,
+        name: String,
+        partial: String,
+    }
+    let mut text = String::new();
+    let mut tools: std::collections::BTreeMap<u64, PendingTool> = std::collections::BTreeMap::new();
+    let mut stop_reason: Option<String> = None;
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_creation = 0u64;
+
+    crate::sse::for_each_event(response, |data| {
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                if let Some(usage) = event.pointer("/message/usage") {
+                    input_tokens = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    cache_read = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    cache_creation = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                }
+            }
+            Some("content_block_start") => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let block = event.get("content_block");
+                if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
+                    tools.insert(
+                        index,
+                        PendingTool {
+                            id: block
+                                .and_then(|b| b.get("id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            name: block
+                                .and_then(|b| b.get("name"))
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            partial: String::new(),
+                        },
+                    );
+                }
+            }
+            Some("content_block_delta") => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let delta = event.get("delta");
+                match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(chunk) = delta.and_then(|d| d.get("text")).and_then(Value::as_str)
+                        {
+                            text.push_str(chunk);
+                            StreamBuffer::append(sink, chunk);
+                        }
+                    }
+                    // Extended-thinking tokens (present only when thinking is
+                    // enabled) — shown dimmed, separate from the answer.
+                    Some("thinking_delta") => {
+                        if let Some(chunk) =
+                            delta.and_then(|d| d.get("thinking")).and_then(Value::as_str)
+                        {
+                            StreamBuffer::append_thinking(sink, chunk);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let (Some(tool), Some(chunk)) = (
+                            tools.get_mut(&index),
+                            delta
+                                .and_then(|d| d.get("partial_json"))
+                                .and_then(Value::as_str),
+                        ) {
+                            tool.partial.push_str(chunk);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("message_delta") => {
+                if let Some(reason) = event
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                {
+                    stop_reason = Some(reason.to_string());
+                }
+                if let Some(out) = event.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                    output_tokens = out;
+                }
+            }
+            _ => {}
+        }
+    })
+    .await
+    .map_err(|error| ToolError::msg(format!("anthropic stream error: {error}")))?;
+
+    let calls = tools
+        .into_values()
+        .map(|tool| GeneratedToolCall {
+            tool_name: tool.name,
+            arguments: serde_json::from_str(&tool.partial).unwrap_or_else(|_| json!({})),
+            id: Some(tool.id),
+        })
+        .collect();
+
+    Ok(ModelOutput {
+        calls,
+        content_text: (!text.is_empty()).then_some(text),
+        usage: Some(TokenUsage {
+            prompt_tokens: input_tokens,
+            completion_tokens: output_tokens,
+            total_tokens: input_tokens.saturating_add(output_tokens),
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
+        }),
+        finish_reason: stop_reason,
+    })
+}
+
 fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
@@ -257,6 +470,8 @@ struct AnthropicRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -280,7 +495,9 @@ enum AnthropicContent {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        // String for text-only results, or an array of blocks (text + image) when
+        // a read_image result carries an inlined image.
+        content: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<Value>,
     },
@@ -358,7 +575,9 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                         AnthropicContent::ToolUse {
                             id: call.id.clone(),
                             name: call.name.clone(),
-                            input: call.arguments.clone(),
+                            // tool_use input must be a JSON object — coerce so a
+                            // salvaged/non-object args value isn't rejected.
+                            input: crate::llm::arguments_as_object(&call.arguments),
                         },
                     );
                 }
@@ -368,8 +587,11 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                 tool_name,
                 content,
             } => {
+                // Pull any inlined image out so it becomes a real image block, not
+                // a giant base64 string in the text.
+                let (cleaned, image) = crate::llm::split_inlined_image(content);
                 let body =
-                    serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string());
+                    serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
                 if tool_call_id.is_empty() {
                     // Legacy state (pre native function calling) — render as text.
                     let text = format!(
@@ -377,12 +599,21 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                     );
                     push_block(&mut prepared, "user", text_block(text));
                 } else {
+                    let content_value = match image {
+                        Some((mime, base64)) => json!([
+                            {"type": "text", "text": body},
+                            {"type": "image", "source": {
+                                "type": "base64", "media_type": mime, "data": base64
+                            }},
+                        ]),
+                        None => Value::String(body),
+                    };
                     push_block(
                         &mut prepared,
                         "user",
                         AnthropicContent::ToolResult {
                             tool_use_id: tool_call_id.clone(),
-                            content: body,
+                            content: content_value,
                             cache_control: None,
                         },
                     );
