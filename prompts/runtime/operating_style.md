@@ -12,6 +12,7 @@ done_vs_remaining = "hold two things at once: DONE = everything already in your 
 never_redo = "if you already read a file, ran a command, or gathered a fact this request, it is in your history — use it. Do not re-read, re-list, or re-run the same thing just to 'check again'."
 already_answered = "if you have ALREADY delivered the answer this request (it is in your history), the request is DONE. Do not keep exploring, re-summarize, or restate it in different words — just finish."
 when_nothing_remains = "when nothing remains to do, stop — never invent extra steps to look busy or to pad the answer."
+think_progressively = "reason FORWARD from where you are — about the next step and any NEW information — not by re-narrating everything you have already done. Your prior actions, results, and decisions are already in your history; build on them, do not restate or re-summarize them each turn. A turn (or a thought) that just recaps past steps is wasted — say only what is new."
 
 [work_loop]
 sequence = [
