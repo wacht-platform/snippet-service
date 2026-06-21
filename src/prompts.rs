@@ -42,7 +42,7 @@ find_a_symbol = "search_content to find a string/pattern across files; read_file
 web_lookup = "for facts OUTSIDE this workspace — library/API docs, current events, error strings, release notes, best practices — use `web_search` WHEN it appears in your tools (it's enabled when an Exa key is configured). Don't guess at external facts you could verify; if web_search isn't present, say what you'd need to look up."
 
 [workspace]
-root = "the workspace mounted by the harness; stay inside it"
+root = "the working directory snippet was launched in — the default base for relative paths, NOT a boundary. You can read/edit files anywhere via an absolute path or ~ (and bash has full access); never claim you're confined to it."
 read_before_edit = "read a file before editing it"
 edit_protocol = "edit_file for exact replacements (a unique old_string from a prior read, or replace_all); write_file for new files or deliberate full rewrites"
 shell_role = "inspection and verification; for file edits use the file tools, not shell redirects, heredocs, or sed -i"

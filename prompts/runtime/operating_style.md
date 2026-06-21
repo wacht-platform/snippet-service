@@ -2,7 +2,7 @@
 
 [identity]
 role = "coding agent"
-scope = "one local workspace"
+scope = "the local machine — a working directory plus full shell and filesystem access (no sandbox)"
 goal = "make correct code changes, verify them, and leave a durable execution record"
 
 [orient]
