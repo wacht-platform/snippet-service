@@ -35,6 +35,21 @@ const LARGE_TOOL_BATCH: usize = 10;
 /// Ported from wacht's `SHELL_NUDGE_ESCALATE_AT`.
 const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
+/// Read-only discovery tools whose exact-duplicate re-call within a request is
+/// wasteful spinning (the result is already in history). `read_file` is excluded
+/// — re-reading after an edit is legitimate.
+const DEDUP_TOOLS: [&str; 4] = ["list_files", "search_content", "search_files", "view_outline"];
+
+/// Tools that change the workspace; running one invalidates the dedup set so
+/// re-discovery afterward is allowed.
+const MUTATING_TOOLS: [&str; 5] = [
+    "write_file",
+    "edit_file",
+    "append_file",
+    "replace_file_content",
+    "bash",
+];
+
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
     /// Runaway backstop for the one-shot / lane loop (the interactive loop is
@@ -227,6 +242,10 @@ struct LoopVars {
     consecutive_note_count: usize,
     /// Consecutive tool-call turns that did no real work (notes / unknown tools).
     unproductive_turns: usize,
+    /// Signatures of read-only discovery calls already executed THIS request, to
+    /// short-circuit exact-duplicate re-calls. Cleared on a new user request and
+    /// whenever a mutation makes re-discovery legitimate again.
+    executed_calls: std::collections::HashSet<String>,
 }
 
 /// What a single model step resolved to.
@@ -483,6 +502,8 @@ impl CodingHarness {
                             // be rewound. An answer continues a turn already checkpointed.
                             if !answering {
                                 self.checkpoint(&mut state, &text);
+                                // Fresh request: re-discovery is legitimate again.
+                                vars.executed_calls.clear();
                             }
                             state.pending_question = None;
                             state.messages.push(HarnessMessage::User {
@@ -979,6 +1000,32 @@ impl CodingHarness {
                 continue;
             }
 
+            // Dedup: re-calling a read-only discovery tool with identical args this
+            // request is the classic spinning loop — its result is already in
+            // history. Short-circuit with a notice instead of re-running. (A
+            // mutation below clears the set, so re-discovery after a change still
+            // works; read_file/bash are excluded — re-reads after edits are legit.)
+            let signature = format!("{}:{}", tool_name, call.arguments);
+            if DEDUP_TOOLS.contains(&tool_name.as_str())
+                && vars.executed_calls.contains(&signature)
+            {
+                let result = tool_error(format!(
+                    "Duplicate call: you already ran `{tool_name}` with these exact arguments \
+                     this turn — its result is already in your history above. Don't repeat it; \
+                     use what you have and move to the next step (or finish if you're done)."
+                ));
+                state.events.push(HarnessEvent::ToolResult {
+                    tool_name: tool_name.clone(),
+                    result: result.clone(),
+                });
+                state.messages.push(HarnessMessage::ToolResult {
+                    tool_call_id: call_id,
+                    tool_name,
+                    content: result,
+                });
+                continue;
+            }
+
             real_work_count += 1;
 
             // Shell discipline: nudge (never block) when `bash` does work a file
@@ -1015,6 +1062,14 @@ impl CodingHarness {
                     }
                 }),
             };
+            // A mutation may have changed the workspace, so prior discovery results
+            // are stale — re-discovery is legitimate again; clear the dedup set.
+            // Otherwise remember this discovery call so an exact repeat is caught.
+            if MUTATING_TOOLS.contains(&tool_name.as_str()) {
+                vars.executed_calls.clear();
+            } else if DEDUP_TOOLS.contains(&tool_name.as_str()) {
+                vars.executed_calls.insert(signature);
+            }
             state.events.push(HarnessEvent::ToolResult {
                 tool_name: tool_name.clone(),
                 result: result.clone(),
