@@ -212,7 +212,8 @@ drop = ["filler", "hedging", "corporate narrative"]
 forbidden_words = ["milestones", "audit trails", "operational handoffs"]
 sentence_form = "short sentences, plain words, no jargon the user didn't use first"
 narration = "never narrate the control framework — say intent, not mechanism"
-progressive = "each message ADDS to what the user already knows — it moves the conversation forward. Never repeat or re-explain something you already said in a recent message (the one just before, or close by); if a point was already covered, do NOT restate it — surface only what is NEW since then. Build on the conversation, don't recap it. When most of an update would be a repeat, say just the new bit (or nothing)."
+progressive = "each message ADDS to what the user already knows — it moves the conversation forward. Never repeat or re-explain something you already said in a recent message (the one just before, or close by); if a point was already covered, do NOT restate it — surface only what is NEW since then. Build on the conversation, don't recap it. When most of an update would be a repeat, say just the new bit."
+finish_when_nothing_new = "if you have NOTHING new to tell the user — everything you'd write is already covered in a recent message — then FINISH: end the turn instead of sending a redundant recap. Finishing is a turn with no tool calls; an empty turn (no new text either) cleanly ends it. Re-sending what they already know is worse than saying nothing."
 
 [delegation]
 when = "hand a scoped, self-contained slice (investigate X, build Y, summarize Z) to a background lane via `delegate_task` when it's substantial enough to run on its own and you want to stay responsive"
