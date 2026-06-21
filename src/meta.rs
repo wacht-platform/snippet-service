@@ -14,19 +14,45 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 4] = ["note", "ask_user", "delegate_task", "terminate_loop"];
+pub const META_TOOL_NAMES: [&str; 3] = ["note", "ask_user", "delegate_task"];
 
 pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
 }
 
 /// Tool definitions advertised to the conversation agent on top of the coding
-/// tools. `terminate_loop` is intentionally absent here — it already ships as a
-/// coding tool definition; the loop reinterprets it for conversation turn-control.
-/// There is no separate "reply"/notify tool: the agent talks to the user with text
-/// beside `terminate_loop`, and progress shows as text beside working tool calls.
+/// tools. There is no terminate/complete tool: the agent finishes a turn simply
+/// by replying with no tool calls, and talks to the user with text beside its
+/// working tool calls.
 pub fn conversation_meta_definitions() -> Vec<NativeToolDefinition> {
     vec![note_tool(), ask_user_tool(), delegate_task_tool()]
+}
+
+/// Explicit completion tool for HEADLESS runs (delegated lanes, one-shot
+/// `run()`) — not advertised to the user-facing conversation agent. A lane ends
+/// by calling this with a deliberate `summary` (the structured handoff folded
+/// back into the parent), so its report is never just "whatever the last prose
+/// happened to be". Replying with no tool calls also ends a run as a fallback.
+pub fn terminate_loop_tool() -> NativeToolDefinition {
+    NativeToolDefinition {
+        name: "terminate_loop".to_string(),
+        description: "End your run and hand back a summary of what you did and found. Call this \
+            once the task is finished: `summary` is a tight account of the outcome, key decisions, \
+            and any blockers — it is what the caller reads. Finish your actual work first, then \
+            call `terminate_loop`."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Tight account of the outcome, key decisions, and any blockers — what the caller reads."
+                }
+            },
+            "required": ["summary"],
+            "additionalProperties": false,
+        }),
+    }
 }
 
 fn note_tool() -> NativeToolDefinition {
@@ -122,9 +148,12 @@ fn delegate_task_tool() -> NativeToolDefinition {
         description: "Hand a scoped, self-contained unit of work to a background lane. The lane \
             runs a fresh coding agent to completion in parallel and reports a summary back to you \
             when done — you keep working in the meantime and may delegate several lanes at once. \
-            The brief must name BOTH the scope to inspect/act on AND the concrete deliverable \
-            expected; a vague brief produces vague work. Do not delegate trivial one-step actions \
-            you can do yourself."
+            REACH FOR THIS when the work splits into multiple independent areas (fan them out as \
+            parallel lanes instead of grinding through them serially), or when a self-contained \
+            investigation/build will take many steps while you'd rather stay responsive. The brief \
+            must name BOTH the scope to inspect/act on AND the concrete deliverable expected; a \
+            vague brief produces vague work. Only skip delegation for trivial one-step actions you \
+            can just do yourself."
             .to_string(),
         input_schema: json!({
             "type": "object",
