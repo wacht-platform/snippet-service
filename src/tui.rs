@@ -4,10 +4,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -39,21 +44,66 @@ const HIDDEN_TOOL_ROWS: [&str; 5] =
 const ALL_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/resume", "Resume a saved session"),
-    ("/login", "Configure API provider inline"),
-    ("/settings", "Open full settings screen"),
+    ("/rewind", "Restore the workspace to a checkpoint"),
+    ("/model", "Connect or change the AI model"),
 ];
 
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
     pub config_path: PathBuf,
     pub config: SnippetConfig,
+    /// A conversation id to resume on launch (from `--resume`).
+    pub resume: Option<String>,
+}
+
+/// What to print after the TUI closes: how to get back in, and token usage.
+struct ExitInfo {
+    conversation: String,
+    config_path: PathBuf,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_read_tokens: u64,
+    total_tokens: u64,
 }
 
 pub async fn run_tui(options: TuiOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = setup_terminal()?;
     let result = run_app(&mut terminal, options).await;
     restore_terminal(&mut terminal)?;
-    result
+    match result {
+        Ok(info) => {
+            info.print();
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+impl ExitInfo {
+    /// Printed to the normal terminal after the alt-screen is torn down.
+    fn print(&self) {
+        if self.conversation.is_empty() {
+            return;
+        }
+        if self.total_tokens > 0 {
+            println!(
+                "tokens — ↑{} in · ↓{} out · ⟳{} cached · {} total",
+                fmt_si(self.prompt_tokens),
+                fmt_si(self.completion_tokens),
+                fmt_si(self.cache_read_tokens),
+                fmt_si(self.total_tokens),
+            );
+        }
+        let default_config = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".snippet/config.toml"))
+            .unwrap_or_default();
+        let config_flag = if self.config_path == default_config {
+            String::new()
+        } else {
+            format!(" --config {}", self.config_path.display())
+        };
+        println!("resume — snippet --resume {}{}", self.conversation, config_flag);
+    }
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -61,14 +111,26 @@ type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 fn setup_terminal() -> Result<TuiTerminal, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Request the kitty keyboard protocol where supported (iTerm2, kitty, WezTerm,
+    // Ghostty…) so modified keys like Shift+Enter are reported distinctly. Plain
+    // terminals (Apple Terminal) ignore it and keep the Alt+Enter fallback.
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
 
 fn restore_terminal(terminal: &mut TuiTerminal) -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -77,7 +139,6 @@ fn restore_terminal(terminal: &mut TuiTerminal) -> Result<(), Box<dyn std::error
 enum Screen {
     Main,
     ResumeSelection,
-    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,15 +147,12 @@ enum SettingsField {
     ApiKey,
     Model,
     BaseUrl,
-    SaveBtn,
-    CancelBtn,
 }
 
-/// Providers offered by the login form and the settings screen, in display order.
+/// Providers offered by the login form, in display order.
 const LOGIN_PROVIDERS: &[&str] = &["openai", "anthropic", "gemini", "openrouter", "openai-compatible"];
 
-/// Single source of truth for a provider's default base URL and model, shared by
-/// the login form and the settings screen so they can't drift apart.
+/// Single source of truth for a provider's default base URL and model.
 fn provider_defaults(provider: &str) -> (String, String) {
     match provider {
         "openai" => ("https://api.openai.com/v1".to_string(), "gpt-5.5".to_string()),
@@ -129,6 +187,11 @@ fn login_model_rows(app: &App) -> Vec<String> {
 struct App {
     options: TuiOptions,
     input: String,
+    /// Cursor position in `input`, as a CHAR index (0..=char_count).
+    input_cursor: usize,
+    /// Collapsed pastes: (placeholder shown in the input, real content). A big
+    /// paste shows as a compact chip and expands back on send.
+    pasted_blocks: Vec<(String, String)>,
     status: String,
     error: Option<String>,
     state: Option<HarnessState>,
@@ -163,8 +226,8 @@ struct App {
     models_fetch_status: String,
     original_config: Option<crate::config::SnippetConfig>,
     last_state_modified: Option<std::time::SystemTime>,
-    /// When true, the compact inline login form is shown and owns key input.
-    /// It edits the shared `form_*` state, same as the settings screen.
+    /// When true, the compact inline model-connect form is shown and owns key
+    /// input. It edits the shared `form_*` state.
     login_active: bool,
     /// Interactive ask_user picker state. `q_index` is the question being
     /// answered (questions are answered in order), `q_sel` the highlighted choice
@@ -175,6 +238,10 @@ struct App {
     q_sel: usize,
     q_answers: Vec<(String, String)>,
     q_token: String,
+    /// Live text the running agent is streaming this turn. Shared with the agent
+    /// task; rendered as a transient block at the transcript tail and cleared
+    /// whenever a newer persisted state loads (the turn has committed).
+    stream: crate::llm::StreamHandle,
 }
 
 impl App {
@@ -190,6 +257,8 @@ impl App {
         let mut app = Self {
             options,
             input: String::new(),
+            input_cursor: 0,
+            pasted_blocks: Vec::new(),
             status,
             error: None,
             state: None,
@@ -221,10 +290,14 @@ impl App {
             q_sel: 0,
             q_answers: Vec::new(),
             q_token: String::new(),
+            stream: crate::llm::StreamHandle::default(),
         };
         app.init_settings_form();
 
-        if app.options.config.resume_on_start {
+        if let Some(id) = app.options.resume.clone() {
+            // Explicit --resume <id> wins: reopen exactly that conversation.
+            app.switch_conversation(&id);
+        } else if app.options.config.resume_on_start {
             if let Some(last_active) = app.find_last_active_conversation() {
                 app.switch_conversation(&last_active);
             }
@@ -234,7 +307,7 @@ impl App {
         }
 
         if app.options.config.model.api_key.trim().is_empty() {
-            app.status = "No model connected yet — type /login to connect one.".to_string();
+            app.status = "No model connected yet — type /model to connect one.".to_string();
         }
 
         app
@@ -247,7 +320,7 @@ impl App {
         self.init_settings_form();
         self.form_focus = SettingsField::Provider;
         self.login_active = true;
-        self.input.clear();
+        self.input_clear();
     }
 
     /// Close the login form, optionally restoring the pre-login config (Esc).
@@ -260,6 +333,8 @@ impl App {
             self.original_config = None;
         }
         self.login_active = false;
+        // When closing login during an active session, don't interrupt the conversation
+        // Only close the login form and preserve the current session
     }
 
     fn conversations_dir(&self) -> PathBuf {
@@ -401,6 +476,33 @@ impl App {
             .collect()
     }
 
+    /// Restore the workspace to the checkpoint whose id starts with `id_prefix`.
+    fn rewind_to(&mut self, id_prefix: &str) {
+        if self.agent_alive() {
+            self.status = "Agent is running — stop it (Esc) before rewinding.".to_string();
+            return;
+        }
+        let Some(state) = &self.state else {
+            self.status = "No active session.".to_string();
+            return;
+        };
+        let Some(checkpoint) = state
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.id.starts_with(id_prefix))
+        else {
+            self.status = format!("No checkpoint matching '{id_prefix}'.");
+            return;
+        };
+        let (id, label) = (checkpoint.id.clone(), checkpoint.label.clone());
+        let workspace = self.options.config.workspace.clone();
+        match crate::checkpoint::restore(&workspace, &id) {
+            Ok(()) => self.status = format!("Rewound workspace to: {label}"),
+            Err(error) => self.error = Some(format!("rewind failed: {error}")),
+        }
+    }
+
     fn switch_conversation(&mut self, name: &str) {
         // Tear down any resident agent SYNCHRONOUSLY. The interactive loop
         // idle-blocks on input and never exits on its own, so a mere async
@@ -428,7 +530,7 @@ impl App {
         self.last_state_modified = None;
         self.state = None;
         self.scroll = 0;
-        self.status = format!("Switched to session: {}", name);
+        self.status = String::new();
     }
 
     fn handle_slash_command(&mut self, text: &str) {
@@ -446,7 +548,7 @@ impl App {
                     uuid::Uuid::new_v4().to_string()
                 };
                 self.switch_conversation(&name);
-                self.status = format!("Started new session: {}. Type a task.", name);
+                self.status = String::new();
             }
             "/resume" => {
                 let target_name = if parts.len() > 1 {
@@ -480,26 +582,28 @@ impl App {
                     self.status = "No saved session to resume. Start a new one with /new or type a task.".to_string();
                 }
             }
-            "/login" => {
+            "/model" => {
                 if self.agent_alive() {
-                    self.status = "Agent is running. Finish or stop it before configuring login.".to_string();
+                    self.status = "Agent is running. Finish or stop it before changing the model.".to_string();
                     return;
                 }
                 self.open_login();
-                self.status = "Connect a model — Tab between fields, Enter to connect.".to_string();
+                self.status = String::new();
             }
-            "/settings" => {
-                if self.agent_alive() {
-                    self.status = "Agent is running. Finish or stop it before modifying settings.".to_string();
-                    return;
+            "/rewind" => {
+                if parts.len() > 1 {
+                    self.rewind_to(parts[1]);
+                } else {
+                    let n = self.state.as_ref().map(|s| s.checkpoints.len()).unwrap_or(0);
+                    self.status = if n == 0 {
+                        "No checkpoints yet — one is taken before each request.".to_string()
+                    } else {
+                        format!("{n} checkpoint(s). Type /rewind <id> (Tab to pick) to restore.")
+                    };
                 }
-                self.original_config = Some(self.options.config.clone());
-                self.init_settings_form();
-                self.screen = Screen::Settings;
-                self.status = "Configure your AI provider settings.".to_string();
             }
             other => {
-                self.status = format!("Unknown command: {}. Type /new, /resume, /login, or /settings.", other);
+                self.status = format!("Unknown command: {}. Type /new, /resume, /rewind, or /model.", other);
             }
         }
     }
@@ -670,7 +774,7 @@ impl App {
 
         self.save_config_file()?;
 
-        self.status = format!("Saved settings! Using {} model.", self.options.config.model.model);
+        self.status = String::new();
         Ok(())
     }
 
@@ -694,76 +798,6 @@ impl App {
         self.form_model_query = String::new();
         // The previous provider's model list no longer applies.
         self.form_fetched_models = None;
-    }
-
-    fn change_model(&mut self, next: bool) {
-        let matches: Vec<&str> = if let Some(ref fetched) = self.form_fetched_models {
-            let query = self.form_model_query.to_lowercase();
-            fetched.iter()
-                .map(|s| s.as_str())
-                .filter(|m| m.to_lowercase().contains(&query))
-                .collect()
-        } else {
-            let standard_models = get_provider_models(&self.form_provider);
-            let query = self.form_model_query.to_lowercase();
-            standard_models.iter()
-                .copied()
-                .filter(|m| m.to_lowercase().contains(&query))
-                .collect()
-        };
-
-        let active_list = if matches.is_empty() {
-            if let Some(ref fetched) = self.form_fetched_models {
-                fetched.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-            } else {
-                get_provider_models(&self.form_provider).to_vec()
-            }
-        } else {
-            matches
-        };
-
-        if active_list.is_empty() {
-            return;
-        }
-
-        let current = self.form_model.trim();
-        let current_idx = active_list.iter().position(|m| *m == current);
-        let next_idx = match current_idx {
-            Some(idx) => {
-                if next {
-                    (idx + 1) % active_list.len()
-                } else {
-                    if idx == 0 { active_list.len() - 1 } else { idx - 1 }
-                }
-            }
-            None => 0,
-        };
-        self.form_model = active_list[next_idx].to_string();
-    }
-
-    fn move_focus(&mut self, next: bool) {
-        let mut order = vec![
-            SettingsField::Provider,
-            SettingsField::ApiKey,
-            SettingsField::Model,
-        ];
-        if self.form_provider == "openai-compatible" {
-            order.push(SettingsField::BaseUrl);
-        }
-        order.push(SettingsField::SaveBtn);
-        order.push(SettingsField::CancelBtn);
-
-        let current_pos = order.iter().position(|f| *f == self.form_focus).unwrap_or(0);
-        let next_pos = if next {
-            (current_pos + 1) % order.len()
-        } else {
-            if current_pos == 0 { order.len() - 1 } else { current_pos - 1 }
-        };
-        self.form_focus = order[next_pos];
-
-        if self.form_focus == SettingsField::Model || self.form_focus == SettingsField::BaseUrl {
-            self.trigger_models_fetch();
-        }
     }
 
     fn agent_alive(&self) -> bool {
@@ -804,12 +838,13 @@ impl App {
         let opts = q_options(question);
 
         let answer = if opts.is_empty() {
-            let typed = self.input.trim().to_string();
+            let typed = self.expand_input();
+            let typed = typed.trim().to_string();
             if typed.is_empty() {
                 self.status = "Type an answer, then press Enter.".to_string();
                 return;
             }
-            self.input.clear();
+            self.input_clear();
             typed
         } else {
             opts[self.q_sel.min(opts.len() - 1)].0.clone()
@@ -841,12 +876,216 @@ impl App {
                 self.error = Some("agent loop is no longer accepting input".to_string());
             }
         }
-        self.input.clear();
+        self.input_clear();
         self.scroll = 0;
         self.q_token.clear();
         self.q_index = 0;
         self.q_sel = 0;
         self.q_answers.clear();
+    }
+
+    // --- Prompt line editing. Cursor is a CHAR index into `self.input`. ---
+
+    fn input_clear(&mut self) {
+        self.input.truncate(0);
+        self.input_cursor = 0;
+        self.pasted_blocks.clear();
+    }
+
+    /// Replace the whole input (e.g. from a slash-command autocomplete) and put
+    /// the cursor at the end.
+    fn input_set(&mut self, value: String) {
+        self.input_cursor = value.chars().count();
+        self.input = value;
+    }
+
+    fn input_len(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    /// Byte offset of a given char index (clamped to the string end).
+    fn input_byte_at(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+
+    fn input_insert(&mut self, c: char) {
+        let at = self.input_byte_at(self.input_cursor);
+        self.input.insert(at, c);
+        self.input_cursor += 1;
+    }
+
+    /// Handle a text paste. A big / multi-line paste collapses to a compact chip
+    /// in the input (expanded on send) so it doesn't overflow; a small single-line
+    /// paste is inserted inline. (Screenshots come via Ctrl+V — see
+    /// `paste_clipboard_image` — not through here.)
+    fn input_paste(&mut self, text: &str) {
+        let text = text.replace('\r', "");
+        let lines = text.lines().count().max(1);
+        if lines > 1 || text.chars().count() > 200 {
+            let n = self.pasted_blocks.len() + 1;
+            let marker = format!("[Pasted #{n} · {lines} line{}]", if lines == 1 { "" } else { "s" });
+            for c in marker.chars() {
+                self.input_insert(c);
+            }
+            self.pasted_blocks.push((marker, text));
+        } else {
+            for c in text.chars() {
+                self.input_insert(c);
+            }
+        }
+        self.suggestion_index = 0;
+    }
+
+    /// Grab an image from the system clipboard (a screenshot) and attach it: write
+    /// it to the workspace temp dir and drop a chip that expands to its path on
+    /// send, so the agent can `read_image` it. macOS-only (uses `osascript`).
+    /// Multiple screenshots accumulate as separate chips.
+    fn paste_clipboard_image(&mut self) {
+        let dir = self
+            .options
+            .config
+            .workspace
+            .join(".snippet")
+            .join("scratch")
+            .join("images");
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.status = format!("couldn't create image temp dir: {error}");
+            return;
+        }
+        let dest = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
+        // Write the clipboard's PNG data to `dest`; errors (no image on the
+        // clipboard) are caught and surfaced as a status message.
+        let script = format!(
+            "set f to open for access (POSIX file \"{}\") with write permission\n\
+             try\n\
+               write (the clipboard as «class PNGf») to f\n\
+               close access f\n\
+             on error errm\n\
+               close access f\n\
+               error errm\n\
+             end try",
+            dest.display()
+        );
+        let ran = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output();
+        let ok = matches!(&ran, Ok(out) if out.status.success())
+            && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&dest);
+            self.status = "No image on the clipboard — copy a screenshot first.".to_string();
+            return;
+        }
+        let n = self.pasted_blocks.len() + 1;
+        let marker = format!("[Image #{n}: screenshot]");
+        for c in marker.chars() {
+            self.input_insert(c);
+        }
+        // On send the chip expands to the temp path; the agent reads it via read_image.
+        self.pasted_blocks.push((marker, dest.display().to_string()));
+        self.status = String::new();
+    }
+
+    /// Expand any paste chips in the current input back to their real content.
+    fn expand_input(&self) -> String {
+        let mut out = self.input.clone();
+        for (marker, content) in &self.pasted_blocks {
+            out = out.replace(marker, content);
+        }
+        out
+    }
+
+    fn input_backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = self.input_byte_at(self.input_cursor - 1);
+        let end = self.input_byte_at(self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor -= 1;
+    }
+
+    fn input_delete(&mut self) {
+        if self.input_cursor >= self.input_len() {
+            return;
+        }
+        let start = self.input_byte_at(self.input_cursor);
+        let end = self.input_byte_at(self.input_cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    /// Char index of the previous word boundary: skip whitespace, then word chars.
+    fn input_prev_word(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.input_cursor.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Char index of the next word boundary: skip whitespace, then word chars.
+    fn input_next_word(&self) -> usize {
+        let chars: Vec<char> = self.input.chars().collect();
+        let n = chars.len();
+        let mut i = self.input_cursor.min(n);
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < n && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    fn input_delete_word_back(&mut self) {
+        let target = self.input_prev_word();
+        if target == self.input_cursor {
+            return;
+        }
+        let start = self.input_byte_at(target);
+        let end = self.input_byte_at(self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor = target;
+    }
+
+    fn input_delete_word_forward(&mut self) {
+        let target = self.input_next_word();
+        if target == self.input_cursor {
+            return;
+        }
+        let start = self.input_byte_at(self.input_cursor);
+        let end = self.input_byte_at(target);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn input_delete_to_start(&mut self) {
+        let end = self.input_byte_at(self.input_cursor);
+        self.input.replace_range(0..end, "");
+        self.input_cursor = 0;
+    }
+
+    fn input_delete_to_end(&mut self) {
+        let start = self.input_byte_at(self.input_cursor);
+        self.input.truncate(start);
+    }
+
+    fn input_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    fn input_right(&mut self) {
+        if self.input_cursor < self.input_len() {
+            self.input_cursor += 1;
+        }
     }
 
     fn submit(&mut self) {
@@ -857,14 +1096,15 @@ impl App {
             return;
         }
 
-        let text = self.input.trim().to_string();
+        let text = self.expand_input();
+        let text = text.trim().to_string();
         if text.is_empty() {
             if !self.agent_alive() {
                 self.status = "Enter a task before starting.".to_string();
             }
             return;
         }
-        self.input.clear();
+        self.input_clear();
         self.scroll = 0;
 
         if text.starts_with('/') {
@@ -887,7 +1127,10 @@ impl App {
                 self.error = Some("agent loop is no longer accepting input".to_string());
             }
         } else {
-            self.spawn_loop(Some(text), false);
+            // Resume the existing conversation rather than starting fresh — after an
+            // interrupt the agent has died but the transcript is intact; resume=false
+            // would clobber it into a new conversation.
+            self.spawn_loop(Some(text), true);
         }
     }
 
@@ -908,30 +1151,27 @@ impl App {
         let workspace = self.options.config.workspace.clone();
         let state_path = self.active_state_path.clone();
         let model_config = self.options.config.model.clone();
+        let exa_api_key = self.options.config.exa_api_key.clone();
         let factory = self.model_factory();
-
-        let locks_dir = state_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("locks");
+        crate::llm::StreamBuffer::clear(&self.stream);
+        let stream = self.stream.clone();
 
         self.agent = Some(tokio::spawn(async move {
             let mut model = model_config.build_model();
-            let locks = std::sync::Arc::new(crate::locks::LockRegistry::new(locks_dir));
-            let context = ToolContext::with_locks(workspace, "main", locks)
-                .map_err(|error| error.to_string())?;
+            let context = ToolContext::new(workspace).map_err(|error| error.to_string())?;
             let harness = CodingHarness::new(
                 HarnessConfig {
                     system_prompt: conversation_system_prompt(),
                     state_path: Some(state_path),
                     resume,
+                    exa_api_key: exa_api_key.clone(),
                     ..HarnessConfig::default()
                 },
-                coding_tools(),
+                coding_tools(exa_api_key),
                 context,
             );
             harness
-                .run_interactive(&mut model, initial, rx, Some(factory))
+                .run_interactive(&mut model, initial, rx, Some(factory), Some(stream))
                 .await
                 .map_err(|error| error.to_string())
         }));
@@ -990,7 +1230,7 @@ impl App {
             let handle = self.agent.take().expect("checked is_some");
             self.input_tx = None;
             match handle.await {
-                Ok(Ok(_state)) => self.status = "Run stopped.".to_string(),
+                Ok(Ok(_state)) => self.status = String::new(),
                 Ok(Err(error)) => {
                     self.status = "Run failed.".to_string();
                     self.error = Some(error);
@@ -1011,6 +1251,10 @@ impl App {
                     return;
                 }
                 self.last_state_modified = Some(modified);
+                // A newer persisted state means the turn that was streaming has
+                // committed its text into events — drop the live buffer so the
+                // committed copy doesn't render twice.
+                crate::llm::StreamBuffer::clear(&self.stream);
             }
         } else {
             self.state = None;
@@ -1046,35 +1290,82 @@ impl App {
 async fn run_app(
     terminal: &mut TuiTerminal,
     options: TuiOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<ExitInfo, Box<dyn std::error::Error>> {
     let mut app = App::new(options);
     app.refresh_state().await;
-    if app.options.config.resume_on_start {
+    if app.options.config.resume_on_start || app.options.resume.is_some() {
         app.spawn_loop(None, true);
     }
 
     while !app.quit {
         terminal.draw(|frame| render(frame, &app))?;
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            handle_key(&mut app, key);
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                // With the kitty protocol a key can arrive as Press/Repeat/Release;
+                // act on Press/Repeat only so a key isn't handled twice.
+                Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(&mut app, key),
+                Event::Paste(text) => app.input_paste(&text),
+                _ => {}
+            }
         }
         app.tick().await;
     }
 
-    Ok(())
+    // Freshest token totals for the closing summary.
+    app.refresh_state().await;
+    let st = app.state.as_ref();
+    Ok(ExitInfo {
+        conversation: app.active_conversation.clone(),
+        config_path: app.options.config_path.clone(),
+        prompt_tokens: st.map(|s| s.prompt_tokens).unwrap_or(0),
+        completion_tokens: st.map(|s| s.completion_tokens).unwrap_or(0),
+        cache_read_tokens: st.map(|s| s.cache_read_tokens).unwrap_or(0),
+        total_tokens: st.map(|s| s.total_tokens).unwrap_or(0),
+    })
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Global shortcuts first.
         match key.code {
-            KeyCode::Char('q') => app.quit = true,
-            KeyCode::Char('c') => app.interrupt_or_quit(),
-            KeyCode::Char('d') => app.quit = true,
-            KeyCode::Char('r') => app.spawn_loop(None, true),
+            KeyCode::Char('q') | KeyCode::Char('d') => {
+                app.quit = true;
+                return;
+            }
+            KeyCode::Char('c') => {
+                app.interrupt_or_quit();
+                return;
+            }
+            KeyCode::Char('r') => {
+                app.spawn_loop(None, true);
+                return;
+            }
+            // Paste a screenshot from the clipboard (macOS) as an attached image.
+            KeyCode::Char('v') => {
+                app.paste_clipboard_image();
+                return;
+            }
             _ => {}
+        }
+        // Readline-style line editing for the prompt (main screen only).
+        if app.screen == Screen::Main && !app.login_active {
+            match key.code {
+                KeyCode::Char('w') => {
+                    app.input_delete_word_back();
+                    app.suggestion_index = 0;
+                }
+                KeyCode::Char('u') => {
+                    app.input_delete_to_start();
+                    app.suggestion_index = 0;
+                }
+                KeyCode::Char('k') => app.input_delete_to_end(),
+                KeyCode::Char('a') => app.input_cursor = 0,
+                KeyCode::Char('e') => app.input_cursor = app.input_len(),
+                KeyCode::Left => app.input_cursor = app.input_prev_word(),
+                KeyCode::Right => app.input_cursor = app.input_next_word(),
+                _ => {}
+            }
         }
         return;
     }
@@ -1123,130 +1414,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if app.screen == Screen::Settings {
-        match key.code {
-            KeyCode::Esc => {
-                if app.options.config.model.api_key.trim().is_empty() {
-                    app.status = "API Key is required to start.".to_string();
-                } else {
-                    if let Some(orig) = app.original_config.take() {
-                        app.options.config = orig;
-                    }
-                    app.screen = Screen::Main;
-                    app.status = "Settings canceled.".to_string();
-                }
-            }
-            KeyCode::Tab | KeyCode::Down => {
-                app.move_focus(true);
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                app.move_focus(false);
-            }
-            KeyCode::Enter => {
-                match app.form_focus {
-                    SettingsField::Provider => {
-                        app.form_focus = SettingsField::ApiKey;
-                    }
-                    SettingsField::ApiKey => {
-                        app.form_focus = SettingsField::Model;
-                        app.trigger_models_fetch();
-                    }
-                    SettingsField::Model => {
-                        if app.form_provider == "openai-compatible" {
-                            app.form_focus = SettingsField::BaseUrl;
-                        } else {
-                            app.form_focus = SettingsField::SaveBtn;
-                        }
-                    }
-                    SettingsField::BaseUrl => {
-                        app.form_focus = SettingsField::SaveBtn;
-                    }
-                    SettingsField::SaveBtn => {
-                        if app.form_api_key.trim().is_empty() {
-                            app.status = "Error: API Key cannot be empty!".to_string();
-                        } else {
-                            match app.save_settings_to_file() {
-                                Ok(_) => {
-                                    app.original_config = None;
-                                    app.screen = Screen::Main;
-                                }
-                                Err(e) => app.error = Some(e),
-                            }
-                        }
-                    }
-                    SettingsField::CancelBtn => {
-                        if app.options.config.model.api_key.trim().is_empty() {
-                            app.status = "API Key is required to start.".to_string();
-                        } else {
-                            if let Some(orig) = app.original_config.take() {
-                                app.options.config = orig;
-                            }
-                            app.screen = Screen::Main;
-                            app.status = "Settings canceled.".to_string();
-                        }
-                    }
-                }
-            }
-            KeyCode::Left => {
-                if app.form_focus == SettingsField::Provider {
-                    app.change_provider(false);
-                } else if app.form_focus == SettingsField::Model {
-                    app.change_model(false);
-                }
-            }
-            KeyCode::Right => {
-                if app.form_focus == SettingsField::Provider {
-                    app.change_provider(true);
-                } else if app.form_focus == SettingsField::Model {
-                    app.change_model(true);
-                }
-            }
-            KeyCode::Char(' ') if app.form_focus == SettingsField::Provider || app.form_focus == SettingsField::Model => {
-                match app.form_focus {
-                    SettingsField::Provider => {
-                        app.change_provider(true);
-                    }
-                    SettingsField::Model => {
-                        app.change_model(true);
-                    }
-                    _ => {}
-                }
-            }
-            KeyCode::Backspace => {
-                match app.form_focus {
-                    SettingsField::ApiKey => {
-                        app.form_api_key.pop();
-                    }
-                    SettingsField::Model => {
-                        app.form_model.pop();
-                        app.form_model_query = app.form_model.clone();
-                    }
-                    SettingsField::BaseUrl => {
-                        app.form_base_url.pop();
-                    }
-                    _ => {}
-                }
-            }
-            KeyCode::Char(c) => {
-                match app.form_focus {
-                    SettingsField::ApiKey => {
-                        app.form_api_key.push(c);
-                    }
-                    SettingsField::Model => {
-                        app.form_model.push(c);
-                        app.form_model_query = app.form_model.clone();
-                    }
-                    SettingsField::BaseUrl => {
-                        app.form_base_url.push(c);
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-        return;
-    }
-
     // The inline login form owns all key input while active.
     if app.login_active {
         handle_login_key(app, key);
@@ -1273,11 +1440,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 // "/resume <name>") fills in as-is; a bare command gets a
                 // trailing space, ready to run or extend.
                 let selected = matches[app.suggestion_index].0.clone();
-                app.input = if selected.contains(' ') {
+                app.input_set(if selected.contains(' ') {
                     selected
                 } else {
                     format!("{selected} ")
-                };
+                });
                 app.suggestion_index = 0;
                 handled = true;
             }
@@ -1295,14 +1462,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Enter => {
                 let selected_cmd = &matches[app.suggestion_index].0;
-                if app.input == *selected_cmd 
-                    || selected_cmd.starts_with("/resume ") 
-                    || selected_cmd.starts_with("/profile ") 
+                if app.input == *selected_cmd
+                    || selected_cmd.starts_with("/resume ")
+                    || selected_cmd.starts_with("/rewind ")
+                    || selected_cmd.starts_with("/profile ")
                 {
-                    app.input = selected_cmd.clone();
+                    app.input_set(selected_cmd.clone());
                     app.submit();
                 } else {
-                    app.input = format!("{} ", selected_cmd);
+                    app.input_set(format!("{} ", selected_cmd));
                     app.suggestion_index = 0;
                 }
                 handled = true;
@@ -1312,17 +1480,34 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if !handled {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
+            // Alt/Shift+Enter inserts a newline so prompts can be multi-line;
+            // plain Enter submits.
+            KeyCode::Enter if alt || shift => {
+                app.input_insert('\n');
+                app.suggestion_index = 0;
+            }
             KeyCode::Enter => app.submit(),
             KeyCode::Up => app.scroll_up(1),
             KeyCode::Down => app.scroll_down(1),
             KeyCode::PageUp => app.scroll_up(10),
             KeyCode::PageDown => app.scroll_down(10),
+            // Home/End move the cursor when editing; scroll the transcript when the
+            // prompt is empty.
+            KeyCode::Home if !app.input.is_empty() => app.input_cursor = 0,
+            KeyCode::End if !app.input.is_empty() => app.input_cursor = app.input_len(),
             KeyCode::Home => app.scroll_up(usize::MAX),
             KeyCode::End => app.scroll = 0,
+            // Cursor movement — Alt/Option + ←/→ jumps by word.
+            KeyCode::Left if alt => app.input_cursor = app.input_prev_word(),
+            KeyCode::Right if alt => app.input_cursor = app.input_next_word(),
+            KeyCode::Left => app.input_left(),
+            KeyCode::Right => app.input_right(),
             KeyCode::Esc => {
                 if !app.input.is_empty() {
-                    app.input.clear();
+                    app.input_clear();
                     app.suggestion_index = 0;
                 } else if app.agent_alive() {
                     if let Some(tx) = &app.input_tx {
@@ -1331,13 +1516,33 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     app.status = "Interrupting...".to_string();
                 }
             }
+            // Alt/Option + Backspace deletes the word before the cursor.
+            KeyCode::Backspace if alt => {
+                app.input_delete_word_back();
+                app.suggestion_index = 0;
+            }
             KeyCode::Backspace => {
-                app.input.pop();
+                app.input_backspace();
+                app.suggestion_index = 0;
+            }
+            KeyCode::Delete if alt => {
+                app.input_delete_word_forward();
+                app.suggestion_index = 0;
+            }
+            KeyCode::Delete => {
+                app.input_delete();
+                app.suggestion_index = 0;
+            }
+            // Readline word ops when the terminal sends Option as Meta (Alt+b/f/d).
+            KeyCode::Char('b') if alt => app.input_cursor = app.input_prev_word(),
+            KeyCode::Char('f') if alt => app.input_cursor = app.input_next_word(),
+            KeyCode::Char('d') if alt => {
+                app.input_delete_word_forward();
                 app.suggestion_index = 0;
             }
             // Typing is allowed while the agent works — it becomes a steer on Enter.
-            KeyCode::Char(c) => {
-                app.input.push(c);
+            KeyCode::Char(c) if !alt => {
+                app.input_insert(c);
                 app.suggestion_index = 0;
             }
             _ => {}
@@ -1352,7 +1557,7 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.close_login(true);
-            app.status = "Login cancelled.".to_string();
+            app.status = String::new();
         }
         KeyCode::Enter => app.login_connect(),
         KeyCode::Tab | KeyCode::Down => app.login_move_focus(true),
@@ -1373,14 +1578,10 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         return;
     }
 
-    if app.screen == Screen::Settings {
-        render_settings(frame, area, app);
-        return;
-    }
-
     let sugg_h = suggestion_height(app);
+    let input_h = input_height(app, area.width);
 
-    // Vertical split: Header (1), Content (Min 10), Suggestions (0-8), Question (0-2), Input (3), Status Message (1), Footer (1)
+    // Vertical split: Header (1), Content (Min 10), Suggestions (0-8), Question (0-2), Input (grows), Status Message (1), Footer (1)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1388,7 +1589,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
             Constraint::Min(10),                     // Content
             Constraint::Length(sugg_h),              // Suggestions
             Constraint::Length(question_height(app)), // Question
-            Constraint::Length(3),                  // Input
+            Constraint::Length(input_h),            // Input (grows with wrapped lines)
             Constraint::Length(1),                  // Status message
             Constraint::Length(1),                  // Footer (metadata)
         ])
@@ -1474,390 +1675,6 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     );
 }
 
-fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, Borders, BorderType};
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),                  // Header
-            Constraint::Length(2),                  // Guide
-            Constraint::Min(16),                     // Main split panel (form + guide)
-            Constraint::Length(1),                  // Footer help
-        ])
-        .split(area);
-
-    // Header
-    let header_text = vec![
-        Span::styled("● snipett", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-        Span::styled("  |  Provider Onboarding & Settings", Style::default().fg(Color::White)),
-    ];
-    frame.render_widget(Paragraph::new(Line::from(header_text)), chunks[0]);
-
-    // Subtitle / Guide
-    let guide_text = "  Configure credentials and switch or create profiles. Snippet persists this globally in ~/.snippet/config.toml.";
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(guide_text, subtle()))), chunks[1]);
-
-    // Main Split Layout: Info Panel (left) & Settings Form Panel (right)
-    let main_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(38), // Information Panel
-            Constraint::Percentage(62), // Form Panel
-        ])
-        .split(chunks[2]);
-
-    let left_panel_area = main_layout[0];
-    let right_panel_area = main_layout[1];
-
-    // --- Render Left Panel (Information & Guide) ---
-    let guide_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 60)))
-        .title(Span::styled(" Information & Capabilities ", Style::default().fg(Color::Gray)));
-
-    let mut guide_lines = Vec::new();
-    guide_lines.push(Line::from(""));
-
-    match app.form_provider.as_str() {
-        "anthropic" => {
-            guide_lines.push(Line::from(vec![
-                Span::styled("  Selected: ", Style::default().fg(Color::Gray)),
-                Span::styled("Anthropic Claude", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-            ]));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from("  Industry-leading for coding & reasoning."));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Capabilities:", Style::default().fg(Color::Gray).add_modifier(Modifier::UNDERLINED)),
-            ]));
-            guide_lines.push(Line::from("  • Prompt Caching: Enabled (cheaper/faster)"));
-            guide_lines.push(Line::from("  • Context Window: 200k tokens"));
-        }
-        "openai" => {
-            guide_lines.push(Line::from(vec![
-                Span::styled("  Selected: ", Style::default().fg(Color::Gray)),
-                Span::styled("OpenAI GPT", Style::default().fg(Color::Rgb(16, 185, 129)).add_modifier(Modifier::BOLD)),
-            ]));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from("  Fast, reliable, state-of-the-art TUI"));
-            guide_lines.push(Line::from("  coding capabilities and tool usage."));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Capabilities:", Style::default().fg(Color::Gray).add_modifier(Modifier::UNDERLINED)),
-            ]));
-            guide_lines.push(Line::from("  • Reliable Tool Execution"));
-            guide_lines.push(Line::from("  • Context Window: 128k tokens"));
-        }
-        "gemini" => {
-            guide_lines.push(Line::from(vec![
-                Span::styled("  Selected: ", Style::default().fg(Color::Gray)),
-                Span::styled("Google Gemini", Style::default().fg(Color::Rgb(59, 130, 246)).add_modifier(Modifier::BOLD)),
-            ]));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from("  Features a massive context window,"));
-            guide_lines.push(Line::from("  making it optimal for large codebases."));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Capabilities:", Style::default().fg(Color::Gray).add_modifier(Modifier::UNDERLINED)),
-            ]));
-            guide_lines.push(Line::from("  • Context Window: 1.0M tokens"));
-        }
-        "openrouter" => {
-            guide_lines.push(Line::from(vec![
-                Span::styled("  Selected: ", Style::default().fg(Color::Gray)),
-                Span::styled("OpenRouter API", Style::default().fg(Color::Rgb(244, 63, 94)).add_modifier(Modifier::BOLD)),
-            ]));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from("  Unified interface to access top models"));
-            guide_lines.push(Line::from("  with flexible, competitive pricing."));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Capabilities:", Style::default().fg(Color::Gray).add_modifier(Modifier::UNDERLINED)),
-            ]));
-            guide_lines.push(Line::from("  • Large variety of open & closed models"));
-            guide_lines.push(Line::from("  • Context Window: up to 1.0M tokens"));
-        }
-        _ => {
-            guide_lines.push(Line::from(vec![
-                Span::styled("  Selected: ", Style::default().fg(Color::Gray)),
-                Span::styled("OpenAI Compatible API", Style::default().fg(Color::Rgb(168, 85, 247)).add_modifier(Modifier::BOLD)),
-            ]));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from("  Connect to local backends (Ollama/etc.)"));
-            guide_lines.push(Line::from("  or custom hosted API endpoints."));
-            guide_lines.push(Line::from(""));
-            guide_lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Requirements:", Style::default().fg(Color::Gray).add_modifier(Modifier::UNDERLINED)),
-            ]));
-            guide_lines.push(Line::from("  • Requires Base URL configuration"));
-            guide_lines.push(Line::from("  • Must support Chat Completions API"));
-        }
-    }
-
-    frame.render_widget(Paragraph::new(guide_lines).block(guide_block), left_panel_area);
-
-    // --- Render Right Panel (Step-by-step Setup Wizard) ---
-    let step_num = match app.form_focus {
-        SettingsField::Provider => 1,
-        SettingsField::ApiKey => 2,
-        SettingsField::Model | SettingsField::BaseUrl => 3,
-        SettingsField::SaveBtn | SettingsField::CancelBtn => 4,
-    };
-
-    let right_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // Step indicator
-            Constraint::Min(12),   // Main wizard card
-        ])
-        .split(right_panel_area);
-
-    let mut step_spans = Vec::new();
-    
-    // Step 1
-    let s1_style = if step_num == 1 {
-        Style::default().fg(blue()).add_modifier(Modifier::BOLD)
-    } else if step_num > 1 {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    step_spans.push(Span::styled(" Provider ", s1_style));
-    step_spans.push(Span::styled("──", Style::default().fg(Color::Rgb(60, 60, 60))));
-
-    // Step 2
-    let s2_style = if step_num == 2 {
-        Style::default().fg(blue()).add_modifier(Modifier::BOLD)
-    } else if step_num > 2 {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    step_spans.push(Span::styled(" API Key ", s2_style));
-    step_spans.push(Span::styled("──", Style::default().fg(Color::Rgb(60, 60, 60))));
-
-    // Step 3
-    let s3_style = if step_num == 3 {
-        Style::default().fg(blue()).add_modifier(Modifier::BOLD)
-    } else if step_num > 3 {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    step_spans.push(Span::styled(" Model ", s3_style));
-    step_spans.push(Span::styled("──", Style::default().fg(Color::Rgb(60, 60, 60))));
-
-    // Step 4
-    let s4_style = if step_num == 4 {
-        Style::default().fg(blue()).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    step_spans.push(Span::styled(" Confirm ", s4_style));
-
-    frame.render_widget(
-        Paragraph::new(Line::from(step_spans).alignment(ratatui::layout::Alignment::Center)),
-        right_chunks[0]
-    );
-
-    let step_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(blue()))
-        .title(Span::styled(format!(" Setup Step {step_num} of 4 "), Style::default().fg(Color::Gray)));
-
-    let mut card_lines = Vec::new();
-    card_lines.push(Line::from(""));
-
-    match step_num {
-        1 => {
-            card_lines.push(Line::from("  Choose the AI provider:"));
-            card_lines.push(Line::from(""));
-            card_lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(" ◀ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {} ", app.form_provider), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled(" ▶ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-            ]));
-        }
-        2 => {
-            let focused = app.form_focus == SettingsField::ApiKey;
-            card_lines.push(Line::from(format!("  Enter the API Key for {}:", app.form_provider)));
-            card_lines.push(Line::from(""));
-
-            let masked_key = if app.form_api_key.is_empty() {
-                Span::styled("    [ enter API credentials... ]", Style::default().fg(Color::DarkGray))
-            } else if focused {
-                let bullets: String = std::iter::repeat('•').take(app.form_api_key.len()).collect();
-                Span::styled(format!("    {}█", bullets), Style::default().fg(Color::White))
-            } else {
-                let bullets: String = std::iter::repeat('•').take(8.max(app.form_api_key.len())).collect();
-                Span::styled(format!("    {}", bullets), Style::default().fg(Color::Gray))
-            };
-            card_lines.push(Line::from(masked_key));
-            card_lines.push(Line::from(""));
-            card_lines.push(Line::from("  (Leave empty if configured in env vars)"));
-        }
-        3 => {
-            let focused_model = app.form_focus == SettingsField::Model;
-            let focused_url = app.form_focus == SettingsField::BaseUrl;
-
-            card_lines.push(Line::from("  Enter Model details:"));
-            card_lines.push(Line::from(""));
-
-            let model_span = if app.form_model.is_empty() {
-                Span::styled("    [ type model name... ]", Style::default().fg(Color::DarkGray))
-            } else if focused_model {
-                Span::styled(format!("    {}█", app.form_model), Style::default().fg(Color::White))
-            } else {
-                Span::styled(format!("    {}", app.form_model), Style::default().fg(Color::Gray))
-            };
-            card_lines.push(Line::from(vec![
-                Span::styled("  Model:    ", if focused_model { Style::default().fg(blue()).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) }),
-                model_span,
-            ]));
-            card_lines.push(Line::from(""));
-            card_lines.push(Line::from("  (Press Space or ◀/▶ to cycle standard models, or type to edit)"));
-
-            if focused_model {
-                if !app.models_fetch_status.is_empty() {
-                    card_lines.push(Line::from(""));
-                    card_lines.push(Line::from(vec![
-                        Span::raw("  Status:   "),
-                        Span::styled(&app.models_fetch_status, Style::default().fg(Color::Yellow)),
-                    ]));
-                }
-
-                let matches: Vec<&str> = if let Some(ref fetched) = app.form_fetched_models {
-                    let query = app.form_model_query.to_lowercase();
-                    fetched.iter()
-                        .map(|s| s.as_str())
-                        .filter(|m| m.to_lowercase().contains(&query))
-                        .collect()
-                } else {
-                    let standard_models = get_provider_models(&app.form_provider);
-                    let query = app.form_model_query.to_lowercase();
-                    standard_models.iter()
-                        .copied()
-                        .filter(|m| m.to_lowercase().contains(&query))
-                        .collect()
-                };
-
-                let active_list = if matches.is_empty() {
-                    if let Some(ref fetched) = app.form_fetched_models {
-                        fetched.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-                    } else {
-                        get_provider_models(&app.form_provider).to_vec()
-                    }
-                } else {
-                    matches
-                };
-
-                if !active_list.is_empty() {
-                    card_lines.push(Line::from(""));
-                    card_lines.push(Line::from(Span::styled("  Matching models:", Style::default().fg(Color::Gray))));
-                    for m in active_list.iter().take(8) {
-                        let is_current = *m == app.form_model;
-                        let line = if is_current {
-                            Line::from(vec![
-                                Span::styled("    ➤ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-                                Span::styled(*m, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                            ])
-                        } else {
-                            Line::from(vec![
-                                Span::raw("      "),
-                                Span::styled(*m, Style::default().fg(Color::DarkGray)),
-                            ])
-                        };
-                        card_lines.push(line);
-                    }
-                    if active_list.len() > 8 {
-                        card_lines.push(Line::from(Span::styled(format!("      ... and {} more models", active_list.len() - 8), Style::default().fg(Color::DarkGray))));
-                    }
-                }
-            }
-
-            if app.form_provider == "openai-compatible" {
-                card_lines.push(Line::from(""));
-                let url_span = if app.form_base_url.is_empty() {
-                    Span::styled("    [ type API Base URL... ]", Style::default().fg(Color::DarkGray))
-                } else if focused_url {
-                    Span::styled(format!("    {}█", app.form_base_url), Style::default().fg(Color::White))
-                } else {
-                    Span::styled(format!("    {}", app.form_base_url), Style::default().fg(Color::Gray))
-                };
-                card_lines.push(Line::from(vec![
-                    Span::styled("  Base URL: ", if focused_url { Style::default().fg(blue()).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) }),
-                    url_span,
-                ]));
-            }
-        }
-        _ => {
-            let save_focused = app.form_focus == SettingsField::SaveBtn;
-            let cancel_focused = app.form_focus == SettingsField::CancelBtn;
-
-            let save_style = if save_focused {
-                Style::default().bg(blue()).fg(Color::Black).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(blue()).add_modifier(Modifier::BOLD)
-            };
-
-            let cancel_style = if cancel_focused {
-                Style::default().bg(Color::Rgb(239, 68, 68)).fg(Color::White).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-
-            card_lines.push(Line::from("  Verify and save your settings:"));
-            card_lines.push(Line::from(""));
-            card_lines.push(Line::from(vec![
-                Span::styled("    Provider: ", Style::default().fg(Color::Gray)),
-                Span::styled(&app.form_provider, Style::default().fg(Color::White)),
-            ]));
-            card_lines.push(Line::from(vec![
-                Span::styled("    Model:    ", Style::default().fg(Color::Gray)),
-                Span::styled(&app.form_model, Style::default().fg(Color::White)),
-            ]));
-            if app.form_provider == "openai-compatible" {
-                card_lines.push(Line::from(vec![
-                    Span::styled("    Base URL: ", Style::default().fg(Color::Gray)),
-                    Span::styled(&app.form_base_url, Style::default().fg(Color::White)),
-                ]));
-            }
-            card_lines.push(Line::from(""));
-            card_lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled("  Save Settings  ", save_style),
-                Span::raw("      "),
-                Span::styled("  Cancel  ", cancel_style),
-            ]));
-        }
-    }
-
-    frame.render_widget(Paragraph::new(card_lines).block(step_block), right_chunks[1]);
-
-    // Footer Help
-    let footer_style = Style::default().fg(Color::DarkGray);
-    let footer_text = match app.form_focus {
-        SettingsField::Provider => "Space or ◀/▶ cycle provider  ·  Enter next step  ·  Shift-Tab go back  ·  Esc cancel",
-        SettingsField::ApiKey => "Type API key  ·  Enter next step  ·  Shift-Tab/Up go back  ·  Esc cancel",
-        SettingsField::Model => "Space or ◀/▶ cycle model  ·  Type to edit  ·  Enter next step  ·  Shift-Tab/Up go back  ·  Esc cancel",
-        SettingsField::BaseUrl => "Type Base URL  ·  Enter next step  ·  Shift-Tab/Up go back  ·  Esc cancel",
-        SettingsField::SaveBtn | SettingsField::CancelBtn => "◀/▶ or Tab to toggle  ·  Enter to select  ·  Shift-Tab/Up go back  ·  Esc cancel",
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer_text, footer_style))),
-        chunks[3]
-    );
-}
-
 fn get_suggestions(app: &App) -> Vec<(String, String)> {
     if !app.input.starts_with('/') {
         return Vec::new();
@@ -1875,6 +1692,24 @@ fn get_suggestions(app: &App) -> Vec<(String, String)> {
             .into_iter()
             .filter(|(name, _)| name.starts_with(query_part))
             .map(|(name, desc)| (format!("/resume {}", name), desc))
+            .collect();
+    }
+
+    if app.input.starts_with("/rewind") {
+        let query = app.input.strip_prefix("/rewind ").unwrap_or("");
+        let checkpoints = app
+            .state
+            .as_ref()
+            .map(|s| s.checkpoints.clone())
+            .unwrap_or_default();
+        return checkpoints
+            .iter()
+            .rev()
+            .map(|c| {
+                let short = &c.id[..c.id.len().min(8)];
+                (format!("/rewind {short}"), c.label.clone())
+            })
+            .filter(|(cmd, _)| cmd.contains(query))
             .collect();
     }
 
@@ -2015,6 +1850,28 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let working = state.status == HarnessStatus::Running
         || state.lanes.iter().any(|lane| lane.status == LaneStatus::Running);
     if working && app.agent_alive() {
+        // Reasoning/thinking the model is streaming (when it returns any), shown
+        // dimmed above the answer so it reads as distinct from the response.
+        let thinking = crate::llm::StreamBuffer::snapshot_thinking(&app.stream);
+        let thinking = thinking.trim_end();
+        if !thinking.is_empty() {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            for seg in wrap_one(thinking, width.saturating_sub(2)) {
+                lines.push(Line::from(Span::styled(seg, Style::default().fg(Color::DarkGray))));
+            }
+        }
+        // Text the model is streaming this turn, shown live until it commits to a
+        // durable AssistantText event (then refresh_state clears the buffer).
+        let live = crate::llm::StreamBuffer::snapshot(&app.stream);
+        let live = live.trim_end();
+        if !live.is_empty() {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.extend(render_prose(live, width));
+        }
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
@@ -2243,7 +2100,7 @@ fn tool_call_preview(tool_name: &str, arguments: &Value, width: usize) -> Vec<Li
         }
         _ => return Vec::new(),
     }
-    result_block(items, width)
+    result_block_verbatim(items, width)
 }
 
 fn tool_call_header(tool_name: &str, arguments: &Value) -> String {
@@ -2264,6 +2121,8 @@ fn tool_call_header(tool_name: &str, arguments: &Value) -> String {
         }
         "search_content" => format!("Grep(\"{}\")", arg("query")),
         "view_outline" => format!("Outline({})", arg("path")),
+        "web_search" => format!("Web(\"{}\")", arg("query")),
+        "web_read" => format!("Fetch({})", arg("url")),
         "bash" => format!("Bash({})", arg("command")),
         _ => format!(
             "{tool_name}({})",
@@ -2318,10 +2177,23 @@ fn tool_result_lines(tool_name: &str, result: &Value, width: usize) -> Vec<Line<
             let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
             vec![(format!("Found {count} content matches"), subtle())]
         }
+        "web_search" => {
+            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
+            vec![(format!("{count} web results"), subtle())]
+        }
+        "web_read" => {
+            let chars = data.get("text").and_then(Value::as_str).map(|t| t.chars().count()).unwrap_or(0);
+            vec![(format!("Read {chars} chars"), subtle())]
+        }
         "view_outline" => {
-            let outline = data.get("outline").and_then(Value::as_array);
-            let count = outline.map(|o| o.len()).unwrap_or(0);
-            vec![(format!("Outline has {count} code declarations"), subtle())]
+            if data.get("is_directory").and_then(Value::as_bool).unwrap_or(false) {
+                let count = data.get("entries").and_then(Value::as_array).map(|e| e.len()).unwrap_or(0);
+                vec![(format!("Directory — {count} entries"), subtle())]
+            } else {
+                let outline = data.get("outline").and_then(Value::as_array);
+                let count = outline.map(|o| o.len()).unwrap_or(0);
+                vec![(format!("Outline has {count} code declarations"), subtle())]
+            }
         }
         "bash" => bash_result_items(data),
         _ => vec![(status.to_string(), subtle())],
@@ -2377,10 +2249,30 @@ fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
 
 /// Render result/output logical lines under a `⎿` gutter, wrapped to width.
 fn result_block(items: Vec<(String, Style)>, width: usize) -> Vec<Line<'static>> {
+    result_block_inner(items, width, false)
+}
+
+/// Like `result_block` but preserves each line verbatim (indentation and runs of
+/// spaces) instead of word-wrapping — used for code/diff previews where leading
+/// whitespace is meaningful.
+fn result_block_verbatim(items: Vec<(String, Style)>, width: usize) -> Vec<Line<'static>> {
+    result_block_inner(items, width, true)
+}
+
+fn result_block_inner(
+    items: Vec<(String, Style)>,
+    width: usize,
+    verbatim: bool,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut first = true;
     for (text, style) in items {
-        for seg in wrap_one(&text, width.saturating_sub(4)) {
+        let segs = if verbatim {
+            wrap_code_line(&text, width.saturating_sub(4))
+        } else {
+            wrap_one(&text, width.saturating_sub(4))
+        };
+        for seg in segs {
             let prefix = if first { "  ⎿ " } else { "    " };
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), subtle()),
@@ -2903,7 +2795,7 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let line = if app.input.is_empty() {
+    if app.input.is_empty() {
         // When a free-text ask_user question is pending, prompt for the answer.
         let placeholder = {
             let qs = questions_of(app);
@@ -2912,19 +2804,100 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 _ => "Type a prompt or a slash command...",
             }
         };
-        Line::from(vec![
+        let line = Line::from(vec![
             Span::styled("❧ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
             Span::styled(placeholder, Style::default().fg(Color::Rgb(75, 85, 99))),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("❧ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-            Span::styled(app.input.clone(), Style::default().fg(Color::White)),
-            Span::styled("█", Style::default().fg(blue())),
-        ])
-    };
+        ]);
+        frame.render_widget(Paragraph::new(line).block(block), area);
+        return;
+    }
 
-    frame.render_widget(Paragraph::new(line).block(block), area);
+    // Wrap the prompt into display rows (honoring explicit newlines) and draw a
+    // block cursor at its (row, col). The prompt glyph takes the first 2 columns;
+    // continuation rows are indented to match.
+    let text_w = (area.width as usize).saturating_sub(2).max(1);
+    let (rows, (cursor_row, cursor_col)) = layout_input(&app.input, app.input_cursor, text_w);
+    let white = Style::default().fg(Color::White);
+    let cursor_style = Style::default().fg(Color::Black).bg(blue());
+
+    let mut lines = Vec::with_capacity(rows.len());
+    for (k, row) in rows.iter().enumerate() {
+        let mut spans = Vec::new();
+        if k == 0 {
+            spans.push(Span::styled("❧ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)));
+        } else {
+            spans.push(Span::raw("  "));
+        }
+        if k == cursor_row {
+            let rchars: Vec<char> = row.chars().collect();
+            let col = cursor_col.min(rchars.len());
+            let before: String = rchars[..col].iter().collect();
+            spans.push(Span::styled(before, white));
+            if col < rchars.len() {
+                spans.push(Span::styled(rchars[col].to_string(), cursor_style));
+                let after: String = rchars[col + 1..].iter().collect();
+                spans.push(Span::styled(after, white));
+            } else {
+                spans.push(Span::styled("█", Style::default().fg(blue())));
+            }
+        } else {
+            spans.push(Span::styled(row.clone(), white));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Keep the cursor row on screen when the input is taller than the box.
+    let visible = (area.height as usize).saturating_sub(2).max(1);
+    let scroll = cursor_row.saturating_sub(visible.saturating_sub(1)) as u16;
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+}
+
+/// Height (incl. top/bottom borders) the input box needs for the current prompt,
+/// clamped so it grows with wrapped/multi-line input but never dominates the view.
+fn input_height(app: &App, width: u16) -> u16 {
+    const MAX_ROWS: usize = 8;
+    if app.input.is_empty() {
+        return 3;
+    }
+    let text_w = (width as usize).saturating_sub(2).max(1);
+    let (rows, _) = layout_input(&app.input, app.input_cursor, text_w);
+    (rows.len().clamp(1, MAX_ROWS) as u16) + 2
+}
+
+/// Wrap `input` into display rows at `width` columns, honoring explicit `\n` as
+/// hard breaks and soft-wrapping longer lines by character count. Returns the
+/// rows plus the cursor's (row, col) so the caller can draw a block cursor.
+fn layout_input(input: &str, cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
+    let width = width.max(1);
+    let chars: Vec<char> = input.chars().collect();
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut col = 0usize;
+    let mut cursor_rc = (0usize, 0usize);
+    for (i, ch) in chars.iter().enumerate() {
+        if *ch == '\n' {
+            if cursor == i {
+                cursor_rc = (rows.len(), col);
+            }
+            rows.push(std::mem::take(&mut cur));
+            col = 0;
+            continue;
+        }
+        if col == width {
+            rows.push(std::mem::take(&mut cur));
+            col = 0;
+        }
+        if cursor == i {
+            cursor_rc = (rows.len(), col);
+        }
+        cur.push(*ch);
+        col += 1;
+    }
+    if cursor >= chars.len() {
+        cursor_rc = (rows.len(), col);
+    }
+    rows.push(cur);
+    (rows, cursor_rc)
 }
 
 /// Render the compact inline login form: all fields on one panel, the focused
@@ -3076,11 +3049,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let style = Style::default().fg(subtle().fg.unwrap());
     
-    // ↑ input · ↓ output · ⚡ cache-read (cumulative) · ctx = current context
+    // ↑ input · ↓ output · ⟳ cache-read (cumulative) · ctx = current context
     // fill (prompt tokens of the most recent request, which grows as the
     // conversation accretes).
     let st = app.state.as_ref();
-    let left_text = format!("📂 {}  |  ↑{} ↓{} ⚡{}  ·  ctx {}  ",
+    let left_text = format!("📂 {}  |  ↑{} ↓{} ⟳{}  ·  ctx {}  ",
         app.cwd_display,
         fmt_si(st.map(|s| s.prompt_tokens).unwrap_or(0)),
         fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0)),
