@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::llm::AgentModel;
 use crate::openai::{OpenAiCompatibleModel, OpenAiCompatibleConfig};
 use crate::anthropic::{AnthropicModel, AnthropicConfig};
+use crate::gemini::{GeminiModel, GeminiConfig};
 use crate::tools::ToolError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,9 +175,20 @@ impl ModelConfig {
             }
 
             "gemini" => {
-                let mut config: OpenAiCompatibleConfig = self.clone().into();
-                config.base_url = "https://generativelanguage.googleapis.com/v1beta/openai/".to_string();
-                Box::new(OpenAiCompatibleModel::new(config))
+                let mut model = self.model.clone();
+                if model.is_empty() {
+                    // Latest stable Flash model (confirmed against ai.google.dev/models).
+                    model = "gemini-3.5-flash".to_string();
+                }
+                Box::new(GeminiModel::new(GeminiConfig {
+                    api_key: self.api_key.clone(),
+                    model,
+                    temperature: self.temperature,
+                    max_retries: self.max_retries,
+                    initial_retry_ms: self.initial_retry_ms,
+                    max_retry_ms: self.max_retry_ms,
+                    cache_prompt: self.cache_prompt,
+                }))
             }
             "anthropic" => {
                 let config = AnthropicConfig {

@@ -157,10 +157,8 @@ fn provider_defaults(provider: &str) -> (String, String) {
     match provider {
         "openai" => ("https://api.openai.com/v1".to_string(), "gpt-5.5".to_string()),
         "anthropic" => (String::new(), "claude-opus-4-8".to_string()),
-        "gemini" => (
-            "https://generativelanguage.googleapis.com/v1beta/openai/".to_string(),
-            "gemini-3.1-pro".to_string(),
-        ),
+        // Native Gemini adapter — no base URL (it has its own endpoint), like Anthropic.
+        "gemini" => (String::new(), "gemini-3.5-flash".to_string()),
         "openrouter" => (
             "https://openrouter.ai/api/v1".to_string(),
             "anthropic/claude-opus-4-8".to_string(),
@@ -3158,11 +3156,10 @@ fn get_provider_models(provider: &str) -> &'static [&'static str] {
             "claude-fable-5",
         ],
         "gemini" => &[
-            "gemini-3.1-pro",
-            "gemini-3.1-flash",
             "gemini-3.5-flash",
+            "gemini-3.1-pro",
+            "gemini-3.1-flash-lite",
             "gemini-3-pro",
-            "gemini-3-flash",
         ],
         "openrouter" => &[
             "anthropic/claude-opus-4-8",

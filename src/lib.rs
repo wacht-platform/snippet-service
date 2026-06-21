@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod builtins;
 pub mod checkpoint;
 pub mod config;
+pub mod gemini;
 pub mod harness;
 pub mod inline;
 pub mod lanes;
