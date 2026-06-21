@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -29,32 +30,37 @@ impl ToolError {
     }
 }
 
+/// Stable content fingerprint for the staleness guard (DefaultHasher over bytes).
+fn content_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     workspace_root: PathBuf,
     owner: String,
-    locks: Option<std::sync::Arc<crate::locks::LockRegistry>>,
+    /// Whole-file content hashes this context last saw per path — recorded on read
+    /// and after its own writes. A write is rejected when the file on disk no
+    /// longer matches the recorded hash, catching any change since (including
+    /// external edits, another lane, or a concurrent process). Optimistic
+    /// concurrency; replaces the former lock registry.
+    seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
 }
 
 impl ToolContext {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self, ToolError> {
-        Self::with_owner(workspace_root, "main", None)
+        Self::with_owner(workspace_root, "main")
     }
 
-    /// Build a context tied to a lock `owner` (e.g. "main" or a lane id) sharing a
-    /// `LockRegistry` with the other agents in this run.
-    pub fn with_locks(
+    /// Build a context with an `owner` label (e.g. "main" or a lane id). Each
+    /// context tracks its own seen-hashes; staleness is detected against the file
+    /// on disk, so lanes need not share any state.
+    pub fn with_owner(
         workspace_root: impl Into<PathBuf>,
         owner: impl Into<String>,
-        locks: std::sync::Arc<crate::locks::LockRegistry>,
-    ) -> Result<Self, ToolError> {
-        Self::with_owner(workspace_root, owner, Some(locks))
-    }
-
-    fn with_owner(
-        workspace_root: impl Into<PathBuf>,
-        owner: impl Into<String>,
-        locks: Option<std::sync::Arc<crate::locks::LockRegistry>>,
     ) -> Result<Self, ToolError> {
         let root = workspace_root.into();
         let root = if root.exists() {
@@ -65,7 +71,7 @@ impl ToolContext {
         Ok(Self {
             workspace_root: root,
             owner: owner.into(),
-            locks,
+            seen: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -77,32 +83,20 @@ impl ToolContext {
         &self.owner
     }
 
-    pub fn locks(&self) -> Option<&std::sync::Arc<crate::locks::LockRegistry>> {
-        self.locks.as_ref()
-    }
-
-    /// Reject a write to `path` when another owner holds a lock over it or has
-    /// changed it since this owner last read it.
+    /// Reject a write to `path` when the file on disk differs from what this
+    /// context last saw — i.e. it was changed underneath us (by another lane, an
+    /// external edit, or another process) since we read it.
     pub fn check_write(&self, path: &Path) -> Result<(), ToolError> {
-        use crate::locks::WriteBlock;
-        if let Some(locks) = &self.locks {
-            match locks.check_write(path, &self.owner) {
-                Ok(()) => {}
-                Err(WriteBlock::Locked(holder)) => {
+        let stored = self.seen.lock().unwrap().get(path).copied();
+        if let Some(stored) = stored {
+            // Compare against the file's CURRENT on-disk bytes. A missing/unreadable
+            // file isn't "stale" — let the write itself surface any real error.
+            if let Ok(current) = std::fs::read(path) {
+                if content_hash(&current) != stored {
                     return Err(ToolError::msg(format!(
-                        "`{}` is locked by `{}` (reason: {}). You have read-only access to it — \
-                         read it, but do not write. Claim a lock or coordinate before editing.",
-                        holder.path.display(),
-                        holder.owner,
-                        holder.reason
-                    )));
-                }
-                Err(WriteBlock::Stale { last_writer }) => {
-                    return Err(ToolError::msg(format!(
-                        "`{}` was modified by `{}` since you last read it. Re-read the file \
-                         before writing so your change is based on its current contents.",
-                        path.display(),
-                        last_writer
+                        "`{}` changed on disk since you last read it. Re-read it before writing \
+                         so your change is based on its current contents.",
+                        path.display()
                     )));
                 }
             }
@@ -110,34 +104,45 @@ impl ToolContext {
         Ok(())
     }
 
-    /// Record that this owner has seen `path`'s current contents (called on read).
+    /// Record that this context has seen `path`'s current on-disk contents (read).
     pub fn mark_read(&self, path: &Path) {
-        if let Some(locks) = &self.locks {
-            locks.mark_read(path, &self.owner);
-        }
+        self.remember(path);
     }
 
-    /// Record that this owner changed `path`.
+    /// Record that this context just wrote `path`, so its own follow-up writes
+    /// aren't flagged stale.
     pub fn record_change(&self, path: &Path) {
-        if let Some(locks) = &self.locks {
-            locks.record_change(path, &self.owner);
+        self.remember(path);
+    }
+
+    fn remember(&self, path: &Path) {
+        if let Ok(bytes) = std::fs::read(path) {
+            self.seen
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), content_hash(&bytes));
         }
     }
 
     pub fn resolve_workspace_path(&self, raw: &str) -> Result<PathBuf, ToolError> {
-        let normalized = normalize_workspace_path(&self.workspace_root, raw);
-        if !normalized.starts_with(&self.workspace_root) {
-            return Err(ToolError::PathEscapesWorkspace {
-                path: raw.to_string(),
-                root: self.workspace_root.display().to_string(),
-            });
-        }
-        Ok(normalized)
+        // No workspace jail: the working directory is just the base for relative
+        // paths. Absolute paths and `~` resolve as given, so the agent can read or
+        // edit any file you point it at (bash already has full access anyway).
+        Ok(normalize_workspace_path(&self.workspace_root, raw))
     }
 }
 
 fn normalize_workspace_path(root: &Path, raw: &str) -> PathBuf {
-    let candidate = Path::new(raw);
+    // Expand a leading `~` to the home directory (so `~/code/wacht` works).
+    let expanded = if raw == "~" || raw.starts_with("~/") {
+        match std::env::var_os("HOME") {
+            Some(home) => format!("{}{}", home.to_string_lossy(), &raw[1..]),
+            None => raw.to_string(),
+        }
+    } else {
+        raw.to_string()
+    };
+    let candidate = Path::new(&expanded);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {

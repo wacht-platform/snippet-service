@@ -10,7 +10,7 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 const MAX_INLINE_CHARS: usize = 60_000;
 
-pub fn coding_tools() -> ToolRegistry {
+pub fn coding_tools(exa_api_key: Option<String>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.insert(ReadFileTool);
     registry.insert(ReadImageTool);
@@ -23,7 +23,11 @@ pub fn coding_tools() -> ToolRegistry {
     registry.insert(SearchContentTool);
     registry.insert(ViewOutlineTool);
     registry.insert(BashTool);
-    registry.insert(TerminateLoopTool);
+    // web_search / web_read are offered only when an Exa key is configured.
+    if let Some(key) = exa_api_key.filter(|k| !k.trim().is_empty()) {
+        registry.insert(WebSearchTool { api_key: key.clone() });
+        registry.insert(WebReadTool { api_key: key });
+    }
     registry
 }
 
@@ -296,9 +300,10 @@ impl Tool for ReadImageTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "read_image".to_string(),
-            description: "Inspect an image file in the workspace: returns its detected MIME type \
-                and byte size (the raw bytes are not inlined). Use it to confirm an image exists \
-                and what kind it is."
+            description: "Load an image file (png/jpg/webp/gif/bmp/svg) so you can SEE it — the \
+                image is attached to your context and you can describe, analyze, or act on its \
+                contents. Use this for screenshots, diagrams, mockups, or any image path the user \
+                points you at. Call it once per image (multiple images are fine)."
                 .to_string(),
             input_schema: object_schema(json!({"path": {"type": "string"}}), &["path"]),
         }
@@ -680,46 +685,6 @@ fn truncate_output_to(value: Value, max_bytes: usize) -> Result<ToolResult, Tool
     })))
 }
 
-pub struct TerminateLoopTool;
-
-#[async_trait]
-impl Tool for TerminateLoopTool {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "terminate_loop".to_string(),
-            description: "End your turn and hand control back to the user — this is the ONLY way to \
-                stop the agent loop. A plain text reply by itself does NOT end the loop; you must \
-                call `terminate_loop` to stop. Call it when you have answered the request, \
-                delivered what was asked, or are blocked waiting on the user. Put your final \
-                user-facing reply in the text beside this call; `summary` is a short internal note \
-                of what was accomplished. It must be the only tool call in its response — finish \
-                any work first, then terminate alone."
-                .to_string(),
-            input_schema: object_schema(json!({"summary": {"type": "string"}}), &["summary"]),
-        }
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let Some(object) = arguments.as_object() else {
-            return Err(ToolError::InvalidArguments {
-                tool: "terminate_loop".to_string(),
-            });
-        };
-        let Some(summary) = object
-            .get("summary")
-            .or_else(|| object.get("message"))
-            .and_then(Value::as_str)
-        else {
-            return Err(ToolError::InvalidArguments {
-                tool: "terminate_loop".to_string(),
-            });
-        };
-        Ok(ToolResult::success(json!({"summary": summary})))
-    }
-}
-
-
-
 pub struct SearchContentTool;
 
 #[derive(Debug, Deserialize)]
@@ -873,7 +838,14 @@ impl Tool for ViewOutlineTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "view_outline".to_string(),
-            description: "Show a high-level outline of classes, functions, structs, and methods defined in a workspace code file.".to_string(),
+            description: "Map the structure of ONE source file: its top-level declarations \
+                (functions, structs, enums, traits, classes, methods) with line numbers. Use it to \
+                see what a file contains and where things are defined WITHOUT reading the whole \
+                file — far cheaper than read_file for a large file or a first-pass overview; then \
+                read_file the specific lines you actually need. Takes a single code FILE path \
+                (Rust, Python, Go, JS/TS). If given a directory it just lists the folder's contents \
+                (use list_files for that), then point view_outline at a specific file."
+                .to_string(),
             input_schema: object_schema(
                 json!({
                     "path": {
@@ -889,6 +861,27 @@ impl Tool for ViewOutlineTool {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ViewOutlineArgs = expect_object("view_outline", arguments)?;
         let path = ctx.resolve_workspace_path(&args.path)?;
+        // view_outline maps a single file, but the model often aims it at a folder.
+        // Rather than error, list the directory (like list_files) so the call still
+        // makes progress and the model can pick a file to outline next.
+        if path.is_dir() {
+            let mut dir = tokio::fs::read_dir(&path).await?;
+            let mut entries = Vec::new();
+            while let Some(entry) = dir.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                entries.push(json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "kind": if file_type.is_dir() { "dir" } else { "file" },
+                }));
+            }
+            return Ok(ToolResult::success(json!({
+                "path": args.path,
+                "is_directory": true,
+                "entries": entries,
+                "note": "This path is a directory, not a file — listed its contents instead. \
+                         Call view_outline on a specific file inside it to map its declarations.",
+            })));
+        }
         let content = tokio::fs::read_to_string(&path).await?;
         ctx.mark_read(&path);
 
@@ -1032,6 +1025,225 @@ impl Tool for ReplaceFileContentTool {
         Ok(ToolResult::success(json!({
             "path": args.path,
             "replaced": true
+        })))
+    }
+}
+
+pub struct WebSearchTool {
+    pub api_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    #[serde(default = "default_web_results")]
+    num_results: usize,
+}
+
+fn default_web_results() -> usize {
+    5
+}
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "web_search".to_string(),
+            description: "Search the web (via Exa) for anything beyond the local workspace — current events, library/API docs, error messages, release notes, best practices. Returns ranked results with title, URL, publish date, and a text snippet from each page. Use a focused natural-language query.".to_string(),
+            input_schema: object_schema(
+                json!({
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language search query."
+                    },
+                    "num_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10,
+                        "default": 5,
+                        "description": "How many results to return (1-10)."
+                    }
+                }),
+                &["query"],
+            ),
+        }
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: WebSearchArgs = expect_object("web_search", arguments)?;
+        let num = args.num_results.clamp(1, 10);
+        let body = json!({
+            "query": args.query,
+            "numResults": num,
+            "type": "auto",
+            "contents": { "text": { "maxCharacters": 1200 } },
+        });
+
+        let response = reqwest::Client::new()
+            .post("https://api.exa.ai/search")
+            .header("x-api-key", &self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ToolError::msg(format!("exa request failed: {error}")))?;
+
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ToolError::msg(format!("reading exa response failed: {error}")))?;
+        if !status.is_success() {
+            let detail = String::from_utf8_lossy(&bytes);
+            return Ok(ToolResult::error(format!(
+                "exa search failed: HTTP {status}: {detail}"
+            )));
+        }
+
+        let parsed: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| ToolError::msg(format!("invalid exa response: {error}")))?;
+
+        let results: Vec<Value> = parsed
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let snippet: String = item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .chars()
+                            .take(1000)
+                            .collect();
+                        json!({
+                            "title": item.get("title").and_then(Value::as_str).unwrap_or(""),
+                            "url": item.get("url").and_then(Value::as_str).unwrap_or(""),
+                            "published_date": item.get("publishedDate").and_then(Value::as_str),
+                            "snippet": snippet,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(ToolResult::success(json!({
+            "query": args.query,
+            "count": results.len(),
+            "results": results,
+        })))
+    }
+}
+
+pub struct WebReadTool {
+    pub api_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebReadArgs {
+    url: String,
+    #[serde(default = "default_read_chars")]
+    max_characters: usize,
+}
+
+fn default_read_chars() -> usize {
+    8000
+}
+
+#[async_trait]
+impl Tool for WebReadTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "web_read".to_string(),
+            description: "Fetch and read the full text of a specific web page by URL (via Exa) — use after web_search to read a result in depth, or to read any known URL (docs page, issue, article). Returns the page's extracted text.".to_string(),
+            input_schema: object_schema(
+                json!({
+                    "url": {
+                        "type": "string",
+                        "description": "The full URL of the page to read."
+                    },
+                    "max_characters": {
+                        "type": "integer",
+                        "minimum": 500,
+                        "maximum": 10000,
+                        "default": 8000,
+                        "description": "Maximum characters of page text to return (Exa caps this at 10000)."
+                    }
+                }),
+                &["url"],
+            ),
+        }
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: WebReadArgs = expect_object("web_read", arguments)?;
+        let max_chars = args.max_characters.clamp(500, 10_000);
+        let body = json!({
+            "urls": [args.url],
+            "text": { "maxCharacters": max_chars },
+            // 0 = fetch fresh: the documented way to crawl a URL not already in
+            // Exa's index (replaces the deprecated `livecrawl`).
+            "maxAgeHours": 0,
+        });
+
+        let response = reqwest::Client::new()
+            .post("https://api.exa.ai/contents")
+            .header("x-api-key", &self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| ToolError::msg(format!("exa request failed: {error}")))?;
+
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| ToolError::msg(format!("reading exa response failed: {error}")))?;
+        if !status.is_success() {
+            let detail = String::from_utf8_lossy(&bytes);
+            return Ok(ToolResult::error(format!(
+                "exa read failed: HTTP {status}: {detail}"
+            )));
+        }
+
+        let parsed: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| ToolError::msg(format!("invalid exa response: {error}")))?;
+
+        let Some(result) = parsed
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+        else {
+            // Exa reports per-URL failures in `statuses[].error` rather than results.
+            let reason = parsed
+                .get("statuses")
+                .and_then(Value::as_array)
+                .and_then(|s| s.first())
+                .and_then(|s| s.get("error"))
+                .and_then(Value::as_str)
+                .map(|e| format!(" ({e})"))
+                .unwrap_or_default();
+            return Ok(ToolResult::error(format!(
+                "no content returned for `{}` — the page may be unreachable or blocked.{reason}",
+                args.url
+            )));
+        };
+
+        let text: String = result
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(max_chars)
+            .collect();
+
+        Ok(ToolResult::success(json!({
+            "url": result.get("url").and_then(Value::as_str).unwrap_or(&args.url),
+            "title": result.get("title").and_then(Value::as_str).unwrap_or(""),
+            "published_date": result.get("publishedDate").and_then(Value::as_str),
+            "text": text,
         })))
     }
 }

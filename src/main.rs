@@ -10,6 +10,9 @@ use snippet::tui::{TuiOptions, run_tui};
 struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Resume a specific conversation by id (the command is printed when a session closes).
+    #[arg(long)]
+    resume: Option<String>,
 }
 
 #[tokio::main]
@@ -26,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_tui(TuiOptions {
         config_path,
         config,
+        resume: cli.resume,
     })
     .await?;
     Ok(())

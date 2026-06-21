@@ -19,6 +19,12 @@ pub struct SnippetConfig {
     pub active_setup: Option<String>,
     #[serde(default, skip_serializing, alias = "profiles", alias = "setups")]
     pub setups: Option<std::collections::HashMap<String, ModelConfig>>,
+    /// Exa API key for the `web_search` / `web_read` tools. When set, web search is
+    /// enabled; absent, the tools aren't offered to the model. Declared before the
+    /// `model` table so it serializes as a top-level key (TOML requires scalars
+    /// before any table).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exa_api_key: Option<String>,
     #[serde(default)]
     pub model: ModelConfig,
 }
@@ -55,6 +61,7 @@ impl Default for SnippetConfig {
             active_setup: None,
             setups: None,
             model: ModelConfig::default(),
+            exa_api_key: None,
         }
     }
 }
