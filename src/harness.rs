@@ -246,6 +246,13 @@ struct LoopVars {
     /// short-circuit exact-duplicate re-calls. Cleared on a new user request and
     /// whenever a mutation makes re-discovery legitimate again.
     executed_calls: std::collections::HashSet<String>,
+    /// Whether the PREVIOUS turn repeated a tool call (consecutive or dedup-caught)
+    /// — so the live context explains the re-prompt only when actually looping.
+    /// Reset on a new user request.
+    last_turn_had_repeat: bool,
+    /// The model's reasoning from the previous turn, surfaced back in the live
+    /// context (experimental). Reset on a new user request.
+    last_thought: Option<String>,
 }
 
 /// What a single model step resolved to.
@@ -502,8 +509,11 @@ impl CodingHarness {
                             // be rewound. An answer continues a turn already checkpointed.
                             if !answering {
                                 self.checkpoint(&mut state, &text);
-                                // Fresh request: re-discovery is legitimate again.
+                                // Fresh request: re-discovery is legitimate again, and
+                                // prior-turn loop/thought state belongs to the past run.
                                 vars.executed_calls.clear();
+                                vars.last_turn_had_repeat = false;
+                                vars.last_thought = None;
                             }
                             state.pending_question = None;
                             state.messages.push(HarnessMessage::User {
@@ -743,6 +753,15 @@ impl CodingHarness {
             Ok(output) => output,
             Err(error) => return StepResult::ModelError(error.to_string()),
         };
+        // Capture this turn's reasoning (from the sink) so the next turn's live
+        // context can surface "what you thought last time". Bounded so it can't
+        // bloat the request.
+        if let Some(sink) = sink {
+            let thought = StreamBuffer::snapshot_thinking(sink);
+            let thought = thought.trim();
+            vars.last_thought =
+                (!thought.is_empty()).then(|| thought.chars().take(1500).collect::<String>());
+        }
         if let Some(usage) = output.usage {
             state.total_tokens = state.total_tokens.saturating_add(usage.total_tokens);
             state.prompt_tokens = state.prompt_tokens.saturating_add(usage.prompt_tokens);
@@ -901,6 +920,7 @@ impl CodingHarness {
         let mut real_work_count = 0usize;
         let mut had_note = false;
         let mut shell_nudged_this_turn = false;
+        let mut dedup_hits = 0usize;
 
         for call in calls {
             let tool_name = call.tool_name.clone();
@@ -1023,6 +1043,7 @@ impl CodingHarness {
                     tool_name,
                     content: result,
                 });
+                dedup_hits += 1;
                 continue;
             }
 
@@ -1085,6 +1106,11 @@ impl CodingHarness {
         if !shell_nudged_this_turn {
             vars.shell_nudge_count = 0;
         }
+
+        // Record whether THIS turn repeated a call (dedup-caught or the exact same
+        // batch as last turn), so next turn's live context explains the re-prompt
+        // only when actually looping.
+        vars.last_turn_had_repeat = dedup_hits > 0 || vars.repeated_tool_count > 0;
 
         // Backpressure on very large single-turn fan-outs.
         if real_work_count >= LARGE_TOOL_BATCH {
@@ -1422,10 +1448,10 @@ fn build_live_context(
     block.push_str("\n[workspace]\n");
     block.push_str(&format!("cwd = \"{}\"\n", workspace.display()));
     block.push_str(
-        "note = \"this is your current working directory — the project you are operating on. \
-         Resolve relative paths against it, run shell commands from here, and keep file work within \
-         it unless the user points you at an absolute path elsewhere. Ground your understanding of \
-         'this folder / this project / here' in THIS path.\"\n",
+        "note = \"this is your current working directory — the project you are operating on by \
+         default. Resolve relative paths against it and run shell commands from here, and ground \
+         'this folder / this project / here' in THIS path. It is NOT a boundary, though: you can \
+         read/edit any absolute path or ~ elsewhere when the task calls for it.\"\n",
     );
 
     if let Some(latest) = latest_user_input(state) {
@@ -1433,16 +1459,23 @@ fn build_live_context(
         block.push_str(&format!("text = \"{}\"\n", sanitize_one_line(&latest)));
     }
 
+    // Surface the model's prior-turn reasoning so it can build on it instead of
+    // re-deriving (experimental; conversation only).
+    if let Some(thought) = vars.last_thought.as_deref() {
+        block.push_str("\n[last_thought]\n");
+        block.push_str("# what you were thinking last turn — continue from it, don't re-derive.\n");
+        block.push_str(&format!("text = \"{}\"\n", sanitize_one_line(thought)));
+    }
+
     block.push_str("\n[turn]\n");
-    // Tell the model WHY it's being invoked again: its last tool call(s) returned,
-    // so it should read the results and move forward — not re-issue the same calls.
-    if matches!(state.messages.last(), Some(HarnessMessage::ToolResult { .. })) {
+    // Explain the re-prompt ONLY when actually looping (a repeated/duplicate call
+    // last turn) — not after every normal tool result.
+    if vars.last_turn_had_repeat {
         block.push_str(
-            "why_now = \"you are being invoked again because your previous turn's tool call(s) \
-             RETURNED — their results are in your history just above. That is the only reason for \
-             this turn. Read those results and take the NEXT step: analyse what came back, act on \
-             it, or finish. Do NOT re-issue calls you already made or re-state what you already \
-             said — each turn must move forward.\"\n",
+            "why_now = \"you just repeated a tool call you had already made this request — that is \
+             why you are back. Its result is already in your history above; re-issuing it advances \
+             nothing. Stop repeating, read what you already have, and take a genuinely NEW step or \
+             finish.\"\n",
         );
     }
     block.push_str("continue = \"to keep working, make tool calls — their results arrive next turn\"\n");
