@@ -87,7 +87,7 @@ impl ExitInfo {
         }
         if self.total_tokens > 0 {
             println!(
-                "tokens — ↑{} in · ↓{} out · ⟳{} cached · {} total",
+                "tokens — ↑{} in · ↓{} out · ↻{} cached · {} total",
                 fmt_si(self.prompt_tokens),
                 fmt_si(self.completion_tokens),
                 fmt_si(self.cache_read_tokens),
@@ -1868,22 +1868,24 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         first = false;
     }
 
+    // Reasoning/thinking the model returned, shown dimmed and distinct from the
+    // answer. DEBUG: rendered whenever present (not just while working) and never
+    // cleared, while experimenting with the thinking display.
+    let thinking = crate::llm::StreamBuffer::snapshot_thinking(&app.stream);
+    let thinking = thinking.trim_end();
+    if !thinking.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        for seg in wrap_one(thinking, width.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(seg, Style::default().fg(Color::DarkGray))));
+        }
+    }
+
     // Live "working…" feedback at the tail while the agent is processing (or a lane is).
     let working = state.status == HarnessStatus::Running
         || state.lanes.iter().any(|lane| lane.status == LaneStatus::Running);
     if working && app.agent_alive() {
-        // Reasoning/thinking the model is streaming (when it returns any), shown
-        // dimmed above the answer so it reads as distinct from the response.
-        let thinking = crate::llm::StreamBuffer::snapshot_thinking(&app.stream);
-        let thinking = thinking.trim_end();
-        if !thinking.is_empty() {
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            for seg in wrap_one(thinking, width.saturating_sub(2)) {
-                lines.push(Line::from(Span::styled(seg, Style::default().fg(Color::DarkGray))));
-            }
-        }
         // Text the model is streaming this turn, shown live until it commits to a
         // durable AssistantText event (then refresh_state clears the buffer).
         let live = crate::llm::StreamBuffer::snapshot(&app.stream);
@@ -3071,29 +3073,32 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let style = Style::default().fg(subtle().fg.unwrap());
     
-    // ↑ input · ↓ output · ⟳ cache-read (cumulative) · ctx = current context
+    // ↑ input · ↓ output · ↻ cache-read (cumulative) · ctx = current context
     // fill (prompt tokens of the most recent request, which grows as the
-    // conversation accretes).
+    // conversation accretes). Icons are arrow-family glyphs (↑ ↓ ↻) that render a
+    // single column everywhere — avoid wide/emoji symbols here, they spill a cell
+    // and overlap the right-aligned model label.
     let st = app.state.as_ref();
-    let left_text = format!("📂 {}  |  ↑{} ↓{} ⟳{}  ·  ctx {}  ",
+    let left_text = format!("📂 {}  |  ↑{} ↓{} ↻{}  ·  ctx {}  ",
         app.cwd_display,
         fmt_si(st.map(|s| s.prompt_tokens).unwrap_or(0)),
         fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0)),
         fmt_si(st.map(|s| s.cache_read_tokens).unwrap_or(0)),
         fmt_si(st.map(|s| s.last_prompt_tokens).unwrap_or(0)),
     );
-    
+
     let model = app.options.config.model.model.clone();
     let right_text = format!("model: {}", model);
-    
+
     let left_span = Span::styled(left_text, style);
     let right_span = Span::styled(right_text, style);
-    
+
+    // Reserve the model column plus a 2-cell gap so nothing abuts/overlaps it.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(10),
-            Constraint::Length(right_span.width() as u16),
+            Constraint::Length(right_span.width() as u16 + 2),
         ])
         .split(area);
         
