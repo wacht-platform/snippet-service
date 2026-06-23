@@ -3070,19 +3070,22 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             }
             lines.extend(render_prose(live, width));
         }
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
-        }
         // Compaction has its own animated bar directly above the input box
-        // (render_compaction_bar); here we just show the generic working spinner.
-        let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{spinner} "),
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("working…", subtle()),
-        ]));
+        // (render_compaction_bar) — suppress the generic "working…" line then so
+        // only the compaction animation shows.
+        if !app.is_compacting() {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{spinner} "),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("working…", subtle()),
+            ]));
+        }
     }
     // Append inline login Q&A if active
     lines.extend(login_lines(app, width));
