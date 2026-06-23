@@ -22,6 +22,7 @@ pub fn coding_tools(exa_api_key: Option<String>) -> ToolRegistry {
     registry.insert(SearchFilesTool);
     registry.insert(SearchContentTool);
     registry.insert(ViewOutlineTool);
+    registry.insert(CodeMapTool);
     registry.insert(BashTool);
     // web_search / web_read are offered only when an Exa key is configured.
     if let Some(key) = exa_api_key.filter(|k| !k.trim().is_empty()) {
@@ -358,23 +359,146 @@ impl Tool for EditFileTool {
         let path = ctx.resolve_workspace_path(&args.path)?;
         ctx.check_write(&path)?;
         let content = tokio::fs::read_to_string(&path).await?;
-        if !content.contains(&args.old_string) {
-            return Err(ToolError::msg(format!(
-                "old_string was not found in `{}`",
-                args.path
-            )));
+
+        // 1. Exact match — fast path.
+        let exact = content.matches(&args.old_string).count();
+        if exact > 0 {
+            if exact > 1 && !args.replace_all {
+                return Err(ToolError::msg(format!(
+                    "old_string matches {exact} places in `{}` — pass replace_all:true to change \
+                     every occurrence, or add surrounding lines so it's unique.",
+                    args.path
+                )));
+            }
+            let updated = if args.replace_all {
+                content.replace(&args.old_string, &args.new_string)
+            } else {
+                content.replacen(&args.old_string, &args.new_string, 1)
+            };
+            tokio::fs::write(&path, updated).await?;
+            ctx.record_change(&path);
+            return Ok(ToolResult::success(json!({"path": args.path, "edited": true})));
         }
-        let updated = if args.replace_all {
-            content.replace(&args.old_string, &args.new_string)
-        } else {
-            content.replacen(&args.old_string, &args.new_string, 1)
-        };
-        tokio::fs::write(&path, updated).await?;
-        ctx.record_change(&path);
-        Ok(ToolResult::success(
-            json!({"path": args.path, "edited": true}),
-        ))
+
+        // 2. Whitespace-flexible fallback (single edit): match line-by-line ignoring
+        // each line's indentation, then re-indent new_string to the file's actual
+        // indentation. Rescues the common failure where the text is right but the
+        // indentation is a few spaces off — instead of looping on "not found".
+        if !args.replace_all {
+            match flexible_replace(&content, &args.old_string, &args.new_string) {
+                Flex::Replaced(updated) => {
+                    tokio::fs::write(&path, updated).await?;
+                    ctx.record_change(&path);
+                    return Ok(ToolResult::success(json!({
+                        "path": args.path,
+                        "edited": true,
+                        "note": "matched ignoring indentation; re-indented to the file",
+                    })));
+                }
+                Flex::Ambiguous(n) => {
+                    return Err(ToolError::msg(format!(
+                        "old_string matches {n} places in `{}` once indentation is ignored — add \
+                         surrounding lines so it's unique.",
+                        args.path
+                    )));
+                }
+                Flex::NoMatch => {}
+            }
+        }
+
+        // 3. No match — return a diagnostic with the file region so the model can fix
+        // its old_string instead of blindly retrying the same near-miss.
+        Err(ToolError::msg(edit_diagnostic(&content, &args.old_string, &args.path)))
     }
+}
+
+fn leading_ws(s: &str) -> &str {
+    &s[..s.len() - s.trim_start().len()]
+}
+
+enum Flex {
+    Replaced(String),
+    Ambiguous(usize),
+    NoMatch,
+}
+
+/// Whitespace-tolerant single-block replace, working purely line-by-line (no byte
+/// math). Finds the lines whose trimmed text equals `old`'s trimmed lines; when
+/// exactly one block matches, rebuilds the file with `new` in its place,
+/// re-indented to the matched block's indentation. Skips CRLF files so it never
+/// rewrites line endings; those fall through to the diagnostic.
+fn flexible_replace(content: &str, old: &str, new: &str) -> Flex {
+    if content.contains('\r') {
+        return Flex::NoMatch;
+    }
+    let file_lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old.lines().collect();
+    let n = old_lines.len();
+    if n == 0 || file_lines.len() < n {
+        return Flex::NoMatch;
+    }
+    let want: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
+    let hits: Vec<usize> = (0..=file_lines.len() - n)
+        .filter(|&i| (0..n).all(|k| file_lines[i + k].trim() == want[k]))
+        .collect();
+    match hits.as_slice() {
+        [] => Flex::NoMatch,
+        &[i] => {
+            let file_indent = leading_ws(file_lines[i]);
+            let old_indent = leading_ws(old_lines.first().copied().unwrap_or(""));
+            let new_block = new.lines().map(|line| {
+                if line.trim().is_empty() {
+                    String::new()
+                } else {
+                    let body = line.strip_prefix(old_indent).unwrap_or(line);
+                    format!("{file_indent}{body}")
+                }
+            });
+            let mut out: Vec<String> = file_lines[..i].iter().map(|s| s.to_string()).collect();
+            out.extend(new_block);
+            out.extend(file_lines[i + n..].iter().map(|s| s.to_string()));
+            let mut joined = out.join("\n");
+            if content.ends_with('\n') {
+                joined.push('\n');
+            }
+            Flex::Replaced(joined)
+        }
+        more => Flex::Ambiguous(more.len()),
+    }
+}
+
+/// A helpful "not found" message: point the model at the file region near the
+/// first line of its old_string so it can copy the exact text.
+fn edit_diagnostic(content: &str, old: &str, path: &str) -> String {
+    let first = old.split('\n').map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let lines: Vec<&str> = content.lines().collect();
+    let near = (!first.is_empty())
+        .then(|| {
+            lines
+                .iter()
+                .position(|l| l.trim() == first)
+                .or_else(|| lines.iter().position(|l| l.trim().contains(first)))
+        })
+        .flatten();
+    let mut msg = format!(
+        "old_string was not found in `{path}`. It doesn't match the file byte-for-byte — usually a \
+         whitespace/indentation difference, or a line that isn't actually there. Copy the snippet \
+         EXACTLY as read_file shows it (including leading spaces), keep it small, and make it unique."
+    );
+    if let Some(idx) = near {
+        let lo = idx.saturating_sub(2);
+        let hi = (idx + 8).min(lines.len());
+        let region = lines[lo..hi]
+            .iter()
+            .enumerate()
+            .map(|(k, l)| format!("{:>4}| {l}", lo + k + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        msg.push_str(&format!(
+            "\n\nThe file near the first line of your old_string (use this exact text):\n{region}"
+        ));
+    }
+    msg
 }
 
 pub struct ListFilesTool;
@@ -714,7 +838,7 @@ impl Tool for SearchContentTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Directory to search within (relative to workspace root). Defaults to workspace root."
+                        "description": "File or directory to search within (relative to workspace root). A file searches just that file; a directory is walked recursively. Defaults to the workspace root."
                     },
                     "extensions": {
                         "type": "array",
@@ -728,9 +852,9 @@ impl Tool for SearchContentTool {
                     "max_results": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 500,
-                        "default": 200,
-                        "description": "Maximum number of matching lines to return."
+                        "maximum": 150,
+                        "default": 150,
+                        "description": "Maximum number of matching lines to return (capped at 150)."
                     }
                 }),
                 &["query"],
@@ -754,10 +878,65 @@ impl Tool for SearchContentTool {
                 .collect()
         });
         
-        let max_results = args.max_results;
-        
+        // Clamp so the result stays under the inline ceiling and is never spilled to
+        // a scratch file (which would drop the `count` and render as "0 matches").
+        let max_results = args.max_results.min(150);
+        let case_sensitive = args.case_sensitive;
+
         let found = tokio::task::spawn_blocking(move || {
             let mut results: Vec<Value> = Vec::new();
+
+            // Scan one file for the query; returns true once max_results is reached.
+            let scan_file = |path: &std::path::Path, results: &mut Vec<Value>| -> bool {
+                if let Some(exts) = &ext_set {
+                    let ext_ok = path
+                        .extension()
+                        .map(|e| exts.contains(&e.to_string_lossy().to_lowercase()))
+                        .unwrap_or(false);
+                    if !ext_ok {
+                        return false;
+                    }
+                }
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    return false; // skip binary/unreadable files
+                };
+                let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
+                for (idx, line) in content.lines().enumerate() {
+                    let line_to_check = if case_sensitive {
+                        line.to_string()
+                    } else {
+                        line.to_lowercase()
+                    };
+                    if line_to_check.contains(&query) {
+                        // Truncate long/minified lines so a big match set can't blow
+                        // past the inline ceiling and get spilled.
+                        let trimmed = line.trim();
+                        let snippet: String = if trimmed.chars().count() > 200 {
+                            trimmed.chars().take(200).collect::<String>() + "…"
+                        } else {
+                            trimmed.to_string()
+                        };
+                        results.push(json!({
+                            "path": rel.display().to_string(),
+                            "line_number": idx + 1,
+                            "content": snippet,
+                        }));
+                        if results.len() >= max_results {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
+
+            // A FILE path searches just that file; a DIRECTORY (or the workspace root)
+            // is walked recursively. This makes `path` work whether the model scopes by
+            // file or by folder — previously a file path hit read_dir and returned 0.
+            if search_root.is_file() {
+                scan_file(&search_root, &mut results);
+                return results;
+            }
+
             let mut stack = vec![search_root];
             while let Some(dir) = stack.pop() {
                 let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -774,42 +953,8 @@ impl Tool for SearchContentTool {
                         }
                         continue;
                     }
-                    
-                    if let Some(exts) = &ext_set {
-                        let ext_ok = entry
-                            .path()
-                            .extension()
-                            .map(|e| exts.contains(&e.to_string_lossy().to_lowercase()))
-                            .unwrap_or(false);
-                        if !ext_ok {
-                            continue;
-                        }
-                    }
-                    
-                    let path = entry.path();
-                    let Ok(content) = std::fs::read_to_string(&path) else {
-                        // Skip binary files
-                        continue;
-                    };
-                    
-                    let rel = path.strip_prefix(&workspace_root).unwrap_or(&path);
-                    for (idx, line) in content.lines().enumerate() {
-                        let line_to_check = if args.case_sensitive {
-                            line.to_string()
-                        } else {
-                            line.to_lowercase()
-                        };
-                        
-                        if line_to_check.contains(&query) {
-                            results.push(json!({
-                                "path": rel.display().to_string(),
-                                "line_number": idx + 1,
-                                "content": line.trim(),
-                            }));
-                            if results.len() >= max_results {
-                                return results;
-                            }
-                        }
+                    if scan_file(&entry.path(), &mut results) {
+                        return results;
                     }
                 }
             }
@@ -817,12 +962,138 @@ impl Tool for SearchContentTool {
         })
         .await
         .map_err(|e| ToolError::msg(format!("search_content failed: {e}")))?;
-        
-        Ok(ToolResult::success(json!({
+
+        let capped = found.len() >= max_results;
+        let mut out = json!({
             "query": args.query,
             "count": found.len(),
             "results": found,
-        })))
+            "truncated": capped,
+        });
+        if capped {
+            out["hint"] = json!(
+                "result list was capped — there may be more matches; narrow the query or pass a \
+                 `path` to focus the search"
+            );
+        }
+        Ok(ToolResult::success(out))
+    }
+}
+
+pub struct CodeMapTool;
+
+#[derive(Debug, Deserialize)]
+struct CodeMapArgs {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+#[async_trait]
+impl Tool for CodeMapTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "code_map".to_string(),
+            description: "Map the declarations (functions, types, methods, classes) across the \
+                whole project (or a subdirectory), grouped by file, via language-aware parsing — \
+                a fast way to learn what exists and where before reading. Optionally narrow with \
+                `path` (a subdirectory) and/or `query` (only symbols whose signature contains the \
+                text). Respects .gitignore. Covers the same languages as view_outline; other \
+                languages are skipped (use search_content for those)."
+                .to_string(),
+            input_schema: object_schema(
+                json!({
+                    "path": {"type": "string", "description": "Subdirectory to map (relative to workspace root). Defaults to the whole project."},
+                    "query": {"type": "string", "description": "Only include symbols whose signature contains this text (case-insensitive)."}
+                }),
+                &[],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: CodeMapArgs = expect_object("code_map", arguments)?;
+        let root = match &args.path {
+            Some(p) => ctx.resolve_workspace_path(p)?,
+            None => ctx.workspace_root().to_path_buf(),
+        };
+        let root_label = args.path.clone().unwrap_or_else(|| ".".to_string());
+        let workspace_root = ctx.workspace_root().to_path_buf();
+        let query = args.query.map(|q| q.to_lowercase());
+
+        // Bounded so the result never trips the inline-output spill (which would drop
+        // counts). The model narrows with `path`/`query` for anything bigger.
+        const MAX_FILES: usize = 300;
+        const MAX_SYMBOLS: usize = 300;
+        const MAX_PER_FILE: usize = 40;
+
+        let (files, symbol_count, truncated) = tokio::task::spawn_blocking(move || {
+            let mut files: Vec<Value> = Vec::new();
+            let mut symbol_count = 0usize;
+            let mut file_count = 0usize;
+            let mut truncated = false;
+            for entry in ignore::WalkBuilder::new(&root).build() {
+                let Ok(entry) = entry else { continue };
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let path = entry.path();
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if !crate::outline::is_supported(&ext) {
+                    continue;
+                }
+                if file_count >= MAX_FILES || symbol_count >= MAX_SYMBOLS {
+                    truncated = true;
+                    break;
+                }
+                file_count += 1;
+                let Ok(content) = std::fs::read_to_string(path) else { continue };
+                let Some(symbols) = crate::outline::outline_source(&ext, &content) else { continue };
+                let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
+                let mut items: Vec<String> = Vec::new();
+                for s in &symbols {
+                    if let Some(q) = &query {
+                        if !s.signature.to_lowercase().contains(q.as_str()) {
+                            continue;
+                        }
+                    }
+                    if items.len() >= MAX_PER_FILE {
+                        break;
+                    }
+                    items.push(format!("{} {} :{}", s.kind, s.signature, s.line));
+                    symbol_count += 1;
+                    if symbol_count >= MAX_SYMBOLS {
+                        truncated = true;
+                        break;
+                    }
+                }
+                if !items.is_empty() {
+                    files.push(json!({ "path": rel.display().to_string(), "symbols": items }));
+                }
+            }
+            (files, symbol_count, truncated)
+        })
+        .await
+        .map_err(|e| ToolError::msg(format!("code_map failed: {e}")))?;
+
+        let mut out = json!({
+            "root": root_label,
+            "file_count": files.len(),
+            "symbol_count": symbol_count,
+            "files": files,
+            "truncated": truncated,
+        });
+        if truncated {
+            out["hint"] = json!(
+                "map was capped — narrow with `path` (a subdirectory) or `query` to see the rest"
+            );
+        }
+        Ok(ToolResult::success(out))
     }
 }
 
@@ -842,9 +1113,11 @@ impl Tool for ViewOutlineTool {
                 (functions, structs, enums, traits, classes, methods) with line numbers. Use it to \
                 see what a file contains and where things are defined WITHOUT reading the whole \
                 file — far cheaper than read_file for a large file or a first-pass overview; then \
-                read_file the specific lines you actually need. Takes a single code FILE path \
-                (Rust, Python, Go, JS/TS). If given a directory it just lists the folder's contents \
-                (use list_files for that), then point view_outline at a specific file."
+                read_file the specific lines you actually need. Parses Rust, Python, JavaScript, \
+                TypeScript/TSX, Go, Java, C, and C++ (real signatures + doc comments); other \
+                languages return a 'not supported' note — use search_content / read_file there. \
+                If given a directory it lists the folder's contents (use list_files for that), \
+                then point view_outline at a specific file."
                 .to_string(),
             input_schema: object_schema(
                 json!({
@@ -890,63 +1163,41 @@ impl Tool for ViewOutlineTool {
             .unwrap_or("")
             .to_lowercase();
 
-        let outline_lines: Vec<Value> = content
-            .lines()
-            .enumerate()
-            .filter_map(|(idx, line)| {
-                let trimmed = line.trim();
-                let is_outline = match ext.as_str() {
-                    "rs" => {
-                        trimmed.starts_with("fn ") 
-                        || trimmed.starts_with("pub fn ") 
-                        || trimmed.starts_with("struct ") 
-                        || trimmed.starts_with("pub struct ") 
-                        || trimmed.starts_with("enum ") 
-                        || trimmed.starts_with("pub enum ") 
-                        || trimmed.starts_with("impl ") 
-                        || trimmed.starts_with("pub impl ") 
-                        || trimmed.starts_with("trait ") 
-                        || trimmed.starts_with("pub trait ") 
-                        || trimmed.starts_with("mod ") 
-                        || trimmed.starts_with("pub mod ")
+        // Tree-sitter structural outline (real signatures + the language's doc-comment
+        // standard, with nested methods) for bundled languages; unsupported languages
+        // get an honest "not supported" note rather than a fake heuristic.
+        if let Some(symbols) = crate::outline::outline_source(&ext, &content) {
+            let items: Vec<Value> = symbols
+                .iter()
+                .map(|s| {
+                    let mut o = json!({
+                        "kind": s.kind,
+                        "signature": s.signature,
+                        "line_number": s.line,
+                        "depth": s.depth,
+                    });
+                    if let Some(doc) = &s.doc {
+                        o["doc"] = json!(doc);
                     }
-                    "py" => {
-                        trimmed.starts_with("def ") 
-                        || trimmed.starts_with("class ")
-                    }
-                    "go" => {
-                        trimmed.starts_with("func ") 
-                        || (trimmed.starts_with("type ") && (trimmed.contains("struct") || trimmed.contains("interface")))
-                    }
-                    "js" | "ts" | "jsx" | "tsx" => {
-                        trimmed.starts_with("class ") 
-                        || trimmed.starts_with("export class ") 
-                        || trimmed.starts_with("function ") 
-                        || trimmed.starts_with("export function ") 
-                        || (trimmed.starts_with("const ") && (trimmed.contains("=>") || trimmed.contains("function")))
-                    }
-                    _ => {
-                        trimmed.starts_with("fn ") 
-                        || trimmed.starts_with("def ") 
-                        || trimmed.starts_with("class ") 
-                        || trimmed.starts_with("struct ")
-                    }
-                };
-
-                if is_outline {
-                    Some(json!({
-                        "line_number": idx + 1,
-                        "content": line.to_string(),
-                    }))
-                } else {
-                    None
-                }
-            })
-            .collect();
+                    o
+                })
+                .collect();
+            return Ok(ToolResult::success(json!({
+                "path": args.path,
+                "language": ext,
+                "symbol_count": items.len(),
+                "outline": items,
+            })));
+        }
 
         Ok(ToolResult::success(json!({
             "path": args.path,
-            "outline": outline_lines,
+            "supported": false,
+            "note": format!(
+                "No structural outline for `.{ext}` files — view_outline supports rust, python, \
+                 javascript, typescript, tsx, go, java, c, c++. Use search_content to locate \
+                 definitions, or read_file to read this file directly."
+            ),
         })))
     }
 }

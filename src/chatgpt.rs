@@ -351,7 +351,6 @@ fn build_responses_request(
         "parallel_tool_calls": true,
         "store": false,
         "stream": true,
-        "prompt_cache_key": null,
     });
     let obj = body.as_object_mut().expect("object");
     if !instructions.is_empty() {

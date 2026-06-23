@@ -1118,20 +1118,8 @@ impl CodingHarness {
             if DEDUP_TOOLS.contains(&tool_name.as_str())
                 && vars.executed_calls.contains(&signature)
             {
-                let result = tool_error(format!(
-                    "Duplicate call: you already ran `{tool_name}` with these exact arguments \
-                     this turn — its result is already in your history above. Don't repeat it; \
-                     use what you have and move to the next step (or finish if you're done)."
-                ));
-                state.events.push(HarnessEvent::ToolResult {
-                    tool_name: tool_name.clone(),
-                    result: result.clone(),
-                });
-                state.messages.push(HarnessMessage::ToolResult {
-                    tool_call_id: call_id,
-                    tool_name,
-                    content: result,
-                });
+                // Already seen this exact discovery call; silently skip it so the
+                // turn can continue instead of re-surfacing the same warning.
                 dedup_hits += 1;
                 continue;
             }

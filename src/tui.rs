@@ -3100,16 +3100,25 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
         HarnessEvent::AssistantText { text } => render_prose(text, width),
         HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", muted(), entry, width),
         HarnessEvent::SystemDecision { step, reasoning } => {
-            if step == "history_compaction_pass" || step == "history_compaction_skipped" {
-                // Not shown in scrollback — compaction is conveyed live by the
-                // animated banner and, once done, by the divider below.
+            if step == "history_compaction_pass" {
+                // Keep the live banner only during the turn; the durable
+                // transcript entry comes from `history_compacted` below.
                 Vec::new()
+            } else if step == "history_compaction_skipped" {
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("  ───────────  ✦ compaction skipped: {reasoning} ───────────"),
+                        Style::default().fg(muted()),
+                    )),
+                    Line::from(""),
+                ]
             } else if step == "history_compacted" {
                 // A clean boundary; everything above it is collapsed by transcript_lines.
                 vec![
                     Line::from(""),
                     Line::from(Span::styled(
-                        "  ───────────  ✦ context compacted  ───────────",
+                        format!("  ───────────  ✦ context compacted: {reasoning} ───────────"),
                         Style::default().fg(muted()),
                     )),
                     Line::from(""),
