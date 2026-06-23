@@ -262,7 +262,10 @@ enum StepResult {
         kind: TurnEndKind,
         final_text: Option<String>,
     },
-    ModelError(String),
+    /// The model request failed. `retryable` is false for fatal errors
+    /// (auth/permission/not-found/bad-request) so the loop gives up at once
+    /// instead of re-running the whole step and flooding the transcript.
+    ModelError { message: String, retryable: bool },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -339,11 +342,18 @@ impl CodingHarness {
                         iterations: iteration,
                     });
                 }
-                StepResult::ModelError(message) => {
+                StepResult::ModelError { message, retryable } => {
                     state.events.push(HarnessEvent::ModelError {
                         message: message.clone(),
                     });
-                    match self.recover(&mut state, &mut consecutive_errors).await {
+                    // Fatal errors (auth/permission/not-found/bad-request) never
+                    // succeed on retry — give up at once instead of recovering.
+                    let action = if retryable {
+                        self.recover(&mut state, &mut consecutive_errors).await
+                    } else {
+                        RecoveryAction::GiveUp
+                    };
+                    match action {
                         RecoveryAction::Retry => {
                             self.persist(&mut state, &lanes).await?;
                             continue;
@@ -476,15 +486,45 @@ impl CodingHarness {
                         vars.steps_since_visible = 0;
                         self.persist(&mut state, &lanes).await?;
                     }
-                    StepResult::ModelError(message) => {
+                    StepResult::ModelError { message, retryable } => {
                         state.events.push(HarnessEvent::ModelError {
                             message: message.clone(),
                         });
-                        match self.recover(&mut state, &mut consecutive_errors).await {
-                            RecoveryAction::Retry => {
+                        // Fatal errors never recover — fail at once, no backoff.
+                        if !retryable {
+                            state.status = HarnessStatus::Failed;
+                            self.persist(&mut state, &lanes).await?;
+                            break;
+                        }
+                        // Race the recovery backoff against the input channel so
+                        // Esc cancels during the wait instead of after it.
+                        let action = {
+                            let recover_fut = self.recover(&mut state, &mut consecutive_errors);
+                            tokio::pin!(recover_fut);
+                            loop {
+                                tokio::select! {
+                                    a = &mut recover_fut => break Some(a),
+                                    msg = input_rx.recv() => match msg {
+                                        Some(LoopInput::Interrupt) | None => break None,
+                                        Some(other) => pending_inputs.push(other),
+                                    }
+                                }
+                            }
+                        };
+                        match action {
+                            None => {
+                                state.status = HarnessStatus::Interrupted;
+                                state.events.push(HarnessEvent::SystemDecision {
+                                    step: "interrupted".to_string(),
+                                    reasoning: "User interrupted the run.".to_string(),
+                                });
+                                self.persist(&mut state, &lanes).await?;
+                                break;
+                            }
+                            Some(RecoveryAction::Retry) => {
                                 self.persist(&mut state, &lanes).await?;
                             }
-                            RecoveryAction::GiveUp => {
+                            Some(RecoveryAction::GiveUp) => {
                                 state.status = HarnessStatus::Failed;
                                 self.persist(&mut state, &lanes).await?;
                                 break;
@@ -554,7 +594,7 @@ impl CodingHarness {
     /// actually SEE the image. Done per-turn on the cloned request only (never
     /// persisted), so state stays lean and images re-inline fresh each turn.
     /// Providers turn the inlined bytes into real image blocks.
-    fn inline_images(&self, messages: &mut [HarnessMessage]) {
+    fn inline_images(&self, messages: &mut [HarnessMessage], supports_images: bool) {
         use base64::{Engine, engine::general_purpose::STANDARD};
         // Skip absurdly large images so a request can't balloon unboundedly.
         const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
@@ -572,6 +612,19 @@ impl CodingHarness {
             else {
                 continue;
             };
+            // Text-only model: never inline image bytes (it 400s and poisons every
+            // later turn). Leave a note so the model knows an image was read.
+            if !supports_images {
+                if let Some(data) = content.get_mut("data").and_then(Value::as_object_mut) {
+                    data.insert(
+                        "image_note".to_string(),
+                        Value::String(format!(
+                            "[image at {path} not shown — the current model is text-only]"
+                        )),
+                    );
+                }
+                continue;
+            }
             let Ok(resolved) = self.context.resolve_workspace_path(&path) else {
                 continue;
             };
@@ -732,7 +785,7 @@ impl CodingHarness {
         // sent to the model but never persisted into `state.messages`, so signals
         // re-ground the model each turn instead of accumulating as stale nudges.
         let mut request_messages = state.messages.clone();
-        self.inline_images(&mut request_messages);
+        self.inline_images(&mut request_messages, model.supports_images());
         request_messages.push(HarnessMessage::User {
             content: build_live_context(state, vars, conversation_mode, self.context.workspace_root()),
         });
@@ -751,7 +804,12 @@ impl CodingHarness {
             .await
         {
             Ok(output) => output,
-            Err(error) => return StepResult::ModelError(error.to_string()),
+            Err(error) => {
+                return StepResult::ModelError {
+                    retryable: error.retryable(),
+                    message: error.to_string(),
+                };
+            }
         };
         // Capture this turn's reasoning (from the sink) so the next turn's live
         // context can surface "what you thought last time". Bounded so it can't
@@ -1067,6 +1125,12 @@ impl CodingHarness {
                     }
                 }
             }
+
+            // Surface the in-flight call before running it so a slow tool (bash,
+            // web fetch) isn't a black box — the TUI shows this ToolCall with a
+            // "running" indicator until its result lands. Best-effort; the
+            // end-of-step persist in the run loop is authoritative.
+            let _ = self.persist(state, lanes).await;
 
             let result = match self
                 .tools
@@ -1454,10 +1518,8 @@ fn build_live_context(
          read/edit any absolute path or ~ elsewhere when the task calls for it.\"\n",
     );
 
-    if let Some(latest) = latest_user_input(state) {
-        block.push_str("\n[most_recent_user_input]\n");
-        block.push_str(&format!("text = \"{}\"\n", sanitize_one_line(&latest)));
-    }
+    // The user's message is already in the durable history (sent verbatim every
+    // request), so we don't re-echo it here — that was redundant.
 
     // Surface the model's prior-turn reasoning so it can build on it instead of
     // re-deriving (experimental; conversation only).
@@ -1468,6 +1530,17 @@ fn build_live_context(
     }
 
     block.push_str("\n[turn]\n");
+    // Keep this terse and goal-oriented: spelling out WHY the turn fired gave weak
+    // models a script to recite ("the harness auto-continued because my tool
+    // returned…"). Point attention AWAY from the re-prompt and TOWARD finishing the
+    // task — no mechanism description to parrot.
+    block.push_str(
+        "auto_continuation = \"internal steering, not a user message — never describe or mention it, \
+         the loop, or that you were re-prompted, in your reply OR your reasoning. Spend no thought on \
+         WHY this turn fired; reason about the OVERALL GOAL — what you're trying to accomplish and \
+         what still remains — and take the next concrete step toward completing it (or give the final \
+         answer if it's done).\"\n",
+    );
     // Explain the re-prompt ONLY when actually looping (a repeated/duplicate call
     // last turn) — not after every normal tool result.
     if vars.last_turn_had_repeat {

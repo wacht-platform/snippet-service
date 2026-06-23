@@ -20,6 +20,8 @@ pub struct AnthropicConfig {
     pub initial_retry_ms: u64,
     pub max_retry_ms: u64,
     pub cache_prompt: bool,
+    pub supports_images: bool,
+    pub reasoning_effort: Option<String>,
 }
 
 pub struct AnthropicModel {
@@ -38,6 +40,10 @@ impl AnthropicModel {
 
 #[async_trait]
 impl AgentModel for AnthropicModel {
+    fn supports_images(&self) -> bool {
+        self.config.supports_images
+    }
+
     async fn generate(
         &mut self,
         messages: &[HarnessMessage],
@@ -133,14 +139,30 @@ impl AnthropicModel {
             None
         };
 
+        // Extended thinking: when reasoning is requested, enable it with a budget
+        // and bump max_tokens above the budget. Anthropic requires temperature to be
+        // unset (defaults to 1) when thinking is on, and forbids forced tool_choice
+        // with thinking — so drop both in that case.
+        let thinking_budget = anthropic_thinking_budget(self.config.reasoning_effort.as_deref());
+        let (thinking, max_tokens, temperature, tool_choice) = match thinking_budget {
+            Some(budget) => (
+                Some(json!({ "type": "enabled", "budget_tokens": budget })),
+                budget + 4096,
+                None,
+                None,
+            ),
+            None => (None, 4096, self.config.temperature, tool_choice),
+        };
+
         AnthropicRequest {
             model: self.config.model.clone(),
             messages: anthropic_messages,
-            max_tokens: 4096,
+            max_tokens,
             system,
             tools: anthropic_tools,
-            temperature: self.config.temperature,
+            temperature,
             tool_choice,
+            thinking,
             stream: stream.then_some(true),
         }
     }
@@ -160,8 +182,11 @@ impl AnthropicModel {
         let body = self.build_anthropic_request(messages, tools, force_tool, true);
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
+        let mut fatal = false;
+        let mut attempts = 0u32;
 
         for attempt in 1..=max_attempts {
+            attempts = attempt;
             StreamBuffer::clear(sink);
             let response = self
                 .client
@@ -182,7 +207,11 @@ impl AnthropicModel {
                     let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                     let response_body = response.text().await.unwrap_or_default();
                     last_error = format!("HTTP {status}: {response_body}");
-                    if !is_retryable_status(status) || attempt == max_attempts {
+                    if !is_retryable_status(status) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
                     sleep(retry_delay(
@@ -195,7 +224,11 @@ impl AnthropicModel {
                 }
                 Err(error) => {
                     last_error = error.to_string();
-                    if !is_retryable_transport_error(&error) || attempt == max_attempts {
+                    if !is_retryable_transport_error(&error) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
                     sleep(retry_delay(
@@ -210,17 +243,20 @@ impl AnthropicModel {
         }
 
         StreamBuffer::clear(sink);
-        Err(ToolError::msg(format!(
-            "anthropic streaming request failed after {} attempt(s): {}",
-            max_attempts, last_error
-        )))
+        Err(ToolError::model_request(
+            format!("anthropic streaming request failed after {attempts} attempt(s): {last_error}"),
+            !fatal,
+        ))
     }
 
     async fn send_with_retries(&self, url: &str, body: &AnthropicRequest) -> Result<Vec<u8>, ToolError> {
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
+        let mut fatal = false;
+        let mut attempts = 0u32;
 
         for attempt in 1..=max_attempts {
+            attempts = attempt;
             let response = self
                 .client
                 .post(url)
@@ -245,7 +281,11 @@ impl AnthropicModel {
 
                     let response_body = String::from_utf8_lossy(&bytes).to_string();
                     last_error = format!("HTTP {status}: {response_body}");
-                    if !is_retryable_status(status) || attempt == max_attempts {
+                    if !is_retryable_status(status) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
 
@@ -259,7 +299,11 @@ impl AnthropicModel {
                 }
                 Err(error) => {
                     last_error = error.to_string();
-                    if !is_retryable_transport_error(&error) || attempt == max_attempts {
+                    if !is_retryable_transport_error(&error) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
                     sleep(retry_delay(
@@ -273,10 +317,10 @@ impl AnthropicModel {
             }
         }
 
-        Err(ToolError::msg(format!(
-            "anthropic model request failed after {} attempt(s): {}",
-            max_attempts, last_error
-        )))
+        Err(ToolError::model_request(
+            format!("anthropic model request failed after {attempts} attempt(s): {last_error}"),
+            !fatal,
+        ))
     }
 }
 
@@ -473,7 +517,20 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+}
+
+/// Map a unified reasoning-effort level to an Anthropic extended-thinking budget
+/// (tokens). `off`/unset/unknown → no extended thinking.
+fn anthropic_thinking_budget(effort: Option<&str>) -> Option<u32> {
+    match effort?.to_ascii_lowercase().as_str() {
+        "low" => Some(2048),
+        "medium" => Some(8192),
+        "high" => Some(16384),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Serialize)]

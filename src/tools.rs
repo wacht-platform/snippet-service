@@ -22,11 +22,32 @@ pub enum ToolError {
     InvalidArguments { tool: String },
     #[error("path `{path}` escapes workspace root `{root}`")]
     PathEscapesWorkspace { path: String, root: String },
+    /// A model request that failed, tagged with whether a retry could plausibly
+    /// help. Fatal (`retryable: false`) covers auth/permission/not-found/bad-
+    /// request — retrying those just floods the screen and never succeeds.
+    #[error("{message}")]
+    ModelRequest { message: String, retryable: bool },
 }
 
 impl ToolError {
     pub fn msg(message: impl Into<String>) -> Self {
         Self::Message(message.into())
+    }
+
+    pub fn model_request(message: impl Into<String>, retryable: bool) -> Self {
+        Self::ModelRequest {
+            message: message.into(),
+            retryable,
+        }
+    }
+
+    /// Whether the harness should attempt recovery after this error. Non-model
+    /// errors default to retryable (treated as transient until proven otherwise).
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::ModelRequest { retryable, .. } => *retryable,
+            _ => true,
+        }
     }
 }
 

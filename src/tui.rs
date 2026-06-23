@@ -87,7 +87,7 @@ impl ExitInfo {
         }
         if self.total_tokens > 0 {
             println!(
-                "tokens — ↑{} in · ↓{} out · ↻{} cached · {} total",
+                "↑{} in · ↓{} out · ↻{} cached · {} total",
                 fmt_si(self.prompt_tokens),
                 fmt_si(self.completion_tokens),
                 fmt_si(self.cache_read_tokens),
@@ -102,7 +102,7 @@ impl ExitInfo {
         } else {
             format!(" --config {}", self.config_path.display())
         };
-        println!("resume — snippet --resume {}{}", self.conversation, config_flag);
+        println!("snippet --resume {}{}", self.conversation, config_flag);
     }
 }
 
@@ -476,8 +476,8 @@ impl App {
 
     /// Restore the workspace to the checkpoint whose id starts with `id_prefix`.
     fn rewind_to(&mut self, id_prefix: &str) {
-        if self.agent_alive() {
-            self.status = "Agent is running — stop it (Esc) before rewinding.".to_string();
+        if self.agent_busy() {
+            self.status = "Agent is working — stop it (Esc) before rewinding.".to_string();
             return;
         }
         let Some(state) = &self.state else {
@@ -581,8 +581,8 @@ impl App {
                 }
             }
             "/model" => {
-                if self.agent_alive() {
-                    self.status = "Agent is running. Finish or stop it before changing the model.".to_string();
+                if self.agent_busy() {
+                    self.status = "Agent is working. Stop it (Esc) before changing the model.".to_string();
                     return;
                 }
                 self.open_login();
@@ -726,13 +726,36 @@ impl App {
         match self.save_settings_to_file() {
             Ok(_) => {
                 self.close_login(false);
+                // The resident loop builds its model once at spawn, so a live
+                // (idle) loop won't pick up the change until it's restarted; it
+                // resumes the persisted conversation, so nothing is lost.
+                let resumed = self.restart_loop_for_config();
                 self.status = format!(
-                    "✓ Connected — {} · {}",
-                    self.options.config.model.provider, self.options.config.model.model
+                    "✓ Connected — {} · {}{}",
+                    self.options.config.model.provider,
+                    self.options.config.model.model,
+                    if resumed { " · resumed" } else { "" },
                 );
             }
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Apply a config change to the resident loop by restarting it. A live loop is
+    /// aborted (it's idle, waiting for input — guards ensure it isn't mid-turn) and
+    /// respawned with `resume`, continuing the conversation with the new model.
+    /// Returns `true` if a loop was actually restarted. No-op when none is running —
+    /// the next `spawn_loop` already uses the new config.
+    fn restart_loop_for_config(&mut self) -> bool {
+        if !self.agent_alive() {
+            return false;
+        }
+        if let Some(handle) = self.agent.take() {
+            handle.abort();
+        }
+        self.input_tx = None;
+        self.spawn_loop(None, true);
+        true
     }
 
     fn init_settings_form(&mut self) {
@@ -820,6 +843,18 @@ impl App {
             .as_ref()
             .map(|handle| !handle.is_finished())
             .unwrap_or(false)
+    }
+
+    /// `true` only while the agent is actively processing a turn (or a lane is).
+    /// The resident loop stays *alive* between turns waiting for input, so
+    /// `agent_alive()` is the wrong test for "is it safe to act now" — use this for
+    /// guards like `/model` and `/rewind` so they aren't blocked when merely idle.
+    fn agent_busy(&self) -> bool {
+        self.agent_alive()
+            && self.state.as_ref().is_some_and(|s| {
+                s.status == HarnessStatus::Running
+                    || s.lanes.iter().any(|l| l.status == LaneStatus::Running)
+            })
     }
 
     fn model_factory(&self) -> ModelFactory {
@@ -1654,7 +1689,7 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     // Render Header
     let header_text = vec![
         Span::styled("● snipett", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-        Span::styled("  |  Select a session to resume", Style::default().fg(Color::White)),
+        Span::styled("  |  Select a session to resume", Style::default().fg(TEXT)),
     ];
     frame.render_widget(Paragraph::new(Line::from(header_text)), chunks[0]);
 
@@ -1689,7 +1724,7 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     frame.render_widget(Paragraph::new(lines).block(list_block), chunks[1]);
 
     // Render Footer
-    let footer_style = Style::default().fg(Color::DarkGray);
+    let footer_style = Style::default().fg(MUTED);
     let footer_text = "↑/↓ scroll  ·  Enter resume selected  ·  Esc go back";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer_text, footer_style))),
@@ -1790,8 +1825,8 @@ fn render_suggestions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let line = if let Some(ref err) = app.error {
         Line::from(vec![
-            Span::styled("error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::styled(err.to_string(), Style::default().fg(Color::Red)),
+            Span::styled("error: ", Style::default().fg(DANGER).add_modifier(Modifier::BOLD)),
+            Span::styled(err.to_string(), Style::default().fg(DANGER)),
         ])
     } else {
         Line::from(vec![
@@ -1801,16 +1836,36 @@ fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) 
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, _app: &App) {
-    let text = vec![
-        Span::styled("● snipett", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
+fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let model = app.options.config.model.model.clone();
+    let name = " snipett";
+    let mut spans = vec![
+        Span::styled(name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(model.clone(), Style::default().fg(MUTED)),
+        Span::raw(" "),
     ];
-    frame.render_widget(Paragraph::new(Line::from(text)), area);
+    // Fill the rest of the row with a thin rule for a clean header rather than a
+    // bare glyph floating in empty space.
+    let used = name.chars().count() + 3 + model.chars().count() + 1;
+    let rule = (area.width as usize).saturating_sub(used + 1);
+    if rule > 0 {
+        spans.push(Span::styled("─".repeat(rule), Style::default().fg(FAINT)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let width = (area.width as usize).saturating_sub(1).max(20);
-    let height = area.height as usize;
+    // Inset the transcript by a 2-column left margin for a consistent gutter (the
+    // header/footer/input sit at a 1-column margin, so content reads as nested).
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: area.height,
+    };
+    let width = (inner.width as usize).saturating_sub(1).max(20);
+    let height = inner.height as usize;
     let lines = transcript_lines(app, width);
 
     let max_scroll = lines.len().saturating_sub(height);
@@ -1821,7 +1876,7 @@ fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let start = end.saturating_sub(height);
     let window = lines[start..end].to_vec();
 
-    frame.render_widget(Paragraph::new(window), area);
+    frame.render_widget(Paragraph::new(window), inner);
 }
 
 fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
@@ -1849,7 +1904,92 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         first = false;
     }
 
-    for event in &state.events {
+    let mut events = state.events.iter().peekable();
+    while let Some(event) = events.next() {
+        // Collapse a run of consecutive model errors (transient retries) into a
+        // single line with a count, so a retry storm doesn't flood the screen.
+        if let HarnessEvent::ModelError { message } = event {
+            let mut last = message.clone();
+            let mut count = 1usize;
+            while let Some(HarnessEvent::ModelError { message: next }) = events.peek() {
+                last = next.clone();
+                count += 1;
+                events.next();
+            }
+            if count > 1 {
+                last = format!("{last}  (×{count})");
+            }
+            if !first {
+                lines.push(Line::from(""));
+            }
+            lines.extend(marker_block("✗ ", "", DANGER, &last, width));
+            prev_tool_row = false;
+            first = false;
+            continue;
+        }
+
+        // Tool call: render `● Verb  arg` and, when the next event is a one-line
+        // result for it, merge that summary onto the same row, right-aligned.
+        if let HarnessEvent::ToolCall { tool_name, arguments } = event {
+            if HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
+                // Drop the paired hidden result too, so no orphan row renders.
+                if let Some(HarnessEvent::ToolResult { tool_name: rn, .. }) = events.peek() {
+                    if HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
+                        events.next();
+                    }
+                }
+                continue;
+            }
+            let mut call_lines = tool_call_lines(tool_name, arguments, width);
+            // The result is pushed right after the call, so a call with NO following
+            // result is the in-flight one (persisted just before execution). When the
+            // result is present and one-line, merge it onto the row; when it's still
+            // running, show a live spinner so a slow tool isn't a black box.
+            let result_follows = matches!(events.peek(), Some(HarnessEvent::ToolResult { .. }));
+            if result_follows {
+                if call_lines.len() == 1 {
+                    if let Some(HarnessEvent::ToolResult { tool_name: rn, result }) = events.peek() {
+                        if !HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
+                            if let Some(summary) = tool_result_oneliner(rn, result) {
+                                let pad = width
+                                    .saturating_sub(call_lines[0].width() + summary.chars().count());
+                                if pad >= 2 {
+                                    call_lines[0].spans.push(Span::raw(" ".repeat(pad)));
+                                    call_lines[0]
+                                        .spans
+                                        .push(Span::styled(summary, Style::default().fg(MUTED)));
+                                    events.next();
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if state.status == HarnessStatus::Running {
+                let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
+                let label = format!("{spinner} running");
+                let style = Style::default().fg(ACCENT);
+                if call_lines.len() == 1
+                    && width > call_lines[0].width() + label.chars().count() + 2
+                {
+                    let pad = width - call_lines[0].width() - label.chars().count();
+                    call_lines[0].spans.push(Span::raw(" ".repeat(pad)));
+                    call_lines[0].spans.push(Span::styled(label, style));
+                } else {
+                    call_lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(label, style),
+                    ]));
+                }
+            }
+            if !first && !prev_tool_row {
+                lines.push(Line::from(""));
+            }
+            lines.extend(call_lines);
+            prev_tool_row = true;
+            first = false;
+            continue;
+        }
+
         let rendered = event_lines(event, width);
         if rendered.is_empty() {
             continue;
@@ -1878,7 +2018,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
         }
         for seg in wrap_one(thinking, width.saturating_sub(2)) {
-            lines.push(Line::from(Span::styled(seg, Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(seg, Style::default().fg(MUTED))));
         }
     }
 
@@ -1903,7 +2043,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{spinner} "),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled("working…", subtle()),
         ]));
@@ -1920,28 +2060,28 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
     match event {
         HarnessEvent::UserInput { text } => user_lines(text, width),
         HarnessEvent::Steer { text } => {
-            marker_block("↳ ", "steer  ", Color::Rgb(120, 200, 255), text, width)
+            marker_block("↳ ", "steer  ", ACCENT, text, width)
         }
         HarnessEvent::AssistantText { text } => render_prose(text, width),
-        HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", Color::DarkGray, entry, width),
+        HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", MUTED, entry, width),
         HarnessEvent::SystemDecision { step, reasoning } => marker_block(
             "⚙ ",
             "",
-            Color::Yellow,
+            WARN,
             &format!("{step} — {reasoning}"),
             width,
         ),
         HarnessEvent::ModelError { message } => {
-            marker_block("✗ ", "", Color::Red, message, width)
+            marker_block("✗ ", "", DANGER, message, width)
         }
         HarnessEvent::UserQuestion { questions } => {
             let text = question_text(questions).unwrap_or_else(|| "(question)".to_string());
-            marker_block("? ", "", Color::Yellow, &text, width)
+            marker_block("? ", "", WARN, &text, width)
         }
         HarnessEvent::LaneSpawned { id, title } => marker_block(
             "→ ",
             "",
-            Color::Cyan,
+            LANE,
             &format!("delegated {id}: {title}"),
             width,
         ),
@@ -1967,7 +2107,7 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
             tool_result_lines(tool_name, result, width)
         }
         HarnessEvent::InvalidToolCall { tool_name, error } => result_block(
-            vec![(format!("✗ {tool_name}: {error}"), Style::default().fg(Color::Red))],
+            vec![(format!("✗ {tool_name}: {error}"), Style::default().fg(DANGER))],
             width,
         ),
     }
@@ -1983,12 +2123,12 @@ fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         if i == 0 {
             lines.push(Line::from(vec![
                 prefix.clone(),
-                Span::styled(seg, Style::default().fg(Color::White)),
+                Span::styled(seg, Style::default().fg(TEXT)),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(seg, Style::default().fg(Color::White)),
+                Span::styled(seg, Style::default().fg(TEXT)),
             ]));
         }
     }
@@ -2044,15 +2184,15 @@ fn lane_completed_lines(
     width: usize,
 ) -> Vec<Line<'static>> {
     let (tag, color) = match status {
-        LaneStatus::Completed => ("done", Color::Green),
-        LaneStatus::Failed => ("failed", Color::Red),
-        LaneStatus::Running => ("running", Color::Cyan),
+        LaneStatus::Completed => ("done", SUCCESS),
+        LaneStatus::Failed => ("failed", DANGER),
+        LaneStatus::Running => ("running", LANE),
     };
     let mut lines = vec![Line::from(vec![
         Span::styled("◆ ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("lane {id} · {title} "),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("[{tag}]"), Style::default().fg(color)),
     ])];
@@ -2066,30 +2206,50 @@ fn lane_completed_lines(
 }
 
 fn tool_call_lines(tool_name: &str, arguments: &Value, width: usize) -> Vec<Line<'static>> {
-    let header = tool_call_header(tool_name, arguments);
+    let mut lines = tool_call_head_lines(tool_name, arguments, width);
+    lines.extend(tool_call_preview(tool_name, arguments, width));
+    lines
+}
+
+/// Render just the call header row(s): `● Verb  arg`, the verb in bold body text
+/// and the argument muted, wrapping the argument under a hanging indent.
+fn tool_call_head_lines(tool_name: &str, arguments: &Value, width: usize) -> Vec<Line<'static>> {
+    let (verb, arg) = tool_call_parts(tool_name, arguments);
+    let head = format!("{verb}  ");
+    let indent = 2 + head.chars().count();
+    let arg_budget = width.saturating_sub(indent).max(8);
+
+    if arg.trim().is_empty() {
+        return vec![Line::from(vec![
+            Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(verb, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        ])];
+    }
+
     let mut lines = Vec::new();
-    for (i, seg) in wrap_one(&header, width.saturating_sub(2)).into_iter().enumerate() {
+    for (i, seg) in wrap_one(&arg, arg_budget).into_iter().enumerate() {
         if i == 0 {
             lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-                Span::styled(seg, Style::default().fg(Color::White)),
+                Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(verb.clone(), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(seg, Style::default().fg(MUTED)),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(seg, Style::default().fg(Color::White)),
+                Span::raw(" ".repeat(indent)),
+                Span::styled(seg, Style::default().fg(MUTED)),
             ]));
         }
     }
-    lines.extend(tool_call_preview(tool_name, arguments, width));
     lines
 }
 
 /// A preview of what the call will do — content for writes, a +/- diff for edits.
 fn tool_call_preview(tool_name: &str, arguments: &Value, width: usize) -> Vec<Line<'static>> {
     let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
-    let green = Style::default().fg(Color::Green);
-    let red = Style::default().fg(Color::Red);
+    let green = Style::default().fg(SUCCESS);
+    let red = Style::default().fg(DANGER);
     const MAX: usize = 8;
 
     let mut items: Vec<(String, Style)> = Vec::new();
@@ -2127,32 +2287,73 @@ fn tool_call_preview(tool_name: &str, arguments: &Value, width: usize) -> Vec<Li
     result_block_verbatim(items, width)
 }
 
-fn tool_call_header(tool_name: &str, arguments: &Value) -> String {
-    let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
+/// A tool call as (verb, argument) — e.g. ("Read", "src/auth.rs") — so the verb
+/// and its target can be styled distinctly instead of a single `Read(path)` blob.
+fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, String) {
+    let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     match tool_name {
-        "read_file" => format!("Read({})", arg("path")),
-        "write_file" => format!("Write({})", arg("path")),
-        "edit_file" => format!("Update({})", arg("path")),
-        "replace_file_content" => format!(
-            "ReplaceContent({}, lines {}-{})",
-            arg("path"),
-            arguments.get("start_line").and_then(Value::as_u64).unwrap_or(0),
-            arguments.get("end_line").and_then(Value::as_u64).unwrap_or(0)
+        "read_file" => ("Read".into(), arg("path")),
+        "write_file" => ("Write".into(), arg("path")),
+        "edit_file" => ("Edit".into(), arg("path")),
+        "replace_file_content" => (
+            "Replace".into(),
+            format!(
+                "{} · lines {}-{}",
+                arg("path"),
+                arguments.get("start_line").and_then(Value::as_u64).unwrap_or(0),
+                arguments.get("end_line").and_then(Value::as_u64).unwrap_or(0)
+            ),
         ),
-        "list_files" => {
-            let path = arguments.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("List({path})")
-        }
-        "search_content" => format!("Grep(\"{}\")", arg("query")),
-        "view_outline" => format!("Outline({})", arg("path")),
-        "web_search" => format!("Web(\"{}\")", arg("query")),
-        "web_read" => format!("Fetch({})", arg("url")),
-        "bash" => format!("Bash({})", arg("command")),
-        _ => format!(
-            "{tool_name}({})",
-            serde_json::to_string(arguments).unwrap_or_default()
+        "list_files" => (
+            "List".into(),
+            arguments.get("path").and_then(Value::as_str).unwrap_or(".").to_string(),
+        ),
+        "search_content" => ("Grep".into(), arg("query")),
+        "view_outline" => ("Outline".into(), arg("path")),
+        "web_search" => ("Web".into(), arg("query")),
+        "web_read" => ("Fetch".into(), arg("url")),
+        "bash" => ("Bash".into(), arg("command")),
+        _ => (
+            tool_name.to_string(),
+            serde_json::to_string(arguments).unwrap_or_default(),
         ),
     }
+}
+
+/// A short, single-line result summary for the tools whose output is just a count
+/// or status — so it can be merged onto the call row (`● Read  path     142 lines`).
+/// Returns None for errors and for tools with multi-line output (bash, list), which
+/// render as their own block below the call.
+fn tool_result_oneliner(tool_name: &str, result: &Value) -> Option<String> {
+    if result.get("status").and_then(Value::as_str) == Some("error") {
+        return None;
+    }
+    let data = result.get("data").unwrap_or(result);
+    let s = |key: &str| data.get(key).and_then(Value::as_str).unwrap_or("");
+    let count = |key: &str| data.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let line = match tool_name {
+        "read_file" => {
+            let n = s("content").lines().count();
+            format!("{n} {}", if n == 1 { "line" } else { "lines" })
+        }
+        "write_file" => "written".to_string(),
+        "edit_file" => "updated".to_string(),
+        "replace_file_content" => "replaced".to_string(),
+        "search_content" => format!("{} matches", count("count")),
+        "web_search" => format!("{} results", count("count")),
+        "web_read" => format!("{} chars", s("text").chars().count()),
+        "view_outline" => {
+            if data.get("is_directory").and_then(Value::as_bool).unwrap_or(false) {
+                let n = data.get("entries").and_then(Value::as_array).map(|e| e.len()).unwrap_or(0);
+                format!("{n} entries")
+            } else {
+                let n = data.get("outline").and_then(Value::as_array).map(|o| o.len()).unwrap_or(0);
+                format!("{n} decls")
+            }
+        }
+        _ => return None,
+    };
+    Some(line)
 }
 
 fn tool_result_lines(tool_name: &str, result: &Value, width: usize) -> Vec<Line<'static>> {
@@ -2166,7 +2367,7 @@ fn tool_result_lines(tool_name: &str, result: &Value, width: usize) -> Vec<Line<
             .and_then(Value::as_str)
             .unwrap_or("failed");
         return result_block(
-            vec![(format!("✗ {message}"), Style::default().fg(Color::Red))],
+            vec![(format!("✗ {message}"), Style::default().fg(DANGER))],
             width,
         );
     }
@@ -2254,7 +2455,7 @@ fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
         (false, 0) => format!("exited {exit} · no output"),
         (false, n) => format!("exited {exit} · {n} {noun}"),
     };
-    let summary_style = if success { subtle() } else { Style::default().fg(Color::Red) };
+    let summary_style = if success { subtle() } else { Style::default().fg(DANGER) };
     let mut items = vec![(summary, summary_style)];
 
     // Glimpse: the first few lines only.
@@ -2311,17 +2512,40 @@ fn result_block_inner(
 // --- Markdown-lite prose rendering (assistant text) ---
 
 fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
-    let base = Style::default().fg(Color::White);
-    let code_block = Style::default().fg(Color::Rgb(224, 196, 132));
+    let base = Style::default().fg(TEXT);
+    let code_block = Style::default().fg(CODE);
     let heading = Style::default().fg(blue()).add_modifier(Modifier::BOLD);
 
+    let lines: Vec<&str> = text.split('\n').collect();
     let mut out = Vec::new();
     let mut in_code = false;
-    for raw in text.split('\n') {
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
             in_code = !in_code;
+            i += 1;
             continue;
+        }
+        // Markdown table: a `|`-delimited header row immediately followed by a
+        // `|---|:--:|` separator row of the same column count. Render aligned with
+        // wrapped cells instead of dumping raw pipes.
+        if !in_code && raw.contains('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+            let header = split_table_cells(raw);
+            let sep = split_table_cells(lines[i + 1]);
+            if !header.is_empty() && header.len() == sep.len() {
+                let aligns: Vec<CellAlign> = sep.iter().map(|c| cell_align(c)).collect();
+                let mut body = Vec::new();
+                let mut j = i + 2;
+                while j < lines.len() && lines[j].contains('|') && !lines[j].trim().is_empty() {
+                    body.push(split_table_cells(lines[j]));
+                    j += 1;
+                }
+                out.extend(render_md_table(&header, &aligns, &body, width));
+                i = j;
+                continue;
+            }
         }
         // Fenced code, or an unfenced block indented 4+ spaces / a tab (Markdown
         // indented code): render verbatim — preserve indentation and skip inline
@@ -2335,12 +2559,14 @@ fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
                     Span::styled(seg, code_block),
                 ]));
             }
+            i += 1;
             continue;
         }
         if let Some(h) = heading_text(trimmed) {
             for seg in wrap_one(h, width) {
                 out.push(Line::from(Span::styled(seg, heading)));
             }
+            i += 1;
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
@@ -2356,17 +2582,173 @@ fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
                 line.spans.insert(0, Span::raw("  "));
             }
             out.extend(bullet);
+            i += 1;
             continue;
         }
         if raw.trim().is_empty() {
             out.push(Line::from(""));
+            i += 1;
             continue;
         }
         let runs = parse_inline_md(trimmed, base);
         out.extend(wrap_runs(runs, width));
+        i += 1;
     }
     if out.is_empty() {
         out.push(Line::from(""));
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+enum CellAlign {
+    Left,
+    Right,
+    Center,
+}
+
+/// Split a markdown table row into trimmed cells, dropping the optional leading
+/// and trailing pipes (`| a | b |` and `a | b` both → ["a", "b"]).
+fn split_table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// A markdown table delimiter row: every cell is dashes with optional `:` ends.
+fn is_table_separator(line: &str) -> bool {
+    let cells = split_table_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let c = c.trim();
+            c.contains('-') && c.chars().all(|ch| ch == '-' || ch == ':')
+        })
+}
+
+fn cell_align(sep: &str) -> CellAlign {
+    let s = sep.trim();
+    match (s.starts_with(':'), s.ends_with(':')) {
+        (true, true) => CellAlign::Center,
+        (false, true) => CellAlign::Right,
+        _ => CellAlign::Left,
+    }
+}
+
+/// Pad a rendered cell line to `w` columns per its alignment.
+fn pad_table_line(mut line: Line<'static>, w: usize, align: CellAlign) -> Line<'static> {
+    let pad = w.saturating_sub(line.width());
+    if pad == 0 {
+        return line;
+    }
+    match align {
+        CellAlign::Left => line.spans.push(Span::raw(" ".repeat(pad))),
+        CellAlign::Right => line.spans.insert(0, Span::raw(" ".repeat(pad))),
+        CellAlign::Center => {
+            let l = pad / 2;
+            line.spans.insert(0, Span::raw(" ".repeat(l)));
+            line.spans.push(Span::raw(" ".repeat(pad - l)));
+        }
+    }
+    line
+}
+
+/// Render a markdown table: column widths from content (shrunk to fit `width`),
+/// header bold + a rule, cells inline-md-styled and wrapped, separated by ` │ `.
+fn render_md_table(
+    header: &[String],
+    aligns: &[CellAlign],
+    body: &[Vec<String>],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let ncols = header
+        .len()
+        .max(body.iter().map(|r| r.len()).max().unwrap_or(0))
+        .max(1);
+    let header_style = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(TEXT);
+    let faint = Style::default().fg(FAINT);
+
+    let runs_for = |s: &str, header_row: bool| {
+        parse_inline_md(s, if header_row { header_style } else { body_style })
+    };
+    let runs_w = |runs: &[(String, Style)]| runs.iter().map(|(t, _)| t.chars().count()).sum::<usize>();
+
+    let mut natural = vec![1usize; ncols];
+    for (c, h) in header.iter().enumerate().take(ncols) {
+        natural[c] = natural[c].max(runs_w(&runs_for(h, true)));
+    }
+    for row in body {
+        for (c, cell) in row.iter().enumerate().take(ncols) {
+            natural[c] = natural[c].max(runs_w(&runs_for(cell, false)));
+        }
+    }
+
+    // Column separator is " │ " (3 cols). Fit natural widths into the budget,
+    // shrinking the widest columns first when they don't fit.
+    let sep_total = 3 * ncols.saturating_sub(1);
+    let avail = width.saturating_sub(sep_total).max(ncols * 3);
+    let natural_sum: usize = natural.iter().sum::<usize>().max(1);
+    let widths: Vec<usize> = if natural_sum <= avail {
+        natural.clone()
+    } else {
+        let mut w: Vec<usize> = natural
+            .iter()
+            .map(|&n| (n * avail / natural_sum).max(3))
+            .collect();
+        let mut total: usize = w.iter().sum();
+        while total > avail {
+            let idx = (0..ncols).max_by_key(|&i| w[i]).unwrap_or(0);
+            if w[idx] <= 3 {
+                break;
+            }
+            w[idx] -= 1;
+            total -= 1;
+        }
+        w
+    };
+
+    let render_row = |cells: &[String], header_row: bool| -> Vec<Line<'static>> {
+        let wrapped: Vec<Vec<Line<'static>>> = (0..ncols)
+            .map(|c| {
+                let text = cells.get(c).map(String::as_str).unwrap_or("");
+                let mut wl = wrap_runs(runs_for(text, header_row), widths[c].max(1));
+                if wl.is_empty() {
+                    wl.push(Line::from(""));
+                }
+                let align = aligns.get(c).copied().unwrap_or(CellAlign::Left);
+                wl.into_iter().map(|l| pad_table_line(l, widths[c], align)).collect()
+            })
+            .collect();
+        let height = wrapped.iter().map(|w| w.len()).max().unwrap_or(1);
+        (0..height)
+            .map(|k| {
+                let mut spans: Vec<Span<'static>> = Vec::new();
+                for c in 0..ncols {
+                    if c > 0 {
+                        spans.push(Span::styled(" │ ", faint));
+                    }
+                    match wrapped[c].get(k) {
+                        Some(l) => spans.extend(l.spans.clone()),
+                        None => spans.push(Span::raw(" ".repeat(widths[c]))),
+                    }
+                }
+                Line::from(spans)
+            })
+            .collect()
+    };
+
+    let mut out = render_row(header, true);
+    let mut rule: Vec<Span<'static>> = Vec::new();
+    for c in 0..ncols {
+        if c > 0 {
+            rule.push(Span::styled("─┼─", faint));
+        }
+        rule.push(Span::styled("─".repeat(widths[c]), faint));
+    }
+    out.push(Line::from(rule));
+    for row in body {
+        out.extend(render_row(row, false));
     }
     out
 }
@@ -2385,7 +2767,7 @@ fn heading_text(line: &str) -> Option<&str> {
 fn parse_inline_md(text: &str, base: Style) -> Vec<(String, Style)> {
     let bold = base.add_modifier(Modifier::BOLD);
     let italic = base.add_modifier(Modifier::ITALIC);
-    let code = Style::default().fg(Color::Rgb(224, 196, 132));
+    let code = Style::default().fg(CODE);
 
     let chars: Vec<char> = text.chars().collect();
     let mut runs: Vec<(String, Style)> = Vec::new();
@@ -2739,7 +3121,7 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let accent = Color::Rgb(96, 165, 250);
     let faint = Color::Rgb(120, 120, 130);
     let dim = Color::Rgb(160, 160, 170);
-    let yellow = Color::Yellow;
+    let yellow = WARN;
 
     let width = (area.width as usize).max(20);
     let counter = if qs.len() > 1 {
@@ -2756,7 +3138,7 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_default();
     lines.push(Line::from(vec![
         Span::styled("? ", Style::default().fg(yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(q_line, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(q_line, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
         Span::styled(counter, Style::default().fg(faint)),
     ]));
 
@@ -2782,7 +3164,7 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 Span::styled(
                     label.clone(),
                     if focused {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(dim)
                     },
@@ -2803,16 +3185,16 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)));
+        .border_style(Style::default().fg(FAINT));
 
     // While the login form is open, editing happens in the inline form above —
     // the input box just shows the controls.
     if app.login_active {
         let line = Line::from(vec![
-            Span::styled("❧ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
+            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
             Span::styled(
                 "Tab next · ←/→ change · Enter connect · Esc cancel",
-                Style::default().fg(Color::Rgb(75, 85, 99)),
+                Style::default().fg(FAINT),
             ),
         ]);
         frame.render_widget(Paragraph::new(line).block(block), area);
@@ -2824,13 +3206,13 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         let placeholder = {
             let qs = questions_of(app);
             match qs.get(app.q_index.min(qs.len().saturating_sub(1))) {
-                Some(q) if q_options(q).is_empty() => "Type your answer, then press ↵...",
-                _ => "Type a prompt or a slash command...",
+                Some(q) if q_options(q).is_empty() => "Type your answer, then press ↵…",
+                _ => "Type a prompt or a slash command…",
             }
         };
         let line = Line::from(vec![
-            Span::styled("❧ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-            Span::styled(placeholder, Style::default().fg(Color::Rgb(75, 85, 99))),
+            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(placeholder, Style::default().fg(FAINT)),
         ]);
         frame.render_widget(Paragraph::new(line).block(block), area);
         return;
@@ -2839,18 +3221,18 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // Wrap the prompt into display rows (honoring explicit newlines) and draw a
     // block cursor at its (row, col). The prompt glyph takes the first 2 columns;
     // continuation rows are indented to match.
-    let text_w = (area.width as usize).saturating_sub(2).max(1);
+    let text_w = (area.width as usize).saturating_sub(3).max(1);
     let (rows, (cursor_row, cursor_col)) = layout_input(&app.input, app.input_cursor, text_w);
-    let white = Style::default().fg(Color::White);
+    let white = Style::default().fg(TEXT);
     let cursor_style = Style::default().fg(Color::Black).bg(blue());
 
     let mut lines = Vec::with_capacity(rows.len());
     for (k, row) in rows.iter().enumerate() {
         let mut spans = Vec::new();
         if k == 0 {
-            spans.push(Span::styled("❧ ", Style::default().fg(blue()).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
         } else {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw("   "));
         }
         if k == cursor_row {
             let rchars: Vec<char> = row.chars().collect();
@@ -2883,7 +3265,7 @@ fn input_height(app: &App, width: u16) -> u16 {
     if app.input.is_empty() {
         return 3;
     }
-    let text_w = (width as usize).saturating_sub(2).max(1);
+    let text_w = (width as usize).saturating_sub(3).max(1);
     let (rows, _) = layout_input(&app.input, app.input_cursor, text_w);
     (rows.len().clamp(1, MAX_ROWS) as u16) + 2
 }
@@ -2932,8 +3314,8 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     let accent = Color::Rgb(96, 165, 250);
-    let dim = Color::DarkGray;
-    let w = Color::White;
+    let dim = MUTED;
+    let w = TEXT;
     let faint = Color::Rgb(75, 85, 99);
     let rule = Color::Rgb(50, 50, 60);
     let focus = app.form_focus;
@@ -3071,41 +3453,41 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let style = Style::default().fg(subtle().fg.unwrap());
-    
-    // ↑ input · ↓ output · ↻ cache-read (cumulative) · ctx = current context
-    // fill (prompt tokens of the most recent request, which grows as the
-    // conversation accretes). Icons are arrow-family glyphs (↑ ↓ ↻) that render a
-    // single column everywhere — avoid wide/emoji symbols here, they spill a cell
-    // and overlap the right-aligned model label.
+    // cwd on the left, token accounting on the right. The model now lives in the
+    // header, so it's dropped here. Arrow glyphs (↑ ↓ ↻) are width-1 everywhere;
+    // no emoji (they spill a cell and misalign the row).
     let st = app.state.as_ref();
-    let left_text = format!("📂 {}  |  ↑{} ↓{} ↻{}  ·  ctx {}  ",
-        app.cwd_display,
-        fmt_si(st.map(|s| s.prompt_tokens).unwrap_or(0)),
-        fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0)),
-        fmt_si(st.map(|s| s.cache_read_tokens).unwrap_or(0)),
-        fmt_si(st.map(|s| s.last_prompt_tokens).unwrap_or(0)),
-    );
+    let dim = Style::default().fg(MUTED);
+    let faint = Style::default().fg(FAINT);
 
-    let model = app.options.config.model.model.clone();
-    let right_text = format!("model: {}", model);
+    let mut right = vec![
+        Span::styled(format!("↑{}", fmt_si(st.map(|s| s.prompt_tokens).unwrap_or(0))), dim),
+        Span::raw(" "),
+        Span::styled(format!("↓{}", fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0))), dim),
+    ];
+    let cache = st.map(|s| s.cache_read_tokens).unwrap_or(0);
+    if cache > 0 {
+        right.push(Span::styled(format!(" ↻{}", fmt_si(cache)), dim));
+    }
+    right.push(Span::styled(" · ", faint));
+    right.push(Span::styled(
+        format!("ctx {} ", fmt_si(st.map(|s| s.last_prompt_tokens).unwrap_or(0))),
+        dim,
+    ));
 
-    let left_span = Span::styled(left_text, style);
-    let right_span = Span::styled(right_text, style);
+    let left_span = Span::styled(format!(" {}", app.cwd_display), dim);
+    let right_line = Line::from(right);
+    let right_w = right_line.width() as u16;
 
-    // Reserve the model column plus a 2-cell gap so nothing abuts/overlaps it.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Length(right_span.width() as u16 + 2),
-        ])
+        .constraints([Constraint::Min(10), Constraint::Length(right_w + 1)])
         .split(area);
-        
+
     frame.render_widget(Paragraph::new(Line::from(left_span)), cols[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(right_span)).alignment(ratatui::layout::Alignment::Right),
-        cols[1]
+        Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
+        cols[1],
     );
 }
 
@@ -3135,12 +3517,25 @@ fn home_path(path: &std::path::Path) -> String {
     text
 }
 
+// --- Theme: one muted palette so colors stay consistent across the UI. The old
+// code scattered raw ANSI (Red/Green/Yellow/Cyan) next to RGB blue, which is the
+// main reason it read as garish. Everything routes through these now. ---
+const ACCENT: Color = Color::Rgb(96, 165, 250); // primary — prompts, glyphs, headings
+const TEXT: Color = Color::Rgb(222, 225, 230); // body text (softer than pure white)
+const MUTED: Color = Color::Rgb(124, 130, 142); // secondary text, summaries, gutters
+const FAINT: Color = Color::Rgb(82, 86, 96); // rules, borders, placeholders
+const SUCCESS: Color = Color::Rgb(126, 186, 120); // added lines, ok
+const DANGER: Color = Color::Rgb(224, 108, 117); // errors, removed lines
+const WARN: Color = Color::Rgb(214, 182, 106); // runtime notices, questions
+const LANE: Color = Color::Rgb(110, 184, 200); // delegated lanes
+const CODE: Color = Color::Rgb(224, 196, 132); // code / diff text
+
 fn subtle() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(MUTED)
 }
 
 fn blue() -> Color {
-    Color::Rgb(96, 165, 250)
+    ACCENT
 }
 
 fn get_provider_models(provider: &str) -> &'static [&'static str] {

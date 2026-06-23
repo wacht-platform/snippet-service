@@ -20,13 +20,15 @@ use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
 
 use crate::llm::{
-    AgentModel, GeneratedToolCall, HarnessMessage, ModelOutput, NativeToolDefinition, StreamHandle,
-    TokenUsage,
+    AgentModel, GeneratedToolCall, HarnessMessage, ModelOutput, NativeToolDefinition, StreamBuffer,
+    StreamHandle, TokenUsage,
 };
 use crate::tools::ToolError;
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta";
-/// How long an explicit cache lives before Gemini evicts it.
+/// How long an explicit cache lives before Gemini evicts it. Storage ($1/M/hr)
+/// only out-costs a read's saving (I−C ≈ $1.35/M) after ~1.35h, so this 30-min TTL
+/// stays net-positive as long as the cache is read again within it.
 const CACHE_TTL_SECS: i64 = 1800;
 /// Minimum estimated prefix tokens below which explicit caching doesn't pay off.
 const CACHE_MIN_TOKENS: usize = 4096;
@@ -46,6 +48,8 @@ pub struct GeminiConfig {
     pub max_retries: u32,
     pub initial_retry_ms: u64,
     pub max_retry_ms: u64,
+    pub supports_images: bool,
+    pub reasoning_effort: Option<String>,
 }
 
 /// Live explicit-cache handle, held across the session (the model is reused).
@@ -56,6 +60,8 @@ struct CacheState {
     cached_contents_signature: String,
     cached_content_count: usize,
     expire_at: DateTime<Utc>,
+    /// Turns this cache has served since creation (M in the re-checkpoint rule).
+    reuse_turns: u32,
 }
 
 struct CachePlan {
@@ -67,6 +73,8 @@ struct CachePlan {
     prefix_signature: String,
     cached_contents_signature: String,
     cached_content_count: usize,
+    /// Whether to (re)create the cache this turn (cost rule) vs reuse the prior one.
+    should_refresh: bool,
 }
 
 pub struct GeminiModel {
@@ -87,14 +95,20 @@ impl GeminiModel {
 
 #[async_trait]
 impl AgentModel for GeminiModel {
+    fn supports_images(&self) -> bool {
+        self.config.supports_images
+    }
+
     async fn generate(
         &mut self,
         messages: &[HarnessMessage],
         tools: &[NativeToolDefinition],
         force_tool: bool,
-        _sink: Option<StreamHandle>,
+        sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
-        // Gemini is buffered (non-streaming) — the sink is unused here.
+        // Gemini is buffered (non-streaming): no live deltas, but we still feed the
+        // reasoning summary into the sink's thinking buffer once the response lands,
+        // so the harness can capture it as last-thought context.
         let (system, contents) = build_contents(messages, &self.config.model);
 
         let mut body = serde_json::Map::new();
@@ -111,7 +125,10 @@ impl AgentModel for GeminiModel {
                     json!({
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.input_schema,
+                        // Gemini's function schema is a strict OpenAPI subset: it
+                        // rejects JSON Schema keywords like `additionalProperties`.
+                        // Strip everything it doesn't understand.
+                        "parameters": normalize_gemini_function_schema(tool.input_schema.clone()),
                     })
                 })
                 .collect();
@@ -125,10 +142,46 @@ impl AgentModel for GeminiModel {
                 json!({ "functionCallingConfig": { "mode": mode } }),
             );
         }
+        let mut generation_config = serde_json::Map::new();
         if let Some(temperature) = self.config.temperature {
+            generation_config.insert("temperature".to_string(), json!(temperature));
+        }
+        // Ask thinking-capable models to return their reasoning summary as parts
+        // tagged `thought: true`, so we can surface it as the last-thought context.
+        // Apply reasoning effort when set: Gemini 3 uses thinkingLevel (low|high),
+        // 2.5 uses thinkingBudget (tokens). Default (unset) keeps dynamic thinking.
+        if supports_thoughts(&self.config.model) {
+            let mut thinking = serde_json::Map::new();
+            thinking.insert("includeThoughts".to_string(), json!(true));
+            let model = self.config.model.to_ascii_lowercase();
+            let is_g3 = model.contains("gemini-3") || model.contains("gemini3");
+            if let Some(effort) = self.config.reasoning_effort.as_deref() {
+                match effort.to_ascii_lowercase().as_str() {
+                    "off" if !is_g3 => {
+                        thinking.insert("thinkingBudget".to_string(), json!(0));
+                    }
+                    e @ ("low" | "medium" | "high") if is_g3 => {
+                        let level = if e == "high" { "high" } else { "low" };
+                        thinking.insert("thinkingLevel".to_string(), json!(level));
+                    }
+                    "low" => {
+                        thinking.insert("thinkingBudget".to_string(), json!(2048));
+                    }
+                    "medium" => {
+                        thinking.insert("thinkingBudget".to_string(), json!(8192));
+                    }
+                    "high" => {
+                        thinking.insert("thinkingBudget".to_string(), json!(24576));
+                    }
+                    _ => {}
+                }
+            }
+            generation_config.insert("thinkingConfig".to_string(), Value::Object(thinking));
+        }
+        if !generation_config.is_empty() {
             body.insert(
                 "generationConfig".to_string(),
-                json!({ "temperature": temperature }),
+                Value::Object(generation_config),
             );
         }
         let body = Value::Object(body);
@@ -142,15 +195,30 @@ impl AgentModel for GeminiModel {
             .map(|plan| plan.send_payload.clone())
             .unwrap_or(body);
 
-        let url = format!("{}/models/{}:generateContent", API_BASE, self.config.model);
-        let parsed = self.post_generate(&url, &send_body).await?;
+        // Stream when the caller wants live output (interactive); lanes pass no
+        // sink and stay buffered. Streaming pushes text + thought deltas to the
+        // sink as they arrive, so Gemini's output and reasoning surface live like
+        // the other providers instead of landing all at once at end of turn.
+        let parsed = if let Some(sink) = sink.as_ref() {
+            let url = format!(
+                "{}/models/{}:streamGenerateContent?alt=sse",
+                API_BASE, self.config.model
+            );
+            self.stream_generate(&url, &send_body, sink).await?
+        } else {
+            let url = format!("{}/models/{}:generateContent", API_BASE, self.config.model);
+            self.post_generate(&url, &send_body).await?
+        };
 
         // Refresh the cache for next turn (create/keep cachedContents), best-effort.
         if let Some(plan) = plan {
             self.refresh_cache(&plan).await;
         }
 
-        Ok(map_response(parsed, &self.config.model))
+        // The streaming path already pushed thought deltas to the sink live, so the
+        // thought return is only needed for the buffered path (which has no sink).
+        let (output, _thought) = map_response(parsed, &self.config.model);
+        Ok(output)
     }
 }
 
@@ -205,15 +273,36 @@ impl GeminiModel {
         }
         let full_cache_payload = Value::Object(cache_payload);
 
-        if estimate_tokens(&full_cache_payload) < CACHE_MIN_TOKENS {
+        let prefix_tokens = estimate_tokens(&full_cache_payload);
+        if prefix_tokens < CACHE_MIN_TOKENS {
             return None;
         }
 
-        // If the prior cache is still a valid prefix, send only the delta contents
-        // plus the live tail, referencing the cache by name.
+        // Reuse the prior cache when it's still a valid prefix: send only the new
+        // delta contents (+ live tail), referencing the cache by name. Then decide
+        // whether to ALSO re-create (extend) the cache with the cost rule
+        //   D·M ≥ P
+        // where D = un-cached delta tokens, M = turns this cache has served, P =
+        // full prefix tokens. Re-checkpointing pays off when expected future savings
+        // (0.9·D per future turn) clear the creation cost (P): assuming ~M more
+        // turns gives the break-even D·M ≥ ~1.1·P. The textbook √(2·P·d) optimum
+        // (D·M ≥ 2P) assumes UNIFORM growth; coding agents are bursty (a file read
+        // spikes D), so the myopic coefficient ~1 re-checkpoints big reads promptly
+        // instead of re-sending them fresh for several turns. Price-independent
+        // (creation and fresh sends are both billed at the input rate). With no
+        // reusable cache, should_refresh stays true → create fresh.
+        let mut should_refresh = true;
         if let Some(prior) = self.cache.as_ref() {
             if self.can_reuse(prior, &prefix_signature, &cacheable) {
-                let mut delta = cacheable[prior.cached_content_count..].to_vec();
+                let delta_contents = cacheable[prior.cached_content_count..].to_vec();
+                let delta_tokens = estimate_tokens(&Value::Array(delta_contents.clone()));
+                let m = (prior.reuse_turns as usize).saturating_add(1);
+                let near_expiry =
+                    prior.expire_at <= Utc::now() + chrono::Duration::seconds(120);
+                should_refresh =
+                    delta_tokens.saturating_mul(m) >= prefix_tokens || near_expiry;
+
+                let mut delta = delta_contents;
                 delta.extend(tail);
                 obj.remove("system_instruction");
                 obj.remove("tools");
@@ -229,6 +318,7 @@ impl GeminiModel {
             prefix_signature,
             cached_contents_signature,
             cached_content_count: cacheable.len(),
+            should_refresh,
         })
     }
 
@@ -252,14 +342,14 @@ impl GeminiModel {
     /// `self.cache` and deleting any superseded cache. Best-effort: a failure just
     /// means the next turn re-sends the prefix uncached.
     async fn refresh_cache(&mut self, plan: &CachePlan) {
-        if let Some(prior) = self.cache.as_ref() {
-            let unchanged = prior.prefix_signature == plan.prefix_signature
-                && prior.cached_contents_signature == plan.cached_contents_signature
-                && prior.cached_content_count == plan.cached_content_count
-                && prior.expire_at > Utc::now() + chrono::Duration::seconds(5);
-            if unchanged {
-                return;
+        // The cost rule says keep reusing the existing cache: just age it (M++) so
+        // its re-checkpoint threshold grows. The delta was already sent fresh; the
+        // cache's TTL is unchanged (near-expiry would have forced should_refresh).
+        if !plan.should_refresh {
+            if let Some(prior) = self.cache.as_mut() {
+                prior.reuse_turns = prior.reuse_turns.saturating_add(1);
             }
+            return;
         }
 
         let url = format!("{API_BASE}/cachedContents");
@@ -296,6 +386,7 @@ impl GeminiModel {
             cached_contents_signature: plan.cached_contents_signature.clone(),
             cached_content_count: plan.cached_content_count,
             expire_at,
+            reuse_turns: 0,
         });
         if let Some(old) = superseded {
             if old != parsed.name {
@@ -321,8 +412,11 @@ impl GeminiModel {
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
         let mut empty_retries = 0u32;
+        let mut fatal = false;
+        let mut attempts = 0u32;
 
         for attempt in 1..=max_attempts {
+            attempts = attempt;
             let response = self
                 .client
                 .post(url)
@@ -353,6 +447,7 @@ impl GeminiModel {
                             sleep(self.delay(attempt)).await;
                             continue;
                         }
+                        fatal = !is_retryable_status(status);
                         break;
                     }
                     let parsed: GeminiResponse = serde_json::from_slice(&bytes)
@@ -374,14 +469,98 @@ impl GeminiModel {
                         sleep(self.delay(attempt)).await;
                         continue;
                     }
+                    fatal = !retryable;
                     break;
                 }
             }
         }
 
-        Err(ToolError::msg(format!(
-            "gemini request failed after {max_attempts} attempt(s): {last_error}"
-        )))
+        Err(ToolError::model_request(
+            format!("gemini request failed after {attempts} attempt(s): {last_error}"),
+            !fatal,
+        ))
+    }
+
+    /// Streaming counterpart to `post_generate`: hit `streamGenerateContent?alt=sse`
+    /// and assemble the response from the SSE chunks, pushing deltas to `sink` live.
+    /// Retries mirror `post_generate`; each attempt clears the sink so a retry never
+    /// double-renders already-streamed text.
+    async fn stream_generate(
+        &self,
+        url: &str,
+        body: &Value,
+        sink: &StreamHandle,
+    ) -> Result<GeminiResponse, ToolError> {
+        let max_attempts = self.config.max_retries.saturating_add(1).max(1);
+        let mut last_error = String::new();
+        let mut fatal = false;
+        let mut attempts = 0u32;
+
+        for attempt in 1..=max_attempts {
+            attempts = attempt;
+            StreamBuffer::clear(sink);
+            let response = self
+                .client
+                .post(url)
+                .header("x-goog-api-key", &self.config.api_key)
+                .header(CONTENT_TYPE, "application/json")
+                .json(body)
+                .send()
+                .await;
+
+            match response {
+                Ok(response) => {
+                    let status = response.status();
+                    if !status.is_success() {
+                        let detail = response.text().await.unwrap_or_default();
+                        last_error = format!(
+                            "HTTP {status}: {}",
+                            detail.chars().take(400).collect::<String>()
+                        );
+                        if is_retryable_status(status) && attempt < max_attempts {
+                            sleep(self.delay(attempt)).await;
+                            continue;
+                        }
+                        fatal = !is_retryable_status(status);
+                        break;
+                    }
+                    match parse_gemini_sse(response, sink).await {
+                        Ok(parsed) => {
+                            // Same empty-turn quirk guard as the buffered path.
+                            if response_empty(&parsed) && attempt < max_attempts {
+                                sleep(self.delay(attempt)).await;
+                                continue;
+                            }
+                            return Ok(parsed);
+                        }
+                        Err(error) => {
+                            last_error = error;
+                            if attempt < max_attempts {
+                                sleep(self.delay(attempt)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    let retryable = error.is_timeout() || error.is_connect() || error.is_request();
+                    if retryable && attempt < max_attempts {
+                        sleep(self.delay(attempt)).await;
+                        continue;
+                    }
+                    fatal = !retryable;
+                    break;
+                }
+            }
+        }
+
+        StreamBuffer::clear(sink);
+        Err(ToolError::model_request(
+            format!("gemini streaming request failed after {attempts} attempt(s): {last_error}"),
+            !fatal,
+        ))
     }
 
     fn delay(&self, attempt: u32) -> Duration {
@@ -475,13 +654,21 @@ fn push_content(contents: &mut Vec<Value>, role: &str, mut parts: Vec<Value>) {
     contents.push(json!({ "role": role, "parts": parts }));
 }
 
-fn map_response(response: GeminiResponse, model: &str) -> ModelOutput {
+/// Map a Gemini response into a `ModelOutput`, returning the reasoning summary
+/// (parts tagged `thought: true`) separately so it can be surfaced as last-thought
+/// context rather than mixed into the user-facing answer.
+fn map_response(response: GeminiResponse, model: &str) -> (ModelOutput, Option<String>) {
     let mut content_text = String::new();
+    let mut thought_text = String::new();
     let mut calls = Vec::new();
     for candidate in &response.candidates {
         for part in &candidate.content.parts {
             if let Some(text) = &part.text {
-                content_text.push_str(text);
+                if part.thought.unwrap_or(false) {
+                    thought_text.push_str(text);
+                } else {
+                    content_text.push_str(text);
+                }
             }
             if let Some(call) = &part.function_call {
                 calls.push(GeneratedToolCall {
@@ -509,12 +696,95 @@ fn map_response(response: GeminiResponse, model: &str) -> ModelOutput {
         cache_read_tokens: u.cached_content_token_count.unwrap_or(0) as u64,
         cache_creation_tokens: 0,
     });
-    ModelOutput {
+    let output = ModelOutput {
         calls,
         content_text: (!content_text.is_empty()).then_some(content_text),
         usage,
         finish_reason,
+    };
+    let thought = thought_text.trim();
+    (
+        output,
+        (!thought.is_empty()).then(|| thought.to_string()),
+    )
+}
+
+/// Consume a Gemini `streamGenerateContent?alt=sse` stream: push text and thought
+/// deltas to `sink` as they arrive, and assemble a `GeminiResponse` (accumulated
+/// text + thought + any function-call parts + usage) for the normal mapping path.
+/// Each SSE `data:` line is a full `GenerateContentResponse` chunk.
+async fn parse_gemini_sse(
+    response: reqwest::Response,
+    sink: &StreamHandle,
+) -> Result<GeminiResponse, String> {
+    let mut text = String::new();
+    let mut thought = String::new();
+    let mut calls: Vec<CandidatePart> = Vec::new();
+    let mut usage: Option<UsageMetadata> = None;
+    let mut finish: Option<String> = None;
+
+    crate::sse::for_each_event(response, |data| {
+        if data.is_empty() {
+            return;
+        }
+        let Ok(chunk) = serde_json::from_str::<GeminiResponse>(data) else {
+            return;
+        };
+        if chunk.usage_metadata.is_some() {
+            usage = chunk.usage_metadata;
+        }
+        for candidate in &chunk.candidates {
+            if candidate.finish_reason.is_some() {
+                finish = candidate.finish_reason.clone();
+            }
+            for part in &candidate.content.parts {
+                if part.function_call.is_some() {
+                    calls.push(CandidatePart {
+                        text: None,
+                        thought: None,
+                        function_call: part.function_call.clone(),
+                        thought_signature: part.thought_signature.clone(),
+                    });
+                } else if let Some(delta) = &part.text {
+                    if part.thought.unwrap_or(false) {
+                        thought.push_str(delta);
+                        StreamBuffer::append_thinking(sink, delta);
+                    } else {
+                        text.push_str(delta);
+                        StreamBuffer::append(sink, delta);
+                    }
+                }
+            }
+        }
+    })
+    .await?;
+
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(CandidatePart {
+            text: Some(text),
+            thought: None,
+            function_call: None,
+            thought_signature: None,
+        });
     }
+    if !thought.is_empty() {
+        parts.push(CandidatePart {
+            text: Some(thought),
+            thought: Some(true),
+            function_call: None,
+            thought_signature: None,
+        });
+    }
+    parts.extend(calls);
+
+    Ok(GeminiResponse {
+        candidates: vec![Candidate {
+            content: CandidateContent { parts },
+            finish_reason: finish,
+        }],
+        usage_metadata: usage,
+    })
 }
 
 fn response_empty(response: &GeminiResponse) -> bool {
@@ -527,8 +797,91 @@ fn response_empty(response: &GeminiResponse) -> bool {
         .candidates
         .iter()
         .flat_map(|candidate| candidate.content.parts.iter())
-        .any(|part| part.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false));
+        // A thought-only response carries no answer — treat it as empty so the
+        // retry logic gives the model another shot at a real turn.
+        .any(|part| {
+            !part.thought.unwrap_or(false)
+                && part.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+        });
     !has_call && !has_text
+}
+
+/// Recursively coerce a JSON Schema into Gemini's function-declaration subset:
+/// keep only the keys Gemini accepts (dropping `additionalProperties`, `$schema`,
+/// `title`, etc.) and lowercase `type` names. Ported from wacht's
+/// `normalize_gemini_function_schema` to keep both engines in lockstep.
+fn normalize_gemini_function_schema(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut normalized = serde_json::Map::new();
+            for (key, value) in map {
+                if key == "properties" {
+                    let property_map = match value {
+                        Value::Object(properties) => Value::Object(
+                            properties
+                                .into_iter()
+                                .map(|(name, schema)| {
+                                    (name, normalize_gemini_function_schema(schema))
+                                })
+                                .collect(),
+                        ),
+                        other => normalize_gemini_function_schema(other),
+                    };
+                    normalized.insert(key, property_map);
+                    continue;
+                }
+
+                let normalized_value = if key == "type" {
+                    match value {
+                        Value::String(type_name) => Value::String(
+                            match type_name.as_str() {
+                                "OBJECT" => "object",
+                                "ARRAY" => "array",
+                                "STRING" => "string",
+                                "INTEGER" => "integer",
+                                "NUMBER" => "number",
+                                "BOOLEAN" => "boolean",
+                                other => other,
+                            }
+                            .to_string(),
+                        ),
+                        other => normalize_gemini_function_schema(other),
+                    }
+                } else {
+                    normalize_gemini_function_schema(value)
+                };
+
+                if !matches!(
+                    key.as_str(),
+                    "type"
+                        | "description"
+                        | "nullable"
+                        | "enum"
+                        | "items"
+                        | "properties"
+                        | "required"
+                        | "anyOf"
+                        | "allOf"
+                        | "oneOf"
+                        | "example"
+                        | "default"
+                        | "propertyOrdering"
+                ) {
+                    continue;
+                }
+
+                normalized.insert(key, normalized_value);
+            }
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(normalize_gemini_function_schema)
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 fn safety_settings() -> Value {
@@ -543,6 +896,13 @@ fn safety_settings() -> Value {
 fn is_gemini_2_5(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.contains("2.5") || model.contains("2-5")
+}
+
+/// Models that emit thinking — the 2.5 series and the 3.x family. Used to gate
+/// `thinkingConfig.includeThoughts` so we don't send it to non-thinking models.
+fn supports_thoughts(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    is_gemini_2_5(model.as_str()) || model.contains("gemini-3") || model.contains("gemini3")
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
@@ -591,13 +951,17 @@ struct CandidateContent {
 struct CandidatePart {
     #[serde(default)]
     text: Option<String>,
+    /// `true` marks a reasoning-summary part (returned when includeThoughts is on),
+    /// distinct from the opaque `thoughtSignature` used for replay.
+    #[serde(default)]
+    thought: Option<bool>,
     #[serde(rename = "functionCall", default)]
     function_call: Option<GeminiFunctionCall>,
     #[serde(rename = "thoughtSignature", default)]
     thought_signature: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct GeminiFunctionCall {
     name: String,
     #[serde(default)]

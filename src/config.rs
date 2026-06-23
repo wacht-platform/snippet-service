@@ -49,6 +49,19 @@ pub struct ModelConfig {
     pub initial_retry_ms: u64,
     #[serde(default = "default_max_retry_ms")]
     pub max_retry_ms: u64,
+    /// Override the User-Agent for OpenAI-compatible endpoints. Leave unset to
+    /// use the default coding-agent UA (needed for Kimi For Coding and similar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    /// Whether the model accepts image inputs. OFF by default (safe): when off,
+    /// images read by `read_image` are passed as a text placeholder instead of
+    /// inlined bytes, so text-only models don't 400. Set true for multimodal models.
+    #[serde(default)]
+    pub supports_images: bool,
+    /// Reasoning effort: "low" | "medium" | "high" | "off" (or unset). Mapped per
+    /// provider (OpenAI reasoning_effort, Gemini thinkingConfig, Anthropic thinking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Model context window in tokens, for the status-bar usage gauge.
     #[serde(default = "default_context_window")]
     pub context_window: u64,
@@ -187,6 +200,8 @@ impl ModelConfig {
                     max_retries: self.max_retries,
                     initial_retry_ms: self.initial_retry_ms,
                     max_retry_ms: self.max_retry_ms,
+                    supports_images: self.supports_images,
+                    reasoning_effort: self.reasoning_effort.clone(),
                 }))
             }
             "anthropic" => {
@@ -198,6 +213,8 @@ impl ModelConfig {
                     initial_retry_ms: self.initial_retry_ms,
                     max_retry_ms: self.max_retry_ms,
                     cache_prompt: self.cache_prompt,
+                    supports_images: self.supports_images,
+                    reasoning_effort: self.reasoning_effort.clone(),
                 };
                 Box::new(AnthropicModel::new(config))
             }
@@ -226,6 +243,9 @@ impl From<ModelConfig> for OpenAiCompatibleConfig {
             max_retries: value.max_retries,
             initial_retry_ms: value.initial_retry_ms,
             max_retry_ms: value.max_retry_ms,
+            user_agent: value.user_agent,
+            supports_images: value.supports_images,
+            reasoning_effort: value.reasoning_effort,
         }
     }
 }
@@ -277,6 +297,9 @@ impl Default for ModelConfig {
             max_retries: default_max_retries(),
             initial_retry_ms: default_initial_retry_ms(),
             max_retry_ms: default_max_retry_ms(),
+            user_agent: None,
+            supports_images: false,
+            reasoning_effort: None,
             context_window: default_context_window(),
             cache_prompt: default_cache_prompt(),
         }

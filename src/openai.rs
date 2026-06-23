@@ -20,7 +20,20 @@ pub struct OpenAiCompatibleConfig {
     pub max_retries: u32,
     pub initial_retry_ms: u64,
     pub max_retry_ms: u64,
+    /// User-Agent sent on every request. Some gated providers (e.g. Kimi For
+    /// Coding) only serve recognised coding-agent UAs; `None` falls back to a
+    /// Claude Code-style UA so those endpoints accept us out of the box.
+    pub user_agent: Option<String>,
+    /// Whether the model accepts image inputs (drives `supports_images()`).
+    pub supports_images: bool,
+    /// Reasoning effort: low | medium | high | off (sent as `reasoning_effort`).
+    pub reasoning_effort: Option<String>,
 }
+
+/// Default UA for OpenAI-compatible endpoints. Mirrors Claude Code's
+/// `claude-cli/<ver> (external, cli)` so coding-agent-gated providers (Kimi For
+/// Coding, etc.) whitelist us; harmless to ungated providers.
+const DEFAULT_USER_AGENT: &str = "claude-cli/2.0.37 (external, cli)";
 
 pub struct OpenAiCompatibleModel {
     config: OpenAiCompatibleConfig,
@@ -29,15 +42,24 @@ pub struct OpenAiCompatibleModel {
 
 impl OpenAiCompatibleModel {
     pub fn new(config: OpenAiCompatibleConfig) -> Self {
-        Self {
-            config,
-            client: reqwest::Client::new(),
-        }
+        let user_agent = config
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
+        let client = reqwest::Client::builder()
+            .user_agent(user_agent)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { config, client }
     }
 }
 
 #[async_trait]
 impl AgentModel for OpenAiCompatibleModel {
+    fn supports_images(&self) -> bool {
+        self.config.supports_images
+    }
+
     async fn generate(
         &mut self,
         messages: &[HarnessMessage],
@@ -122,6 +144,14 @@ impl OpenAiCompatibleModel {
             temperature: self.config.temperature,
             // `required` needs tools to choose from, else providers reject it.
             tool_choice: (force_tool && !tools.is_empty()).then_some("required"),
+            // Reasoning effort for o-series / gpt-5 / reasoning models. "off" or
+            // unset omits it so non-reasoning models don't 400 on the field.
+            reasoning_effort: self
+                .config
+                .reasoning_effort
+                .as_deref()
+                .filter(|e| !e.eq_ignore_ascii_case("off") && !e.trim().is_empty())
+                .map(str::to_string),
             // Opt into usage accounting on OpenRouter so cache-read tokens surface.
             usage: self
                 .config
@@ -137,8 +167,11 @@ impl OpenAiCompatibleModel {
     async fn send_with_retries(&self, url: &str, body: &ChatRequest) -> Result<Vec<u8>, ToolError> {
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
+        let mut fatal = false;
+        let mut attempts = 0u32;
 
         for attempt in 1..=max_attempts {
+            attempts = attempt;
             let response = self
                 .client
                 .post(url)
@@ -162,7 +195,11 @@ impl OpenAiCompatibleModel {
 
                     let response_body = String::from_utf8_lossy(&bytes).to_string();
                     last_error = format!("HTTP {status}: {response_body}");
-                    if !is_retryable_status(status) || attempt == max_attempts {
+                    if !is_retryable_status(status) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
 
@@ -176,7 +213,11 @@ impl OpenAiCompatibleModel {
                 }
                 Err(error) => {
                     last_error = error.to_string();
-                    if !is_retryable_transport_error(&error) || attempt == max_attempts {
+                    if !is_retryable_transport_error(&error) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
                     sleep(retry_delay(
@@ -190,10 +231,10 @@ impl OpenAiCompatibleModel {
             }
         }
 
-        Err(ToolError::msg(format!(
-            "model request failed after {} attempt(s): {}",
-            max_attempts, last_error
-        )))
+        Err(ToolError::model_request(
+            format!("model request failed after {attempts} attempt(s): {last_error}"),
+            !fatal,
+        ))
     }
 }
 
@@ -247,8 +288,11 @@ async fn stream_chat_with_retries(
 ) -> Result<ModelOutput, ToolError> {
     let max_attempts = max_retries.saturating_add(1).max(1);
     let mut last_error = String::new();
+    let mut fatal = false;
+    let mut attempts = 0u32;
 
     for attempt in 1..=max_attempts {
+        attempts = attempt;
         StreamBuffer::clear(sink);
         let mut request = client
             .post(url)
@@ -267,14 +311,22 @@ async fn stream_chat_with_retries(
                 let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                 let response_body = response.text().await.unwrap_or_default();
                 last_error = format!("HTTP {status}: {response_body}");
-                if !is_retryable_status(status) || attempt == max_attempts {
+                if !is_retryable_status(status) {
+                    fatal = true;
+                    break;
+                }
+                if attempt == max_attempts {
                     break;
                 }
                 sleep(retry_delay(attempt, retry_after, initial_ms, max_ms)).await;
             }
             Err(error) => {
                 last_error = error.to_string();
-                if !is_retryable_transport_error(&error) || attempt == max_attempts {
+                if !is_retryable_transport_error(&error) {
+                    fatal = true;
+                    break;
+                }
+                if attempt == max_attempts {
                     break;
                 }
                 sleep(retry_delay(attempt, None, initial_ms, max_ms)).await;
@@ -283,10 +335,10 @@ async fn stream_chat_with_retries(
     }
 
     StreamBuffer::clear(sink);
-    Err(ToolError::msg(format!(
-        "model streaming request failed after {} attempt(s): {}",
-        max_attempts, last_error
-    )))
+    Err(ToolError::model_request(
+        format!("model streaming request failed after {attempts} attempt(s): {last_error}"),
+        !fatal,
+    ))
 }
 
 /// Consume an OpenAI-style `chat.completions` SSE stream and assemble a
@@ -502,6 +554,8 @@ struct ChatRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     // OpenRouter only reports detailed token accounting (incl.
     // prompt_tokens_details.cached_tokens) when usage accounting is opted into.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -736,6 +790,7 @@ impl GithubCopilotModel {
             temperature: self.config.temperature,
             // `required` needs tools to choose from, else providers reject it.
             tool_choice: (force_tool && !tools.is_empty()).then_some("required"),
+            reasoning_effort: None,
             usage: None,
             stream: stream.then_some(true),
             stream_options: stream.then_some(StreamOptions { include_usage: true }),
@@ -745,10 +800,13 @@ impl GithubCopilotModel {
     async fn send_with_retries(&self, url: &str, body: &ChatRequest) -> Result<Vec<u8>, ToolError> {
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
+        let mut fatal = false;
+        let mut attempts = 0u32;
 
         let session_token = self.get_copilot_token().await?;
 
         for attempt in 1..=max_attempts {
+            attempts = attempt;
             let response = self
                 .client
                 .post(url)
@@ -777,7 +835,11 @@ impl GithubCopilotModel {
 
                     let response_body = String::from_utf8_lossy(&bytes).to_string();
                     last_error = format!("HTTP {status}: {response_body}");
-                    if !is_retryable_status(status) || attempt == max_attempts {
+                    if !is_retryable_status(status) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
 
@@ -791,7 +853,11 @@ impl GithubCopilotModel {
                 }
                 Err(error) => {
                     last_error = error.to_string();
-                    if !is_retryable_transport_error(&error) || attempt == max_attempts {
+                    if !is_retryable_transport_error(&error) {
+                        fatal = true;
+                        break;
+                    }
+                    if attempt == max_attempts {
                         break;
                     }
                     sleep(retry_delay(
@@ -805,10 +871,10 @@ impl GithubCopilotModel {
             }
         }
 
-        Err(ToolError::msg(format!(
-            "model request failed after {} attempt(s): {}",
-            max_attempts, last_error
-        )))
+        Err(ToolError::model_request(
+            format!("model request failed after {attempts} attempt(s): {last_error}"),
+            !fatal,
+        ))
     }
 }
 

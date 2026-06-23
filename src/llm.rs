@@ -194,6 +194,13 @@ pub trait AgentModel: Send + Sync {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError>;
+
+    /// Whether this model accepts image inputs. Text-only models return false, so
+    /// the harness sends a text placeholder instead of inlining image bytes —
+    /// avoiding a multimodal 400 and un-sticking an already-poisoned conversation.
+    fn supports_images(&self) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -206,6 +213,10 @@ impl<T: ?Sized + AgentModel + Send> AgentModel for Box<T> {
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
         (**self).generate(messages, tools, force_tool, sink).await
+    }
+
+    fn supports_images(&self) -> bool {
+        (**self).supports_images()
     }
 }
 
