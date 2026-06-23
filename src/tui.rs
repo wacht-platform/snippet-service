@@ -2938,7 +2938,16 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         first = false;
     }
 
-    let mut events = state.events.iter().peekable();
+    // After a compaction, clear the screen above it: render only from the last
+    // compaction boundary down (a "✦ context compacted" divider, then any newer
+    // activity). The full history still lives in `state` on disk — this only hides
+    // the compacted-away messages from the view.
+    let compact_start = state
+        .events
+        .iter()
+        .rposition(|e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"))
+        .unwrap_or(0);
+    let mut events = state.events[compact_start..].iter().peekable();
     while let Some(event) = events.next() {
         // Collapse a run of consecutive model errors (transient retries) into a
         // single line with a count, so a retry storm doesn't flood the screen.
