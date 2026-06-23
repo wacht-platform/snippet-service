@@ -1768,7 +1768,7 @@ impl CodingHarness {
         state: &mut HarnessState,
         force: bool,
     ) -> Result<(), ToolError> {
-        const RECENT_DETAIL_KEEP: usize = 12;
+        const RECENT_FOCUS: usize = 12;
         const MIN_COMPACTABLE_MESSAGES: usize = 14;
 
         let window = self.config.context_window_tokens.max(1);
@@ -1802,18 +1802,14 @@ impl CodingHarness {
             })
             .unwrap_or_default();
 
-        // Keep a recent verbatim tail; never cut between a tool call and its result.
-        let keep = RECENT_DETAIL_KEEP.min(total.saturating_sub(1));
-        let mut split = total.saturating_sub(keep);
-        while split > 1 && matches!(state.messages[split], HarnessMessage::ToolResult { .. }) {
-            split -= 1;
-        }
-        let older: Vec<HarnessMessage> = state.messages[1..split]
+        // Summarize the ENTIRE conversation (minus the system prompt and the prior
+        // table) into one table — no verbatim tail kept. The summarizer is told to
+        // capture the most recent messages in extra detail.
+        let older: Vec<HarnessMessage> = state.messages[1..]
             .iter()
             .filter(|m| !matches!(m, HarnessMessage::Summary { kind, .. } if kind == "compacted_window"))
             .cloned()
             .collect();
-        let recent_tail: Vec<HarnessMessage> = state.messages[split..].to_vec();
         if older.is_empty() {
             return Ok(());
         }
@@ -1821,38 +1817,27 @@ impl CodingHarness {
         // Surface the compaction animation while the summarizer works.
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compaction_pass".to_string(),
-            reasoning: format!("Updating the context table from {} new message(s).", older.len()),
+            reasoning: format!("Compacting {} messages into the context table.", older.len()),
         });
         let _ = self.persist_state(state).await;
 
-        let window_text = render_window(&prior_table, &older, &state.user_request);
+        let window_text = render_window(&prior_table, &older, &state.user_request, RECENT_FOCUS);
         let table = match self.run_agentic_summary(model, &window_text).await {
             Ok(table) => table,
             // Model unavailable / failed — fall back to the heuristic compaction.
             Err(_) => return self.compact_history(state, force).await,
         };
 
-        let mut messages = vec![
+        // The whole conversation is now the table — no verbatim tail.
+        state.messages = vec![
             HarnessMessage::System { content: system_prompt },
             HarnessMessage::Summary { kind: "compacted_window".to_string(), content: table },
         ];
-        messages.extend(recent_tail.iter().cloned());
-        // Providers expect a trailing user turn; carry the last one if the tail lacks it.
-        if !recent_tail.iter().any(|m| matches!(m, HarnessMessage::User { .. })) {
-            if let Some(last_user) = state.messages.iter().rev().find_map(|m| match m {
-                HarnessMessage::User { content } => Some(content.clone()),
-                _ => None,
-            }) {
-                messages.push(HarnessMessage::User { content: last_user });
-            }
-        }
-
-        state.messages = messages;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
-                "Compacted into the context table at {} / {} tokens ({}%); kept {} recent messages verbatim.",
-                state.last_prompt_tokens, window, self.config.compact_at_pct, recent_tail.len()
+                "Compacted the full conversation into the context table at {} / {} tokens ({}%), with extra detail on the most recent activity.",
+                state.last_prompt_tokens, window, self.config.compact_at_pct
             ),
         });
         state.last_prompt_tokens = 0;
@@ -2274,13 +2259,14 @@ const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer
 [identity]
 role = "worker that maintains ONE living context table for a coding agent"
 input = "each turn you get the activity to fold in, the current table draft, your last tool result, and the turn counter"
-stakes = "this table is the ONLY surviving record of everything before the recent tail — anything not captured is lost"
+stakes = "this table becomes the ENTIRE surviving record of the conversation — nothing is kept verbatim, so anything you don't capture is lost forever"
 
 [method]
 update = "fold the new activity INTO the existing draft: keep what's still true, add what's new, drop what's stale or superseded"
 order = "fill/refresh sections most-important-first: objective -> state -> actions -> decisions -> open_issues -> next_steps"
+recent_focus = "the window marks a 'MOST RECENT ACTIVITY' section — give it EXTRA detail: capture exactly what just happened, the precise current state, any in-flight work, and the immediate next step, so the agent can continue seamlessly. Condense older history more aggressively, but never lose the recent thread."
 evidence = "preserve exact paths, IDs, error strings, and user corrections verbatim; no speculation, no padding, never narrate this process"
-budget = "the whole table must fit ~6k tokens — be dense and minimal; finalize is rejected while over budget, so compress the largest sections"
+budget = "the whole table must fit ~6k tokens — be dense and minimal; finalize is rejected while over budget, so compress the OLDER material first, keeping recent detail"
 
 [finalize]
 when = "objective and state are filled and accurate and the table fits the budget"
@@ -2370,7 +2356,12 @@ fn clip(s: &str, n: usize) -> String {
 }
 
 /// Render the prior table + the new activity window as plain text for the summarizer.
-fn render_window(prior_table: &str, older: &[HarnessMessage], user_request: &str) -> String {
+fn render_window(
+    prior_table: &str,
+    older: &[HarnessMessage],
+    user_request: &str,
+    recent_focus: usize,
+) -> String {
     let mut out = String::new();
     if !prior_table.trim().is_empty() {
         out.push_str("PRIOR TABLE (update this in place):\n");
@@ -2379,8 +2370,15 @@ fn render_window(prior_table: &str, older: &[HarnessMessage], user_request: &str
     } else if !user_request.trim().is_empty() {
         out.push_str(&format!("ORIGINAL REQUEST: {}\n\n", clip(user_request, 600)));
     }
-    out.push_str("NEW ACTIVITY:\n");
-    for m in older {
+    out.push_str("CONVERSATION TO SUMMARIZE:\n");
+    // Mark the most recent messages so the summarizer captures them in extra detail.
+    let focus_start = older.len().saturating_sub(recent_focus);
+    for (i, m) in older.iter().enumerate() {
+        if i == focus_start && focus_start > 0 {
+            out.push_str(
+                "\n=== MOST RECENT ACTIVITY — capture this in extra detail (what just happened, current state, next steps) ===\n",
+            );
+        }
         let line = match m {
             HarnessMessage::User { content } => format!("USER: {}", clip(content, 600)),
             HarnessMessage::Assistant { content, tool_calls } => {
