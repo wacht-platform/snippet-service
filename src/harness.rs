@@ -584,6 +584,11 @@ impl CodingHarness {
                         }
                         Some(LoopInput::Compact) => {
                             let before_len = state.messages.len();
+                            // Manual /compact runs while idle — mark Running and
+                            // persist first so the TUI shows the compaction bar
+                            // (is_compacting requires Running + the pass event).
+                            state.status = HarnessStatus::Running;
+                            self.persist(&mut state, &lanes).await?;
                             self.compact_history_agentic(model, &mut state, true).await?;
                             if state.messages.len() >= before_len {
                                 state.events.push(HarnessEvent::SystemDecision {
