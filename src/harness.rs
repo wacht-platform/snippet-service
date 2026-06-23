@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ const LARGE_TOOL_BATCH: usize = 10;
 /// Ported from wacht's `SHELL_NUDGE_ESCALATE_AT`.
 const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
+
 /// Read-only discovery tools whose exact-duplicate re-call within a request is
 /// wasteful spinning (the result is already in history). `read_file` is excluded
 /// — re-reading after an edit is legitimate.
@@ -68,6 +70,11 @@ pub struct HarnessConfig {
     /// Exa API key, propagated to delegated lanes so their tool set matches the
     /// main agent's (web_search enabled only when set).
     pub exa_api_key: Option<String>,
+    /// Configured model context window for this run; used by compaction gates.
+    pub context_window_tokens: u64,
+    /// Start compaction when the largest observed prompt reaches this percentage
+    /// of `context_window_tokens`.
+    pub compact_at_pct: u8,
 }
 
 impl Default for HarnessConfig {
@@ -81,6 +88,8 @@ impl Default for HarnessConfig {
             recovery_base_ms: 1_000,
             recovery_max_ms: 30_000,
             exa_api_key: None,
+            context_window_tokens: 128_000,
+            compact_at_pct: 85,
         }
     }
 }
@@ -190,6 +199,8 @@ pub enum LoopInput {
     UserMessage(String),
     /// An answer to a pending `ask_user` question.
     Answer(String),
+    /// Request a manual history compaction pass.
+    Compact,
     /// Cancel the run.
     Interrupt,
 }
@@ -309,6 +320,7 @@ impl CodingHarness {
         let mut state = self
             .load_or_initialize_state(Some(user_request.into()))
             .await?;
+        self.compact_history_if_needed(model, &mut state).await?;
         if state.status == HarnessStatus::Completed {
             return Ok(HarnessOutcome {
                 final_text: state.final_text,
@@ -389,6 +401,7 @@ impl CodingHarness {
     ) -> Result<HarnessState, ToolError> {
         let (lane_tx, mut lane_rx) = mpsc::unbounded_channel::<LaneResult>();
         let mut state = self.load_or_initialize_state(initial_request).await?;
+        self.compact_history_if_needed(model, &mut state).await?;
         // A reopened terminal state (completed / failed / interrupted) starts idle
         // so the loop blocks for the next message instead of exiting at the top.
         // Interrupted is the important one: a session is left in that state whenever
@@ -569,6 +582,19 @@ impl CodingHarness {
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
                         }
+                        Some(LoopInput::Compact) => {
+                            let before_len = state.messages.len();
+                            self.compact_history_agentic(model, &mut state, true).await?;
+                            if state.messages.len() >= before_len {
+                                state.events.push(HarnessEvent::SystemDecision {
+                                    step: "history_compaction_skipped".to_string(),
+                                    reasoning: "Manual compaction ran, but there was no additional older history left to shrink beyond the preserved recent tail.".to_string(),
+                                });
+                            }
+                            state.pending_question = None;
+                            state.status = HarnessStatus::Idle;
+                            self.persist(&mut state, &lanes).await?;
+                        }
                         Some(LoopInput::Interrupt) | None => {
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;
@@ -709,6 +735,11 @@ impl CodingHarness {
                     });
                     state.events.push(HarnessEvent::Steer { text });
                 }
+                false
+            }
+            LoopInput::Compact => {
+                // Manual compaction is handled directly by the outer interactive loop;
+                // it should not inject a steer or schedule another model turn.
                 false
             }
             LoopInput::Interrupt => true,
@@ -1424,6 +1455,505 @@ impl CodingHarness {
         self.persist_state(state).await
     }
 
+    async fn compact_history_if_needed(
+        &self,
+        model: &mut dyn AgentModel,
+        state: &mut HarnessState,
+    ) -> Result<(), ToolError> {
+        self.compact_history_agentic(model, state, false).await
+    }
+
+    async fn compact_history(
+        &self,
+        state: &mut HarnessState,
+        force: bool,
+    ) -> Result<(), ToolError> {
+        const RECENT_DETAIL_KEEP: usize = 12;
+        const MIN_COMPACTABLE_MESSAGES: usize = 18;
+        const MAX_SECTION_ITEMS: usize = 18;
+        const MAX_COMPACTION_PASSES: usize = 4;
+
+        let window = self.config.context_window_tokens.max(1);
+        let threshold = window
+            .saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64)
+            / 100;
+        if !force && (threshold == 0 || state.last_prompt_tokens < threshold) {
+            return Ok(());
+        }
+
+        let system_prompt = match state.messages.first() {
+            Some(HarnessMessage::System { content }) => content.clone(),
+            _ => return Ok(()),
+        };
+
+        let last_summary_index = state
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, HarnessMessage::Summary { kind, .. } if kind == "compacted_window"));
+        let window_start = last_summary_index.map(|idx| idx + 1).unwrap_or(1);
+        if state.messages.len().saturating_sub(window_start) <= MIN_COMPACTABLE_MESSAGES {
+            return Ok(());
+        }
+
+        let preview_text = |text: &str, limit: usize| -> String {
+            let trimmed = text.trim();
+            let snippet: String = trimmed.chars().take(limit).collect();
+            if trimmed.chars().count() > limit {
+                format!("{snippet}…")
+            } else {
+                snippet
+            }
+        };
+
+        let preview_json = |value: &Value, limit: usize| -> String {
+            let raw = serde_json::to_string(value).unwrap_or_default();
+            preview_text(&raw, limit)
+        };
+
+        let summarize_window = |messages: &[HarnessMessage], user_request: &str| -> (String, String, usize) {
+            let mut objective = Vec::new();
+            let mut actions = Vec::new();
+            let mut outcomes = Vec::new();
+            let mut decisions = Vec::new();
+            let mut errors_open = Vec::new();
+
+            let push_unique = |items: &mut Vec<String>, value: String, max: usize| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() || items.len() >= max {
+                    return;
+                }
+                if !items.iter().any(|existing| existing == trimmed) {
+                    items.push(trimmed.to_string());
+                }
+            };
+
+            for message in messages {
+                match message {
+                    HarnessMessage::User { content } => {
+                        let text = preview_text(content, 320);
+                        push_unique(
+                            &mut objective,
+                            format!("- USER {text}"),
+                            MAX_SECTION_ITEMS,
+                        );
+                    }
+                    HarnessMessage::Assistant { content, tool_calls } => {
+                        let content = content.trim();
+                        if !content.is_empty() {
+                            push_unique(
+                                &mut actions,
+                                format!("- Assistant reply: {}", preview_text(content, 320)),
+                                MAX_SECTION_ITEMS,
+                            );
+                        }
+                        for call in tool_calls {
+                            push_unique(
+                                &mut actions,
+                                format!(
+                                    "- Tool call: {} args={}",
+                                    call.name,
+                                    preview_json(&call.arguments, 220)
+                                ),
+                                MAX_SECTION_ITEMS,
+                            );
+                        }
+                    }
+                    HarnessMessage::ToolResult { tool_name, content, .. } => {
+                        let rendered = preview_json(content, 420);
+                        push_unique(
+                            &mut outcomes,
+                            format!("- Tool result {tool_name}: {rendered}"),
+                            MAX_SECTION_ITEMS,
+                        );
+                        if rendered.to_ascii_lowercase().contains("\"status\":\"error\"")
+                            || rendered.to_ascii_lowercase().contains("\"status\": \"error\"")
+                            || rendered.to_ascii_lowercase().contains("\"error\"")
+                        {
+                            push_unique(
+                                &mut errors_open,
+                                format!("- {tool_name}: {rendered}"),
+                                MAX_SECTION_ITEMS,
+                            );
+                        }
+                    }
+                    HarnessMessage::Summary { kind, content } => {
+                        push_unique(
+                            &mut outcomes,
+                            format!("- Prior {kind}: {}", preview_text(content, 360)),
+                            MAX_SECTION_ITEMS,
+                        );
+                    }
+                    HarnessMessage::System { content } => {
+                        let text = content.trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if text.starts_with("[Recent activity orientation") {
+                            push_unique(
+                                &mut decisions,
+                                format!("- Orientation: {}", preview_text(text, 320)),
+                                MAX_SECTION_ITEMS,
+                            );
+                        } else if text.starts_with("[Compressed prior thread history") {
+                            push_unique(
+                                &mut outcomes,
+                                format!("- Prior archive: {}", preview_text(text, 320)),
+                                MAX_SECTION_ITEMS,
+                            );
+                        } else {
+                            push_unique(
+                                &mut decisions,
+                                format!("- System: {}", preview_text(text, 320)),
+                                MAX_SECTION_ITEMS,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if objective.is_empty() && !user_request.trim().is_empty() {
+                objective.push(format!("- Original request: {}", preview_text(user_request, 320)));
+            }
+
+            let section = |title: &str, items: &[String]| -> String {
+                if items.is_empty() {
+                    format!("{title} = \"\"\n")
+                } else {
+                    format!("{title} = \"\"\"\n{}\n\"\"\"\n", items.join("\n"))
+                }
+            };
+
+            // Order sections by importance (objective → decisions → open errors →
+            // outcomes → actions) so the budget trim drops the least-critical detail.
+            let mut summary = format!(
+                "[compacted_window]\n{}{}{}{}{}",
+                section("objective", &objective),
+                section("decisions", &decisions),
+                section("errors_open", &errors_open),
+                section("outcomes", &outcomes),
+                section("actions", &actions),
+            );
+            // The compacted window targets ~6k tokens so it stays cheap to carry
+            // forward. Approximate at ~3.5 chars/token and trim the tail if over.
+            const COMPACTION_BUDGET_CHARS: usize = 21_000;
+            if summary.chars().count() > COMPACTION_BUDGET_CHARS {
+                summary = summary.chars().take(COMPACTION_BUDGET_CHARS).collect::<String>()
+                    + "\n…[compacted summary trimmed to fit the 6k-token budget]";
+            }
+
+            let recent_start = messages.len().saturating_sub(RECENT_DETAIL_KEEP);
+            let recent_tail = &messages[recent_start..];
+            let mut recent = String::from(
+                "[Recent activity orientation — keep this in mind while continuing the thread]\n",
+            );
+            for message in recent_tail.iter().take(8) {
+                let line = match message {
+                    HarnessMessage::User { content } => format!("- user: {}", preview_text(content, 220)),
+                    HarnessMessage::Assistant { content, tool_calls } => {
+                        let content = content.trim();
+                        if !content.is_empty() {
+                            format!("- assistant: {}", preview_text(content, 220))
+                        } else if let Some(call) = tool_calls.first() {
+                            format!(
+                                "- assistant tool_call {}: {}",
+                                call.name,
+                                preview_json(&call.arguments, 180)
+                            )
+                        } else {
+                            continue;
+                        }
+                    }
+                    HarnessMessage::ToolResult { tool_name, content, .. } => {
+                        format!("- tool {tool_name}: {}", preview_json(content, 220))
+                    }
+                    HarnessMessage::Summary { kind, content } => {
+                        format!("- {kind}: {}", preview_text(content, 220))
+                    }
+                    HarnessMessage::System { content } => format!("- system: {}", preview_text(content, 220)),
+                };
+                recent.push_str(&line);
+                recent.push('\n');
+            }
+
+            (summary, recent, recent_tail.len())
+        };
+
+        let preserved_prefix: Vec<HarnessMessage> = state.messages[..window_start].to_vec();
+        let mut working: Vec<HarnessMessage> = state.messages[window_start..].to_vec();
+        let mut pass_count = 0usize;
+        let mut preserved_recent_count = 0usize;
+        let mut ran = false;
+
+        while working.len() > MIN_COMPACTABLE_MESSAGES && pass_count < MAX_COMPACTION_PASSES {
+            pass_count += 1;
+            ran = true;
+            state.events.push(HarnessEvent::SystemDecision {
+                step: "history_compaction_pass".to_string(),
+                reasoning: format!(
+                    "Compaction pass {}: condensing {} new history messages since the last summary while preserving a recent verbatim tail.",
+                    pass_count,
+                    working.len()
+                ),
+            });
+            let split_at = working.len().saturating_sub(RECENT_DETAIL_KEEP);
+            if split_at == 0 {
+                break;
+            }
+            let older = working[..split_at].to_vec();
+            let recent_tail = working[split_at..].to_vec();
+            if older.is_empty() {
+                break;
+            }
+
+            let (summary, recent, recent_len) = summarize_window(&older, &state.user_request);
+            preserved_recent_count = recent_len;
+
+            let mut next = vec![
+                HarnessMessage::Summary {
+                    kind: "compacted_window".to_string(),
+                    content: summary,
+                },
+                HarnessMessage::Summary {
+                    kind: "recent_activity".to_string(),
+                    content: recent,
+                },
+            ];
+            next.extend(recent_tail.iter().cloned());
+
+            let tail_has_user = recent_tail
+                .iter()
+                .any(|m| matches!(m, HarnessMessage::User { .. }));
+            if !tail_has_user {
+                if let Some(last_user) = state.messages.iter().rev().find_map(|m| match m {
+                    HarnessMessage::User { content } => Some(content.clone()),
+                    _ => None,
+                }) {
+                    next.push(HarnessMessage::User { content: last_user });
+                }
+            }
+
+            if next.len() >= working.len() {
+                break;
+            }
+            working = next;
+        }
+
+        if !ran {
+            return Ok(());
+        }
+
+        let mut messages = vec![HarnessMessage::System {
+            content: system_prompt,
+        }];
+        messages.extend(preserved_prefix.into_iter().skip(1));
+        messages.extend(working);
+        state.messages = messages;
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "history_compacted".to_string(),
+            reasoning: format!(
+                "Compacted history after prompt usage reached {} / {} tokens ({}%) in {} pass(es); preserved {} recent messages verbatim and compacted only the post-summary window.",
+                state.last_prompt_tokens,
+                window,
+                self.config.compact_at_pct,
+                pass_count,
+                preserved_recent_count
+            ),
+        });
+        // Reset ONLY the current-context gauge — the cumulative session counters
+        // (prompt/completion/total) reflect everything sent and are unaffected by
+        // compaction. The gauge repopulates from the next response's usage.
+        state.last_prompt_tokens = 0;
+        Ok(())
+    }
+
+    /// Agentic compaction: the model maintains ONE living "context table", updating
+    /// its sections from the prior table + new activity, fit to a ~6k-token budget.
+    /// Falls back to the heuristic compaction if the model is unavailable.
+    async fn compact_history_agentic(
+        &self,
+        model: &mut dyn AgentModel,
+        state: &mut HarnessState,
+        force: bool,
+    ) -> Result<(), ToolError> {
+        const RECENT_DETAIL_KEEP: usize = 12;
+        const MIN_COMPACTABLE_MESSAGES: usize = 14;
+
+        let window = self.config.context_window_tokens.max(1);
+        let threshold = window
+            .saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64)
+            / 100;
+        if !force && (threshold == 0 || state.last_prompt_tokens < threshold) {
+            return Ok(());
+        }
+
+        let Some(HarnessMessage::System { content: system_prompt }) = state.messages.first().cloned()
+        else {
+            return Ok(());
+        };
+
+        let total = state.messages.len();
+        if !force && total.saturating_sub(1) <= MIN_COMPACTABLE_MESSAGES {
+            return Ok(());
+        }
+
+        // The prior living table, carried forward and updated (not chained).
+        let prior_table = state
+            .messages
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                HarnessMessage::Summary { kind, content } if kind == "compacted_window" => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // Keep a recent verbatim tail; never cut between a tool call and its result.
+        let keep = RECENT_DETAIL_KEEP.min(total.saturating_sub(1));
+        let mut split = total.saturating_sub(keep);
+        while split > 1 && matches!(state.messages[split], HarnessMessage::ToolResult { .. }) {
+            split -= 1;
+        }
+        let older: Vec<HarnessMessage> = state.messages[1..split]
+            .iter()
+            .filter(|m| !matches!(m, HarnessMessage::Summary { kind, .. } if kind == "compacted_window"))
+            .cloned()
+            .collect();
+        let recent_tail: Vec<HarnessMessage> = state.messages[split..].to_vec();
+        if older.is_empty() {
+            return Ok(());
+        }
+
+        // Surface the compaction animation while the summarizer works.
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "history_compaction_pass".to_string(),
+            reasoning: format!("Updating the context table from {} new message(s).", older.len()),
+        });
+        let _ = self.persist_state(state).await;
+
+        let window_text = render_window(&prior_table, &older, &state.user_request);
+        let table = match self.run_agentic_summary(model, &window_text).await {
+            Ok(table) => table,
+            // Model unavailable / failed — fall back to the heuristic compaction.
+            Err(_) => return self.compact_history(state, force).await,
+        };
+
+        let mut messages = vec![
+            HarnessMessage::System { content: system_prompt },
+            HarnessMessage::Summary { kind: "compacted_window".to_string(), content: table },
+        ];
+        messages.extend(recent_tail.iter().cloned());
+        // Providers expect a trailing user turn; carry the last one if the tail lacks it.
+        if !recent_tail.iter().any(|m| matches!(m, HarnessMessage::User { .. })) {
+            if let Some(last_user) = state.messages.iter().rev().find_map(|m| match m {
+                HarnessMessage::User { content } => Some(content.clone()),
+                _ => None,
+            }) {
+                messages.push(HarnessMessage::User { content: last_user });
+            }
+        }
+
+        state.messages = messages;
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "history_compacted".to_string(),
+            reasoning: format!(
+                "Compacted into the context table at {} / {} tokens ({}%); kept {} recent messages verbatim.",
+                state.last_prompt_tokens, window, self.config.compact_at_pct, recent_tail.len()
+            ),
+        });
+        state.last_prompt_tokens = 0;
+        Ok(())
+    }
+
+    /// Drive the summarizer worker: it calls `write_section` to fill the living table
+    /// and `finalize` to finish; finalize is rejected while a required section is
+    /// empty or the table is over the ~6k-token budget, so it progressively
+    /// compresses. Returns the assembled `[compacted_window]` table.
+    async fn run_agentic_summary(
+        &self,
+        model: &mut dyn AgentModel,
+        window_text: &str,
+    ) -> Result<String, ToolError> {
+        const MAX_TURNS: usize = 16;
+        const BUDGET_CHARS: usize = 21_000; // ~6k tokens at ~3.5 chars/token
+
+        let tools = summarizer_tools();
+        let mut sections: BTreeMap<&'static str, String> = BTreeMap::new();
+        let mut feedback = "(empty — start with `objective`)".to_string();
+
+        for turn in 1..=MAX_TURNS {
+            let user = format!(
+                "ACTIVITY TO FOLD INTO THE TABLE:\n{window_text}\n\nCURRENT TABLE DRAFT:\n{draft}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS}. Call exactly one tool.",
+                draft = render_sections_draft(&sections),
+            );
+            let messages = vec![
+                HarnessMessage::System { content: SUMMARIZER_SYSTEM.to_string() },
+                HarnessMessage::User { content: user },
+            ];
+            let output = model.generate(&messages, &tools, true, None).await?;
+            let Some(call) = output.calls.first() else {
+                feedback = "no tool call received — call exactly one tool".to_string();
+                continue;
+            };
+            match call.tool_name.as_str() {
+                "write_section" => {
+                    let section = call.arguments.get("section").and_then(Value::as_str).unwrap_or_default();
+                    let content = call
+                        .arguments
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default();
+                    match SUMMARY_SECTIONS.iter().find(|(name, ..)| *name == section) {
+                        Some((name, ..)) if !content.is_empty() => {
+                            sections.insert(name, content.to_string());
+                            let missing = required_missing(&sections);
+                            feedback = if missing.is_empty() {
+                                "written; required sections filled — finalize when accurate".to_string()
+                            } else {
+                                format!("written; required still empty: {}", missing.join(", "))
+                            };
+                        }
+                        Some(_) => feedback = "content must be non-empty".to_string(),
+                        None => feedback = format!("unknown section `{section}`"),
+                    }
+                }
+                "finalize" => {
+                    let missing = required_missing(&sections);
+                    if !missing.is_empty() {
+                        feedback = format!("finalize rejected — required section(s) empty: {}", missing.join(", "));
+                        continue;
+                    }
+                    let assembled = assemble_sections(&sections);
+                    let len = assembled.chars().count();
+                    if len > BUDGET_CHARS {
+                        feedback = format!(
+                            "over the ~6k-token budget by ~{} chars — shorten the largest sections (drop low-value detail), then finalize again",
+                            len - BUDGET_CHARS
+                        );
+                        continue;
+                    }
+                    return Ok(assembled);
+                }
+                other => feedback = format!("unknown tool `{other}`"),
+            }
+        }
+
+        // Turn cap reached: assemble if the required sections are filled, else error
+        // (the caller falls back to heuristic compaction).
+        if required_missing(&sections).is_empty() {
+            let assembled = assemble_sections(&sections);
+            return Ok(if assembled.chars().count() > BUDGET_CHARS {
+                assembled.chars().take(BUDGET_CHARS).collect::<String>()
+                    + "\n…[trimmed to the 6k-token budget]"
+            } else {
+                assembled
+            });
+        }
+        Err(ToolError::msg("summarizer exhausted its turns without filling required sections"))
+    }
+
     /// Append a line to `<state_dir>/debug.log` for tracing model/loop behaviour.
     /// No-op when no state path is configured.
     fn debug_log(&self, line: &str) {
@@ -1729,4 +2259,157 @@ pub fn deserialize_state(bytes: &[u8]) -> Result<HarnessState, String> {
     }
 
     Err("failed to deserialize state: not a valid compressed MessagePack or legacy JSON".to_string())
+}
+
+// --- Agentic compaction: the living "context table" ---
+
+/// (name, description, required) — the sections the summarizer maintains.
+const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
+    ("objective", "what the user ultimately wants, and for whom", true),
+    (
+        "state",
+        "where things stand now: files changed, what works/doesn't, plus exact paths/IDs/values worth keeping verbatim",
+        true,
+    ),
+    ("actions", "what was actually done, in order — the condensed trail", false),
+    ("decisions", "key decisions and user corrections, verbatim where wording matters", false),
+    ("open_issues", "exact error strings and genuinely unresolved/open work", false),
+    ("next_steps", "what to do next", false),
+];
+
+const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer
+[identity]
+role = "worker that maintains ONE living context table for a coding agent"
+input = "each turn you get the activity to fold in, the current table draft, your last tool result, and the turn counter"
+stakes = "this table is the ONLY surviving record of everything before the recent tail — anything not captured is lost"
+
+[method]
+update = "fold the new activity INTO the existing draft: keep what's still true, add what's new, drop what's stale or superseded"
+order = "fill/refresh sections most-important-first: objective -> state -> actions -> decisions -> open_issues -> next_steps"
+evidence = "preserve exact paths, IDs, error strings, and user corrections verbatim; no speculation, no padding, never narrate this process"
+budget = "the whole table must fit ~6k tokens — be dense and minimal; finalize is rejected while over budget, so compress the largest sections"
+
+[finalize]
+when = "objective and state are filled and accurate and the table fits the budget"
+how = "call finalize (one tool call per turn)""#;
+
+fn summarizer_tools() -> Vec<crate::llm::NativeToolDefinition> {
+    let names: Vec<&str> = SUMMARY_SECTIONS.iter().map(|(n, ..)| *n).collect();
+    let docs = SUMMARY_SECTIONS
+        .iter()
+        .map(|(n, d, req)| format!("`{n}`{}: {d}", if *req { " (required)" } else { "" }))
+        .collect::<Vec<_>>()
+        .join("; ");
+    vec![
+        crate::llm::NativeToolDefinition {
+            name: "write_section".to_string(),
+            description: format!("Write or replace one table section. Sections: {docs}."),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "section": { "type": "string", "enum": names },
+                    "content": { "type": "string", "description": "Full replacement content for the section (markdown bullets preferred)." }
+                },
+                "required": ["section", "content"],
+                "additionalProperties": false
+            }),
+        },
+        crate::llm::NativeToolDefinition {
+            name: "finalize".to_string(),
+            description: "Assemble the table and finish. Rejected while a required section is empty or the table is over the ~6k-token budget.".to_string(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+    ]
+}
+
+fn toml_block(body: &str) -> String {
+    format!("\"\"\"\n{}\n\"\"\"", body.replace("\"\"\"", "'''"))
+}
+
+fn render_sections_draft(sections: &BTreeMap<&'static str, String>) -> String {
+    let body = SUMMARY_SECTIONS
+        .iter()
+        .map(|(name, _, req)| {
+            let v = match sections.get(name).map(String::as_str) {
+                Some(b) => toml_block(b),
+                None if *req => "\"\" # empty — required".to_string(),
+                None => "\"\" # empty".to_string(),
+            };
+            format!("{name} = {v}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("[compacted_window]\n{body}")
+}
+
+fn required_missing(sections: &BTreeMap<&'static str, String>) -> Vec<&'static str> {
+    SUMMARY_SECTIONS
+        .iter()
+        .filter(|(name, _, req)| {
+            *req && sections.get(name).map(|s| s.trim().is_empty()).unwrap_or(true)
+        })
+        .map(|(n, ..)| *n)
+        .collect()
+}
+
+fn assemble_sections(sections: &BTreeMap<&'static str, String>) -> String {
+    let body = SUMMARY_SECTIONS
+        .iter()
+        .filter_map(|(name, ..)| {
+            sections
+                .get(name)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|b| format!("{name} = {}", toml_block(b)))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("[compacted_window]\n{body}")
+}
+
+fn clip(s: &str, n: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() > n {
+        t.chars().take(n).collect::<String>() + "…"
+    } else {
+        t.to_string()
+    }
+}
+
+/// Render the prior table + the new activity window as plain text for the summarizer.
+fn render_window(prior_table: &str, older: &[HarnessMessage], user_request: &str) -> String {
+    let mut out = String::new();
+    if !prior_table.trim().is_empty() {
+        out.push_str("PRIOR TABLE (update this in place):\n");
+        out.push_str(prior_table.trim());
+        out.push_str("\n\n");
+    } else if !user_request.trim().is_empty() {
+        out.push_str(&format!("ORIGINAL REQUEST: {}\n\n", clip(user_request, 600)));
+    }
+    out.push_str("NEW ACTIVITY:\n");
+    for m in older {
+        let line = match m {
+            HarnessMessage::User { content } => format!("USER: {}", clip(content, 600)),
+            HarnessMessage::Assistant { content, tool_calls } => {
+                let mut s = String::new();
+                if !content.trim().is_empty() {
+                    s.push_str(&format!("ASSISTANT: {}", clip(content, 600)));
+                }
+                for c in tool_calls {
+                    s.push_str(&format!("\nTOOL_CALL {}({})", c.name, clip(&c.arguments.to_string(), 300)));
+                }
+                s
+            }
+            HarnessMessage::ToolResult { tool_name, content, .. } => {
+                format!("TOOL_RESULT {tool_name}: {}", clip(&content.to_string(), 600))
+            }
+            HarnessMessage::Summary { kind, content } => format!("[{kind}] {}", clip(content, 600)),
+            HarnessMessage::System { content } => format!("SYSTEM: {}", clip(content, 300)),
+        };
+        if !line.trim().is_empty() {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
 }

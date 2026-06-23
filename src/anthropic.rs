@@ -678,6 +678,10 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                     );
                 }
             }
+            HarnessMessage::Summary { kind, content } => {
+                let text = format!("[summary:{kind}]\n{content}\n[/summary]");
+                push_block(&mut prepared, "user", text_block(text));
+            }
         }
     }
 

@@ -242,6 +242,10 @@ pub enum HarnessMessage {
         tool_name: String,
         content: Value,
     },
+    Summary {
+        kind: String,
+        content: String,
+    },
     System {
         content: String,
     },

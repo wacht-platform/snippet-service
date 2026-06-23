@@ -238,23 +238,23 @@ impl OpenAiCompatibleModel {
     }
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
+pub(crate) fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::CONFLICT
         || status.is_server_error()
 }
 
-fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
+pub(crate) fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }
 
-fn retry_after_delay(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
+pub(crate) fn retry_after_delay(value: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
     let raw = value?.to_str().ok()?;
     raw.parse::<u64>().ok().map(Duration::from_secs)
 }
 
-fn retry_delay(
+pub(crate) fn retry_delay(
     attempt: u32,
     retry_after: Option<Duration>,
     initial_ms: u64,
@@ -531,6 +531,10 @@ fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<Cha
                 out
             }
         }
+        HarnessMessage::Summary { kind, content } => vec![ChatMessage::text(
+            "user",
+            &format!("[summary:{kind}]\n{content}\n[/summary]"),
+        )],
     }
 }
 

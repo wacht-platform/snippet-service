@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod builtins;
+pub mod chatgpt;
+pub mod chatgpt_auth;
 pub mod checkpoint;
 pub mod config;
 pub mod gemini;
@@ -9,6 +11,7 @@ pub mod lanes;
 pub mod llm;
 pub mod meta;
 pub mod openai;
+pub mod outline;
 pub mod prompts;
 pub mod replay;
 pub mod sanitize;

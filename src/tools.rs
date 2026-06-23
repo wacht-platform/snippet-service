@@ -8,6 +8,10 @@ use thiserror::Error;
 
 use crate::llm::NativeToolDefinition;
 
+// Re-export so `crate::tools::coding_tools` resolves (the tool registry is defined
+// in `builtins`); lanes.rs imports it via this path.
+pub use crate::builtins::coding_tools;
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("{0}")]

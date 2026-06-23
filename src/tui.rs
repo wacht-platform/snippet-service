@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{
@@ -19,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use serde_json::Value;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -46,6 +47,8 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ("/resume", "Resume a saved session"),
     ("/rewind", "Restore the workspace to a checkpoint"),
     ("/model", "Connect or change the AI model"),
+    ("/compact", "Compact older conversation history now"),
+    ("/theme", "Switch the color theme"),
 ];
 
 #[derive(Debug, Clone)]
@@ -139,6 +142,8 @@ fn restore_terminal(terminal: &mut TuiTerminal) -> Result<(), Box<dyn std::error
 enum Screen {
     Main,
     ResumeSelection,
+    ThemeSelection,
+    Profiles,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,15 +152,20 @@ enum SettingsField {
     ApiKey,
     Model,
     BaseUrl,
+    Reasoning,
+    ContextWindow,
+    Compaction,
 }
 
 /// Providers offered by the login form, in display order.
-const LOGIN_PROVIDERS: &[&str] = &["openai", "anthropic", "gemini", "openrouter", "openai-compatible"];
+const LOGIN_PROVIDERS: &[&str] = &["openai", "chatgpt", "anthropic", "gemini", "openrouter", "openai-compatible"];
 
 /// Single source of truth for a provider's default base URL and model.
 fn provider_defaults(provider: &str) -> (String, String) {
     match provider {
         "openai" => ("https://api.openai.com/v1".to_string(), "gpt-5.5".to_string()),
+        // ChatGPT-subscription (OAuth) — no base URL / API key; model is a Codex slug.
+        "chatgpt" => (String::new(), "gpt-5.1-codex".to_string()),
         "anthropic" => (String::new(), "claude-opus-4-8".to_string()),
         // Native Gemini adapter — no base URL (it has its own endpoint), like Anthropic.
         "gemini" => (String::new(), "gemini-3.5-flash".to_string()),
@@ -169,17 +179,56 @@ fn provider_defaults(provider: &str) -> (String, String) {
     }
 }
 
-/// The model candidates shown in the login form's picker dropdown: the
-/// live-fetched list when available, else the static fallback (capped).
+fn provider_context_defaults(provider: &str) -> (u64, u8) {
+    match provider {
+        "openai" | "chatgpt" | "anthropic" | "gemini" => (250_000, 90),
+        "openai-compatible" => (130_000, 90),
+        // Keep openrouter aligned with the hosted-provider defaults unless the
+        // user overrides it per profile.
+        "openrouter" => (250_000, 90),
+        _ => (130_000, 90),
+    }
+}
+
+/// The model candidates shown inline in the login form. The list is filtered by
+/// the current model text, with prefix matches ranked first and the active value
+/// pinned into the results so arrowing through suggestions stays stable.
 fn login_model_rows(app: &App) -> Vec<String> {
-    match &app.form_fetched_models {
-        Some(fetched) => fetched.iter().take(6).cloned().collect(),
+    let all: Vec<String> = match &app.form_fetched_models {
+        Some(fetched) => fetched.clone(),
         None => get_provider_models(&app.form_provider)
             .iter()
-            .take(6)
             .map(|s| s.to_string())
             .collect(),
+    };
+    let query = app.form_model.trim().to_ascii_lowercase();
+    let mut prefix = Vec::new();
+    let mut contains = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for model in all {
+        let lower = model.to_ascii_lowercase();
+        let matches = query.is_empty()
+            || lower.starts_with(&query)
+            || lower.contains(&query);
+        if !matches || !seen.insert(model.clone()) {
+            continue;
+        }
+        if !query.is_empty() && lower.starts_with(&query) {
+            prefix.push(model);
+        } else {
+            contains.push(model);
+        }
     }
+
+    let current = app.form_model.trim();
+    if !current.is_empty() && seen.insert(current.to_string()) {
+        prefix.insert(0, current.to_string());
+    }
+
+    prefix.extend(contains);
+    prefix.truncate(6);
+    prefix
 }
 
 struct App {
@@ -203,6 +252,8 @@ struct App {
     /// Largest valid scroll offset, recomputed each frame from the rendered
     /// transcript so key handlers can clamp.
     max_scroll: Cell<usize>,
+    /// True while a compaction animation should be shown in the transcript.
+    compacting: bool,
     /// Home-abbreviated, canonicalized workspace path for the status bar.
     cwd_display: String,
     /// Animation frame counter for the "working…" spinner.
@@ -213,14 +264,41 @@ struct App {
     suggestion_index: usize,
     screen: Screen,
     resume_selected_index: usize,
+    /// Theme picker cursor + the index to restore if the picker is cancelled.
+    theme_selected_index: usize,
+    theme_original_index: usize,
+    /// Inline model suggestion cursor in the login form.
+    model_picker_index: usize,
+    /// Profiles screen cursor; which profile (if any) the editor is editing; and
+    /// whether closing the editor should return to the profiles list.
+    profiles_selected_index: usize,
+    editing_profile: Option<String>,
+    return_to_profiles: bool,
+    /// Inputs typed while the agent is executing — held and submitted when the run
+    /// finishes (or is stopped), instead of steering mid-run.
+    queued_inputs: std::collections::VecDeque<String>,
+    /// Was the agent busy on the previous tick? Drives the queue flush on the
+    /// busy → not-busy edge.
+    was_busy: bool,
     form_provider: String,
     form_api_key: String,
     form_model: String,
     form_model_query: String,
     form_base_url: String,
+    form_reasoning_effort: Option<String>,
+    form_context_window: String,
+    form_compact_at_pct: String,
     form_focus: SettingsField,
     form_fetched_models: Option<Vec<String>>,
     models_fetch_handle: Option<tokio::task::JoinHandle<Result<Vec<String>, String>>>,
+    /// In-flight ChatGPT sign-in task (browser OAuth or device-code flow), polled in `tick`).
+    chatgpt_login_handle:
+        Option<tokio::task::JoinHandle<Result<crate::chatgpt_auth::ChatGptTokens, String>>>,
+    /// Current device-code prompt, shown while the poll task is running.
+    chatgpt_device_code: Option<crate::chatgpt_auth::DeviceCodeInfo>,
+    /// In-flight device-code *begin* task (fetches the code to display), polled in `tick`.
+    chatgpt_device_begin_handle:
+        Option<tokio::task::JoinHandle<Result<crate::chatgpt_auth::DeviceCodeInfo, String>>>,
     models_fetch_status: String,
     original_config: Option<crate::config::SnippetConfig>,
     last_state_modified: Option<std::time::SystemTime>,
@@ -244,6 +322,10 @@ struct App {
 
 impl App {
     fn new(options: TuiOptions) -> Self {
+        // Apply the persisted theme (if any) before the first render.
+        if let Some(name) = options.config.theme.as_deref() {
+            set_theme_by_name(name);
+        }
         let status = if options.config.resume_on_start {
             "Resuming the saved run...".to_string()
         } else {
@@ -272,14 +354,28 @@ impl App {
             suggestion_index: 0,
             screen: Screen::Main,
             resume_selected_index: 0,
+            theme_selected_index: 0,
+            theme_original_index: 0,
+            model_picker_index: 0,
+            profiles_selected_index: 0,
+            editing_profile: None,
+            return_to_profiles: false,
+            queued_inputs: std::collections::VecDeque::new(),
+            was_busy: false,
             form_provider: String::new(),
             form_api_key: String::new(),
             form_model: String::new(),
             form_model_query: String::new(),
             form_base_url: String::new(),
+            form_reasoning_effort: None,
+            form_context_window: String::new(),
+            form_compact_at_pct: String::new(),
             form_focus: SettingsField::Provider,
             form_fetched_models: None,
             models_fetch_handle: None,
+            chatgpt_login_handle: None,
+            chatgpt_device_code: None,
+            chatgpt_device_begin_handle: None,
             models_fetch_status: String::new(),
             original_config: None,
             last_state_modified: None,
@@ -289,6 +385,7 @@ impl App {
             q_answers: Vec::new(),
             q_token: String::new(),
             stream: crate::llm::StreamHandle::default(),
+            compacting: false,
         };
         app.init_settings_form();
 
@@ -304,21 +401,84 @@ impl App {
             app.switch_conversation(&name);
         }
 
-        if app.options.config.model.api_key.trim().is_empty() {
+        let chatgpt_ready =
+            app.options.config.model.provider == "chatgpt" && crate::chatgpt_auth::is_signed_in();
+        if app.options.config.model.api_key.trim().is_empty() && !chatgpt_ready {
             app.status = "No model connected yet — type /model to connect one.".to_string();
         }
 
         app
     }
 
-    /// Open the compact inline login form, seeding the shared form fields from
-    /// the current config and focusing the provider selector.
-    fn open_login(&mut self) {
-        self.original_config = Some(self.options.config.clone());
-        self.init_settings_form();
-        self.form_focus = SettingsField::Provider;
-        self.login_active = true;
+    /// Open the profiles screen (the model page). Migrates a lone `[model]` into a
+    /// named profile so everything is managed uniformly, then selects the active one.
+    fn open_profiles(&mut self) {
+        self.options.config.ensure_setups();
+        let names = self.options.config.profile_names();
+        self.profiles_selected_index = self
+            .options
+            .config
+            .active_setup
+            .as_ref()
+            .and_then(|a| names.iter().position(|n| n == a))
+            .unwrap_or(0);
+        self.screen = Screen::Profiles;
         self.input_clear();
+    }
+
+    /// Open the connect/editor form for a profile — `Some(name)` edits it, `None`
+    /// starts a new one. Saving writes back to that profile (and activates it).
+    fn open_profile_editor(&mut self, name: Option<String>) {
+        self.original_config = Some(self.options.config.clone());
+        let existing = name
+            .as_ref()
+            .and_then(|n| self.options.config.setups.as_ref().and_then(|m| m.get(n)).cloned());
+        match existing {
+            Some(cfg) => {
+                self.form_provider = cfg.provider.clone();
+                self.form_api_key = cfg.api_key.clone();
+                self.form_model = cfg.model.clone();
+                self.form_base_url = cfg.base_url.clone();
+                self.form_reasoning_effort = cfg.reasoning_effort.clone();
+                self.form_context_window = cfg.context_window.to_string();
+                self.form_compact_at_pct = cfg.compact_at_pct.to_string();
+            }
+            None => {
+                self.form_provider = "openai".to_string();
+                let (base, model) = provider_defaults(&self.form_provider);
+                self.form_base_url = base;
+                self.form_model = model;
+                self.form_api_key = String::new();
+                self.form_reasoning_effort = Some("medium".to_string());
+                let (context_window, compact_at_pct) = provider_context_defaults(&self.form_provider);
+                self.form_context_window = context_window.to_string();
+                self.form_compact_at_pct = compact_at_pct.to_string();
+            }
+        }
+        self.editing_profile = name;
+        self.form_model_query = String::new();
+        self.form_fetched_models = None;
+        self.models_fetch_status = String::new();
+        self.form_focus = SettingsField::Provider;
+        self.return_to_profiles = true;
+        self.login_active = true;
+        self.screen = Screen::Profiles;
+        self.input_clear();
+    }
+
+    /// Activate a saved profile: persist, restart the loop with it, return to Main.
+    fn activate_profile(&mut self, name: &str) {
+        if self.options.config.activate(name) {
+            let _ = self.save_config_file();
+            let resumed = self.restart_loop_for_config();
+            self.screen = Screen::Main;
+            self.status = format!(
+                "✓ {} · {}{}",
+                self.options.config.model.provider,
+                self.options.config.model.model,
+                if resumed { " · resumed" } else { "" },
+            );
+        }
     }
 
     /// Close the login form, optionally restoring the pre-login config (Esc).
@@ -331,8 +491,14 @@ impl App {
             self.original_config = None;
         }
         self.login_active = false;
-        // When closing login during an active session, don't interrupt the conversation
-        // Only close the login form and preserve the current session
+        // When opened from the profiles screen, return there (refreshed) rather than
+        // dropping to the transcript.
+        if self.return_to_profiles {
+            self.return_to_profiles = false;
+            self.editing_profile = None;
+            self.open_profiles();
+        }
+        // When closing login during an active session, the conversation is preserved.
     }
 
     fn conversations_dir(&self) -> PathBuf {
@@ -585,7 +751,7 @@ impl App {
                     self.status = "Agent is working. Stop it (Esc) before changing the model.".to_string();
                     return;
                 }
-                self.open_login();
+                self.open_profiles();
                 self.status = String::new();
             }
             "/rewind" => {
@@ -600,19 +766,70 @@ impl App {
                     };
                 }
             }
+            "/compact" => {
+                if let Some(tx) = &self.input_tx {
+                    if tx.send(LoopInput::Compact).is_ok() {
+                        if let Ok(mut stream) = self.stream.lock() {
+                            stream.text = "Compacting history…".to_string();
+                            stream.thinking.clear();
+                        }
+                        self.status = String::new();
+                    } else {
+                        self.status = "Failed to send compact request to the agent loop.".to_string();
+                    }
+                } else {
+                    self.status = "No active session to compact.".to_string();
+                }
+            }
+            "/theme" => {
+                if parts.len() > 1 {
+                    if set_theme_by_name(parts[1]) {
+                        self.persist_theme();
+                        self.status = format!("Theme: {}", parts[1]);
+                    } else {
+                        let names = PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join(", ");
+                        self.status = format!("Unknown theme '{}'. Available: {names}", parts[1]);
+                    }
+                } else {
+                    self.theme_original_index = current_theme_index();
+                    self.theme_selected_index = current_theme_index();
+                    self.screen = Screen::ThemeSelection;
+                    self.status = String::new();
+                }
+            }
             other => {
-                self.status = format!("Unknown command: {}. Type /new, /resume, /rewind, or /model.", other);
+                self.status =
+                    format!("Unknown command: {other}. Type /new, /resume, /rewind, /model, or /theme.");
             }
         }
     }
 
+    /// Persist the active theme's name to config so it survives restarts.
+    fn persist_theme(&mut self) {
+        self.options.config.theme = PRESETS.get(current_theme_index()).map(|p| p.name.to_string());
+        let _ = self.save_config_file();
+    }
+
     /// Tab order of the login form fields (Base URL only for openai-compatible).
     fn login_focus_order(&self) -> Vec<SettingsField> {
+        // ChatGPT-subscription signs in via OAuth — no API key / base URL fields.
+        if self.form_provider == "chatgpt" {
+            return vec![
+                SettingsField::Provider,
+                SettingsField::Model,
+                SettingsField::Reasoning,
+                SettingsField::ContextWindow,
+                SettingsField::Compaction,
+            ];
+        }
         let mut order = vec![SettingsField::Provider, SettingsField::ApiKey];
         if self.form_provider == "openai-compatible" {
             order.push(SettingsField::BaseUrl);
         }
         order.push(SettingsField::Model);
+        order.push(SettingsField::Reasoning);
+        order.push(SettingsField::ContextWindow);
+        order.push(SettingsField::Compaction);
         order
     }
 
@@ -643,8 +860,65 @@ impl App {
         match self.form_focus {
             SettingsField::Provider => self.change_provider(forward),
             SettingsField::Model => self.login_cycle_model(forward),
+            SettingsField::Reasoning => self.login_cycle_reasoning(forward),
+            SettingsField::Compaction => self.login_cycle_compaction_pct(forward),
             _ => {}
         }
+    }
+
+    fn login_move_model_suggestion(&mut self, forward: bool) {
+        let rows = login_model_rows(self);
+        if rows.is_empty() {
+            self.model_picker_index = 0;
+            return;
+        }
+        if self.model_picker_index >= rows.len() {
+            self.model_picker_index = 0;
+        }
+        self.model_picker_index = if forward {
+            (self.model_picker_index + 1) % rows.len()
+        } else if self.model_picker_index == 0 {
+            rows.len() - 1
+        } else {
+            self.model_picker_index - 1
+        };
+        if let Some(chosen) = rows.get(self.model_picker_index) {
+            self.form_model = chosen.clone();
+        }
+    }
+
+    fn login_cycle_reasoning(&mut self, forward: bool) {
+        const OPTIONS: [&str; 4] = ["off", "low", "medium", "high"];
+        let current = self
+            .form_reasoning_effort
+            .as_deref()
+            .unwrap_or("medium")
+            .to_ascii_lowercase();
+        let idx = OPTIONS.iter().position(|v| *v == current).unwrap_or(2);
+        let next = if forward {
+            (idx + 1) % OPTIONS.len()
+        } else if idx == 0 {
+            OPTIONS.len() - 1
+        } else {
+            idx - 1
+        };
+        self.form_reasoning_effort = Some(OPTIONS[next].to_string());
+    }
+
+    fn login_cycle_compaction_pct(&mut self, forward: bool) {
+        let current = self
+            .form_compact_at_pct
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .unwrap_or(85)
+            .clamp(50, 95);
+        let next = if forward {
+            current.saturating_add(5).min(95)
+        } else {
+            current.saturating_sub(5).max(50)
+        };
+        self.form_compact_at_pct = next.to_string();
     }
 
     /// Cycle the chosen model through the full candidate list (fetched or
@@ -667,6 +941,7 @@ impl App {
             None => 0,
         };
         self.form_model = all[next].clone();
+        self.model_picker_index = 0;
     }
 
     /// Type a character into the focused text field.
@@ -674,7 +949,20 @@ impl App {
         match self.form_focus {
             SettingsField::ApiKey => self.form_api_key.push(c),
             SettingsField::BaseUrl => self.form_base_url.push(c),
-            SettingsField::Model => self.form_model.push(c),
+            SettingsField::Model => {
+                self.form_model.push(c);
+                self.model_picker_index = 0;
+            }
+            SettingsField::ContextWindow => {
+                if c.is_ascii_digit() {
+                    self.form_context_window.push(c);
+                }
+            }
+            SettingsField::Compaction => {
+                if c.is_ascii_digit() {
+                    self.form_compact_at_pct.push(c);
+                }
+            }
             _ => {}
         }
     }
@@ -691,7 +979,16 @@ impl App {
         match self.form_focus {
             SettingsField::ApiKey => self.form_api_key.push_str(cleaned),
             SettingsField::BaseUrl => self.form_base_url.push_str(cleaned),
-            SettingsField::Model => self.form_model.push_str(cleaned),
+            SettingsField::Model => {
+                self.form_model.push_str(cleaned);
+                self.model_picker_index = 0;
+            }
+            SettingsField::ContextWindow => self
+                .form_context_window
+                .push_str(&cleaned.chars().filter(|c| c.is_ascii_digit()).collect::<String>()),
+            SettingsField::Compaction => self
+                .form_compact_at_pct
+                .push_str(&cleaned.chars().filter(|c| c.is_ascii_digit()).collect::<String>()),
             _ => {}
         }
     }
@@ -706,6 +1003,13 @@ impl App {
             }
             SettingsField::Model => {
                 self.form_model.pop();
+                self.model_picker_index = 0;
+            }
+            SettingsField::ContextWindow => {
+                self.form_context_window.pop();
+            }
+            SettingsField::Compaction => {
+                self.form_compact_at_pct.pop();
             }
             _ => {}
         }
@@ -713,6 +1017,12 @@ impl App {
 
     /// Validate the form and connect: persist the config and close the form.
     fn login_connect(&mut self) {
+        // ChatGPT-subscription has no API key — it signs in via OAuth (or reuses an
+        // existing sign-in) instead of validating a key.
+        if self.form_provider == "chatgpt" {
+            self.start_chatgpt_login(crate::chatgpt_auth::ChatGptLoginMethod::Browser);
+            return;
+        }
         if self.form_api_key.trim().is_empty() {
             self.form_focus = SettingsField::ApiKey;
             self.status = "An API key is required to connect.".to_string();
@@ -723,7 +1033,21 @@ impl App {
             self.status = "Pick or type a model to connect.".to_string();
             return;
         }
-        match self.save_settings_to_file() {
+        let context_window = self
+            .form_context_window
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|v| *v >= 8_000)
+            .unwrap_or_else(|| provider_context_defaults(&self.form_provider).0);
+        let compact_at_pct = self
+            .form_compact_at_pct
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .unwrap_or_else(|| provider_context_defaults(&self.form_provider).1)
+            .clamp(50, 95);
+        match self.save_settings_to_file_with_limits(context_window, compact_at_pct) {
             Ok(_) => {
                 self.close_login(false);
                 // The resident loop builds its model once at spawn, so a live
@@ -738,6 +1062,95 @@ impl App {
                 );
             }
             Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Begin a ChatGPT sign-in flow. Reuses an existing sign-in if there
+    /// is one; otherwise starts either the browser OAuth flow or the device-code flow.
+    fn start_chatgpt_login(&mut self, method: crate::chatgpt_auth::ChatGptLoginMethod) {
+        if self.chatgpt_login_handle.is_some() {
+            self.status = match method {
+                crate::chatgpt_auth::ChatGptLoginMethod::Browser => {
+                    "Sign-in already in progress — finish it in your browser.".to_string()
+                }
+                crate::chatgpt_auth::ChatGptLoginMethod::DeviceCode => {
+                    "Sign-in already in progress — finish the device-code flow first.".to_string()
+                }
+            };
+            return;
+        }
+        if crate::chatgpt_auth::is_signed_in() {
+            self.finish_chatgpt_login(None);
+            return;
+        }
+        self.chatgpt_device_code = None;
+        match method {
+            crate::chatgpt_auth::ChatGptLoginMethod::Browser => {
+                self.status = "Opening browser — finish signing in to ChatGPT…".to_string();
+                self.chatgpt_login_handle = Some(tokio::spawn(async move {
+                    crate::chatgpt_auth::login(crate::chatgpt_auth::ChatGptLoginMethod::Browser)
+                        .await
+                }));
+            }
+            crate::chatgpt_auth::ChatGptLoginMethod::DeviceCode => {
+                // Fetch the device code off-thread (NEVER block_on inside the async
+                // runtime — that panics). tick() surfaces the code and starts polling.
+                self.status = "Starting device-code sign-in…".to_string();
+                self.chatgpt_device_begin_handle =
+                    Some(tokio::spawn(
+                        async move { crate::chatgpt_auth::begin_device_code_login().await },
+                    ));
+            }
+        }
+    }
+
+    /// Persist the chatgpt provider + model once a sign-in is in place and connect.
+    fn finish_chatgpt_login(&mut self, email: Option<String>) {
+        if self.form_model.trim().is_empty() {
+            self.form_model = "gpt-5.1-codex".to_string();
+        }
+        self.form_api_key = String::new();
+        self.form_base_url = String::new();
+        self.chatgpt_device_code = None;
+        match self.save_settings_to_file() {
+            Ok(_) => {
+                self.close_login(false);
+                let resumed = self.restart_loop_for_config();
+                let who = email.map(|e| format!(" as {e}")).unwrap_or_default();
+                self.status = format!(
+                    "✓ Signed in to ChatGPT{who} — {}{}",
+                    self.options.config.model.model,
+                    if resumed { " · resumed" } else { "" },
+                );
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn logout_chatgpt(&mut self) {
+        match crate::chatgpt_auth::logout_blocking() {
+            Ok(()) => {
+                self.chatgpt_device_code = None;
+                if self.form_provider == "chatgpt" {
+                    self.form_api_key.clear();
+                    self.form_base_url.clear();
+                }
+                if self.options.config.model.provider == "chatgpt" {
+                    let name = self.options.config.active_setup.clone();
+                    if let Some(name) = name {
+                        if let Some(setups) = self.options.config.setups.as_mut() {
+                            if let Some(cfg) = setups.get_mut(&name) {
+                                cfg.api_key.clear();
+                            }
+                        }
+                    }
+                    let _ = self.save_config_file();
+                }
+                self.status = "Signed out of ChatGPT.".to_string();
+            }
+            Err(error) => {
+                self.error = Some(format!("ChatGPT logout failed: {error}"));
+            }
         }
     }
 
@@ -764,6 +1177,9 @@ impl App {
         self.form_model = self.options.config.model.model.clone();
         self.form_model_query = String::new();
         self.form_base_url = self.options.config.model.base_url.clone();
+        self.form_reasoning_effort = self.options.config.model.reasoning_effort.clone().or(Some("medium".to_string()));
+        self.form_context_window = self.options.config.model.context_window.to_string();
+        self.form_compact_at_pct = self.options.config.model.compact_at_pct.to_string();
         self.form_focus = SettingsField::Provider;
         self.form_fetched_models = None;
         self.models_fetch_status = String::new();
@@ -789,26 +1205,56 @@ impl App {
         let toml_str = toml::to_string_pretty(&self.options.config)
             .map_err(|e| format!("failed to serialize config: {e}"))?;
 
+        // Never overwrite the config with something we can't read back — guards
+        // against a serialization ordering bug silently corrupting the user's file.
+        toml::from_str::<crate::config::SnippetConfig>(&toml_str)
+            .map_err(|e| format!("refusing to write config that won't round-trip: {e}"))?;
+
         std::fs::write(&self.options.config_path, toml_str)
             .map_err(|e| format!("failed to write config: {e}"))?;
         Ok(())
     }
 
     fn save_settings_to_file(&mut self) -> Result<(), String> {
-        let mut model_config = self.options.config.model.clone();
+        let context_window = provider_context_defaults(&self.form_provider).0;
+        let compact_at_pct = provider_context_defaults(&self.form_provider).1;
+        self.save_settings_to_file_with_limits(context_window, compact_at_pct)
+    }
+
+    fn save_settings_to_file_with_limits(
+        &mut self,
+        context_window: u64,
+        compact_at_pct: u8,
+    ) -> Result<(), String> {
+        // Start from the profile being edited (preserving its other fields like
+        // temperature/reasoning) or the active config when adding a new one.
+        let mut model_config = self
+            .editing_profile
+            .as_ref()
+            .and_then(|n| self.options.config.setups.as_ref().and_then(|m| m.get(n)).cloned())
+            .unwrap_or_else(|| self.options.config.model.clone());
 
         model_config.provider = self.form_provider.clone();
         model_config.api_key = self.form_api_key.clone();
         model_config.model = self.form_model.clone();
         model_config.base_url = self.form_base_url.clone();
+        model_config.reasoning_effort = self
+            .form_reasoning_effort
+            .clone()
+            .filter(|v| !v.trim().is_empty());
 
-        model_config.context_window = match self.form_provider.as_str() {
-            "anthropic" => 200_000,
-            "gemini" => 1_000_000,
-            _ => 128_000,
-        };
+        model_config.context_window = context_window;
+        model_config.compact_at_pct = compact_at_pct;
 
-        self.options.config.model = model_config;
+        // Write into the named profile (editing the same key, or a fresh unique one)
+        // and make it active.
+        let key = self
+            .editing_profile
+            .clone()
+            .unwrap_or_else(|| self.options.config.unique_profile_key(&self.form_provider));
+        self.options.config.upsert_profile(&key, model_config);
+        self.options.config.activate(&key);
+        self.editing_profile = Some(key);
 
         self.save_config_file()?;
 
@@ -833,6 +1279,13 @@ impl App {
         let (base_url, model) = provider_defaults(&self.form_provider);
         self.form_base_url = base_url;
         self.form_model = model;
+        let (context_window, compact_at_pct) = provider_context_defaults(&self.form_provider);
+        self.form_context_window = context_window.to_string();
+        self.form_compact_at_pct = compact_at_pct.to_string();
+        // Keep the user's current reasoning preference if present; otherwise default to medium.
+        if self.form_reasoning_effort.is_none() {
+            self.form_reasoning_effort = Some("medium".to_string());
+        }
         self.form_model_query = String::new();
         // The previous provider's model list no longer applies.
         self.form_fetched_models = None;
@@ -854,6 +1307,20 @@ impl App {
             && self.state.as_ref().is_some_and(|s| {
                 s.status == HarnessStatus::Running
                     || s.lanes.iter().any(|l| l.status == LaneStatus::Running)
+            })
+    }
+
+    /// True while the harness is mid-compaction (recent compaction-pass event + still
+    /// running) — used to hold input and label the wait.
+    fn is_compacting(&self) -> bool {
+        self.compacting
+            || self.state.as_ref().is_some_and(|s| {
+                s.status == HarnessStatus::Running
+                    && matches!(
+                        s.events.last(),
+                        Some(HarnessEvent::SystemDecision { step, .. })
+                            if step == "history_compaction_pass" || step == "history_compacted"
+                    )
             })
     }
 
@@ -1162,6 +1629,31 @@ impl App {
             return;
         }
 
+        // While the agent is executing, hold the message instead of steering the
+        // running turn — it's submitted when the run finishes (or is stopped). Esc
+        // stops the run, which flushes the queue immediately.
+        if self.agent_busy() {
+            self.queued_inputs.push_back(text);
+            self.status = if self.is_compacting() {
+                self.compacting = true;
+                String::new()
+            } else {
+                format!(
+                    "queued ({}) — sends when the run finishes · Esc to stop & send now",
+                    self.queued_inputs.len()
+                )
+            };
+            return;
+        }
+
+        self.submit_text(text);
+    }
+
+    /// Send one input to the loop now (answer a pending question, steer an idle
+    /// resident loop, or spawn a fresh run if none is alive). Used by `submit` when
+    /// not busy and by the queue flush.
+    fn submit_text(&mut self, text: String) {
+        self.scroll = 0;
         if let Some(tx) = self.input_tx.clone().filter(|_| self.agent_alive()) {
             let waiting = self
                 .state
@@ -1181,6 +1673,19 @@ impl App {
             // interrupt the agent has died but the transcript is intact; resume=false
             // would clobber it into a new conversation.
             self.spawn_loop(Some(text), true);
+        }
+    }
+
+    /// Submit the next queued input when the agent goes idle/stopped. One per
+    /// busy→idle edge so each becomes its own turn (no mid-run steering).
+    fn flush_queued_input(&mut self) {
+        if let Some(text) = self.queued_inputs.pop_front() {
+            self.submit_text(text);
+            self.status = if self.queued_inputs.is_empty() {
+                String::new()
+            } else {
+                format!("{} more queued", self.queued_inputs.len())
+            };
         }
     }
 
@@ -1215,6 +1720,8 @@ impl App {
                     state_path: Some(state_path),
                     resume,
                     exa_api_key: exa_api_key.clone(),
+                    context_window_tokens: model_config.context_window,
+                    compact_at_pct: model_config.compact_at_pct,
                     ..HarnessConfig::default()
                 },
                 coding_tools(exa_api_key),
@@ -1241,7 +1748,15 @@ impl App {
     async fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.refresh_state().await;
-        
+
+        // Flush a queued input on the busy → not-busy edge: the run just finished or
+        // was stopped, so submit the next held message as its own turn.
+        let busy = self.agent_busy();
+        if self.was_busy && !busy && !self.queued_inputs.is_empty() {
+            self.flush_queued_input();
+        }
+        self.was_busy = busy;
+
         if self
             .models_fetch_handle
             .as_ref()
@@ -1267,6 +1782,53 @@ impl App {
                 }
                 Err(error) => {
                     self.models_fetch_status = format!("Fetch task crashed: {}", error);
+                }
+            }
+        }
+
+        if self
+            .chatgpt_device_begin_handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false)
+        {
+            let handle = self.chatgpt_device_begin_handle.take().expect("checked is_some");
+            match handle.await {
+                Ok(Ok(info)) => {
+                    self.status = format!(
+                        "Open {} and enter code {} — waiting for sign-in…",
+                        info.verification_url, info.user_code
+                    );
+                    self.chatgpt_device_code = Some(info.clone());
+                    self.chatgpt_login_handle = Some(tokio::spawn(async move {
+                        crate::chatgpt_auth::complete_device_code_login(info).await
+                    }));
+                }
+                Ok(Err(error)) => self.status = format!("device-code start failed: {error}"),
+                Err(error) => self.status = format!("device-code task crashed: {error}"),
+            }
+        }
+
+        if self
+            .chatgpt_login_handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false)
+        {
+            let handle = self.chatgpt_login_handle.take().expect("checked is_some");
+            match handle.await {
+                Ok(Ok(tokens)) => {
+                    self.chatgpt_device_code = None;
+                    let email = tokens.email.clone();
+                    self.finish_chatgpt_login(email);
+                }
+                Ok(Err(error)) => {
+                    self.chatgpt_device_code = None;
+                    self.status = format!("ChatGPT sign-in failed: {error}");
+                }
+                Err(error) => {
+                    self.chatgpt_device_code = None;
+                    self.status = format!("ChatGPT sign-in task crashed: {error}");
                 }
             }
         }
@@ -1383,6 +1945,11 @@ async fn run_app(
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.login_active {
+        handle_login_key(app, key);
+        return;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         // Global shortcuts first.
         match key.code {
@@ -1423,6 +1990,81 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Right => app.input_cursor = app.input_next_word(),
                 _ => {}
             }
+        }
+        return;
+    }
+
+    if app.screen == Screen::Profiles {
+        let names = app.options.config.profile_names();
+        let total = names.len();
+        let rows = total + 1; // profiles + the "Add a model" row
+        match key.code {
+            KeyCode::Up => {
+                app.profiles_selected_index = (app.profiles_selected_index + rows - 1) % rows;
+            }
+            KeyCode::Down => {
+                app.profiles_selected_index = (app.profiles_selected_index + 1) % rows;
+            }
+            KeyCode::Enter => {
+                if app.profiles_selected_index >= total {
+                    app.open_profile_editor(None);
+                } else {
+                    let name = names[app.profiles_selected_index].clone();
+                    app.activate_profile(&name);
+                }
+            }
+            KeyCode::Char('a') => app.open_profile_editor(None),
+            KeyCode::Char('e') => {
+                if app.profiles_selected_index < total {
+                    let name = names[app.profiles_selected_index].clone();
+                    app.open_profile_editor(Some(name));
+                }
+            }
+            KeyCode::Char('d') => {
+                if total <= 1 {
+                    app.status = "Can't delete the only profile.".to_string();
+                } else if app.profiles_selected_index < total {
+                    let name = names[app.profiles_selected_index].clone();
+                    app.options.config.remove_profile(&name);
+                    let _ = app.save_config_file();
+                    let new_total = app.options.config.profile_names().len();
+                    if app.profiles_selected_index >= new_total {
+                        app.profiles_selected_index = new_total.saturating_sub(1);
+                    }
+                    app.status = format!("Removed profile “{name}”");
+                }
+            }
+            KeyCode::Esc => app.screen = Screen::Main,
+            _ => {}
+        }
+        return;
+    }
+
+
+    if app.screen == Screen::ThemeSelection {
+        let count = PRESETS.len();
+        match key.code {
+            KeyCode::Up => {
+                app.theme_selected_index = (app.theme_selected_index + count - 1) % count;
+                set_theme_index(app.theme_selected_index); // live preview
+            }
+            KeyCode::Down => {
+                app.theme_selected_index = (app.theme_selected_index + 1) % count;
+                set_theme_index(app.theme_selected_index);
+            }
+            KeyCode::Enter => {
+                set_theme_index(app.theme_selected_index);
+                app.persist_theme();
+                let label = PRESETS.get(app.theme_selected_index).map(|p| p.label).unwrap_or("");
+                app.status = format!("Theme: {label}");
+                app.screen = Screen::Main;
+            }
+            KeyCode::Esc => {
+                set_theme_index(app.theme_original_index); // revert live preview
+                app.screen = Screen::Main;
+                app.status = String::new();
+            }
+            _ => {}
         }
         return;
     }
@@ -1616,9 +2258,35 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
             app.close_login(true);
             app.status = String::new();
         }
-        KeyCode::Enter => app.login_connect(),
-        KeyCode::Tab | KeyCode::Down => app.login_move_focus(true),
-        KeyCode::BackTab | KeyCode::Up => app.login_move_focus(false),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)
+            && app.form_provider == "chatgpt" =>
+        {
+            app.start_chatgpt_login(crate::chatgpt_auth::ChatGptLoginMethod::DeviceCode);
+        }
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL)
+            && app.form_provider == "chatgpt" =>
+        {
+            app.logout_chatgpt();
+        }
+        KeyCode::Enter => {
+            if app.form_provider == "chatgpt" && app.form_focus != SettingsField::Model {
+                app.login_connect();
+            } else if app.form_focus == SettingsField::Model {
+                let rows = login_model_rows(app);
+                if let Some(chosen) = rows.get(app.model_picker_index).cloned() {
+                    app.form_model = chosen;
+                }
+                app.login_connect();
+            } else {
+                app.login_connect();
+            }
+        }
+        KeyCode::Tab => app.login_move_focus(true),
+        KeyCode::BackTab => app.login_move_focus(false),
+        KeyCode::Down if app.form_focus == SettingsField::Model => app.login_move_model_suggestion(true),
+        KeyCode::Up if app.form_focus == SettingsField::Model => app.login_move_model_suggestion(false),
+        KeyCode::Down => app.login_move_focus(true),
+        KeyCode::Up => app.login_move_focus(false),
         KeyCode::Left => app.login_adjust(false),
         KeyCode::Right => app.login_adjust(true),
         KeyCode::Backspace => app.login_backspace(),
@@ -1632,6 +2300,17 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     if app.screen == Screen::ResumeSelection {
         render_resume_selection(frame, area, app);
+        return;
+    }
+
+    if app.screen == Screen::ThemeSelection {
+        render_theme_selection(frame, area, app);
+        return;
+    }
+
+
+    if app.screen == Screen::Profiles {
+        render_profiles(frame, area, app);
         return;
     }
 
@@ -1671,6 +2350,163 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     render_status(frame, footer_area, app);
 }
 
+/// One-line auth/endpoint status for a profile card.
+fn profile_status(cfg: &crate::config::ModelConfig) -> String {
+    match cfg.provider.as_str() {
+        "chatgpt" => {
+            if crate::chatgpt_auth::is_signed_in() {
+                "✓ signed in".to_string()
+            } else {
+                "not signed in — Enter to sign in".to_string()
+            }
+        }
+        "openai-compatible" => {
+            let host = cfg
+                .base_url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            host.split('/').next().filter(|h| !h.is_empty()).unwrap_or("custom endpoint").to_string()
+        }
+        _ => {
+            if cfg.api_key.trim().is_empty() {
+                "no api key".to_string()
+            } else {
+                "api key set".to_string()
+            }
+        }
+    }
+}
+
+/// The profiles screen — every saved provider config as a card, one active. Enter
+/// activates, `e` edits, `a` adds, `d` deletes.
+fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders};
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled("  ·  models", subtle()),
+            Span::styled(
+                format!("  ·  {} active lane{}", app.state.as_ref().map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count()).unwrap_or(0), if app.state.as_ref().map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count()).unwrap_or(0) == 1 { "" } else { "s" }),
+                Style::default().fg(lane()),
+            ),
+        ])),
+        chunks[0],
+    );
+
+    let names = app.options.config.profile_names();
+    let total = names.len();
+    let active = app.options.config.active_setup.clone().unwrap_or_default();
+    let setups = app.options.config.setups.as_ref();
+    let sel = app.profiles_selected_index.min(total); // index `total` == the Add row
+
+    // Window over profile cards (3 lines each); the Add row always shows at the end.
+    let list_h = (chunks[1].height as usize).saturating_sub(2);
+    let visible = (list_h.saturating_sub(2) / 3).max(1);
+    let focus = sel.min(total.saturating_sub(1));
+    let start = if total > 0 && focus >= visible { focus + 1 - visible } else { 0 };
+    let end = (start + visible).min(total);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if start > 0 {
+        lines.push(Line::from(Span::styled(format!("  ↑ {start} more"), Style::default().fg(faint()))));
+    }
+    for i in start..end {
+        let name = &names[i];
+        let is_sel = i == sel;
+        let is_active = *name == active;
+        let mut head = vec![
+            Span::styled(
+                if is_sel { "▍ " } else { "  " },
+                Style::default().fg(accent()),
+            ),
+            Span::styled(
+                name.clone(),
+                if is_sel {
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(self::text()).add_modifier(Modifier::BOLD)
+                },
+            ),
+        ];
+        if is_active {
+            head.push(Span::styled("   ● active", Style::default().fg(success())));
+        }
+        lines.push(Line::from(head));
+        if let Some(cfg) = setups.and_then(|m| m.get(name)) {
+            let model = if cfg.model.is_empty() {
+                "(no model)".to_string()
+            } else {
+                cfg.model.clone()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("     {model} · {}", profile_status(cfg)),
+                subtle(),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    if end < total {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more", total - end),
+            Style::default().fg(faint()),
+        )));
+    }
+
+    let add_sel = sel >= total;
+    lines.push(Line::from(vec![
+        Span::styled(if add_sel { "▍ " } else { "  " }, Style::default().fg(accent())),
+        Span::styled(
+            "+ Add a model",
+            if add_sel {
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(faint())
+            },
+        ),
+    ]));
+
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(faint()));
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑/↓ move  ·  ↵ activate  ·  e edit  ·  a add  ·  d delete  ·  Esc",
+            subtle(),
+        ))),
+        chunks[2],
+    );
+
+    if app.login_active {
+        let popup_width = area.width.saturating_sub(8).min(96).max(64);
+        let popup_height = area.height.saturating_sub(6).min(26).max(16);
+        let popup = Rect {
+            x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+            y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .title(Span::styled(" model setup ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent()));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        frame.render_widget(Paragraph::new(login_lines(app, inner.width as usize)).wrap(Wrap { trim: false }), inner);
+    }
+}
+
 fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     use ratatui::widgets::{Block, Borders};
 
@@ -1689,48 +2525,147 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     // Render Header
     let header_text = vec![
         Span::styled("● snipett", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-        Span::styled("  |  Select a session to resume", Style::default().fg(TEXT)),
+        Span::styled("  |  Select a session to resume", Style::default().fg(self::text())),
     ];
     frame.render_widget(Paragraph::new(Line::from(header_text)), chunks[0]);
 
-    // Render List
+    // Render List — windowed so a long list never clips the selection off-screen.
     let mut lines = Vec::new();
     if convs.is_empty() {
         lines.push(Line::from(Span::styled("  No saved conversations found.", subtle())));
     } else {
-        let selected_idx = app.resume_selected_index.min(convs.len().saturating_sub(1));
-        for (idx, (name, desc)) in convs.iter().enumerate() {
-            let is_selected = idx == selected_idx;
-
+        let total = convs.len();
+        let selected_idx = app.resume_selected_index.min(total - 1);
+        // chunks[1] borders (TOP|BOTTOM) take 2 rows; reserve 2 more for the
+        // ↑/↓ "N more" hints so the visible window always fits.
+        let visible = (chunks[1].height as usize).saturating_sub(4).max(1);
+        let start = if selected_idx >= visible {
+            selected_idx + 1 - visible
+        } else {
+            0
+        };
+        let end = (start + visible).min(total);
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ↑ {} more", start),
+                Style::default().fg(faint()),
+            )));
+        }
+        for (offset, (name, desc)) in convs[start..end].iter().enumerate() {
+            let is_selected = start + offset == selected_idx;
             let line = if is_selected {
                 Line::from(vec![
-                    Span::styled(format!("  ➤ {:<38} ", name), Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)),
-                    Span::styled(desc.to_string(), Style::default().fg(Color::Rgb(30, 41, 59))),
-                ]).style(Style::default().bg(blue()))
+                    Span::styled("▍ ", Style::default().fg(accent())),
+                    Span::styled(format!("{:<38} ", name), Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                    Span::styled(desc.to_string(), subtle()),
+                ])
             } else {
                 Line::from(vec![
-                    Span::styled(format!("    {:<38} ", name), Style::default().fg(blue())),
-                    Span::styled(desc.to_string(), subtle()),
+                    Span::raw("  "),
+                    Span::styled(format!("{:<38} ", name), Style::default().fg(self::text())),
+                    Span::styled(desc.to_string(), Style::default().fg(faint())),
                 ])
             };
             lines.push(line);
+        }
+        if end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ↓ {} more", total - end),
+                Style::default().fg(faint()),
+            )));
         }
     }
 
     let list_block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)));
+        .border_style(Style::default().fg(faint()));
 
     frame.render_widget(Paragraph::new(lines).block(list_block), chunks[1]);
 
     // Render Footer
-    let footer_style = Style::default().fg(MUTED);
     let footer_text = "↑/↓ scroll  ·  Enter resume selected  ·  Esc go back";
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer_text, footer_style))),
+        Paragraph::new(Line::from(Span::styled(footer_text, subtle()))),
         chunks[2]
     );
 }
+
+/// The `/theme` picker: presets with a live color swatch; arrowing previews the
+/// whole UI in that theme (set in the key handler), Enter applies + persists.
+fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders};
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    let header = vec![
+        Span::styled(" snipett", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  theme", subtle()),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
+
+    let total = PRESETS.len();
+    let sel = app.theme_selected_index.min(total.saturating_sub(1));
+    // Window so a long preset list never clips the selection off-screen.
+    let visible = (chunks[1].height as usize).saturating_sub(4).max(1);
+    let start = if sel >= visible { sel + 1 - visible } else { 0 };
+    let end = (start + visible).min(total);
+    let mut lines = Vec::new();
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {} more", start),
+            Style::default().fg(faint()),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    for (idx, preset) in PRESETS.iter().enumerate().take(end).skip(start) {
+        let selected = idx == sel;
+        let bar = if selected {
+            Span::styled("▍ ", Style::default().fg(accent()))
+        } else {
+            Span::raw("  ")
+        };
+        let label_style = if selected {
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self::text())
+        };
+        // Swatch in THIS preset's own colors, so each row previews its palette.
+        let t = preset.theme;
+        let mut spans = vec![bar, Span::styled(format!("{:<18}", preset.label), label_style)];
+        for color in [t.accent, t.success, t.warn, t.danger, t.lane, t.code] {
+            spans.push(Span::styled("●", Style::default().fg(color)));
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+    }
+    if end < total {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more", total - end),
+            Style::default().fg(faint()),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(faint()));
+    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
+
+    let footer = "↑/↓ preview  ·  Enter apply  ·  Esc cancel";
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(footer, subtle()))),
+        chunks[2],
+    );
+}
+
+/// Models offered by the picker: the live-fetched list (uncapped) or the static
+/// fallback for the provider, filtered by the search query (case-insensitive).
 
 fn get_suggestions(app: &App) -> Vec<(String, String)> {
     if !app.input.starts_with('/') {
@@ -1799,25 +2734,32 @@ fn render_suggestions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let mut lines = Vec::new();
     for (idx, (cmd, desc)) in matches.iter().enumerate() {
         let is_selected = idx == app.suggestion_index;
-
-        let line = if is_selected {
-            Line::from(vec![
-                Span::styled(format!("  ➤ {:<9} ", cmd), Style::default().fg(Color::Black).add_modifier(Modifier::BOLD)),
-                Span::styled(desc.to_string(), Style::default().fg(Color::Rgb(30, 41, 59))),
-            ]).style(Style::default().bg(blue()))
+        // Accent-bar flat style: the selected row gets a left ▍ bar + bold accent
+        // command; others sit dim with a blank gutter. No full-width background.
+        let (bar, cmd_style, desc_style) = if is_selected {
+            (
+                Span::styled("▍ ", Style::default().fg(accent())),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                subtle(),
+            )
         } else {
-            Line::from(vec![
-                Span::styled(format!("    {:<9} ", cmd), Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-                Span::styled(desc.to_string(), subtle()),
-            ])
+            (
+                Span::raw("  "),
+                Style::default().fg(self::text()),
+                Style::default().fg(faint()),
+            )
         };
-        lines.push(line);
+        lines.push(Line::from(vec![
+            bar,
+            Span::styled(format!("{:<10}", cmd), cmd_style),
+            Span::styled(format!("  {desc}"), desc_style),
+        ]));
     }
 
     use ratatui::widgets::{Block, Borders};
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::Rgb(40, 40, 40)));
+        .border_style(Style::default().fg(faint()));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -1825,12 +2767,12 @@ fn render_suggestions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let line = if let Some(ref err) = app.error {
         Line::from(vec![
-            Span::styled("error: ", Style::default().fg(DANGER).add_modifier(Modifier::BOLD)),
-            Span::styled(err.to_string(), Style::default().fg(DANGER)),
+            Span::styled("error: ", Style::default().fg(danger()).add_modifier(Modifier::BOLD)),
+            Span::styled(err.to_string(), Style::default().fg(danger())),
         ])
     } else {
         Line::from(vec![
-            Span::styled(&app.status, Style::default().fg(Color::Gray)),
+            Span::styled(&app.status, subtle()),
         ])
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -1840,9 +2782,9 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let model = app.options.config.model.model.clone();
     let name = " snipett";
     let mut spans = vec![
-        Span::styled(name, Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        Span::styled(" · ", Style::default().fg(MUTED)),
-        Span::styled(model.clone(), Style::default().fg(MUTED)),
+        Span::styled(name, Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(muted())),
+        Span::styled(model.clone(), Style::default().fg(muted())),
         Span::raw(" "),
     ];
     // Fill the rest of the row with a thin rule for a clean header rather than a
@@ -1850,7 +2792,7 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let used = name.chars().count() + 3 + model.chars().count() + 1;
     let rule = (area.width as usize).saturating_sub(used + 1);
     if rule > 0 {
-        spans.push(Span::styled("─".repeat(rule), Style::default().fg(FAINT)));
+        spans.push(Span::styled("─".repeat(rule), Style::default().fg(faint())));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1866,6 +2808,23 @@ fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     let width = (inner.width as usize).saturating_sub(1).max(20);
     let height = inner.height as usize;
+
+    // Empty state: no conversation yet (and not in the login form) — show a small
+    // animated splash centered in the content area instead of a blank screen.
+    let empty = !app.login_active
+        && app
+            .state
+            .as_ref()
+            .map_or(true, |s| s.events.is_empty() && s.user_request.trim().is_empty());
+    if empty {
+        let block = empty_state_lines(app.frame, width);
+        let top = height.saturating_sub(block.len()) / 2;
+        let mut lines: Vec<Line<'static>> = std::iter::repeat(Line::from("")).take(top).collect();
+        lines.extend(block);
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
     let lines = transcript_lines(app, width);
 
     let max_scroll = lines.len().saturating_sub(height);
@@ -1877,6 +2836,61 @@ fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let window = lines[start..end].to_vec();
 
     frame.render_widget(Paragraph::new(window), inner);
+}
+
+/// Center a line horizontally within `width` by left-padding to half the slack.
+fn center_line(line: Line<'static>, width: usize) -> Line<'static> {
+    let pad = width.saturating_sub(line.width()) / 2;
+    if pad == 0 {
+        return line;
+    }
+    let mut spans = vec![Span::raw(" ".repeat(pad))];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+/// The empty-state splash: a shimmering wordmark, a waving bar row, and a hint —
+/// animated by the frame counter so the idle screen feels alive.
+fn empty_state_lines(frame_n: usize, width: usize) -> Vec<Line<'static>> {
+    let f = frame_n;
+
+    // The wordmark with a highlight that sweeps across it.
+    let word: Vec<char> = "snipett".chars().collect();
+    let sweep = (f / 2) % (word.len() + 6);
+    let mut title = Vec::new();
+    for (i, c) in word.iter().enumerate() {
+        let style = if i == sweep {
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self::text()).add_modifier(Modifier::BOLD)
+        };
+        title.push(Span::styled(c.to_string(), style));
+    }
+
+    // A small equalizer wave that ripples left→right.
+    const BARS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+    let mut wave = Vec::new();
+    for i in 0..11usize {
+        let phase = (f / 2 + i * 2) % 14;
+        let h = if phase < 7 { phase } else { 14 - phase }; // triangle 0..6..0
+        wave.push(Span::styled(BARS[h.min(7)].to_string(), Style::default().fg(accent())));
+        wave.push(Span::raw(" "));
+    }
+
+    vec![
+        center_line(Line::from(title), width),
+        Line::from(""),
+        center_line(Line::from(wave), width),
+        Line::from(""),
+        Line::from(""),
+        center_line(
+            Line::from(Span::styled(
+                "type a task and press Enter   ·   / for commands",
+                subtle(),
+            )),
+            width,
+        ),
+    ]
 }
 
 fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
@@ -1922,7 +2936,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             if !first {
                 lines.push(Line::from(""));
             }
-            lines.extend(marker_block("✗ ", "", DANGER, &last, width));
+            lines.extend(marker_block("✗ ", "", danger(), &last, width));
             prev_tool_row = false;
             first = false;
             continue;
@@ -1957,7 +2971,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                                     call_lines[0].spans.push(Span::raw(" ".repeat(pad)));
                                     call_lines[0]
                                         .spans
-                                        .push(Span::styled(summary, Style::default().fg(MUTED)));
+                                        .push(Span::styled(summary, Style::default().fg(muted())));
                                     events.next();
                                 }
                             }
@@ -1967,7 +2981,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             } else if state.status == HarnessStatus::Running {
                 let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
                 let label = format!("{spinner} running");
-                let style = Style::default().fg(ACCENT);
+                let style = Style::default().fg(accent());
                 if call_lines.len() == 1
                     && width > call_lines[0].width() + label.chars().count() + 2
                 {
@@ -2018,7 +3032,7 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
         }
         for seg in wrap_one(thinking, width.saturating_sub(2)) {
-            lines.push(Line::from(Span::styled(seg, Style::default().fg(MUTED))));
+            lines.push(Line::from(Span::styled(seg, Style::default().fg(muted()))));
         }
     }
 
@@ -2039,14 +3053,35 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{spinner} "),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("working…", subtle()),
-        ]));
+        let compacting = state.status == HarnessStatus::Running
+            && matches!(
+                state.events.last(),
+                Some(HarnessEvent::SystemDecision { step, .. })
+                    if step == "history_compaction_pass" || step == "history_compacted"
+            );
+        if compacting {
+            // Compaction shown as motion — an accent wave — not a log line.
+            const BARS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+            let mut spans = vec![Span::styled(
+                "✦ compacting context  ",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            )];
+            for i in 0..9usize {
+                let phase = (app.frame / 2 + i * 2) % 14;
+                let h = if phase < 7 { phase } else { 14 - phase };
+                spans.push(Span::styled(BARS[h.min(7)], Style::default().fg(accent())));
+            }
+            lines.push(Line::from(spans));
+        } else {
+            let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{spinner} "),
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("working…", subtle()),
+            ]));
+        }
     }
     // Append inline login Q&A if active
     lines.extend(login_lines(app, width));
@@ -2060,28 +3095,46 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
     match event {
         HarnessEvent::UserInput { text } => user_lines(text, width),
         HarnessEvent::Steer { text } => {
-            marker_block("↳ ", "steer  ", ACCENT, text, width)
+            marker_block("↳ ", "steer  ", accent(), text, width)
         }
         HarnessEvent::AssistantText { text } => render_prose(text, width),
-        HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", MUTED, entry, width),
-        HarnessEvent::SystemDecision { step, reasoning } => marker_block(
-            "⚙ ",
-            "",
-            WARN,
-            &format!("{step} — {reasoning}"),
-            width,
-        ),
+        HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", muted(), entry, width),
+        HarnessEvent::SystemDecision { step, reasoning } => {
+            if step == "history_compaction_pass" || step == "history_compaction_skipped" {
+                // Not shown in scrollback — compaction is conveyed live by the
+                // animated banner and, once done, by the divider below.
+                Vec::new()
+            } else if step == "history_compacted" {
+                // A clean boundary; everything above it is collapsed by transcript_lines.
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  ───────────  ✦ context compacted  ───────────",
+                        Style::default().fg(muted()),
+                    )),
+                    Line::from(""),
+                ]
+            } else {
+                marker_block(
+                    "⚙ ",
+                    "",
+                    warn(),
+                    &format!("{step} — {reasoning}"),
+                    width,
+                )
+            }
+        }
         HarnessEvent::ModelError { message } => {
-            marker_block("✗ ", "", DANGER, message, width)
+            marker_block("✗ ", "", danger(), message, width)
         }
         HarnessEvent::UserQuestion { questions } => {
             let text = question_text(questions).unwrap_or_else(|| "(question)".to_string());
-            marker_block("? ", "", WARN, &text, width)
+            marker_block("? ", "", warn(), &text, width)
         }
         HarnessEvent::LaneSpawned { id, title } => marker_block(
             "→ ",
             "",
-            LANE,
+            lane(),
             &format!("delegated {id}: {title}"),
             width,
         ),
@@ -2107,7 +3160,7 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
             tool_result_lines(tool_name, result, width)
         }
         HarnessEvent::InvalidToolCall { tool_name, error } => result_block(
-            vec![(format!("✗ {tool_name}: {error}"), Style::default().fg(DANGER))],
+            vec![(format!("✗ {tool_name}: {error}"), Style::default().fg(danger()))],
             width,
         ),
     }
@@ -2123,12 +3176,12 @@ fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         if i == 0 {
             lines.push(Line::from(vec![
                 prefix.clone(),
-                Span::styled(seg, Style::default().fg(TEXT)),
+                Span::styled(seg, Style::default().fg(self::text())),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(seg, Style::default().fg(TEXT)),
+                Span::styled(seg, Style::default().fg(self::text())),
             ]));
         }
     }
@@ -2184,15 +3237,15 @@ fn lane_completed_lines(
     width: usize,
 ) -> Vec<Line<'static>> {
     let (tag, color) = match status {
-        LaneStatus::Completed => ("done", SUCCESS),
-        LaneStatus::Failed => ("failed", DANGER),
-        LaneStatus::Running => ("running", LANE),
+        LaneStatus::Completed => ("done", success()),
+        LaneStatus::Failed => ("failed", danger()),
+        LaneStatus::Running => ("running", lane()),
     };
     let mut lines = vec![Line::from(vec![
         Span::styled("◆ ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("lane {id} · {title} "),
-            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            Style::default().fg(self::text()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("[{tag}]"), Style::default().fg(color)),
     ])];
@@ -2221,8 +3274,8 @@ fn tool_call_head_lines(tool_name: &str, arguments: &Value, width: usize) -> Vec
 
     if arg.trim().is_empty() {
         return vec![Line::from(vec![
-            Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(verb, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+            Span::styled("● ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled(verb, Style::default().fg(self::text()).add_modifier(Modifier::BOLD)),
         ])];
     }
 
@@ -2230,15 +3283,15 @@ fn tool_call_head_lines(tool_name: &str, arguments: &Value, width: usize) -> Vec
     for (i, seg) in wrap_one(&arg, arg_budget).into_iter().enumerate() {
         if i == 0 {
             lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-                Span::styled(verb.clone(), Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+                Span::styled("● ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                Span::styled(verb.clone(), Style::default().fg(self::text()).add_modifier(Modifier::BOLD)),
                 Span::raw("  "),
-                Span::styled(seg, Style::default().fg(MUTED)),
+                Span::styled(seg, Style::default().fg(muted())),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::raw(" ".repeat(indent)),
-                Span::styled(seg, Style::default().fg(MUTED)),
+                Span::styled(seg, Style::default().fg(muted())),
             ]));
         }
     }
@@ -2248,8 +3301,8 @@ fn tool_call_head_lines(tool_name: &str, arguments: &Value, width: usize) -> Vec
 /// A preview of what the call will do — content for writes, a +/- diff for edits.
 fn tool_call_preview(tool_name: &str, arguments: &Value, width: usize) -> Vec<Line<'static>> {
     let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
-    let green = Style::default().fg(SUCCESS);
-    let red = Style::default().fg(DANGER);
+    let green = Style::default().fg(success());
+    let red = Style::default().fg(danger());
     const MAX: usize = 8;
 
     let mut items: Vec<(String, Style)> = Vec::new();
@@ -2312,7 +3365,16 @@ fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, String) {
         "view_outline" => ("Outline".into(), arg("path")),
         "web_search" => ("Web".into(), arg("query")),
         "web_read" => ("Fetch".into(), arg("url")),
-        "bash" => ("Bash".into(), arg("command")),
+        "bash" => {
+            // Commands can be long or multi-line; show a compact single line (first
+            // line, whitespace-collapsed, capped) with an ellipsis when elided.
+            let cmd = arg("command");
+            let first = cmd.lines().next().unwrap_or("").trim();
+            let compact = first.split_whitespace().collect::<Vec<_>>().join(" ");
+            let capped: String = compact.chars().take(110).collect();
+            let elided = cmd.lines().count() > 1 || capped.chars().count() < compact.chars().count();
+            ("Bash".into(), if elided { format!("{capped} …") } else { capped })
+        }
         _ => (
             tool_name.to_string(),
             serde_json::to_string(arguments).unwrap_or_default(),
@@ -2367,7 +3429,7 @@ fn tool_result_lines(tool_name: &str, result: &Value, width: usize) -> Vec<Line<
             .and_then(Value::as_str)
             .unwrap_or("failed");
         return result_block(
-            vec![(format!("✗ {message}"), Style::default().fg(DANGER))],
+            vec![(format!("✗ {message}"), Style::default().fg(danger()))],
             width,
         );
     }
@@ -2424,7 +3486,14 @@ fn tool_result_lines(tool_name: &str, result: &Value, width: usize) -> Vec<Line<
         _ => vec![(status.to_string(), subtle())],
     };
 
-    result_block(items.into_iter().filter(|(t, _)| !t.is_empty()).collect(), width)
+    let items: Vec<(String, Style)> = items.into_iter().filter(|(t, _)| !t.is_empty()).collect();
+    // Bash output is rendered verbatim so leading whitespace / column alignment is
+    // preserved (word-wrap would strip indentation); other results word-wrap.
+    if tool_name == "bash" {
+        result_block_verbatim(items, width)
+    } else {
+        result_block(items, width)
+    }
 }
 
 fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
@@ -2455,7 +3524,7 @@ fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
         (false, 0) => format!("exited {exit} · no output"),
         (false, n) => format!("exited {exit} · {n} {noun}"),
     };
-    let summary_style = if success { subtle() } else { Style::default().fg(DANGER) };
+    let summary_style = if success { subtle() } else { Style::default().fg(danger()) };
     let mut items = vec![(summary, summary_style)];
 
     // Glimpse: the first few lines only.
@@ -2512,8 +3581,8 @@ fn result_block_inner(
 // --- Markdown-lite prose rendering (assistant text) ---
 
 fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
-    let base = Style::default().fg(TEXT);
-    let code_block = Style::default().fg(CODE);
+    let base = Style::default().fg(self::text());
+    let code_block = Style::default().fg(code());
     let heading = Style::default().fg(blue()).add_modifier(Modifier::BOLD);
 
     let lines: Vec<&str> = text.split('\n').collect();
@@ -2665,9 +3734,9 @@ fn render_md_table(
         .len()
         .max(body.iter().map(|r| r.len()).max().unwrap_or(0))
         .max(1);
-    let header_style = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
-    let body_style = Style::default().fg(TEXT);
-    let faint = Style::default().fg(FAINT);
+    let header_style = Style::default().fg(self::text()).add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(self::text());
+    let faint = Style::default().fg(faint());
 
     let runs_for = |s: &str, header_row: bool| {
         parse_inline_md(s, if header_row { header_style } else { body_style })
@@ -2767,7 +3836,7 @@ fn heading_text(line: &str) -> Option<&str> {
 fn parse_inline_md(text: &str, base: Style) -> Vec<(String, Style)> {
     let bold = base.add_modifier(Modifier::BOLD);
     let italic = base.add_modifier(Modifier::ITALIC);
-    let code = Style::default().fg(CODE);
+    let code = Style::default().fg(code());
 
     let chars: Vec<char> = text.chars().collect();
     let mut runs: Vec<(String, Style)> = Vec::new();
@@ -3118,10 +4187,10 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let accent = Color::Rgb(96, 165, 250);
-    let faint = Color::Rgb(120, 120, 130);
-    let dim = Color::Rgb(160, 160, 170);
-    let yellow = WARN;
+    let accent = accent();
+    let faint = faint();
+    let dim = muted();
+    let yellow = warn();
 
     let width = (area.width as usize).max(20);
     let counter = if qs.len() > 1 {
@@ -3138,7 +4207,7 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .unwrap_or_default();
     lines.push(Line::from(vec![
         Span::styled("? ", Style::default().fg(yellow).add_modifier(Modifier::BOLD)),
-        Span::styled(q_line, Style::default().fg(TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled(q_line, Style::default().fg(self::text()).add_modifier(Modifier::BOLD)),
         Span::styled(counter, Style::default().fg(faint)),
     ]));
 
@@ -3164,7 +4233,7 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 Span::styled(
                     label.clone(),
                     if focused {
-                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+                        Style::default().fg(self::text()).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(dim)
                     },
@@ -3185,16 +4254,16 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(FAINT));
+        .border_style(Style::default().fg(faint()));
 
     // While the login form is open, editing happens in the inline form above —
     // the input box just shows the controls.
     if app.login_active {
         let line = Line::from(vec![
-            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" ❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
             Span::styled(
                 "Tab next · ←/→ change · Enter connect · Esc cancel",
-                Style::default().fg(FAINT),
+                Style::default().fg(faint()),
             ),
         ]);
         frame.render_widget(Paragraph::new(line).block(block), area);
@@ -3211,8 +4280,8 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             }
         };
         let line = Line::from(vec![
-            Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-            Span::styled(placeholder, Style::default().fg(FAINT)),
+            Span::styled(" ❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled(placeholder, Style::default().fg(faint())),
         ]);
         frame.render_widget(Paragraph::new(line).block(block), area);
         return;
@@ -3223,14 +4292,14 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // continuation rows are indented to match.
     let text_w = (area.width as usize).saturating_sub(3).max(1);
     let (rows, (cursor_row, cursor_col)) = layout_input(&app.input, app.input_cursor, text_w);
-    let white = Style::default().fg(TEXT);
+    let white = Style::default().fg(self::text());
     let cursor_style = Style::default().fg(Color::Black).bg(blue());
 
     let mut lines = Vec::with_capacity(rows.len());
     for (k, row) in rows.iter().enumerate() {
         let mut spans = Vec::new();
         if k == 0 {
-            spans.push(Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(" ❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
         } else {
             spans.push(Span::raw("   "));
         }
@@ -3313,11 +4382,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         return Vec::new();
     }
 
-    let accent = Color::Rgb(96, 165, 250);
-    let dim = MUTED;
-    let w = TEXT;
-    let faint = Color::Rgb(75, 85, 99);
-    let rule = Color::Rgb(50, 50, 60);
+    let accent = accent();
+    let dim = muted();
+    let w = self::text();
+    let faint = muted();
+    let rule = self::faint();
     let focus = app.form_focus;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -3340,11 +4409,12 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 Style::default().fg(accent).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:9}", label),
+                format!("{label:<12}"),
                 Style::default()
                     .fg(if focused { w } else { dim })
                     .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
             ),
+            Span::raw("  "),
         ];
         spans.extend(value);
         Line::from(spans)
@@ -3365,24 +4435,67 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
     // Provider
     let p_focus = focus == SettingsField::Provider;
-    lines.push(field_row("provider", p_focus, chooser(app.form_provider.clone(), p_focus, "")));
+    lines.push(field_row(
+        "provider",
+        p_focus,
+        chooser(app.form_provider.clone(), p_focus, ""),
+    ));
 
-    // API key (masked)
-    let k_focus = focus == SettingsField::ApiKey;
-    let key_len = app.form_api_key.chars().count();
-    let key_val = if key_len == 0 {
-        vec![Span::styled(
-            if k_focus { "█".to_string() } else { "(required)".to_string() },
-            Style::default().fg(if k_focus { accent } else { faint }),
-        )]
-    } else {
-        let mut v = vec![Span::styled("•".repeat(key_len), Style::default().fg(w))];
-        if k_focus {
-            v.push(Span::styled("█", Style::default().fg(accent)));
+    // ChatGPT-subscription signs in via OAuth — no API key / base URL.
+    if app.form_provider == "chatgpt" {
+        let signed_in = crate::chatgpt_auth::is_signed_in();
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("    ChatGPT account", Style::default().fg(w).add_modifier(Modifier::BOLD)),
+            Span::styled("  ·  browser or device-code sign in", Style::default().fg(dim)),
+        ]));
+        if signed_in {
+            lines.push(Line::from(Span::styled(
+                "    ✓ signed in".to_string(),
+                Style::default().fg(success()),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    Enter = use this account  ·  Ctrl-L = sign out".to_string(),
+                Style::default().fg(faint),
+            )));
+        } else if let Some(info) = &app.chatgpt_device_code {
+            lines.push(Line::from(Span::styled(
+                format!("    Device code: {}", info.user_code),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("    Open {} to complete sign-in", info.verification_url),
+                Style::default().fg(w),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    Enter = browser sign-in  ·  Ctrl-D = device code".to_string(),
+                Style::default().fg(faint),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "    Enter = sign in with browser  ·  Ctrl-D = device code".to_string(),
+                Style::default().fg(accent),
+            )));
         }
-        v
-    };
-    lines.push(field_row("api key", k_focus, key_val));
+        lines.push(Line::from(""));
+    } else {
+        // API key (masked)
+        let k_focus = focus == SettingsField::ApiKey;
+        let key_len = app.form_api_key.chars().count();
+        let key_val = if key_len == 0 {
+            vec![Span::styled(
+                if k_focus { "█".to_string() } else { "(required)".to_string() },
+                Style::default().fg(if k_focus { accent } else { faint }),
+            )]
+        } else {
+            let mut v = vec![Span::styled("•".repeat(key_len), Style::default().fg(w))];
+            if k_focus {
+                v.push(Span::styled("█", Style::default().fg(accent)));
+            }
+            v
+        };
+        lines.push(field_row("api key", k_focus, key_val));
+    }
 
     // Base URL (openai-compatible only)
     if app.form_provider == "openai-compatible" {
@@ -3405,6 +4518,40 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         app.form_model.clone()
     };
     lines.push(field_row("model", m_focus, chooser(model_text, m_focus, " ▾")));
+
+    // Reasoning / thinking effort
+    let r_focus = focus == SettingsField::Reasoning;
+    let reasoning = app
+        .form_reasoning_effort
+        .clone()
+        .unwrap_or_else(|| "medium".to_string());
+    let reasoning_hint = match app.form_provider.as_str() {
+        "anthropic" => "thinking",
+        "gemini" => "thinking",
+        _ => "reasoning",
+    };
+    lines.push(field_row(
+        reasoning_hint,
+        r_focus,
+        chooser(reasoning, r_focus, ""),
+    ));
+
+    let cw_focus = focus == SettingsField::ContextWindow;
+    let mut cw_val = vec![Span::styled(
+        app.form_context_window.clone(),
+        Style::default().fg(if app.form_context_window.is_empty() { faint } else { w }),
+    )];
+    if cw_focus {
+        cw_val.push(Span::styled("█", Style::default().fg(accent)));
+    }
+    lines.push(field_row("context", cw_focus, cw_val));
+
+    let cp_focus = focus == SettingsField::Compaction;
+    lines.push(field_row(
+        "compact at",
+        cp_focus,
+        chooser(format!("{}%", app.form_compact_at_pct.trim()), cp_focus, ""),
+    ));
 
     // Model dropdown — shown while the Model field is focused.
     if m_focus {
@@ -3445,6 +4592,13 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
+        format!(
+            "    Context window = max prompt budget. Compaction starts near {}% of it.",
+            app.form_compact_at_pct.trim()
+        ),
+        Style::default().fg(faint),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
         "─".repeat(width.min(56)),
         Style::default().fg(rule),
     )]));
@@ -3457,14 +4611,26 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // header, so it's dropped here. Arrow glyphs (↑ ↓ ↻) are width-1 everywhere;
     // no emoji (they spill a cell and misalign the row).
     let st = app.state.as_ref();
-    let dim = Style::default().fg(MUTED);
-    let faint = Style::default().fg(FAINT);
+    let dim = Style::default().fg(muted());
+    let faint = Style::default().fg(faint());
 
     let mut right = vec![
         Span::styled(format!("↑{}", fmt_si(st.map(|s| s.prompt_tokens).unwrap_or(0))), dim),
         Span::raw(" "),
         Span::styled(format!("↓{}", fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0))), dim),
     ];
+    let running_lanes = st
+        .map(|s| s.lanes.iter().filter(|lane| lane.status == LaneStatus::Running).count())
+        .unwrap_or(0);
+    if running_lanes > 0 {
+        right.push(Span::styled(format!("  ◆{}", running_lanes), Style::default().fg(lane())));
+    }
+    let running_lanes = st
+        .map(|s| s.lanes.iter().filter(|lane| lane.status == LaneStatus::Running).count())
+        .unwrap_or(0);
+    if running_lanes > 0 {
+        right.push(Span::styled(format!("  ◆{}", running_lanes), Style::default().fg(lane())));
+    }
     let cache = st.map(|s| s.cache_read_tokens).unwrap_or(0);
     if cache > 0 {
         right.push(Span::styled(format!(" ↻{}", fmt_si(cache)), dim));
@@ -3517,25 +4683,221 @@ fn home_path(path: &std::path::Path) -> String {
     text
 }
 
-// --- Theme: one muted palette so colors stay consistent across the UI. The old
-// code scattered raw ANSI (Red/Green/Yellow/Cyan) next to RGB blue, which is the
-// main reason it read as garish. Everything routes through these now. ---
-const ACCENT: Color = Color::Rgb(96, 165, 250); // primary — prompts, glyphs, headings
-const TEXT: Color = Color::Rgb(222, 225, 230); // body text (softer than pure white)
-const MUTED: Color = Color::Rgb(124, 130, 142); // secondary text, summaries, gutters
-const FAINT: Color = Color::Rgb(82, 86, 96); // rules, borders, placeholders
-const SUCCESS: Color = Color::Rgb(126, 186, 120); // added lines, ok
-const DANGER: Color = Color::Rgb(224, 108, 117); // errors, removed lines
-const WARN: Color = Color::Rgb(214, 182, 106); // runtime notices, questions
-const LANE: Color = Color::Rgb(110, 184, 200); // delegated lanes
-const CODE: Color = Color::Rgb(224, 196, 132); // code / diff text
+// --- Theme: a runtime-selectable palette. Every UI color routes through the
+// active theme (switch with `/theme`, persisted to config). Presets below. ---
+#[derive(Clone, Copy)]
+struct Theme {
+    accent: Color,
+    text: Color,
+    muted: Color,
+    faint: Color,
+    success: Color,
+    danger: Color,
+    warn: Color,
+    lane: Color,
+    code: Color,
+}
+
+struct ThemePreset {
+    name: &'static str,
+    label: &'static str,
+    theme: Theme,
+}
+
+const MIDNIGHT: Theme = Theme {
+    accent: Color::Rgb(96, 165, 250),
+    text: Color::Rgb(222, 225, 230),
+    muted: Color::Rgb(124, 130, 142),
+    faint: Color::Rgb(82, 86, 96),
+    success: Color::Rgb(126, 186, 120),
+    danger: Color::Rgb(224, 108, 117),
+    warn: Color::Rgb(214, 182, 106),
+    lane: Color::Rgb(110, 184, 200),
+    code: Color::Rgb(224, 196, 132),
+};
+
+const LIGHT: Theme = Theme {
+    accent: Color::Rgb(37, 99, 235),
+    text: Color::Rgb(30, 41, 59),
+    muted: Color::Rgb(90, 105, 125),
+    faint: Color::Rgb(176, 184, 198),
+    success: Color::Rgb(21, 128, 76),
+    danger: Color::Rgb(193, 41, 46),
+    warn: Color::Rgb(168, 113, 10),
+    lane: Color::Rgb(13, 124, 156),
+    code: Color::Rgb(146, 64, 14),
+};
+
+const HIGH_CONTRAST: Theme = Theme {
+    accent: Color::Rgb(125, 205, 255),
+    text: Color::Rgb(255, 255, 255),
+    muted: Color::Rgb(190, 196, 206),
+    faint: Color::Rgb(120, 126, 136),
+    success: Color::Rgb(120, 240, 130),
+    danger: Color::Rgb(255, 112, 112),
+    warn: Color::Rgb(255, 214, 92),
+    lane: Color::Rgb(120, 232, 250),
+    code: Color::Rgb(245, 222, 150),
+};
+
+const EMBER: Theme = Theme {
+    accent: Color::Rgb(245, 158, 11),
+    text: Color::Rgb(237, 224, 212),
+    muted: Color::Rgb(168, 148, 130),
+    faint: Color::Rgb(96, 84, 74),
+    success: Color::Rgb(158, 188, 108),
+    danger: Color::Rgb(228, 110, 92),
+    warn: Color::Rgb(232, 180, 90),
+    lane: Color::Rgb(206, 150, 110),
+    code: Color::Rgb(230, 190, 130),
+};
+
+const NORD: Theme = Theme {
+    accent: Color::Rgb(136, 192, 208),
+    text: Color::Rgb(216, 222, 233),
+    muted: Color::Rgb(129, 140, 158),
+    faint: Color::Rgb(76, 86, 106),
+    success: Color::Rgb(163, 190, 140),
+    danger: Color::Rgb(191, 97, 106),
+    warn: Color::Rgb(235, 203, 139),
+    lane: Color::Rgb(129, 161, 193),
+    code: Color::Rgb(143, 188, 187),
+};
+
+const DRACULA: Theme = Theme {
+    accent: Color::Rgb(189, 147, 249),
+    text: Color::Rgb(248, 248, 242),
+    muted: Color::Rgb(130, 138, 165),
+    faint: Color::Rgb(98, 114, 164),
+    success: Color::Rgb(80, 250, 123),
+    danger: Color::Rgb(255, 85, 85),
+    warn: Color::Rgb(241, 250, 140),
+    lane: Color::Rgb(139, 233, 253),
+    code: Color::Rgb(255, 184, 108),
+};
+
+const GRUVBOX: Theme = Theme {
+    accent: Color::Rgb(250, 189, 47),
+    text: Color::Rgb(235, 219, 178),
+    muted: Color::Rgb(168, 153, 132),
+    faint: Color::Rgb(102, 92, 84),
+    success: Color::Rgb(184, 187, 38),
+    danger: Color::Rgb(251, 73, 52),
+    warn: Color::Rgb(254, 128, 25),
+    lane: Color::Rgb(142, 192, 124),
+    code: Color::Rgb(131, 165, 152),
+};
+
+const TOKYO_NIGHT: Theme = Theme {
+    accent: Color::Rgb(122, 162, 247),
+    text: Color::Rgb(192, 202, 245),
+    muted: Color::Rgb(140, 148, 184),
+    faint: Color::Rgb(65, 72, 104),
+    success: Color::Rgb(158, 206, 106),
+    danger: Color::Rgb(247, 118, 142),
+    warn: Color::Rgb(224, 175, 104),
+    lane: Color::Rgb(125, 207, 255),
+    code: Color::Rgb(187, 154, 247),
+};
+
+const CATPPUCCIN: Theme = Theme {
+    accent: Color::Rgb(203, 166, 247),
+    text: Color::Rgb(205, 214, 244),
+    muted: Color::Rgb(147, 153, 178),
+    faint: Color::Rgb(88, 91, 112),
+    success: Color::Rgb(166, 227, 161),
+    danger: Color::Rgb(243, 139, 168),
+    warn: Color::Rgb(249, 226, 175),
+    lane: Color::Rgb(137, 220, 235),
+    code: Color::Rgb(250, 179, 135),
+};
+
+const SOLARIZED: Theme = Theme {
+    accent: Color::Rgb(38, 139, 210),
+    text: Color::Rgb(147, 161, 161),
+    muted: Color::Rgb(101, 123, 131),
+    faint: Color::Rgb(68, 93, 100),
+    success: Color::Rgb(133, 153, 0),
+    danger: Color::Rgb(220, 50, 47),
+    warn: Color::Rgb(181, 137, 0),
+    lane: Color::Rgb(42, 161, 152),
+    code: Color::Rgb(203, 75, 22),
+};
+
+const PRESETS: &[ThemePreset] = &[
+    ThemePreset { name: "midnight", label: "Midnight (dark)", theme: MIDNIGHT },
+    ThemePreset { name: "light", label: "Light", theme: LIGHT },
+    ThemePreset { name: "high-contrast", label: "High-contrast", theme: HIGH_CONTRAST },
+    ThemePreset { name: "ember", label: "Ember (warm)", theme: EMBER },
+    ThemePreset { name: "nord", label: "Nord", theme: NORD },
+    ThemePreset { name: "dracula", label: "Dracula", theme: DRACULA },
+    ThemePreset { name: "gruvbox", label: "Gruvbox", theme: GRUVBOX },
+    ThemePreset { name: "tokyo-night", label: "Tokyo Night", theme: TOKYO_NIGHT },
+    ThemePreset { name: "catppuccin", label: "Catppuccin", theme: CATPPUCCIN },
+    ThemePreset { name: "solarized", label: "Solarized Dark", theme: SOLARIZED },
+];
+
+static THEME_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+fn theme() -> Theme {
+    PRESETS
+        .get(THEME_INDEX.load(Ordering::Relaxed))
+        .map(|p| p.theme)
+        .unwrap_or(MIDNIGHT)
+}
+
+fn set_theme_index(i: usize) {
+    THEME_INDEX.store(i.min(PRESETS.len().saturating_sub(1)), Ordering::Relaxed);
+}
+
+/// Apply a theme by its config name; returns false if no preset matches.
+fn set_theme_by_name(name: &str) -> bool {
+    if let Some(i) = PRESETS.iter().position(|p| p.name.eq_ignore_ascii_case(name.trim())) {
+        set_theme_index(i);
+        true
+    } else {
+        false
+    }
+}
+
+fn current_theme_index() -> usize {
+    THEME_INDEX.load(Ordering::Relaxed)
+}
+
+fn accent() -> Color {
+    theme().accent
+}
+fn text() -> Color {
+    theme().text
+}
+fn muted() -> Color {
+    theme().muted
+}
+fn faint() -> Color {
+    theme().faint
+}
+fn success() -> Color {
+    theme().success
+}
+fn danger() -> Color {
+    theme().danger
+}
+fn warn() -> Color {
+    theme().warn
+}
+fn lane() -> Color {
+    theme().lane
+}
+fn code() -> Color {
+    theme().code
+}
 
 fn subtle() -> Style {
-    Style::default().fg(MUTED)
+    Style::default().fg(muted())
 }
 
 fn blue() -> Color {
-    ACCENT
+    accent()
 }
 
 fn get_provider_models(provider: &str) -> &'static [&'static str] {

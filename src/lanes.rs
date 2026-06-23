@@ -16,7 +16,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::builtins::coding_tools;
+use crate::tools::coding_tools;
 use crate::harness::{CodingHarness, HarnessConfig};
 use crate::llm::AgentModel;
 use crate::prompts::coding_system_prompt;

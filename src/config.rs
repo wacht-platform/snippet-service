@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -19,16 +20,25 @@ pub struct SnippetConfig {
     pub state_path: PathBuf,
     #[serde(default)]
     pub resume_on_start: bool,
-    #[serde(default, skip_serializing, alias = "active_profile", alias = "active_setup")]
+    /// Name of the active profile in `setups`. The active profile's config is
+    /// mirrored into `model` for the runtime.
+    #[serde(default, alias = "active_profile", alias = "active_setup", skip_serializing_if = "Option::is_none")]
     pub active_setup: Option<String>,
-    #[serde(default, skip_serializing, alias = "profiles", alias = "setups")]
-    pub setups: Option<std::collections::HashMap<String, ModelConfig>>,
     /// Exa API key for the `web_search` / `web_read` tools. When set, web search is
     /// enabled; absent, the tools aren't offered to the model. Declared before the
     /// `model` table so it serializes as a top-level key (TOML requires scalars
     /// before any table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exa_api_key: Option<String>,
+    /// TUI color theme name (e.g. "midnight", "light", "high-contrast", "ember").
+    /// Unset = default. Declared before `model` so it stays a top-level key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// Saved provider profiles, keyed by name. Multiple can be configured; one is
+    /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
+    /// stays valid (tables must follow top-level scalars).
+    #[serde(default, alias = "profiles", alias = "setups", skip_serializing_if = "Option::is_none")]
+    pub setups: Option<BTreeMap<String, ModelConfig>>,
     #[serde(default)]
     pub model: ModelConfig,
 }
@@ -62,9 +72,14 @@ pub struct ModelConfig {
     /// provider (OpenAI reasoning_effort, Gemini thinkingConfig, Anthropic thinking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
-    /// Model context window in tokens, for the status-bar usage gauge.
+    /// Model context window in tokens, for the status-bar usage gauge and
+    /// compaction thresholds.
     #[serde(default = "default_context_window")]
     pub context_window: u64,
+    /// Start compaction when the largest observed prompt reaches this percentage
+    /// of the configured context window.
+    #[serde(default = "default_compact_at_pct")]
+    pub compact_at_pct: u8,
     #[serde(default = "default_cache_prompt")]
     pub cache_prompt: bool,
 }
@@ -79,6 +94,7 @@ impl Default for SnippetConfig {
             setups: None,
             model: ModelConfig::default(),
             exa_api_key: None,
+            theme: None,
         }
     }
 }
@@ -132,10 +148,10 @@ impl SnippetConfig {
         }
 
         match config.model.provider.as_str() {
-            "openai-compatible" | "openai" | "anthropic" | "gemini" | "openrouter" => {}
+            "openai-compatible" | "openai" | "anthropic" | "gemini" | "openrouter" | "chatgpt" => {}
             other => {
                 return Err(ToolError::msg(format!(
-                    "unsupported model.provider `{}`; expected one of `openai-compatible`, `openai`, `anthropic`, `gemini`, `openrouter`",
+                    "unsupported model.provider `{}`; expected one of `openai-compatible`, `openai`, `anthropic`, `gemini`, `openrouter`, `chatgpt`",
                     other
                 )));
             }
@@ -173,6 +189,85 @@ impl SnippetConfig {
             ".snippet/workspaces/{}-{:x}/state.json",
             workspace_name, workspace_hash
         ));
+    }
+}
+
+impl SnippetConfig {
+    /// Profile names in stable (sorted) order.
+    pub fn profile_names(&self) -> Vec<String> {
+        self.setups
+            .as_ref()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Migrate a lone `[model]` into a named profile if none exist, so the rest of
+    /// the UI can treat every config as a profile.
+    pub fn ensure_setups(&mut self) {
+        if self.setups.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
+            let key = if self.model.provider.is_empty() {
+                "default".to_string()
+            } else {
+                self.model.provider.clone()
+            };
+            let mut map = BTreeMap::new();
+            map.insert(key.clone(), self.model.clone());
+            self.setups = Some(map);
+            self.active_setup = Some(key);
+        }
+    }
+
+    /// A unique profile key derived from a provider name (`provider`, `provider-2`, …).
+    pub fn unique_profile_key(&self, provider: &str) -> String {
+        let exists = |k: &str| self.setups.as_ref().map(|m| m.contains_key(k)).unwrap_or(false);
+        if !exists(provider) {
+            return provider.to_string();
+        }
+        let mut n = 2;
+        loop {
+            let k = format!("{provider}-{n}");
+            if !exists(&k) {
+                return k;
+            }
+            n += 1;
+        }
+    }
+
+    /// Insert or replace a profile; mirror it into `model` when it's the active one.
+    pub fn upsert_profile(&mut self, name: &str, cfg: ModelConfig) {
+        let map = self.setups.get_or_insert_with(BTreeMap::new);
+        map.insert(name.to_string(), cfg.clone());
+        if self.active_setup.as_deref() == Some(name) || self.active_setup.is_none() {
+            self.active_setup = Some(name.to_string());
+            self.model = cfg;
+        }
+    }
+
+    /// Activate a profile, mirroring its config into `model`. False if not found.
+    pub fn activate(&mut self, name: &str) -> bool {
+        if let Some(cfg) = self.setups.as_ref().and_then(|m| m.get(name)).cloned() {
+            self.active_setup = Some(name.to_string());
+            self.model = cfg;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a profile; if it was active, fall back to the first remaining one.
+    pub fn remove_profile(&mut self, name: &str) {
+        if let Some(map) = self.setups.as_mut() {
+            map.remove(name);
+        }
+        if self.active_setup.as_deref() == Some(name) {
+            let next = self.setups.as_ref().and_then(|m| m.keys().next().cloned());
+            match next {
+                Some(k) => {
+                    self.activate(&k);
+                }
+                None => self.active_setup = None,
+            }
+        }
     }
 }
 
@@ -225,6 +320,20 @@ impl ModelConfig {
                     config.model = "google/gemini-2.5-pro".to_string();
                 }
                 Box::new(OpenAiCompatibleModel::new(config))
+            }
+            "chatgpt" => {
+                let mut model = self.model.clone();
+                if model.is_empty() {
+                    model = "gpt-5.1-codex".to_string();
+                }
+                Box::new(crate::chatgpt::ChatGptModel::new(crate::chatgpt::ChatGptConfig {
+                    model,
+                    reasoning_effort: self.reasoning_effort.clone(),
+                    supports_images: self.supports_images,
+                    max_retries: self.max_retries,
+                    initial_retry_ms: self.initial_retry_ms,
+                    max_retry_ms: self.max_retry_ms,
+                }))
             }
             _ => {
                 Box::new(OpenAiCompatibleModel::new(self.clone().into()))
@@ -282,6 +391,10 @@ fn default_context_window() -> u64 {
     128_000
 }
 
+fn default_compact_at_pct() -> u8 {
+    85
+}
+
 fn default_cache_prompt() -> bool {
     true
 }
@@ -301,6 +414,7 @@ impl Default for ModelConfig {
             supports_images: false,
             reasoning_effort: None,
             context_window: default_context_window(),
+            compact_at_pct: default_compact_at_pct(),
             cache_prompt: default_cache_prompt(),
         }
     }
