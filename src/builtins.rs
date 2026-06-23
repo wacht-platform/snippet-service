@@ -422,30 +422,56 @@ enum Flex {
     NoMatch,
 }
 
-/// Whitespace-tolerant single-block replace, working purely line-by-line (no byte
-/// math). Finds the lines whose trimmed text equals `old`'s trimmed lines; when
-/// exactly one block matches, rebuilds the file with `new` in its place,
-/// re-indented to the matched block's indentation. Skips CRLF files so it never
-/// rewrites line endings; those fall through to the diagnostic.
+/// Normalize a line for matching: drop leading/trailing whitespace AND collapse
+/// internal whitespace runs to a single space. So `  foo( x )` and `foo(  x  )`
+/// compare equal. A blank/whitespace-only line normalizes to "".
+fn norm_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whitespace-tolerant single-block replace, line-by-line (no byte math). Matches
+/// `old` against the file ignoring indentation, internal whitespace runs, AND
+/// blank-line differences (blank lines are skipped on both sides). When exactly
+/// one block matches, rebuilds the file with `new` in its place, re-indented to
+/// the matched block's indentation. Skips CRLF files so it never rewrites line
+/// endings; those fall through to the diagnostic.
 fn flexible_replace(content: &str, old: &str, new: &str) -> Flex {
     if content.contains('\r') {
         return Flex::NoMatch;
     }
     let file_lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old.lines().collect();
-    let n = old_lines.len();
-    if n == 0 || file_lines.len() < n {
+
+    // The needle: old's non-blank lines, normalized.
+    let needle: Vec<String> = old.lines().map(norm_line).filter(|l| !l.is_empty()).collect();
+    if needle.is_empty() {
         return Flex::NoMatch;
     }
-    let want: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
-    let hits: Vec<usize> = (0..=file_lines.len() - n)
-        .filter(|&i| (0..n).all(|k| file_lines[i + k].trim() == want[k]))
+    // File's non-blank lines, normalized, paired with their original line index.
+    let file_nb: Vec<(usize, String)> = file_lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (i, norm_line(l)))
+        .filter(|(_, l)| !l.is_empty())
         .collect();
+    let m = needle.len();
+    if file_nb.len() < m {
+        return Flex::NoMatch;
+    }
+
+    // Find windows of file non-blank lines equal to the needle; record the
+    // ORIGINAL span (first..=last, including any interior blank lines).
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for start in 0..=file_nb.len() - m {
+        if (0..m).all(|k| file_nb[start + k].1 == needle[k]) {
+            hits.push((file_nb[start].0, file_nb[start + m - 1].0));
+        }
+    }
     match hits.as_slice() {
         [] => Flex::NoMatch,
-        &[i] => {
-            let file_indent = leading_ws(file_lines[i]);
-            let old_indent = leading_ws(old_lines.first().copied().unwrap_or(""));
+        &[(first, last)] => {
+            let file_indent = leading_ws(file_lines[first]);
+            let old_indent =
+                leading_ws(old.lines().find(|l| !l.trim().is_empty()).unwrap_or(""));
             let new_block = new.lines().map(|line| {
                 if line.trim().is_empty() {
                     String::new()
@@ -454,9 +480,9 @@ fn flexible_replace(content: &str, old: &str, new: &str) -> Flex {
                     format!("{file_indent}{body}")
                 }
             });
-            let mut out: Vec<String> = file_lines[..i].iter().map(|s| s.to_string()).collect();
+            let mut out: Vec<String> = file_lines[..first].iter().map(|s| s.to_string()).collect();
             out.extend(new_block);
-            out.extend(file_lines[i + n..].iter().map(|s| s.to_string()));
+            out.extend(file_lines[last + 1..].iter().map(|s| s.to_string()));
             let mut joined = out.join("\n");
             if content.ends_with('\n') {
                 joined.push('\n');

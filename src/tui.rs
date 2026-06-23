@@ -252,8 +252,6 @@ struct App {
     /// Largest valid scroll offset, recomputed each frame from the rendered
     /// transcript so key handlers can clamp.
     max_scroll: Cell<usize>,
-    /// True while a compaction animation should be shown in the transcript.
-    compacting: bool,
     /// Home-abbreviated, canonicalized workspace path for the status bar.
     cwd_display: String,
     /// Animation frame counter for the "working…" spinner.
@@ -385,7 +383,6 @@ impl App {
             q_answers: Vec::new(),
             q_token: String::new(),
             stream: crate::llm::StreamHandle::default(),
-            compacting: false,
         };
         app.init_settings_form();
 
@@ -1313,15 +1310,14 @@ impl App {
     /// True while the harness is mid-compaction (recent compaction-pass event + still
     /// running) — used to hold input and label the wait.
     fn is_compacting(&self) -> bool {
-        self.compacting
-            || self.state.as_ref().is_some_and(|s| {
-                s.status == HarnessStatus::Running
-                    && matches!(
-                        s.events.last(),
-                        Some(HarnessEvent::SystemDecision { step, .. })
-                            if step == "history_compaction_pass" || step == "history_compacted"
-                    )
-            })
+        self.state.as_ref().is_some_and(|s| {
+            s.status == HarnessStatus::Running
+                && matches!(
+                    s.events.last(),
+                    Some(HarnessEvent::SystemDecision { step, .. })
+                        if step == "history_compaction_pass"
+                )
+        })
     }
 
     fn model_factory(&self) -> ModelFactory {
@@ -1635,8 +1631,7 @@ impl App {
         if self.agent_busy() {
             self.queued_inputs.push_back(text);
             self.status = if self.is_compacting() {
-                self.compacting = true;
-                String::new()
+                "compacting context — your message will send once it's done".to_string()
             } else {
                 format!(
                     "queued ({}) — sends when the run finishes · Esc to stop & send now",
@@ -2316,8 +2311,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     let sugg_h = suggestion_height(app);
     let input_h = input_height(app, area.width);
+    // A dedicated compaction-progress row sits directly above the input while the
+    // history is being compacted (1 row when active, 0 otherwise).
+    let compact_h: u16 = if app.is_compacting() { 1 } else { 0 };
 
-    // Vertical split: Header (1), Content (Min 10), Suggestions (0-8), Question (0-2), Input (grows), Status Message (1), Footer (1)
+    // Header (1), Content (Min 10), Suggestions, Question, Compaction (0/1), Input, Status, Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2325,19 +2323,21 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
             Constraint::Min(10),                     // Content
             Constraint::Length(sugg_h),              // Suggestions
             Constraint::Length(question_height(app)), // Question
+            Constraint::Length(compact_h),          // Compaction progress (above input)
             Constraint::Length(input_h),            // Input (grows with wrapped lines)
             Constraint::Length(1),                  // Status message
             Constraint::Length(1),                  // Footer (metadata)
         ])
         .split(area);
-        
+
     let header_area = chunks[0];
     let content_area = chunks[1];
     let suggestions_area = chunks[2];
     let question_area = chunks[3];
-    let input_area = chunks[4];
-    let status_msg_area = chunks[5];
-    let footer_area = chunks[6];
+    let compaction_area = chunks[4];
+    let input_area = chunks[5];
+    let status_msg_area = chunks[6];
+    let footer_area = chunks[7];
 
     render_header(frame, header_area, app);
     render_history(frame, content_area, app);
@@ -2345,9 +2345,29 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         render_suggestions(frame, suggestions_area, app);
     }
     render_question(frame, question_area, app);
+    if compact_h > 0 {
+        render_compaction_bar(frame, compaction_area, app);
+    }
     render_input(frame, input_area, app);
     render_status_message(frame, status_msg_area, app);
     render_status(frame, footer_area, app);
+}
+
+/// An animated "compacting" progress line shown directly above the input box while
+/// the history is being compacted.
+fn render_compaction_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    const BARS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+    let f = app.frame as usize;
+    let mut spans = vec![Span::styled(
+        " ✦ compacting context  ",
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+    )];
+    for i in 0..16usize {
+        let phase = (f / 2 + i * 2) % 14;
+        let h = if phase < 7 { phase } else { 14 - phase };
+        spans.push(Span::styled(BARS[h.min(7)], Style::default().fg(accent())));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// One-line auth/endpoint status for a profile card.
@@ -3053,35 +3073,16 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        let compacting = state.status == HarnessStatus::Running
-            && matches!(
-                state.events.last(),
-                Some(HarnessEvent::SystemDecision { step, .. })
-                    if step == "history_compaction_pass" || step == "history_compacted"
-            );
-        if compacting {
-            // Compaction shown as motion — an accent wave — not a log line.
-            const BARS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
-            let mut spans = vec![Span::styled(
-                "✦ compacting context  ",
+        // Compaction has its own animated bar directly above the input box
+        // (render_compaction_bar); here we just show the generic working spinner.
+        let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
                 Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-            )];
-            for i in 0..9usize {
-                let phase = (app.frame / 2 + i * 2) % 14;
-                let h = if phase < 7 { phase } else { 14 - phase };
-                spans.push(Span::styled(BARS[h.min(7)], Style::default().fg(accent())));
-            }
-            lines.push(Line::from(spans));
-        } else {
-            let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{spinner} "),
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("working…", subtle()),
-            ]));
-        }
+            ),
+            Span::styled("working…", subtle()),
+        ]));
     }
     // Append inline login Q&A if active
     lines.extend(login_lines(app, width));

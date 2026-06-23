@@ -253,16 +253,15 @@ fn build_responses_request(
             HarnessMessage::System { content } => {
                 input.push(message_item(
                     "user",
-                    "input_text",
                     &format!("[runtime_signal]\n{content}\n[/runtime_signal]"),
                 ));
             }
             HarnessMessage::User { content } => {
-                input.push(message_item("user", "input_text", content));
+                input.push(message_item("user", content));
             }
             HarnessMessage::Assistant { content, tool_calls } => {
                 if !content.is_empty() {
-                    input.push(message_item("assistant", "output_text", content));
+                    input.push(message_item("assistant", content));
                 }
                 for call in tool_calls {
                     let args = serde_json::to_string(&crate::llm::arguments_as_object(&call.arguments))
@@ -289,7 +288,6 @@ fn build_responses_request(
                     // Legacy state with no native call id — render as user text.
                     input.push(message_item(
                         "user",
-                        "input_text",
                         &format!("[tool_result]\ntool = \"{tool_name}\"\noutput = {output}\n[/tool_result]"),
                     ));
                 } else if !seen_calls.contains(tool_call_id) {
@@ -298,7 +296,6 @@ fn build_responses_request(
                     // the API would reject.
                     input.push(message_item(
                         "user",
-                        "input_text",
                         &format!("[tool_result {tool_name}]\n{output}\n[/tool_result]"),
                     ));
                 } else {
@@ -324,7 +321,6 @@ fn build_responses_request(
             HarnessMessage::Summary { kind, content } => {
                 input.push(message_item(
                     "user",
-                    "input_text",
                     &format!("[summary:{kind}]\n{content}\n[/summary]"),
                 ));
             }
@@ -366,7 +362,15 @@ fn build_responses_request(
     body
 }
 
-fn message_item(role: &str, content_type: &str, text: &str) -> Value {
+fn message_item(role: &str, text: &str) -> Value {
+    // The Responses API requires assistant content to be `output_text`; user /
+    // developer content must be `input_text`. Sending input_text on an assistant
+    // message 400s ("'input_text' invalid, expected 'output_text'").
+    let content_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
     json!({
         "type": "message",
         "role": role,
