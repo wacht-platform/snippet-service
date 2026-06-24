@@ -91,6 +91,7 @@ impl AgentModel for AnthropicModel {
             // Anthropic signals a token-cap cut-off as `max_tokens`; normalize so
             // `ModelOutput::is_truncated` catches it like the OpenAI `length`.
             finish_reason: response.stop_reason,
+            rate_limit: None,
         })
     }
 }
@@ -457,6 +458,7 @@ async fn parse_anthropic_sse(
             cache_creation_tokens: cache_creation,
         }),
         finish_reason: stop_reason,
+        rate_limit: None,
     })
 }
 

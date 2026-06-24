@@ -356,6 +356,13 @@ impl Tool for EditFileTool {
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: EditFileArgs = expect_object("edit_file", arguments)?;
+        if args.old_string == args.new_string {
+            return Err(ToolError::msg(
+                "old_string and new_string are identical — this edit changes nothing. \
+                 Supply the actual replacement, or skip the edit."
+                    .to_string(),
+            ));
+        }
         let path = ctx.resolve_workspace_path(&args.path)?;
         ctx.check_write(&path)?;
         let content = tokio::fs::read_to_string(&path).await?;

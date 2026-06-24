@@ -75,6 +75,8 @@ pub struct HarnessConfig {
     /// Start compaction when the largest observed prompt reaches this percentage
     /// of `context_window_tokens`.
     pub compact_at_pct: u8,
+    /// Start fresh runs in manual approval mode (bash + file edits wait for y/n).
+    pub manual_approval: bool,
 }
 
 impl Default for HarnessConfig {
@@ -90,6 +92,7 @@ impl Default for HarnessConfig {
             exa_api_key: None,
             context_window_tokens: 128_000,
             compact_at_pct: 85,
+            manual_approval: false,
         }
     }
 }
@@ -108,6 +111,14 @@ pub enum HarnessEvent {
     ModelError { message: String },
     /// The agent asked the user a question and the turn is paused.
     UserQuestion { questions: Value },
+    /// In manual mode, a mutating tool is awaiting approval. `index`/`total` track
+    /// position within a batch of tool calls so the UI can show "action 2 of 3".
+    ApprovalRequest {
+        tool_name: String,
+        summary: String,
+        index: usize,
+        total: usize,
+    },
     /// A delegated lane was started.
     LaneSpawned { id: String, title: String },
     /// A delegated lane reported back.
@@ -144,6 +155,26 @@ pub enum HarnessStatus {
     Failed,
 }
 
+/// Whether mutating tools (writes / shell) run freely or require per-call approval.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Mutating tools run without prompting (current behavior).
+    #[default]
+    Auto,
+    /// Each mutating tool call pauses for the user's approval.
+    Manual,
+}
+
+/// A user's decision on a pending approval, delivered to the in-flight step.
+#[derive(Debug, Clone, Copy)]
+pub enum ApprovalDecision {
+    Approve,
+    /// Approve this call and switch to Auto for the rest of the run.
+    ApproveAll,
+    Deny,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessState {
     pub version: u32,
@@ -162,6 +193,9 @@ pub struct HarnessState {
     /// The currently pending `ask_user` question set, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<Value>,
+    /// Auto (run mutating tools freely) vs Manual (per-call approval).
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
     /// Cumulative model token usage for this session (across all turns).
     #[serde(default)]
     pub total_tokens: u64,
@@ -180,6 +214,9 @@ pub struct HarnessState {
     /// Working-tree checkpoints taken before each turn (newest last), for `/rewind`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checkpoints: Vec<CheckpointRecord>,
+    /// Latest ChatGPT-subscription rate-limit usage, for the footer (None otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<crate::llm::RateLimitSnapshot>,
 }
 
 /// A working-tree snapshot the user can rewind to (a commit in the shadow repo).
@@ -201,6 +238,13 @@ pub enum LoopInput {
     Answer(String),
     /// Request a manual history compaction pass.
     Compact,
+    /// Approve / deny the currently pending mutating tool call (manual mode).
+    Approve,
+    /// Approve the pending call and switch to Auto for the rest of the run.
+    ApproveAll,
+    Deny,
+    /// Switch between Auto and Manual (approval) mode.
+    SetMode(ApprovalMode),
     /// Cancel the run.
     Interrupt,
 }
@@ -247,6 +291,9 @@ struct LoopVars {
     last_tool_signature: Option<String>,
     /// How many turns the same tool-call signature has repeated.
     repeated_tool_count: usize,
+    /// Recent tool-call signatures (windowed), to catch a repeated call even when
+    /// other calls are interleaved between the repeats.
+    recent_tool_signatures: std::collections::VecDeque<String>,
     /// Consecutive shell-discipline nudges, for escalation.
     shell_nudge_count: usize,
     /// Consecutive note-only turns (notes with no real work).
@@ -336,11 +383,16 @@ impl CodingHarness {
         let mut consecutive_errors = 0usize;
 
         let start = state.iterations + 1;
+        // One-shot / lane runs are always Auto mode; this receiver is never read.
+        let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel::<ApprovalDecision>();
         for iteration in start..=self.config.runtime_backstop_iterations {
             state.iterations = iteration;
             self.persist(&mut state, &lanes).await?;
 
-            match self.step(model, &mut state, &mut lanes, &mut vars, false, None).await {
+            match self
+                .step(model, &mut state, &mut lanes, &mut vars, false, None, &mut approval_rx)
+                .await
+            {
                 StepResult::Continue => {
                     consecutive_errors = 0;
                 }
@@ -448,6 +500,10 @@ impl CodingHarness {
                 state.iterations += 1;
                 self.persist(&mut state, &lanes).await?;
 
+                // Compact before the next model call when the last prompt exceeded the
+                // budget — not just once at startup.
+                self.compact_history_if_needed(model, &mut state).await?;
+
                 // Race the step against the input channel so an interrupt cancels
                 // the in-flight model call immediately — otherwise the loop only
                 // notices the interrupt at the next iteration, after waiting out the
@@ -457,15 +513,35 @@ impl CodingHarness {
                 // sees a clean boundary (never an unpaired assistant tool call).
                 let msg_mark = state.messages.len();
                 let evt_mark = state.events.len();
+                // Bridge approvals from the input channel to the in-flight step: while
+                // a mutating tool waits (manual mode), Approve/Deny arrive here and are
+                // forwarded to the step over this channel; interrupt still cancels.
+                let (approval_tx, mut approval_rx) = mpsc::unbounded_channel::<ApprovalDecision>();
                 let outcome = {
-                    let step_fut =
-                        self.step(model, &mut state, &mut lanes, &mut vars, true, sink.as_ref());
+                    let step_fut = self.step(
+                        model,
+                        &mut state,
+                        &mut lanes,
+                        &mut vars,
+                        true,
+                        sink.as_ref(),
+                        &mut approval_rx,
+                    );
                     tokio::pin!(step_fut);
                     loop {
                         tokio::select! {
                             result = &mut step_fut => break Some(result),
                             msg = input_rx.recv() => match msg {
                                 Some(LoopInput::Interrupt) | None => break None,
+                                Some(LoopInput::Approve) => {
+                                    let _ = approval_tx.send(ApprovalDecision::Approve);
+                                }
+                                Some(LoopInput::ApproveAll) => {
+                                    let _ = approval_tx.send(ApprovalDecision::ApproveAll);
+                                }
+                                Some(LoopInput::Deny) => {
+                                    let _ = approval_tx.send(ApprovalDecision::Deny);
+                                }
                                 Some(other) => pending_inputs.push(other),
                             }
                         }
@@ -600,6 +676,12 @@ impl CodingHarness {
                             state.status = HarnessStatus::Idle;
                             self.persist(&mut state, &lanes).await?;
                         }
+                        Some(LoopInput::SetMode(mode)) => {
+                            state.approval_mode = mode;
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        // No tool call is pending while idle — nothing to approve.
+                        Some(LoopInput::Approve) | Some(LoopInput::ApproveAll) | Some(LoopInput::Deny) => {}
                         Some(LoopInput::Interrupt) | None => {
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;
@@ -747,6 +829,13 @@ impl CodingHarness {
                 // it should not inject a steer or schedule another model turn.
                 false
             }
+            LoopInput::SetMode(mode) => {
+                state.approval_mode = mode;
+                false
+            }
+            // Approve/Deny are only meaningful while a tool call is awaiting approval
+            // inside a step; arriving here (between turns) they're stray no-ops.
+            LoopInput::Approve | LoopInput::ApproveAll | LoopInput::Deny => false,
             LoopInput::Interrupt => true,
         }
     }
@@ -796,6 +885,7 @@ impl CodingHarness {
         vars: &mut LoopVars,
         conversation_mode: bool,
         sink: Option<&StreamHandle>,
+        approval_rx: &mut mpsc::UnboundedReceiver<ApprovalDecision>,
     ) -> StepResult {
         let definitions = self.definitions_for(conversation_mode);
 
@@ -864,6 +954,9 @@ impl CodingHarness {
             state.cache_read_tokens =
                 state.cache_read_tokens.saturating_add(usage.cache_read_tokens);
             state.last_prompt_tokens = usage.prompt_tokens;
+        }
+        if output.rate_limit.is_some() {
+            state.rate_limit = output.rate_limit.clone();
         }
 
         // A response cut off at the token cap is never a finished reply.
@@ -975,7 +1068,18 @@ impl CodingHarness {
         } else {
             vars.repeated_tool_count = 0;
         }
-        vars.last_tool_signature = Some(signature);
+        vars.last_tool_signature = Some(signature.clone());
+
+        // Windowed repeat detection: the same call appearing 3+ times within the
+        // last 8 turns is a loop even if other calls are interleaved between them.
+        vars.recent_tool_signatures.push_back(signature.clone());
+        while vars.recent_tool_signatures.len() > 8 {
+            vars.recent_tool_signatures.pop_front();
+        }
+        let windowed = vars.recent_tool_signatures.iter().filter(|s| **s == signature).count();
+        if windowed >= 3 && vars.repeated_tool_count < 2 {
+            vars.pending_signals.push(RuntimeSignal::ToolCallLoop { count: windowed });
+        }
 
         // Assign every call a stable id and record the native assistant turn: the
         // visible progress text plus the tool calls it made. Each call is answered
@@ -1015,6 +1119,14 @@ impl CodingHarness {
         let mut had_note = false;
         let mut shell_nudged_this_turn = false;
         let mut dedup_hits = 0usize;
+
+        // Manual mode: count mutating calls up front so each approval prompt can show
+        // "action N of M", and track which one we're on.
+        let total_mutating = calls
+            .iter()
+            .filter(|c| MUTATING_TOOLS.contains(&c.tool_name.as_str()))
+            .count();
+        let mut approval_index = 0usize;
 
         for call in calls {
             let tool_name = call.tool_name.clone();
@@ -1147,6 +1259,52 @@ impl CodingHarness {
                                 .push(RuntimeSignal::ShellDiscipline { message });
                         }
                     }
+                }
+            }
+
+            // Manual mode: pause for the user's approval before a mutating tool runs.
+            // Approvals queue across a batch (index/total); Deny skips this one with a
+            // denial result so the model adapts. Interrupt cancels the whole step.
+            if state.approval_mode == ApprovalMode::Manual
+                && MUTATING_TOOLS.contains(&tool_name.as_str())
+            {
+                approval_index += 1;
+                state.events.push(HarnessEvent::ApprovalRequest {
+                    tool_name: tool_name.clone(),
+                    summary: approval_summary(&tool_name, &call.arguments),
+                    index: approval_index,
+                    total: total_mutating,
+                });
+                state.status = HarnessStatus::WaitingForInput;
+                let _ = self.persist(state, lanes).await;
+                let decision = approval_rx.recv().await;
+                state.status = HarnessStatus::Running;
+                if matches!(decision, Some(ApprovalDecision::ApproveAll)) {
+                    state.approval_mode = ApprovalMode::Auto;
+                }
+                let approved = matches!(
+                    decision,
+                    Some(ApprovalDecision::Approve | ApprovalDecision::ApproveAll)
+                );
+                if !approved {
+                    let result = json!({
+                        "schema_version": 1,
+                        "status": "error",
+                        "error": {
+                            "code": "user_denied",
+                            "message": "The user denied this action. Do not retry it as-is — adjust your approach or ask what they'd prefer."
+                        }
+                    });
+                    state.events.push(HarnessEvent::ToolResult {
+                        tool_name: tool_name.clone(),
+                        result: result.clone(),
+                    });
+                    state.messages.push(HarnessMessage::ToolResult {
+                        tool_call_id: call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        content: result,
+                    });
+                    continue;
                 }
             }
 
@@ -1428,12 +1586,18 @@ impl CodingHarness {
             final_text: None,
             lanes: Vec::new(),
             pending_question: None,
+            approval_mode: if self.config.manual_approval {
+                ApprovalMode::Manual
+            } else {
+                ApprovalMode::Auto
+            },
             total_tokens: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
             last_prompt_tokens: 0,
             cache_read_tokens: 0,
             checkpoints: Vec::new(),
+            rate_limit: None,
         };
         self.persist_state(&state).await?;
         Ok(state)
@@ -1688,7 +1852,12 @@ impl CodingHarness {
                     working.len()
                 ),
             });
-            let split_at = working.len().saturating_sub(RECENT_DETAIL_KEEP);
+            // Don't split between a tool call and its results — that orphans the
+            // function_call_output and providers reject it.
+            let mut split_at = working.len().saturating_sub(RECENT_DETAIL_KEEP);
+            while split_at > 0 && matches!(working[split_at], HarnessMessage::ToolResult { .. }) {
+                split_at -= 1;
+            }
             if split_at == 0 {
                 break;
             }
@@ -2356,6 +2525,21 @@ fn clip(s: &str, n: usize) -> String {
 }
 
 /// Render the prior table + the new activity window as plain text for the summarizer.
+/// A short one-line summary of a mutating tool call for the approval prompt:
+/// the shell command for `bash`, otherwise the target path.
+fn approval_summary(tool_name: &str, args: &Value) -> String {
+    let raw = match tool_name {
+        "bash" => args.get("command").and_then(Value::as_str).unwrap_or(""),
+        _ => args.get("path").and_then(Value::as_str).unwrap_or(""),
+    };
+    let s = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() > 120 {
+        s.chars().take(120).collect::<String>() + "…"
+    } else {
+        s
+    }
+}
+
 fn render_window(
     prior_table: &str,
     older: &[HarnessMessage],

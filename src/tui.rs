@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -48,6 +48,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ("/rewind", "Restore the workspace to a checkpoint"),
     ("/model", "Connect or change the AI model"),
     ("/compact", "Compact older conversation history now"),
+    ("/mode", "Toggle manual approval (bash & file edits ask y/n)"),
     ("/theme", "Switch the color theme"),
 ];
 
@@ -114,7 +115,7 @@ type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 fn setup_terminal() -> Result<TuiTerminal, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
     // Request the kitty keyboard protocol where supported (iTerm2, kitty, WezTerm,
     // Ghostty…) so modified keys like Shift+Enter are reported distinctly. Plain
     // terminals (Apple Terminal) ignore it and keep the Alt+Enter fallback.
@@ -133,7 +134,7 @@ fn restore_terminal(terminal: &mut TuiTerminal) -> Result<(), Box<dyn std::error
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     }
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -236,6 +237,12 @@ struct App {
     input: String,
     /// Cursor position in `input`, as a CHAR index (0..=char_count).
     input_cursor: usize,
+    /// Submitted inputs (oldest first) for Up/Down history recall.
+    input_history: Vec<String>,
+    /// Position while navigating history; None = editing the live draft.
+    history_pos: Option<usize>,
+    /// The in-progress input saved when history navigation begins.
+    history_draft: String,
     /// Collapsed pastes: (placeholder shown in the input, real content). A big
     /// paste shows as a compact chip and expands back on send.
     pasted_blocks: Vec<(String, String)>,
@@ -272,6 +279,10 @@ struct App {
     profiles_selected_index: usize,
     editing_profile: Option<String>,
     return_to_profiles: bool,
+    /// Hold the compaction animation until this instant (time-based, so a fast
+    /// render loop during streaming doesn't burn through it).
+    compaction_anim_until: Option<std::time::Instant>,
+    seen_compactions: usize,
     /// Inputs typed while the agent is executing — held and submitted when the run
     /// finishes (or is stopped), instead of steering mid-run.
     queued_inputs: std::collections::VecDeque<String>,
@@ -336,6 +347,9 @@ impl App {
             options,
             input: String::new(),
             input_cursor: 0,
+            input_history: Vec::new(),
+            history_pos: None,
+            history_draft: String::new(),
             pasted_blocks: Vec::new(),
             status,
             error: None,
@@ -358,6 +372,9 @@ impl App {
             profiles_selected_index: 0,
             editing_profile: None,
             return_to_profiles: false,
+            compaction_anim_until: None,
+            seen_compactions: usize::MAX, // uninitialized; first tick seeds it, no flash
+
             queued_inputs: std::collections::VecDeque::new(),
             was_busy: false,
             form_provider: String::new(),
@@ -763,6 +780,20 @@ impl App {
                     };
                 }
             }
+            "/mode" => {
+                let manual = !self.options.config.manual_approval;
+                self.options.config.manual_approval = manual;
+                let _ = self.save_config_file();
+                if let Some(tx) = &self.input_tx {
+                    let mode = if manual {
+                        crate::harness::ApprovalMode::Manual
+                    } else {
+                        crate::harness::ApprovalMode::Auto
+                    };
+                    let _ = tx.send(LoopInput::SetMode(mode));
+                }
+                self.status = String::new();
+            }
             "/compact" => {
                 if let Some(tx) = &self.input_tx {
                     if tx.send(LoopInput::Compact).is_ok() {
@@ -863,26 +894,6 @@ impl App {
         }
     }
 
-    fn login_move_model_suggestion(&mut self, forward: bool) {
-        let rows = login_model_rows(self);
-        if rows.is_empty() {
-            self.model_picker_index = 0;
-            return;
-        }
-        if self.model_picker_index >= rows.len() {
-            self.model_picker_index = 0;
-        }
-        self.model_picker_index = if forward {
-            (self.model_picker_index + 1) % rows.len()
-        } else if self.model_picker_index == 0 {
-            rows.len() - 1
-        } else {
-            self.model_picker_index - 1
-        };
-        if let Some(chosen) = rows.get(self.model_picker_index) {
-            self.form_model = chosen.clone();
-        }
-    }
 
     fn login_cycle_reasoning(&mut self, forward: bool) {
         const OPTIONS: [&str; 4] = ["off", "low", "medium", "high"];
@@ -1310,6 +1321,9 @@ impl App {
     /// True while the harness is mid-compaction (recent compaction-pass event + still
     /// running) — used to hold input and label the wait.
     fn is_compacting(&self) -> bool {
+        if self.compaction_anim_until.is_some_and(|t| std::time::Instant::now() < t) {
+            return true;
+        }
         self.state.as_ref().is_some_and(|s| {
             s.status == HarnessStatus::Running
                 && matches!(
@@ -1318,6 +1332,28 @@ impl App {
                         if step == "history_compaction_pass"
                 )
         })
+    }
+
+    /// The mutating tool call currently awaiting approval (manual mode), if any.
+    fn pending_approval(&self) -> Option<(String, String, usize, usize)> {
+        let s = self.state.as_ref()?;
+        if s.status != HarnessStatus::WaitingForInput {
+            return None;
+        }
+        match s.events.last() {
+            Some(HarnessEvent::ApprovalRequest { tool_name, summary, index, total }) => {
+                Some((tool_name.clone(), summary.clone(), *index, *total))
+            }
+            _ => None,
+        }
+    }
+
+    /// True when the active model is in manual (approval) mode.
+    fn is_manual_mode(&self) -> bool {
+        self.state
+            .as_ref()
+            .map(|s| s.approval_mode == crate::harness::ApprovalMode::Manual)
+            .unwrap_or(self.options.config.manual_approval)
     }
 
     fn model_factory(&self) -> ModelFactory {
@@ -1414,6 +1450,89 @@ impl App {
 
     fn input_len(&self) -> usize {
         self.input.chars().count()
+    }
+
+    /// Replace the input from a recalled history entry (clears any paste chips).
+    fn recall_set(&mut self, value: String) {
+        self.pasted_blocks.clear();
+        self.input_set(value);
+    }
+
+    /// True when the cursor sits on the first / last line of the input.
+    fn input_on_first_line(&self) -> bool {
+        let end = self.input_byte_at(self.input_cursor);
+        !self.input[..end].contains('\n')
+    }
+    fn input_on_last_line(&self) -> bool {
+        let start = self.input_byte_at(self.input_cursor);
+        !self.input[start..].contains('\n')
+    }
+
+    /// Recall the previous (older) history entry. Returns false when there's none.
+    fn recall_history_prev(&mut self) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+        let pos = match self.history_pos {
+            None => {
+                self.history_draft = self.expand_input();
+                self.input_history.len() - 1
+            }
+            Some(0) => return true, // already at the oldest
+            Some(p) => p - 1,
+        };
+        self.history_pos = Some(pos);
+        self.recall_set(self.input_history[pos].clone());
+        true
+    }
+
+    /// Recall the next (newer) entry, restoring the draft past the newest. False
+    /// when already editing the draft.
+    fn recall_history_next(&mut self) -> bool {
+        match self.history_pos {
+            None => false,
+            Some(p) if p + 1 < self.input_history.len() => {
+                self.history_pos = Some(p + 1);
+                self.recall_set(self.input_history[p + 1].clone());
+                true
+            }
+            Some(_) => {
+                self.history_pos = None;
+                let draft = std::mem::take(&mut self.history_draft);
+                self.recall_set(draft);
+                true
+            }
+        }
+    }
+
+    /// Move the cursor up / down one line in multi-line input, preserving column.
+    fn input_up(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cur = self.input_cursor.min(chars.len());
+        let line_start = chars[..cur].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+        if line_start == 0 {
+            return;
+        }
+        let col = cur - line_start;
+        let prev_end = line_start - 1;
+        let prev_start = chars[..prev_end].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+        self.input_cursor = prev_start + col.min(prev_end - prev_start);
+    }
+    fn input_down(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cur = self.input_cursor.min(chars.len());
+        let line_start = chars[..cur].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+        let col = cur - line_start;
+        let Some(nl) = chars[cur..].iter().position(|&c| c == '\n').map(|i| cur + i) else {
+            return;
+        };
+        let next_start = nl + 1;
+        let next_end = chars[next_start..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|i| next_start + i)
+            .unwrap_or(chars.len());
+        self.input_cursor = next_start + col.min(next_end - next_start);
     }
 
     /// Byte offset of a given char index (clamped to the string end).
@@ -1617,6 +1736,11 @@ impl App {
             }
             return;
         }
+        // Record for Up/Down history recall (skip consecutive duplicates).
+        if self.input_history.last().map(String::as_str) != Some(text.as_str()) {
+            self.input_history.push(text.clone());
+        }
+        self.history_pos = None;
         self.input_clear();
         self.scroll = 0;
 
@@ -1702,6 +1826,7 @@ impl App {
         let state_path = self.active_state_path.clone();
         let model_config = self.options.config.model.clone();
         let exa_api_key = self.options.config.exa_api_key.clone();
+        let manual_approval = self.options.config.manual_approval;
         let factory = self.model_factory();
         crate::llm::StreamBuffer::clear(&self.stream);
         let stream = self.stream.clone();
@@ -1717,6 +1842,7 @@ impl App {
                     exa_api_key: exa_api_key.clone(),
                     context_window_tokens: model_config.context_window,
                     compact_at_pct: model_config.compact_at_pct,
+                    manual_approval,
                     ..HarnessConfig::default()
                 },
                 coding_tools(exa_api_key),
@@ -1751,6 +1877,23 @@ impl App {
             self.flush_queued_input();
         }
         self.was_busy = busy;
+
+        // Hold the animation briefly when a new compaction lands.
+        let compactions = self
+            .state
+            .as_ref()
+            .map(|s| {
+                s.events
+                    .iter()
+                    .filter(|e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"))
+                    .count()
+            })
+            .unwrap_or(0);
+        if compactions > self.seen_compactions {
+            self.compaction_anim_until =
+                Some(std::time::Instant::now() + Duration::from_millis(1500));
+        }
+        self.seen_compactions = compactions;
 
         if self
             .models_fetch_handle
@@ -1920,6 +2063,12 @@ async fn run_app(
                         app.input_paste(&text);
                     }
                 }
+                // Mouse wheel scrolls the transcript (chat canvas).
+                Event::Mouse(me) => match me.kind {
+                    MouseEventKind::ScrollUp => app.scroll_up(3),
+                    MouseEventKind::ScrollDown => app.scroll_down(3),
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -1942,6 +2091,38 @@ async fn run_app(
 fn handle_key(app: &mut App, key: KeyEvent) {
     if app.login_active {
         handle_login_key(app, key);
+        return;
+    }
+
+    // While a mutating tool waits for approval (manual mode), keys are y/n/Esc only.
+    if app.screen == Screen::Main && app.pending_approval().is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(tx) = &app.input_tx {
+                    let _ = tx.send(LoopInput::Approve);
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Approve this and stop prompting for the rest of the run.
+                app.options.config.manual_approval = false;
+                let _ = app.save_config_file();
+                if let Some(tx) = &app.input_tx {
+                    let _ = tx.send(LoopInput::ApproveAll);
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(tx) = &app.input_tx {
+                    let _ = tx.send(LoopInput::Deny);
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(tx) = &app.input_tx {
+                    let _ = tx.send(LoopInput::Interrupt);
+                }
+                app.status = "Interrupting…".to_string();
+            }
+            _ => {}
+        }
         return;
     }
 
@@ -2184,8 +2365,27 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.suggestion_index = 0;
             }
             KeyCode::Enter => app.submit(),
-            KeyCode::Up => app.scroll_up(1),
-            KeyCode::Down => app.scroll_down(1),
+            // Up/Down recall input history at the edges of the prompt; move the
+            // cursor by line in the middle of a multi-line prompt; fall back to
+            // scrolling the transcript when there's no history to recall.
+            KeyCode::Up => {
+                if app.input_on_first_line() {
+                    if !app.recall_history_prev() {
+                        app.scroll_up(1);
+                    }
+                } else {
+                    app.input_up();
+                }
+            }
+            KeyCode::Down => {
+                if app.input_on_last_line() {
+                    if !app.recall_history_next() {
+                        app.scroll_down(1);
+                    }
+                } else {
+                    app.input_down();
+                }
+            }
             KeyCode::PageUp => app.scroll_up(10),
             KeyCode::PageDown => app.scroll_down(10),
             // Home/End move the cursor when editing; scroll the transcript when the
@@ -2263,23 +2463,11 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
         {
             app.logout_chatgpt();
         }
-        KeyCode::Enter => {
-            if app.form_provider == "chatgpt" && app.form_focus != SettingsField::Model {
-                app.login_connect();
-            } else if app.form_focus == SettingsField::Model {
-                let rows = login_model_rows(app);
-                if let Some(chosen) = rows.get(app.model_picker_index).cloned() {
-                    app.form_model = chosen;
-                }
-                app.login_connect();
-            } else {
-                app.login_connect();
-            }
-        }
+        KeyCode::Enter => app.login_connect(),
         KeyCode::Tab => app.login_move_focus(true),
         KeyCode::BackTab => app.login_move_focus(false),
-        KeyCode::Down if app.form_focus == SettingsField::Model => app.login_move_model_suggestion(true),
-        KeyCode::Up if app.form_focus == SettingsField::Model => app.login_move_model_suggestion(false),
+        // Up/Down move between fields everywhere (incl. the Model field); the model
+        // value is changed with Left/Right.
         KeyCode::Down => app.login_move_focus(true),
         KeyCode::Up => app.login_move_focus(false),
         KeyCode::Left => app.login_adjust(false),
@@ -2314,8 +2502,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     // A dedicated compaction-progress row sits directly above the input while the
     // history is being compacted (1 row when active, 0 otherwise).
     let compact_h: u16 = if app.is_compacting() { 1 } else { 0 };
+    // Approval prompt (manual mode): 2 rows directly above the input when a mutating
+    // tool is awaiting y/n (mutually exclusive with compaction).
+    let approval_h: u16 = if app.pending_approval().is_some() { 6 } else { 0 };
 
-    // Header (1), Content (Min 10), Suggestions, Question, Compaction (0/1), Input, Status, Footer
+    // Header, Content, Suggestions, Question, Compaction, Approval, Input, Status, Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2323,7 +2514,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
             Constraint::Min(10),                     // Content
             Constraint::Length(sugg_h),              // Suggestions
             Constraint::Length(question_height(app)), // Question
-            Constraint::Length(compact_h),          // Compaction progress (above input)
+            Constraint::Length(compact_h),          // Compaction progress
+            Constraint::Length(approval_h),         // Approval prompt (above input)
             Constraint::Length(input_h),            // Input (grows with wrapped lines)
             Constraint::Length(1),                  // Status message
             Constraint::Length(1),                  // Footer (metadata)
@@ -2335,9 +2527,10 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let suggestions_area = chunks[2];
     let question_area = chunks[3];
     let compaction_area = chunks[4];
-    let input_area = chunks[5];
-    let status_msg_area = chunks[6];
-    let footer_area = chunks[7];
+    let approval_area = chunks[5];
+    let input_area = chunks[6];
+    let status_msg_area = chunks[7];
+    let footer_area = chunks[8];
 
     render_header(frame, header_area, app);
     render_history(frame, content_area, app);
@@ -2348,9 +2541,54 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     if compact_h > 0 {
         render_compaction_bar(frame, compaction_area, app);
     }
+    if approval_h > 0 {
+        render_approval_bar(frame, approval_area, app);
+    }
     render_input(frame, input_area, app);
     render_status_message(frame, status_msg_area, app);
     render_status(frame, footer_area, app);
+}
+
+/// The approval prompt shown above the input while a mutating tool awaits y/n.
+fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders, Wrap};
+    let Some((tool, summary, index, total)) = app.pending_approval() else {
+        return;
+    };
+    let title = if total > 1 {
+        format!(" approve · {tool}   {index}/{total} ")
+    } else {
+        format!(" approve · {tool} ")
+    };
+    let prefix = if tool == "bash" { "$ " } else { "" };
+    let cmd = if summary.trim().is_empty() {
+        "(no preview)".to_string()
+    } else {
+        summary
+    };
+    let actions = Line::from(vec![
+        Span::styled("  ✓ y ", Style::default().fg(success()).add_modifier(Modifier::BOLD)),
+        Span::styled("approve   ", subtle()),
+        Span::styled("⏩ a ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled("approve all   ", subtle()),
+        Span::styled("✗ n ", Style::default().fg(danger()).add_modifier(Modifier::BOLD)),
+        Span::styled("deny   ", subtle()),
+        Span::styled("esc ", Style::default().fg(muted()).add_modifier(Modifier::BOLD)),
+        Span::styled("stop", subtle()),
+    ]);
+    let body = vec![
+        Line::from(Span::styled(format!("  {prefix}{cmd}"), Style::default().fg(self::text()))),
+        Line::from(""),
+        actions,
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(warn()))
+        .title(Span::styled(title, Style::default().fg(warn()).add_modifier(Modifier::BOLD)));
+    frame.render_widget(
+        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// An animated "compacting" progress line shown directly above the input box while
@@ -3118,24 +3356,12 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
                 // transcript entry comes from `history_compacted` below.
                 Vec::new()
             } else if step == "history_compaction_skipped" {
-                vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        format!("  ───────────  ✦ compaction skipped: {reasoning} ───────────"),
-                        Style::default().fg(muted()),
-                    )),
-                    Line::from(""),
-                ]
+                let _ = reasoning; // detail goes to the debug log, not the transcript
+                Vec::new()
             } else if step == "history_compacted" {
                 // A clean boundary; everything above it is collapsed by transcript_lines.
-                vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        format!("  ───────────  ✦ context compacted: {reasoning} ───────────"),
-                        Style::default().fg(muted()),
-                    )),
-                    Line::from(""),
-                ]
+                // The verbose token detail lives in the debug log, not here.
+                compaction_divider(width)
             } else {
                 marker_block(
                     "⚙ ",
@@ -3152,6 +3378,12 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
         HarnessEvent::UserQuestion { questions } => {
             let text = question_text(questions).unwrap_or_else(|| "(question)".to_string());
             marker_block("? ", "", warn(), &text, width)
+        }
+        HarnessEvent::ApprovalRequest { .. } => {
+            // While pending it's shown in the approval card above the input; the
+            // outcome is logged via the `approval_resolved` decision. No transcript
+            // line for the bare request.
+            Vec::new()
         }
         HarnessEvent::LaneSpawned { id, title } => marker_block(
             "→ ",
@@ -3214,6 +3446,22 @@ fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 }
 
 /// A leading glyph + optional label, then wrapped body text in one color.
+/// A clean, centered boundary marking where history was compacted.
+fn compaction_divider(width: usize) -> Vec<Line<'static>> {
+    let label = " ✦ context compacted ";
+    let side = width.saturating_sub(label.chars().count()) / 2;
+    let dash = "─".repeat(side.min(36));
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(dash.clone(), Style::default().fg(faint())),
+            Span::styled(label.to_string(), Style::default().fg(muted())),
+            Span::styled(dash, Style::default().fg(faint())),
+        ]),
+        Line::from(""),
+    ]
+}
+
 fn marker_block(
     glyph: &str,
     label: &str,
@@ -4636,11 +4884,24 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let dim = Style::default().fg(muted());
     let faint = Style::default().fg(faint());
 
-    let mut right = vec![
+    let mut right: Vec<Span<'static>> = Vec::new();
+    // ChatGPT-subscription rate-limit usage (parsed from response headers).
+    if let Some(rl) = st.and_then(|s| s.rate_limit.as_ref()) {
+        let mut parts = Vec::new();
+        for w in [rl.primary.as_ref(), rl.secondary.as_ref()].into_iter().flatten() {
+            let left = (100.0 - w.used_percent).clamp(0.0, 100.0);
+            parts.push(format!("{} {:.0}%", rate_window_label(w.window_minutes), left));
+        }
+        if !parts.is_empty() {
+            right.push(Span::styled(format!("◷ {} left", parts.join(" · ")), Style::default().fg(warn())));
+            right.push(Span::styled("   ", faint));
+        }
+    }
+    right.extend([
         Span::styled(format!("↑{}", fmt_si(st.map(|s| s.prompt_tokens).unwrap_or(0))), dim),
         Span::raw(" "),
         Span::styled(format!("↓{}", fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0))), dim),
-    ];
+    ]);
     let running_lanes = st
         .map(|s| s.lanes.iter().filter(|lane| lane.status == LaneStatus::Running).count())
         .unwrap_or(0);
@@ -4663,7 +4924,10 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         dim,
     ));
 
-    let left_span = Span::styled(format!(" {}", app.cwd_display), dim);
+    let mut left = vec![Span::styled(format!(" {}", app.cwd_display), dim)];
+    if app.is_manual_mode() {
+        left.push(Span::styled("  ⚠ manual", Style::default().fg(warn())));
+    }
     let right_line = Line::from(right);
     let right_w = right_line.width() as u16;
 
@@ -4672,11 +4936,29 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Min(10), Constraint::Length(right_w + 1)])
         .split(area);
 
-    frame.render_widget(Paragraph::new(Line::from(left_span)), cols[0]);
+    frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
     frame.render_widget(
         Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
         cols[1],
     );
+}
+
+/// Short label for a rate-limit window length (minutes), ±5% tolerance.
+fn rate_window_label(minutes: i64) -> String {
+    let near = |t: i64| (minutes - t).abs() as f64 <= (t as f64) * 0.05;
+    if near(300) {
+        "5h".to_string()
+    } else if near(1440) {
+        "daily".to_string()
+    } else if near(10080) {
+        "wk".to_string()
+    } else if near(43200) {
+        "mo".to_string()
+    } else if minutes > 0 {
+        format!("{}h", (minutes / 60).max(1))
+    } else {
+        "limit".to_string()
+    }
 }
 
 /// SI-ish formatting for token counts: 91M, 425k, 128k, 512.

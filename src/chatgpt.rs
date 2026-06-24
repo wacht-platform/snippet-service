@@ -20,6 +20,38 @@ use crate::tools::ToolError;
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
+/// Parse the Codex rate-limit usage headers (`x-codex-{primary,secondary}-*`) that
+/// ride on every /codex/responses response.
+fn parse_codex_rate_limits(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<crate::llm::RateLimitSnapshot> {
+    use crate::llm::{RateLimitSnapshot, RateLimitWindow};
+    let f64_at = |name: String| {
+        headers.get(&name).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<f64>().ok())
+    };
+    let i64_at = |name: String| {
+        headers.get(&name).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<i64>().ok())
+    };
+    let window = |p: &str| {
+        let used = f64_at(format!("x-codex-{p}-used-percent")).unwrap_or(0.0);
+        let mins = i64_at(format!("x-codex-{p}-window-minutes")).unwrap_or(0);
+        let reset = i64_at(format!("x-codex-{p}-reset-at"));
+        if used == 0.0 && mins == 0 && reset.is_none() {
+            return None;
+        }
+        Some(RateLimitWindow {
+            used_percent: used,
+            window_minutes: mins,
+            resets_at: reset.unwrap_or(0),
+        })
+    };
+    let (primary, secondary) = (window("primary"), window("secondary"));
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+    Some(RateLimitSnapshot { primary, secondary })
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatGptConfig {
     pub model: String,
@@ -88,22 +120,6 @@ impl AgentModel for ChatGptModel {
         self.ensure_fresh().await?;
 
         let body = build_responses_request(&self.config, messages, tools, force_tool);
-        let body_preview = serde_json::to_string(&body)
-            .unwrap_or_else(|_| "<unserializable body>".to_string())
-            .chars()
-            .take(2000)
-            .collect::<String>();
-        let content_type = "application/json";
-        {
-            let log_path = std::path::PathBuf::from("/tmp/snippet/.snippet/debug.log");
-            if let Some(parent) = log_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                use std::io::Write;
-                let _ = writeln!(file, "chatgpt_request url={RESPONSES_URL} content_type={content_type} body={body_preview}");
-            }
-        }
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
         let mut fatal = false;
@@ -137,7 +153,12 @@ impl AgentModel for ChatGptModel {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        return parse_responses_sse(response, sink.as_ref()).await;
+                        // Rate-limit usage is on the response headers (read before the
+                        // SSE body consumes the response).
+                        let rate_limit = parse_codex_rate_limits(response.headers());
+                        let mut output = parse_responses_sse(response, sink.as_ref()).await?;
+                        output.rate_limit = rate_limit;
+                        return Ok(output);
                     }
                     // Expired/invalid token → refresh once, then retry without
                     // consuming a backoff attempt.
@@ -160,16 +181,6 @@ impl AgentModel for ChatGptModel {
                     }
                     let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                     let text = response.text().await.unwrap_or_default();
-                    {
-                        let log_path = std::path::PathBuf::from("/tmp/snippet/.snippet/debug.log");
-                        if let Some(parent) = log_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                            use std::io::Write;
-                            let _ = writeln!(file, "chatgpt_response status={status} body={text}");
-                        }
-                    }
                     last_error = format!("HTTP {status}: {text}");
                     if !is_retryable_status(status) {
                         fatal = true;
@@ -240,9 +251,7 @@ fn build_responses_request(
     // the `input` item array.
     let mut instructions = String::new();
     let mut input: Vec<Value> = Vec::new();
-    // The Responses API rejects a `function_call_output` whose `call_id` has no
-    // preceding `function_call` (e.g. after compaction summarized the assistant
-    // turn that made the call). Track emitted call ids and drop orphaned outputs.
+    // Drop function_call_outputs whose function_call was compacted away (the API 400s).
     let mut seen_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (index, message) in messages.iter().enumerate() {
@@ -291,9 +300,7 @@ fn build_responses_request(
                         &format!("[tool_result]\ntool = \"{tool_name}\"\noutput = {output}\n[/tool_result]"),
                     ));
                 } else if !seen_calls.contains(tool_call_id) {
-                    // Orphaned result (its call was compacted away) — keep the content
-                    // as plain text so it isn't lost, but not as a function_call_output
-                    // the API would reject.
+                    // Orphaned result (call was compacted away) — send as plain text.
                     input.push(message_item(
                         "user",
                         &format!("[tool_result {tool_name}]\n{output}\n[/tool_result]"),
@@ -326,6 +333,34 @@ fn build_responses_request(
             }
         }
     }
+
+    // Every function_call must have a matching function_call_output, or the API
+    // 400s. Synthesize a placeholder for any call whose result was never recorded
+    // (failed/cut tool calls).
+    let output_ids: std::collections::HashSet<String> = input
+        .iter()
+        .filter(|v| v.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .filter_map(|v| v.get("call_id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut reconciled: Vec<Value> = Vec::with_capacity(input.len());
+    for item in input {
+        let missing = item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(|id| !id.is_empty() && !output_ids.contains(id))
+                .unwrap_or(false);
+        let call_id = item.get("call_id").and_then(Value::as_str).map(str::to_string);
+        reconciled.push(item);
+        if missing {
+            reconciled.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "[no result recorded]",
+            }));
+        }
+    }
+    let input = reconciled;
 
     let tools_json: Vec<Value> = tools
         .iter()
@@ -476,5 +511,6 @@ async fn parse_responses_sse(
         content_text: (!text.is_empty()).then_some(text),
         usage,
         finish_reason: None,
+        rate_limit: None,
     })
 }

@@ -125,6 +125,7 @@ impl AgentModel for OpenAiCompatibleModel {
                 ..Default::default()
             }),
             finish_reason: choice.finish_reason,
+            rate_limit: None,
         })
     }
 }
@@ -449,6 +450,7 @@ async fn parse_openai_sse(
         content_text: (!text.is_empty()).then_some(text),
         usage,
         finish_reason,
+        rate_limit: None,
     })
 }
 
@@ -954,6 +956,7 @@ impl AgentModel for GithubCopilotModel {
                 ..Default::default()
             }),
             finish_reason: choice.finish_reason,
+            rate_limit: None,
         })
     }
 }

@@ -20,6 +20,9 @@ pub struct SnippetConfig {
     pub state_path: PathBuf,
     #[serde(default)]
     pub resume_on_start: bool,
+    /// Start runs in manual approval mode — bash and file edits wait for y/n.
+    #[serde(default)]
+    pub manual_approval: bool,
     /// Name of the active profile in `setups`. The active profile's config is
     /// mirrored into `model` for the runtime.
     #[serde(default, alias = "active_profile", alias = "active_setup", skip_serializing_if = "Option::is_none")]
@@ -90,6 +93,7 @@ impl Default for SnippetConfig {
             workspace: default_workspace(),
             state_path: default_state_path(),
             resume_on_start: false,
+            manual_approval: false,
             active_setup: None,
             setups: None,
             model: ModelConfig::default(),
@@ -295,7 +299,7 @@ impl ModelConfig {
                     max_retries: self.max_retries,
                     initial_retry_ms: self.initial_retry_ms,
                     max_retry_ms: self.max_retry_ms,
-                    supports_images: self.supports_images,
+                    supports_images: true, // Gemini models are multimodal
                     reasoning_effort: self.reasoning_effort.clone(),
                 }))
             }
@@ -329,7 +333,7 @@ impl ModelConfig {
                 Box::new(crate::chatgpt::ChatGptModel::new(crate::chatgpt::ChatGptConfig {
                     model,
                     reasoning_effort: self.reasoning_effort.clone(),
-                    supports_images: self.supports_images,
+                    supports_images: true, // ChatGPT/Codex models are multimodal
                     max_retries: self.max_retries,
                     initial_retry_ms: self.initial_retry_ms,
                     max_retry_ms: self.max_retry_ms,

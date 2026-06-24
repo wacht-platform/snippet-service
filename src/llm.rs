@@ -150,6 +150,9 @@ pub struct ModelOutput {
     /// `stop`, `tool_calls`). Used to detect a response cut off at the token cap.
     #[serde(default)]
     pub finish_reason: Option<String>,
+    /// ChatGPT-subscription rate-limit usage, when the provider reports it.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitSnapshot>,
 }
 
 impl ModelOutput {
@@ -179,6 +182,23 @@ pub struct TokenUsage {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub cache_creation_tokens: u64,
+}
+
+/// ChatGPT-subscription rate-limit usage (parsed from Codex response headers).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RateLimitSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<RateLimitWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<RateLimitWindow>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub window_minutes: i64,
+    /// Unix epoch seconds when the window resets (0 if unknown).
+    pub resets_at: i64,
 }
 
 #[async_trait]
