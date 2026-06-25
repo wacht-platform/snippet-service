@@ -100,7 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serve::daemonize_self()?;
                 runtime()?.block_on(async {
                     let config = SnippetConfig::load(&config_path).await?;
-                    serve::run_serve(config, port, token, tunnel)
+                    serve::run_serve(config, config_path, port, token, tunnel)
                         .await
                         .map_err::<Box<dyn std::error::Error>, _>(Into::into)
                 })
@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if needs_cf {
                     serve::ensure_cloudflared_foreground()?;
                 }
-                serve::launch_and_show(port, &token, no_tunnel, public_url, tunnel_token)
+                serve::launch_and_show(port, &token, no_tunnel, public_url, tunnel_token, &config_path)
                     .map_err(Into::into)
             }
         }

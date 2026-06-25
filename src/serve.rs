@@ -14,14 +14,14 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::config::{SnippetConfig, workspaces_root};
+use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{LoopInput, deserialize_state};
 use crate::session::{list_device_sessions, start_session, state_path_for_id};
 
@@ -29,10 +29,14 @@ struct LiveSession {
     input_tx: UnboundedSender<LoopInput>,
     join: JoinHandle<Result<crate::harness::HarnessState, String>>,
     state_path: PathBuf,
+    /// The profile this session's model was built from (per-conversation override,
+    /// in-memory only — reverts to the global active profile on daemon restart).
+    profile: Option<String>,
 }
 
 struct Daemon {
-    config: SnippetConfig,
+    config: std::sync::Mutex<SnippetConfig>,
+    config_path: PathBuf,
     token: String,
     sessions: Mutex<HashMap<String, LiveSession>>,
 }
@@ -71,12 +75,20 @@ impl Daemon {
         if state.workspace.is_empty() || !folder.is_dir() {
             return None;
         }
-        let cfg = self.config.for_workspace(folder);
+        let cfg = {
+            let c = self.config.lock().unwrap();
+            c.for_workspace(folder)
+        };
         let handle = start_session(&cfg, sp.clone(), None, true, None);
         let tx = handle.input_tx.clone();
         sessions.insert(
             id.to_string(),
-            LiveSession { input_tx: handle.input_tx, join: handle.join, state_path: sp.clone() },
+            LiveSession {
+                input_tx: handle.input_tx,
+                join: handle.join,
+                state_path: sp.clone(),
+                profile: None,
+            },
         );
         Some((tx, sp))
     }
@@ -98,13 +110,17 @@ pub enum Tunnel {
 /// print a scannable QR + connection string. The token is the app-layer auth gate.
 pub async fn run_serve(
     config: SnippetConfig,
+    config_path: PathBuf,
     port: u16,
     token: String,
     tunnel: Tunnel,
 ) -> Result<(), String> {
     let token_for_print = token.clone();
+    let mut config = config;
+    config.ensure_setups();
     let daemon: Shared = Arc::new(Daemon {
-        config,
+        config: std::sync::Mutex::new(config),
+        config_path,
         token,
         sessions: Mutex::new(HashMap::new()),
     });
@@ -113,6 +129,10 @@ pub async fn run_serve(
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/fs", get(browse_fs))
         .route("/attach", get(attach_ws))
+        .route("/config", get(get_config))
+        .route("/config/profile", put(put_profile).delete(delete_profile))
+        .route("/config/active", post(set_active))
+        .route("/session/model", post(set_session_model))
         .with_state(daemon);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -408,10 +428,13 @@ async fn list_sessions(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
     let out: Vec<serde_json::Value> = sessions
         .into_iter()
         .map(|s| {
-            let running = live.contains_key(&s.id);
+            let live_s = live.get(&s.id);
+            let running = live_s.is_some();
+            let profile = live_s.and_then(|l| l.profile.clone());
             let mut v = serde_json::to_value(&s).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("running".into(), serde_json::json!(running));
+                obj.insert("profile".into(), serde_json::json!(profile));
             }
             v
         })
@@ -424,6 +447,9 @@ struct OpenReq {
     folder: String,
     #[serde(default = "default_true")]
     resume: bool,
+    /// Optional profile to build this session's model from (else the global active).
+    #[serde(default)]
+    profile: Option<String>,
 }
 fn default_true() -> bool {
     true
@@ -438,7 +464,17 @@ async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req):
     if !folder.is_dir() {
         return (StatusCode::BAD_REQUEST, "not a directory").into_response();
     }
-    let cfg = d.config.for_workspace(folder.clone());
+    let cfg = {
+        let c = d.config.lock().unwrap();
+        let mut w = c.for_workspace(folder.clone());
+        if let Some(name) = req.profile.as_ref() {
+            if let Some(m) = w.setups.as_ref().and_then(|s| s.get(name)).cloned() {
+                w.model = m;
+                w.active_setup = Some(name.clone());
+            }
+        }
+        w
+    };
     let sp = cfg.state_path.clone();
     let id = sp.strip_prefix(workspaces_root()).unwrap_or(&sp).display().to_string();
 
@@ -447,10 +483,226 @@ async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req):
         let handle = start_session(&cfg, sp.clone(), None, req.resume, None);
         sessions.insert(
             id.clone(),
-            LiveSession { input_tx: handle.input_tx, join: handle.join, state_path: sp.clone() },
+            LiveSession {
+                input_tx: handle.input_tx,
+                join: handle.join,
+                state_path: sp.clone(),
+                profile: req.profile.clone(),
+            },
         );
     }
     Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
+}
+
+// ---- model configuration (mirrors the TUI's profiles, shared config.toml) ----
+
+#[derive(Serialize)]
+struct ProfileView {
+    name: String,
+    provider: String,
+    base_url: String,
+    model: String,
+    has_key: bool,
+    active: bool,
+}
+
+#[derive(Serialize)]
+struct ConfigView {
+    profiles: Vec<ProfileView>,
+    active: Option<String>,
+    theme: Option<String>,
+    manual_approval: bool,
+}
+
+// GET /config — profiles with keys redacted (has_key only), active profile, theme.
+async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let c = d.config.lock().unwrap();
+    let active = c.active_setup.clone();
+    let mut profiles = Vec::new();
+    if let Some(setups) = c.setups.as_ref() {
+        for (name, m) in setups {
+            profiles.push(ProfileView {
+                name: name.clone(),
+                provider: m.provider.clone(),
+                base_url: m.base_url.clone(),
+                model: m.model.clone(),
+                has_key: !m.api_key.trim().is_empty(),
+                active: active.as_deref() == Some(name.as_str()),
+            });
+        }
+    }
+    Json(ConfigView { profiles, active, theme: c.theme.clone(), manual_approval: c.manual_approval })
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct ProfileReq {
+    name: Option<String>,
+    provider: String,
+    #[serde(default)]
+    base_url: Option<String>,
+    model: String,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    supports_images: Option<bool>,
+    #[serde(default)]
+    set_active: bool,
+}
+
+// PUT /config/profile — add/update an API-key provider profile; persists to disk.
+// An omitted/blank api_key keeps any existing key (so editing doesn't wipe it).
+async fn put_profile(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ProfileReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.provider.trim().is_empty() || req.model.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "provider and model are required").into_response();
+    }
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        let name = req
+            .name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| c.unique_profile_key(&req.provider));
+        let existing_key = c.setups.as_ref().and_then(|m| m.get(&name)).map(|m| m.api_key.clone());
+        let base_url = req
+            .base_url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| ModelConfig::default().base_url);
+        let api_key = req
+            .api_key
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or(existing_key)
+            .unwrap_or_default();
+        let mc = ModelConfig {
+            provider: req.provider.clone(),
+            base_url,
+            model: req.model.clone(),
+            api_key,
+            reasoning_effort: req.reasoning_effort.clone().filter(|s| !s.is_empty()),
+            supports_images: req.supports_images.unwrap_or(false),
+            ..ModelConfig::default()
+        };
+        c.upsert_profile(&name, mc);
+        if req.set_active {
+            c.activate(&name);
+        }
+        save_config(&c, &d.config_path).map(|_| name)
+    };
+    match result {
+        Ok(name) => Json(serde_json::json!({ "name": name })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ActiveReq {
+    name: String,
+}
+
+// POST /config/active — set the global active profile (default for new sessions).
+async fn set_active(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ActiveReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        if !c.activate(&req.name) {
+            return (StatusCode::NOT_FOUND, "no such profile").into_response();
+        }
+        save_config(&c, &d.config_path)
+    };
+    match result {
+        Ok(_) => Json(serde_json::json!({ "active": req.name })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteProfileQuery {
+    token: Option<String>,
+    name: String,
+}
+
+// DELETE /config/profile?name= — remove a profile (active falls back to first left).
+async fn delete_profile(State(d): State<Shared>, Query(q): Query<DeleteProfileQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        c.remove_profile(&q.name);
+        save_config(&c, &d.config_path)
+    };
+    match result {
+        Ok(_) => Json(serde_json::json!({ "removed": q.name })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionModelReq {
+    session: String,
+    profile: String,
+}
+
+// POST /session/model {session, profile} — switch one conversation's model until
+// daemon restart: rebuild its loop on the chosen profile, resuming from disk.
+async fn set_session_model(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<SessionModelReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let model_cfg = {
+        let c = d.config.lock().unwrap();
+        match c.setups.as_ref().and_then(|m| m.get(&req.profile)).cloned() {
+            Some(m) => m,
+            None => return (StatusCode::NOT_FOUND, "no such profile").into_response(),
+        }
+    };
+    let Some(sp) = state_path_for_id(&req.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    let Ok(bytes) = std::fs::read(&sp) else {
+        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
+    };
+    let folder = PathBuf::from(&state.workspace);
+    if state.workspace.is_empty() || !folder.is_dir() {
+        return (StatusCode::BAD_REQUEST, "session workspace missing").into_response();
+    }
+    let cfg = {
+        let c = d.config.lock().unwrap();
+        let mut w = c.for_workspace(folder);
+        w.model = model_cfg;
+        w.active_setup = Some(req.profile.clone());
+        w
+    };
+    let mut sessions = d.sessions.lock().await;
+    if let Some(old) = sessions.remove(&req.session) {
+        old.join.abort();
+    }
+    let handle = start_session(&cfg, sp.clone(), None, true, None);
+    sessions.insert(
+        req.session.clone(),
+        LiveSession {
+            input_tx: handle.input_tx,
+            join: handle.join,
+            state_path: sp,
+            profile: Some(req.profile.clone()),
+        },
+    );
+    Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
 }
 
 #[derive(Serialize)]
@@ -635,6 +887,7 @@ pub fn launch_and_show(
     no_tunnel: bool,
     public_url: Option<String>,
     tunnel_token: Option<String>,
+    config_path: &std::path::Path,
 ) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
 
@@ -648,7 +901,13 @@ pub fn launch_and_show(
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("serve").arg("--port").arg(port.to_string()).arg("--token").arg(token);
+    cmd.arg("--config")
+        .arg(config_path)
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--token")
+        .arg(token);
     if no_tunnel {
         cmd.arg("--no-tunnel");
     }

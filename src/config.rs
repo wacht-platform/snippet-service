@@ -445,3 +445,19 @@ impl Default for ModelConfig {
         }
     }
 }
+
+
+/// Write `config` to `path` with a round-trip parse guard (refuse to write a config
+/// that won't load back), then chmod it 0600. Shared by the TUI-style save path and
+/// the serve daemon's config endpoints.
+pub fn save_config(config: &SnippetConfig, path: &Path) -> Result<(), String> {
+    let toml_str = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
+    toml::from_str::<SnippetConfig>(&toml_str)
+        .map_err(|e| format!("refusing to write config that won't round-trip: {e}"))?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(path, toml_str).map_err(|e| format!("write {}: {e}", path.display()))?;
+    set_private(path);
+    Ok(())
+}
