@@ -39,9 +39,22 @@ struct Daemon {
 
 type Shared = Arc<Daemon>;
 
+/// Constant-time token check: hash both sides to a fixed 32-byte digest and compare
+/// without short-circuiting, so neither token length nor content leaks via timing.
+fn token_matches(provided: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let a = Sha256::digest(provided.as_bytes());
+    let b = Sha256::digest(expected.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 impl Daemon {
     fn authed(&self, token: &Option<String>) -> bool {
-        token.as_deref() == Some(self.token.as_str())
+        token.as_deref().is_some_and(|t| token_matches(t, &self.token))
     }
 
     /// Return a live session's input channel + state path, starting (resuming) it
