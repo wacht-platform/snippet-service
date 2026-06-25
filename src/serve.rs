@@ -144,6 +144,7 @@ pub async fn run_serve(
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/fs", get(browse_fs))
         .route("/attach", get(attach_ws))
+        .route("/events", get(events_ws))
         .route("/config", get(get_config))
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
@@ -872,6 +873,8 @@ async fn handle_ws(socket: WebSocket, tx: UnboundedSender<LoopInput>, state_path
     // Push the HarnessState whenever it changes on disk (mtime poll, like the TUI).
     let push = tokio::spawn(async move {
         let mut last_mtime = None;
+        let mut last_count: Option<usize> = None;
+        let mut last_head: u64 = 0;
         loop {
             if let Ok(meta) = tokio::fs::metadata(&state_path).await {
                 if let Ok(mtime) = meta.modified() {
@@ -879,9 +882,38 @@ async fn handle_ws(socket: WebSocket, tx: UnboundedSender<LoopInput>, state_path
                         last_mtime = Some(mtime);
                         if let Ok(bytes) = tokio::fs::read(&state_path).await {
                             if let Ok(state) = deserialize_state(&bytes) {
-                                if let Ok(json) = serde_json::to_string(&state) {
-                                    if sender.send(Message::Text(json.into())).await.is_err() {
-                                        break;
+                                if let Ok(mut v) = serde_json::to_value(&state) {
+                                    // `messages` (raw LLM history) is unused by the app — never wire it.
+                                    if let Some(o) = v.as_object_mut() {
+                                        o.remove("messages");
+                                    }
+                                    let count = state.events.len();
+                                    let head = events_head_fp(&state);
+                                    // Full snapshot on connect / compaction (head changed) / shrink;
+                                    // otherwise stream only the appended tail.
+                                    let snapshot = match last_count {
+                                        None => true,
+                                        Some(lc) => head != last_head || count < lc,
+                                    };
+                                    if let Some(o) = v.as_object_mut() {
+                                        if snapshot {
+                                            o.insert("wire".into(), serde_json::json!("snapshot"));
+                                        } else {
+                                            let start = last_count.unwrap_or(0);
+                                            let tail = serde_json::to_value(&state.events[start..])
+                                                .unwrap_or_default();
+                                            o.remove("events");
+                                            o.insert("wire".into(), serde_json::json!("delta"));
+                                            o.insert("new_events".into(), tail);
+                                            o.insert("event_count".into(), serde_json::json!(count));
+                                        }
+                                    }
+                                    last_count = Some(count);
+                                    last_head = head;
+                                    if let Ok(json) = serde_json::to_string(&v) {
+                                        if sender.send(Message::Text(json.into())).await.is_err() {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -903,6 +935,80 @@ async fn handle_ws(socket: WebSocket, tx: UnboundedSender<LoopInput>, state_path
             }
             Message::Close(_) => break,
             _ => {}
+        }
+    }
+    push.abort();
+}
+
+/// Fingerprint of the event log's head — detects compaction (history replaced)
+/// vs a plain append. Stable across appends; changes when events[0] changes.
+fn events_head_fp(state: &crate::harness::HarnessState) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(first) = state.events.first() {
+        if let Ok(s) = serde_json::to_string(first) {
+            s.hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+// WS /events — device-wide notification firehose. Emits a compact event whenever a
+// session leaves the running state (asked a question / needs approval / stopped /
+// errored), so the app can notify even for sessions it isn't actively watching.
+async fn events_ws(ws: WebSocketUpgrade, State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    ws.on_upgrade(handle_events_ws)
+}
+
+async fn handle_events_ws(socket: WebSocket) {
+    use std::collections::{HashMap, HashSet};
+    let (mut sender, mut receiver) = socket.split();
+    let push = tokio::spawn(async move {
+        let mut last: HashMap<String, String> = HashMap::new();
+        let mut first = true;
+        loop {
+            let sessions = list_device_sessions();
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for s in &sessions {
+                seen.insert(s.id.clone());
+                let prev = last.insert(s.id.clone(), s.status.clone());
+                if first {
+                    continue;
+                }
+                if prev.as_deref() == Some("running") && s.status != "running" {
+                    let kind = match s.status.as_str() {
+                        "waiting_for_input" => "waiting",
+                        "completed" => "done",
+                        "failed" => "error",
+                        "idle" => "idle",
+                        _ => continue, // interrupted (user-initiated) etc.
+                    };
+                    out.push(serde_json::json!({
+                        "session": s.id,
+                        "title": s.title,
+                        "workspace": s.folder,
+                        "kind": kind,
+                        "status": s.status,
+                    }));
+                }
+            }
+            last.retain(|k, _| seen.contains(k));
+            first = false;
+            for e in out {
+                if sender.send(Message::Text(e.to_string().into())).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    });
+    while let Some(Ok(msg)) = receiver.next().await {
+        if let Message::Close(_) = msg {
+            break;
         }
     }
     push.abort();
