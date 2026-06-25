@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use snippet::config::SnippetConfig;
+use snippet::serve::{self, Tunnel};
 use snippet::tui::{TuiOptions, run_tui};
 
 #[derive(Debug, Parser)]
@@ -19,8 +20,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run headless and serve the agent for remote control (mobile app). The TUI is
-    /// unaffected — this is an additional frontend over the same on-disk sessions.
+    /// Run headless in the background and serve the agent for remote control (mobile
+    /// app). Additive — the TUI is unchanged; both use the same on-disk sessions.
     Serve {
         /// Local port to bind (a tunnel exposes it; the token is the auth gate).
         #[arg(long, default_value_t = 8787)]
@@ -34,44 +35,82 @@ enum Command {
         /// Advertise this public URL instead of auto-launching a tunnel (bring-your-own).
         #[arg(long)]
         public_url: Option<String>,
-        /// Run a pre-created named cloudflared tunnel by token (needs --public-url for its hostname).
+        /// Run a pre-created named cloudflared tunnel by token (needs --public-url).
         #[arg(long)]
         tunnel_token: Option<String>,
+        /// Stop the running background daemon.
+        #[arg(long)]
+        stop: bool,
+        /// Show the running daemon's status + its QR / connection string.
+        #[arg(long)]
+        status: bool,
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or_else(|| {
+fn config_path(cli: &Cli) -> PathBuf {
+    cli.config.clone().unwrap_or_else(|| {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         home.join(".snippet/config.toml")
-    });
+    })
+}
 
-    let config = SnippetConfig::load(&config_path).await?;
+fn runtime() -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
+    Ok(tokio::runtime::Builder::new_multi_thread().enable_all().build()?)
+}
+
+// Not `#[tokio::main]`: `serve` daemonizes (fork) before any runtime threads exist,
+// so the runtime is built explicitly *after* the fork.
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let config_path = config_path(&cli);
 
     match cli.command {
-        Some(Command::Serve { port, token, no_tunnel, public_url, tunnel_token }) => {
+        Some(Command::Serve {
+            port,
+            token,
+            no_tunnel,
+            public_url,
+            tunnel_token,
+            stop,
+            status,
+        }) => {
+            // Lifecycle commands are synchronous and need no config/runtime.
+            if stop {
+                return serve::stop().map_err(Into::into);
+            }
+            if status {
+                return serve::status().map_err(Into::into);
+            }
             let token = token.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
             let tunnel = if no_tunnel {
-                snippet::serve::Tunnel::None
+                Tunnel::None
             } else if let Some(t) = tunnel_token {
-                let url = public_url
-                    .ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
-                snippet::serve::Tunnel::Named { token: t, url }
+                let url = public_url.ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
+                Tunnel::Named { token: t, url }
             } else if let Some(u) = public_url {
-                snippet::serve::Tunnel::Url(u)
+                Tunnel::Url(u)
             } else {
-                snippet::serve::Tunnel::Cloudflared
+                Tunnel::Cloudflared
             };
-            if let Err(e) = snippet::serve::run_serve(config, port, token, tunnel).await {
-                return Err(e.into());
+            // Fetch cloudflared in the foreground (visible progress bar) before we
+            // detach — the backgrounded child can't draw to this terminal.
+            if matches!(tunnel, Tunnel::Cloudflared | Tunnel::Named { .. }) {
+                serve::ensure_cloudflared_foreground()?;
             }
-            Ok(())
+            // Fork into the background BEFORE the async runtime exists; returns only
+            // in the detached child.
+            serve::detach()?;
+            runtime()?.block_on(async {
+                let config = SnippetConfig::load(&config_path).await?;
+                serve::run_serve(config, port, token, tunnel)
+                    .await
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)
+            })
         }
-        None => {
+        None => runtime()?.block_on(async {
+            let config = SnippetConfig::load(&config_path).await?;
             run_tui(TuiOptions {
                 config_path,
                 config,
@@ -79,6 +118,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await?;
             Ok(())
-        }
+        }),
     }
 }

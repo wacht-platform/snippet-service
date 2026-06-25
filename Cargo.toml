@@ -10,6 +10,7 @@ base64 = "0.22"
 qrcode = "0.14"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+daemonize = "0.5"
 crossterm = "0.28"
 futures-util = "0.3"
 ratatui = "0.29"
@@ -18,7 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "1"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"

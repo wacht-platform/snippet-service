@@ -107,7 +107,7 @@ pub async fn run_serve(
         .map_err(|e| format!("bind {addr}: {e}"))?;
 
     // Serve in the background so we can bring up the tunnel and print the QR.
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let mut server = tokio::spawn(async move { axum::serve(listener, app).await });
 
     // Serve is remote-only: a tunnel is required (on-device, use the TUI). A tunnel
     // failure is fatal — never silently fall back to an unreachable localhost URL.
@@ -140,11 +140,23 @@ pub async fn run_serve(
     };
 
     print_connection(&public_url, &token_for_print);
+    write_serve_state(&public_url, &token_for_print);
 
-    let result = server.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string());
+    // Run until the listener dies or we get SIGTERM/SIGINT (`serve --stop`); either
+    // way tear down the tunnel so cloudflared doesn't linger, and clear our pidfile.
+    let result = tokio::select! {
+        joined = &mut server => match joined {
+            Ok(inner) => inner.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
+        _ = shutdown_signal() => Ok(()),
+    };
+    server.abort();
     if let Some(mut child) = tunnel_child {
         let _ = child.start_kill();
     }
+    let _ = std::fs::remove_file(state_json_path());
+    let _ = std::fs::remove_file(pid_path());
     result
 }
 
@@ -234,21 +246,73 @@ fn cloudflared_asset() -> Result<&'static str, String> {
     }
 }
 
+/// Fetch cloudflared in the foreground (with a progress bar) before detaching, so
+/// the one-time download is visible. The detached child then finds it cached and
+/// returns instantly. Runs on a current-thread runtime so no worker threads exist
+/// across the subsequent fork.
+pub fn ensure_cloudflared_foreground() -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(ensure_cloudflared())?;
+    Ok(())
+}
+
+/// Redraw the single-line download progress bar in place (driven by chunk arrival).
+fn draw_download_progress(spinner: char, done: u64, total: Option<u64>) {
+    use std::io::Write;
+    let mb = |b: u64| b as f64 / 1_000_000.0;
+    let line = match total.filter(|t| *t > 0) {
+        Some(t) => {
+            let frac = (done as f64 / t as f64).min(1.0);
+            let width = 24usize;
+            let filled = (frac * width as f64).round() as usize;
+            let bar: String = (0..width)
+                .map(|i| if i < filled { '█' } else { '░' })
+                .collect();
+            format!(
+                "\r  {spinner} cloudflared  {:>5.1} / {:>5.1} MB  [{bar}] {:>3.0}%",
+                mb(done),
+                mb(t),
+                frac * 100.0
+            )
+        }
+        None => format!("\r  {spinner} cloudflared  {:.1} MB", mb(done)),
+    };
+    print!("{line}");
+    let _ = std::io::stdout().flush();
+}
+
 /// Fetch the official cloudflared static binary into `dest` (one-time, ~35 MB).
 async fn download_cloudflared(dest: &std::path::Path) -> Result<(), String> {
+    use futures_util::StreamExt;
+
     let asset = cloudflared_asset()?;
     let url = format!("https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}");
-    eprintln!("downloading cloudflared (one-time) for {}…", std::env::consts::OS);
-    let bytes = reqwest::Client::new()
+    println!("  Fetching cloudflared (one-time) for {}…", std::env::consts::OS);
+
+    let resp = reqwest::Client::new()
         .get(&url)
         .send()
         .await
         .map_err(|e| format!("download cloudflared: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("download cloudflared: {e}"))?
-        .bytes()
-        .await
         .map_err(|e| format!("download cloudflared: {e}"))?;
+    let total = resp.content_length();
+    let mut stream = resp.bytes_stream();
+    let mut bytes: Vec<u8> = Vec::with_capacity(total.unwrap_or(0) as usize);
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let mut tick = 0usize;
+    draw_download_progress(FRAMES[0], 0, total);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("download cloudflared: {e}"))?;
+        bytes.extend_from_slice(&chunk);
+        tick = tick.wrapping_add(1);
+        draw_download_progress(FRAMES[tick % FRAMES.len()], bytes.len() as u64, total);
+    }
+    println!("\r\x1b[2K  ✓ cloudflared downloaded ({:.1} MB)", bytes.len() as f64 / 1_000_000.0);
+
     let dir = bin_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
@@ -485,4 +549,128 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+// --- background daemon lifecycle ---
+
+fn snippet_dir() -> PathBuf {
+    home_dir().join(".snippet")
+}
+fn pid_path() -> PathBuf {
+    snippet_dir().join("serve.pid")
+}
+fn log_path() -> PathBuf {
+    snippet_dir().join("serve.log")
+}
+fn state_json_path() -> PathBuf {
+    snippet_dir().join("serve.json")
+}
+
+/// Persist the live connection (url + token) so the launching parent and
+/// `serve --status` can reprint the QR. Written 0600 — it holds the auth token.
+fn write_serve_state(public_url: &str, token: &str) {
+    let _ = std::fs::create_dir_all(snippet_dir());
+    let payload = serde_json::json!({
+        "url": public_url,
+        "token": token,
+        "pid": std::process::id(),
+    });
+    let path = state_json_path();
+    if std::fs::write(&path, payload.to_string()).is_ok() {
+        crate::config::set_private(&path);
+    }
+}
+
+/// Fork into the background (proper double-fork + setsid via the `daemonize` crate;
+/// no marker, no re-exec). Returns Ok ONLY in the detached child — the launching
+/// process exits inside `start()`. Call once, before building the async runtime.
+pub fn detach() -> Result<(), String> {
+    if let Some(pid) = running_pid() {
+        return Err(format!(
+            "snippet serve is already running (pid {pid}). `snippet serve --stop` first."
+        ));
+    }
+    std::fs::create_dir_all(snippet_dir()).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(state_json_path()); // stale connection from a prior run
+    let log = std::fs::File::create(log_path()).map_err(|e| format!("open log: {e}"))?;
+    let log2 = log.try_clone().map_err(|e| e.to_string())?;
+
+    println!("snippet serve starting in the background.");
+    println!("  show the QR/connection : snippet serve --status");
+    println!("  stop                   : snippet serve --stop");
+    println!("  logs                   : {}", log_path().display());
+
+    daemonize::Daemonize::new()
+        .pid_file(pid_path())
+        .working_directory(home_dir())
+        .stdout(daemonize::Stdio::from(log))
+        .stderr(daemonize::Stdio::from(log2))
+        .start()
+        .map_err(|e| format!("daemonize: {e}"))
+}
+
+/// Resolves on SIGTERM/SIGINT; pends forever if the handlers can't be installed
+/// (so the server arm of the select still wins).
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (mut term, mut intr) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+        (Ok(t), Ok(i)) => (t, i),
+        _ => return std::future::pending().await,
+    };
+    tokio::select! {
+        _ = term.recv() => {},
+        _ = intr.recv() => {},
+    }
+}
+
+fn read_serve_state() -> Option<(String, String)> {
+    let bytes = std::fs::read(state_json_path()).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some((v["url"].as_str()?.to_string(), v["token"].as_str()?.to_string()))
+}
+
+/// The running daemon's pid, if the pidfile points at a live process.
+fn running_pid() -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(pid_path()).ok()?.trim().parse().ok()?;
+    // signal 0 = liveness probe
+    let alive = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    alive.then_some(pid)
+}
+
+/// Stop the background daemon (kills its whole process group → tunnel too).
+pub fn stop() -> Result<(), String> {
+    let Some(pid) = running_pid() else {
+        let _ = std::fs::remove_file(pid_path());
+        return Err("snippet serve is not running".to_string());
+    };
+    // SIGTERM the daemon; its handler tears down the tunnel before exiting.
+    let _ = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+    let _ = std::fs::remove_file(pid_path());
+    let _ = std::fs::remove_file(state_json_path());
+    println!("stopped snippet serve (pid {pid})");
+    Ok(())
+}
+
+/// Print the current daemon status + reprint the QR/connection if it's running.
+pub fn status() -> Result<(), String> {
+    match (running_pid(), read_serve_state()) {
+        (Some(pid), Some((url, token))) => {
+            println!("snippet serve running (pid {pid})");
+            print_connection(&url, &token);
+            Ok(())
+        }
+        (Some(pid), None) => {
+            println!("snippet serve running (pid {pid}) — connection not published yet");
+            Ok(())
+        }
+        (None, _) => {
+            println!("snippet serve is not running");
+            Ok(())
+        }
+    }
 }
