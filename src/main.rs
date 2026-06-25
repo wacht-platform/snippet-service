@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if status {
                 return serve::status().map_err(Into::into);
             }
-            let token = token.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+            let token = serve::resolve_token(token);
             if std::env::var_os("__SNIPPET_SERVE_WORKER").is_some() {
                 // Detached worker: become a daemon, then run the server.
                 let tunnel = if no_tunnel {

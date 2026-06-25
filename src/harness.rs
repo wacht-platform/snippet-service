@@ -221,6 +221,9 @@ pub struct HarnessState {
     /// Latest ChatGPT-subscription rate-limit usage, for the footer (None otherwise).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<crate::llm::RateLimitSnapshot>,
+    /// The model's context window in tokens, for the usage gauge (0 = unknown).
+    #[serde(default)]
+    pub context_window: u64,
 }
 
 /// A working-tree snapshot the user can rewind to (a commit in the shadow repo).
@@ -1554,6 +1557,7 @@ impl CodingHarness {
                 Ok(mut state) => {
                     // Reflect the current run's folder (backfills pre-field states).
                     state.workspace = self.context.workspace_root().display().to_string();
+                    state.context_window = self.config.context_window_tokens;
                     // tokio tasks don't survive a process restart; surface lost lanes.
                     for lane in state.lanes.iter_mut() {
                         if lane.status == LaneStatus::Running {
@@ -1623,6 +1627,7 @@ impl CodingHarness {
             cache_read_tokens: 0,
             checkpoints: Vec::new(),
             rate_limit: None,
+            context_window: self.config.context_window_tokens,
         };
         self.persist_state(&state).await?;
         Ok(state)

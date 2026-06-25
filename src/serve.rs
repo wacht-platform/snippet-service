@@ -133,6 +133,7 @@ pub async fn run_serve(
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
         .route("/session/model", post(set_session_model))
+        .route("/session/rewind", post(rewind_session))
         .with_state(daemon);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -703,6 +704,63 @@ async fn set_session_model(State(d): State<Shared>, Query(a): Query<Auth>, Json(
         },
     );
     Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
+}
+
+#[derive(Deserialize)]
+struct RewindReq {
+    session: String,
+    checkpoint: String,
+}
+
+// POST /session/rewind {session, checkpoint} — restore the workspace files to a
+// checkpoint (the conversation continues; only the work-tree reverts), mirroring
+// the TUI's /rewind.
+async fn rewind_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<RewindReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(sp) = state_path_for_id(&req.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    let Ok(bytes) = std::fs::read(&sp) else {
+        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
+    };
+    if state.workspace.is_empty() {
+        return (StatusCode::BAD_REQUEST, "session workspace missing").into_response();
+    }
+    let workspace = PathBuf::from(&state.workspace);
+    let checkpoint = req.checkpoint.clone();
+    let result =
+        tokio::task::spawn_blocking(move || crate::checkpoint::restore(&workspace, &checkpoint)).await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({ "restored": req.checkpoint })).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Resolve the auth token: an explicit one wins; else reuse the persisted token so
+/// restarts keep the same token (only the tunnel URL changes); else generate + save.
+pub fn resolve_token(explicit: Option<String>) -> String {
+    if let Some(t) = explicit.filter(|s| !s.trim().is_empty()) {
+        return t;
+    }
+    let path = snippet_dir().join("serve.token");
+    if let Ok(t) = std::fs::read_to_string(&path) {
+        let t = t.trim().to_string();
+        if t.len() >= 16 {
+            return t;
+        }
+    }
+    let t = uuid::Uuid::new_v4().simple().to_string();
+    let _ = std::fs::create_dir_all(snippet_dir());
+    if std::fs::write(&path, &t).is_ok() {
+        crate::config::set_private(&path);
+    }
+    t
 }
 
 #[derive(Serialize)]
