@@ -174,39 +174,50 @@ pub async fn run_serve(
 }
 
 /// Launch `cloudflared tunnel --url` and capture the printed `*.trycloudflare.com`
-/// URL. The returned child must be kept alive for the tunnel's lifetime.
+/// URL. cloudflared's output goes to a log FILE (not a parent pipe): if we piped it
+/// and stopped reading, the pipe would fill and cloudflared would die on SIGPIPE,
+/// killing the tunnel. The returned child must be kept alive for the tunnel to serve.
 async fn start_cloudflared_quick(
     bin: &std::path::Path,
     port: u16,
 ) -> Result<(String, tokio::process::Child), String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    let _ = std::fs::create_dir_all(snippet_dir());
+    let log = snippet_dir().join("cloudflared.log");
+    let _ = std::fs::remove_file(&log);
+    let out = std::fs::File::create(&log).map_err(|e| format!("cloudflared log: {e}"))?;
+    let err = out.try_clone().map_err(|e| e.to_string())?;
     let mut child = tokio::process::Command::new(bin)
         .args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{port}")])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err))
         .spawn()
-        .map_err(|e| format!("launch cloudflared (is it installed? `brew install cloudflared`): {e}"))?;
-    let stderr = child.stderr.take().ok_or("cloudflared: no stderr")?;
-    let mut reader = BufReader::new(stderr).lines();
-    let found = tokio::time::timeout(Duration::from_secs(30), async {
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(i) = line.find("https://") {
-                let url: String = line[i..].chars().take_while(|c| !c.is_whitespace()).collect();
-                if url.contains("trycloudflare.com") {
-                    return Some(url);
-                }
+        .map_err(|e| format!("launch cloudflared: {e}"))?;
+
+    // ~30s: poll the log file for the assigned URL while cloudflared keeps running.
+    for _ in 0..100 {
+        if let Ok(content) = std::fs::read_to_string(&log) {
+            if let Some(url) = extract_trycloudflare_url(&content) {
+                return Ok((url, child));
             }
         }
-        None
-    })
-    .await;
-    match found {
-        Ok(Some(url)) => Ok((url, child)),
-        _ => {
-            let _ = child.start_kill();
-            Err("timed out waiting for the cloudflared URL".to_string())
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let _ = child.start_kill();
+    Err("timed out waiting for the cloudflared URL".to_string())
+}
+
+/// Pull the first `https://*.trycloudflare.com` URL out of cloudflared's log output.
+fn extract_trycloudflare_url(s: &str) -> Option<String> {
+    for line in s.lines() {
+        if let Some(i) = line.find("https://") {
+            let url: String =
+                line[i..].chars().take_while(|c| !c.is_whitespace()).collect();
+            if url.contains("trycloudflare.com") {
+                return Some(url.trim_end_matches(['.', ',']).to_string());
+            }
         }
     }
+    None
 }
 
 /// Run a pre-created named cloudflared tunnel by its token (stable URL).
