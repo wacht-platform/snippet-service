@@ -124,6 +124,7 @@ pub enum Tunnel {
 pub async fn run_serve(
     config: SnippetConfig,
     config_path: PathBuf,
+    host: &str,
     port: u16,
     token: String,
     tunnel: Tunnel,
@@ -149,7 +150,9 @@ pub async fn run_serve(
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
         .with_state(daemon);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr: SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| format!("invalid bind address {host}:{port}: {e}"))?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
@@ -961,6 +964,7 @@ pub fn daemonize_self() -> Result<(), String> {
 /// for it to publish the connection, print the QR here, then exit. This is why the
 /// QR shows on the terminal even though the server runs in the background.
 pub fn launch_and_show(
+    host: &str,
     port: u16,
     token: &str,
     no_tunnel: bool,
@@ -983,6 +987,8 @@ pub fn launch_and_show(
     cmd.arg("--config")
         .arg(config_path)
         .arg("serve")
+        .arg("--host")
+        .arg(host)
         .arg("--port")
         .arg(port.to_string())
         .arg("--token")

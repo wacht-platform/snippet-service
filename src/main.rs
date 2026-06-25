@@ -38,6 +38,10 @@ enum Command {
         /// Run a pre-created named cloudflared tunnel by token (needs --public-url).
         #[arg(long)]
         tunnel_token: Option<String>,
+        /// Bind address. Use 0.0.0.0 to expose on the box's public IP for a fixed,
+        /// tunnel-less URL (pair with --public-url http://<ip>:<port>). Default localhost.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         /// Stop the running background daemon.
         #[arg(long)]
         stop: bool,
@@ -73,6 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_tunnel,
             public_url,
             tunnel_token,
+            host,
             stop,
             status,
         }) => {
@@ -100,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serve::daemonize_self()?;
                 runtime()?.block_on(async {
                     let config = SnippetConfig::load(&config_path).await?;
-                    serve::run_serve(config, config_path, port, token, tunnel)
+                    serve::run_serve(config, config_path, &host, port, token, tunnel)
                         .await
                         .map_err::<Box<dyn std::error::Error>, _>(Into::into)
                 })
@@ -110,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if needs_cf {
                     serve::ensure_cloudflared_foreground()?;
                 }
-                serve::launch_and_show(port, &token, no_tunnel, public_url, tunnel_token, &config_path)
+                serve::launch_and_show(&host, port, &token, no_tunnel, public_url, tunnel_token, &config_path)
                     .map_err(Into::into)
             }
         }
