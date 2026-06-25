@@ -84,30 +84,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return serve::status().map_err(Into::into);
             }
             let token = token.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-            let tunnel = if no_tunnel {
-                Tunnel::None
-            } else if let Some(t) = tunnel_token {
-                let url = public_url.ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
-                Tunnel::Named { token: t, url }
-            } else if let Some(u) = public_url {
-                Tunnel::Url(u)
+            if std::env::var_os("__SNIPPET_SERVE_WORKER").is_some() {
+                // Detached worker: become a daemon, then run the server.
+                let tunnel = if no_tunnel {
+                    Tunnel::None
+                } else if let Some(t) = tunnel_token {
+                    let url = public_url
+                        .ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
+                    Tunnel::Named { token: t, url }
+                } else if let Some(u) = public_url {
+                    Tunnel::Url(u)
+                } else {
+                    Tunnel::Cloudflared
+                };
+                serve::daemonize_self()?;
+                runtime()?.block_on(async {
+                    let config = SnippetConfig::load(&config_path).await?;
+                    serve::run_serve(config, port, token, tunnel)
+                        .await
+                        .map_err::<Box<dyn std::error::Error>, _>(Into::into)
+                })
             } else {
-                Tunnel::Cloudflared
-            };
-            // Fetch cloudflared in the foreground (visible progress bar) before we
-            // detach — the backgrounded child can't draw to this terminal.
-            if matches!(tunnel, Tunnel::Cloudflared | Tunnel::Named { .. }) {
-                serve::ensure_cloudflared_foreground()?;
+                // Launcher: fetch cloudflared (visible), spawn the worker, print the QR.
+                let needs_cf = !no_tunnel && (tunnel_token.is_some() || public_url.is_none());
+                if needs_cf {
+                    serve::ensure_cloudflared_foreground()?;
+                }
+                serve::launch_and_show(port, &token, no_tunnel, public_url, tunnel_token)
+                    .map_err(Into::into)
             }
-            // Fork into the background BEFORE the async runtime exists; returns only
-            // in the detached child.
-            serve::detach()?;
-            runtime()?.block_on(async {
-                let config = SnippetConfig::load(&config_path).await?;
-                serve::run_serve(config, port, token, tunnel)
-                    .await
-                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)
-            })
         }
         None => runtime()?.block_on(async {
             let config = SnippetConfig::load(&config_path).await?;

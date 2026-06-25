@@ -359,7 +359,7 @@ async fn download_cloudflared(dest: &std::path::Path) -> Result<(), String> {
 /// Print the QR + connection string the mobile app scans/pastes: a JSON payload
 /// `{url, token}` (the app derives wss/https from the URL).
 fn print_connection(public_url: &str, token: &str) {
-    let connection = serde_json::json!({ "url": public_url, "token": token }).to_string();
+    let connection = connection_string(public_url, token);
     println!("\n  Scan the QR in the snippet app, or paste this connection string:\n");
     if let Ok(code) = qrcode::QrCode::new(connection.as_bytes()) {
         let rendered = code
@@ -369,6 +369,13 @@ fn print_connection(public_url: &str, token: &str) {
         println!("{rendered}");
     }
     println!("  {connection}\n");
+}
+
+/// The single connection string the app pastes/scans: the public URL carrying the
+/// auth token as a query param (e.g. https://host/?token=abc).
+fn connection_string(public_url: &str, token: &str) -> String {
+    let sep = if public_url.contains('?') { '&' } else { '?' };
+    format!("{public_url}{sep}token={token}")
 }
 
 fn unauthorized() -> Response {
@@ -592,25 +599,13 @@ fn write_serve_state(public_url: &str, token: &str) {
     }
 }
 
-/// Fork into the background (proper double-fork + setsid via the `daemonize` crate;
-/// no marker, no re-exec). Returns Ok ONLY in the detached child — the launching
-/// process exits inside `start()`. Call once, before building the async runtime.
-pub fn detach() -> Result<(), String> {
-    if let Some(pid) = running_pid() {
-        return Err(format!(
-            "snippet serve is already running (pid {pid}). `snippet serve --stop` first."
-        ));
-    }
+/// Fully detach the current process into the background (double-fork + setsid via
+/// the `daemonize` crate, output to the log). Run by the spawned worker before it
+/// builds the runtime and serves.
+pub fn daemonize_self() -> Result<(), String> {
     std::fs::create_dir_all(snippet_dir()).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(state_json_path()); // stale connection from a prior run
     let log = std::fs::File::create(log_path()).map_err(|e| format!("open log: {e}"))?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
-
-    println!("snippet serve starting in the background.");
-    println!("  show the QR/connection : snippet serve --status");
-    println!("  stop                   : snippet serve --stop");
-    println!("  logs                   : {}", log_path().display());
-
     daemonize::Daemonize::new()
         .pid_file(pid_path())
         .working_directory(home_dir())
@@ -618,6 +613,62 @@ pub fn detach() -> Result<(), String> {
         .stderr(daemonize::Stdio::from(log2))
         .start()
         .map_err(|e| format!("daemonize: {e}"))
+}
+
+/// Foreground launcher (what `snippet serve` runs): spawn the detached worker, wait
+/// for it to publish the connection, print the QR here, then exit. This is why the
+/// QR shows on the terminal even though the server runs in the background.
+pub fn launch_and_show(
+    port: u16,
+    token: &str,
+    no_tunnel: bool,
+    public_url: Option<String>,
+    tunnel_token: Option<String>,
+) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+
+    if let Some(pid) = running_pid() {
+        return Err(format!(
+            "snippet serve is already running (pid {pid}). `snippet serve --stop` first."
+        ));
+    }
+    std::fs::create_dir_all(snippet_dir()).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(state_json_path());
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("serve").arg("--port").arg(port.to_string()).arg("--token").arg(token);
+    if no_tunnel {
+        cmd.arg("--no-tunnel");
+    }
+    if let Some(u) = &public_url {
+        cmd.arg("--public-url").arg(u);
+    }
+    if let Some(t) = &tunnel_token {
+        cmd.arg("--tunnel-token").arg(t);
+    }
+    // The worker re-enters `serve` with this marker set and runs the server; we (the
+    // launcher) stay alive to print the QR. The worker redirects output to the log.
+    cmd.env("__SNIPPET_SERVE_WORKER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    cmd.spawn().map_err(|e| format!("spawn worker: {e}"))?;
+
+    println!("\n  snippet serve — bringing up the tunnel…");
+    for _ in 0..120 {
+        if let Some((url, tok)) = read_serve_state() {
+            print_connection(&url, &tok);
+            println!("  Running in the background.  stop: snippet serve --stop\n");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(format!(
+        "the server didn't come up within 60s — check the log: {}",
+        log_path().display()
+    ))
 }
 
 /// Resolves on SIGTERM/SIGINT; pends forever if the handlers can't be installed
