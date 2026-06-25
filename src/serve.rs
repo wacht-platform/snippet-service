@@ -150,6 +150,7 @@ pub async fn run_serve(
         .route("/config/active", post(set_active))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
+        .route("/session/exec", post(exec_in_session))
         .with_state(daemon);
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -448,7 +449,7 @@ async fn list_sessions(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
         .into_iter()
         .map(|s| {
             let live_s = live.get(&s.id);
-            let running = live_s.is_some();
+            let running = s.status == "running";
             let profile = live_s.and_then(|l| l.profile.clone());
             let mut v = serde_json::to_value(&s).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
@@ -765,6 +766,70 @@ async fn rewind_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct ExecReq {
+    session: String,
+    command: String,
+}
+
+// POST /session/exec {session, command} — run a shell command in the session's
+// workspace and return its output. Token-gated; runs as the daemon user.
+async fn exec_in_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ExecReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(sp) = state_path_for_id(&req.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    let Ok(bytes) = std::fs::read(&sp) else {
+        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
+    };
+    let dir = PathBuf::from(&state.workspace);
+    if state.workspace.is_empty() || !dir.is_dir() {
+        return (StatusCode::BAD_REQUEST, "session workspace missing").into_response();
+    }
+    if req.command.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty command").into_response();
+    }
+    let fut = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&req.command)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(60), fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(_) => {
+            return Json(serde_json::json!({
+                "exit_code": -1, "stdout": "", "stderr": "timed out after 60s", "truncated": false,
+            }))
+            .into_response()
+        }
+    };
+    fn clip(b: &[u8]) -> (String, bool) {
+        const MAX: usize = 20_000;
+        let s = String::from_utf8_lossy(b);
+        if s.chars().count() > MAX {
+            (s.chars().take(MAX).collect::<String>() + "\u{2026}", true)
+        } else {
+            (s.into_owned(), false)
+        }
+    }
+    let (stdout, t1) = clip(&out.stdout);
+    let (stderr, t2) = clip(&out.stderr);
+    Json(serde_json::json!({
+        "exit_code": out.status.code().unwrap_or(-1),
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": t1 || t2,
+    }))
+    .into_response()
 }
 
 /// Resolve the auth token: an explicit one wins; else reuse the persisted token so
