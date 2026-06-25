@@ -38,7 +38,20 @@ struct Daemon {
     config: std::sync::Mutex<SnippetConfig>,
     config_path: PathBuf,
     token: String,
+    hostname: String,
     sessions: Mutex<HashMap<String, LiveSession>>,
+}
+
+/// The machine's hostname, used as the app's default instance name.
+fn machine_hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "snippet".to_string())
 }
 
 type Shared = Arc<Daemon>;
@@ -122,6 +135,7 @@ pub async fn run_serve(
         config: std::sync::Mutex::new(config),
         config_path,
         token,
+        hostname: machine_hostname(),
         sessions: Mutex::new(HashMap::new()),
     });
     let app = Router::new()
@@ -513,6 +527,7 @@ struct ConfigView {
     active: Option<String>,
     theme: Option<String>,
     manual_approval: bool,
+    hostname: String,
 }
 
 // GET /config — profiles with keys redacted (has_key only), active profile, theme.
@@ -535,8 +550,14 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
             });
         }
     }
-    Json(ConfigView { profiles, active, theme: c.theme.clone(), manual_approval: c.manual_approval })
-        .into_response()
+    Json(ConfigView {
+        profiles,
+        active,
+        theme: c.theme.clone(),
+        manual_approval: c.manual_approval,
+        hostname: d.hostname.clone(),
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
