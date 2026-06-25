@@ -181,6 +181,10 @@ pub struct HarnessState {
     pub status: HarnessStatus,
     pub created_at: String,
     pub updated_at: String,
+    /// Absolute workspace folder this session runs in (for the serve daemon's
+    /// device-wide session list). Empty on states from before this field existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace: String,
     pub user_request: String,
     pub messages: Vec<HarnessMessage>,
     pub events: Vec<HarnessEvent>,
@@ -232,7 +236,7 @@ pub struct CheckpointRecord {
 /// Inputs the interactive driver receives from its UI (or, headless, over the
 /// wire — hence `Serialize`/`Deserialize`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum LoopInput {
     /// A new user message or a mid-run steer.
     UserMessage(String),
@@ -1548,6 +1552,8 @@ impl CodingHarness {
             // the run — fall through and start a fresh session, overwriting it.
             match deserialize_state(&bytes) {
                 Ok(mut state) => {
+                    // Reflect the current run's folder (backfills pre-field states).
+                    state.workspace = self.context.workspace_root().display().to_string();
                     // tokio tasks don't survive a process restart; surface lost lanes.
                     for lane in state.lanes.iter_mut() {
                         if lane.status == LaneStatus::Running {
@@ -1597,6 +1603,7 @@ impl CodingHarness {
             status,
             created_at: now.clone(),
             updated_at: now,
+            workspace: self.context.workspace_root().display().to_string(),
             user_request,
             messages,
             events,

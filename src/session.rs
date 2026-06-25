@@ -3,14 +3,15 @@
 //! sending `LoopInput` on `input_tx`; observe it via the persisted `HarnessState`
 //! (and, optionally, a live `StreamHandle`). Shared by the TUI and headless `serve`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::builtins::coding_tools;
-use crate::config::SnippetConfig;
-use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput};
+use crate::config::{SnippetConfig, workspaces_root};
+use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, deserialize_state};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
 use crate::prompts::conversation_system_prompt;
@@ -70,4 +71,86 @@ pub fn start_session(
     });
 
     SessionHandle { input_tx, join, state_path }
+}
+
+/// One session as seen on disk, for the serve daemon's device-wide list.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionInfo {
+    /// Stable id = the state file's path relative to the workspaces root
+    /// (e.g. `snipett-2a3f/state.json`). Used to resolve the session for /attach.
+    pub id: String,
+    /// Absolute workspace folder.
+    pub folder: String,
+    /// Conversation name (`default` for the active state, else the saved name).
+    pub conversation: String,
+    /// First user request (truncated), for a list label.
+    pub title: String,
+    pub status: String,
+    /// Last-active time, unix seconds.
+    pub last_active: i64,
+}
+
+/// Resolve a session id (relative path under the workspaces root) to its state
+/// file, rejecting any path that escapes the root.
+pub fn state_path_for_id(id: &str) -> Option<PathBuf> {
+    let root = workspaces_root();
+    let path = root.join(id);
+    // Reject traversal: the resolved path must stay under the root.
+    let canon_root = std::fs::canonicalize(&root).ok()?;
+    let canon = std::fs::canonicalize(&path).ok()?;
+    canon.starts_with(&canon_root).then_some(canon)
+}
+
+/// Enumerate every session persisted on the device (across all workspaces).
+pub fn list_device_sessions() -> Vec<SessionInfo> {
+    let root = workspaces_root();
+    let mut out = Vec::new();
+    let Ok(workspaces) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for ws in workspaces.flatten() {
+        let dir = ws.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        read_session(&dir.join("state.json"), &root, "default", &mut out);
+        if let Ok(convs) = std::fs::read_dir(dir.join("conversations")) {
+            for c in convs.flatten() {
+                let p = c.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        read_session(&p, &root, &name, &mut out);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+    out
+}
+
+fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<SessionInfo>) {
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return;
+    };
+    let last_active = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let id = path.strip_prefix(root).unwrap_or(path).display().to_string();
+    let title: String = state.user_request.chars().take(120).collect();
+    out.push(SessionInfo {
+        id,
+        folder: state.workspace.clone(),
+        conversation: conversation.to_string(),
+        title,
+        status: format!("{:?}", state.status).to_lowercase(),
+        last_active,
+    });
 }

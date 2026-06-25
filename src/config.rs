@@ -3,8 +3,25 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Restrict a file to owner-only (0600) on Unix; no-op elsewhere. Used for files
-/// holding secrets (config with API keys, the ChatGPT token store).
+/// Per-workspace state path: `~/.snippet/workspaces/{name}-{hash}/state.json`.
+/// Single source of truth, used by the per-launch config and the serve daemon.
+pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    workspace.hash(&mut hasher);
+    let hash = hasher.finish();
+    let name = workspace.file_name().and_then(|n| n.to_str()).unwrap_or("workspace");
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join(format!(".snippet/workspaces/{name}-{hash:x}/state.json"))
+}
+
+/// Root holding every workspace's session state.
+pub fn workspaces_root() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    home.join(".snippet").join("workspaces")
+}
+
+/// Restrict a file to owner-only (0600) on Unix; no-op elsewhere.
 pub fn set_private(path: &Path) {
     #[cfg(unix)]
     {
@@ -187,25 +204,17 @@ impl SnippetConfig {
         } else if self.workspace.as_os_str().is_empty() {
             self.workspace = PathBuf::from(".");
         }
+        self.state_path = state_path_for_workspace(&self.workspace);
+    }
 
-        let workspace_hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            self.workspace.hash(&mut hasher);
-            hasher.finish()
-        };
-        let workspace_name = self
-            .workspace
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("workspace");
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        self.state_path = home.join(format!(
-            ".snippet/workspaces/{}-{:x}/state.json",
-            workspace_name, workspace_hash
-        ));
+    /// A copy of this config pinned to a different workspace folder — keeps the
+    /// provider/model/keys but recomputes the workspace + state path. The serve
+    /// daemon uses this to open a session in any folder the user picks.
+    pub fn for_workspace(&self, workspace: PathBuf) -> SnippetConfig {
+        let mut c = self.clone();
+        c.state_path = state_path_for_workspace(&workspace);
+        c.workspace = workspace;
+        c
     }
 }
 

@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+qrcode = "0.14"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 crossterm = "0.28"
