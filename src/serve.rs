@@ -359,18 +359,16 @@ async fn download_cloudflared(dest: &std::path::Path) -> Result<(), String> {
 /// Print the QR + connection string the mobile app scans/pastes: a JSON payload
 /// `{url, token}` (the app derives wss/https from the URL).
 fn print_connection(public_url: &str, token: &str) {
-    let payload = serde_json::json!({ "url": public_url, "token": token }).to_string();
-    println!("\n  Scan to connect (snippet mobile), or paste the string below:\n");
-    if let Ok(code) = qrcode::QrCode::new(payload.as_bytes()) {
+    let connection = serde_json::json!({ "url": public_url, "token": token }).to_string();
+    println!("\n  Scan the QR in the snippet app, or paste this connection string:\n");
+    if let Ok(code) = qrcode::QrCode::new(connection.as_bytes()) {
         let rendered = code
             .render::<qrcode::render::unicode::Dense1x2>()
             .quiet_zone(true)
             .build();
         println!("{rendered}");
     }
-    println!("  url    : {public_url}");
-    println!("  token  : {token}");
-    println!("  string : {payload}\n");
+    println!("  {connection}\n");
 }
 
 fn unauthorized() -> Response {
