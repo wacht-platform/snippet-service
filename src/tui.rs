@@ -4893,7 +4893,12 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let mut right: Vec<Span<'static>> = Vec::new();
     // ChatGPT-subscription rate-limit usage (parsed from response headers).
-    if let Some(rl) = st.and_then(|s| s.rate_limit.as_ref()) {
+    let rl = if app.options.config.model.provider == "chatgpt" {
+        st.and_then(|s| s.rate_limit.as_ref())
+    } else {
+        None
+    };
+    if let Some(rl) = rl {
         let mut parts = Vec::new();
         for w in [rl.primary.as_ref(), rl.secondary.as_ref()].into_iter().flatten() {
             let left = (100.0 - w.used_percent).clamp(0.0, 100.0);

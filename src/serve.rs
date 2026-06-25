@@ -1044,22 +1044,26 @@ async fn handle_events_ws(socket: WebSocket) {
                 if first {
                     continue;
                 }
-                if prev.as_deref() == Some("running") && s.status != "running" {
-                    let kind = match s.status.as_str() {
-                        "waiting_for_input" => "waiting",
-                        "completed" => "done",
-                        "failed" => "error",
-                        "idle" => "idle",
-                        _ => continue, // interrupted (user-initiated) etc.
-                    };
-                    out.push(serde_json::json!({
-                        "session": s.id,
-                        "title": s.title,
-                        "workspace": s.folder,
-                        "kind": kind,
-                        "status": s.status,
-                    }));
+                let prevs = prev.as_deref().unwrap_or("");
+                if prevs == s.status {
+                    continue;
                 }
+                // Notify on a change into any attention state, regardless of the prior
+                // state (a session can go idle->running->waiting within one poll).
+                let kind = match s.status.as_str() {
+                    "waiting_for_input" => "waiting", // asked a question / needs approval
+                    "failed" => "error",
+                    "completed" => "done",
+                    "idle" if prevs == "running" => "idle", // a turn just finished
+                    _ => continue, // running / interrupted / newly-seen idle
+                };
+                out.push(serde_json::json!({
+                    "session": s.id,
+                    "title": s.title,
+                    "workspace": s.folder,
+                    "kind": kind,
+                    "status": s.status,
+                }));
             }
             last.retain(|k, _| seen.contains(k));
             first = false;
