@@ -641,7 +641,7 @@ impl CodingHarness {
                             // the whole turn (direct edits + any lane changes + bash) can
                             // be rewound. An answer continues a turn already checkpointed.
                             if !answering {
-                                self.checkpoint(&mut state, &text);
+                                self.checkpoint(&mut state, &text).await;
                                 // Fresh request: re-discovery is legitimate again, and
                                 // prior-turn loop/thought state belongs to the past run.
                                 vars.executed_calls.clear();
@@ -760,14 +760,28 @@ impl CodingHarness {
 
     /// Snapshot the workspace before a turn so the user can `/rewind` to it.
     /// Best-effort — a failure (no git, etc.) is skipped, never blocking the turn.
-    fn checkpoint(&self, state: &mut HarnessState, prompt: &str) {
+    async fn checkpoint(&self, state: &mut HarnessState, prompt: &str) {
         let label: String = prompt.chars().take(80).collect();
-        if let Some(id) = crate::checkpoint::snapshot(self.context.workspace_root(), &label) {
+        let workspace = self.context.workspace_root().to_path_buf();
+        let snap_label = label.clone();
+        // `git add -A` + commit-tree can take a while on a large workspace — run it
+        // off the async runtime so it never stalls streaming or other lanes.
+        let id = tokio::task::spawn_blocking(move || crate::checkpoint::snapshot(&workspace, &snap_label))
+            .await
+            .ok()
+            .flatten();
+        if let Some(id) = id {
             state.checkpoints.push(CheckpointRecord {
                 id,
                 label,
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
+            // Cap retained records so a long session doesn't bloat persisted state.
+            const MAX_CHECKPOINTS: usize = 50;
+            let len = state.checkpoints.len();
+            if len > MAX_CHECKPOINTS {
+                state.checkpoints.drain(..len - MAX_CHECKPOINTS);
+            }
         }
     }
 
@@ -1925,6 +1939,12 @@ impl CodingHarness {
                 preserved_recent_count
             ),
         });
+        // Prune events to this compaction boundary (see compact_history_agentic).
+        if let Some(i) = state.events.iter().rposition(
+            |e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"),
+        ) {
+            state.events.drain(..i);
+        }
         // Reset ONLY the current-context gauge — the cumulative session counters
         // (prompt/completion/total) reflect everything sent and are unaffected by
         // compaction. The gauge repopulates from the next response's usage.
@@ -2013,6 +2033,14 @@ impl CodingHarness {
                 state.last_prompt_tokens, window, self.config.compact_at_pct
             ),
         });
+        // Drop events before this boundary — they're hidden from the UI and absent
+        // from model history (which lives in `messages`), so they'd only bloat every
+        // persist. This is what keeps a long session from growing unbounded.
+        if let Some(i) = state.events.iter().rposition(
+            |e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"),
+        ) {
+            state.events.drain(..i);
+        }
         state.last_prompt_tokens = 0;
         Ok(())
     }
