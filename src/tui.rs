@@ -1898,9 +1898,10 @@ impl App {
             let handle = self.chatgpt_device_begin_handle.take().expect("checked is_some");
             match handle.await {
                 Ok(Ok(info)) => {
+                    copy_to_clipboard(&info.user_code);
                     self.status = format!(
-                        "Open {} and enter code {} — waiting for sign-in…",
-                        info.verification_url, info.user_code
+                        "Code {} copied — open {} and paste it. Waiting for sign-in…",
+                        info.user_code, info.verification_url
                     );
                     self.chatgpt_device_code = Some(info.clone());
                     self.chatgpt_login_handle = Some(tokio::spawn(async move {
@@ -2409,11 +2410,52 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Copy text to the clipboard, best-effort: a native tool if present, plus an
+/// OSC52 escape so it also works over SSH / inside tmux.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    fn pipe(cmd: &str, args: &[&str], text: &str) -> bool {
+        let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(mut si) = child.stdin.take() {
+            let _ = si.write_all(text.as_bytes());
+        }
+        matches!(child.wait(), Ok(s) if s.success())
+    }
+    let _ = (cfg!(target_os = "macos") && pipe("pbcopy", &[], text))
+        || pipe("wl-copy", &[], text)
+        || pipe("xclip", &["-selection", "clipboard"], text);
+    // OSC52 reaches the terminal's own clipboard (works over SSH / in tmux).
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut out = std::io::stdout();
+    let _ = out.write_all(format!("\x1b]52;c;{b64}\x07").as_bytes());
+    let _ = out.flush();
+}
+
 /// Key handling for the compact inline login form. Tab/↑/↓ move between fields,
 /// ←/→ change the provider or model, typing edits the focused text field, Enter
 /// connects, Esc cancels.
 fn handle_login_key(app: &mut App, key: KeyEvent) {
     match key.code {
+        KeyCode::Char('c') if app.chatgpt_device_code.is_some() => {
+            let code = app.chatgpt_device_code.as_ref().unwrap().user_code.clone();
+            copy_to_clipboard(&code);
+            app.status = format!("Copied code {code} to clipboard.");
+        }
+        KeyCode::Char('u') if app.chatgpt_device_code.is_some() => {
+            let url = app.chatgpt_device_code.as_ref().unwrap().verification_url.clone();
+            copy_to_clipboard(&url);
+            app.status = "Copied sign-in URL to clipboard.".to_string();
+        }
         KeyCode::Esc => {
             app.close_login(true);
             app.status = String::new();
@@ -4703,7 +4745,7 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 Style::default().fg(w),
             )));
             lines.push(Line::from(Span::styled(
-                "    Enter = browser sign-in  ·  Ctrl-D = device code".to_string(),
+                "    c = copy code  ·  u = copy URL  ·  Enter = browser sign-in".to_string(),
                 Style::default().fg(faint),
             )));
         } else {
