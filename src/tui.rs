@@ -644,8 +644,8 @@ impl App {
 
         list.into_iter()
             .map(|(name, desc, _, relative)| {
-                let short_desc = if desc.len() > 40 {
-                    format!("{}...", &desc[..37])
+                let short_desc = if desc.chars().count() > 40 {
+                    format!("{}...", desc.chars().take(37).collect::<String>())
                 } else {
                     desc
                 };
@@ -1220,6 +1220,7 @@ impl App {
 
         std::fs::write(&self.options.config_path, toml_str)
             .map_err(|e| format!("failed to write config: {e}"))?;
+        crate::config::set_private(&self.options.config_path);
         Ok(())
     }
 
@@ -4902,12 +4903,6 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::raw(" "),
         Span::styled(format!("↓{}", fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0))), dim),
     ]);
-    let running_lanes = st
-        .map(|s| s.lanes.iter().filter(|lane| lane.status == LaneStatus::Running).count())
-        .unwrap_or(0);
-    if running_lanes > 0 {
-        right.push(Span::styled(format!("  ◆{}", running_lanes), Style::default().fg(lane())));
-    }
     let running_lanes = st
         .map(|s| s.lanes.iter().filter(|lane| lane.status == LaneStatus::Running).count())
         .unwrap_or(0);

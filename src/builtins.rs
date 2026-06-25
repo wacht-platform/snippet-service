@@ -113,7 +113,9 @@ impl Tool for ReadFileTool {
         let (selected, mut range_meta) = if args.start_char.is_some() || args.end_char.is_some() {
             let chars: Vec<char> = content.chars().collect();
             let start = args.start_char.unwrap_or(1).max(1);
-            let end = args.end_char.unwrap_or(total_chars).clamp(start, total_chars);
+            // `clamp(start, total)` panics if start > total (e.g. an empty file), so
+            // bound `end` independently and only slice when the window is in range.
+            let end = args.end_char.unwrap_or(total_chars).min(total_chars).max(start);
             let slice: String = if start <= total_chars {
                 chars[start - 1..end].iter().collect()
             } else {
@@ -1273,9 +1275,13 @@ impl Tool for ReplaceFileContentTool {
         let content = tokio::fs::read_to_string(&path).await?;
         let lines: Vec<&str> = content.lines().collect();
         
-        if args.start_line > lines.len() || args.end_line > lines.len() || args.start_line > args.end_line {
+        if args.start_line == 0
+            || args.start_line > lines.len()
+            || args.end_line > lines.len()
+            || args.start_line > args.end_line
+        {
             return Err(ToolError::msg(format!(
-                "Invalid line range [{}-{}] for file with {} lines",
+                "Invalid line range [{}-{}] for file with {} lines (lines are 1-based)",
                 args.start_line, args.end_line, lines.len()
             )));
         }

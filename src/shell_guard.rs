@@ -96,41 +96,37 @@ fn has_tracked_redirect(command: &str) -> bool {
 fn segments(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let bytes = command.as_bytes();
+    let chars: Vec<char> = command.chars().collect();
     let mut i = 0;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let c = bytes[i];
+    let mut quote: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
         if let Some(q) = quote {
-            cur.push(c as char);
+            cur.push(c);
             if c == q {
                 quote = None;
             }
             i += 1;
             continue;
         }
-        if c == b'\'' || c == b'"' {
+        if c == '\'' || c == '"' {
             quote = Some(c);
-            cur.push(c as char);
+            cur.push(c);
             i += 1;
             continue;
         }
-        let two = if i + 1 < bytes.len() {
-            &command[i..i + 2]
-        } else {
-            ""
-        };
-        if two == "&&" || two == "||" {
+        // Two-char operators `&&` / `||`.
+        if (c == '&' || c == '|') && chars.get(i + 1) == Some(&c) {
             out.push(std::mem::take(&mut cur));
             i += 2;
             continue;
         }
-        if c == b'|' || c == b';' || c == b'\n' {
+        if c == '|' || c == ';' || c == '\n' {
             out.push(std::mem::take(&mut cur));
             i += 1;
             continue;
         }
-        cur.push(c as char);
+        cur.push(c);
         i += 1;
     }
     if !cur.trim().is_empty() {

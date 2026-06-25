@@ -74,7 +74,20 @@ pub fn save_blocking(tokens: &ChatGptTokens) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("create config dir: {e}"))?;
     }
     let json = serde_json::to_string_pretty(tokens).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
+    set_private(&path);
+    Ok(())
+}
+
+/// Restrict a credential file to owner-only (0600) on Unix.
+fn set_private(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 pub fn logout_blocking() -> Result<(), String> {

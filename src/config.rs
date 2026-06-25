@@ -3,6 +3,18 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Restrict a file to owner-only (0600) on Unix; no-op elsewhere. Used for files
+/// holding secrets (config with API keys, the ChatGPT token store).
+pub fn set_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 use crate::llm::AgentModel;
 use crate::openai::{OpenAiCompatibleModel, OpenAiCompatibleConfig};
 use crate::anthropic::{AnthropicModel, AnthropicConfig};
@@ -122,6 +134,7 @@ impl SnippetConfig {
                 tokio::fs::write(path, toml_str).await.map_err(|err| {
                     ToolError::msg(format!("failed to write default config to `{}`: {err}", path.display()))
                 })?;
+                set_private(path);
                 let mut config = default_config;
                 config.resolve_relative_paths(path);
                 return Ok(config);

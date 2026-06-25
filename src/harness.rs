@@ -229,8 +229,10 @@ pub struct CheckpointRecord {
     pub created_at: String,
 }
 
-/// Inputs the interactive driver receives from its UI.
-#[derive(Debug, Clone)]
+/// Inputs the interactive driver receives from its UI (or, headless, over the
+/// wire — hence `Serialize`/`Deserialize`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoopInput {
     /// A new user message or a mid-run steer.
     UserMessage(String),
@@ -383,7 +385,9 @@ impl CodingHarness {
         let mut consecutive_errors = 0usize;
 
         let start = state.iterations + 1;
-        // One-shot / lane runs are always Auto mode; this receiver is never read.
+        // One-shot / lane runs are always Auto — force it so a resumed/forced Manual
+        // state can't block forever on an approval channel that's never driven here.
+        state.approval_mode = ApprovalMode::Auto;
         let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel::<ApprovalDecision>();
         for iteration in start..=self.config.runtime_backstop_iterations {
             state.iterations = iteration;
