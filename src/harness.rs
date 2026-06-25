@@ -498,6 +498,16 @@ impl CodingHarness {
             }
 
             if state.status == HarnessStatus::Running {
+                if !model.is_configured() {
+                    state.events.push(HarnessEvent::ModelError {
+                        message:
+                            "No API key configured for this model. Add one in the model settings (app: Models · TUI: /model) before sending."
+                                .to_string(),
+                    });
+                    state.status = HarnessStatus::Idle;
+                    self.persist(&mut state, &lanes).await?;
+                    continue;
+                }
                 if self.drain_pending(&mut state, &mut lanes, &mut input_rx, &mut lane_rx) {
                     state.status = HarnessStatus::Interrupted;
                     state.events.push(HarnessEvent::SystemDecision {
@@ -956,9 +966,17 @@ impl CodingHarness {
         {
             Ok(output) => output,
             Err(error) => {
+                // Adapters embed the full HTTP body; show only a concise first line.
+                let raw = error.to_string();
+                let line = raw.lines().next().unwrap_or(&raw);
+                let message = if line.chars().count() > 240 {
+                    format!("{}…", line.chars().take(240).collect::<String>())
+                } else {
+                    line.to_string()
+                };
                 return StepResult::ModelError {
                     retryable: error.retryable(),
-                    message: error.to_string(),
+                    message,
                 };
             }
         };

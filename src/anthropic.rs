@@ -40,6 +40,10 @@ impl AnthropicModel {
 
 #[async_trait]
 impl AgentModel for AnthropicModel {
+    fn is_configured(&self) -> bool {
+        !self.config.api_key.trim().is_empty()
+    }
+
     fn supports_images(&self) -> bool {
         self.config.supports_images
     }

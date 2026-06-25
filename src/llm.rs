@@ -221,6 +221,12 @@ pub trait AgentModel: Send + Sync {
     fn supports_images(&self) -> bool {
         false
     }
+
+    /// Whether the model has usable credentials (API key / OAuth tokens). When
+    /// false the harness refuses the API call and asks the user to configure one.
+    fn is_configured(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -237,6 +243,10 @@ impl<T: ?Sized + AgentModel + Send> AgentModel for Box<T> {
 
     fn supports_images(&self) -> bool {
         (**self).supports_images()
+    }
+
+    fn is_configured(&self) -> bool {
+        (**self).is_configured()
     }
 }
 

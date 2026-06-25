@@ -105,6 +105,10 @@ impl ChatGptModel {
 
 #[async_trait]
 impl AgentModel for ChatGptModel {
+    fn is_configured(&self) -> bool {
+        self.tokens.is_some()
+    }
+
     fn supports_images(&self) -> bool {
         self.config.supports_images
     }
