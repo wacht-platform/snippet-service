@@ -69,9 +69,27 @@ impl Daemon {
     }
 }
 
-/// Run the daemon's HTTP/WS server on `127.0.0.1:port`. (A tunnel exposes it; the
-/// token is the app-layer gate.)
-pub async fn run_serve(config: SnippetConfig, port: u16, token: String) -> Result<(), String> {
+/// How the daemon is reached from outside the box.
+pub enum Tunnel {
+    /// Auto-launch a cloudflared quick tunnel (random public HTTPS URL, no account).
+    Cloudflared,
+    /// A named cloudflared tunnel by token (stable URL); the user supplies the URL.
+    Named { token: String, url: String },
+    /// Bring-your-own: just advertise this public URL (you run the tunnel).
+    Url(String),
+    /// Local only (no public URL).
+    None,
+}
+
+/// Run the daemon's HTTP/WS server on `127.0.0.1:port`, bring up the tunnel, and
+/// print a scannable QR + connection string. The token is the app-layer auth gate.
+pub async fn run_serve(
+    config: SnippetConfig,
+    port: u16,
+    token: String,
+    tunnel: Tunnel,
+) -> Result<(), String> {
+    let token_for_print = token.clone();
     let daemon: Shared = Arc::new(Daemon {
         config,
         token,
@@ -87,7 +105,195 @@ pub async fn run_serve(config: SnippetConfig, port: u16, token: String) -> Resul
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
-    axum::serve(listener, app).await.map_err(|e| e.to_string())
+
+    // Serve in the background so we can bring up the tunnel and print the QR.
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    // Serve is remote-only: a tunnel is required (on-device, use the TUI). A tunnel
+    // failure is fatal — never silently fall back to an unreachable localhost URL.
+    // `--no-tunnel` (Tunnel::None) is an explicit local mode for testing only.
+    let mut tunnel_child: Option<tokio::process::Child> = None;
+    let resolved: Result<String, String> = async {
+        match tunnel {
+            Tunnel::Url(u) => Ok(u),
+            Tunnel::None => Ok(format!("http://127.0.0.1:{port}")),
+            Tunnel::Cloudflared => {
+                let bin = ensure_cloudflared().await?;
+                let (url, child) = start_cloudflared_quick(&bin, port).await?;
+                tunnel_child = Some(child);
+                Ok(url)
+            }
+            Tunnel::Named { token: t, url } => {
+                let bin = ensure_cloudflared().await?;
+                tunnel_child = Some(start_cloudflared_named(&bin, &t).await?);
+                Ok(url)
+            }
+        }
+    }
+    .await;
+    let public_url = match resolved {
+        Ok(u) => u,
+        Err(e) => {
+            server.abort();
+            return Err(format!("could not establish the tunnel: {e}"));
+        }
+    };
+
+    print_connection(&public_url, &token_for_print);
+
+    let result = server.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string());
+    if let Some(mut child) = tunnel_child {
+        let _ = child.start_kill();
+    }
+    result
+}
+
+/// Launch `cloudflared tunnel --url` and capture the printed `*.trycloudflare.com`
+/// URL. The returned child must be kept alive for the tunnel's lifetime.
+async fn start_cloudflared_quick(
+    bin: &std::path::Path,
+    port: u16,
+) -> Result<(String, tokio::process::Child), String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = tokio::process::Command::new(bin)
+        .args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{port}")])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("launch cloudflared (is it installed? `brew install cloudflared`): {e}"))?;
+    let stderr = child.stderr.take().ok_or("cloudflared: no stderr")?;
+    let mut reader = BufReader::new(stderr).lines();
+    let found = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Ok(Some(line)) = reader.next_line().await {
+            if let Some(i) = line.find("https://") {
+                let url: String = line[i..].chars().take_while(|c| !c.is_whitespace()).collect();
+                if url.contains("trycloudflare.com") {
+                    return Some(url);
+                }
+            }
+        }
+        None
+    })
+    .await;
+    match found {
+        Ok(Some(url)) => Ok((url, child)),
+        _ => {
+            let _ = child.start_kill();
+            Err("timed out waiting for the cloudflared URL".to_string())
+        }
+    }
+}
+
+/// Run a pre-created named cloudflared tunnel by its token (stable URL).
+async fn start_cloudflared_named(
+    bin: &std::path::Path,
+    token: &str,
+) -> Result<tokio::process::Child, String> {
+    tokio::process::Command::new(bin)
+        .args(["tunnel", "--no-autoupdate", "run", "--token", token])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("launch cloudflared run: {e}"))
+}
+
+/// Locate a usable cloudflared: prefer one on PATH, else a cached copy under
+/// `~/.snippet/bin`, else download the official static binary for this OS/arch.
+async fn ensure_cloudflared() -> Result<PathBuf, String> {
+    if std::process::Command::new("cloudflared")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return Ok(PathBuf::from("cloudflared"));
+    }
+    let bin = bin_dir().join("cloudflared");
+    if bin.exists() {
+        return Ok(bin);
+    }
+    download_cloudflared(&bin).await?;
+    Ok(bin)
+}
+
+fn bin_dir() -> PathBuf {
+    home_dir().join(".snippet").join("bin")
+}
+
+/// The cloudflared release asset for this platform (verified naming: Linux ships a
+/// raw binary, macOS a `.tgz`).
+fn cloudflared_asset() -> Result<&'static str, String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("cloudflared-darwin-arm64.tgz"),
+        ("macos", "x86_64") => Ok("cloudflared-darwin-amd64.tgz"),
+        ("linux", "x86_64") => Ok("cloudflared-linux-amd64"),
+        ("linux", "aarch64") => Ok("cloudflared-linux-arm64"),
+        (os, arch) => Err(format!("no cloudflared build for {os}/{arch} — install it manually")),
+    }
+}
+
+/// Fetch the official cloudflared static binary into `dest` (one-time, ~35 MB).
+async fn download_cloudflared(dest: &std::path::Path) -> Result<(), String> {
+    let asset = cloudflared_asset()?;
+    let url = format!("https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}");
+    eprintln!("downloading cloudflared (one-time) for {}…", std::env::consts::OS);
+    let bytes = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("download cloudflared: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("download cloudflared: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("download cloudflared: {e}"))?;
+    let dir = bin_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+    if asset.ends_with(".tgz") {
+        // macOS: extract the `cloudflared` binary from the tarball via system `tar`.
+        let tgz = dir.join("cloudflared.tgz");
+        std::fs::write(&tgz, &bytes).map_err(|e| e.to_string())?;
+        let ok = std::process::Command::new("tar")
+            .args(["-xzf"])
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_file(&tgz);
+        if !ok || !dest.exists() {
+            return Err("failed to extract cloudflared from the .tgz".to_string());
+        }
+    } else {
+        std::fs::write(dest, &bytes).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
+}
+
+/// Print the QR + connection string the mobile app scans/pastes: a JSON payload
+/// `{url, token}` (the app derives wss/https from the URL).
+fn print_connection(public_url: &str, token: &str) {
+    let payload = serde_json::json!({ "url": public_url, "token": token }).to_string();
+    println!("\n  Scan to connect (snippet mobile), or paste the string below:\n");
+    if let Ok(code) = qrcode::QrCode::new(payload.as_bytes()) {
+        let rendered = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        println!("{rendered}");
+    }
+    println!("  url    : {public_url}");
+    println!("  token  : {token}");
+    println!("  string : {payload}\n");
 }
 
 fn unauthorized() -> Response {

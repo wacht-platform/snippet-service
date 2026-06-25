@@ -28,6 +28,15 @@ enum Command {
         /// Auth token; generated if omitted.
         #[arg(long)]
         token: Option<String>,
+        /// Bind localhost only, no tunnel (testing — serve is otherwise remote-only).
+        #[arg(long)]
+        no_tunnel: bool,
+        /// Advertise this public URL instead of auto-launching a tunnel (bring-your-own).
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Run a pre-created named cloudflared tunnel by token (needs --public-url for its hostname).
+        #[arg(long)]
+        tunnel_token: Option<String>,
     },
 }
 
@@ -44,12 +53,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = SnippetConfig::load(&config_path).await?;
 
     match cli.command {
-        Some(Command::Serve { port, token }) => {
+        Some(Command::Serve { port, token, no_tunnel, public_url, tunnel_token }) => {
             let token = token.unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-            println!("snippet serve — listening on 127.0.0.1:{port}");
-            println!("token: {token}");
-            println!("(tunnel + QR connection string come next; for now connect on localhost)");
-            if let Err(e) = snippet::serve::run_serve(config, port, token).await {
+            let tunnel = if no_tunnel {
+                snippet::serve::Tunnel::None
+            } else if let Some(t) = tunnel_token {
+                let url = public_url
+                    .ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
+                snippet::serve::Tunnel::Named { token: t, url }
+            } else if let Some(u) = public_url {
+                snippet::serve::Tunnel::Url(u)
+            } else {
+                snippet::serve::Tunnel::Cloudflared
+            };
+            if let Err(e) = snippet::serve::run_serve(config, port, token, tunnel).await {
                 return Err(e.into());
             }
             Ok(())
