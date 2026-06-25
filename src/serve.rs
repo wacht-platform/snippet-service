@@ -105,6 +105,61 @@ impl Daemon {
         );
         Some((tx, sp))
     }
+
+    /// Send a loop input to a session. If its loop has ended (interrupt / failure),
+    /// a new message revives it as the next turn — so the app can resume like the
+    /// TUI does. Non-message inputs to a dead loop are dropped.
+    async fn deliver(&self, id: &str, input: LoopInput) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get(id) {
+            if !s.join.is_finished() {
+                let _ = s.input_tx.send(input);
+                return;
+            }
+        }
+        let text = match input {
+            LoopInput::UserMessage(t) | LoopInput::Answer(t) => t,
+            _ => return,
+        };
+        let (sp, profile) = match sessions.get(id) {
+            Some(s) => (s.state_path.clone(), s.profile.clone()),
+            None => match state_path_for_id(id) {
+                Some(sp) => (sp, None),
+                None => return,
+            },
+        };
+        let Ok(bytes) = std::fs::read(&sp) else {
+            return;
+        };
+        let Ok(state) = deserialize_state(&bytes) else {
+            return;
+        };
+        let folder = PathBuf::from(&state.workspace);
+        if state.workspace.is_empty() || !folder.is_dir() {
+            return;
+        }
+        let cfg = {
+            let c = self.config.lock().unwrap();
+            let mut w = c.for_workspace(folder);
+            if let Some(name) = profile.as_ref() {
+                if let Some(m) = w.setups.as_ref().and_then(|s| s.get(name)).cloned() {
+                    w.model = m;
+                    w.active_setup = Some(name.clone());
+                }
+            }
+            w
+        };
+        let handle = start_session(&cfg, sp.clone(), Some(text), true, None);
+        sessions.insert(
+            id.to_string(),
+            LiveSession {
+                input_tx: handle.input_tx,
+                join: handle.join,
+                state_path: sp,
+                profile,
+            },
+        );
+    }
 }
 
 /// How the daemon is reached from outside the box.
@@ -927,12 +982,16 @@ async fn attach_ws(ws: WebSocketUpgrade, State(d): State<Shared>, Query(q): Quer
         return unauthorized();
     }
     match d.ensure_live(&q.session).await {
-        Some((tx, state_path)) => ws.on_upgrade(move |socket| handle_ws(socket, tx, state_path)),
+        Some((_, state_path)) => {
+            let daemon = d.clone();
+            let session = q.session.clone();
+            ws.on_upgrade(move |socket| handle_ws(socket, daemon, session, state_path))
+        }
         None => (StatusCode::NOT_FOUND, "no such session").into_response(),
     }
 }
 
-async fn handle_ws(socket: WebSocket, tx: UnboundedSender<LoopInput>, state_path: PathBuf) {
+async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_path: PathBuf) {
     let (mut sender, mut receiver) = socket.split();
 
     // Push the HarnessState whenever it changes on disk (mtime poll, like the TUI).
@@ -995,7 +1054,7 @@ async fn handle_ws(socket: WebSocket, tx: UnboundedSender<LoopInput>, state_path
         match msg {
             Message::Text(t) => {
                 if let Ok(input) = serde_json::from_str::<LoopInput>(t.as_str()) {
-                    let _ = tx.send(input);
+                    daemon.deliver(&session, input).await;
                 }
             }
             Message::Close(_) => break,
