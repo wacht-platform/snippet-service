@@ -15,6 +15,7 @@ pub mod outline;
 pub mod prompts;
 pub mod replay;
 pub mod sanitize;
+pub mod session;
 pub mod shell_guard;
 pub mod sse;
 pub mod signals;

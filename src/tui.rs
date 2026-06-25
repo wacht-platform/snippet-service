@@ -1,7 +1,6 @@
 use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -22,17 +21,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use serde_json::Value;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::builtins::coding_tools;
 use crate::config::SnippetConfig;
-use crate::harness::{
-    CodingHarness, HarnessConfig, HarnessEvent, HarnessState, HarnessStatus, LoopInput,
-};
-use crate::lanes::{LaneStatus, ModelFactory};
-use crate::prompts::conversation_system_prompt;
-use crate::tools::ToolContext;
+use crate::harness::{HarnessEvent, HarnessState, HarnessStatus, LoopInput};
+use crate::lanes::LaneStatus;
 
 /// Meta tools render through their own dedicated events (Note / AssistantText /
 /// UserQuestion / LaneSpawned), so their raw tool-call/result rows are hidden to
@@ -1357,12 +1351,6 @@ impl App {
             .unwrap_or(self.options.config.manual_approval)
     }
 
-    fn model_factory(&self) -> ModelFactory {
-        let model_config = self.options.config.model.clone();
-        Arc::new(move || {
-            model_config.build_model()
-        })
-    }
 
     fn scroll_up(&mut self, lines: usize) {
         self.scroll = (self.scroll + lines).min(self.max_scroll.get());
@@ -1820,40 +1808,16 @@ impl App {
         // footer label here would just go stale.
         self.status = String::new();
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.input_tx = Some(tx);
-
-        let workspace = self.options.config.workspace.clone();
-        let state_path = self.active_state_path.clone();
-        let model_config = self.options.config.model.clone();
-        let exa_api_key = self.options.config.exa_api_key.clone();
-        let manual_approval = self.options.config.manual_approval;
-        let factory = self.model_factory();
         crate::llm::StreamBuffer::clear(&self.stream);
-        let stream = self.stream.clone();
-
-        self.agent = Some(tokio::spawn(async move {
-            let mut model = model_config.build_model();
-            let context = ToolContext::new(workspace).map_err(|error| error.to_string())?;
-            let harness = CodingHarness::new(
-                HarnessConfig {
-                    system_prompt: conversation_system_prompt(),
-                    state_path: Some(state_path),
-                    resume,
-                    exa_api_key: exa_api_key.clone(),
-                    context_window_tokens: model_config.context_window,
-                    compact_at_pct: model_config.compact_at_pct,
-                    manual_approval,
-                    ..HarnessConfig::default()
-                },
-                coding_tools(exa_api_key),
-                context,
-            );
-            harness
-                .run_interactive(&mut model, initial, rx, Some(factory), Some(stream))
-                .await
-                .map_err(|error| error.to_string())
-        }));
+        let handle = crate::session::start_session(
+            &self.options.config,
+            self.active_state_path.clone(),
+            initial,
+            resume,
+            Some(self.stream.clone()),
+        );
+        self.input_tx = Some(handle.input_tx);
+        self.agent = Some(handle.join);
     }
 
     fn interrupt_or_quit(&mut self) {
