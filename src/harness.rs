@@ -810,7 +810,7 @@ impl CodingHarness {
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
             // Cap retained records so a long session doesn't bloat persisted state.
-            const MAX_CHECKPOINTS: usize = 50;
+            const MAX_CHECKPOINTS: usize = 8;
             let len = state.checkpoints.len();
             if len > MAX_CHECKPOINTS {
                 state.checkpoints.drain(..len - MAX_CHECKPOINTS);
