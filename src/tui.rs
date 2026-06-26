@@ -263,6 +263,8 @@ struct App {
     suggestion_index: usize,
     screen: Screen,
     resume_selected_index: usize,
+    /// In the resume picker: a `d` was pressed once; a second `d` confirms delete.
+    resume_pending_delete: bool,
     /// Theme picker cursor + the index to restore if the picker is cancelled.
     theme_selected_index: usize,
     theme_original_index: usize,
@@ -360,6 +362,7 @@ impl App {
             suggestion_index: 0,
             screen: Screen::Main,
             resume_selected_index: 0,
+            resume_pending_delete: false,
             theme_selected_index: 0,
             theme_original_index: 0,
             model_picker_index: 0,
@@ -557,6 +560,12 @@ impl App {
                 p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
             }
         })
+    }
+
+    /// Delete a saved conversation file (used by the resume picker's `d` key).
+    fn delete_conversation(&self, name: &str) {
+        let path = self.conversations_dir().join(format!("{name}.json"));
+        let _ = std::fs::remove_file(path);
     }
 
     fn list_conversations(&self) -> Vec<(String, String)> {
@@ -2226,6 +2235,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         match key.code {
             KeyCode::Up => {
+                app.resume_pending_delete = false;
                 app.resume_selected_index = if app.resume_selected_index == 0 {
                     convs.len() - 1
                 } else {
@@ -2233,9 +2243,33 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 };
             }
             KeyCode::Down => {
+                app.resume_pending_delete = false;
                 app.resume_selected_index = (app.resume_selected_index + 1) % convs.len();
             }
+            KeyCode::Char('d') => {
+                let idx = app.resume_selected_index.min(convs.len() - 1);
+                let (name, title) = convs[idx].clone();
+                if app.resume_pending_delete {
+                    app.delete_conversation(&name);
+                    app.resume_pending_delete = false;
+                    let remaining = convs.len() - 1;
+                    if remaining == 0 {
+                        app.screen = Screen::Main;
+                        app.status = "Session deleted. No saved sessions left.".to_string();
+                    } else {
+                        if app.resume_selected_index >= remaining {
+                            app.resume_selected_index = remaining - 1;
+                        }
+                        app.status = "Session deleted.".to_string();
+                    }
+                } else {
+                    app.resume_pending_delete = true;
+                    let short: String = title.chars().take(48).collect();
+                    app.status = format!("Press d again to delete \"{short}\", or Esc/↑↓ to cancel.");
+                }
+            }
             KeyCode::Enter => {
+                app.resume_pending_delete = false;
                 let selected_idx = app.resume_selected_index.min(convs.len().saturating_sub(1));
                 let name = convs[selected_idx].0.clone();
                 app.switch_conversation(&name);
@@ -2247,6 +2281,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 }
             }
             KeyCode::Esc => {
+                app.resume_pending_delete = false;
                 app.screen = Screen::Main;
                 app.status = "Type a task and press Enter.".to_string();
             }
@@ -2848,7 +2883,7 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     frame.render_widget(Paragraph::new(lines).block(list_block), chunks[1]);
 
     // Render Footer
-    let footer_text = "↑/↓ scroll  ·  Enter resume selected  ·  Esc go back";
+    let footer_text = "↑/↓ scroll  ·  Enter resume selected  ·  d delete  ·  Esc go back";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer_text, subtle()))),
         chunks[2]

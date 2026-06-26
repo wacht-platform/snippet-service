@@ -221,6 +221,7 @@ pub async fn run_serve(
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
         .route("/session/exec", post(exec_in_session))
+        .route("/session/delete", post(delete_session))
         .with_state(daemon);
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -1007,6 +1008,35 @@ async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Resp
         }
         Ok(_) => (StatusCode::BAD_REQUEST, "not a file").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteReq {
+    session: String,
+}
+
+// POST /session/delete {session} — stop the live loop (if any) and delete the
+// session's conversation file.
+async fn delete_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<DeleteReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(sp) = state_path_for_id(&req.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    {
+        let mut sessions = d.sessions.lock().await;
+        if let Some(s) = sessions.remove(&req.session) {
+            s.join.abort();
+        }
+    }
+    match std::fs::remove_file(&sp) {
+        Ok(()) => Json(serde_json::json!({"deleted": true})).into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Json(serde_json::json!({"deleted": true})).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
