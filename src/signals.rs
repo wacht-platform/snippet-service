@@ -99,10 +99,10 @@ impl RuntimeSignal {
                  and recover from — prefer a few focused calls, read the results, then continue."
             ),
             Self::StateIntent =>
-                "a new user message just arrived. Call `set_intent` once — one or two sentences \
-                 covering any work you were mid-way through (so it survives the interruption) and \
-                 what you will do next for this message — then proceed (you may batch it with your \
-                 first real step). Overwrite, don't append."
+                "a new user message just arrived. Call `note` once stating your intent — one or two \
+                 sentences covering any work you were mid-way through (so it survives the \
+                 interruption) and what you will do next for this message — then proceed (you may \
+                 batch it with your first real step)."
                     .to_string(),
         }
     }

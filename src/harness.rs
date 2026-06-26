@@ -224,11 +224,6 @@ pub struct HarnessState {
     /// The model's context window in tokens, for the usage gauge (0 = unknown).
     #[serde(default)]
     pub context_window: u64,
-    /// The model's current working intent — what it's doing now and next. Set via
-    /// `set_intent` (nudged on every user message), overwritten each time, and
-    /// surfaced in the live context so the run stays anchored across interruptions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_intent: Option<String>,
 }
 
 /// A working-tree snapshot the user can rewind to (a commit in the shadow repo).
@@ -1198,17 +1193,10 @@ impl CodingHarness {
         for call in calls {
             let tool_name = call.tool_name.clone();
             let call_id = call.id.clone().unwrap_or_default();
-            // `set_intent` is a virtual/internal tool: it only updates the live
-            // context the model sees, and is never surfaced to the user. Skip its
-            // call/result events (but keep the message-history result below so the
-            // model's tool_call stays paired).
-            let virtual_tool = tool_name == "set_intent";
-            if !virtual_tool {
-                state.events.push(HarnessEvent::ToolCall {
-                    tool_name: tool_name.clone(),
-                    arguments: call.arguments.clone(),
-                });
-            }
+            state.events.push(HarnessEvent::ToolCall {
+                tool_name: tool_name.clone(),
+                arguments: call.arguments.clone(),
+            });
 
             // Headless explicit completion: a lane / one-shot run ends with a
             // structured `summary` (folded back into the caller). Not advertised to
@@ -1256,12 +1244,10 @@ impl CodingHarness {
                 }
                 let (result, control) =
                     self.dispatch_meta(state, lanes, &tool_name, &call.arguments);
-                if !virtual_tool {
-                    state.events.push(HarnessEvent::ToolResult {
-                        tool_name: tool_name.clone(),
-                        result: result.clone(),
-                    });
-                }
+                state.events.push(HarnessEvent::ToolResult {
+                    tool_name: tool_name.clone(),
+                    result: result.clone(),
+                });
                 state.messages.push(HarnessMessage::ToolResult {
                     tool_call_id: call_id,
                     tool_name,
@@ -1492,25 +1478,6 @@ impl CodingHarness {
                     MetaControl::Continue,
                 )
             }
-            "set_intent" => {
-                let intent = arguments
-                    .get("intent")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let Some(intent) = intent else {
-                    return (
-                        tool_error("set_intent requires a non-empty `intent`."),
-                        MetaControl::Continue,
-                    );
-                };
-                // Single evolving intent — overwrite, never append.
-                state.current_intent = Some(intent.to_string());
-                (
-                    json!({"schema_version": 1, "status": "success", "data": {"intent_set": true}}),
-                    MetaControl::Continue,
-                )
-            }
             "ask_user" => match parse_ask_user(arguments) {
                 Ok(rendered) => {
                     let prompt_text = first_question_text(&rendered)
@@ -1698,7 +1665,6 @@ impl CodingHarness {
             checkpoints: Vec::new(),
             rate_limit: None,
             context_window: self.config.context_window_tokens,
-            current_intent: None,
         };
         self.persist_state(&state).await?;
         Ok(state)
@@ -2298,19 +2264,6 @@ fn build_live_context(
         "NOTE: harness-injected, not a user message — don't attribute it to the user, quote it, or \
          mention it; just act on it.\n",
     );
-
-    // The model's own evolving intent (set via set_intent, refreshed on every user
-    // message) — the persistent anchor that keeps the run on track across turns.
-    if let Some(intent) = state
-        .current_intent
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        block.push_str("\n[intent]\n");
-        block.push_str("# your current working intent (you set this); keep pursuing it, update via set_intent when it changes.\n");
-        block.push_str(&format!("current = \"{}\"\n", sanitize_one_line(intent)));
-    }
 
     block.push_str("\n[workspace]\n");
     block.push_str(&format!("cwd = \"{}\"\n", workspace.display()));
