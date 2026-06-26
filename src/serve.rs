@@ -1373,8 +1373,20 @@ pub struct ServeSettings {
     pub tunnel_token: Option<String>,
 }
 
+/// XDG-style config dir, shared by the CLI and the auto-start service so both
+/// agree on one location regardless of working directory. `$XDG_CONFIG_HOME` wins
+/// (Linux/systemd convention); otherwise `~/.config/snippet` (also sensible on
+/// macOS). This holds user-editable config; secrets/runtime stay in ~/.snippet.
+pub fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("snippet")
+}
+
 fn serve_settings_path() -> PathBuf {
-    snippet_dir().join("serve.toml")
+    config_dir().join("serve.toml")
 }
 
 impl ServeSettings {
@@ -1388,7 +1400,7 @@ impl ServeSettings {
 
     /// Persist 0600 (may hold a tunnel token).
     fn save(&self) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(snippet_dir());
+        let _ = std::fs::create_dir_all(config_dir());
         let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         let path = serve_settings_path();
         std::fs::write(&path, body).map_err(|e| format!("write serve.toml: {e}"))?;
