@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 3] = ["note", "ask_user", "delegate_task"];
+pub const META_TOOL_NAMES: [&str; 4] = ["note", "ask_user", "delegate_task", "set_intent"];
 
 pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
@@ -25,7 +25,33 @@ pub fn is_meta_tool(name: &str) -> bool {
 /// by replying with no tool calls, and talks to the user with text beside its
 /// working tool calls.
 pub fn conversation_meta_definitions() -> Vec<NativeToolDefinition> {
-    vec![note_tool(), ask_user_tool(), delegate_task_tool()]
+    vec![note_tool(), ask_user_tool(), delegate_task_tool(), set_intent_tool()]
+}
+
+/// Set the working intent — a single evolving line of "what I'm doing now and
+/// next". Overwritten each time (nudged on every user message); surfaced back in
+/// the live context so the run stays anchored across interruptions.
+fn set_intent_tool() -> NativeToolDefinition {
+    NativeToolDefinition {
+        name: "set_intent".to_string(),
+        description: "Record your current working intent — one or two sentences: what you are \
+            doing now and what comes next (include any work you were mid-way through so it survives \
+            an interruption). Call it whenever a new user message arrives, and whenever your plan \
+            meaningfully changes. It OVERWRITES the previous intent (it is not a log), does not end \
+            the turn, and can be batched with your first real step."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "description": "One or two sentences: current focus + next step (and prior in-progress work if interrupted)."
+                }
+            },
+            "required": ["intent"],
+            "additionalProperties": false,
+        }),
+    }
 }
 
 /// Explicit completion tool for HEADLESS runs (delegated lanes, one-shot

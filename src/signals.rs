@@ -33,6 +33,8 @@ pub enum RuntimeSignal {
     NoteLoop { count: usize },
     /// A very large batch of tool calls was issued in one turn.
     BatchBackpressure { batch_size: usize },
+    /// A user message just arrived — state the working intent before continuing.
+    StateIntent,
 }
 
 impl RuntimeSignal {
@@ -48,6 +50,7 @@ impl RuntimeSignal {
             Self::ShellDisciplineEscalated { .. } => "shell_discipline",
             Self::NoteLoop { .. } => "note_loop",
             Self::BatchBackpressure { .. } => "batch_backpressure",
+            Self::StateIntent => "state_intent",
         }
     }
 
@@ -95,6 +98,12 @@ impl RuntimeSignal {
                 "you issued {batch_size} tool calls in one turn. Large fan-outs are hard to verify \
                  and recover from — prefer a few focused calls, read the results, then continue."
             ),
+            Self::StateIntent =>
+                "a new user message just arrived. Call `set_intent` once — one or two sentences \
+                 covering any work you were mid-way through (so it survives the interruption) and \
+                 what you will do next for this message — then proceed (you may batch it with your \
+                 first real step). Overwrite, don't append."
+                    .to_string(),
         }
     }
 

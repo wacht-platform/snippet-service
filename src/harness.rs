@@ -224,6 +224,11 @@ pub struct HarnessState {
     /// The model's context window in tokens, for the usage gauge (0 = unknown).
     #[serde(default)]
     pub context_window: u64,
+    /// The model's current working intent — what it's doing now and next. Set via
+    /// `set_intent` (nudged on every user message), overwritten each time, and
+    /// surfaced in the live context so the run stays anchored across interruptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_intent: Option<String>,
 }
 
 /// A working-tree snapshot the user can rewind to (a commit in the shadow repo).
@@ -491,8 +496,16 @@ impl CodingHarness {
             // Apply any input buffered during a step. A message that arrived mid- or
             // post-turn wakes the loop so the next step addresses it.
             if !pending_inputs.is_empty() {
+                // A steer that arrived mid-run is still a user message — nudge an
+                // intent restatement next turn so the interruption is captured.
+                let had_user_msg = pending_inputs
+                    .iter()
+                    .any(|i| matches!(i, LoopInput::UserMessage(_) | LoopInput::Answer(_)));
                 for input in std::mem::take(&mut pending_inputs) {
                     self.apply_input(&mut state, input);
+                }
+                if had_user_msg {
+                    vars.pending_signals.push(RuntimeSignal::StateIntent);
                 }
                 if state.status != HarnessStatus::Running {
                     state.status = HarnessStatus::Running;
@@ -678,6 +691,8 @@ impl CodingHarness {
                                 },
                             });
                             state.events.push(HarnessEvent::UserInput { text });
+                            // Every user message → restate intent next turn.
+                            vars.pending_signals.push(RuntimeSignal::StateIntent);
                             state.status = HarnessStatus::Running;
                             vars.steps_since_visible = 0;
                             consecutive_errors = 0;
@@ -1183,10 +1198,17 @@ impl CodingHarness {
         for call in calls {
             let tool_name = call.tool_name.clone();
             let call_id = call.id.clone().unwrap_or_default();
-            state.events.push(HarnessEvent::ToolCall {
-                tool_name: tool_name.clone(),
-                arguments: call.arguments.clone(),
-            });
+            // `set_intent` is a virtual/internal tool: it only updates the live
+            // context the model sees, and is never surfaced to the user. Skip its
+            // call/result events (but keep the message-history result below so the
+            // model's tool_call stays paired).
+            let virtual_tool = tool_name == "set_intent";
+            if !virtual_tool {
+                state.events.push(HarnessEvent::ToolCall {
+                    tool_name: tool_name.clone(),
+                    arguments: call.arguments.clone(),
+                });
+            }
 
             // Headless explicit completion: a lane / one-shot run ends with a
             // structured `summary` (folded back into the caller). Not advertised to
@@ -1234,10 +1256,12 @@ impl CodingHarness {
                 }
                 let (result, control) =
                     self.dispatch_meta(state, lanes, &tool_name, &call.arguments);
-                state.events.push(HarnessEvent::ToolResult {
-                    tool_name: tool_name.clone(),
-                    result: result.clone(),
-                });
+                if !virtual_tool {
+                    state.events.push(HarnessEvent::ToolResult {
+                        tool_name: tool_name.clone(),
+                        result: result.clone(),
+                    });
+                }
                 state.messages.push(HarnessMessage::ToolResult {
                     tool_call_id: call_id,
                     tool_name,
@@ -1468,6 +1492,25 @@ impl CodingHarness {
                     MetaControl::Continue,
                 )
             }
+            "set_intent" => {
+                let intent = arguments
+                    .get("intent")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let Some(intent) = intent else {
+                    return (
+                        tool_error("set_intent requires a non-empty `intent`."),
+                        MetaControl::Continue,
+                    );
+                };
+                // Single evolving intent — overwrite, never append.
+                state.current_intent = Some(intent.to_string());
+                (
+                    json!({"schema_version": 1, "status": "success", "data": {"intent_set": true}}),
+                    MetaControl::Continue,
+                )
+            }
             "ask_user" => match parse_ask_user(arguments) {
                 Ok(rendered) => {
                     let prompt_text = first_question_text(&rendered)
@@ -1655,6 +1698,7 @@ impl CodingHarness {
             checkpoints: Vec::new(),
             rate_limit: None,
             context_window: self.config.context_window_tokens,
+            current_intent: None,
         };
         self.persist_state(&state).await?;
         Ok(state)
@@ -2251,19 +2295,28 @@ fn build_live_context(
     let signals = std::mem::take(&mut vars.pending_signals);
     let mut block = String::from("<runtime_context>\n");
     block.push_str(
-        "NOTE: this block is injected by the harness at the end of the turn — it is NOT a message \
-         from the user. The user did not write any of it. Never attribute it to the user (\"the user \
-         said / pointed out…\"), never quote or mention it, never reply to it as if the user sent it. \
-         Read it, act on it, stay silent about it.\n\n",
+        "NOTE: harness-injected, not a user message — don't attribute it to the user, quote it, or \
+         mention it; just act on it.\n",
     );
+
+    // The model's own evolving intent (set via set_intent, refreshed on every user
+    // message) — the persistent anchor that keeps the run on track across turns.
+    if let Some(intent) = state
+        .current_intent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        block.push_str("\n[intent]\n");
+        block.push_str("# your current working intent (you set this); keep pursuing it, update via set_intent when it changes.\n");
+        block.push_str(&format!("current = \"{}\"\n", sanitize_one_line(intent)));
+    }
 
     block.push_str("\n[workspace]\n");
     block.push_str(&format!("cwd = \"{}\"\n", workspace.display()));
     block.push_str(
-        "note = \"this is your current working directory — the project you are operating on by \
-         default. Resolve relative paths against it and run shell commands from here, and ground \
-         'this folder / this project / here' in THIS path. It is NOT a boundary, though: you can \
-         read/edit any absolute path or ~ elsewhere when the task calls for it.\"\n",
+        "note = \"default project dir — resolve relative paths and run shell from here; ground \
+         'this folder/here' in it. Not a boundary: read/edit any absolute or ~ path when needed.\"\n",
     );
 
     // The user's message is already in the durable history (sent verbatim every
@@ -2283,11 +2336,9 @@ fn build_live_context(
     // returned…"). Point attention AWAY from the re-prompt and TOWARD finishing the
     // task — no mechanism description to parrot.
     block.push_str(
-        "auto_continuation = \"internal steering, not a user message — never describe or mention it, \
-         the loop, or that you were re-prompted, in your reply OR your reasoning. Spend no thought on \
-         WHY this turn fired; reason about the OVERALL GOAL — what you're trying to accomplish and \
-         what still remains — and take the next concrete step toward completing it (or give the final \
-         answer if it's done).\"\n",
+        "auto_continuation = \"internal steering, not a user message — never mention it, the loop, or \
+         being re-prompted (in reply or reasoning). Focus on the overall goal; take the next concrete \
+         step, or give the final answer if done.\"\n",
     );
     // Explain the re-prompt ONLY when actually looping (a repeated/duplicate call
     // last turn) — not after every normal tool result.
