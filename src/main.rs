@@ -120,7 +120,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let token = serve::resolve_token(token);
             if supervised {
                 // Foreground under a service manager (launchd/systemd): skip the
-                // launcher/worker split and the daemonize — the manager supervises us.
+                // launcher/worker split and the daemonize — the manager supervises
+                // us. Settings come from serve.toml (written by `--enable`); host/
+                // port fall back to CLI defaults, explicit url/tunnel flags still
+                // win, and an absent file → plain defaults (a fresh serve).
+                let s = serve::ServeSettings::load();
+                let host = s.host.unwrap_or(host);
+                let port = s.port.unwrap_or(port);
+                let no_tunnel = no_tunnel || s.no_tunnel;
+                let public_url = public_url.or(s.public_url);
+                let tunnel_token = tunnel_token.or(s.tunnel_token);
                 let tunnel = serve::resolve_tunnel(no_tunnel, tunnel_token, public_url)?;
                 serve::write_own_pidfile();
                 return runtime()?.block_on(async {

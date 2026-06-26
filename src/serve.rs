@@ -1354,48 +1354,75 @@ pub fn write_own_pidfile() {
     let _ = std::fs::write(pid_path(), std::process::id().to_string());
 }
 
-/// Build the `snippet serve --supervised …` arg list the service runs, preserving
-/// the flags the user passed to `--enable`. `--config` is a top-level arg, so it
-/// precedes the `serve` subcommand.
-fn build_serve_args(
-    config_path: &std::path::Path,
-    host: &str,
-    port: u16,
-    no_tunnel: bool,
-    public_url: Option<&str>,
-    tunnel_token: Option<&str>,
-    token: Option<&str>,
-) -> Vec<String> {
-    let mut a = vec![
+/// Persisted serve runtime config (`~/.snippet/serve.toml`). The auto-start
+/// service reads this on every boot rather than having the settings frozen into
+/// its plist/unit — so re-running `--enable` (or hand-editing this one file)
+/// changes how the daemon comes up without touching the service definition.
+/// Absent/empty file → the daemon starts with CLI defaults.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ServeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub no_tunnel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_token: Option<String>,
+}
+
+fn serve_settings_path() -> PathBuf {
+    snippet_dir().join("serve.toml")
+}
+
+impl ServeSettings {
+    /// Load from disk; an absent or unparseable file yields defaults.
+    pub fn load() -> Self {
+        std::fs::read_to_string(serve_settings_path())
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist 0600 (may hold a tunnel token).
+    fn save(&self) -> Result<(), String> {
+        let _ = std::fs::create_dir_all(snippet_dir());
+        let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        let path = serve_settings_path();
+        std::fs::write(&path, body).map_err(|e| format!("write serve.toml: {e}"))?;
+        crate::config::set_private(&path);
+        Ok(())
+    }
+}
+
+/// Persist an explicit auth token to `~/.snippet/serve.token` (0600) so the daemon
+/// reuses it across restarts without it ever appearing on a command line.
+pub fn persist_token(token: &str) {
+    let _ = std::fs::create_dir_all(snippet_dir());
+    let path = snippet_dir().join("serve.token");
+    if std::fs::write(&path, token).is_ok() {
+        crate::config::set_private(&path);
+    }
+}
+
+/// The fixed command the service runs. Runtime settings come from serve.toml,
+/// not from these args, so the service definition never has to change.
+/// `--config` is a top-level arg, so it precedes the `serve` subcommand.
+fn service_args(config_path: &std::path::Path) -> Vec<String> {
+    vec![
         "--config".to_string(),
         config_path.display().to_string(),
         "serve".to_string(),
         "--supervised".to_string(),
-        "--host".to_string(),
-        host.to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
-    if no_tunnel {
-        a.push("--no-tunnel".to_string());
-    }
-    if let Some(u) = public_url {
-        a.push("--public-url".to_string());
-        a.push(u.to_string());
-    }
-    if let Some(t) = tunnel_token {
-        a.push("--tunnel-token".to_string());
-        a.push(t.to_string());
-    }
-    if let Some(t) = token {
-        a.push("--token".to_string());
-        a.push(t.to_string());
-    }
-    a
+    ]
 }
 
-/// Install snippet serve as an OS service that auto-starts on boot/login, baking in
-/// the given flags. launchd LaunchAgent on macOS, systemd `--user` unit on Linux.
+/// Install snippet serve as an OS service that auto-starts on boot/login. The
+/// serve flags are written to serve.toml (read at runtime); the service itself
+/// just runs `snippet serve --supervised`. launchd on macOS, systemd `--user` on
+/// Linux. Re-running updates serve.toml in place — there is only ever one service.
 pub fn install_service(
     host: &str,
     port: u16,
@@ -1406,7 +1433,19 @@ pub fn install_service(
     config_path: &std::path::Path,
 ) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let args = build_serve_args(config_path, host, port, no_tunnel, public_url, tunnel_token, token);
+    // Persist the settings the supervised daemon will read on boot.
+    ServeSettings {
+        host: Some(host.to_string()),
+        port: Some(port),
+        public_url: public_url.map(str::to_string),
+        no_tunnel,
+        tunnel_token: tunnel_token.map(str::to_string),
+    }
+    .save()?;
+    if let Some(t) = token {
+        persist_token(t);
+    }
+    let args = service_args(config_path);
     // Free the port: a manually-started daemon would block the service's bind.
     let _ = stop();
 
