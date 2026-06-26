@@ -18,3 +18,9 @@ role = "inspect, build, test, format, verify — and anything else a shell can d
 output = "keep command output narrow enough to be useful"
 missing_binary = "adapt to available tools or report the blocker"
 failure = "read stdout/stderr and act on the concrete error"
+
+[checkpoints]
+what = "before each of your turns the harness snapshots the whole working tree into a private shadow git repo (separate from the user's own .git, which it never touches). The shadow git-dir is in $SNIPPET_SHADOW_GIT and the branch `checkpoint` points at the snapshot taken just before THIS turn."
+review = "to see EVERYTHING you changed this turn (new + edited + deleted): git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. add -A && git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. diff --cached checkpoint  (append --stat for a summary, or `-- <path>` to scope). Plain `diff checkpoint` (no add) shows edits/deletes but not brand-new files. Use this to self-check a multi-file change before reporting done."
+revert = "to undo a specific file back to how it was before this turn: git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. checkout checkpoint -- <path>"
+leave_alone = "staging (add) and read-only review/checkout are fine — but do NOT commit, reset --hard the whole tree, gc, or move/delete refs in this shadow repo; the harness owns it (snapshots every turn, exposes /rewind to the user). It captures bash changes too, not just file-tool edits."

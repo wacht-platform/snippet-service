@@ -815,6 +815,11 @@ impl CodingHarness {
             if len > MAX_CHECKPOINTS {
                 state.checkpoints.drain(..len - MAX_CHECKPOINTS);
             }
+            // Drop dropped snapshots from the shadow repo and gc so disk stays
+            // bounded to the retained set (off the async runtime — gc can be slow).
+            let keep: Vec<String> = state.checkpoints.iter().map(|c| c.id.clone()).collect();
+            let ws = self.context.workspace_root().to_path_buf();
+            let _ = tokio::task::spawn_blocking(move || crate::checkpoint::prune(&ws, &keep)).await;
         }
     }
 

@@ -759,6 +759,9 @@ impl Tool for BashTool {
             .arg("-lc")
             .arg(&args.command)
             .current_dir(ctx.workspace_root())
+            // The shadow checkpoint repo's git-dir, so the agent can review its own
+            // changes: `git --git-dir=$SNIPPET_SHADOW_GIT --work-tree=. diff checkpoint`.
+            .env("SNIPPET_SHADOW_GIT", crate::checkpoint::shadow_dir(ctx.workspace_root()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
