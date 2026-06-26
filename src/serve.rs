@@ -212,6 +212,7 @@ pub async fn run_serve(
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
+        .route("/fs/upload", post(upload_fs_file))
         .route("/attach", get(attach_ws))
         .route("/events", get(events_ws))
         .route("/config", get(get_config))
@@ -1007,6 +1008,46 @@ async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Resp
         Ok(_) => (StatusCode::BAD_REQUEST, "not a file").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct UploadReq {
+    data_base64: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+// POST /fs/upload {data_base64, name?} — save an uploaded file (e.g. an image the
+// user posts from the app) to a temp dir and return its absolute path, which the
+// agent can then view with `read_image` (or read).
+async fn upload_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<UploadReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    use base64::Engine;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(req.data_base64.trim()) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad base64: {e}")).into_response(),
+    };
+    if bytes.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty upload").into_response();
+    }
+    let ext = req
+        .name
+        .as_deref()
+        .and_then(|n| std::path::Path::new(n).extension())
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 5)
+        .unwrap_or("png");
+    let dir = std::env::temp_dir().join("snippet-uploads");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let path = dir.join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()));
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    Json(serde_json::json!({"path": path.display().to_string(), "size": bytes.len()})).into_response()
 }
 
 #[derive(Deserialize)]
