@@ -174,6 +174,25 @@ pub enum Tunnel {
     None,
 }
 
+/// Map the serve CLI's tunnel flags to a `Tunnel`. Shared by the daemonizing worker
+/// and the supervised (service-manager) path.
+pub fn resolve_tunnel(
+    no_tunnel: bool,
+    tunnel_token: Option<String>,
+    public_url: Option<String>,
+) -> Result<Tunnel, String> {
+    Ok(if no_tunnel {
+        Tunnel::None
+    } else if let Some(t) = tunnel_token {
+        let url = public_url.ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
+        Tunnel::Named { token: t, url }
+    } else if let Some(u) = public_url {
+        Tunnel::Url(u)
+    } else {
+        Tunnel::Cloudflared
+    })
+}
+
 /// Run the daemon's HTTP/WS server on `127.0.0.1:port`, bring up the tunnel, and
 /// print a scannable QR + connection string. The token is the app-layer auth gate.
 pub async fn run_serve(
@@ -1324,4 +1343,316 @@ pub fn status() -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+// --- auto-start service (launchd / systemd) ---
+
+/// Supervised mode doesn't daemonize, so record our pid here so `serve --status`
+/// can find us (the service manager owns actual lifecycle/restart).
+pub fn write_own_pidfile() {
+    let _ = std::fs::create_dir_all(snippet_dir());
+    let _ = std::fs::write(pid_path(), std::process::id().to_string());
+}
+
+/// Build the `snippet serve --supervised …` arg list the service runs, preserving
+/// the flags the user passed to `--enable`. `--config` is a top-level arg, so it
+/// precedes the `serve` subcommand.
+fn build_serve_args(
+    config_path: &std::path::Path,
+    host: &str,
+    port: u16,
+    no_tunnel: bool,
+    public_url: Option<&str>,
+    tunnel_token: Option<&str>,
+    token: Option<&str>,
+) -> Vec<String> {
+    let mut a = vec![
+        "--config".to_string(),
+        config_path.display().to_string(),
+        "serve".to_string(),
+        "--supervised".to_string(),
+        "--host".to_string(),
+        host.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ];
+    if no_tunnel {
+        a.push("--no-tunnel".to_string());
+    }
+    if let Some(u) = public_url {
+        a.push("--public-url".to_string());
+        a.push(u.to_string());
+    }
+    if let Some(t) = tunnel_token {
+        a.push("--tunnel-token".to_string());
+        a.push(t.to_string());
+    }
+    if let Some(t) = token {
+        a.push("--token".to_string());
+        a.push(t.to_string());
+    }
+    a
+}
+
+/// Install snippet serve as an OS service that auto-starts on boot/login, baking in
+/// the given flags. launchd LaunchAgent on macOS, systemd `--user` unit on Linux.
+pub fn install_service(
+    host: &str,
+    port: u16,
+    token: Option<&str>,
+    no_tunnel: bool,
+    public_url: Option<&str>,
+    tunnel_token: Option<&str>,
+    config_path: &std::path::Path,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let args = build_serve_args(config_path, host, port, no_tunnel, public_url, tunnel_token, token);
+    // Free the port: a manually-started daemon would block the service's bind.
+    let _ = stop();
+
+    #[cfg(target_os = "macos")]
+    {
+        install_launchd(&exe, &args)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        install_systemd(&exe, &args)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (&exe, &args);
+        Err("auto-start is only supported on macOS and Linux".to_string())
+    }
+}
+
+/// Remove the auto-start service installed by `install_service`.
+pub fn uninstall_service() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist = launch_agent_path();
+        if plist.exists() {
+            let uid = current_uid();
+            if let Some(uid) = &uid {
+                let _ = run("launchctl", &["bootout", &format!("gui/{uid}/{}", SERVICE_LABEL)]);
+            }
+            let _ = run("launchctl", &["unload", "-w", &plist.display().to_string()]);
+            std::fs::remove_file(&plist).map_err(|e| format!("remove plist: {e}"))?;
+            println!("✓ Removed launchd agent: {}", plist.display());
+        } else {
+            println!("no launchd agent installed");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let unit = systemd_unit_path();
+        let _ = run("systemctl", &["--user", "disable", "--now", "snippet-serve.service"]);
+        if unit.exists() {
+            std::fs::remove_file(&unit).map_err(|e| format!("remove unit: {e}"))?;
+            println!("✓ Removed systemd user unit: {}", unit.display());
+        } else {
+            println!("no systemd user unit installed");
+        }
+        let _ = run("systemctl", &["--user", "daemon-reload"]);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        return Err("auto-start is only supported on macOS and Linux".to_string());
+    }
+    let _ = std::fs::remove_file(pid_path());
+    let _ = std::fs::remove_file(state_json_path());
+    Ok(())
+}
+
+/// Run a command to completion, returning whether it exited 0 (errors → false).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Poll for the published connection (the service starts asynchronously) and print
+/// the QR + string once it's up.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn print_service_connection() {
+    for _ in 0..30 {
+        if let Some((url, tok)) = read_serve_state() {
+            print_connection(&url, &tok);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    println!("  (starting… run `snippet serve --status` for the connection string)");
+}
+
+#[cfg(target_os = "macos")]
+const SERVICE_LABEL: &str = "com.snippet.serve";
+
+#[cfg(target_os = "macos")]
+fn launch_agent_path() -> PathBuf {
+    home_dir().join("Library/LaunchAgents/com.snippet.serve.plist")
+}
+
+#[cfg(target_os = "macos")]
+fn current_uid() -> Option<String> {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
+    let plist = launch_agent_path();
+    if let Some(dir) = plist.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut prog = format!("    <string>{}</string>\n", xml_escape(&exe.display().to_string()));
+    for a in args {
+        prog.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
+    }
+    let home = home_dir().display().to_string();
+    // cloudflared lives in ~/.snippet/bin; include common brew/system paths too.
+    let path_env = format!("{home}/.snippet/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    let log = log_path().display().to_string();
+    let content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+{prog}  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>{home_x}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>{home_x}</string>
+    <key>PATH</key>
+    <string>{path_x}</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{log_x}</string>
+  <key>StandardErrorPath</key>
+  <string>{log_x}</string>
+</dict>
+</plist>
+"#,
+        label = SERVICE_LABEL,
+        prog = prog,
+        home_x = xml_escape(&home),
+        path_x = xml_escape(&path_env),
+        log_x = xml_escape(&log),
+    );
+    std::fs::write(&plist, content).map_err(|e| format!("write plist: {e}"))?;
+
+    let plist_s = plist.display().to_string();
+    let loaded = if let Some(uid) = current_uid() {
+        // Modern domain-target API; bootout first so a re-enable is idempotent.
+        let target = format!("gui/{uid}/{SERVICE_LABEL}");
+        let _ = run("launchctl", &["bootout", &target]);
+        let ok = run("launchctl", &["bootstrap", &format!("gui/{uid}"), &plist_s]);
+        if ok {
+            let _ = run("launchctl", &["enable", &target]);
+        }
+        ok
+    } else {
+        false
+    };
+    // Fall back to the legacy load -w if bootstrap is unavailable.
+    if !loaded {
+        let _ = run("launchctl", &["unload", &plist_s]);
+        if !run("launchctl", &["load", "-w", &plist_s]) {
+            return Err("launchctl could not load the agent".to_string());
+        }
+    }
+
+    println!("✓ Installed launchd agent: {}", plist.display());
+    println!("  Auto-starts at login and restarts on crash.  Disable: snippet serve --disable");
+    print_service_connection();
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit_path() -> PathBuf {
+    home_dir().join(".config/systemd/user/snippet-serve.service")
+}
+
+/// Quote an arg for a systemd `ExecStart` line (which is shell-like word-split).
+#[cfg(target_os = "linux")]
+fn sh_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'='));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
+    let unit = systemd_unit_path();
+    if let Some(dir) = unit.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut exec = sh_quote(&exe.display().to_string());
+    for a in args {
+        exec.push(' ');
+        exec.push_str(&sh_quote(a));
+    }
+    let home = home_dir().display().to_string();
+    let path_env = format!("{home}/.snippet/bin:/usr/local/bin:/usr/bin:/bin");
+    let content = format!(
+        r#"[Unit]
+Description=snippet serve (remote-control daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exec}
+WorkingDirectory={home}
+Environment=HOME={home}
+Environment=PATH={path_env}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+"#,
+    );
+    std::fs::write(&unit, content).map_err(|e| format!("write unit: {e}"))?;
+
+    let _ = run("systemctl", &["--user", "daemon-reload"]);
+    if !run("systemctl", &["--user", "enable", "--now", "snippet-serve.service"]) {
+        return Err("systemctl --user enable failed (is a user systemd session available?)".to_string());
+    }
+    // Survive logout / start at boot without an active login session.
+    if let Ok(user) = std::env::var("USER") {
+        let _ = run("loginctl", &["enable-linger", &user]);
+    }
+
+    println!("✓ Installed systemd user unit: {}", unit.display());
+    println!("  Enabled + started; lingering on so it survives logout.  Disable: snippet serve --disable");
+    print_service_connection();
+    Ok(())
 }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use snippet::config::SnippetConfig;
-use snippet::serve::{self, Tunnel};
+use snippet::serve::{self};
 use snippet::tui::{TuiOptions, run_tui};
 
 #[derive(Debug, Parser)]
@@ -48,6 +48,17 @@ enum Command {
         /// Show the running daemon's status + its QR / connection string.
         #[arg(long)]
         status: bool,
+        /// Install as an OS service that auto-starts on boot/login (launchd on macOS,
+        /// systemd --user on Linux), baking in the other flags you pass here.
+        #[arg(long)]
+        enable: bool,
+        /// Remove the auto-start service installed by --enable.
+        #[arg(long)]
+        disable: bool,
+        /// Internal: run the server in the foreground under a service manager (no
+        /// daemonize); the manager owns supervision/restart.
+        #[arg(long, hide = true)]
+        supervised: bool,
     },
 }
 
@@ -80,6 +91,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host,
             stop,
             status,
+            enable,
+            disable,
+            supervised,
         }) => {
             // Lifecycle commands are synchronous and need no config/runtime.
             if stop {
@@ -88,20 +102,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if status {
                 return serve::status().map_err(Into::into);
             }
+            if disable {
+                return serve::uninstall_service().map_err(Into::into);
+            }
+            if enable {
+                return serve::install_service(
+                    &host,
+                    port,
+                    token.as_deref(),
+                    no_tunnel,
+                    public_url.as_deref(),
+                    tunnel_token.as_deref(),
+                    &config_path,
+                )
+                .map_err(Into::into);
+            }
             let token = serve::resolve_token(token);
+            if supervised {
+                // Foreground under a service manager (launchd/systemd): skip the
+                // launcher/worker split and the daemonize — the manager supervises us.
+                let tunnel = serve::resolve_tunnel(no_tunnel, tunnel_token, public_url)?;
+                serve::write_own_pidfile();
+                return runtime()?.block_on(async {
+                    let config = SnippetConfig::load(&config_path).await?;
+                    serve::run_serve(config, config_path, &host, port, token, tunnel)
+                        .await
+                        .map_err::<Box<dyn std::error::Error>, _>(Into::into)
+                });
+            }
             if std::env::var_os("__SNIPPET_SERVE_WORKER").is_some() {
                 // Detached worker: become a daemon, then run the server.
-                let tunnel = if no_tunnel {
-                    Tunnel::None
-                } else if let Some(t) = tunnel_token {
-                    let url = public_url
-                        .ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
-                    Tunnel::Named { token: t, url }
-                } else if let Some(u) = public_url {
-                    Tunnel::Url(u)
-                } else {
-                    Tunnel::Cloudflared
-                };
+                let tunnel = serve::resolve_tunnel(no_tunnel, tunnel_token, public_url)?;
                 serve::daemonize_self()?;
                 runtime()?.block_on(async {
                     let config = SnippetConfig::load(&config_path).await?;
