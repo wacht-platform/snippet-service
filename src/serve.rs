@@ -1589,7 +1589,10 @@ fn install_launchd(exe: &std::path::Path, args: &[String]) -> Result<(), String>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>WorkingDirectory</key>
   <string>{home_x}</string>
   <key>EnvironmentVariables</key>
