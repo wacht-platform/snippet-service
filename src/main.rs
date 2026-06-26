@@ -32,12 +32,10 @@ enum Command {
         /// Bind localhost only, no tunnel (testing — serve is otherwise remote-only).
         #[arg(long)]
         no_tunnel: bool,
-        /// Advertise this public URL instead of auto-launching a tunnel (bring-your-own).
+        /// Advertise this public URL and launch no tunnel — bring-your-own (run your
+        /// own cloudflared/named tunnel as a service, pointed at the local port).
         #[arg(long)]
         public_url: Option<String>,
-        /// Run a pre-created named cloudflared tunnel by token (needs --public-url).
-        #[arg(long)]
-        tunnel_token: Option<String>,
         /// Bind address. Use 0.0.0.0 to expose on the box's public IP for a fixed,
         /// tunnel-less URL (pair with --public-url http://<ip>:<port>). Default localhost.
         #[arg(long, default_value = "127.0.0.1")]
@@ -87,7 +85,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             token,
             no_tunnel,
             public_url,
-            tunnel_token,
             host,
             stop,
             status,
@@ -112,7 +109,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     token.as_deref(),
                     no_tunnel,
                     public_url.as_deref(),
-                    tunnel_token.as_deref(),
                     &config_path,
                 )
                 .map_err(Into::into);
@@ -122,15 +118,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Foreground under a service manager (launchd/systemd): skip the
                 // launcher/worker split and the daemonize — the manager supervises
                 // us. Settings come from serve.toml (written by `--enable`); host/
-                // port fall back to CLI defaults, explicit url/tunnel flags still
-                // win, and an absent file → plain defaults (a fresh serve).
+                // port fall back to CLI defaults, an explicit url flag still wins,
+                // and an absent file → plain defaults (a fresh serve).
                 let s = serve::ServeSettings::load();
                 let host = s.host.unwrap_or(host);
                 let port = s.port.unwrap_or(port);
                 let no_tunnel = no_tunnel || s.no_tunnel;
                 let public_url = public_url.or(s.public_url);
-                let tunnel_token = tunnel_token.or(s.tunnel_token);
-                let tunnel = serve::resolve_tunnel(no_tunnel, tunnel_token, public_url)?;
+                let tunnel = serve::resolve_tunnel(no_tunnel, public_url);
                 serve::write_own_pidfile();
                 return runtime()?.block_on(async {
                     let config = SnippetConfig::load(&config_path).await?;
@@ -141,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if std::env::var_os("__SNIPPET_SERVE_WORKER").is_some() {
                 // Detached worker: become a daemon, then run the server.
-                let tunnel = serve::resolve_tunnel(no_tunnel, tunnel_token, public_url)?;
+                let tunnel = serve::resolve_tunnel(no_tunnel, public_url);
                 serve::daemonize_self()?;
                 runtime()?.block_on(async {
                     let config = SnippetConfig::load(&config_path).await?;
@@ -151,11 +146,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             } else {
                 // Launcher: fetch cloudflared (visible), spawn the worker, print the QR.
-                let needs_cf = !no_tunnel && (tunnel_token.is_some() || public_url.is_none());
+                // Only the default quick-tunnel route needs cloudflared.
+                let needs_cf = !no_tunnel && public_url.is_none();
                 if needs_cf {
                     serve::ensure_cloudflared_foreground()?;
                 }
-                serve::launch_and_show(&host, port, &token, no_tunnel, public_url, tunnel_token, &config_path)
+                serve::launch_and_show(&host, port, &token, no_tunnel, public_url, &config_path)
                     .map_err(Into::into)
             }
         }

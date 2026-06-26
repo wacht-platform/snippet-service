@@ -165,32 +165,26 @@ impl Daemon {
 /// How the daemon is reached from outside the box.
 pub enum Tunnel {
     /// Auto-launch a cloudflared quick tunnel (random public HTTPS URL, no account).
+    /// The only tunnel serve manages itself.
     Cloudflared,
-    /// A named cloudflared tunnel by token (stable URL); the user supplies the URL.
-    Named { token: String, url: String },
-    /// Bring-your-own: just advertise this public URL (you run the tunnel).
+    /// Bring-your-own: just advertise this public URL (you run your own tunnel —
+    /// e.g. a named cloudflared run as its own service — pointed at the local port).
     Url(String),
     /// Local only (no public URL).
     None,
 }
 
 /// Map the serve CLI's tunnel flags to a `Tunnel`. Shared by the daemonizing worker
-/// and the supervised (service-manager) path.
-pub fn resolve_tunnel(
-    no_tunnel: bool,
-    tunnel_token: Option<String>,
-    public_url: Option<String>,
-) -> Result<Tunnel, String> {
-    Ok(if no_tunnel {
+/// and the supervised (service-manager) path. serve only ever runs the default quick
+/// tunnel; a stable URL means binding locally and running your own tunnel.
+pub fn resolve_tunnel(no_tunnel: bool, public_url: Option<String>) -> Tunnel {
+    if no_tunnel {
         Tunnel::None
-    } else if let Some(t) = tunnel_token {
-        let url = public_url.ok_or_else(|| "--tunnel-token requires --public-url".to_string())?;
-        Tunnel::Named { token: t, url }
     } else if let Some(u) = public_url {
         Tunnel::Url(u)
     } else {
         Tunnel::Cloudflared
-    })
+    }
 }
 
 /// Run the daemon's HTTP/WS server on `127.0.0.1:port`, bring up the tunnel, and
@@ -248,11 +242,6 @@ pub async fn run_serve(
                 let bin = ensure_cloudflared().await?;
                 let (url, child) = start_cloudflared_quick(&bin, port).await?;
                 tunnel_child = Some(child);
-                Ok(url)
-            }
-            Tunnel::Named { token: t, url } => {
-                let bin = ensure_cloudflared().await?;
-                tunnel_child = Some(start_cloudflared_named(&bin, &t).await?);
                 Ok(url)
             }
         }
@@ -332,19 +321,6 @@ fn extract_trycloudflare_url(s: &str) -> Option<String> {
         }
     }
     None
-}
-
-/// Run a pre-created named cloudflared tunnel by its token (stable URL).
-async fn start_cloudflared_named(
-    bin: &std::path::Path,
-    token: &str,
-) -> Result<tokio::process::Child, String> {
-    tokio::process::Command::new(bin)
-        .args(["tunnel", "--no-autoupdate", "run", "--token", token])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("launch cloudflared run: {e}"))
 }
 
 /// Locate a usable cloudflared: prefer one on PATH, else a cached copy under
@@ -1222,7 +1198,6 @@ pub fn launch_and_show(
     token: &str,
     no_tunnel: bool,
     public_url: Option<String>,
-    tunnel_token: Option<String>,
     config_path: &std::path::Path,
 ) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
@@ -1251,9 +1226,6 @@ pub fn launch_and_show(
     }
     if let Some(u) = &public_url {
         cmd.arg("--public-url").arg(u);
-    }
-    if let Some(t) = &tunnel_token {
-        cmd.arg("--tunnel-token").arg(t);
     }
     // The worker re-enters `serve` with this marker set and runs the server; we (the
     // launcher) stay alive to print the QR. The worker redirects output to the log.
@@ -1354,7 +1326,7 @@ pub fn write_own_pidfile() {
     let _ = std::fs::write(pid_path(), std::process::id().to_string());
 }
 
-/// Persisted serve runtime config (`~/.snippet/serve.toml`). The auto-start
+/// Persisted serve runtime config (`~/.config/snippet/serve.toml`). The auto-start
 /// service reads this on every boot rather than having the settings frozen into
 /// its plist/unit — so re-running `--enable` (or hand-editing this one file)
 /// changes how the daemon comes up without touching the service definition.
@@ -1369,8 +1341,6 @@ pub struct ServeSettings {
     pub public_url: Option<String>,
     #[serde(default)]
     pub no_tunnel: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tunnel_token: Option<String>,
 }
 
 /// XDG-style config dir, shared by the CLI and the auto-start service so both
@@ -1398,7 +1368,7 @@ impl ServeSettings {
             .unwrap_or_default()
     }
 
-    /// Persist 0600 (may hold a tunnel token).
+    /// Persist 0600.
     fn save(&self) -> Result<(), String> {
         let _ = std::fs::create_dir_all(config_dir());
         let body = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
@@ -1441,7 +1411,6 @@ pub fn install_service(
     token: Option<&str>,
     no_tunnel: bool,
     public_url: Option<&str>,
-    tunnel_token: Option<&str>,
     config_path: &std::path::Path,
 ) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -1451,7 +1420,6 @@ pub fn install_service(
         port: Some(port),
         public_url: public_url.map(str::to_string),
         no_tunnel,
-        tunnel_token: tunnel_token.map(str::to_string),
     }
     .save()?;
     if let Some(t) = token {
