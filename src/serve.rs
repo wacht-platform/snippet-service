@@ -211,6 +211,7 @@ pub async fn run_serve(
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/fs", get(browse_fs))
+        .route("/fs/file", get(read_fs_file))
         .route("/attach", get(attach_ws))
         .route("/events", get(events_ws))
         .route("/config", get(get_config))
@@ -963,6 +964,49 @@ async fn browse_fs(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Respons
         entries,
     })
     .into_response()
+}
+
+#[derive(Serialize)]
+struct FileContent {
+    path: String,
+    content: String,
+    size: u64,
+    truncated: bool,
+    binary: bool,
+}
+
+/// Cap a single file read for the mobile viewer.
+const MAX_FS_FILE_BYTES: usize = 512 * 1024;
+
+// GET /fs/file?path= — read one text file's contents (for the in-app file viewer).
+async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let Some(path) = q.path.filter(|p| !p.is_empty()).map(PathBuf::from) else {
+        return (StatusCode::BAD_REQUEST, "path required").into_response();
+    };
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => {
+            let size = m.len();
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            };
+            let truncated = bytes.len() > MAX_FS_FILE_BYTES;
+            let slice = &bytes[..bytes.len().min(MAX_FS_FILE_BYTES)];
+            // Binary if it has a NUL or isn't valid UTF-8 up to the cut.
+            let binary = slice.contains(&0) || std::str::from_utf8(slice).is_err();
+            let content = if binary {
+                String::new()
+            } else {
+                String::from_utf8_lossy(slice).to_string()
+            };
+            Json(FileContent { path: path.display().to_string(), content, size, truncated, binary }).into_response()
+        }
+        Ok(_) => (StatusCode::BAD_REQUEST, "not a file").into_response(),
+        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

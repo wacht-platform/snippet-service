@@ -254,6 +254,8 @@ pub enum LoopInput {
     Deny,
     /// Switch between Auto and Manual (approval) mode.
     SetMode(ApprovalMode),
+    /// Drop messages queued mid-run (in `pending_inputs`) before they're applied.
+    DropQueued,
     /// Cancel the run.
     Interrupt,
 }
@@ -563,6 +565,7 @@ impl CodingHarness {
                                 Some(LoopInput::Deny) => {
                                     let _ = approval_tx.send(ApprovalDecision::Deny);
                                 }
+                                Some(LoopInput::DropQueued) => pending_inputs.clear(),
                                 Some(other) => pending_inputs.push(other),
                             }
                         }
@@ -616,6 +619,7 @@ impl CodingHarness {
                                     a = &mut recover_fut => break Some(a),
                                     msg = input_rx.recv() => match msg {
                                         Some(LoopInput::Interrupt) | None => break None,
+                                        Some(LoopInput::DropQueued) => pending_inputs.clear(),
                                         Some(other) => pending_inputs.push(other),
                                     }
                                 }
@@ -703,6 +707,8 @@ impl CodingHarness {
                         }
                         // No tool call is pending while idle — nothing to approve.
                         Some(LoopInput::Approve) | Some(LoopInput::ApproveAll) | Some(LoopInput::Deny) => {}
+                        // Nothing queued while idle.
+                        Some(LoopInput::DropQueued) => {}
                         Some(LoopInput::Interrupt) | None => {
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;
@@ -868,6 +874,9 @@ impl CodingHarness {
                 state.approval_mode = mode;
                 false
             }
+            // Cancelling queued input is handled where pending_inputs lives; by the
+            // time it reaches apply_input (between turns) there's nothing to drop.
+            LoopInput::DropQueued => false,
             // Approve/Deny are only meaningful while a tool call is awaiting approval
             // inside a step; arriving here (between turns) they're stray no-ops.
             LoopInput::Approve | LoopInput::ApproveAll | LoopInput::Deny => false,
