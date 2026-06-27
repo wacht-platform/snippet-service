@@ -265,6 +265,9 @@ struct App {
     resume_selected_index: usize,
     /// In the resume picker: a `d` was pressed once; a second `d` confirms delete.
     resume_pending_delete: bool,
+    /// While renaming a saved session in the resume picker: the in-progress title
+    /// buffer (None = not renaming).
+    resume_rename: Option<String>,
     /// Theme picker cursor + the index to restore if the picker is cancelled.
     theme_selected_index: usize,
     theme_original_index: usize,
@@ -363,6 +366,7 @@ impl App {
             screen: Screen::Main,
             resume_selected_index: 0,
             resume_pending_delete: false,
+            resume_rename: None,
             theme_selected_index: 0,
             theme_original_index: 0,
             model_picker_index: 0,
@@ -568,6 +572,12 @@ impl App {
         crate::session::remove_session_files(&path);
     }
 
+    /// Set a saved conversation's title override (resume picker `r`).
+    fn rename_conversation(&self, name: &str, title: &str) {
+        let path = self.conversations_dir().join(format!("{name}.json"));
+        let _ = crate::session::set_session_title(&path, title);
+    }
+
     fn list_conversations(&self) -> Vec<(String, String)> {
         let dir = self.conversations_dir();
         let mut list = Vec::new();
@@ -592,7 +602,9 @@ impl App {
 
                     if let Ok(bytes) = std::fs::read(&path) {
                         if let Ok(state) = crate::harness::deserialize_state(&bytes) {
-                            if !state.user_request.is_empty() {
+                            if let Some(t) = state.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                                desc = t.to_string();
+                            } else if !state.user_request.is_empty() {
                                 desc = state.user_request.clone();
                             }
                         }
@@ -2233,6 +2245,42 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             return;
         }
 
+        // Rename mode owns all keys: build the title buffer until Enter/Esc.
+        if app.resume_rename.is_some() {
+            match key.code {
+                KeyCode::Char(c) => {
+                    let b = app.resume_rename.as_mut().unwrap();
+                    b.push(c);
+                    let s = b.clone();
+                    app.status = format!("Rename: {s}_  (Enter to save · Esc to cancel)");
+                }
+                KeyCode::Backspace => {
+                    let b = app.resume_rename.as_mut().unwrap();
+                    b.pop();
+                    let s = b.clone();
+                    app.status = format!("Rename: {s}_  (Enter to save · Esc to cancel)");
+                }
+                KeyCode::Enter => {
+                    let idx = app.resume_selected_index.min(convs.len() - 1);
+                    let name = convs[idx].0.clone();
+                    let title = app.resume_rename.take().unwrap_or_default();
+                    app.rename_conversation(&name, title.trim());
+                    let short: String = title.trim().chars().take(40).collect();
+                    app.status = if short.is_empty() {
+                        "Title cleared.".to_string()
+                    } else {
+                        format!("Renamed to “{short}”.")
+                    };
+                }
+                KeyCode::Esc => {
+                    app.resume_rename = None;
+                    app.status = "Rename cancelled.".to_string();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Up => {
                 app.resume_pending_delete = false;
@@ -2267,6 +2315,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     let short: String = title.chars().take(48).collect();
                     app.status = format!("Press d again to delete \"{short}\", or Esc/↑↓ to cancel.");
                 }
+            }
+            KeyCode::Char('r') => {
+                app.resume_pending_delete = false;
+                app.resume_rename = Some(String::new());
+                app.status = "Rename: type a new title, Enter to save, Esc to cancel.".to_string();
             }
             KeyCode::Enter => {
                 app.resume_pending_delete = false;
@@ -2883,7 +2936,7 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     frame.render_widget(Paragraph::new(lines).block(list_block), chunks[1]);
 
     // Render Footer
-    let footer_text = "↑/↓ scroll  ·  Enter resume selected  ·  d delete  ·  Esc go back";
+    let footer_text = "↑/↓ scroll  ·  Enter resume  ·  r rename  ·  d delete  ·  Esc go back";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer_text, subtle()))),
         chunks[2]

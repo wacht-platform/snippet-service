@@ -186,6 +186,10 @@ pub struct HarnessState {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub workspace: String,
     pub user_request: String,
+    /// User-set title override for the session list; when set it wins over the
+    /// `user_request`-derived label. Renaming (TUI/app) sets this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub messages: Vec<HarnessMessage>,
     pub events: Vec<HarnessEvent>,
     pub iterations: usize,
@@ -256,6 +260,8 @@ pub enum LoopInput {
     SetMode(ApprovalMode),
     /// Drop messages queued mid-run (in `pending_inputs`) before they're applied.
     DropQueued,
+    /// Rename the session (user-set title override).
+    SetTitle(String),
     /// Cancel the run.
     Interrupt,
 }
@@ -670,6 +676,11 @@ impl CodingHarness {
                             // the whole turn (direct edits + any lane changes + bash) can
                             // be rewound. An answer continues a turn already checkpointed.
                             if !answering {
+                                // First real request seeds the session title (app
+                                // sessions open empty, so user_request starts blank).
+                                if state.user_request.trim().is_empty() {
+                                    state.user_request = text.clone();
+                                }
                                 self.checkpoint(&mut state, &text).await;
                                 // Fresh request: re-discovery is legitimate again, and
                                 // prior-turn loop/thought state belongs to the past run.
@@ -713,6 +724,11 @@ impl CodingHarness {
                         }
                         Some(LoopInput::SetMode(mode)) => {
                             state.approval_mode = mode;
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::SetTitle(title)) => {
+                            let t = title.trim();
+                            state.title = if t.is_empty() { None } else { Some(t.to_string()) };
                             self.persist(&mut state, &lanes).await?;
                         }
                         // No tool call is pending while idle — nothing to approve.
@@ -892,6 +908,11 @@ impl CodingHarness {
             // Cancelling queued input is handled where pending_inputs lives; by the
             // time it reaches apply_input (between turns) there's nothing to drop.
             LoopInput::DropQueued => false,
+            LoopInput::SetTitle(title) => {
+                let t = title.trim();
+                state.title = if t.is_empty() { None } else { Some(t.to_string()) };
+                false
+            }
             // Approve/Deny are only meaningful while a tool call is awaiting approval
             // inside a step; arriving here (between turns) they're stray no-ops.
             LoopInput::Approve | LoopInput::ApproveAll | LoopInput::Deny => false,
@@ -1668,6 +1689,7 @@ impl CodingHarness {
             updated_at: now,
             workspace: self.context.workspace_root().display().to_string(),
             user_request,
+            title: None,
             messages,
             events,
             iterations: 0,

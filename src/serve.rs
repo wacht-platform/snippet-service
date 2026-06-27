@@ -223,6 +223,7 @@ pub async fn run_serve(
         .route("/session/rewind", post(rewind_session))
         .route("/session/exec", post(exec_in_session))
         .route("/session/delete", post(delete_session))
+        .route("/session/rename", post(rename_session))
         .with_state(daemon);
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
@@ -1081,6 +1082,37 @@ async fn delete_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
     }
     crate::session::remove_session_files(&sp);
     Json(serde_json::json!({"deleted": true})).into_response()
+}
+
+#[derive(Deserialize)]
+struct RenameReq {
+    session: String,
+    title: String,
+}
+
+// POST /session/rename {session, title} — set the session's title override. A live
+// session goes through its loop so the in-memory state stays in sync; otherwise the
+// state file is edited directly (without reviving the loop).
+async fn rename_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<RenameReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(sp) = state_path_for_id(&req.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    {
+        let sessions = d.sessions.lock().await;
+        if let Some(s) = sessions.get(&req.session) {
+            if !s.join.is_finished() {
+                let _ = s.input_tx.send(LoopInput::SetTitle(req.title.clone()));
+                return Json(serde_json::json!({"renamed": true})).into_response();
+            }
+        }
+    }
+    match crate::session::set_session_title(&sp, &req.title) {
+        Ok(()) => Json(serde_json::json!({"renamed": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

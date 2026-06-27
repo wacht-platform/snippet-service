@@ -144,12 +144,38 @@ fn meta_path(state_path: &Path) -> PathBuf {
     state_path.with_extension("meta.json")
 }
 
+/// The label for the session list: the user-set title override if present, else
+/// the first request truncated.
+fn effective_title(state: &HarnessState) -> String {
+    state
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| t.chars().take(120).collect())
+        .unwrap_or_else(|| state.user_request.chars().take(120).collect())
+}
+
 fn meta_from_state(state: &HarnessState) -> SessionMeta {
     SessionMeta {
         folder: state.workspace.clone(),
-        title: state.user_request.chars().take(120).collect(),
+        title: effective_title(state),
         status: format!("{:?}", state.status).to_lowercase(),
     }
+}
+
+/// Set (or clear, if empty) a saved session's title override and rewrite its
+/// sidecar. For sessions that aren't currently live — the daemon routes live ones
+/// through the loop so its in-memory state stays in sync.
+pub fn set_session_title(state_path: &Path, title: &str) -> Result<(), String> {
+    let bytes = std::fs::read(state_path).map_err(|e| e.to_string())?;
+    let mut state = deserialize_state(&bytes)?;
+    let t = title.trim();
+    state.title = if t.is_empty() { None } else { Some(t.to_string()) };
+    let out = crate::harness::serialize_state(&state)?;
+    std::fs::write(state_path, out).map_err(|e| e.to_string())?;
+    write_session_meta(state_path, &state);
+    Ok(())
 }
 
 /// Write the metadata sidecar for a state file (best-effort). Called on every
@@ -199,12 +225,11 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         return;
     };
     write_session_meta(path, &state);
-    let title: String = state.user_request.chars().take(120).collect();
     out.push(SessionInfo {
         id,
         folder: state.workspace.clone(),
         conversation: conversation.to_string(),
-        title,
+        title: effective_title(&state),
         status: format!("{:?}", state.status).to_lowercase(),
         last_active,
     });
