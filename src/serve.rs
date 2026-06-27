@@ -498,6 +498,9 @@ struct ListQuery {
     /// Optional: only sessions whose workspace is exactly this folder.
     #[serde(default)]
     folder: Option<String>,
+    /// Optional: cap to the N most-recent (the list is sorted last-active first).
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 // GET /sessions[?folder=] — device sessions (optionally scoped to one folder),
@@ -510,6 +513,9 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
     let mut sessions = list_device_sessions();
     if let Some(folder) = q.folder.as_deref().filter(|f| !f.is_empty()) {
         sessions.retain(|s| s.folder == folder);
+    }
+    if let Some(n) = q.limit {
+        sessions.truncate(n);
     }
     let live = d.sessions.lock().await;
     let out: Vec<serde_json::Value> = sessions
