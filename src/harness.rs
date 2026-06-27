@@ -1302,9 +1302,26 @@ impl CodingHarness {
             if DEDUP_TOOLS.contains(&tool_name.as_str())
                 && vars.executed_calls.contains(&signature)
             {
-                // Already seen this exact discovery call; silently skip it so the
-                // turn can continue instead of re-surfacing the same warning.
+                // Already ran this exact discovery call; skip re-running it. But we
+                // must STILL answer the call_id: an assistant tool_calls message with
+                // any unanswered tool_call_id makes strict providers (DeepSeek) 400
+                // ("insufficient tool messages"), and the broken turn poisons every
+                // later request until compaction.
                 dedup_hits += 1;
+                let result = json!({
+                    "schema_version": 1,
+                    "status": "ok",
+                    "data": {"skipped": "Identical discovery call already ran this turn — reuse the earlier result instead of repeating it."},
+                });
+                state.events.push(HarnessEvent::ToolResult {
+                    tool_name: tool_name.clone(),
+                    result: result.clone(),
+                });
+                state.messages.push(HarnessMessage::ToolResult {
+                    tool_call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: result,
+                });
                 continue;
             }
 

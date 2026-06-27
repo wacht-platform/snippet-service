@@ -480,7 +480,52 @@ fn build_chat_messages(messages: &[HarnessMessage]) -> Vec<ChatMessage> {
         }
     }
     out.append(&mut pending_images);
+    ensure_tool_results(&mut out);
     out
+}
+
+/// Safety net: guarantee every assistant `tool_call` is followed by a `tool`
+/// message with the matching id. Strict providers (DeepSeek) 400 with
+/// "insufficient tool messages" otherwise — and a single unanswered call poisons
+/// every later request. Heals histories where a call went unanswered for any
+/// reason (deduped, interrupted, or crashed mid-batch).
+fn ensure_tool_results(out: &mut Vec<ChatMessage>) {
+    let mut i = 0;
+    while i < out.len() {
+        let ids: Vec<String> = if out[i].role == "assistant" {
+            out[i].tool_calls.iter().map(|c| c.id.clone()).filter(|s| !s.is_empty()).collect()
+        } else {
+            Vec::new()
+        };
+        if ids.is_empty() {
+            i += 1;
+            continue;
+        }
+        // Walk the contiguous run of tool messages right after this assistant turn.
+        let mut j = i + 1;
+        let mut answered = std::collections::HashSet::new();
+        while j < out.len() && out[j].role == "tool" {
+            if let Some(id) = &out[j].tool_call_id {
+                answered.insert(id.clone());
+            }
+            j += 1;
+        }
+        // Insert a stub for each unanswered id so the run stays complete.
+        let mut at = j;
+        for id in ids {
+            if !answered.contains(&id) {
+                out.insert(
+                    at,
+                    ChatMessage::tool(
+                        &id,
+                        "{\"schema_version\":1,\"status\":\"ok\",\"data\":{\"note\":\"no result recorded for this call\"}}",
+                    ),
+                );
+                at += 1;
+            }
+        }
+        i = at;
+    }
 }
 
 fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<ChatMessage> {
