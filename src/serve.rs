@@ -612,6 +612,7 @@ struct ProfileView {
     model: String,
     has_key: bool,
     active: bool,
+    context_window: u64,
 }
 
 #[derive(Serialize)]
@@ -640,6 +641,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
                 model: m.model.clone(),
                 has_key: !m.api_key.trim().is_empty(),
                 active: active.as_deref() == Some(name.as_str()),
+                context_window: m.context_window,
             });
         }
     }
@@ -666,6 +668,9 @@ struct ProfileReq {
     reasoning_effort: Option<String>,
     #[serde(default)]
     supports_images: Option<bool>,
+    /// Model context window in tokens (drives the usage gauge + compaction point).
+    #[serde(default)]
+    context_window: Option<u64>,
     #[serde(default)]
     set_active: bool,
 }
@@ -686,7 +691,9 @@ async fn put_profile(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| c.unique_profile_key(&req.provider));
-        let existing_key = c.setups.as_ref().and_then(|m| m.get(&name)).map(|m| m.api_key.clone());
+        let existing = c.setups.as_ref().and_then(|m| m.get(&name));
+        let existing_key = existing.map(|m| m.api_key.clone());
+        let existing_ctx = existing.map(|m| m.context_window);
         let base_url = req
             .base_url
             .clone()
@@ -705,6 +712,12 @@ async fn put_profile(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
             api_key,
             reasoning_effort: req.reasoning_effort.clone().filter(|s| !s.is_empty()),
             supports_images: req.supports_images.unwrap_or(false),
+            // Explicit value wins; else keep the profile's current one; else default.
+            context_window: req
+                .context_window
+                .filter(|&n| n > 0)
+                .or(existing_ctx)
+                .unwrap_or_else(|| ModelConfig::default().context_window),
             ..ModelConfig::default()
         };
         c.upsert_profile(&name, mc);
