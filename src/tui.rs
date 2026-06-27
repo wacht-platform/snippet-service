@@ -724,6 +724,11 @@ impl App {
         self.state = None;
         self.scroll = 0;
         self.status = String::new();
+        // Re-seed the compaction counter so the new conversation's EXISTING
+        // compaction history doesn't fire the "new compaction" animation on its
+        // first tick (same as startup). Also drop any leftover animation hold.
+        self.seen_compactions = usize::MAX;
+        self.compaction_anim_until = None;
     }
 
     fn handle_slash_command(&mut self, text: &str) {
