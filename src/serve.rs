@@ -210,6 +210,7 @@ pub async fn run_serve(
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
+        .route("/sessions/counts", get(session_counts))
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
         .route("/fs/upload", post(upload_fs_file))
@@ -491,12 +492,25 @@ struct Auth {
     token: Option<String>,
 }
 
-// GET /sessions — every session on the device, with a `running` flag.
-async fn list_sessions(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) {
+#[derive(Deserialize)]
+struct ListQuery {
+    token: Option<String>,
+    /// Optional: only sessions whose workspace is exactly this folder.
+    #[serde(default)]
+    folder: Option<String>,
+}
+
+// GET /sessions[?folder=] — device sessions (optionally scoped to one folder),
+// each with a `running` flag. Metadata comes from per-session sidecars, so this
+// no longer decompresses every conversation.
+async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> Response {
+    if !d.authed(&q.token) {
         return unauthorized();
     }
-    let sessions = list_device_sessions();
+    let mut sessions = list_device_sessions();
+    if let Some(folder) = q.folder.as_deref().filter(|f| !f.is_empty()) {
+        sessions.retain(|s| s.folder == folder);
+    }
     let live = d.sessions.lock().await;
     let out: Vec<serde_json::Value> = sessions
         .into_iter()
@@ -513,6 +527,21 @@ async fn list_sessions(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
         })
         .collect();
     Json(out).into_response()
+}
+
+// GET /sessions/counts — {folder: count} across all sessions (cheap, from
+// sidecars), for the app's per-folder session badges without downloading the list.
+async fn session_counts(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for s in list_device_sessions() {
+        if !s.folder.is_empty() {
+            *counts.entry(s.folder).or_insert(0) += 1;
+        }
+    }
+    Json(counts).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1031,13 +1060,8 @@ async fn delete_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
             s.join.abort();
         }
     }
-    match std::fs::remove_file(&sp) {
-        Ok(()) => Json(serde_json::json!({"deleted": true})).into_response(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Json(serde_json::json!({"deleted": true})).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
+    crate::session::remove_session_files(&sp);
+    Json(serde_json::json!({"deleted": true})).into_response()
 }
 
 #[derive(Deserialize)]

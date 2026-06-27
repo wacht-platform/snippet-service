@@ -562,10 +562,10 @@ impl App {
         })
     }
 
-    /// Delete a saved conversation file (used by the resume picker's `d` key).
+    /// Delete a saved conversation file + its metadata sidecar (resume picker `d`).
     fn delete_conversation(&self, name: &str) {
         let path = self.conversations_dir().join(format!("{name}.json"));
-        let _ = std::fs::remove_file(path);
+        crate::session::remove_session_files(&path);
     }
 
     fn list_conversations(&self) -> Vec<(String, String)> {

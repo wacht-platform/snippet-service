@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::builtins::coding_tools;
@@ -130,13 +130,43 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
     out
 }
 
+/// Lightweight session metadata, written next to each state file so listing can
+/// skip decompressing/parsing the full conversation (the scaling path).
+#[derive(Serialize, Deserialize)]
+struct SessionMeta {
+    folder: String,
+    title: String,
+    status: String,
+}
+
+/// `<conv>.json` → `<conv>.meta.json`.
+fn meta_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("meta.json")
+}
+
+fn meta_from_state(state: &HarnessState) -> SessionMeta {
+    SessionMeta {
+        folder: state.workspace.clone(),
+        title: state.user_request.chars().take(120).collect(),
+        status: format!("{:?}", state.status).to_lowercase(),
+    }
+}
+
+/// Write the metadata sidecar for a state file (best-effort). Called on every
+/// persist so the sidecar tracks the latest title/folder/status.
+pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
+    if let Ok(s) = serde_json::to_string(&meta_from_state(state)) {
+        let _ = std::fs::write(meta_path(state_path), s);
+    }
+}
+
+/// Remove a session's state file and its metadata sidecar.
+pub fn remove_session_files(state_path: &Path) {
+    let _ = std::fs::remove_file(state_path);
+    let _ = std::fs::remove_file(meta_path(state_path));
+}
+
 fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<SessionInfo>) {
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return;
-    };
     let last_active = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
@@ -144,6 +174,31 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let id = path.strip_prefix(root).unwrap_or(path).display().to_string();
+
+    // Fast path: read the tiny sidecar, no decompression.
+    if let Some(meta) = std::fs::read(meta_path(path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
+    {
+        out.push(SessionInfo {
+            id,
+            folder: meta.folder,
+            conversation: conversation.to_string(),
+            title: meta.title,
+            status: meta.status,
+            last_active,
+        });
+        return;
+    }
+
+    // Slow path (pre-sidecar sessions): decompress once, then backfill the sidecar.
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return;
+    };
+    write_session_meta(path, &state);
     let title: String = state.user_request.chars().take(120).collect();
     out.push(SessionInfo {
         id,

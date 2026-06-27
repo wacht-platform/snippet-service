@@ -2223,6 +2223,9 @@ impl CodingHarness {
         let bytes = serialize_state(&state).map_err(ToolError::msg)?;
         tokio::fs::write(&temp_path, bytes).await?;
         tokio::fs::rename(&temp_path, path).await?;
+        // Tiny metadata sidecar so `list_device_sessions` can skip decompressing
+        // every conversation when enumerating (scales to thousands of sessions).
+        crate::session::write_session_meta(path, &state);
         Ok(())
     }
 }
