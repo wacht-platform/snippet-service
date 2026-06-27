@@ -328,6 +328,10 @@ struct LoopVars {
     /// The model's reasoning from the previous turn, surfaced back in the live
     /// context (experimental). Reset on a new user request.
     last_thought: Option<String>,
+    /// Empty completions (no reply — e.g. the agent only left a note) re-prompted
+    /// this response cycle. Capped so we ask for an answer without looping forever.
+    /// Reset on a new user message.
+    empty_reply_reprompts: usize,
 }
 
 /// What a single model step resolved to.
@@ -507,6 +511,7 @@ impl CodingHarness {
                 }
                 if had_user_msg {
                     vars.pending_signals.push(RuntimeSignal::StateIntent);
+                    vars.empty_reply_reprompts = 0;
                 }
                 if state.status != HarnessStatus::Running {
                     state.status = HarnessStatus::Running;
@@ -701,6 +706,7 @@ impl CodingHarness {
                             vars.pending_signals.push(RuntimeSignal::StateIntent);
                             state.status = HarnessStatus::Running;
                             vars.steps_since_visible = 0;
+                            vars.empty_reply_reprompts = 0;
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
                         }
@@ -1132,6 +1138,20 @@ impl CodingHarness {
                 });
                 state.events.push(HarnessEvent::AssistantText { text });
                 vars.steps_since_visible = 0;
+            }
+            // Conversation agent: don't end with NO visible reply when the agent
+            // hasn't actually answered since the last user message (e.g. it only
+            // left a note and then returned an empty turn). Re-prompt for a real
+            // reply a couple of times before giving up.
+            let empty_reply = progress_text.as_deref().map(str::trim).unwrap_or("").is_empty();
+            if conversation_mode
+                && empty_reply
+                && !replied_since_last_user(&state.events)
+                && vars.empty_reply_reprompts < 2
+            {
+                vars.empty_reply_reprompts += 1;
+                vars.pending_signals.push(RuntimeSignal::EmptyResponse);
+                return StepResult::Continue;
             }
             return StepResult::TurnEnded {
                 kind: TurnEndKind::Complete,
@@ -2469,6 +2489,20 @@ fn backoff_delay(attempt: usize, base_ms: u64, max_ms: u64) -> Duration {
     let shift = (attempt.saturating_sub(1)).min(7) as u32;
     let delay = base_ms.max(1).saturating_mul(1u64 << shift).min(max_ms.max(1));
     Duration::from_millis(delay)
+}
+
+/// Whether the agent has produced a user-visible reply (`AssistantText`) since the
+/// most recent user message — i.e. it actually answered, not just took notes / ran
+/// tools. Scans events newest-first, stopping at the last user input.
+fn replied_since_last_user(events: &[HarnessEvent]) -> bool {
+    for e in events.iter().rev() {
+        match e {
+            HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. } => return false,
+            HarnessEvent::AssistantText { .. } => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn temp_state_path(path: &Path) -> PathBuf {
