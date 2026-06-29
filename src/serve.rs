@@ -1052,7 +1052,9 @@ async fn git_status(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): J
         Ok(d) => d,
         Err(r) => return r,
     };
-    match run_git(&dir, ["status", "--porcelain=v1", "-b", "-z"]).await {
+    // -uall lists every untracked file individually (not a collapsed `dir/`), so
+    // the app can show what's inside a new folder.
+    match run_git(&dir, ["status", "--porcelain=v1", "-b", "-z", "-uall"]).await {
         Ok((0, stdout, _, _)) => Json(parse_status(&stdout)).into_response(),
         Ok((_, _, stderr, _)) => Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1145,9 +1147,13 @@ struct GitDiffReq {
     file: Option<String>,
     #[serde(default)]
     staged: bool,
+    /// Untracked (new) file: show its whole content as an add-diff via
+    /// `git diff --no-index` (plain `git diff` shows nothing for untracked files).
+    #[serde(default)]
+    untracked: bool,
 }
 
-// POST /git/diff {session, file?, staged?} — unified diff (clipped for huge diffs).
+// POST /git/diff {session, file?, staged?, untracked?} — unified diff (clipped).
 async fn git_diff(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitDiffReq>) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
@@ -1156,17 +1162,28 @@ async fn git_diff(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Jso
         Ok(d) => d,
         Err(r) => return r,
     };
-    let mut args: Vec<String> = vec!["diff".into()];
-    if req.staged {
-        args.push("--staged".into());
-    }
-    if let Some(f) = req.file.as_deref().filter(|s| !s.trim().is_empty()) {
-        args.push("--".into());
-        args.push(f.to_string());
-    }
+    let file = req.file.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let args: Vec<String> = if req.untracked {
+        let Some(f) = file else {
+            return (StatusCode::BAD_REQUEST, "untracked diff needs a file").into_response();
+        };
+        // /dev/null → file shows the entire file as additions.
+        vec!["diff".into(), "--no-index".into(), "--".into(), "/dev/null".into(), f.to_string()]
+    } else {
+        let mut a = vec!["diff".into()];
+        if req.staged {
+            a.push("--staged".into());
+        }
+        if let Some(f) = file {
+            a.push("--".into());
+            a.push(f.to_string());
+        }
+        a
+    };
     match run_git(&dir, &args).await {
         Ok((code, stdout, stderr, truncated)) => Json(serde_json::json!({
-            "ok": code == 0,
+            // `git diff --no-index` exits 1 when files differ — that's success here.
+            "ok": code == 0 || (req.untracked && code == 1),
             "patch": stdout,
             "stderr": stderr,
             "truncated": truncated,
