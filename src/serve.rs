@@ -218,6 +218,7 @@ pub async fn run_serve(
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
         .route("/fs/upload", post(upload_fs_file))
+        .route("/fs/write", post(write_fs_file))
         .route("/attach", get(attach_ws))
         .route("/events", get(events_ws))
         .route("/config", get(get_config))
@@ -1521,6 +1522,78 @@ struct FileContent {
     size: u64,
     truncated: bool,
     binary: bool,
+    /// Fingerprint of the full on-disk bytes — the editor sends it back on save
+    /// for optimistic-concurrency conflict detection.
+    hash: String,
+}
+
+/// Fast non-cryptographic fingerprint of file bytes (same scheme used elsewhere).
+fn hash_bytes(b: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    b.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+#[derive(Deserialize)]
+struct FsWriteReq {
+    path: String,
+    content: String,
+    /// If set, the write is refused when the file on disk no longer matches it
+    /// (someone — the agent or another editor — changed it since it was opened).
+    #[serde(default)]
+    prev_hash: Option<String>,
+}
+
+// POST /fs/write {path, content, prev_hash?} — atomic write (temp + rename) with
+// optimistic-concurrency conflict detection. Token-gated; UTF-8 text only.
+async fn write_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsWriteReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.path.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "path required").into_response();
+    }
+    let path = PathBuf::from(&req.path);
+    if let Some(prev) = req.prev_hash.as_deref() {
+        match std::fs::read(&path) {
+            Ok(cur) if hash_bytes(&cur) != prev => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "conflict": true,
+                        "error": "file changed on disk since you opened it — reload before saving",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"ok": false, "conflict": true, "error": "file no longer exists"})),
+                )
+                    .into_response();
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+    }
+    let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    if let Err(e) = std::fs::create_dir_all(&parent) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("create dir: {e}")).into_response();
+    }
+    let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = parent.join(format!(".{fname}.snippet.tmp"));
+    let bytes = req.content.into_bytes();
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write temp: {e}")).into_response();
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
+    }
+    Json(serde_json::json!({"ok": true, "hash": hash_bytes(&bytes), "size": bytes.len()})).into_response()
 }
 
 /// Cap a single file read for the mobile viewer.
@@ -1550,7 +1623,7 @@ async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Resp
             } else {
                 String::from_utf8_lossy(slice).to_string()
             };
-            Json(FileContent { path: path.display().to_string(), content, size, truncated, binary }).into_response()
+            Json(FileContent { path: path.display().to_string(), content, size, truncated, binary, hash: hash_bytes(&bytes) }).into_response()
         }
         Ok(_) => (StatusCode::BAD_REQUEST, "not a file").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
