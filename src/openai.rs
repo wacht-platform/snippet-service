@@ -142,21 +142,33 @@ impl OpenAiCompatibleModel {
         force_tool: bool,
         stream: bool,
     ) -> ChatRequest {
+        // Reasoning effort for o-series / gpt-5 / reasoning models. "off" or unset
+        // omits it so non-reasoning models don't 400 on the field.
+        let reasoning_effort = self
+            .config
+            .reasoning_effort
+            .as_deref()
+            .filter(|e| !e.eq_ignore_ascii_case("off") && !e.trim().is_empty())
+            .map(str::to_string);
+        // DeepSeek's THINKING mode rejects `tool_choice: required` (HTTP 400
+        // "Thinking mode does not support this tool_choice"). When thinking is on
+        // for a DeepSeek model, degrade forced tool use to `auto` — callers that
+        // force (the compaction summarizer + memory reflection) re-prompt if the
+        // model skips the tool, so correctness is preserved. Other providers
+        // (OpenAI o-series) support `required` with reasoning, so keep it there.
+        let model_l = self.config.model.to_lowercase();
+        let base_l = self.config.base_url.to_lowercase();
+        let deepseek_thinking =
+            reasoning_effort.is_some() && (model_l.contains("deepseek") || base_l.contains("deepseek"));
         ChatRequest {
             model: self.config.model.clone(),
             messages: build_chat_messages(messages),
             tools: tools.iter().map(chat_tool_from_definition).collect(),
             temperature: self.config.temperature,
-            // `required` needs tools to choose from, else providers reject it.
-            tool_choice: (force_tool && !tools.is_empty()).then_some("required"),
-            // Reasoning effort for o-series / gpt-5 / reasoning models. "off" or
-            // unset omits it so non-reasoning models don't 400 on the field.
-            reasoning_effort: self
-                .config
-                .reasoning_effort
-                .as_deref()
-                .filter(|e| !e.eq_ignore_ascii_case("off") && !e.trim().is_empty())
-                .map(str::to_string),
+            // `required` needs tools to choose from, else providers reject it; and
+            // DeepSeek thinking mode rejects it outright (see above).
+            tool_choice: (force_tool && !tools.is_empty() && !deepseek_thinking).then_some("required"),
+            reasoning_effort,
             // Opt into usage accounting on OpenRouter so cache-read tokens surface.
             usage: self
                 .config
