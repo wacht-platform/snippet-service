@@ -77,6 +77,14 @@ pub struct HarnessConfig {
     pub compact_at_pct: u8,
     /// Start fresh runs in manual approval mode (bash + file edits wait for y/n).
     pub manual_approval: bool,
+    /// Per-workspace memory: inject the `[workspace_memory]` index into the system
+    /// prefix each session and offer the memory tools.
+    pub memory_enabled: bool,
+    pub memory_index_budget_chars: usize,
+    pub memory_entry_budget_chars: usize,
+    pub memory_max_entries: usize,
+    /// Run a bounded learning/reflection pass during compaction (main session only).
+    pub memory_reflect_on_compaction: bool,
 }
 
 impl Default for HarnessConfig {
@@ -93,6 +101,11 @@ impl Default for HarnessConfig {
             context_window_tokens: 128_000,
             compact_at_pct: 85,
             manual_approval: false,
+            memory_enabled: true,
+            memory_index_budget_chars: 5_000,
+            memory_entry_budget_chars: 12_000,
+            memory_max_entries: 128,
+            memory_reflect_on_compaction: true,
         }
     }
 }
@@ -1646,6 +1659,25 @@ impl CodingHarness {
         &self,
         user_request: Option<String>,
     ) -> Result<HarnessState, ToolError> {
+        // Build the per-workspace memory block once and fold it into the system
+        // prefix, so it rides in the cached prompt and refreshes every session
+        // (including resume). Within a session it stays fixed; mid-session writes
+        // are visible to the agent only on the next start (cache-stable by design).
+        let seeded_system = {
+            let block = if self.config.memory_enabled {
+                crate::memory::render_session_memory(
+                    self.context.workspace_root(),
+                    self.config.memory_index_budget_chars,
+                )
+            } else {
+                None
+            };
+            match block {
+                Some(b) => format!("{}\n\n{}", self.config.system_prompt, b),
+                None => self.config.system_prompt.clone(),
+            }
+        };
+
         if self.config.resume
             && let Some(path) = &self.config.state_path
             && tokio::fs::try_exists(path).await?
@@ -1658,6 +1690,11 @@ impl CodingHarness {
                     // Reflect the current run's folder (backfills pre-field states).
                     state.workspace = self.context.workspace_root().display().to_string();
                     state.context_window = self.config.context_window_tokens;
+                    // Refresh the system prefix so resumed sessions pick up the
+                    // latest workspace memory (guarded: no-op if messages[0] isn't System).
+                    if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
+                        *content = seeded_system.clone();
+                    }
                     // tokio tasks don't survive a process restart; surface lost lanes.
                     for lane in state.lanes.iter_mut() {
                         if lane.status == LaneStatus::Running {
@@ -1689,7 +1726,7 @@ impl CodingHarness {
         let now = Utc::now().to_rfc3339();
         let request = user_request.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
         let mut messages = vec![HarnessMessage::System {
-            content: self.config.system_prompt.clone(),
+            content: seeded_system,
         }];
         let mut events = Vec::new();
         let (status, user_request) = match request {
@@ -2131,9 +2168,15 @@ impl CodingHarness {
         let table = match self.run_agentic_summary(model, &window_text).await {
             Ok(table) => table,
             // Model unavailable / failed — fall back to the heuristic compaction.
-            Err(_) => return self.compact_history(state, force).await,
+            // Note: the heuristic path does NOT run the memory reflection pass.
+            Err(e) => {
+                self.debug_log(&format!("agentic summary failed → heuristic compaction (memory reflection skipped): {e}"));
+                return self.compact_history(state, force).await;
+            }
         };
 
+        // Keep a copy of the fresh table to feed the memory reflection pass below.
+        let table_for_memory = table.clone();
         // The whole conversation is now the table — no verbatim tail.
         state.messages = vec![
             HarnessMessage::System { content: system_prompt },
@@ -2153,6 +2196,17 @@ impl CodingHarness {
             |e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"),
         ) {
             state.events.drain(..i);
+        }
+        // Learning pass: distill durable facts/playbooks from the just-compacted
+        // session into per-workspace memory. Main session only (lanes are read-only,
+        // avoids concurrent index writers). Non-fatal — never abort compaction.
+        if self.config.memory_enabled
+            && self.config.memory_reflect_on_compaction
+            && self.context.owner() == "main"
+        {
+            if let Err(e) = self.run_memory_reflection(model, &table_for_memory).await {
+                self.debug_log(&format!("memory reflection failed (non-fatal): {e}"));
+            }
         }
         state.last_prompt_tokens = 0;
         Ok(())
@@ -2244,6 +2298,98 @@ impl CodingHarness {
             });
         }
         Err(ToolError::msg("summarizer exhausted its turns without filling required sections"))
+    }
+
+    /// Learning pass run after compaction: a bounded worker that curates the
+    /// per-workspace memory (facts, pointers, how-to playbooks) from the freshly
+    /// compacted session table. Mirrors `run_agentic_summary`'s tool-loop shape.
+    /// Best-effort: errors are surfaced to the caller, which treats them as non-fatal.
+    async fn run_memory_reflection(
+        &self,
+        model: &mut dyn AgentModel,
+        summary_table: &str,
+    ) -> Result<(), ToolError> {
+        const MAX_TURNS: usize = 8;
+
+        let store = crate::memory::MemoryStore::for_workspace(self.context.workspace_root());
+        let index_budget = self.config.memory_index_budget_chars;
+        let entry_budget = self.config.memory_entry_budget_chars;
+        let max_entries = self.config.memory_max_entries;
+        let tools = memory_reflector_tools();
+        let ws = self.context.workspace_root().display().to_string();
+        let mut feedback = "(review the current index/entries, then extract the reusable procedure(s) and key facts)".to_string();
+        let mut writes = 0usize;
+        self.debug_log(&format!(
+            "memory reflection: start (existing entries={}, index={}b)",
+            store.list_entries().len(),
+            store.read_index().len()
+        ));
+
+        for turn in 1..=MAX_TURNS {
+            let index = store.read_index();
+            let entries = store.list_entries();
+            let user = format!(
+                "WORKSPACE: {ws}\n\nWHAT JUST HAPPENED (compacted session table):\n{summary_table}\n\nCURRENT MEMORY INDEX:\n{index}\n\nEXISTING ENTRIES: {entries}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS}. Make exactly one tool call. Extract what would help a FUTURE session here: the reusable PROCEDURE(s)/playbook(s) this session demonstrated (the steps that worked + gotchas) and any durable FACTS/pointers. Write them with memory_write and keep the index pointing to them with memory_index. Only finalize with nothing written if the session was genuinely trivial (a quick question, no real work).",
+                index = if index.trim().is_empty() { "(empty)".to_string() } else { index },
+                entries = if entries.is_empty() { "(none)".to_string() } else { entries.join(", ") },
+            );
+            let messages = vec![
+                HarnessMessage::System { content: MEMORY_REFLECTOR_SYSTEM.to_string() },
+                HarnessMessage::User { content: user },
+            ];
+            let output = model.generate(&messages, &tools, true, None).await?;
+            let Some(call) = output.calls.first() else {
+                feedback = "no tool call received — call exactly one tool".to_string();
+                continue;
+            };
+            let arg_str = |k: &str| call.arguments.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            match call.tool_name.as_str() {
+                "finalize" => {
+                    self.debug_log(&format!("memory reflection: finalized after {writes} write(s)"));
+                    return Ok(());
+                }
+                "memory_read" => {
+                    let id = arg_str("id");
+                    feedback = match store.read_entry(&id) {
+                        Ok(c) => format!("entry `{id}`:\n{c}"),
+                        Err(e) => e,
+                    };
+                }
+                "memory_write" => {
+                    let id = arg_str("id");
+                    let content = arg_str("content");
+                    feedback = match store.write_entry(&id, &content, entry_budget, max_entries) {
+                        Ok(()) => {
+                            writes += 1;
+                            self.debug_log(&format!("memory reflection: wrote entry `{id}` ({}b)", content.len()));
+                            format!("entry `{id}` saved — make sure the index points to it")
+                        }
+                        Err(e) => e,
+                    };
+                }
+                "memory_index" => {
+                    let content = arg_str("content");
+                    feedback = match store.write_index(&content, index_budget) {
+                        Ok(()) => {
+                            writes += 1;
+                            self.debug_log("memory reflection: updated index");
+                            "index updated".to_string()
+                        }
+                        Err(e) => e,
+                    };
+                }
+                "memory_delete" => {
+                    let id = arg_str("id");
+                    feedback = match store.delete_entry(&id) {
+                        Ok(()) => format!("entry `{id}` deleted"),
+                        Err(e) => e,
+                    };
+                }
+                other => feedback = format!("unknown tool `{other}`"),
+            }
+        }
+        self.debug_log(&format!("memory reflection: hit turn cap after {writes} write(s)"));
+        Ok(())
     }
 
     /// Append a line to `<state_dir>/debug.log` for tracing model/loop behaviour.
@@ -2579,6 +2725,77 @@ const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
     ("open_issues", "exact error strings and genuinely unresolved/open work", false),
     ("next_steps", "what to do next", false),
 ];
+
+const MEMORY_REFLECTOR_SYSTEM: &str = r#"# memory_reflector
+[identity]
+role = "worker that curates a coding agent's PERSISTENT, per-workspace memory"
+input = "each turn: the workspace path, a compacted table of the session that just ran, the current memory index, the existing entry ids, your last tool result, and the turn counter"
+purpose = "carry forward only what will help FUTURE sessions in THIS exact folder"
+
+[what_to_keep]
+durable = "stable facts (architecture, where things live, conventions), pointers to key files/resources, and how-to PLAYBOOKS for recurring tasks (the steps that worked + the gotchas)"
+learning = "when this session revealed a better way or a pitfall, fold it into the relevant playbook so next time is faster"
+skip = "ephemeral task state, one-off details, and anything already obvious from the code — that belongs in the session table, not here"
+
+[how]
+entries = "memory_write(id, content) stores a full note under a short kebab-case id; prefer UPDATING an existing entry over creating a near-duplicate (memory_read it first)"
+index = "memory_index(content) REPLACES the always-loaded index — keep it lean: one short line per entry (label, one-line summary, id). It must fit its budget; oversize writes are rejected, so compress"
+evidence = "exact paths, commands, and IDs verbatim; no speculation, no padding"
+
+[finalize]
+bias_to_capture = "if the session did REAL work (edits, debugging, a build, a multi-step task), it almost always demonstrated a reusable procedure or surfaced a durable fact — write at least one entry before finalizing. Finalizing with nothing written is only correct when the session was genuinely trivial."
+when = "finalize once the index and entries reflect the durable procedures/facts from this session"
+how = "call finalize (one tool call per turn)""#;
+
+fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
+    use crate::llm::NativeToolDefinition;
+    let id_schema = json!({
+        "type": "object",
+        "properties": { "id": { "type": "string", "description": "kebab-case entry id" } },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+    vec![
+        NativeToolDefinition {
+            name: "memory_read".to_string(),
+            description: "Read the full content of an existing entry by id.".to_string(),
+            input_schema: id_schema.clone(),
+        },
+        NativeToolDefinition {
+            name: "memory_write".to_string(),
+            description: "Create or replace an entry (durable fact, pointer, or how-to playbook) under a short kebab-case id.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "kebab-case entry id" },
+                    "content": { "type": "string" }
+                },
+                "required": ["id", "content"],
+                "additionalProperties": false
+            }),
+        },
+        NativeToolDefinition {
+            name: "memory_index".to_string(),
+            description: "Replace the always-loaded index — one short line per entry (label, summary, id). Must fit the budget.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "content": { "type": "string" } },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+        },
+        NativeToolDefinition {
+            name: "memory_delete".to_string(),
+            description: "Delete an entry by id (also drop its line from the index).".to_string(),
+            input_schema: id_schema,
+        },
+        NativeToolDefinition {
+            name: "finalize".to_string(),
+            description: "Finish — memory reflects all durable learnings from this session.".to_string(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+    ]
+}
 
 const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer
 [identity]

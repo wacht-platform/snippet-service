@@ -66,6 +66,20 @@ pub struct SnippetConfig {
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Per-workspace memory: the agent accumulates durable facts/playbooks per
+    /// folder under `<ws>/.snippet/memory/`, loaded into context each session and
+    /// refreshed by a reflection pass during compaction. These are scalars, so
+    /// they're declared before the `setups`/`model` tables (TOML ordering rule).
+    #[serde(default = "default_memory_enabled")]
+    pub memory_enabled: bool,
+    #[serde(default = "default_memory_index_budget_chars")]
+    pub memory_index_budget_chars: usize,
+    #[serde(default = "default_memory_entry_budget_chars")]
+    pub memory_entry_budget_chars: usize,
+    #[serde(default = "default_memory_max_entries")]
+    pub memory_max_entries: usize,
+    #[serde(default = "default_memory_reflect_on_compaction")]
+    pub memory_reflect_on_compaction: bool,
     /// Saved provider profiles, keyed by name. Multiple can be configured; one is
     /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
     /// stays valid (tables must follow top-level scalars).
@@ -128,6 +142,11 @@ impl Default for SnippetConfig {
             model: ModelConfig::default(),
             exa_api_key: None,
             theme: None,
+            memory_enabled: default_memory_enabled(),
+            memory_index_budget_chars: default_memory_index_budget_chars(),
+            memory_entry_budget_chars: default_memory_entry_budget_chars(),
+            memory_max_entries: default_memory_max_entries(),
+            memory_reflect_on_compaction: default_memory_reflect_on_compaction(),
         }
     }
 }
@@ -422,6 +441,26 @@ fn default_compact_at_pct() -> u8 {
 }
 
 fn default_cache_prompt() -> bool {
+    true
+}
+
+fn default_memory_enabled() -> bool {
+    true
+}
+
+fn default_memory_index_budget_chars() -> usize {
+    5_000
+}
+
+fn default_memory_entry_budget_chars() -> usize {
+    12_000
+}
+
+fn default_memory_max_entries() -> usize {
+    128
+}
+
+fn default_memory_reflect_on_compaction() -> bool {
     true
 }
 

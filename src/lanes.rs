@@ -203,7 +203,7 @@ async fn run_lane(
             exa_api_key: exa_api_key.clone(),
             ..HarnessConfig::default()
         },
-        coding_tools(exa_api_key),
+        coding_tools(exa_api_key, crate::memory::MemoryLimits::read_only()),
         context,
     );
     let outcome = harness

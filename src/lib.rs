@@ -9,6 +9,7 @@ pub mod harness;
 pub mod inline;
 pub mod lanes;
 pub mod llm;
+pub mod memory;
 pub mod meta;
 pub mod openai;
 pub mod outline;

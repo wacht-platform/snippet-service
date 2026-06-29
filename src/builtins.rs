@@ -10,7 +10,7 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 const MAX_INLINE_CHARS: usize = 60_000;
 
-pub fn coding_tools(exa_api_key: Option<String>) -> ToolRegistry {
+pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLimits) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.insert(ReadFileTool);
     registry.insert(ReadImageTool);
@@ -28,6 +28,20 @@ pub fn coding_tools(exa_api_key: Option<String>) -> ToolRegistry {
     if let Some(key) = exa_api_key.filter(|k| !k.trim().is_empty()) {
         registry.insert(WebSearchTool { api_key: key.clone() });
         registry.insert(WebReadTool { api_key: key });
+    }
+    // Per-workspace memory: read is offered whenever enabled; writes only to the
+    // main session (lanes are read-only, so they can't clobber the shared index).
+    if memory.enabled {
+        registry.insert(MemoryReadTool);
+        if memory.writable {
+            registry.insert(MemoryWriteTool {
+                entry_budget: memory.entry_budget_chars,
+                max_entries: memory.max_entries,
+            });
+            registry.insert(MemoryIndexTool { index_budget: memory.index_budget_chars });
+            registry.insert(MemoryDeleteTool);
+            registry.insert(MemoryRuleTool);
+        }
     }
     registry
 }
@@ -1538,5 +1552,200 @@ impl Tool for WebReadTool {
             "published_date": result.get("publishedDate").and_then(Value::as_str),
             "text": text,
         })))
+    }
+}
+
+// --- Per-workspace memory tools (store: crate::memory::MemoryStore) -----------
+
+fn memory_store(ctx: &ToolContext) -> crate::memory::MemoryStore {
+    crate::memory::MemoryStore::for_workspace(ctx.workspace_root())
+}
+
+/// Memory writes are confined to the main session; lanes share the workspace and
+/// would otherwise race on the single index file.
+fn require_main_owner(ctx: &ToolContext) -> Result<(), ToolError> {
+    if ctx.owner() != "main" {
+        return Err(ToolError::msg(
+            "workspace memory is read-only in delegated lanes — only the main session can write it",
+        ));
+    }
+    Ok(())
+}
+
+pub struct MemoryReadTool;
+
+#[derive(Debug, Deserialize)]
+struct MemoryReadArgs {
+    id: String,
+}
+
+#[async_trait]
+impl Tool for MemoryReadTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "memory_read".to_string(),
+            description: "Load the full content of a workspace memory entry by id (entry ids are listed in the [workspace_memory] index).".to_string(),
+            input_schema: object_schema(
+                json!({ "id": {"type": "string", "description": "entry id, e.g. build-and-test"} }),
+                &["id"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: MemoryReadArgs = expect_object("memory_read", arguments)?;
+        let content = memory_store(ctx).read_entry(&args.id).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({ "id": args.id, "content": content })))
+    }
+}
+
+pub struct MemoryWriteTool {
+    pub entry_budget: usize,
+    pub max_entries: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryWriteArgs {
+    id: String,
+    content: String,
+}
+
+#[async_trait]
+impl Tool for MemoryWriteTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "memory_write".to_string(),
+            description: "Create or replace a workspace memory ENTRY — a durable fact, pointer, or \
+                how-to playbook for THIS folder that should help future sessions. Use a short \
+                kebab-case id. After writing, add or update a one-line pointer to it via \
+                memory_index so it stays discoverable."
+                .to_string(),
+            input_schema: object_schema(
+                json!({
+                    "id": {"type": "string", "description": "kebab-case slug, e.g. build-and-test"},
+                    "content": {"type": "string"}
+                }),
+                &["id", "content"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        require_main_owner(ctx)?;
+        let args: MemoryWriteArgs = expect_object("memory_write", arguments)?;
+        memory_store(ctx)
+            .write_entry(&args.id, &args.content, self.entry_budget, self.max_entries)
+            .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({ "id": args.id, "saved": true })))
+    }
+}
+
+pub struct MemoryIndexTool {
+    pub index_budget: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryIndexArgs {
+    content: String,
+}
+
+#[async_trait]
+impl Tool for MemoryIndexTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "memory_index".to_string(),
+            description: "Replace the always-loaded workspace memory INDEX. Keep it lean: one short \
+                line per entry — a label, a one-line summary, and the entry id to load with \
+                memory_read. Must fit the index budget (oversize writes are rejected)."
+                .to_string(),
+            input_schema: object_schema(
+                json!({ "content": {"type": "string"} }),
+                &["content"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        require_main_owner(ctx)?;
+        let args: MemoryIndexArgs = expect_object("memory_index", arguments)?;
+        memory_store(ctx).write_index(&args.content, self.index_budget).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({ "saved": true })))
+    }
+}
+
+pub struct MemoryDeleteTool;
+
+#[derive(Debug, Deserialize)]
+struct MemoryDeleteArgs {
+    id: String,
+}
+
+#[async_trait]
+impl Tool for MemoryDeleteTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "memory_delete".to_string(),
+            description: "Delete a workspace memory entry by id. Also remove its line from the index with memory_index.".to_string(),
+            input_schema: object_schema(
+                json!({ "id": {"type": "string"} }),
+                &["id"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        require_main_owner(ctx)?;
+        let args: MemoryDeleteArgs = expect_object("memory_delete", arguments)?;
+        memory_store(ctx).delete_entry(&args.id).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({ "id": args.id, "deleted": true })))
+    }
+}
+
+pub struct MemoryRuleTool;
+
+#[derive(Debug, Deserialize)]
+struct MemoryRuleArgs {
+    scope: String,
+    content: String,
+}
+
+#[async_trait]
+impl Tool for MemoryRuleTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "memory_rule".to_string(),
+            description: "Set the STANDING RULES that are always loaded into context and must be \
+                followed. `scope`='global' applies in EVERY workspace — use it for cross-cutting \
+                user preferences (e.g. \"when writing emails, don't use dashes\"); 'workspace' \
+                applies to THIS folder only. Replaces the rule list at that scope, so include all \
+                rules you want kept; pass empty content to clear. Keep them short and imperative; \
+                never store secrets here."
+                .to_string(),
+            input_schema: object_schema(
+                json!({
+                    "scope": {"type": "string", "enum": ["global", "workspace"]},
+                    "content": {"type": "string", "description": "the full rule list for this scope (e.g. markdown bullets)"}
+                }),
+                &["scope", "content"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        require_main_owner(ctx)?;
+        let args: MemoryRuleArgs = expect_object("memory_rule", arguments)?;
+        let store = match args.scope.as_str() {
+            "global" => crate::memory::MemoryStore::global(),
+            "workspace" => memory_store(ctx),
+            other => {
+                return Err(ToolError::msg(format!(
+                    "scope must be 'global' or 'workspace', got '{other}'"
+                )));
+            }
+        };
+        store
+            .write_rules(&args.content, crate::memory::rules_budget())
+            .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({ "scope": args.scope, "saved": true })))
     }
 }

@@ -41,6 +41,11 @@ pub fn start_session(
     let manual_approval = config.manual_approval;
     let context_window_tokens = model_config.context_window;
     let compact_at_pct = model_config.compact_at_pct;
+    let memory_enabled = config.memory_enabled;
+    let memory_index_budget_chars = config.memory_index_budget_chars;
+    let memory_entry_budget_chars = config.memory_entry_budget_chars;
+    let memory_max_entries = config.memory_max_entries;
+    let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
     let factory: ModelFactory = {
         let mc = model_config.clone();
         Arc::new(move || mc.build_model())
@@ -59,9 +64,23 @@ pub fn start_session(
                 context_window_tokens,
                 compact_at_pct,
                 manual_approval,
+                memory_enabled,
+                memory_index_budget_chars,
+                memory_entry_budget_chars,
+                memory_max_entries,
+                memory_reflect_on_compaction,
                 ..HarnessConfig::default()
             },
-            coding_tools(exa_api_key),
+            coding_tools(
+                exa_api_key,
+                crate::memory::MemoryLimits {
+                    enabled: memory_enabled,
+                    writable: true,
+                    index_budget_chars: memory_index_budget_chars,
+                    entry_budget_chars: memory_entry_budget_chars,
+                    max_entries: memory_max_entries,
+                },
+            ),
             context,
         );
         harness
