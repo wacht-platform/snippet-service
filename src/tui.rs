@@ -1570,6 +1570,11 @@ impl App {
     /// paste is inserted inline. (Screenshots come via Ctrl+V — see
     /// `paste_clipboard_image` — not through here.)
     fn input_paste(&mut self, text: &str) {
+        // Dragging a file/screenshot into the terminal pastes its path — attach it.
+        if let Some(path) = Self::dropped_file(text) {
+            self.attach_dropped(&path);
+            return;
+        }
         let text = text.replace('\r', "");
         let lines = text.lines().count().max(1);
         if lines > 1 || text.chars().count() > 200 {
@@ -1634,6 +1639,59 @@ impl App {
             self.input_insert(c);
         }
         // On send the chip expands to the temp path; the agent reads it via read_image.
+        self.pasted_blocks.push((marker, dest.display().to_string()));
+        self.status = String::new();
+    }
+
+    /// If `text` is exactly one existing file path (as a terminal pastes when you
+    /// drag a file in — possibly quoted or with backslash-escaped spaces), return it.
+    fn dropped_file(text: &str) -> Option<std::path::PathBuf> {
+        let mut s = text.trim();
+        if s.len() >= 2
+            && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+        {
+            s = &s[1..s.len() - 1];
+        }
+        if s.is_empty() {
+            return None;
+        }
+        let unescaped = s.replace("\\ ", " ").replace("\\\\", "\\");
+        let p = std::path::PathBuf::from(&unescaped);
+        if p.is_file() {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    /// Copy a dropped file into the workspace scratch dir and add a chip that
+    /// expands to its path on send (images → read_image, others → read).
+    fn attach_dropped(&mut self, src: &std::path::Path) {
+        let is_img = matches!(
+            src.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "heic" | "heif")
+        );
+        let subdir = if is_img { "images" } else { "files" };
+        let dir = self.options.config.workspace.join(".snippet").join("scratch").join(subdir);
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            self.status = format!("couldn't attach: {error}");
+            return;
+        }
+        let fname = src.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let dest = dir.join(format!("{}-{fname}", uuid::Uuid::new_v4().simple()));
+        if let Err(error) = std::fs::copy(src, &dest) {
+            self.status = format!("couldn't attach {fname}: {error}");
+            return;
+        }
+        let n = self.pasted_blocks.len() + 1;
+        let marker = if is_img {
+            format!("[Image #{n}: {fname}]")
+        } else {
+            format!("[File #{n}: {fname}]")
+        };
+        for c in marker.chars() {
+            self.input_insert(c);
+        }
         self.pasted_blocks.push((marker, dest.display().to_string()));
         self.status = String::new();
     }
@@ -3446,7 +3504,7 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
     match event {
         HarnessEvent::UserInput { text } => user_lines(text, width),
         HarnessEvent::Steer { text } => {
-            marker_block("↳ ", "steer  ", accent(), text, width)
+            marker_block("↳ ", "steer  ", accent(), &strip_attachment_markers(text), width)
         }
         HarnessEvent::AssistantText { text } => render_prose(text, width),
         HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", muted(), entry, width),
@@ -3520,13 +3578,30 @@ fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
     }
 }
 
+/// Hide the app's `[attached image — …]` / `[attached file — …]` markers from the
+/// rendered transcript — they're instructions for the agent, never shown to users.
+fn strip_attachment_markers(text: &str) -> String {
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !((t.starts_with("[attached image —") || t.starts_with("[attached file —")) && t.ends_with(']'))
+        })
+        .collect();
+    kept.join("\n").trim_end().to_string()
+}
+
 fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let mut cleaned = strip_attachment_markers(text);
+    if cleaned.is_empty() && text.contains("[attached ") {
+        cleaned = "📎 attachment".to_string();
+    }
     let prefix = Span::styled(
         "› ",
         Style::default().fg(blue()).add_modifier(Modifier::BOLD),
     );
     let mut lines = Vec::new();
-    for (i, seg) in wrap_one(text, width.saturating_sub(2)).into_iter().enumerate() {
+    for (i, seg) in wrap_one(&cleaned, width.saturating_sub(2)).into_iter().enumerate() {
         if i == 0 {
             lines.push(Line::from(vec![
                 prefix.clone(),

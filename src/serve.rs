@@ -221,6 +221,7 @@ pub async fn run_serve(
         .route("/fs/write", post(write_fs_file))
         .route("/fs/mkdir", post(make_fs_dir))
         .route("/fs/delete", post(delete_fs_path))
+        .route("/fs/download", get(download_fs_file))
         .route("/attach", get(attach_ws))
         .route("/events", get(events_ws))
         .route("/config", get(get_config))
@@ -1673,6 +1674,33 @@ async fn delete_fs_path(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
     match res {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")).into_response(),
+    }
+}
+
+// GET /fs/download?path= — stream a file's raw bytes (any type) for the app to
+// save to the device. Token-gated.
+const MAX_FS_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
+async fn download_fs_file(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let Some(path) = q.path.filter(|p| !p.is_empty()).map(PathBuf::from) else {
+        return (StatusCode::BAD_REQUEST, "path required").into_response();
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if meta.is_dir() {
+        return (StatusCode::BAD_REQUEST, "path is a directory").into_response();
+    }
+    if meta.len() > MAX_FS_DOWNLOAD_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "file too large to download").into_response();
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
