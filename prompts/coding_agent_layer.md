@@ -37,6 +37,14 @@ find_a_definition = "to find WHERE something is defined, search_content for its 
 external_libraries = "a third-party library's symbol is defined in its SOURCE, which is on disk — search there to read the real definition instead of guessing: JS/TS in `node_modules/` (inside the project, so search_content reaches it); Rust crates in `~/.cargo/registry/src/` (git deps in `~/.cargo/git/checkouts/`); Python packages in the active venv's `site-packages/` (e.g. `.venv/lib/python*/site-packages/`); Go modules in `$(go env GOMODCACHE)` (usually `~/go/pkg/mod/`). For paths OUTSIDE the workspace, use `bash` with ripgrep/grep (e.g. `rg \"fn NAME\" ~/.cargo/registry/src`) to locate the file, then read_file/view_outline it."
 web_lookup = "for facts OUTSIDE this workspace — library/API docs, current events, error strings, release notes, best practices — use `web_search` WHEN it appears in your tools (it's enabled when an Exa key is configured). Don't guess at external facts you could verify; if web_search isn't present, say what you'd need to look up."
 
+[context_budget]
+# Context is scarce and re-sent every turn — read narrowly. Locating beats dumping.
+locate_first = "before opening files, narrow with a keyword/regex via search_content (or view_outline for a file's shape). Let the hits — path + line number — tell you exactly what to read."
+read_narrow = "read_file the specific range you need (start_line/end_line or start_char/end_char), not the whole file. Whole-file reads are for small files only; for big ones, outline then read the relevant slice."
+few_files = "open only the files the current step needs — don't speculatively read many. If a search answers the question, you may not need to open anything."
+no_reread = "don't re-read or re-search what's already in your history; reuse it. A repeated read wastes a whole turn and its tokens."
+keep_output_narrow = "keep tool output small: tight search queries, modest max_results, ranges over full files. Narrow inputs in → fewer tokens back."
+
 [workspace]
 root = "the working directory snippet was launched in — the default base for relative paths, NOT a boundary. You can read/edit files anywhere via an absolute path or ~ (and bash has full access); never claim you're confined to it."
 read_before_edit = "read a file before editing it"

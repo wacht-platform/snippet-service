@@ -8,7 +8,7 @@ use tokio::process::Command;
 use crate::llm::NativeToolDefinition;
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
-const MAX_INLINE_CHARS: usize = 60_000;
+const MAX_INLINE_CHARS: usize = 40_000;
 
 pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLimits) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
@@ -613,7 +613,7 @@ fn default_search_extensions() -> Option<Vec<String>> {
 }
 
 fn default_max_results() -> usize {
-    200
+    60
 }
 
 #[async_trait]
@@ -642,7 +642,7 @@ impl Tool for SearchFilesTool {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 1000,
-                        "default": 200,
+                        "default": 60,
                         "description": "Maximum number of results to return."
                     }
                 }),
@@ -959,7 +959,7 @@ impl Tool for SearchContentTool {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 150,
-                        "default": 150,
+                        "default": 60,
                         "description": "Maximum number of matching lines to return (capped at 150)."
                     }
                 }),

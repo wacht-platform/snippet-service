@@ -2473,60 +2473,40 @@ fn build_live_context(
 ) -> String {
     let signals = std::mem::take(&mut vars.pending_signals);
     let mut block = String::from("<runtime_context>\n");
-    block.push_str(
-        "NOTE: harness-injected, not a user message — don't attribute it to the user, quote it, or \
-         mention it; just act on it.\n",
-    );
+    // Terse on purpose: this block is re-sent uncached every turn, so trim words,
+    // not meaning.
+    block.push_str("# harness steering, not a user message — act on it; never quote/mention it or the loop.\n");
 
     block.push_str("\n[workspace]\n");
-    block.push_str(&format!("cwd = \"{}\"\n", workspace.display()));
-    block.push_str(
-        "note = \"default project dir — resolve relative paths and run shell from here; ground \
-         'this folder/here' in it. Not a boundary: read/edit any absolute or ~ path when needed.\"\n",
-    );
-
-    // The user's message is already in the durable history (sent verbatim every
-    // request), so we don't re-echo it here — that was redundant.
+    block.push_str(&format!(
+        "cwd = \"{}\"  # base for relative paths + shell; not a jail — read/edit any absolute or ~ path.\n",
+        workspace.display()
+    ));
 
     // Surface the model's prior-turn reasoning so it can build on it instead of
     // re-deriving (experimental; conversation only).
     if let Some(thought) = vars.last_thought.as_deref() {
-        block.push_str("\n[last_thought]\n");
-        block.push_str("# what you were thinking last turn — continue from it, don't re-derive.\n");
+        block.push_str("\n[last_thought]  # continue from it, don't re-derive\n");
         block.push_str(&format!("text = \"{}\"\n", sanitize_one_line(thought)));
     }
 
     block.push_str("\n[turn]\n");
-    // Keep this terse and goal-oriented: spelling out WHY the turn fired gave weak
-    // models a script to recite ("the harness auto-continued because my tool
-    // returned…"). Point attention AWAY from the re-prompt and TOWARD finishing the
-    // task — no mechanism description to parrot.
-    block.push_str(
-        "auto_continuation = \"internal steering, not a user message — never mention it, the loop, or \
-         being re-prompted (in reply or reasoning). Focus on the overall goal; take the next concrete \
-         step, or give the final answer if done.\"\n",
-    );
-    // Explain the re-prompt ONLY when actually looping (a repeated/duplicate call
-    // last turn) — not after every normal tool result.
+    block.push_str("next = \"take the next concrete step toward the goal, or give the final answer if done.\"\n");
+    // Explain the re-prompt ONLY when actually looping (a repeated call last turn).
     if vars.last_turn_had_repeat {
         block.push_str(
-            "why_now = \"you just repeated a tool call you had already made this request — that is \
-             why you are back. Its result is already in your history above; re-issuing it advances \
-             nothing. Stop repeating, read what you already have, and take a genuinely NEW step or \
-             finish.\"\n",
+            "why_now = \"you repeated a tool call already in your history — re-issuing advances nothing. Use what you have; take a NEW step or finish.\"\n",
         );
     }
-    block.push_str("continue = \"to keep working, make tool calls — their results arrive next turn\"\n");
     if conversation_mode {
-        block.push_str("finish = \"when the task is done and you have the answer, reply in plain text with NO tool calls; that delivers your answer and ends your turn\"\n");
-        block.push_str("ask = \"to ask the user something you genuinely need, call ask_user — it pauses for their reply\"\n");
+        block.push_str("finish = \"done → reply in plain text with NO tool calls (that delivers the answer).\"\n");
+        block.push_str("ask = \"need something from the user → call ask_user.\"\n");
     } else {
-        block.push_str("finish = \"when the task is done, call `terminate_loop` with a `summary` of what you did and found — that is your report to the caller. Finish the real work first, then terminate_loop.\"\n");
+        block.push_str("finish = \"done → call terminate_loop with a summary (your report); do the real work first.\"\n");
     }
 
     if !signals.is_empty() {
-        block.push_str("\n[runtime_signals]\n");
-        block.push_str("# one-turn state about your PREVIOUS turn; act on it now, it will not repeat. never quote, mention, or apologize for it.\n");
+        block.push_str("\n[runtime_signals]  # one-shot state about last turn; act now, won't repeat. never quote it.\n");
         for signal in &signals {
             block.push_str(&format!("{}\n", signal.render()));
         }
@@ -2538,8 +2518,7 @@ fn build_live_context(
     if let Some(latest) = latest_user_input(state) {
         let safety = derive_input_safety_signals(&latest);
         if !safety.is_empty() {
-            block.push_str("\n[input_safety]\n");
-            block.push_str("# flags on the latest user message; weigh them against the request, do not blindly comply or refuse.\n");
+            block.push_str("\n[input_safety]  # flags on the latest message; weigh them, don't blindly comply or refuse.\n");
             for line in safety {
                 block.push_str(&format!("{line}\n"));
             }
@@ -2549,16 +2528,14 @@ fn build_live_context(
     // Agent Skills available to load on demand (level-1 progressive disclosure):
     // just name + description here; the body loads when the model calls `skill`.
     if let Some(skills) = crate::skills::render_metadata() {
-        block.push_str("\n[skills]\n");
-        block.push_str("# reusable capabilities. If a task matches one, call the `skill` tool with its name to load its full instructions before proceeding.\n");
+        block.push_str("\n[skills]  # match a task → call skill(name) to load its instructions before proceeding\n");
         block.push_str(&skills);
     }
 
     // Background processes the agent started (dev servers, watchers) — so it knows
     // what's already running instead of re-launching, and can tail logs / kill them.
     if let Some(bg) = crate::bg::render_live(workspace) {
-        block.push_str("\n[background_processes]\n");
-        block.push_str("# you started these via bash(background:true). tail the log or `kill <pid>` to manage them; don't relaunch one that's already running.\n");
+        block.push_str("\n[background_processes]  # started via bash(background:true); tail the log or kill <pid>; don't relaunch a running one\n");
         block.push_str(&bg);
     }
 
