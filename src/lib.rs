@@ -22,6 +22,7 @@ pub mod session;
 pub mod shell_guard;
 pub mod sse;
 pub mod signals;
+pub mod skills;
 pub mod tools;
 pub mod tui;
 

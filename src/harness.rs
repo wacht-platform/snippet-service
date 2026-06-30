@@ -2546,6 +2546,14 @@ fn build_live_context(
         }
     }
 
+    // Agent Skills available to load on demand (level-1 progressive disclosure):
+    // just name + description here; the body loads when the model calls `skill`.
+    if let Some(skills) = crate::skills::render_metadata() {
+        block.push_str("\n[skills]\n");
+        block.push_str("# reusable capabilities. If a task matches one, call the `skill` tool with its name to load its full instructions before proceeding.\n");
+        block.push_str(&skills);
+    }
+
     // Background processes the agent started (dev servers, watchers) — so it knows
     // what's already running instead of re-launching, and can tail logs / kill them.
     if let Some(bg) = crate::bg::render_live(workspace) {

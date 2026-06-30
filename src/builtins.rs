@@ -24,6 +24,7 @@ pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLi
     registry.insert(ViewOutlineTool);
     registry.insert(CodeMapTool);
     registry.insert(BashTool);
+    registry.insert(SkillTool);
     // web_search / web_read are offered only when an Exa key is configured.
     if let Some(key) = exa_api_key.filter(|k| !k.trim().is_empty()) {
         registry.insert(WebSearchTool { api_key: key.clone() });
@@ -1810,5 +1811,46 @@ impl Tool for MemoryRuleTool {
             .write_rules(&args.content, crate::memory::rules_budget())
             .map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({ "scope": args.scope, "saved": true })))
+    }
+}
+
+pub struct SkillTool;
+
+#[derive(Debug, Deserialize)]
+struct SkillArgs {
+    name: String,
+}
+
+#[async_trait]
+impl Tool for SkillTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "skill".to_string(),
+            description:
+                "Load an Agent Skill by name — returns its full instructions (SKILL.md) and a list of its bundled files. Call this when a task matches one of the skills listed under [skills]. After loading, follow the instructions; read any referenced files with read_file and run bundled scripts with bash (their contents stay out of context until you do)."
+                    .to_string(),
+            input_schema: object_schema(
+                json!({
+                    "name": {"type": "string", "description": "The skill name, exactly as listed under [skills]."}
+                }),
+                &["name"],
+            ),
+        }
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: SkillArgs = expect_object("skill", arguments)?;
+        match crate::skills::load(&args.name) {
+            Some((sk, body, files)) => Ok(ToolResult::success(json!({
+                "name": sk.name,
+                "dir": sk.dir.display().to_string(),
+                "instructions": body,
+                "bundled_files": files,
+            }))),
+            None => Err(ToolError::msg(format!(
+                "no such skill: {} (see the [skills] list)",
+                args.name
+            ))),
+        }
     }
 }
