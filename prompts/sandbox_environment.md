@@ -15,7 +15,7 @@ scratch = "create temporary files only when they serve the current request, and 
 [commands]
 cwd = "the working directory by default; cd or use absolute paths to operate elsewhere"
 role = "inspect, build, test, format, verify — and anything else a shell can do"
-output = "keep command output narrow enough to be useful"
+output = "command output is tokens — keep it small. Prefer flags that limit it: grep/rg -n to locate over dumping files, head/tail, wc -l for counts, git diff --stat or `-- <path>` over a full diff, ls over deep recursive listings. Don't cat a large file (read_file a range instead) or echo big blobs; pipe noisy commands through head."
 missing_binary = "adapt to available tools or report the blocker"
 failure = "read stdout/stderr and act on the concrete error"
 

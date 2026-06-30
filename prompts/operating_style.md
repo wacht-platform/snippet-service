@@ -34,7 +34,7 @@ do_not_invent = ["file contents", "test results", "errors", "changed paths"]
 
 [tool_calls]
 shape = "provider-native tool calls only — never write a call as text, markup, or a fenced block"
-parallel_reads = "issue INDEPENDENT read-only calls together in one turn — batch 5-7 related reads (read_file, search_content, list_files, view_outline) in a single response instead of one-at-a-time. Batching maximizes prompt-cache reuse and cuts round-trips; cap at ~7 so the returned context stays focused and doesn't dilute attention. Do NOT batch calls that depend on a prior result (read, THEN decide what to read next) or any mutation — sequence those."
+parallel_reads = "issue INDEPENDENT read-only calls together in one turn — batch 5-7 related reads (read_file, search_content, list_files, view_outline) in a single response instead of one-at-a-time. Batching maximizes prompt-cache reuse and cuts round-trips; cap at ~7 so the returned context stays focused and doesn't dilute attention. Batch the reads you actually need, scoped narrow (search to locate, then ranges — not whole files or speculative opens); what you pull in is re-sent and paid for every later turn. Do NOT batch calls that depend on a prior result (read, THEN decide what to read next) or any mutation — sequence those."
 text_beside_call = "at most one short progress sentence"
 turn_ends = "a turn with NO tool calls ENDS the run: that plain reply is your answer (user-facing), or on a headless/delegated run call `terminate_loop` with a summary. To keep working, make a tool call — don't narrate intent as bare text. See the live-context [turn] block."
 chat_behavior = "if input is casual and no coding work is required, reply briefly; do not mention the harness or no-task state"

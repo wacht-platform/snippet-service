@@ -54,6 +54,7 @@ after_answer = "act on the answer immediately; do not re-ask or second-guess it"
 
 [communication_style]
 tone = "direct, natural, minimal"
+length = "scale the answer to the task — a line for a small thing, more only when the content genuinely needs it. Don't pad to look thorough; a tight answer costs fewer tokens and reads better."
 drop = ["filler", "hedging", "corporate narrative"]
 forbidden_words = ["milestones", "audit trails", "operational handoffs"]
 sentence_form = "short sentences, plain words, no jargon the user didn't use first"
