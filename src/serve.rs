@@ -37,6 +37,36 @@ struct LiveSession {
     profile: Option<String>,
 }
 
+/// Apply a named profile's model to a workspace config (no-op if the name isn't a
+/// known setup). Shared by the session open / resume / attach paths.
+fn apply_profile(cfg: &mut SnippetConfig, profile: &Option<String>) {
+    if let Some(name) = profile.as_ref() {
+        if let Some(m) = cfg.setups.as_ref().and_then(|s| s.get(name)).cloned() {
+            cfg.model = m;
+            cfg.active_setup = Some(name.clone());
+        }
+    }
+}
+
+/// Resolve a session id to its (state_path, workspace_dir), reading and validating
+/// the persisted state. Returns the error Response to send on any failure.
+fn load_session_workspace(session: &str) -> Result<(PathBuf, PathBuf), Response> {
+    let Some(sp) = state_path_for_id(session) else {
+        return Err((StatusCode::NOT_FOUND, "no such session").into_response());
+    };
+    let Ok(bytes) = std::fs::read(&sp) else {
+        return Err((StatusCode::NOT_FOUND, "session state unreadable").into_response());
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response());
+    };
+    let folder = PathBuf::from(&state.workspace);
+    if state.workspace.is_empty() || !folder.is_dir() {
+        return Err((StatusCode::BAD_REQUEST, "session workspace missing").into_response());
+    }
+    Ok((sp, folder))
+}
+
 struct Daemon {
     config: std::sync::Mutex<SnippetConfig>,
     config_path: PathBuf,
@@ -99,12 +129,7 @@ impl Daemon {
         let cfg = {
             let c = self.config.lock().unwrap();
             let mut w = c.for_workspace(folder);
-            if let Some(name) = profile.as_ref() {
-                if let Some(m) = w.setups.as_ref().and_then(|s| s.get(name)).cloned() {
-                    w.model = m;
-                    w.active_setup = Some(name.clone());
-                }
-            }
+            apply_profile(&mut w, &profile);
             w
         };
         let handle = start_session(&cfg, sp.clone(), None, true, None);
@@ -159,12 +184,7 @@ impl Daemon {
         let cfg = {
             let c = self.config.lock().unwrap();
             let mut w = c.for_workspace(folder);
-            if let Some(name) = profile.as_ref() {
-                if let Some(m) = w.setups.as_ref().and_then(|s| s.get(name)).cloned() {
-                    w.model = m;
-                    w.active_setup = Some(name.clone());
-                }
-            }
+            apply_profile(&mut w, &profile);
             w
         };
         let handle = start_session(&cfg, sp.clone(), Some(text), true, None);
@@ -640,12 +660,7 @@ async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req):
     let cfg = {
         let c = d.config.lock().unwrap();
         let mut w = c.for_workspace(folder);
-        if let Some(name) = profile.as_ref() {
-            if let Some(m) = w.setups.as_ref().and_then(|s| s.get(name)).cloned() {
-                w.model = m;
-                w.active_setup = Some(name.clone());
-            }
-        }
+        apply_profile(&mut w, &profile);
         w
     };
 
@@ -864,19 +879,10 @@ async fn set_session_model(State(d): State<Shared>, Query(a): Query<Auth>, Json(
             None => return (StatusCode::NOT_FOUND, "no such profile").into_response(),
         }
     };
-    let Some(sp) = state_path_for_id(&req.session) else {
-        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    let (sp, folder) = match load_session_workspace(&req.session) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    let Ok(bytes) = std::fs::read(&sp) else {
-        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
-    };
-    let folder = PathBuf::from(&state.workspace);
-    if state.workspace.is_empty() || !folder.is_dir() {
-        return (StatusCode::BAD_REQUEST, "session workspace missing").into_response();
-    }
     let cfg = {
         let c = d.config.lock().unwrap();
         let mut w = c.for_workspace(folder);
@@ -915,19 +921,10 @@ async fn rewind_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let Some(sp) = state_path_for_id(&req.session) else {
-        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    let (_sp, workspace) = match load_session_workspace(&req.session) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    let Ok(bytes) = std::fs::read(&sp) else {
-        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
-    };
-    if state.workspace.is_empty() {
-        return (StatusCode::BAD_REQUEST, "session workspace missing").into_response();
-    }
-    let workspace = PathBuf::from(&state.workspace);
     let checkpoint = req.checkpoint.clone();
     let result =
         tokio::task::spawn_blocking(move || crate::checkpoint::restore(&workspace, &checkpoint)).await;
@@ -950,19 +947,10 @@ async fn exec_in_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(re
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let Some(sp) = state_path_for_id(&req.session) else {
-        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    let (_sp, dir) = match load_session_workspace(&req.session) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    let Ok(bytes) = std::fs::read(&sp) else {
-        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
-    };
-    let dir = PathBuf::from(&state.workspace);
-    if state.workspace.is_empty() || !dir.is_dir() {
-        return (StatusCode::BAD_REQUEST, "session workspace missing").into_response();
-    }
     if req.command.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty command").into_response();
     }
@@ -982,17 +970,8 @@ async fn exec_in_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(re
             .into_response()
         }
     };
-    fn clip(b: &[u8]) -> (String, bool) {
-        const MAX: usize = 20_000;
-        let s = String::from_utf8_lossy(b);
-        if s.chars().count() > MAX {
-            (s.chars().take(MAX).collect::<String>() + "\u{2026}", true)
-        } else {
-            (s.into_owned(), false)
-        }
-    }
-    let (stdout, t1) = clip(&out.stdout);
-    let (stderr, t2) = clip(&out.stderr);
+    let (stdout, t1) = clip_output(&out.stdout, 20_000);
+    let (stderr, t2) = clip_output(&out.stderr, 20_000);
     Json(serde_json::json!({
         "exit_code": out.status.code().unwrap_or(-1),
         "stdout": stdout,
@@ -1031,11 +1010,11 @@ fn resolve_session_dir(session: &str) -> Result<PathBuf, Response> {
     Err((StatusCode::NOT_FOUND, "no such session or directory").into_response())
 }
 
-fn clip_git(b: &[u8]) -> (String, bool) {
-    const MAX: usize = 100_000;
+/// Lossy-decode bytes and clip to `max` chars, returning (text, was_truncated).
+fn clip_output(b: &[u8], max: usize) -> (String, bool) {
     let s = String::from_utf8_lossy(b);
-    if s.chars().count() > MAX {
-        (s.chars().take(MAX).collect::<String>() + "\u{2026}", true)
+    if s.chars().count() > max {
+        (s.chars().take(max).collect::<String>() + "\u{2026}", true)
     } else {
         (s.into_owned(), false)
     }
@@ -1056,8 +1035,8 @@ where
         .output();
     match tokio::time::timeout(Duration::from_secs(120), fut).await {
         Ok(Ok(o)) => {
-            let (so, t1) = clip_git(&o.stdout);
-            let (se, t2) = clip_git(&o.stderr);
+            let (so, t1) = clip_output(&o.stdout, 100_000);
+            let (se, t2) = clip_output(&o.stderr, 100_000);
             Ok((o.status.code().unwrap_or(-1), so, se, t1 || t2))
         }
         Ok(Err(e)) => Err(format!("failed to run git (is it installed?): {e}")),
