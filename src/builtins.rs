@@ -783,9 +783,10 @@ impl Tool for BashTool {
             let log = std::fs::File::create(&log_path)
                 .map_err(|e| ToolError::msg(format!("background log: {e}")))?;
             let log_err = log.try_clone().map_err(|e| ToolError::msg(e.to_string()))?;
-            // Detached: redirect to the log, don't await, drop the handle (tokio
-            // reaps the orphan when it exits). It keeps running across tool calls.
-            let child = Command::new("sh")
+            // Detached: redirect to the log; keep running across tool calls. A
+            // detached task awaits it only to record its exit status (the process
+            // itself isn't blocked on us).
+            let mut child = Command::new("sh")
                 .arg("-lc")
                 .arg(&args.command)
                 .current_dir(ctx.workspace_root())
@@ -795,8 +796,15 @@ impl Tool for BashTool {
                 .stderr(Stdio::from(log_err))
                 .spawn()?;
             let pid = child.id().unwrap_or(0);
-            drop(child);
             crate::bg::record(ctx.workspace_root(), &id, &args.command, pid).ok();
+            let status_path = crate::bg::status_path(ctx.workspace_root(), &id);
+            tokio::spawn(async move {
+                let code = match child.wait().await {
+                    Ok(s) => s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+                    Err(_) => "?".to_string(),
+                };
+                let _ = std::fs::write(status_path, code);
+            });
             return Ok(ToolResult::success(json!({
                 "command": args.command,
                 "background": true,

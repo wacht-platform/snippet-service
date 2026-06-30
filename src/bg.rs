@@ -15,6 +15,11 @@ pub fn log_path(workspace: &Path, id: &str) -> PathBuf {
     bg_dir(workspace).join(format!("{id}.log"))
 }
 
+/// Exit-status file: written when the process exits (the code, or "signal"/"?").
+pub fn status_path(workspace: &Path, id: &str) -> PathBuf {
+    bg_dir(workspace).join(format!("{id}.status"))
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct BgEntry {
     pub id: String,
@@ -81,8 +86,17 @@ pub fn render_live(workspace: &Path) -> Option<String> {
         if pid_alive(entry.pid) {
             lines.push(format!("- [{}] `{}` — pid {}, running. log: {}", entry.id, cmd, entry.pid, entry.log));
         } else {
-            lines.push(format!("- [{}] `{}` — exited. log: {}", entry.id, cmd, entry.log));
-            let _ = std::fs::remove_file(&path); // surfaced once; drop the record
+            // Exited: report the captured exit status, then drop the record (keep the log).
+            let code = std::fs::read_to_string(status_path(workspace, &entry.id)).ok().map(|s| s.trim().to_string());
+            let status = match code.as_deref() {
+                Some("0") => "exited (ok)".to_string(),
+                Some("signal") => "killed".to_string(),
+                Some(c) if !c.is_empty() => format!("exited (code {c})"),
+                _ => "exited".to_string(),
+            };
+            lines.push(format!("- [{}] `{}` — {}. log: {}", entry.id, cmd, status, entry.log));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(status_path(workspace, &entry.id));
         }
     }
     if lines.is_empty() {
