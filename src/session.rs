@@ -120,6 +120,32 @@ pub fn state_path_for_id(id: &str) -> Option<PathBuf> {
     canon.starts_with(&canon_root).then_some(canon)
 }
 
+/// Sidecar file holding a session's per-conversation model override (the profile
+/// name), kept next to its state file so it survives daemon restarts.
+fn profile_sidecar(state_path: &std::path::Path) -> PathBuf {
+    PathBuf::from(format!("{}.profile", state_path.display()))
+}
+
+/// Read a session's persisted model override, if one was set.
+pub fn read_session_profile(state_path: &std::path::Path) -> Option<String> {
+    let s = std::fs::read_to_string(profile_sidecar(state_path)).ok()?;
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Persist a session's model override (or clear it when `profile` is empty).
+pub fn write_session_profile(state_path: &std::path::Path, profile: &str) {
+    let path = profile_sidecar(state_path);
+    if profile.trim().is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = std::fs::write(path, profile.trim());
+}
+
 /// Enumerate every session persisted on the device (across all workspaces).
 pub fn list_device_sessions() -> Vec<SessionInfo> {
     let root = workspaces_root();

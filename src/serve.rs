@@ -23,7 +23,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{LoopInput, deserialize_state};
-use crate::session::{list_device_sessions, start_session, state_path_for_id};
+use crate::session::{
+    list_device_sessions, read_session_profile, start_session, state_path_for_id,
+    write_session_profile,
+};
 
 struct LiveSession {
     input_tx: UnboundedSender<LoopInput>,
@@ -91,9 +94,18 @@ impl Daemon {
         if state.workspace.is_empty() || !folder.is_dir() {
             return None;
         }
+        // Re-apply any persisted per-conversation model override; else the default.
+        let profile = read_session_profile(&sp);
         let cfg = {
             let c = self.config.lock().unwrap();
-            c.for_workspace(folder)
+            let mut w = c.for_workspace(folder);
+            if let Some(name) = profile.as_ref() {
+                if let Some(m) = w.setups.as_ref().and_then(|s| s.get(name)).cloned() {
+                    w.model = m;
+                    w.active_setup = Some(name.clone());
+                }
+            }
+            w
         };
         let handle = start_session(&cfg, sp.clone(), None, true, None);
         let tx = handle.input_tx.clone();
@@ -103,7 +115,7 @@ impl Daemon {
                 input_tx: handle.input_tx,
                 join: handle.join,
                 state_path: sp.clone(),
-                profile: None,
+                profile,
             },
         );
         Some((tx, sp))
@@ -127,7 +139,10 @@ impl Daemon {
         let (sp, profile) = match sessions.get(id) {
             Some(s) => (s.state_path.clone(), s.profile.clone()),
             None => match state_path_for_id(id) {
-                Some(sp) => (sp, None),
+                Some(sp) => {
+                    let p = read_session_profile(&sp);
+                    (sp, p)
+                }
                 None => return,
             },
         };
@@ -543,7 +558,10 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
         .map(|s| {
             let live_s = live.get(&s.id);
             let running = s.status == "running";
-            let profile = live_s.and_then(|l| l.profile.clone());
+            // Live override if running, else the persisted sidecar (or none → default).
+            let profile = live_s
+                .and_then(|l| l.profile.clone())
+                .or_else(|| state_path_for_id(&s.id).and_then(|p| read_session_profile(&p)));
             let mut v = serde_json::to_value(&s).unwrap_or_default();
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("running".into(), serde_json::json!(running));
@@ -597,10 +615,32 @@ async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req):
     if !folder.is_dir() {
         return (StatusCode::BAD_REQUEST, "not a directory").into_response();
     }
+    // Resolve the state path first (needs the workspace's base config).
+    let base_state = {
+        let c = d.config.lock().unwrap();
+        c.for_workspace(folder.clone()).state_path
+    };
+    // Default → the folder's single `state.json`. New conversation → a fresh
+    // `conversations/<uuid>.json` (started blank), so the folder's existing
+    // session(s) are preserved and a new one appears in the list.
+    let (sp, resume) = if req.new_conversation {
+        let name = uuid::Uuid::new_v4().to_string();
+        let path = base_state
+            .parent()
+            .map(|p| p.join("conversations").join(format!("{name}.json")))
+            .unwrap_or_else(|| base_state.clone());
+        (path, false)
+    } else {
+        (base_state.clone(), req.resume)
+    };
+    let id = sp.strip_prefix(workspaces_root()).unwrap_or(&sp).display().to_string();
+    // Effective model: an explicit request wins; otherwise reuse any persisted
+    // per-conversation override (when resuming); otherwise the global default.
+    let profile = req.profile.clone().or_else(|| read_session_profile(&sp));
     let cfg = {
         let c = d.config.lock().unwrap();
-        let mut w = c.for_workspace(folder.clone());
-        if let Some(name) = req.profile.as_ref() {
+        let mut w = c.for_workspace(folder);
+        if let Some(name) = profile.as_ref() {
             if let Some(m) = w.setups.as_ref().and_then(|s| s.get(name)).cloned() {
                 w.model = m;
                 w.active_setup = Some(name.clone());
@@ -608,32 +648,20 @@ async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req):
         }
         w
     };
-    // Default → the folder's single `state.json`. New conversation → a fresh
-    // `conversations/<uuid>.json` (started blank), so the folder's existing
-    // session(s) are preserved and a new one appears in the list.
-    let (sp, resume) = if req.new_conversation {
-        let name = uuid::Uuid::new_v4().to_string();
-        let path = cfg
-            .state_path
-            .parent()
-            .map(|p| p.join("conversations").join(format!("{name}.json")))
-            .unwrap_or_else(|| cfg.state_path.clone());
-        (path, false)
-    } else {
-        (cfg.state_path.clone(), req.resume)
-    };
-    let id = sp.strip_prefix(workspaces_root()).unwrap_or(&sp).display().to_string();
 
     let mut sessions = d.sessions.lock().await;
     if !sessions.contains_key(&id) {
         let handle = start_session(&cfg, sp.clone(), None, resume, None);
+        if let Some(name) = req.profile.as_ref() {
+            write_session_profile(&sp, name); // persist an explicit override
+        }
         sessions.insert(
             id.clone(),
             LiveSession {
                 input_tx: handle.input_tx,
                 join: handle.join,
                 state_path: sp.clone(),
-                profile: req.profile.clone(),
+                profile,
             },
         );
     }
@@ -859,6 +887,7 @@ async fn set_session_model(State(d): State<Shared>, Query(a): Query<Auth>, Json(
         old.join.abort();
     }
     let handle = start_session(&cfg, sp.clone(), None, true, None);
+    write_session_profile(&sp, &req.profile); // persist so it survives restart
     sessions.insert(
         req.session.clone(),
         LiveSession {
