@@ -220,6 +220,7 @@ pub async fn run_serve(
         .route("/fs/upload", post(upload_fs_file))
         .route("/fs/write", post(write_fs_file))
         .route("/fs/mkdir", post(make_fs_dir))
+        .route("/fs/delete", post(delete_fs_path))
         .route("/attach", get(attach_ws))
         .route("/events", get(events_ws))
         .route("/config", get(get_config))
@@ -1569,6 +1570,12 @@ struct FsMkdirReq {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct FsDeleteReq {
+    /// Absolute path of the file or directory to delete (dirs are removed recursively).
+    path: String,
+}
+
 // POST /fs/write {path, content, prev_hash?} — atomic write (temp + rename) with
 // optimistic-concurrency conflict detection. Token-gated; UTF-8 text only.
 async fn write_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsWriteReq>) -> Response {
@@ -1640,6 +1647,33 @@ async fn make_fs_dir(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("create dir: {e}")).into_response();
     }
     Json(serde_json::json!({"ok": true, "path": path.to_string_lossy()})).into_response()
+}
+
+// POST /fs/delete {path} — remove a file or directory (recursive). Token-gated.
+async fn delete_fs_path(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsDeleteReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.path.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "path required").into_response();
+    }
+    let path = PathBuf::from(&req.path);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Json(serde_json::json!({"ok": true, "already_gone": true})).into_response();
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let res = if meta.is_dir() {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match res {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("delete: {e}")).into_response(),
+    }
 }
 
 /// Cap a single file read for the mobile viewer.
