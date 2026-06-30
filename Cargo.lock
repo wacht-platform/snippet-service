@@ -1907,6 +1907,7 @@ dependencies = [
  "ignore",
  "qrcode",
  "ratatui",
+ "regex",
  "reqwest",
  "rmp-serde",
  "serde",

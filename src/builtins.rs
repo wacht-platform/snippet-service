@@ -909,6 +909,13 @@ fn truncate_output_to(value: Value, max_bytes: usize) -> Result<ToolResult, Tool
 
 pub struct SearchContentTool;
 
+/// How `search_content` matches a line: a compiled regex (default), or a literal
+/// substring fallback when the query isn't a valid regex.
+enum Matcher {
+    Regex(regex::Regex),
+    Literal(String),
+}
+
 #[derive(Debug, Deserialize)]
 struct SearchContentArgs {
     query: String,
@@ -927,12 +934,12 @@ impl Tool for SearchContentTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "search_content".to_string(),
-            description: "Search for a query string within the contents of workspace text files recursively.".to_string(),
+            description: "Search file contents recursively with a regular expression (RE2 syntax: `|` alternation, `.*`, `\\b`, char classes, etc.). Case-insensitive by default. An invalid regex is treated as a literal substring.".to_string(),
             input_schema: object_schema(
                 json!({
                     "query": {
                         "type": "string",
-                        "description": "The exact substring or pattern to search for."
+                        "description": "Regular expression to search for (RE2 syntax). Use `\\b`, `|`, `.*`, char classes, etc. Plain text works too (it's a valid regex). An invalid regex falls back to a literal substring match."
                     },
                     "path": {
                         "type": "string",
@@ -964,12 +971,20 @@ impl Tool for SearchContentTool {
         let args: SearchContentArgs = expect_object("search_content", arguments)?;
         let search_root = ctx.resolve_workspace_path(&args.path)?;
         let workspace_root = ctx.workspace_root().to_path_buf();
-        let query = if args.case_sensitive {
-            args.query.clone()
-        } else {
-            args.query.to_lowercase()
+        // Treat the query as a regex (models write grep-style patterns: `a|b`, `.*`,
+        // `\b`). Fall back to a literal substring if it doesn't compile.
+        let matcher = match regex::RegexBuilder::new(&args.query)
+            .case_insensitive(!args.case_sensitive)
+            .build()
+        {
+            Ok(re) => Matcher::Regex(re),
+            Err(_) => Matcher::Literal(if args.case_sensitive {
+                args.query.clone()
+            } else {
+                args.query.to_lowercase()
+            }),
         };
-        
+
         let ext_set: Option<std::collections::HashSet<String>> = args.extensions.as_ref().map(|exts| {
             exts.iter()
                 .map(|e| e.trim_start_matches('.').to_lowercase())
@@ -1000,12 +1015,14 @@ impl Tool for SearchContentTool {
                 };
                 let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
                 for (idx, line) in content.lines().enumerate() {
-                    let line_to_check = if case_sensitive {
-                        line.to_string()
-                    } else {
-                        line.to_lowercase()
+                    let hit = match &matcher {
+                        Matcher::Regex(re) => re.is_match(line),
+                        Matcher::Literal(q) => {
+                            let l = if case_sensitive { line.to_string() } else { line.to_lowercase() };
+                            l.contains(q)
+                        }
                     };
-                    if line_to_check.contains(&query) {
+                    if hit {
                         // Truncate long/minified lines so a big match set can't blow
                         // past the inline ceiling and get spilled.
                         let trimmed = line.trim();
