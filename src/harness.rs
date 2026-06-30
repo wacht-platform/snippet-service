@@ -99,7 +99,7 @@ impl Default for HarnessConfig {
             recovery_max_ms: 30_000,
             exa_api_key: None,
             context_window_tokens: 128_000,
-            compact_at_pct: 85,
+            compact_at_pct: 90,
             manual_approval: false,
             memory_enabled: true,
             memory_index_budget_chars: 5_000,

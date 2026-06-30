@@ -437,7 +437,7 @@ fn default_context_window() -> u64 {
 }
 
 fn default_compact_at_pct() -> u8 {
-    85
+    90
 }
 
 fn default_cache_prompt() -> bool {
