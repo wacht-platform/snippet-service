@@ -1007,21 +1007,26 @@ async fn exec_in_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(re
 // take the daemon's git_write lock so a user action can't race the agent's edits.
 
 /// Resolve a session id to its on-disk workspace folder, or an error response.
+/// Resolve the directory git should run in. The value is either a session id
+/// (→ that session's workspace) or, for git on a plain folder with no session
+/// (e.g. the file explorer), a direct directory path.
 fn resolve_session_dir(session: &str) -> Result<PathBuf, Response> {
-    let Some(sp) = state_path_for_id(session) else {
-        return Err((StatusCode::NOT_FOUND, "no such session").into_response());
-    };
-    let Ok(bytes) = std::fs::read(&sp) else {
-        return Err((StatusCode::NOT_FOUND, "session state unreadable").into_response());
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response());
-    };
-    let dir = PathBuf::from(&state.workspace);
-    if state.workspace.is_empty() || !dir.is_dir() {
-        return Err((StatusCode::BAD_REQUEST, "session workspace missing").into_response());
+    if let Some(sp) = state_path_for_id(session) {
+        if let Ok(bytes) = std::fs::read(&sp) {
+            if let Ok(state) = deserialize_state(&bytes) {
+                let dir = PathBuf::from(&state.workspace);
+                if !state.workspace.is_empty() && dir.is_dir() {
+                    return Ok(dir);
+                }
+            }
+        }
     }
-    Ok(dir)
+    // Not a session id → treat it as a folder path (no-session git).
+    let dir = PathBuf::from(session);
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    Err((StatusCode::NOT_FOUND, "no such session or directory").into_response())
 }
 
 fn clip_git(b: &[u8]) -> (String, bool) {
