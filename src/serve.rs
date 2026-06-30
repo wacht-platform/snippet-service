@@ -219,6 +219,7 @@ pub async fn run_serve(
         .route("/fs/file", get(read_fs_file))
         .route("/fs/upload", post(upload_fs_file))
         .route("/fs/write", post(write_fs_file))
+        .route("/fs/mkdir", post(make_fs_dir))
         .route("/attach", get(attach_ws))
         .route("/events", get(events_ws))
         .route("/config", get(get_config))
@@ -1562,6 +1563,12 @@ struct FsWriteReq {
     prev_hash: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct FsMkdirReq {
+    /// Absolute path of the new directory to create.
+    path: String,
+}
+
 // POST /fs/write {path, content, prev_hash?} — atomic write (temp + rename) with
 // optimistic-concurrency conflict detection. Token-gated; UTF-8 text only.
 async fn write_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsWriteReq>) -> Response {
@@ -1611,6 +1618,28 @@ async fn write_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req)
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
     }
     Json(serde_json::json!({"ok": true, "hash": hash_bytes(&bytes), "size": bytes.len()})).into_response()
+}
+
+// POST /fs/mkdir {path} — create a new directory (token-gated).
+async fn make_fs_dir(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsMkdirReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.path.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "path required").into_response();
+    }
+    let path = PathBuf::from(&req.path);
+    if path.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"ok": false, "error": "a file or folder with that name already exists"})),
+        )
+            .into_response();
+    }
+    if let Err(e) = std::fs::create_dir_all(&path) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("create dir: {e}")).into_response();
+    }
+    Json(serde_json::json!({"ok": true, "path": path.to_string_lossy()})).into_response()
 }
 
 /// Cap a single file read for the mobile viewer.
