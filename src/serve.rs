@@ -1736,6 +1736,10 @@ struct UploadReq {
     data_base64: String,
     #[serde(default)]
     name: Option<String>,
+    /// When set, save into this directory under the original [name] (instead of
+    /// a temp dir with a generated name) — used by the file-explorer upload.
+    #[serde(default)]
+    dir: Option<String>,
 }
 
 // POST /fs/upload {data_base64, name?} — save an uploaded file (e.g. an image the
@@ -1753,18 +1757,44 @@ async fn upload_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
     if bytes.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty upload").into_response();
     }
-    let ext = req
-        .name
-        .as_deref()
-        .and_then(|n| std::path::Path::new(n).extension())
-        .and_then(|e| e.to_str())
-        .filter(|e| e.len() <= 5)
-        .unwrap_or("png");
-    let dir = std::env::temp_dir().join("snippet-uploads");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    let path = dir.join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()));
+    // Targeted upload into a directory under the original filename, or (default)
+    // a temp dir with a generated name (for chat attachments).
+    let path = if let Some(dir) = req.dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let name = req
+            .name
+            .as_deref()
+            .and_then(|n| std::path::Path::new(n).file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty());
+        let Some(name) = name else {
+            return (StatusCode::BAD_REQUEST, "name required when uploading to a directory").into_response();
+        };
+        let p = PathBuf::from(dir).join(name);
+        if p.exists() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"ok": false, "error": "a file with that name already exists"})),
+            )
+                .into_response();
+        }
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        p
+    } else {
+        let ext = req
+            .name
+            .as_deref()
+            .and_then(|n| std::path::Path::new(n).extension())
+            .and_then(|e| e.to_str())
+            .filter(|e| e.len() <= 5)
+            .unwrap_or("png");
+        let dir = std::env::temp_dir().join("snippet-uploads");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        dir.join(format!("{}.{ext}", uuid::Uuid::new_v4().simple()))
+    };
     if let Err(e) = std::fs::write(&path, &bytes) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
