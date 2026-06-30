@@ -481,19 +481,60 @@ impl App {
         self.input_clear();
     }
 
-    /// Activate a saved profile: persist, restart the loop with it, return to Main.
+    /// The config the current chat's loop should run with: the global config, but
+    /// with this conversation's persisted per-chat model override applied (if any).
+    /// Same precedence as the serve daemon, so TUI and app agree.
+    fn effective_config(&self) -> SnippetConfig {
+        let mut cfg = self.options.config.clone();
+        if let Some(name) = crate::session::read_session_profile(&self.active_state_path) {
+            if let Some(m) = cfg.setups.as_ref().and_then(|s| s.get(&name)).cloned() {
+                cfg.model = m;
+                cfg.active_setup = Some(name);
+            }
+        }
+        cfg
+    }
+
+    /// Set a profile as the GLOBAL default (the model new chats use). A chat that
+    /// has its own per-chat override keeps it (override wins), so we only restart
+    /// the current loop when it has no override.
     fn activate_profile(&mut self, name: &str) {
         if self.options.config.activate(name) {
             let _ = self.save_config_file();
-            let resumed = self.restart_loop_for_config();
+            let has_override = crate::session::read_session_profile(&self.active_state_path).is_some();
+            let resumed = if has_override { false } else { self.restart_loop_for_config() };
             self.screen = Screen::Main;
-            self.status = format!(
-                "✓ {} · {}{}",
-                self.options.config.model.provider,
-                self.options.config.model.model,
-                if resumed { " · resumed" } else { "" },
-            );
+            self.status = if has_override {
+                format!(
+                    "✓ global default · {} · {} (this chat keeps its own model)",
+                    self.options.config.model.provider, self.options.config.model.model,
+                )
+            } else {
+                format!(
+                    "✓ {} · {}{}",
+                    self.options.config.model.provider,
+                    self.options.config.model.model,
+                    if resumed { " · resumed" } else { "" },
+                )
+            };
         }
+    }
+
+    /// Set a profile for THIS chat only (a persisted per-conversation override),
+    /// without changing the global default. Restarts the chat's loop with it.
+    fn activate_profile_local(&mut self, name: &str) {
+        let Some(model) = self.options.config.setups.as_ref().and_then(|m| m.get(name)).cloned() else {
+            return;
+        };
+        crate::session::write_session_profile(&self.active_state_path, name);
+        let resumed = self.restart_loop_for_config();
+        self.screen = Screen::Main;
+        self.status = format!(
+            "✓ this chat · {} · {}{}",
+            model.provider,
+            model.model,
+            if resumed { " · resumed" } else { "" },
+        );
     }
 
     /// Close the login form, optionally restoring the pre-login config (Esc).
@@ -1893,8 +1934,9 @@ impl App {
         self.status = String::new();
 
         crate::llm::StreamBuffer::clear(&self.stream);
+        let cfg = self.effective_config();
         let handle = crate::session::start_session(
-            &self.options.config,
+            &cfg,
             self.active_state_path.clone(),
             initial,
             resume,
@@ -2236,7 +2278,19 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     app.open_profile_editor(None);
                 } else {
                     let name = names[app.profiles_selected_index].clone();
-                    app.activate_profile(&name);
+                    // Enter sets the model for THIS chat (local override); with no live
+                    // chat there's nothing to scope to, so fall back to the global default.
+                    if app.agent_alive() {
+                        app.activate_profile_local(&name);
+                    } else {
+                        app.activate_profile(&name);
+                    }
+                }
+            }
+            KeyCode::Char('g') => {
+                if app.profiles_selected_index < total {
+                    let name = names[app.profiles_selected_index].clone();
+                    app.activate_profile(&name); // global default for all chats
                 }
             }
             KeyCode::Char('a') => app.open_profile_editor(None),
@@ -2897,7 +2951,7 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑/↓ move  ·  ↵ activate  ·  e edit  ·  a add  ·  d delete  ·  Esc",
+            "↑/↓ move  ·  ↵ this chat  ·  g global default  ·  e edit  ·  a add  ·  d delete  ·  Esc",
             subtle(),
         ))),
         chunks[2],
