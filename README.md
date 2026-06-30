@@ -145,3 +145,24 @@ appends the conversation layer for the user-facing thread.
 Sessions persist under `~/.snippet/workspaces/<workspace>/` (loop state +
 conversation history + checkpoints), which is what lets both the TUI and `serve`
 list, resume, and attach to the same sessions.
+
+## Mobile / desktop client
+
+[`snippet-mobile`](https://github.com/wacht-platform/snippet-mobile) is a Flutter
+client (Android + macOS) that drives a `serve` daemon over the tunnel — browse
+files, view diffs, run commands, and chat with the agent from another device.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). `cargo build`
+should pass before opening a PR.
+
+## License
+
+Copyright (C) 2026 snipextt.
+
+This program is free software: licensed under the **GNU Affero General Public
+License v3.0 or later** (AGPL-3.0-or-later). It comes with NO WARRANTY. Because
+`serve` can run as a network service, the AGPL's network-use clause applies: if
+you run a modified version for others over a network, you must offer them its
+source. See [LICENSE](LICENSE) for the full text.
