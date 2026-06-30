@@ -679,6 +679,7 @@ struct ProfileView {
     has_key: bool,
     active: bool,
     context_window: u64,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -708,6 +709,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
                 has_key: !m.api_key.trim().is_empty(),
                 active: active.as_deref() == Some(name.as_str()),
                 context_window: m.context_window,
+                reasoning_effort: m.reasoning_effort.clone(),
             });
         }
     }
