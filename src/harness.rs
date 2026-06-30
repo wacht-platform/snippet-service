@@ -2546,6 +2546,14 @@ fn build_live_context(
         }
     }
 
+    // Background processes the agent started (dev servers, watchers) — so it knows
+    // what's already running instead of re-launching, and can tail logs / kill them.
+    if let Some(bg) = crate::bg::render_live(workspace) {
+        block.push_str("\n[background_processes]\n");
+        block.push_str("# you started these via bash(background:true). tail the log or `kill <pid>` to manage them; don't relaunch one that's already running.\n");
+        block.push_str(&bg);
+    }
+
     block.push_str("</runtime_context>\n");
     block
 }

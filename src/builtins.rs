@@ -741,6 +741,10 @@ struct BashArgs {
     max_lines: Option<usize>,
     #[serde(default = "default_max_bytes")]
     max_bytes: usize,
+    /// Run detached (long-lived servers/watchers): returns immediately, output goes
+    /// to a log file, and it's tracked in the live background-process list.
+    #[serde(default)]
+    background: bool,
 }
 
 fn default_max_bytes() -> usize {
@@ -753,14 +757,15 @@ impl Tool for BashTool {
         NativeToolDefinition {
             name: "bash".to_string(),
             description:
-                "Run a shell command in the workspace. Keep output narrow and deterministic. Use max_lines or max_bytes to limit output."
+                "Run a shell command in the workspace. Keep output narrow and deterministic. Use max_lines or max_bytes to limit output. Set background=true for long-lived processes (dev servers, watchers): it returns immediately, redirects output to a log file, and tracks the process in the live background-process list — tail the log or `kill <pid>` to manage it."
                     .to_string(),
             input_schema: object_schema(
                 json!({
                     "command": {"type": "string"},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800},
                     "max_lines": {"type": "integer", "minimum": 1, "description": "Limit stdout/stderr output to this many lines. If omitted, uses max_bytes."},
-                    "max_bytes": {"type": "integer", "minimum": 1, "default": 20000, "description": "Hard limit on output size in bytes."}
+                    "max_bytes": {"type": "integer", "minimum": 1, "default": 20000, "description": "Hard limit on output size in bytes."},
+                    "background": {"type": "boolean", "default": false, "description": "Run detached and return immediately; for servers/watchers that should keep running. Output goes to a log file; the process shows up in the background-process list."}
                 }),
                 &["command"],
             ),
@@ -769,6 +774,39 @@ impl Tool for BashTool {
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: BashArgs = expect_object("bash", arguments)?;
+
+        if args.background {
+            let id = crate::bg::new_id();
+            let log_path = crate::bg::log_path(ctx.workspace_root(), &id);
+            std::fs::create_dir_all(crate::bg::bg_dir(ctx.workspace_root()))
+                .map_err(|e| ToolError::msg(format!("background dir: {e}")))?;
+            let log = std::fs::File::create(&log_path)
+                .map_err(|e| ToolError::msg(format!("background log: {e}")))?;
+            let log_err = log.try_clone().map_err(|e| ToolError::msg(e.to_string()))?;
+            // Detached: redirect to the log, don't await, drop the handle (tokio
+            // reaps the orphan when it exits). It keeps running across tool calls.
+            let child = Command::new("sh")
+                .arg("-lc")
+                .arg(&args.command)
+                .current_dir(ctx.workspace_root())
+                .env("SNIPPET_SHADOW_GIT", crate::checkpoint::shadow_dir(ctx.workspace_root()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(log_err))
+                .spawn()?;
+            let pid = child.id().unwrap_or(0);
+            drop(child);
+            crate::bg::record(ctx.workspace_root(), &id, &args.command, pid).ok();
+            return Ok(ToolResult::success(json!({
+                "command": args.command,
+                "background": true,
+                "id": id,
+                "pid": pid,
+                "log": log_path.display().to_string(),
+                "note": "started in the background and still running. tail the log file to see output, or `kill <pid>` to stop it. it appears in your background-process list.",
+            })));
+        }
+
         let child = Command::new("sh")
             .arg("-lc")
             .arg(&args.command)
