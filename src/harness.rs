@@ -1005,6 +1005,10 @@ impl CodingHarness {
             vars.steps_since_visible = 0;
         }
 
+        // Keep the lane snapshot current so the live context shows what's still
+        // running (the orchestrator must know what it's waiting on).
+        state.lanes = lanes.records().to_vec();
+
         // Rebuild the live-context block fresh every turn (freshest user input +
         // drained runtime signals) and append it after the durable history. It is
         // sent to the model but never persisted into `state.messages`, so signals
@@ -2537,6 +2541,26 @@ fn build_live_context(
     if let Some(bg) = crate::bg::render_live(workspace) {
         block.push_str("\n[background_processes]  # started via bash(background:true); tail the log or kill <pid>; don't relaunch a running one\n");
         block.push_str(&bg);
+    }
+
+    // Delegated lanes still running — you're an ORCHESTRATOR here. Don't finalize
+    // while they're in flight; end the turn to wait (their reports wake you).
+    let running: Vec<&str> = state
+        .lanes
+        .iter()
+        .filter(|l| l.status == LaneStatus::Running)
+        .map(|l| l.title.as_str())
+        .collect();
+    if !running.is_empty() {
+        block.push_str("\n[delegated_lanes]\n");
+        block.push_str("# background sub-agents you spawned; they run in parallel and their reports wake you.\n");
+        for t in &running {
+            block.push_str(&format!("- {t} — running\n"));
+        }
+        block.push_str(&format!(
+            "orchestrate = \"{} lane(s) still working. You are the orchestrator: do NOT deliver a final answer or terminate_loop yet — end this turn (make no tool call and no final reply) to WAIT; each lane's report wakes you. Fold every report in, then synthesize. You may spawn more lanes to keep your own context lean.\"\n",
+            running.len()
+        ));
     }
 
     block.push_str("</runtime_context>\n");

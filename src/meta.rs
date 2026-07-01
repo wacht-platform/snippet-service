@@ -145,15 +145,18 @@ fn ask_user_tool() -> NativeToolDefinition {
 fn delegate_task_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "delegate_task".to_string(),
-        description: "Hand a scoped, self-contained unit of work to a background lane. The lane \
-            runs a fresh coding agent to completion in parallel and reports a summary back to you \
-            when done — you keep working in the meantime and may delegate several lanes at once. \
-            REACH FOR THIS when the work splits into multiple independent areas (fan them out as \
-            parallel lanes instead of grinding through them serially), or when a self-contained \
-            investigation/build will take many steps while you'd rather stay responsive. The brief \
-            must name BOTH the scope to inspect/act on AND the concrete deliverable expected; a \
-            vague brief produces vague work. Only skip delegation for trivial one-step actions you \
-            can just do yourself."
+        description: "Hand a scoped, self-contained unit of work to a background lane — a fresh \
+            coding sub-agent that runs to completion in PARALLEL and reports back (its findings \
+            cited with exact file:line). Delegating makes you an ORCHESTRATOR: spawn SEVERAL lanes \
+            to cover breadth and keep YOUR OWN context lean (the lanes hold the detail; you keep the \
+            conclusions). REACH FOR THIS when the work splits into independent areas (fan them out \
+            instead of grinding serially), or a self-contained investigation/build will take many \
+            steps. The brief must name BOTH the scope to inspect/act on AND the concrete deliverable \
+            expected; a vague brief produces vague work. \
+            WAIT for what you delegate: while lanes are running do NOT deliver a final answer or \
+            terminate — end your turn (no reply) to wait; each report wakes you (your \
+            [delegated_lanes] context lists what's still running). Fold every report in, then \
+            synthesize. Only skip delegation for trivial one-step actions you can just do yourself."
             .to_string(),
         input_schema: json!({
             "type": "object",

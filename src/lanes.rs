@@ -206,6 +206,13 @@ async fn run_lane(
         coding_tools(exa_api_key, crate::memory::MemoryLimits::read_only()),
         context,
     );
+    // Lanes report to an orchestrator: make findings navigable with exact locations.
+    let brief = format!(
+        "{brief}\n\n[lane_reporting]\nYou are a delegated lane reporting back to an orchestrator agent. \
+         In your final terminate_loop summary, cite EXACT file:line references (e.g. `src/foo.rs:42`) \
+         for every location, symbol, definition, or finding you identify — report WHERE things are, not \
+         just that they exist, so the orchestrator can navigate straight to them without re-searching."
+    );
     let outcome = harness
         .run(&mut *model, brief)
         .await
