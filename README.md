@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="snippet-mascot/png/snip-mascot-256.png" alt="snippet mascot" width="132" height="132" />
+
 # snippet
 
 **An open-source AI coding agent that lives in your terminal — and that you can drive from your phone.**
