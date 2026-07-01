@@ -93,12 +93,17 @@ impl AgentModel for OpenAiCompatibleModel {
         let body = self.build_chat_request(messages, tools, force_tool, false);
         let bytes = self.send_with_retries(&url, &body).await?;
 
-        let response: ChatResponse = serde_json::from_slice(&bytes)?;
+        // Surface the raw body on parse / empty-choices failures. Some OpenAI-compatible
+        // gateways (notably NVIDIA NIM) return HTTP 200 with an error payload or an empty
+        // `choices` array; swallowing the body makes the failure undebuggable.
+        let response: ChatResponse = serde_json::from_slice(&bytes).map_err(|error| {
+            ToolError::msg(format!("could not parse model response: {error}; {}", body_snippet(&bytes)))
+        })?;
         let choice = response
             .choices
             .into_iter()
             .next()
-            .ok_or_else(|| ToolError::msg("model response had no choices"))?;
+            .ok_or_else(|| ToolError::msg(format!("model response had no choices; {}", body_snippet(&bytes))))?;
         let calls = choice
             .message
             .tool_calls
@@ -160,6 +165,12 @@ impl OpenAiCompatibleModel {
         let base_l = self.config.base_url.to_lowercase();
         let deepseek_thinking =
             reasoning_effort.is_some() && (model_l.contains("deepseek") || base_l.contains("deepseek"));
+        // Providers that reject `tool_choice: "required"`: DeepSeek thinking mode (400
+        // "Thinking mode does not support this tool_choice") and NVIDIA NIM, which
+        // dropped `required` on its OpenAI-compatible endpoint. Degrade to auto — the
+        // forced-tool callers (summarizer, memory reflection) re-prompt if the model
+        // skips the tool, so correctness holds.
+        let no_forced_tool_choice = deepseek_thinking || base_l.contains("nvidia.com");
         ChatRequest {
             model: self.config.model.clone(),
             messages: build_chat_messages(messages),
@@ -167,7 +178,7 @@ impl OpenAiCompatibleModel {
             temperature: self.config.temperature,
             // `required` needs tools to choose from, else providers reject it; and
             // DeepSeek thinking mode rejects it outright (see above).
-            tool_choice: (force_tool && !tools.is_empty() && !deepseek_thinking).then_some("required"),
+            tool_choice: (force_tool && !tools.is_empty() && !no_forced_tool_choice).then_some("required"),
             reasoning_effort,
             // Opt into usage accounting on OpenRouter so cache-read tokens surface.
             usage: self
@@ -791,5 +802,22 @@ struct ChatToolCallFunction {
 
 fn empty_json_object() -> String {
     json!({}).to_string()
+}
+
+/// A short, safe preview of a raw response body for error messages — enough to see a
+/// gateway's soft-error payload (e.g. NVIDIA NIM's HTTP-200 errors) without dumping a
+/// huge blob into the UI.
+fn body_snippet(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "body: <empty>".to_string();
+    }
+    let preview: String = trimmed.chars().take(600).collect();
+    if preview.chars().count() < trimmed.chars().count() {
+        format!("body: {preview}…")
+    } else {
+        format!("body: {preview}")
+    }
 }
 
