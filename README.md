@@ -6,7 +6,7 @@
 
 One Rust binary: a durable terminal UI *and* a headless daemon you can remote-control over an authenticated tunnel. Bring your own model — Claude, GPT, Gemini, DeepSeek, a local model, or a ChatGPT subscription.
 
-[Quickstart](#quickstart) · [Remote control](#remote-control-from-anywhere) · [Configure](#configure-your-models) · [How it works](#how-it-works) · [Mobile app](https://github.com/wacht-platform/snippet-mobile)
+[Quickstart](#quickstart) · [Remote control](#remote-control-from-anywhere) · [Configure](#configure-your-models) · [How it works](#how-it-works) · [Mobile app](https://github.com/wacht-platform/snippet-native)
 
 _Built by the team behind [Wacht](https://wacht.dev) — open-source infrastructure for AI-native apps._
 
@@ -21,7 +21,7 @@ No cloud middleman, no lock-in, no subscription of ours. Your keys, your machine
 ## Features
 
 - **Terminal-native** — a fast, durable TUI. Loop state is persisted (compressed msgpack) with automatic **checkpoints**, so you can resume any conversation exactly where you left off and rewind a bad turn.
-- **Drive it from your phone or Mac** — run `snippet serve` on your dev box and control it from the [mobile/desktop app](https://github.com/wacht-platform/snippet-mobile) over an authenticated [cloudflared](https://github.com/cloudflare/cloudflared) tunnel: chat, browse & edit files, view git diffs, run commands, manage checkpoints.
+- **Drive it from your phone or Mac** — run `snippet serve` on your dev box and control it from the [mobile/desktop app](https://github.com/wacht-platform/snippet-native) over an authenticated [cloudflared](https://github.com/cloudflare/cloudflared) tunnel: chat, browse & edit files, view git diffs, run commands, manage checkpoints.
 - **Any model** — `openai-compatible`, `openai`, `anthropic`, `gemini`, `openrouter`, or a **ChatGPT subscription** (OAuth). Configure several providers as **profiles** and switch the active one — even **per conversation**.
 - **Real tool surface** — read/write/edit, shell, recursive regex search, structural code mapping, image reading, and web search (with an Exa key).
 - **Parallel sub-agents** — the agent orchestrates scoped work across background **lanes** that share the workspace and report back with exact `file:line` references, keeping its own context lean.
@@ -34,8 +34,8 @@ No cloud middleman, no lock-in, no subscription of ours. Your keys, your machine
 Requires [Rust](https://rustup.rs).
 
 ```sh
-git clone https://github.com/wacht-platform/snippet
-cd snippet
+git clone https://github.com/wacht-platform/snippet-service
+cd snippet-service
 cargo run                  # builds + launches the TUI
 ```
 
@@ -57,7 +57,7 @@ snippet serve --status     # reprint the QR / connection string
 snippet serve --stop       # stop cleanly (tears the tunnel down)
 ```
 
-It prints a **QR code + connection string** (`{url, token}`) — scan or paste it into the [**snippet mobile & desktop app**](https://github.com/wacht-platform/snippet-mobile) (Android + macOS) and you're driving your machine's agent from your pocket. Every endpoint is gated by a bearer token (constant-time comparison); secrets are stored `0600` and never returned by the API.
+It prints a **QR code + connection string** (`{url, token}`) — scan or paste it into the [**snippet mobile & desktop app**](https://github.com/wacht-platform/snippet-native) (Android + macOS) and you're driving your machine's agent from your pocket. Every endpoint is gated by a bearer token (constant-time comparison); secrets are stored `0600` and never returned by the API.
 
 Flags: `--port` (default 8787) · `--token` (auto-generated) · `--no-tunnel` (localhost only) · `--public-url` (bring your own tunnel). Linux and macOS.
 
