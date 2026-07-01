@@ -345,6 +345,9 @@ struct LoopVars {
     /// this response cycle. Capped so we ask for an answer without looping forever.
     /// Reset on a new user message.
     empty_reply_reprompts: usize,
+    /// Turns spent on the CURRENT request (a soft budget surfaced each turn so the
+    /// agent converges instead of sprawling). Reset on a new user request.
+    turns_this_request: u64,
 }
 
 /// What a single model step resolved to.
@@ -705,6 +708,7 @@ impl CodingHarness {
                                 vars.executed_calls.clear();
                                 vars.last_turn_had_repeat = false;
                                 vars.last_thought = None;
+                                vars.turns_this_request = 0;
                             }
                             state.pending_question = None;
                             state.messages.push(HarnessMessage::User {
@@ -1004,6 +1008,9 @@ impl CodingHarness {
             vars.pending_signals.push(RuntimeSignal::VisibilityLapse);
             vars.steps_since_visible = 0;
         }
+
+        // This turn counts against the current request's soft turn budget.
+        vars.turns_this_request = vars.turns_this_request.saturating_add(1);
 
         // Keep the lane snapshot current so the live context shows what's still
         // running (the orchestrator must know what it's waiting on).
@@ -2463,6 +2470,10 @@ fn tool_error(message: impl Into<String>) -> Value {
     })
 }
 
+/// Soft budget of turns per request — surfaced each turn so the agent converges
+/// instead of sprawling (bounds context growth and cost). Not a hard kill.
+const TURN_BUDGET: u64 = 15;
+
 /// Build the per-turn live-context block — snippet's port of wacht's
 /// `agent_loop_live_context.hbs`. Regenerated every turn and appended after the
 /// durable history (never persisted): it re-surfaces the freshest user input so it
@@ -2496,6 +2507,22 @@ fn build_live_context(
 
     block.push_str("\n[turn]\n");
     block.push_str("next = \"take the next concrete step toward the goal, or give the final answer if done.\"\n");
+    // Soft turn budget: nudge the agent to converge instead of sprawling (keeps
+    // context — and cost — bounded). Escalates as it approaches the cap.
+    let n = vars.turns_this_request;
+    if n >= TURN_BUDGET {
+        block.push_str(&format!(
+            "budget = \"turn {n} — you are AT/PAST the ~{TURN_BUDGET}-turn budget for this task. FINISH THIS TURN: deliver your best current result or answer now, and do not start new work. If truly blocked, say what's blocking and stop.\"\n"
+        ));
+    } else if n + 3 >= TURN_BUDGET {
+        block.push_str(&format!(
+            "budget = \"turn {n} of ~{TURN_BUDGET} — near the limit. Converge NOW: stop exploring, do only what's needed to finish, and deliver.\"\n"
+        ));
+    } else {
+        block.push_str(&format!(
+            "budget = \"turn {n} of ~{TURN_BUDGET} for this task — work efficiently and aim to finish within it; don't sprawl.\"\n"
+        ));
+    }
     // Explain the re-prompt ONLY when actually looping (a repeated call last turn).
     if vars.last_turn_had_repeat {
         block.push_str(

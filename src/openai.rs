@@ -256,8 +256,9 @@ impl OpenAiCompatibleModel {
 }
 
 pub(crate) fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::REQUEST_TIMEOUT
+    // 429 (rate limited) is deliberately NOT retried — surface it immediately so the
+    // user knows they've hit a limit, instead of silently backing off and re-hitting it.
+    status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::CONFLICT
         || status.is_server_error()
 }
