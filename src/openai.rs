@@ -3,6 +3,7 @@ use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 use tokio::time::{Duration, sleep};
 
 use crate::llm::{
@@ -28,6 +29,10 @@ pub struct OpenAiCompatibleConfig {
     pub supports_images: bool,
     /// Reasoning effort: low | medium | high | off (sent as `reasoning_effort`).
     pub reasoning_effort: Option<String>,
+    /// Force the streaming wire protocol even when no live sink is attached, so
+    /// stream-only providers (e.g. NVIDIA NIM MiniMax) work on the buffered
+    /// serve/app/lanes path instead of returning an empty non-streaming completion.
+    pub stream: bool,
 }
 
 /// Default UA for OpenAI-compatible endpoints. Mirrors Claude Code's
@@ -75,15 +80,22 @@ impl AgentModel for OpenAiCompatibleModel {
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
         );
-        if let Some(sink) = sink {
+        // Stream when there's a live sink (interactive) or when the profile forces it
+        // (stream-only providers like NVIDIA NIM MiniMax). A buffered caller with no
+        // sink still assembles a full response from a throwaway buffer.
+        if sink.is_some() || self.config.stream {
             let body = self.build_chat_request(messages, tools, force_tool, true);
             let headers = vec![("authorization", format!("Bearer {}", self.config.api_key))];
+            let detached = sink
+                .is_none()
+                .then(|| Arc::new(Mutex::new(StreamBuffer::default())));
+            let sink_ref = sink.as_ref().or(detached.as_ref()).expect("a sink is present");
             return stream_chat_with_retries(
                 &self.client,
                 &url,
                 &headers,
                 &body,
-                &sink,
+                sink_ref,
                 self.config.max_retries,
                 self.config.initial_retry_ms,
                 self.config.max_retry_ms,

@@ -695,6 +695,7 @@ struct ProfileView {
     active: bool,
     context_window: u64,
     reasoning_effort: Option<String>,
+    stream: bool,
 }
 
 #[derive(Serialize)]
@@ -725,6 +726,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
                 active: active.as_deref() == Some(name.as_str()),
                 context_window: m.context_window,
                 reasoning_effort: m.reasoning_effort.clone(),
+                stream: m.stream,
             });
         }
     }
@@ -754,6 +756,9 @@ struct ProfileReq {
     /// Model context window in tokens (drives the usage gauge + compaction point).
     #[serde(default)]
     context_window: Option<u64>,
+    /// Force the streaming wire protocol (needed by stream-only models, e.g. NIM MiniMax).
+    #[serde(default)]
+    stream: Option<bool>,
     #[serde(default)]
     set_active: bool,
 }
@@ -777,6 +782,7 @@ async fn put_profile(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
         let existing = c.setups.as_ref().and_then(|m| m.get(&name));
         let existing_key = existing.map(|m| m.api_key.clone());
         let existing_ctx = existing.map(|m| m.context_window);
+        let existing_stream = existing.map(|m| m.stream);
         let base_url = req
             .base_url
             .clone()
@@ -801,6 +807,8 @@ async fn put_profile(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
                 .filter(|&n| n > 0)
                 .or(existing_ctx)
                 .unwrap_or_else(|| ModelConfig::default().context_window),
+            // Explicit value wins; else keep the profile's current one; else off.
+            stream: req.stream.or(existing_stream).unwrap_or(false),
             ..ModelConfig::default()
         };
         c.upsert_profile(&name, mc);

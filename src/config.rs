@@ -128,6 +128,12 @@ pub struct ModelConfig {
     pub compact_at_pct: u8,
     #[serde(default = "default_cache_prompt")]
     pub cache_prompt: bool,
+    /// Force the streaming wire protocol (`stream: true`) even on the buffered
+    /// serve/app/lanes path. Off by default. Some OpenAI-compatible models only
+    /// return output when streamed — e.g. NVIDIA NIM's MiniMax, which sends an
+    /// empty non-streaming completion — so this makes them usable there.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 impl Default for SnippetConfig {
@@ -400,6 +406,7 @@ impl From<ModelConfig> for OpenAiCompatibleConfig {
             user_agent: value.user_agent,
             supports_images: value.supports_images,
             reasoning_effort: value.reasoning_effort,
+            stream: value.stream,
         }
     }
 }
@@ -481,6 +488,7 @@ impl Default for ModelConfig {
             context_window: default_context_window(),
             compact_at_pct: default_compact_at_pct(),
             cache_prompt: default_cache_prompt(),
+            stream: false,
         }
     }
 }
