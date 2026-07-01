@@ -63,8 +63,13 @@ pub struct LaneResult {
     pub error: Option<String>,
 }
 
+/// Max lanes running at once — a runaway/cost guard so "spawn several" can't
+/// balloon into dozens of concurrent coding-agent runs.
+const MAX_ACTIVE_LANES: usize = 8;
+
 /// Owns lane lifecycle for one conversation run. Lives in the interactive loop's
-/// local scope (not in the immutable `CodingHarness`).
+/// local scope (not in the immutable `CodingHarness`). Aborts any still-running
+/// lanes when dropped (the run was interrupted / ended).
 pub struct LaneManager {
     factory: Option<ModelFactory>,
     workspace_root: PathBuf,
@@ -73,6 +78,16 @@ pub struct LaneManager {
     records: Vec<LaneRecord>,
     counter: usize,
     exa_api_key: Option<String>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for LaneManager {
+    fn drop(&mut self) {
+        // Interrupt/teardown: don't leave detached lanes burning tokens.
+        for h in &self.handles {
+            h.abort();
+        }
+    }
 }
 
 impl LaneManager {
@@ -91,11 +106,21 @@ impl LaneManager {
             records: Vec::new(),
             counter: 0,
             exa_api_key,
+            handles: Vec::new(),
         }
     }
 
     /// Restore prior records (e.g. on resume) so the display reflects history.
-    pub fn with_records(mut self, records: Vec<LaneRecord>) -> Self {
+    /// Lanes do NOT survive a process restart, so any record still marked Running
+    /// is a ghost — fail it so the orchestrator doesn't wait on it forever.
+    pub fn with_records(mut self, mut records: Vec<LaneRecord>) -> Self {
+        for record in records.iter_mut() {
+            if record.status == LaneStatus::Running {
+                record.status = LaneStatus::Failed;
+                record.error = Some("lane did not survive a restart".to_string());
+                record.finished_at = Some(Utc::now().to_rfc3339());
+            }
+        }
         self.counter = records.len();
         self.records = records;
         self
@@ -125,6 +150,11 @@ impl LaneManager {
                     .to_string(),
             );
         };
+        if self.active_count() >= MAX_ACTIVE_LANES {
+            return Err(format!(
+                "{MAX_ACTIVE_LANES} lanes are already running — wait for some to report before delegating more."
+            ));
+        }
 
         self.counter += 1;
         let id = format!("lane-{}", self.counter);
@@ -146,7 +176,7 @@ impl LaneManager {
         let lane_id = id.clone();
         let exa_api_key = self.exa_api_key.clone();
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result =
                 run_lane(factory, workspace_root, state_path, brief, lane_id.clone(), exa_api_key)
                     .await;
@@ -170,6 +200,7 @@ impl LaneManager {
             };
             let _ = result_tx.send(lane_result);
         });
+        self.handles.push(handle);
 
         Ok(id)
     }

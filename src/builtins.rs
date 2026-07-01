@@ -24,8 +24,12 @@ pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLi
     registry.insert(ViewOutlineTool);
     registry.insert(CodeMapTool);
     registry.insert(BashTool);
-    registry.insert(SearchSkillsTool);
-    registry.insert(SkillTool);
+    // Skill tools only when the user actually has skills installed — otherwise they
+    // are dead weight in every prompt's tool list.
+    if !crate::skills::discover().is_empty() {
+        registry.insert(SearchSkillsTool);
+        registry.insert(SkillTool);
+    }
     // web_search / web_read are offered only when an Exa key is configured.
     if let Some(key) = exa_api_key.filter(|k| !k.trim().is_empty()) {
         registry.insert(WebSearchTool { api_key: key.clone() });
