@@ -24,6 +24,7 @@ pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLi
     registry.insert(ViewOutlineTool);
     registry.insert(CodeMapTool);
     registry.insert(BashTool);
+    registry.insert(SearchSkillsTool);
     registry.insert(SkillTool);
     // web_search / web_read are offered only when an Exa key is configured.
     if let Some(key) = exa_api_key.filter(|k| !k.trim().is_empty()) {
@@ -1814,6 +1815,51 @@ impl Tool for MemoryRuleTool {
     }
 }
 
+pub struct SearchSkillsTool;
+
+#[derive(Debug, Deserialize)]
+struct SearchSkillsArgs {
+    #[serde(default)]
+    query: String,
+}
+
+#[async_trait]
+impl Tool for SearchSkillsTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "search_skills".to_string(),
+            description:
+                "Find a reusable Agent Skill relevant to the task. Skills are installed procedures / playbooks / recipes (a specific workflow, a tool or API integration, a generation or formatting routine). They are NOT preloaded into your context, so search here BEFORE improvising anything that sounds like an established procedure — a matching skill gives you the exact steps. Returns candidate skills (name + description); load the best one with `skill(name)` to get its full instructions. An empty query lists everything available."
+                    .to_string(),
+            input_schema: object_schema(
+                json!({
+                    "query": {"type": "string", "description": "What you're trying to do — keywords or a short phrase. Empty lists all skills."}
+                }),
+                &[],
+            ),
+        }
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: SearchSkillsArgs = expect_object("search_skills", arguments)?;
+        let skills: Vec<Value> = crate::skills::search(&args.query)
+            .into_iter()
+            .map(|(name, description)| json!({ "name": name, "description": description }))
+            .collect();
+        let note = if skills.is_empty() {
+            "no skills installed"
+        } else {
+            "call skill(name) to load a skill's full instructions"
+        };
+        Ok(ToolResult::success(json!({
+            "query": args.query,
+            "count": skills.len(),
+            "skills": skills,
+            "note": note,
+        })))
+    }
+}
+
 pub struct SkillTool;
 
 #[derive(Debug, Deserialize)]
@@ -1827,7 +1873,7 @@ impl Tool for SkillTool {
         NativeToolDefinition {
             name: "skill".to_string(),
             description:
-                "Load an Agent Skill by name — returns its full instructions (SKILL.md) and a list of its bundled files. Call this when a task matches one of the skills listed under [skills]. After loading, follow the instructions; read any referenced files with read_file and run bundled scripts with bash (their contents stay out of context until you do)."
+                "Load an Agent Skill by name (find one first with search_skills) — returns its full instructions (SKILL.md) plus the absolute paths of its bundled files. After loading, follow the instructions; read referenced files with read_file and run bundled scripts with bash (their contents stay out of context until you do)."
                     .to_string(),
             input_schema: object_schema(
                 json!({

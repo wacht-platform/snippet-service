@@ -91,18 +91,46 @@ fn unquote(s: &str) -> String {
         .to_string()
 }
 
-/// The `[skills]` metadata block for the agent's runtime context (level 1).
-/// `None` when there are no model-invocable skills.
-pub fn render_metadata() -> Option<String> {
-    let skills: Vec<Skill> = discover().into_iter().filter(|s| !s.disable_model_invocation).collect();
-    if skills.is_empty() {
-        return None;
+/// Find skills relevant to `query`, ranked. Skills are NOT preloaded into the
+/// agent's context — it discovers them on demand via this, so context stays lean
+/// no matter how many skills exist. Matches over name + description (weighted) and
+/// the SKILL.md body. Returns (name, description) pairs, best first; when nothing
+/// matches (or the query is blank) it returns all skills, so discovery never dead-ends.
+pub fn search(query: &str) -> Vec<(String, String)> {
+    search_in(&skills_root(), query)
+}
+
+/// Like [`search`] but against an explicit root (used in tests).
+pub fn search_in(root: &Path, query: &str) -> Vec<(String, String)> {
+    let terms: Vec<String> = query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| s.len() > 1)
+        .map(|s| s.to_string())
+        .collect();
+    let mut scored: Vec<(usize, String, String)> = Vec::new();
+    for sk in discover_in(root) {
+        if sk.disable_model_invocation {
+            continue;
+        }
+        let meta = format!("{} {}", sk.name, sk.description).to_lowercase();
+        let body = std::fs::read_to_string(&sk.path).map(|t| t.to_lowercase()).unwrap_or_default();
+        let mut score = 0usize;
+        for t in &terms {
+            if meta.contains(t) {
+                score += 3; // name/description hits weigh more than body hits
+            } else if body.contains(t) {
+                score += 1;
+            }
+        }
+        scored.push((score, sk.name, sk.description));
     }
-    let mut s = String::new();
-    for sk in &skills {
-        s.push_str(&format!("- {} — {}\n", sk.name, sk.description.replace('\n', " ")));
+    if scored.iter().any(|(s, _, _)| *s > 0) {
+        scored.retain(|(s, _, _)| *s > 0);
     }
-    Some(s)
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    scored.truncate(20);
+    scored.into_iter().map(|(_, n, d)| (n, d)).collect()
 }
 
 /// Load a skill's instructions (body, frontmatter stripped) plus a listing of its
@@ -143,9 +171,8 @@ fn bundled_files(dir: &Path) -> Vec<String> {
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             } else if p.file_name().map(|n| n != "SKILL.md").unwrap_or(true) {
-                if let Ok(rel) = p.strip_prefix(dir) {
-                    files.push(rel.display().to_string());
-                }
+                // Absolute paths, so the agent can read_file / bash them directly.
+                files.push(p.display().to_string());
             }
         }
     }

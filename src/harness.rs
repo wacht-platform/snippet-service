@@ -2529,12 +2529,9 @@ fn build_live_context(
         }
     }
 
-    // Agent Skills available to load on demand (level-1 progressive disclosure):
-    // just name + description here; the body loads when the model calls `skill`.
-    if let Some(skills) = crate::skills::render_metadata() {
-        block.push_str("\n[skills]  # match a task → call skill(name) to load its instructions before proceeding\n");
-        block.push_str(&skills);
-    }
+    // Skills are NOT preloaded into context — the agent finds them on demand with
+    // `search_skills` (keeps context lean however many skills exist), then loads the
+    // chosen one with `skill`.
 
     // Background processes the agent started (dev servers, watchers) — so it knows
     // what's already running instead of re-launching, and can tail logs / kill them.
