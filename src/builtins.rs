@@ -532,22 +532,19 @@ fn edit_diagnostic(content: &str, old: &str, path: &str) -> String {
         })
         .flatten();
     let mut msg = format!(
-        "old_string was not found in `{path}`. It doesn't match the file byte-for-byte — usually a \
-         whitespace/indentation difference, or a line that isn't actually there. Copy the snippet \
-         EXACTLY as read_file shows it (including leading spaces), keep it small, and make it unique."
+        "old_string not found in `{path}` — likely a whitespace/indentation diff. Copy the exact \
+         text from read_file, keep it small and unique."
     );
     if let Some(idx) = near {
-        let lo = idx.saturating_sub(2);
-        let hi = (idx + 8).min(lines.len());
+        let lo = idx.saturating_sub(1);
+        let hi = (idx + 4).min(lines.len());
         let region = lines[lo..hi]
             .iter()
             .enumerate()
             .map(|(k, l)| format!("{:>4}| {l}", lo + k + 1))
             .collect::<Vec<_>>()
             .join("\n");
-        msg.push_str(&format!(
-            "\n\nThe file near the first line of your old_string (use this exact text):\n{region}"
-        ));
+        msg.push_str(&format!("\n\nActual text there:\n{region}"));
     }
     msg
 }
