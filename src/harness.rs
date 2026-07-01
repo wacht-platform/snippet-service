@@ -2558,7 +2558,7 @@ fn build_live_context(
             block.push_str(&format!("- {t} — running\n"));
         }
         block.push_str(&format!(
-            "orchestrate = \"{} lane(s) still working. You are the orchestrator: do NOT deliver a final answer or terminate_loop yet — end this turn (make no tool call and no final reply) to WAIT; each lane's report wakes you. Fold every report in, then synthesize. You may spawn more lanes to keep your own context lean.\"\n",
+            "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — you go idle and each lane's report wakes you (no polling, no blocking). A short progress note to the user about what you kicked off is good. Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
             running.len()
         ));
     }
