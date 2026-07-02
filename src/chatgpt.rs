@@ -130,7 +130,9 @@ impl AgentModel for ChatGptModel {
         let mut refreshed = false;
         let mut attempts = 0u32;
 
-        for attempt in 1..=max_attempts {
+        let mut attempt = 0u32;
+        while attempt < max_attempts {
+            attempt += 1;
             attempts = attempt;
             if let Some(sink) = sink.as_ref() {
                 StreamBuffer::clear(sink);
@@ -172,6 +174,10 @@ impl AgentModel for ChatGptModel {
                             match chatgpt_auth::refresh(&prior).await {
                                 Ok(fresh) => {
                                     self.tokens = Some(fresh);
+                                    // Genuinely free retry: on the last attempt a
+                                    // plain `continue` exhausted the loop and the
+                                    // fresh token was never used.
+                                    attempt -= 1;
                                     continue;
                                 }
                                 Err(e) => {
@@ -428,6 +434,7 @@ async fn parse_responses_sse(
     let mut calls: Vec<GeneratedToolCall> = Vec::new();
     let mut usage: Option<TokenUsage> = None;
     let mut failure: Option<String> = None;
+    let mut incomplete = false;
 
     crate::sse::for_each_event(response, |data| {
         if data == "[DONE]" {
@@ -489,6 +496,9 @@ async fn parse_responses_sse(
                 }
             }
             "response.failed" | "response.incomplete" => {
+                if chunk.get("type").and_then(Value::as_str) == Some("response.incomplete") {
+                    incomplete = true;
+                }
                 failure = chunk
                     .pointer("/response/error/message")
                     .and_then(Value::as_str)
@@ -514,7 +524,10 @@ async fn parse_responses_sse(
         calls,
         content_text: (!text.is_empty()).then_some(text),
         usage,
-        finish_reason: None,
+        // An incomplete response with partial output is a token-cap truncation —
+        // report it as such so the harness continues the turn instead of
+        // presenting the fragment as the final answer.
+        finish_reason: incomplete.then(|| "length".to_string()),
         rate_limit: None,
     })
 }

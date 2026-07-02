@@ -110,9 +110,6 @@ impl AgentModel for GeminiModel {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
-        // Gemini is buffered (non-streaming): no live deltas, but we still feed the
-        // reasoning summary into the sink's thinking buffer once the response lands,
-        // so the harness can capture it as last-thought context.
         let (system, contents) = build_contents(messages, &self.config.model);
 
         let mut body = serde_json::Map::new();

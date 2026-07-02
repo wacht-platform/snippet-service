@@ -398,6 +398,7 @@ async fn parse_openai_sse(
     let mut calls: std::collections::BTreeMap<u64, PendingCall> = std::collections::BTreeMap::new();
     let mut finish_reason: Option<String> = None;
     let mut usage: Option<TokenUsage> = None;
+    let mut stream_error: Option<String> = None;
 
     crate::sse::for_each_event(response, |data| {
         if data == "[DONE]" {
@@ -406,6 +407,17 @@ async fn parse_openai_sse(
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             return;
         };
+        // Mid-stream failure (OpenRouter et al. send `{"error":{...}}` and close):
+        // surface it — skipping it returned a partial accumulation as success.
+        if let Some(err) = chunk.get("error").filter(|e| !e.is_null()) {
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| err.to_string());
+            stream_error.get_or_insert(msg);
+            return;
+        }
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
             usage = Some(TokenUsage {
                 prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
@@ -472,6 +484,13 @@ async fn parse_openai_sse(
     })
     .await
     .map_err(|error| ToolError::msg(format!("model stream error: {error}")))?;
+
+    if let Some(err) = stream_error {
+        return Err(ToolError::model_request(
+            format!("model mid-stream error: {err}"),
+            true,
+        ));
+    }
 
     let calls = calls
         .into_values()

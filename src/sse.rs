@@ -12,19 +12,28 @@ where
 {
     let mut stream = response.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
+    let emit = |line: &[u8], on_data: &mut F| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Ok(text) = std::str::from_utf8(line) {
+            if let Some(data) = text.strip_prefix("data:") {
+                on_data(data.trim_start());
+            }
+        }
+    };
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         buf.extend_from_slice(&chunk);
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buf.drain(..=pos).collect();
             let line = line.strip_suffix(b"\n").unwrap_or(&line);
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if let Ok(text) = std::str::from_utf8(line) {
-                if let Some(data) = text.strip_prefix("data:") {
-                    on_data(data.trim_start());
-                }
-            }
+            emit(line, &mut on_data);
         }
+    }
+    // A stream cut without a trailing newline still carries a final event —
+    // flush it so the last data line isn't silently lost.
+    if !buf.is_empty() {
+        let line = std::mem::take(&mut buf);
+        emit(&line, &mut on_data);
     }
     Ok(())
 }

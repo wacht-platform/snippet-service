@@ -105,10 +105,20 @@ fn looks_like_hallucinated_tool_render(text: &str) -> bool {
     if pseudo_count >= 2 && separator_lines >= 2 {
         return true;
     }
+    // A verbatim-repeated block only marks a hallucinated render when it itself
+    // looks like tool markup — legitimate answers repeat boilerplate stanzas,
+    // fixtures, or lyrics too, and dropping the whole reply for those ate real
+    // final answers.
+    let looks_like_markup = |block: &str| {
+        PSEUDO_CALL_MARKERS.iter().any(|m| block.contains(m))
+            || block.contains("tool_name")
+            || block.contains("<tool")
+            || block.contains("function_call")
+    };
     let mut block_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for chunk in text.split("\n\n") {
         let trimmed = chunk.trim();
-        if trimmed.len() >= 60 {
+        if trimmed.len() >= 60 && looks_like_markup(trimmed) {
             *block_counts.entry(trimmed).or_insert(0) += 1;
         }
     }

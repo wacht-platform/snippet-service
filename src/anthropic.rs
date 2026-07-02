@@ -79,6 +79,8 @@ impl AgentModel for AnthropicModel {
                         ..Default::default()
                     });
                 }
+                AnthropicResponseContent::Thinking {}
+                | AnthropicResponseContent::RedactedThinking {} => {}
             }
         }
 
@@ -123,17 +125,48 @@ impl AnthropicModel {
         }
 
         if self.config.cache_prompt {
+            // Stamp the breakpoint on the last DURABLE content block, not the
+            // final one: the final block is the harness's per-turn live-context
+            // text, regenerated every turn — a breakpoint there caches a prefix
+            // no later request can ever match, so the message history would get
+            // ZERO cache hits (only system+tools would hit). The block before it
+            // is stable history; entries cached there are exact prefixes of the
+            // next turn's request and hit via Anthropic's breakpoint lookback.
+            let stamp = |block: &mut AnthropicContent| match block {
+                AnthropicContent::Text { cache_control, .. }
+                | AnthropicContent::ToolResult { cache_control, .. } => {
+                    *cache_control = Some(json!({"type": "ephemeral"}));
+                    true
+                }
+                // A bare tool_use block is never the last durable block (its
+                // results follow it); skip rather than stamping it.
+                AnthropicContent::ToolUse { .. } => false,
+            };
+            let mut placed = false;
+            // The live context may share the final message with preceding blocks
+            // (user-role merging) — prefer that message's second-to-last block.
             if let Some(last_msg) = anthropic_messages.last_mut() {
-                if let Some(last_content) = last_msg.content.last_mut() {
-                    match last_content {
-                        AnthropicContent::Text { cache_control, .. }
-                        | AnthropicContent::ToolResult { cache_control, .. } => {
-                            *cache_control = Some(json!({"type": "ephemeral"}));
-                        }
-                        // A bare tool_use block as the final content is rare; skip
-                        // the cache breakpoint rather than stamping it.
-                        AnthropicContent::ToolUse { .. } => {}
+                let n = last_msg.content.len();
+                if n >= 2 {
+                    placed = stamp(&mut last_msg.content[n - 2]);
+                }
+            }
+            if !placed {
+                let m = anthropic_messages.len();
+                if m >= 2 {
+                    if let Some(block) = anthropic_messages[m - 2].content.last_mut() {
+                        placed = stamp(block);
                     }
+                }
+            }
+            if !placed {
+                // Single-message requests (summarizer / reflection workers): the
+                // only block is the target — their long shared prefix still
+                // benefits across those workers' turns.
+                if let Some(block) =
+                    anthropic_messages.last_mut().and_then(|m| m.content.last_mut())
+                {
+                    stamp(block);
                 }
             }
         }
@@ -148,7 +181,17 @@ impl AnthropicModel {
         // and bump max_tokens above the budget. Anthropic requires temperature to be
         // unset (defaults to 1) when thinking is on, and forbids forced tool_choice
         // with thinking — so drop both in that case.
-        let thinking_budget = anthropic_thinking_budget(self.config.reasoning_effort.as_deref());
+        //
+        // Thinking is only enabled on TOOL-LESS requests: with tools, Anthropic
+        // requires the assistant's `thinking` block (with its signature) to be
+        // replayed ahead of `tool_use` on the follow-up request, and this adapter
+        // doesn't capture/persist thinking blocks — every post-tool-call request
+        // would 400 (fatal) and agentic use breaks entirely.
+        let thinking_budget = if tools.is_empty() {
+            anthropic_thinking_budget(self.config.reasoning_effort.as_deref())
+        } else {
+            None
+        };
         let (thinking, max_tokens, temperature, tool_choice) = match thinking_budget {
             Some(budget) => (
                 Some(json!({ "type": "enabled", "budget_tokens": budget })),
@@ -350,6 +393,7 @@ async fn parse_anthropic_sse(
     let mut output_tokens = 0u64;
     let mut cache_read = 0u64;
     let mut cache_creation = 0u64;
+    let mut stream_error: Option<String> = None;
 
     crate::sse::for_each_event(response, |data| {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
@@ -435,11 +479,32 @@ async fn parse_anthropic_sse(
                     output_tokens = out;
                 }
             }
+            // Mid-stream failure (e.g. overloaded_error): the stream ends here.
+            // Surface it — silently returning the partial accumulation made a
+            // truncated fragment look like a finished reply.
+            Some("error") => {
+                let msg = event
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown mid-stream error");
+                let kind = event
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error");
+                stream_error = Some(format!("{kind}: {msg}"));
+            }
             _ => {}
         }
     })
     .await
     .map_err(|error| ToolError::msg(format!("anthropic stream error: {error}")))?;
+
+    if let Some(err) = stream_error {
+        return Err(ToolError::model_request(
+            format!("anthropic mid-stream error: {err}"),
+            true,
+        ));
+    }
 
     let calls = tools
         .into_values()
@@ -600,6 +665,11 @@ struct AnthropicResponse {
 enum AnthropicResponseContent {
     Text { text: String },
     ToolUse { id: String, name: String, input: Value },
+    // Extended-thinking blocks (tool-less requests can enable thinking); the
+    // buffered path has nowhere to show them, but parsing must not fail on them.
+    // Fields intentionally ignored.
+    Thinking {},
+    RedactedThinking {},
 }
 
 #[derive(Debug, Deserialize, Default)]
