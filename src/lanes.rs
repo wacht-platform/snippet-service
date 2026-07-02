@@ -48,6 +48,9 @@ pub struct LaneRecord {
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// Investigation lane: file-mutation tools removed. Sticky across follow-ups.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Terminal report delivered back to the parent loop when a lane finishes.
@@ -66,6 +69,11 @@ pub struct LaneResult {
 /// Max lanes running at once — a runaway/cost guard so "spawn several" can't
 /// balloon into dozens of concurrent coding-agent runs.
 const MAX_ACTIVE_LANES: usize = 8;
+
+/// Wall-clock cap per lane. Without one, a hung lane (stalled provider, endless
+/// tool loop under the iteration backstop) never reports, and the orchestrator —
+/// told that ending its turn is how it waits — waits forever.
+const LANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// Owns lane lifecycle for one conversation run. Lives in the interactive loop's
 /// local scope (not in the immutable `CodingHarness`). Aborts any still-running
@@ -143,8 +151,8 @@ impl LaneManager {
 
     /// Spawn a lane. Returns the new lane id, or an error string (fed back to the
     /// model as a tool error) when delegation is unavailable.
-    pub fn spawn(&mut self, title: &str, brief: &str) -> Result<String, String> {
-        let Some(factory) = self.factory.clone() else {
+    pub fn spawn(&mut self, title: &str, brief: &str, read_only: bool) -> Result<String, String> {
+        if self.factory.is_none() {
             return Err(
                 "delegate_task is unavailable in this run (no model factory; interactive mode only)."
                     .to_string(),
@@ -166,20 +174,83 @@ impl LaneManager {
             error: None,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
+            read_only,
         });
+        self.launch(&id, title, brief, false, read_only);
+        Ok(id)
+    }
 
+    /// Continue a FINISHED lane with a follow-up brief: its harness state is
+    /// resumed from disk, so the lane keeps everything it learned (the analog of
+    /// messaging an existing agent instead of spawning a fresh one). Returns the
+    /// lane's title.
+    pub fn follow_up(&mut self, lane_id: &str, brief: &str) -> Result<String, String> {
+        if self.factory.is_none() {
+            return Err(
+                "delegate_task is unavailable in this run (no model factory; interactive mode only)."
+                    .to_string(),
+            );
+        }
+        if self.active_count() >= MAX_ACTIVE_LANES {
+            return Err(format!(
+                "{MAX_ACTIVE_LANES} lanes are already running — wait for some to report before delegating more."
+            ));
+        }
+        let Some(record) = self.records.iter_mut().find(|r| r.id == lane_id) else {
+            let known: Vec<&str> = self.records.iter().map(|r| r.id.as_str()).collect();
+            return Err(format!(
+                "no lane `{lane_id}` in this conversation. Known lanes: [{}]. Omit lane_id to start a new one.",
+                known.join(", ")
+            ));
+        };
+        if record.status == LaneStatus::Running {
+            return Err(format!(
+                "lane `{lane_id}` is still running — its report will arrive as a [lane_report]; follow up after that."
+            ));
+        }
+        // A lane lost to a restart has no live task but its state file survives —
+        // following up is exactly how to revive it.
+        record.status = LaneStatus::Running;
+        record.finished_at = None;
+        record.error = None;
+        let (title, read_only) = (record.title.clone(), record.read_only);
+        self.launch(lane_id, &title, brief, true, read_only);
+        Ok(title)
+    }
+
+    /// Shared spawn: run the lane on a tokio task and report back over the channel.
+    fn launch(&mut self, id: &str, title: &str, brief: &str, resume: bool, read_only: bool) {
+        let factory = self.factory.clone().expect("checked by callers");
         let result_tx = self.result_tx.clone();
         let workspace_root = self.workspace_root.clone();
         let state_path = self.lane_root.join(format!("{id}.json"));
         let brief = brief.to_string();
         let title = title.to_string();
-        let lane_id = id.clone();
+        let lane_id = id.to_string();
         let exa_api_key = self.exa_api_key.clone();
 
         let handle = tokio::spawn(async move {
-            let result =
-                run_lane(factory, workspace_root, state_path, brief, lane_id.clone(), exa_api_key)
-                    .await;
+            let result = tokio::time::timeout(
+                LANE_TIMEOUT,
+                run_lane(
+                    factory,
+                    workspace_root,
+                    state_path,
+                    brief,
+                    lane_id.clone(),
+                    exa_api_key,
+                    resume,
+                    read_only,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "lane timed out after {} minutes and was aborted — its partial work (if any) \
+                     is in the workspace; re-delegate a narrower brief if the task is still needed",
+                    LANE_TIMEOUT.as_secs() / 60
+                ))
+            });
             let lane_result = match result {
                 Ok((summary, report)) => LaneResult {
                     id: lane_id,
@@ -201,8 +272,6 @@ impl LaneManager {
             let _ = result_tx.send(lane_result);
         });
         self.handles.push(handle);
-
-        Ok(id)
     }
 
     /// Fold a completed lane's terminal report into its record.
@@ -216,6 +285,7 @@ impl LaneManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_lane(
     factory: ModelFactory,
     workspace_root: PathBuf,
@@ -223,23 +293,41 @@ async fn run_lane(
     brief: String,
     owner: String,
     exa_api_key: Option<String>,
+    resume: bool,
+    read_only: bool,
 ) -> Result<(String, String), String> {
     let mut model = factory();
+    let workspace_for_grounding = workspace_root.clone();
     let context = ToolContext::with_owner(workspace_root, owner).map_err(|error| error.to_string())?;
+    let mut tools = coding_tools(exa_api_key.clone(), crate::memory::MemoryLimits::read_only());
+    if read_only {
+        // Investigation lane: strip the file-mutation tools so a fan-out of
+        // readers can't collide with the main agent's (or each other's) edits.
+        // The shell remains for inspection — the brief tells the lane its role.
+        for tool in ["write_file", "edit_file", "append_file", "replace_file_content"] {
+            tools.remove(tool);
+        }
+    }
     let harness = CodingHarness::new(
         HarnessConfig {
             system_prompt: coding_system_prompt(),
             state_path: Some(state_path),
-            resume: false,
-            exa_api_key: exa_api_key.clone(),
+            resume,
+            exa_api_key,
             ..HarnessConfig::default()
         },
-        coding_tools(exa_api_key, crate::memory::MemoryLimits::read_only()),
+        tools,
         context,
     );
     // Lanes report to an orchestrator: make findings navigable with exact locations.
+    let role = if read_only {
+        "You are a READ-ONLY investigation lane: your file-editing tools are removed; do not attempt \
+         to mutate the workspace (including via shell) — investigate and report. "
+    } else {
+        ""
+    };
     let brief = format!(
-        "{brief}\n\n[lane_reporting]\nYou are a delegated lane reporting back to an orchestrator agent. \
+        "{brief}\n\n[lane_reporting]\n{role}You are a delegated lane reporting back to an orchestrator agent. \
          In your final terminate_loop summary, cite EXACT file:line references (e.g. `src/foo.rs:42`) \
          for every location, symbol, definition, or finding you identify — report WHERE things are, not \
          just that they exist, so the orchestrator can navigate straight to them without re-searching."
@@ -252,8 +340,83 @@ async fn run_lane(
         .final_text
         .clone()
         .unwrap_or_else(|| "lane completed without a summary".to_string());
-    let report = summarize_lane_outcome(&outcome);
+    let mut report = summarize_lane_outcome(&outcome);
+    // Ground the report: the file:line citations the prompt demands are only
+    // useful if they're real. Verify each against the workspace and flag the ones
+    // that don't resolve, so the orchestrator knows which locations to trust.
+    if let Some(check) = verify_grounding(&workspace_for_grounding, &report) {
+        report.push_str("\n\n");
+        report.push_str(&check);
+    }
     Ok((summary, report))
+}
+
+/// Verify every `path:line` reference in `text` against the workspace. Returns a
+/// `[reference_check]` block when the text contains any such references: a
+/// one-line all-clear, or the list of references that don't resolve (missing
+/// file / line beyond EOF) so the orchestrator treats them as unverified.
+fn verify_grounding(workspace: &std::path::Path, text: &str) -> Option<String> {
+    let re = regex::Regex::new(r"([A-Za-z0-9_~./+\-]+\.[A-Za-z0-9_]+):(\d{1,7})\b").ok()?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut verified = 0usize;
+    let mut invalid: Vec<String> = Vec::new();
+    for cap in re.captures_iter(text) {
+        let path_str = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let line: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        // Require a real-looking path (letters, not a decimal like `3.5:1`).
+        if line == 0 || !path_str.chars().any(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        if !seen.insert(format!("{path_str}:{line}")) {
+            continue;
+        }
+        let resolved = if std::path::Path::new(path_str).is_absolute() {
+            PathBuf::from(path_str)
+        } else {
+            workspace.join(path_str)
+        };
+        match std::fs::read_to_string(&resolved) {
+            Ok(content) => {
+                let lines = content.lines().count();
+                if line <= lines.max(1) {
+                    verified += 1;
+                } else {
+                    invalid.push(format!("- {path_str}:{line} (file has {lines} lines)"));
+                }
+            }
+            // Missing OR unreadable-as-text (binary): only flag when the file
+            // isn't there at all — a binary file's line refs just aren't checkable.
+            Err(_) => {
+                if resolved.exists() {
+                    verified += 1;
+                } else {
+                    invalid.push(format!("- {path_str}:{line} (file not found)"));
+                }
+            }
+        }
+    }
+    if verified == 0 && invalid.is_empty() {
+        return None;
+    }
+    if invalid.is_empty() {
+        return Some(format!(
+            "[reference_check]\nall {verified} file:line reference(s) verified against the workspace."
+        ));
+    }
+    const CAP: usize = 20;
+    let mut out = format!(
+        "[reference_check]\n{verified} file:line reference(s) verified; {} did NOT resolve — treat \
+         these as unverified and re-check before relying on them:",
+        invalid.len()
+    );
+    for item in invalid.iter().take(CAP) {
+        out.push('\n');
+        out.push_str(item);
+    }
+    if invalid.len() > CAP {
+        out.push_str(&format!("\n… and {} more", invalid.len() - CAP));
+    }
+    Some(out)
 }
 
 /// Build the parent-facing report for a finished lane: its final summary, the

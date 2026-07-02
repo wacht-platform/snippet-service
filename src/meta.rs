@@ -157,21 +157,36 @@ fn delegate_task_tool() -> NativeToolDefinition {
             polling). Keep the user posted with a short progress note; just don't present your \
             COMPLETE/final answer while lanes you need are still running (your [delegated_lanes] \
             context lists them). Fold each report in and synthesize once they're in — progressively \
-            or all at once. Only skip delegation for trivial one-step actions you can just do yourself."
+            or all at once. Only skip delegation for trivial one-step actions you can just do yourself. \
+            CONTINUING: pass `lane_id` (from an earlier delegation) to send a FOLLOW-UP to a finished \
+            lane — it resumes with its full context intact, so use it for 'now also check X' or \
+            'apply the fix you proposed' instead of re-briefing a fresh lane from scratch. \
+            SCOPING: set access='read_only' for pure investigation/search/review lanes (their \
+            file-editing tools are removed) — prefer it whenever the lane shouldn't change anything; \
+            several read-only lanes can safely fan out in parallel while you keep editing."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "Short label for the lane (a few words)."
+                    "description": "Short label for the lane (a few words). Ignored when lane_id is set."
                 },
                 "description": {
                     "type": "string",
-                    "description": "The brief. State what to inspect/do, what to ignore, and the concrete output expected (e.g. a file to write or a finding to report). Minimum ~80 chars."
+                    "description": "The brief. State what to inspect/do, what to ignore, and the concrete output expected (e.g. a file to write or a finding to report). Minimum ~80 chars. With lane_id: the follow-up instruction."
+                },
+                "lane_id": {
+                    "type": "string",
+                    "description": "Continue this FINISHED lane with the description as a follow-up (context intact) instead of starting a new lane."
+                },
+                "access": {
+                    "type": "string",
+                    "enum": ["full", "read_only"],
+                    "description": "read_only removes the lane's file-editing tools (investigation/review lanes). Default full."
                 }
             },
-            "required": ["title", "description"],
+            "required": ["description"],
             "additionalProperties": false,
         }),
     }
@@ -184,6 +199,10 @@ const MIN_DELEGATE_DESCRIPTION_CHARS: usize = 40;
 pub struct DelegateBrief {
     pub title: String,
     pub description: String,
+    /// Continue this existing lane with `description` as a follow-up.
+    pub lane_id: Option<String>,
+    /// Strip the lane's file-mutation tools (investigation lanes).
+    pub read_only: bool,
 }
 
 /// Validate a `delegate_task` payload. Mirrors wacht's `validate_delegate_description`:
@@ -191,24 +210,48 @@ pub struct DelegateBrief {
 /// lane can't drift. Returns a user-correctable message on failure (fed back to the
 /// model as a tool error so it self-corrects next turn).
 pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> {
+    let lane_id = arguments
+        .get("lane_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let read_only = match arguments.get("access").and_then(Value::as_str).map(str::trim) {
+        None | Some("") | Some("full") => false,
+        Some("read_only") => true,
+        Some(other) => {
+            return Err(format!(
+                "delegate_task `access` must be `full` or `read_only`, not `{other}`."
+            ));
+        }
+    };
     let title = arguments
         .get("title")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim()
         .to_string();
-    if title.is_empty() {
-        return Err("delegate_task requires a non-empty `title`.".to_string());
+    // A follow-up reuses the existing lane's title; a new lane needs one.
+    if title.is_empty() && lane_id.is_none() {
+        return Err("delegate_task requires a non-empty `title` (or a `lane_id` to follow up).".to_string());
     }
 
-    let normalized = arguments
+    let description = arguments
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or_default()
+        .trim()
+        .to_string();
+    // Length-check the collapsed form but DELIVER the original text: collapsing
+    // all whitespace destroyed the brief's structure (lists, code blocks,
+    // paragraphs) before the lane ever saw it.
+    let collapsed_len = description
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.chars().count() < MIN_DELEGATE_DESCRIPTION_CHARS {
+        .join(" ")
+        .chars()
+        .count();
+    if collapsed_len < MIN_DELEGATE_DESCRIPTION_CHARS {
         return Err(format!(
             "delegate_task needs a brief describing what the lane should do and what it should \
              produce (at least {MIN_DELEGATE_DESCRIPTION_CHARS} characters — a sentence or two)."
@@ -217,7 +260,9 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
 
     Ok(DelegateBrief {
         title,
-        description: normalized,
+        description,
+        lane_id,
+        read_only,
     })
 }
 

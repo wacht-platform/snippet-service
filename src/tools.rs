@@ -244,6 +244,12 @@ impl ToolRegistry {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
+    /// Remove a tool by name (used to derive scoped registries, e.g. read-only
+    /// investigation lanes).
+    pub fn remove(&mut self, name: &str) {
+        self.tools.remove(name);
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }

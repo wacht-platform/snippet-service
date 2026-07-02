@@ -35,6 +35,14 @@ pub enum RuntimeSignal {
     BatchBackpressure { batch_size: usize },
     /// A user message just arrived — state the working intent before continuing.
     StateIntent,
+    /// Several consecutive turns of failing tool calls (or near the unproductive
+    /// backstop): step back and re-think creatively, or ask for help.
+    StuckEscalation {
+        failed_turns: usize,
+        /// Whether `ask_user` is available (conversation mode) — headless lanes
+        /// report the blocker instead.
+        can_ask_user: bool,
+    },
 }
 
 impl RuntimeSignal {
@@ -51,6 +59,7 @@ impl RuntimeSignal {
             Self::NoteLoop { .. } => "note_loop",
             Self::BatchBackpressure { .. } => "batch_backpressure",
             Self::StateIntent => "state_intent",
+            Self::StuckEscalation { .. } => "stuck_escalation",
         }
     }
 
@@ -69,7 +78,8 @@ impl RuntimeSignal {
                     .to_string(),
             Self::ToolCallLoop { count } => format!(
                 "you have issued the same tool call {count} turns in a row; the result will not \
-                 change. Change the inputs, use a different tool, or finish with `terminate_loop`."
+                 change. Change the inputs, use a different tool, or finish the turn and deliver \
+                 your conclusion."
             ),
             Self::UnknownTool { name, available } => format!(
                 "`{name}` is not an available tool. Use one of these by exact name: [{available}]. \
@@ -92,7 +102,8 @@ impl RuntimeSignal {
             ),
             Self::NoteLoop { count } => format!(
                 "you have written {count} notes in a row without doing any work. Notes do not make \
-                 progress. Act now with a real tool call, or finish with `terminate_loop`."
+                 progress. Act now with a real tool call, or finish the turn and deliver your \
+                 conclusion."
             ),
             Self::BatchBackpressure { batch_size } => format!(
                 "you issued {batch_size} tool calls in one turn. Large fan-outs are hard to verify \
@@ -104,6 +115,22 @@ impl RuntimeSignal {
                  interruption) and what you will do next for this message — then proceed (you may \
                  batch it with your first real step)."
                     .to_string(),
+            Self::StuckEscalation { failed_turns, can_ask_user } => {
+                let escape = if *can_ask_user {
+                    "if you genuinely cannot proceed (missing access, credentials, information, or \
+                     permission), call `ask_user` and ask for help instead of spinning"
+                } else {
+                    "if you genuinely cannot proceed, stop and report exactly what is blocking you \
+                     and what you'd need to continue"
+                };
+                format!(
+                    "your last {failed_turns} turns of tool calls all failed — the current approach \
+                     is not working. STOP repeating it. Step back: question your assumptions, list \
+                     what you know, and try a genuinely different angle (different tool, different \
+                     starting point, simplify the step, or investigate the failure itself first); \
+                     {escape}."
+                )
+            }
         }
     }
 

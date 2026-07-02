@@ -330,6 +330,9 @@ struct LoopVars {
     consecutive_note_count: usize,
     /// Consecutive tool-call turns that did no real work (notes / unknown tools).
     unproductive_turns: usize,
+    /// Consecutive turns in which EVERY executed tool call failed — the approach
+    /// isn't working; escalates to a re-think-or-ask-for-help nudge.
+    consecutive_failed_turns: usize,
     /// Signatures of read-only discovery calls already executed THIS request, to
     /// short-circuit exact-duplicate re-calls. Cleared on a new user request and
     /// whenever a mutation makes re-discovery legitimate again.
@@ -517,20 +520,58 @@ impl CodingHarness {
             // Apply any input buffered during a step. A message that arrived mid- or
             // post-turn wakes the loop so the next step addresses it.
             if !pending_inputs.is_empty() {
-                // A steer that arrived mid-run is still a user message — nudge an
-                // intent restatement next turn so the interruption is captured.
-                let had_user_msg = pending_inputs
-                    .iter()
-                    .any(|i| matches!(i, LoopInput::UserMessage(_) | LoopInput::Answer(_)));
+                let prior_status = state.status;
+                let was_running = prior_status == HarnessStatus::Running;
+                let mut had_user_msg = false;
+                let mut wants_compact = false;
                 for input in std::mem::take(&mut pending_inputs) {
-                    self.apply_input(&mut state, input);
+                    match input {
+                        // Buffered /compact must actually run — `apply_input`
+                        // treated it as a no-op, silently swallowing the request.
+                        LoopInput::Compact => wants_compact = true,
+                        LoopInput::UserMessage(text) | LoopInput::Answer(text) => {
+                            let text = text.trim().to_string();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            had_user_msg = true;
+                            if was_running {
+                                // Mid-run steer: the step continues; fold it in.
+                                state.messages.push(HarnessMessage::User {
+                                    content: format!("[steer]\n{text}"),
+                                });
+                                state.events.push(HarnessEvent::Steer { text });
+                            } else {
+                                // The step ENDED while this was queued: it's the
+                                // next real request (or the answer to the question
+                                // that ended the turn), not a steer — take the full
+                                // new-request path (checkpoint, budget/dedup reset,
+                                // pending-question clearing).
+                                self.accept_user_message(&mut state, &mut vars, text).await;
+                                consecutive_errors = 0;
+                            }
+                        }
+                        other => {
+                            self.apply_input(&mut state, other);
+                        }
+                    }
                 }
                 if had_user_msg {
+                    // A steer is still a user message — nudge an intent
+                    // restatement next turn so the interruption is captured.
                     vars.pending_signals.push(RuntimeSignal::StateIntent);
                     vars.empty_reply_reprompts = 0;
                 }
-                if state.status != HarnessStatus::Running {
+                if wants_compact {
+                    self.run_manual_compaction(model, &mut state, &lanes).await?;
+                }
+                if had_user_msg || was_running {
                     state.status = HarnessStatus::Running;
+                } else if wants_compact {
+                    // Compaction ran while parked — return to the parked status
+                    // rather than waking the model with nothing new.
+                    state.status = prior_status;
+                    self.persist(&mut state, &lanes).await?;
                 }
             }
 
@@ -545,7 +586,9 @@ impl CodingHarness {
                     self.persist(&mut state, &lanes).await?;
                     continue;
                 }
-                if self.drain_pending(&mut state, &mut lanes, &mut input_rx, &mut lane_rx) {
+                let (interrupted, wants_compact) =
+                    self.drain_pending(&mut state, &mut lanes, &mut input_rx, &mut lane_rx);
+                if interrupted {
                     state.status = HarnessStatus::Interrupted;
                     state.events.push(HarnessEvent::SystemDecision {
                         step: "interrupted".to_string(),
@@ -553,6 +596,9 @@ impl CodingHarness {
                     });
                     self.persist(&mut state, &lanes).await?;
                     break;
+                }
+                if wants_compact {
+                    self.run_manual_compaction(model, &mut state, &lanes).await?;
                 }
 
                 state.iterations += 1;
@@ -692,55 +738,12 @@ impl CodingHarness {
                             if text.is_empty() {
                                 continue;
                             }
-                            let answering = state.status == HarnessStatus::WaitingForInput;
-                            // Snapshot the workspace before acting on a NEW request, so
-                            // the whole turn (direct edits + any lane changes + bash) can
-                            // be rewound. An answer continues a turn already checkpointed.
-                            if !answering {
-                                // First real request seeds the session title (app
-                                // sessions open empty, so user_request starts blank).
-                                if state.user_request.trim().is_empty() {
-                                    state.user_request = text.clone();
-                                }
-                                self.checkpoint(&mut state, &text).await;
-                                // Fresh request: re-discovery is legitimate again, and
-                                // prior-turn loop/thought state belongs to the past run.
-                                vars.executed_calls.clear();
-                                vars.last_turn_had_repeat = false;
-                                vars.last_thought = None;
-                                vars.turns_this_request = 0;
-                            }
-                            state.pending_question = None;
-                            state.messages.push(HarnessMessage::User {
-                                content: if answering {
-                                    format!("[answer]\n{text}")
-                                } else {
-                                    text.clone()
-                                },
-                            });
-                            state.events.push(HarnessEvent::UserInput { text });
-                            // Every user message → restate intent next turn.
-                            vars.pending_signals.push(RuntimeSignal::StateIntent);
-                            state.status = HarnessStatus::Running;
-                            vars.steps_since_visible = 0;
-                            vars.empty_reply_reprompts = 0;
+                            self.accept_user_message(&mut state, &mut vars, text).await;
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
                         }
                         Some(LoopInput::Compact) => {
-                            let before_len = state.messages.len();
-                            // Manual /compact runs while idle — mark Running and
-                            // persist first so the TUI shows the compaction bar
-                            // (is_compacting requires Running + the pass event).
-                            state.status = HarnessStatus::Running;
-                            self.persist(&mut state, &lanes).await?;
-                            self.compact_history_agentic(model, &mut state, true).await?;
-                            if state.messages.len() >= before_len {
-                                state.events.push(HarnessEvent::SystemDecision {
-                                    step: "history_compaction_skipped".to_string(),
-                                    reasoning: "Manual compaction ran, but there was no additional older history left to shrink beyond the preserved recent tail.".to_string(),
-                                });
-                            }
+                            self.run_manual_compaction(model, &mut state, &lanes).await?;
                             state.pending_question = None;
                             state.status = HarnessStatus::Idle;
                             self.persist(&mut state, &lanes).await?;
@@ -779,6 +782,75 @@ impl CodingHarness {
         Ok(state)
     }
 
+    /// Accept a user message that STARTS a turn (or answers the question that
+    /// ended one) — the shared path for the idle receive and for a message that
+    /// was buffered while a step finished. Handles checkpointing, per-request
+    /// bookkeeping resets, and the pending question, and marks the loop Running.
+    /// Persisting is left to the caller.
+    async fn accept_user_message(
+        &self,
+        state: &mut HarnessState,
+        vars: &mut LoopVars,
+        text: String,
+    ) {
+        let answering =
+            state.status == HarnessStatus::WaitingForInput && state.pending_question.is_some();
+        // Snapshot the workspace before acting on a NEW request, so the whole turn
+        // (direct edits + any lane changes + bash) can be rewound. An answer
+        // continues a turn already checkpointed.
+        if !answering {
+            // First real request seeds the session title (app sessions open
+            // empty, so user_request starts blank).
+            if state.user_request.trim().is_empty() {
+                state.user_request = text.clone();
+            }
+            self.checkpoint(state, &text).await;
+            // Fresh request: re-discovery is legitimate again, and prior-turn
+            // loop/thought/failure state belongs to the past run.
+            vars.executed_calls.clear();
+            vars.last_turn_had_repeat = false;
+            vars.last_thought = None;
+            vars.turns_this_request = 0;
+            vars.consecutive_failed_turns = 0;
+        }
+        state.pending_question = None;
+        state.messages.push(HarnessMessage::User {
+            content: if answering {
+                format!("[answer]\n{text}")
+            } else {
+                text.clone()
+            },
+        });
+        state.events.push(HarnessEvent::UserInput { text });
+        // Every user message → restate intent next turn.
+        vars.pending_signals.push(RuntimeSignal::StateIntent);
+        state.status = HarnessStatus::Running;
+        vars.steps_since_visible = 0;
+        vars.empty_reply_reprompts = 0;
+    }
+
+    /// Run a user-requested compaction pass now, surfacing the compaction UI
+    /// (Running + the pass event). Leaves `state.status` Running; callers decide
+    /// what follows and persist it.
+    async fn run_manual_compaction(
+        &self,
+        model: &mut dyn AgentModel,
+        state: &mut HarnessState,
+        lanes: &LaneManager,
+    ) -> Result<(), ToolError> {
+        let before_len = state.messages.len();
+        state.status = HarnessStatus::Running;
+        self.persist(state, lanes).await?;
+        self.compact_history_agentic(model, state, true).await?;
+        if state.messages.len() >= before_len {
+            state.events.push(HarnessEvent::SystemDecision {
+                step: "history_compaction_skipped".to_string(),
+                reasoning: "Manual compaction ran, but there was no additional older history left to shrink beyond the preserved recent tail.".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Stamp base64 image bytes onto `read_image` tool results so the model can
     /// actually SEE the image. Done per-turn on the cloned request only (never
     /// persisted), so state stays lean and images re-inline fresh each turn.
@@ -787,7 +859,53 @@ impl CodingHarness {
         use base64::{Engine, engine::general_purpose::STANDARD};
         // Skip absurdly large images so a request can't balloon unboundedly.
         const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-        for message in messages.iter_mut() {
+        // Inlined images cost their image tokens again on EVERY subsequent turn,
+        // so a long session that read a few screenshots pays for all of them
+        // forever. Age out by TURN, not by count: everything the model read in
+        // the last few assistant turns stays visible (a 10-screenshot batch is
+        // still fully visible while it's being worked on); older results carry a
+        // note instead — the model re-reads if it truly needs one back.
+        const IMAGE_TURN_WINDOW: usize = 3;
+        // Safety cap across the inlined set so one batch can't balloon a request.
+        const MAX_TOTAL_IMAGE_BYTES: usize = 24 * 1024 * 1024;
+        let mut assistant_turns = 0usize;
+        let mut cutoff = 0usize;
+        for (i, m) in messages.iter().enumerate().rev() {
+            if matches!(m, HarnessMessage::Assistant { .. }) {
+                assistant_turns += 1;
+                if assistant_turns >= IMAGE_TURN_WINDOW {
+                    cutoff = i;
+                    break;
+                }
+            }
+        }
+        // Budget pass, newest first, so when a batch exceeds the total cap it's
+        // the OLDEST images that drop to notes.
+        let mut allowed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut total_inlined = 0usize;
+        for (index, message) in messages.iter().enumerate().rev() {
+            let HarnessMessage::ToolResult { tool_name, content, .. } = message else {
+                continue;
+            };
+            if tool_name != "read_image" || index < cutoff {
+                continue;
+            }
+            let Some(path) = content.pointer("/data/path").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok(resolved) = self.context.resolve_workspace_path(path) else {
+                continue;
+            };
+            let Ok(len) = std::fs::metadata(&resolved).map(|m| m.len() as usize) else {
+                continue;
+            };
+            if len == 0 || len > MAX_IMAGE_BYTES || total_inlined + len > MAX_TOTAL_IMAGE_BYTES {
+                continue;
+            }
+            total_inlined += len;
+            allowed.insert(index);
+        }
+        for (index, message) in messages.iter_mut().enumerate() {
             let HarnessMessage::ToolResult { tool_name, content, .. } = message else {
                 continue;
             };
@@ -809,6 +927,19 @@ impl CodingHarness {
                         "image_note".to_string(),
                         Value::String(format!(
                             "[image at {path} not shown — the current model is text-only]"
+                        )),
+                    );
+                }
+                continue;
+            }
+            // Aged out of the inline window (or over the total budget): note
+            // instead of bytes.
+            if !allowed.contains(&index) {
+                if let Some(data) = content.get_mut("data").and_then(Value::as_object_mut) {
+                    data.insert(
+                        "image_note".to_string(),
+                        Value::String(format!(
+                            "[image at {path} was shown in an earlier turn — call read_image again if you need to see it now]"
                         )),
                     );
                 }
@@ -851,14 +982,24 @@ impl CodingHarness {
             // Cap retained records so a long session doesn't bloat persisted state.
             const MAX_CHECKPOINTS: usize = 8;
             let len = state.checkpoints.len();
-            if len > MAX_CHECKPOINTS {
-                state.checkpoints.drain(..len - MAX_CHECKPOINTS);
-            }
-            // Drop dropped snapshots from the shadow repo and gc so disk stays
-            // bounded to the retained set (off the async runtime — gc can be slow).
+            let dropped: Vec<String> = if len > MAX_CHECKPOINTS {
+                state
+                    .checkpoints
+                    .drain(..len - MAX_CHECKPOINTS)
+                    .map(|c| c.id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Drop ONLY this session's aged-out snapshots from the shadow repo and
+            // gc so disk stays bounded (off the async runtime — gc can be slow).
+            // The shadow is shared by all sessions in the workspace, so pruning by
+            // "everything not in my keep list" destroyed sibling sessions' rewinds.
             let keep: Vec<String> = state.checkpoints.iter().map(|c| c.id.clone()).collect();
             let ws = self.context.workspace_root().to_path_buf();
-            let _ = tokio::task::spawn_blocking(move || crate::checkpoint::prune(&ws, &keep)).await;
+            let _ =
+                tokio::task::spawn_blocking(move || crate::checkpoint::prune(&ws, &keep, &dropped))
+                    .await;
         }
     }
 
@@ -886,22 +1027,28 @@ impl CodingHarness {
     }
 
     /// Non-blocking drain of steers + lane reports between iterations. Returns
-    /// `true` if an interrupt was seen.
+    /// `(interrupted, wants_compact)` — a `/compact` seen here must be run by the
+    /// caller (`apply_input` can't do it; it has no model access).
     fn drain_pending(
         &self,
         state: &mut HarnessState,
         lanes: &mut LaneManager,
         input_rx: &mut mpsc::UnboundedReceiver<LoopInput>,
         lane_rx: &mut mpsc::UnboundedReceiver<LaneResult>,
-    ) -> bool {
+    ) -> (bool, bool) {
         let mut interrupted = false;
+        let mut wants_compact = false;
         while let Ok(input) = input_rx.try_recv() {
+            if matches!(input, LoopInput::Compact) {
+                wants_compact = true;
+                continue;
+            }
             interrupted |= self.apply_input(state, input);
         }
         while let Ok(result) = lane_rx.try_recv() {
             self.inject_lane_result(state, lanes, &result);
         }
-        interrupted
+        (interrupted, wants_compact)
     }
 
     /// Apply one queued input while a run is active: a message/answer becomes a
@@ -958,16 +1105,36 @@ impl CodingHarness {
                 .clone()
                 .or_else(|| result.summary.clone())
                 .unwrap_or_else(|| "completed".to_string()),
+            // A failure is a decision point, not a dead end — spell the options
+            // out so the orchestrator recovers instead of stalling or re-briefing
+            // from scratch.
             LaneStatus::Failed => format!(
-                "FAILED: {}",
-                result.error.clone().unwrap_or_else(|| "unknown error".to_string())
+                "FAILED: {}\nRecover deliberately: follow up THIS lane (delegate_task with lane_id=\"{}\") \
+                 with a narrower or corrected brief — it keeps everything it learned — or do the slice \
+                 yourself if it's small. Don't silently drop this part of the work.",
+                result.error.clone().unwrap_or_else(|| "unknown error".to_string()),
+                result.id,
             ),
             LaneStatus::Running => "still running".to_string(),
         };
+        // Orchestration cue: tell the agent whether it's still waiting on others
+        // or holding the complete picture — the difference between a progress
+        // note and the final synthesis.
+        let outstanding = lanes.active_count();
+        let cue = if outstanding > 0 {
+            format!(
+                "{outstanding} lane(s) still out — fold this in (or note progress) and keep waiting; don't finalize yet."
+            )
+        } else {
+            "ALL delegated lanes have now reported. You hold the complete picture: synthesize the results \
+             into the deliverable now (verify load-bearing findings against the cited file:line first). \
+             Don't restart the investigation yourself; follow up a specific lane if something is missing."
+                .to_string()
+        };
         state.messages.push(HarnessMessage::User {
             content: format!(
-                "[lane_report]\nlane = \"{}\" ({})\nstatus = {:?}\n{}\n[/lane_report]",
-                result.title, result.id, result.status, body
+                "[lane_report]\nlane = \"{}\" ({})\nstatus = {:?}\n{}\n[orchestration] {}\n[/lane_report]",
+                result.title, result.id, result.status, body, cue
             ),
         });
         state.events.push(HarnessEvent::LaneCompleted {
@@ -1020,9 +1187,20 @@ impl CodingHarness {
         // drained runtime signals) and append it after the durable history. It is
         // sent to the model but never persisted into `state.messages`, so signals
         // re-ground the model each turn instead of accumulating as stale nudges.
+        // Snapshot the pending signals: `build_live_context` drains them into this
+        // request, but if the request FAILS they must survive to the retry — losing
+        // a loop-breaking nudge exactly when the model is looping made things worse.
+        let signals_backup = vars.pending_signals.clone();
         let mut request_messages = state.messages.clone();
         self.inline_images(&mut request_messages, model.supports_images());
-        request_messages.push(HarnessMessage::User {
+        // Delivered as System, not User: adapters wrap a mid-history System turn
+        // in a `[runtime_signal]` envelope, so the model reads it as out-of-band
+        // runtime state rather than the user speaking — which stopped it from (a)
+        // replying with "you should do X" advice and (b) narrating its completion
+        // status back to "the user". (On the wire this still lands in the user
+        // role on providers with no mid-conversation system role — the framing in
+        // build_live_context is the portable half of the fix.)
+        request_messages.push(HarnessMessage::System {
             content: build_live_context(state, vars, conversation_mode, self.context.workspace_root()),
         });
 
@@ -1041,6 +1219,9 @@ impl CodingHarness {
         {
             Ok(output) => output,
             Err(error) => {
+                // The failed request consumed the drained signals — restore them
+                // so the retry carries the same steering.
+                vars.pending_signals = signals_backup;
                 // Adapters embed the full HTTP body; show only a concise first line.
                 let raw = error.to_string();
                 let line = raw.lines().next().unwrap_or(&raw);
@@ -1248,6 +1429,7 @@ impl CodingHarness {
         // Per-turn productivity tracking, drives note-loop / unproductive /
         // backpressure / shell-discipline signals after the batch runs.
         let mut real_work_count = 0usize;
+        let mut failed_results = 0usize;
         let mut had_note = false;
         let mut shell_nudged_this_turn = false;
         let mut dedup_hits = 0usize;
@@ -1297,6 +1479,17 @@ impl CodingHarness {
                     content: result,
                 });
                 if let Some(s) = summary {
+                    // The conversation agent isn't offered terminate_loop, but a
+                    // steered model calls it anyway. Its summary IS the answer —
+                    // render it as one, or the turn ends silently and the user
+                    // never sees the reply.
+                    if conversation_mode && !replied_since_last_user(&state.events) {
+                        state.messages.push(HarnessMessage::Assistant {
+                            content: s.to_string(),
+                            tool_calls: Vec::new(),
+                        });
+                        state.events.push(HarnessEvent::AssistantText { text: s.to_string() });
+                    }
                     return StepResult::TurnEnded {
                         kind: TurnEndKind::Complete,
                         final_text: Some(s.to_string()),
@@ -1418,6 +1611,10 @@ impl CodingHarness {
                 && MUTATING_TOOLS.contains(&tool_name.as_str())
             {
                 approval_index += 1;
+                // Discard stale decisions (double-taps, key repeat) queued before
+                // this prompt existed — an unconsumed leftover would instantly
+                // "approve" an action the user never saw.
+                while approval_rx.try_recv().is_ok() {}
                 state.events.push(HarnessEvent::ApprovalRequest {
                     tool_name: tool_name.clone(),
                     summary: approval_summary(&tool_name, &call.arguments),
@@ -1478,6 +1675,9 @@ impl CodingHarness {
                     }
                 }),
             };
+            if result.get("status").and_then(Value::as_str) == Some("error") {
+                failed_results += 1;
+            }
             // A mutation may have changed the workspace, so prior discovery results
             // are stale — re-discovery is legitimate again; clear the dedup set.
             // Otherwise remember this discovery call so an exact repeat is caught.
@@ -1512,6 +1712,21 @@ impl CodingHarness {
             vars.pending_signals.push(RuntimeSignal::BatchBackpressure {
                 batch_size: real_work_count,
             });
+        }
+
+        // Stuck detection: a turn where every executed call failed doesn't loop
+        // forever on the same broken approach — after a couple of those, steer the
+        // model to re-think creatively or ask for help (`ask_user` in conversation).
+        if real_work_count > 0 && failed_results >= real_work_count {
+            vars.consecutive_failed_turns += 1;
+            if vars.consecutive_failed_turns >= 2 {
+                vars.pending_signals.push(RuntimeSignal::StuckEscalation {
+                    failed_turns: vars.consecutive_failed_turns,
+                    can_ask_user: conversation_mode,
+                });
+            }
+        } else if real_work_count > 0 {
+            vars.consecutive_failed_turns = 0;
         }
 
         // Productivity accounting: real work resets the streaks; a turn that only
@@ -1590,28 +1805,57 @@ impl CodingHarness {
                 Err(error) => (tool_error(error), MetaControl::Continue),
             },
             "delegate_task" => match parse_delegate_brief(arguments) {
-                Ok(brief) => match lanes.spawn(&brief.title, &brief.description) {
-                    Ok(id) => {
-                        state.events.push(HarnessEvent::LaneSpawned {
-                            id: id.clone(),
-                            title: brief.title.clone(),
-                        });
-                        (
-                            json!({
-                                "schema_version": 1,
-                                "status": "success",
-                                "data": {
-                                    "delegated": true,
-                                    "lane_id": id,
-                                    "title": brief.title,
-                                    "note": "Lane runs in the background; its report will arrive as a [lane_report] message.",
-                                }
-                            }),
-                            MetaControl::Continue,
-                        )
+                Ok(brief) => {
+                    // Follow-up to an existing lane: resume it with the new brief,
+                    // context intact.
+                    if let Some(lane_id) = brief.lane_id.as_deref() {
+                        return match lanes.follow_up(lane_id, &brief.description) {
+                            Ok(title) => {
+                                state.events.push(HarnessEvent::LaneSpawned {
+                                    id: lane_id.to_string(),
+                                    title: title.clone(),
+                                });
+                                (
+                                    json!({
+                                        "schema_version": 1,
+                                        "status": "success",
+                                        "data": {
+                                            "continued": true,
+                                            "lane_id": lane_id,
+                                            "title": title,
+                                            "note": "Lane resumed with its prior context; its report will arrive as a [lane_report] message.",
+                                        }
+                                    }),
+                                    MetaControl::Continue,
+                                )
+                            }
+                            Err(error) => (tool_error(error), MetaControl::Continue),
+                        };
                     }
-                    Err(error) => (tool_error(error), MetaControl::Continue),
-                },
+                    match lanes.spawn(&brief.title, &brief.description, brief.read_only) {
+                        Ok(id) => {
+                            state.events.push(HarnessEvent::LaneSpawned {
+                                id: id.clone(),
+                                title: brief.title.clone(),
+                            });
+                            (
+                                json!({
+                                    "schema_version": 1,
+                                    "status": "success",
+                                    "data": {
+                                        "delegated": true,
+                                        "lane_id": id,
+                                        "title": brief.title,
+                                        "access": if brief.read_only { "read_only" } else { "full" },
+                                        "note": "Lane runs in the background; its report will arrive as a [lane_report] message. Follow up later by re-calling delegate_task with this lane_id.",
+                                    }
+                                }),
+                                MetaControl::Continue,
+                            )
+                        }
+                        Err(error) => (tool_error(error), MetaControl::Continue),
+                    }
+                }
                 Err(error) => (tool_error(error), MetaControl::Continue),
             },
             other => (
@@ -1714,6 +1958,11 @@ impl CodingHarness {
                                 Some("lane lost on resume (process restarted)".to_string());
                         }
                     }
+                    // A crash mid tool-batch persists an assistant `tool_calls`
+                    // message whose later calls never got results; strict providers
+                    // (Anthropic, DeepSeek) 400 on that history forever after.
+                    // Repair on load so a resumed session is always well-formed.
+                    repair_unanswered_tool_calls(&mut state.messages);
                     if let Some(request) =
                         user_request.map(|r| r.trim().to_string()).filter(|r| !r.is_empty())
                     {
@@ -1732,6 +1981,13 @@ impl CodingHarness {
                     self.debug_log(&format!("resume: ignoring unreadable state file: {err}"));
                 }
             }
+        }
+
+        // Fresh session in this folder: keep snippet's `.snippet/` workspace scratch
+        // (bg processes, lanes) out of the user's git history. Main agent only —
+        // lanes share the workspace and would just race on the same file.
+        if self.context.owner() == "main" {
+            ensure_snippet_gitignored(self.context.workspace_root());
         }
 
         let now = Utc::now().to_rfc3339();
@@ -2188,11 +2444,26 @@ impl CodingHarness {
 
         // Keep a copy of the fresh table to feed the memory reflection pass below.
         let table_for_memory = table.clone();
-        // The whole conversation is now the table — no verbatim tail.
+        // A trailing user message hasn't been acted on yet (auto-compaction runs
+        // between the push and the step) — keep it verbatim, or the request only
+        // survives as well as the summarizer happened to capture it.
+        let trailing_user: Vec<HarnessMessage> = state
+            .messages
+            .iter()
+            .rev()
+            .take_while(|m| matches!(m, HarnessMessage::User { .. }))
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        // The whole conversation is now the table — no verbatim tail (except the
+        // pending user message(s) above).
         state.messages = vec![
             HarnessMessage::System { content: system_prompt },
             HarnessMessage::Summary { kind: "compacted_window".to_string(), content: table },
         ];
+        state.messages.extend(trailing_user);
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
@@ -2446,6 +2717,54 @@ impl CodingHarness {
     }
 }
 
+/// Insert synthetic error results for assistant tool calls that never received
+/// one. Every unanswered `tool_call_id` gets a stub result appended right after
+/// the contiguous result run that follows its assistant message, preserving the
+/// call/result pairing strict providers require.
+fn repair_unanswered_tool_calls(messages: &mut Vec<HarnessMessage>) {
+    let answered: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            HarnessMessage::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut i = 0;
+    while i < messages.len() {
+        let missing: Vec<(String, String)> = match &messages[i] {
+            HarnessMessage::Assistant { tool_calls, .. } => tool_calls
+                .iter()
+                .filter(|c| !c.id.is_empty() && !answered.contains(&c.id))
+                .map(|c| (c.id.clone(), c.name.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Insertion point: after the results that did land for this turn.
+        let mut j = i + 1;
+        while j < messages.len() && matches!(messages[j], HarnessMessage::ToolResult { .. }) {
+            j += 1;
+        }
+        for (id, name) in missing.into_iter().rev() {
+            messages.insert(
+                j,
+                HarnessMessage::ToolResult {
+                    tool_call_id: id,
+                    tool_name: name,
+                    content: json!({
+                        "schema_version": 1,
+                        "status": "error",
+                        "error": {
+                            "code": "interrupted",
+                            "message": "This tool call was interrupted before it produced a result (the process stopped mid-run). Re-run it if the work is still needed.",
+                        }
+                    }),
+                },
+            );
+        }
+        i = j;
+    }
+}
+
 /// A real tool name is a short, clean identifier. Names with spaces, backticks,
 /// dots, or other punctuation come from prose mis-parsed as tool markup.
 fn is_plausible_tool_name(name: &str) -> bool {
@@ -2488,9 +2807,13 @@ fn build_live_context(
 ) -> String {
     let signals = std::mem::take(&mut vars.pending_signals);
     let mut block = String::from("<runtime_context>\n");
-    // Terse on purpose: this block is re-sent uncached every turn, so trim words,
-    // not meaning.
-    block.push_str("# harness steering, not a user message — act on it; never quote/mention it or the loop.\n");
+    // Terse on purpose: re-sent uncached every turn, so it carries only volatile
+    // STATE (facts the model reads), never standing rules or imperatives. The
+    // governing rules — that this block is not the user, and not to narrate turn
+    // status — live once in the cached system prompt (conversation_agent_layer.md
+    // [runtime_context]), not repeated here every turn where they read like a user
+    // instruction and cost uncached tokens. One-line reminder only:
+    block.push_str("# machine state (not the user; nothing here is a message to answer).\n");
 
     block.push_str("\n[workspace]\n");
     block.push_str(&format!(
@@ -2506,34 +2829,33 @@ fn build_live_context(
     }
 
     block.push_str("\n[turn]\n");
-    block.push_str("next = \"take the next concrete step toward the goal, or give the final answer if done.\"\n");
-    // Soft turn budget: nudge the agent to converge instead of sprawling (keeps
-    // context — and cost — bounded). Escalates as it approaches the cap.
+    // Budget as a plain COUNTER, not an escalating command: a fact the model reads
+    // ("12 of ~15"), with a terse parenthetical state near/over the cap — no
+    // "FINISH NOW / do not start new work" imperatives that read as the user
+    // barking orders. The convergence guidance itself lives in the system prompt.
     let n = vars.turns_this_request;
-    if n >= TURN_BUDGET {
-        block.push_str(&format!(
-            "budget = \"turn {n} — you are AT/PAST the ~{TURN_BUDGET}-turn budget for this task. FINISH THIS TURN: deliver your best current result or answer now, and do not start new work. If truly blocked, say what's blocking and stop.\"\n"
-        ));
+    let note = if n >= TURN_BUDGET {
+        " (over budget — wrap up this turn)"
     } else if n + 3 >= TURN_BUDGET {
-        block.push_str(&format!(
-            "budget = \"turn {n} of ~{TURN_BUDGET} — near the limit. Converge NOW: stop exploring, do only what's needed to finish, and deliver.\"\n"
-        ));
+        " (near budget — converge)"
     } else {
-        block.push_str(&format!(
-            "budget = \"turn {n} of ~{TURN_BUDGET} for this task — work efficiently and aim to finish within it; don't sprawl.\"\n"
-        ));
-    }
-    // Explain the re-prompt ONLY when actually looping (a repeated call last turn).
+        ""
+    };
+    block.push_str(&format!("turns_used = \"{n} of ~{TURN_BUDGET}{note}\"\n"));
+    // Observed loop (a repeated call last turn) — stated as an observation, not an
+    // order; the system prompt covers what to do about it.
     if vars.last_turn_had_repeat {
         block.push_str(
-            "why_now = \"you repeated a tool call already in your history — re-issuing advances nothing. Use what you have; take a NEW step or finish.\"\n",
+            "observed = \"your last tool call repeated one already in history — its result won't change.\"\n",
         );
     }
-    if conversation_mode {
-        block.push_str("finish = \"done → reply in plain text with NO tool calls (that delivers the answer).\"\n");
-        block.push_str("ask = \"need something from the user → call ask_user.\"\n");
-    } else {
-        block.push_str("finish = \"done → call terminate_loop with a summary (your report); do the real work first.\"\n");
+    // Conversation mode: how to finish/ask is a standing RULE, now stated once in
+    // the cached system prompt (conversation_agent_layer.md) — not repeated here.
+    // Headless lanes DON'T load that layer, so they still need the terminate_loop
+    // reminder; keep it (it's an instruction to a reporter, not the user-facing
+    // symptom this rework targets).
+    if !conversation_mode {
+        block.push_str("finish = \"when the work is genuinely done, call terminate_loop with your summary. Do the real work first; don't emit intermediate status.\"\n");
     }
 
     if !signals.is_empty() {
@@ -2567,24 +2889,42 @@ fn build_live_context(
         block.push_str(&bg);
     }
 
-    // Delegated lanes still running — you're an ORCHESTRATOR here. Don't finalize
+    // Delegated lanes — you're an ORCHESTRATOR here. Running ones: don't finalize
     // while they're in flight; end the turn to wait (their reports wake you).
-    let running: Vec<&str> = state
+    // Finished ones ride along by id so follow-ups stay targetable even after
+    // their report messages have been compacted away.
+    let running: Vec<&LaneRecord> = state
         .lanes
         .iter()
         .filter(|l| l.status == LaneStatus::Running)
-        .map(|l| l.title.as_str())
         .collect();
-    if !running.is_empty() {
+    let finished: Vec<&LaneRecord> = state
+        .lanes
+        .iter()
+        .rev()
+        .filter(|l| l.status != LaneStatus::Running)
+        .take(6)
+        .collect();
+    if !running.is_empty() || !finished.is_empty() {
         block.push_str("\n[delegated_lanes]\n");
-        block.push_str("# background sub-agents you spawned; they run in parallel and their reports wake you.\n");
-        for t in &running {
-            block.push_str(&format!("- {t} — running\n"));
+        block.push_str("# background sub-agents; reports wake you. Continue ANY finished one with delegate_task{lane_id} — it resumes with its context intact (prefer that over re-briefing from scratch).\n");
+        for l in &running {
+            block.push_str(&format!("- {} \"{}\" — running\n", l.id, clip(&l.title, 40)));
         }
-        block.push_str(&format!(
-            "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — you go idle and each lane's report wakes you (no polling, no blocking). A short progress note to the user about what you kicked off is good. Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
-            running.len()
-        ));
+        for l in &finished {
+            let status = match l.status {
+                LaneStatus::Completed => "completed",
+                LaneStatus::Failed => "FAILED",
+                LaneStatus::Running => unreachable!("filtered above"),
+            };
+            block.push_str(&format!("- {} \"{}\" — {}\n", l.id, clip(&l.title, 40), status));
+        }
+        if !running.is_empty() {
+            block.push_str(&format!(
+                "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — you go idle and each lane's report wakes you (no polling, no blocking). A short progress note to the user about what you kicked off is good. Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
+                running.len()
+            ));
+        }
     }
 
     block.push_str("</runtime_context>\n");
@@ -2688,6 +3028,53 @@ fn replied_since_last_user(events: &[HarnessEvent]) -> bool {
             HarnessEvent::AssistantText { .. } => return true,
             _ => {}
         }
+    }
+    false
+}
+
+/// On a fresh session in a git work tree, make sure snippet's `.snippet/` scratch
+/// (bg-process registry, lane state) is gitignored so it never lands in the user's
+/// history. Best-effort and idempotent: creates `.gitignore` if it's missing,
+/// appends the entry if absent, no-ops if already covered. Skips folders that
+/// aren't in a git repo — a `.gitignore` there would be pointless clutter.
+fn ensure_snippet_gitignored(workspace: &Path) {
+    if !in_git_work_tree(workspace) {
+        return;
+    }
+    let gitignore = workspace.join(".gitignore");
+    let covered = |content: &str| {
+        content
+            .lines()
+            .any(|line| matches!(line.trim(), ".snippet" | ".snippet/" | "/.snippet" | "/.snippet/"))
+    };
+    match std::fs::read_to_string(&gitignore) {
+        Ok(content) => {
+            if covered(&content) {
+                return;
+            }
+            let mut updated = content;
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str(".snippet/\n");
+            let _ = std::fs::write(&gitignore, updated);
+        }
+        // No `.gitignore` yet (or unreadable) — create one with just the entry.
+        Err(_) => {
+            let _ = std::fs::write(&gitignore, ".snippet/\n");
+        }
+    }
+}
+
+/// Whether `dir` sits inside a git work tree — walk up for a `.git` marker (a dir
+/// for a normal clone, a file for a worktree/submodule). No subprocess.
+fn in_git_work_tree(dir: &Path) -> bool {
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.join(".git").exists() {
+            return true;
+        }
+        cur = d.parent();
     }
     false
 }
@@ -2969,12 +3356,18 @@ fn render_window(
         out.push_str(&format!("ORIGINAL REQUEST: {}\n\n", clip(user_request, 600)));
     }
     out.push_str("CONVERSATION TO SUMMARIZE:\n");
+    // Overall budget: this window is re-sent on EVERY summarizer turn (up to 16),
+    // so an uncapped render of a huge history multiplies into serious input cost.
+    // Render newest-first mentally: when over budget, elide the OLDEST lines —
+    // the prior table already carries the old context.
+    const WINDOW_BUDGET_CHARS: usize = 120_000; // ~35k tokens
+    let mut rendered: Vec<String> = Vec::with_capacity(older.len());
     // Mark the most recent messages so the summarizer captures them in extra detail.
     let focus_start = older.len().saturating_sub(recent_focus);
     for (i, m) in older.iter().enumerate() {
         if i == focus_start && focus_start > 0 {
-            out.push_str(
-                "\n=== MOST RECENT ACTIVITY — capture this in extra detail (what just happened, current state, next steps) ===\n",
+            rendered.push(
+                "\n=== MOST RECENT ACTIVITY — capture this in extra detail (what just happened, current state, next steps) ===".to_string(),
             );
         }
         let line = match m {
@@ -2996,9 +3389,88 @@ fn render_window(
             HarnessMessage::System { content } => format!("SYSTEM: {}", clip(content, 300)),
         };
         if !line.trim().is_empty() {
-            out.push_str(&line);
+            rendered.push(line);
+        }
+    }
+    let total: usize = rendered.iter().map(|l| l.chars().count() + 1).sum();
+    if total > WINDOW_BUDGET_CHARS {
+        // Drop oldest lines until the window fits; note the elision once.
+        let mut over = total - WINDOW_BUDGET_CHARS;
+        let mut skip = 0usize;
+        for line in &rendered {
+            if over == 0 {
+                break;
+            }
+            over = over.saturating_sub(line.chars().count() + 1);
+            skip += 1;
+        }
+        out.push_str(&format!(
+            "[…{skip} oldest message(s) elided to fit the window budget — rely on the PRIOR TABLE for that span]\n"
+        ));
+        for line in &rendered[skip..] {
+            out.push_str(line);
+            out.push('\n');
+        }
+    } else {
+        for line in &rendered {
+            out.push_str(line);
             out.push('\n');
         }
     }
     out
+}
+
+#[cfg(test)]
+mod gitignore_tests {
+    use super::{ensure_snippet_gitignored, in_git_work_tree};
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn creates_gitignore_when_missing() {
+        let repo = git_repo();
+        ensure_snippet_gitignored(repo.path());
+        let gi = std::fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+        assert_eq!(gi, ".snippet/\n");
+    }
+
+    #[test]
+    fn appends_entry_and_preserves_prior_lines() {
+        let repo = git_repo();
+        let gi = repo.path().join(".gitignore");
+        std::fs::write(&gi, "target/\nnode_modules/").unwrap(); // no trailing newline
+        ensure_snippet_gitignored(repo.path());
+        let out = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(out, "target/\nnode_modules/\n.snippet/\n");
+    }
+
+    #[test]
+    fn idempotent_when_already_covered() {
+        let repo = git_repo();
+        let gi = repo.path().join(".gitignore");
+        std::fs::write(&gi, "target/\n.snippet\n").unwrap(); // bare form counts
+        ensure_snippet_gitignored(repo.path());
+        let out = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(out, "target/\n.snippet\n"); // unchanged
+    }
+
+    #[test]
+    fn skips_non_git_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!in_git_work_tree(dir.path()));
+        ensure_snippet_gitignored(dir.path());
+        assert!(!dir.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn detects_repo_from_subfolder() {
+        let repo = git_repo();
+        let sub = repo.path().join("crates/inner");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(in_git_work_tree(&sub));
+    }
 }
