@@ -201,11 +201,21 @@ fn effective_title(state: &HarnessState) -> String {
         .unwrap_or_else(|| state.user_request.chars().take(120).collect())
 }
 
+/// The status string exposed on the session list / events APIs. Uses the enum's
+/// serde (snake_case) name — `Debug`-lowercasing produced `waitingforinput`,
+/// which consumers matching the documented `waiting_for_input` never saw.
+pub fn status_str(status: crate::harness::HarnessStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 fn meta_from_state(state: &HarnessState) -> SessionMeta {
     SessionMeta {
         folder: state.workspace.clone(),
         title: effective_title(state),
-        status: format!("{:?}", state.status).to_lowercase(),
+        status: status_str(state.status),
     }
 }
 
@@ -218,7 +228,11 @@ pub fn set_session_title(state_path: &Path, title: &str) -> Result<(), String> {
     let t = title.trim();
     state.title = if t.is_empty() { None } else { Some(t.to_string()) };
     let out = crate::harness::serialize_state(&state)?;
-    std::fs::write(state_path, out).map_err(|e| e.to_string())?;
+    // Temp + rename like `persist_state`: a crash mid-write must never leave a
+    // truncated state file (an unreadable state is silently started-over on open).
+    let tmp = state_path.with_extension("json.tmp");
+    std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, state_path).map_err(|e| e.to_string())?;
     write_session_meta(state_path, &state);
     Ok(())
 }
@@ -231,10 +245,13 @@ pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
     }
 }
 
-/// Remove a session's state file and its metadata sidecar.
+/// Remove a session's state file and its sidecars (metadata + model override —
+/// a leftover `.profile` would silently re-apply the deleted session's model to
+/// the next session opened on this state path).
 pub fn remove_session_files(state_path: &Path) {
     let _ = std::fs::remove_file(state_path);
     let _ = std::fs::remove_file(meta_path(state_path));
+    let _ = std::fs::remove_file(profile_sidecar(state_path));
 }
 
 fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<SessionInfo>) {
@@ -275,7 +292,7 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         folder: state.workspace.clone(),
         conversation: conversation.to_string(),
         title: effective_title(&state),
-        status: format!("{:?}", state.status).to_lowercase(),
+        status: status_str(state.status),
         last_active,
     });
 }

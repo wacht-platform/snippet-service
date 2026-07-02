@@ -206,14 +206,16 @@ impl SnippetConfig {
             }
         }
 
-        match config.model.provider.as_str() {
-            "openai-compatible" | "openai" | "anthropic" | "gemini" | "openrouter" | "chatgpt" => {}
-            other => {
-                return Err(ToolError::msg(format!(
-                    "unsupported model.provider `{}`; expected one of `openai-compatible`, `openai`, `anthropic`, `gemini`, `openrouter`, `chatgpt`",
-                    other
-                )));
-            }
+        if !provider_supported(&config.model.provider) {
+            return Err(ToolError::msg(format!(
+                "unsupported model.provider `{}`; expected one of {}",
+                config.model.provider,
+                SUPPORTED_PROVIDERS
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
         config.resolve_relative_paths(path);
         Ok(config)
@@ -417,6 +419,16 @@ fn default_workspace() -> PathBuf {
 
 fn default_state_path() -> PathBuf {
     ".snippet/state.json".into()
+}
+
+/// The providers `load` accepts for the active model. Config writers (the serve
+/// API, the TUI) must validate against this — persisting anything else bricks
+/// the next startup, since `load` hard-errors on it.
+pub const SUPPORTED_PROVIDERS: &[&str] =
+    &["openai-compatible", "openai", "anthropic", "gemini", "openrouter", "chatgpt"];
+
+pub fn provider_supported(provider: &str) -> bool {
+    SUPPORTED_PROVIDERS.contains(&provider)
 }
 
 fn default_provider() -> String {

@@ -48,6 +48,17 @@ fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Restrict a path to the owning user (0700). Best-effort, unix-only.
+fn set_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 pub fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
@@ -62,8 +73,12 @@ fn ensure_init(workspace: &Path) -> Result<(), String> {
     if !shadow.exists() {
         if let Some(parent) = shadow.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            set_private(parent);
         }
         git(workspace, &["init", "-q"])?;
+        // The shadow holds a full copy of the workspace tree and lives in the
+        // shared OS temp dir — keep it unreadable to other local users.
+        set_private(&shadow);
         // git already skips the nested `.git`; also keep snippet's scratch/shadow out.
         let exclude = shadow.join("info").join("exclude");
         let _ = std::fs::write(&exclude, ".snippet/\n");
@@ -101,10 +116,13 @@ pub fn snapshot(workspace: &Path, label: &str) -> Option<String> {
     Some(commit)
 }
 
-/// Keep only the snapshots whose commit id is in `keep` reachable; drop the rest
-/// and garbage-collect the shadow repo so disk stays bounded. Best-effort (never
-/// errors). Also migrates the legacy `refs/heads/snapshots` chain.
-pub fn prune(workspace: &Path, keep: &[String]) {
+/// Drop the snapshots in `dropped` and garbage-collect the shadow repo so disk
+/// stays bounded, while making sure everything in `keep` stays reachable.
+/// Deletion is by explicit id only: the shadow repo is shared by every session in
+/// this workspace, so "delete whatever isn't in MY keep list" would destroy the
+/// other sessions' rewind points. Best-effort (never errors). Also migrates the
+/// legacy `refs/heads/snapshots` chain.
+pub fn prune(workspace: &Path, keep: &[String], dropped: &[String]) {
     if !git_available() || !shadow_dir(workspace).exists() {
         return;
     }
@@ -116,19 +134,13 @@ pub fn prune(workspace: &Path, keep: &[String]) {
     }
     // Drop the legacy chain branch so its intermediate commits become collectable.
     let _ = git(workspace, &["update-ref", "-d", "refs/heads/snapshots"]);
-    // Delete refs for snapshots no longer retained.
-    if let Ok(out) = git(
-        workspace,
-        &["for-each-ref", "--format=%(refname) %(objectname)", "refs/snapshots"],
-    ) {
-        for line in out.lines() {
-            let mut it = line.split_whitespace();
-            if let (Some(refname), Some(oid)) = (it.next(), it.next()) {
-                if !keep.iter().any(|k| k == oid) {
-                    let _ = git(workspace, &["update-ref", "-d", refname]);
-                }
-            }
+    // Delete refs only for the snapshots this session explicitly dropped.
+    for id in dropped {
+        if keep.iter().any(|k| k == id) {
+            continue;
         }
+        let refname = format!("refs/snapshots/{id}");
+        let _ = git(workspace, &["update-ref", "-d", &refname]);
     }
     // Pack + prune now-unreachable objects (gc.auto/pruneExpire set in ensure_init).
     let _ = git(workspace, &["gc", "--auto", "--quiet"]);
