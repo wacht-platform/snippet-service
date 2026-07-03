@@ -429,7 +429,7 @@ fn print_service_connection() {
 }
 
 #[cfg(target_os = "macos")]
-const SERVICE_LABEL: &str = "com.snippet.serve";
+pub(super) const SERVICE_LABEL: &str = "com.snippet.serve";
 
 #[cfg(target_os = "macos")]
 fn launch_agent_path() -> PathBuf {
@@ -437,7 +437,7 @@ fn launch_agent_path() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn current_uid() -> Option<String> {
+pub(super) fn current_uid() -> Option<String> {
     std::process::Command::new("id")
         .arg("-u")
         .output()

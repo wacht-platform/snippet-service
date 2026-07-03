@@ -25,6 +25,7 @@ pub mod signals;
 pub mod skills;
 pub mod tools;
 pub mod tui;
+pub mod update;
 
 pub use harness::{
     CodingHarness, HarnessConfig, HarnessEvent, HarnessOutcome, HarnessState, HarnessStatus,

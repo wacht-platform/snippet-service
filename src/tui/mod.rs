@@ -275,6 +275,9 @@ struct App {
     /// paste shows as a compact chip and expands back on send.
     pasted_blocks: Vec<(String, String)>,
     status: String,
+    /// Set by the startup self-update task to the version it installed; shown in
+    /// the header as a "restart to apply" hint.
+    update_notice: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     error: Option<String>,
     state: Option<HarnessState>,
     /// The resident conversation loop. Spawned once, lives across turns.
@@ -427,6 +430,7 @@ impl App {
             chatgpt_device_code: None,
             chatgpt_device_begin_handle: None,
             models_fetch_status: String::new(),
+            update_notice: std::sync::Arc::new(std::sync::Mutex::new(None)),
             original_config: None,
             last_state_modified: None,
             login_active: false,
@@ -2183,6 +2187,21 @@ async fn run_app(
         app.spawn_loop(None, true);
     }
 
+    // Best-effort self-update in the background: if a newer release exists, it's
+    // downloaded and the binary is replaced in place; the header then shows a
+    // "restart to apply" hint. Never blocks startup; failures are silent.
+    if !crate::update::disabled() {
+        let slot = app.update_notice.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            if let Some(version) = crate::update::check_and_update(&client).await {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(version);
+                }
+            }
+        });
+    }
+
     while !app.quit {
         terminal.draw(|frame| render(frame, &app))?;
 
@@ -3314,12 +3333,21 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::styled(model.clone(), Style::default().fg(muted())),
         Span::raw(" "),
     ];
+    // A self-update landed this session → a right-aligned "restart to apply" hint.
+    let update = app.update_notice.lock().ok().and_then(|g| g.clone());
+    let notice = update.map(|v| format!("⬆ updated to v{v} — restart to apply"));
+    let notice_len = notice.as_ref().map(|n| n.chars().count() + 1).unwrap_or(0);
+
     // Fill the rest of the row with a thin rule for a clean header rather than a
-    // bare glyph floating in empty space.
+    // bare glyph floating in empty space (leaving room for any update hint).
     let used = name.chars().count() + 3 + model.chars().count() + 1;
-    let rule = (area.width as usize).saturating_sub(used + 1);
+    let rule = (area.width as usize).saturating_sub(used + 1 + notice_len);
     if rule > 0 {
         spans.push(Span::styled("─".repeat(rule), Style::default().fg(faint())));
+    }
+    if let Some(notice) = notice {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(notice, Style::default().fg(accent())));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

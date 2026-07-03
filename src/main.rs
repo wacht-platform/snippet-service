@@ -129,7 +129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serve::write_own_pidfile();
                 return runtime()?.block_on(async {
                     let config = SnippetConfig::load(&config_path).await?;
-                    serve::run_serve(config, config_path, &host, port, token, tunnel)
+                    // Supervised: a service manager can restart us onto a new binary.
+                    serve::run_serve(config, config_path, &host, port, token, tunnel, true)
                         .await
                         .map_err::<Box<dyn std::error::Error>, _>(Into::into)
                 });
@@ -140,7 +141,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serve::daemonize_self()?;
                 runtime()?.block_on(async {
                     let config = SnippetConfig::load(&config_path).await?;
-                    serve::run_serve(config, config_path, &host, port, token, tunnel)
+                    // Daemonized without a supervisor: update in place, apply on next restart.
+                    serve::run_serve(config, config_path, &host, port, token, tunnel, false)
                         .await
                         .map_err::<Box<dyn std::error::Error>, _>(Into::into)
                 })

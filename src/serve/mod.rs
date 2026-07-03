@@ -246,6 +246,7 @@ pub async fn run_serve(
     port: u16,
     token: String,
     tunnel: Tunnel,
+    supervised: bool,
 ) -> Result<(), String> {
     let token_for_print = token.clone();
     let mut config = config;
@@ -258,6 +259,17 @@ pub async fn run_serve(
         sessions: Mutex::new(HashMap::new()),
         git_write: Mutex::new(()),
     });
+
+    // Background self-update: periodically check for a newer release, replace the
+    // binary in place, wait for every session to be between turns (so nothing
+    // in-flight is lost), then restart via the service manager to run the new
+    // code. Supervised only — a bare daemonized process has no supervisor to
+    // bring it back, so there we update the binary and leave applying it to the
+    // next manual restart.
+    if !crate::update::disabled() {
+        let d = daemon.clone();
+        tokio::spawn(async move { self_update_loop(d, supervised).await });
+    }
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
@@ -348,6 +360,89 @@ pub async fn run_serve(
     let _ = std::fs::remove_file(state_json_path());
     let _ = std::fs::remove_file(pid_path());
     result
+}
+
+/// Periodic self-update loop for the daemon. On a new release: replace the
+/// binary, wait for sessions to be idle, then hand off to the service manager.
+async fn self_update_loop(daemon: Shared, supervised: bool) {
+    use std::time::Duration;
+    const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
+    let client = reqwest::Client::new();
+    // The version already staged on disk THIS run. Without a supervisor the
+    // running process keeps its old CARGO_PKG_VERSION, so `is_newer` would stay
+    // true and we'd re-download the same release every cycle — this guards it.
+    let mut staged: Option<String> = None;
+    loop {
+        tokio::time::sleep(CHECK_EVERY).await;
+        if crate::update::disabled() {
+            continue;
+        }
+        let Some(latest) = crate::update::latest_version(&client).await else {
+            continue;
+        };
+        if !crate::update::is_newer(&latest) || staged.as_deref() == Some(latest.as_str()) {
+            continue;
+        }
+        if crate::update::download_and_replace(&client, &latest).await.is_err() {
+            continue;
+        }
+        staged = Some(latest);
+        // Binary replaced on disk. Supervised: wait for a clean moment, then let
+        // the service manager restart us onto it. Unsupervised: it's staged and
+        // takes effect on the next manual restart (we can't safely self-restart
+        // with nothing to bring us back).
+        if supervised {
+            wait_for_idle(&daemon).await;
+            trigger_restart();
+            return;
+        }
+    }
+}
+
+/// Whether any live session is mid-turn (persisted status `Running`).
+async fn any_session_busy(daemon: &Shared) -> bool {
+    let sessions = daemon.sessions.lock().await;
+    for s in sessions.values() {
+        if let Ok(bytes) = std::fs::read(&s.state_path) {
+            if let Ok(state) = deserialize_state(&bytes) {
+                if state.status == crate::harness::HarnessStatus::Running {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Block until no session is mid-turn, capped at ~5 minutes so a perpetually
+/// busy session can't defer the update forever (a restart never loses persisted
+/// state — at worst it interrupts one in-flight turn, which resumes cleanly).
+async fn wait_for_idle(daemon: &Shared) {
+    for _ in 0..60 {
+        if !any_session_busy(daemon).await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Ask the OS service manager to restart this daemon (systemd --user on Linux,
+/// launchd on macOS) so it comes back on the freshly-installed binary.
+fn trigger_restart() {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "restart", "snippet-serve.service"])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(uid) = current_uid() {
+            let _ = std::process::Command::new("launchctl")
+                .args(["kickstart", "-k", &format!("gui/{uid}/{SERVICE_LABEL}")])
+                .spawn();
+        }
+    }
 }
 
 fn unauthorized() -> Response {
