@@ -2854,19 +2854,20 @@ fn build_live_context(
     }
 
     block.push_str("\n[turn]\n");
-    // Budget as a plain COUNTER, not an escalating command: a fact the model reads
-    // ("12 of ~15"), with a terse parenthetical state near/over the cap — no
-    // "FINISH NOW / do not start new work" imperatives that read as the user
-    // barking orders. The convergence guidance itself lives in the system prompt.
+    // Private pacing only — a fact the model reads to converge, NEVER spoken to the
+    // user. The word "budget" (and "near/over budget") leaked into replies, so it's
+    // gone; the note is a quiet internal nudge and the line is marked private.
     let n = vars.turns_this_request;
     let note = if n >= TURN_BUDGET {
-        " (over budget — wrap up this turn)"
+        " — wrap up now: deliver your best current result, don't open new threads"
     } else if n + 3 >= TURN_BUDGET {
-        " (near budget — converge)"
+        " — begin converging toward the result"
     } else {
         ""
     };
-    block.push_str(&format!("turns_used = \"{n} of ~{TURN_BUDGET}{note}\"\n"));
+    block.push_str(&format!(
+        "pace = \"{n} of ~{TURN_BUDGET} steps in{note}\"  # PRIVATE — internal pacing only; never mention step counts, pacing, or 'converging' to the user.\n"
+    ));
     // Observed loop (a repeated call last turn) — stated as an observation, not an
     // order; the system prompt covers what to do about it.
     if vars.last_turn_had_repeat {
