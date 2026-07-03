@@ -2431,12 +2431,19 @@ impl CodingHarness {
         });
         let _ = self.persist_state(state).await;
 
+        // Run the summarizer/reflection tool-loops at minimal reasoning effort:
+        // they're mechanical (~24 sequential calls worst case), and full
+        // chain-of-thought on a reasoning model turns compaction into minutes of
+        // thinking. Restore the session's effort before returning either way.
+        let prev_effort = model.swap_reasoning_effort(Some("low".to_string()));
+
         let window_text = render_window(&prior_table, &older, &state.user_request, RECENT_FOCUS);
         let table = match self.run_agentic_summary(model, &window_text).await {
             Ok(table) => table,
             // Model unavailable / failed — fall back to the heuristic compaction.
             // Note: the heuristic path does NOT run the memory reflection pass.
             Err(e) => {
+                model.swap_reasoning_effort(prev_effort);
                 self.debug_log(&format!("agentic summary failed → heuristic compaction (memory reflection skipped): {e}"));
                 return self.compact_history(state, force).await;
             }
@@ -2482,14 +2489,24 @@ impl CodingHarness {
         // Learning pass: distill durable facts/playbooks from the just-compacted
         // session into per-workspace memory. Main session only (lanes are read-only,
         // avoids concurrent index writers). Non-fatal — never abort compaction.
-        if self.config.memory_enabled
+        // Skip a pure-conversation window (no tool calls / results): there's no
+        // reusable procedure to learn, and skipping saves the reflection round-trips.
+        let did_work = older.iter().any(|m| {
+            matches!(m, HarnessMessage::ToolResult { .. })
+                || matches!(m, HarnessMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+        });
+        let reflect = self.config.memory_enabled
             && self.config.memory_reflect_on_compaction
-            && self.context.owner() == "main"
-        {
+            && self.context.owner() == "main";
+        if reflect && did_work {
             if let Err(e) = self.run_memory_reflection(model, &table_for_memory).await {
                 self.debug_log(&format!("memory reflection failed (non-fatal): {e}"));
             }
+        } else if reflect {
+            self.debug_log("memory reflection skipped: no tool work in the compacted window");
         }
+        // Restore the session's reasoning effort for the next real model call.
+        model.swap_reasoning_effort(prev_effort);
         state.last_prompt_tokens = 0;
         Ok(())
     }
@@ -2503,83 +2520,89 @@ impl CodingHarness {
         model: &mut dyn AgentModel,
         window_text: &str,
     ) -> Result<String, ToolError> {
-        const MAX_TURNS: usize = 16;
+        // The whole table is written in ONE call. Extra turns exist only to fill a
+        // missing required section or compress to budget — and a pure over-budget
+        // retry re-sends only the (small) table, never the full window again. This
+        // is the token fix: the old per-section loop re-sent the entire window on
+        // every one of up to 16 turns (~window × 16); now it's ~window × 1.
+        const MAX_TURNS: usize = 4;
         const BUDGET_CHARS: usize = 21_000; // ~6k tokens at ~3.5 chars/token
 
         let tools = summarizer_tools();
-        let mut sections: BTreeMap<&'static str, String> = BTreeMap::new();
-        let mut feedback = "(empty — start with `objective`)".to_string();
+        // The last full table we assembled (used for a cheap, window-free trim turn).
+        let mut over_budget_table: Option<String> = None;
+        let mut feedback = String::new();
 
-        for turn in 1..=MAX_TURNS {
-            let user = format!(
-                "ACTIVITY TO FOLD INTO THE TABLE:\n{window_text}\n\nCURRENT TABLE DRAFT:\n{draft}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS}. Call exactly one tool.",
-                draft = render_sections_draft(&sections),
-            );
+        for _turn in 1..=MAX_TURNS {
+            // Over-budget retry: hand back only the table to compress — the raw
+            // window isn't needed to shrink an existing table, and re-sending it is
+            // the whole cost we're avoiding. Every other turn sends the window.
+            let user = if let Some(table) = &over_budget_table {
+                format!(
+                    "Compress this context table to fit the ~6k-token budget. Drop the lowest-value \
+                     detail from the largest/oldest sections; keep every exact path, id, error string, \
+                     decision, and the recent thread. Return the FULL table via write_table.\n\n\
+                     CURRENT TABLE:\n{table}\n\n{feedback}"
+                )
+            } else {
+                format!(
+                    "CONVERSATION TO COMPACT — fold ALL of it into one table:\n{window_text}\n\n\
+                     Call write_table ONCE with every section filled.{}",
+                    if feedback.is_empty() { String::new() } else { format!("\n\n{feedback}") }
+                )
+            };
             let messages = vec![
                 HarnessMessage::System { content: SUMMARIZER_SYSTEM.to_string() },
                 HarnessMessage::User { content: user },
             ];
             let output = model.generate(&messages, &tools, true, None).await?;
-            let Some(call) = output.calls.first() else {
-                feedback = "no tool call received — call exactly one tool".to_string();
+            let Some(call) = output.calls.first().filter(|c| c.tool_name == "write_table") else {
+                feedback = "Call write_table once, filling every section.".to_string();
                 continue;
             };
-            match call.tool_name.as_str() {
-                "write_section" => {
-                    let section = call.arguments.get("section").and_then(Value::as_str).unwrap_or_default();
-                    let content = call
-                        .arguments
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .unwrap_or_default();
-                    match SUMMARY_SECTIONS.iter().find(|(name, ..)| *name == section) {
-                        Some((name, ..)) if !content.is_empty() => {
-                            sections.insert(name, content.to_string());
-                            let missing = required_missing(&sections);
-                            feedback = if missing.is_empty() {
-                                "written; required sections filled — finalize when accurate".to_string()
-                            } else {
-                                format!("written; required still empty: {}", missing.join(", "))
-                            };
-                        }
-                        Some(_) => feedback = "content must be non-empty".to_string(),
-                        None => feedback = format!("unknown section `{section}`"),
-                    }
+
+            // Pull each section out of the single call.
+            let mut sections: BTreeMap<&'static str, String> = BTreeMap::new();
+            for (name, ..) in SUMMARY_SECTIONS {
+                if let Some(v) = call
+                    .arguments
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    sections.insert(name, v.to_string());
                 }
-                "finalize" => {
-                    let missing = required_missing(&sections);
-                    if !missing.is_empty() {
-                        feedback = format!("finalize rejected — required section(s) empty: {}", missing.join(", "));
-                        continue;
-                    }
-                    let assembled = assemble_sections(&sections);
-                    let len = assembled.chars().count();
-                    if len > BUDGET_CHARS {
-                        feedback = format!(
-                            "over the ~6k-token budget by ~{} chars — shorten the largest sections (drop low-value detail), then finalize again",
-                            len - BUDGET_CHARS
-                        );
-                        continue;
-                    }
-                    return Ok(assembled);
-                }
-                other => feedback = format!("unknown tool `{other}`"),
             }
+
+            let missing = required_missing(&sections);
+            if !missing.is_empty() {
+                // Model left a required section empty — needs the window again.
+                over_budget_table = None;
+                feedback = format!(
+                    "Required section(s) empty: {}. Fill them from the conversation.",
+                    missing.join(", ")
+                );
+                continue;
+            }
+
+            let assembled = assemble_sections(&sections);
+            if assembled.chars().count() > BUDGET_CHARS {
+                let over = assembled.chars().count() - BUDGET_CHARS;
+                over_budget_table = Some(assembled);
+                feedback = format!("Currently ~{over} chars over budget.");
+                continue;
+            }
+            return Ok(assembled);
         }
 
-        // Turn cap reached: assemble if the required sections are filled, else error
-        // (the caller falls back to heuristic compaction).
-        if required_missing(&sections).is_empty() {
-            let assembled = assemble_sections(&sections);
-            return Ok(if assembled.chars().count() > BUDGET_CHARS {
-                assembled.chars().take(BUDGET_CHARS).collect::<String>()
-                    + "\n…[trimmed to the 6k-token budget]"
-            } else {
-                assembled
-            });
+        // Turn cap hit: use the last over-budget table (hard-trimmed) if we have one,
+        // else give up so the caller falls back to heuristic compaction.
+        if let Some(table) = over_budget_table {
+            return Ok(table.chars().take(BUDGET_CHARS).collect::<String>()
+                + "\n…[trimmed to the 6k-token budget]");
         }
-        Err(ToolError::msg("summarizer exhausted its turns without filling required sections"))
+        Err(ToolError::msg("summarizer did not produce a valid table"))
     }
 
     /// Learning pass run after compaction: a bounded worker that curates the
@@ -2591,7 +2614,9 @@ impl CodingHarness {
         model: &mut dyn AgentModel,
         summary_table: &str,
     ) -> Result<(), ToolError> {
-        const MAX_TURNS: usize = 8;
+        // Tight cap — each turn is a full model round-trip and this runs after
+        // every main-session compaction (was 8).
+        const MAX_TURNS: usize = 5;
 
         let store = crate::memory::MemoryStore::for_workspace(self.context.workspace_root());
         let index_budget = self.config.memory_index_budget_chars;
@@ -3227,69 +3252,65 @@ fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
 
 const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer
 [identity]
-role = "worker that maintains ONE living context table for a coding agent"
-input = "each turn you get the activity to fold in, the current table draft, your last tool result, and the turn counter"
-stakes = "this table becomes the ENTIRE surviving record of the conversation — nothing is kept verbatim, so anything you don't capture is lost forever"
+role = "you compress a coding agent's whole conversation into ONE dense context table that REPLACES the raw history"
+stakes = "the raw messages are then discarded — this table is all that survives. Anything you leave out is lost forever; anything you pad is re-sent on every future turn and wastes tokens. Maximize signal per token."
+
+[preserve]  # carry these forward — verbatim where the exact value/wording matters
+goal = "the user's actual objective and any hard constraints or preferences they stated"
+state = "the CURRENT state: which files were created/changed, what works, what's broken or unverified"
+specifics = "every exact path, identifier, function/type/symbol name, command, config value, URL, version, and error string — copy these literally, never paraphrase them"
+decisions = "key decisions and the user's corrections in their OWN words"
+open = "genuinely unresolved problems and in-flight work"
+next = "the immediate next step, so the agent resumes without re-deriving it"
+recent_bias = "spend MORE detail on the most recent activity than on old activity — precise current state + what was mid-flight + the next action; that is what lets the agent continue seamlessly"
+
+[drop]  # do NOT carry these — they are the bulk of the tokens and add nothing
+noise = "resolved intermediate steps, superseded/abandoned attempts, verbose tool output (keep the CONCLUSION, not the dump), acknowledgements and chit-chat, restated instructions, and anything trivially re-readable from the code itself"
 
 [method]
-update = "fold the new activity INTO the existing draft: keep what's still true, add what's new, drop what's stale or superseded"
-order = "fill/refresh sections most-important-first: objective -> state -> actions -> decisions -> open_issues -> next_steps"
-recent_focus = "the window marks a 'MOST RECENT ACTIVITY' section — give it EXTRA detail: capture exactly what just happened, the precise current state, any in-flight work, and the immediate next step, so the agent can continue seamlessly. Condense older history more aggressively, but never lose the recent thread."
-evidence = "preserve exact paths, IDs, error strings, and user corrections verbatim; no speculation, no padding, never narrate this process"
-budget = "the whole table must fit ~6k tokens — be dense and minimal; finalize is rejected while over budget, so compress the OLDER material first, keeping recent detail"
+fold = "if a PRIOR TABLE is present, update it in place — keep what's still true, add what's new, delete what's stale or superseded; do not just append"
+dense = "terse markdown bullets, not prose. Facts and values, not sentences. No preamble, no narration of this process, no filler adjectives."
+budget = "the whole table must fit ~6k tokens. If told it is OVER BUDGET, compress the largest/oldest sections first (drop the lowest-value detail) while keeping every exact value and the recent thread — never re-expand."
 
-[finalize]
-when = "objective and state are filled and accurate and the table fits the budget"
-how = "call finalize (one tool call per turn)""#;
+[how]
+one_call = "call write_table ONCE, filling every section from the entire conversation. That single call is the whole job. You are asked again only if you left a required section empty or the table is over budget — otherwise you are done in one shot.""#;
 
 fn summarizer_tools() -> Vec<crate::llm::NativeToolDefinition> {
-    let names: Vec<&str> = SUMMARY_SECTIONS.iter().map(|(n, ..)| *n).collect();
-    let docs = SUMMARY_SECTIONS
-        .iter()
-        .map(|(n, d, req)| format!("`{n}`{}: {d}", if *req { " (required)" } else { "" }))
-        .collect::<Vec<_>>()
-        .join("; ");
-    vec![
-        crate::llm::NativeToolDefinition {
-            name: "write_section".to_string(),
-            description: format!("Write or replace one table section. Sections: {docs}."),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "section": { "type": "string", "enum": names },
-                    "content": { "type": "string", "description": "Full replacement content for the section (markdown bullets preferred)." }
-                },
-                "required": ["section", "content"],
-                "additionalProperties": false
-            }),
-        },
-        crate::llm::NativeToolDefinition {
-            name: "finalize".to_string(),
-            description: "Assemble the table and finish. Rejected while a required section is empty or the table is over the ~6k-token budget.".to_string(),
-            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        },
-    ]
+    // One tool that writes the ENTIRE table in a single call — a string field per
+    // section. Filling it in one shot is the whole job (the loop only comes back
+    // for a missing required section or a budget trim), which is what keeps the
+    // big conversation window from being re-sent turn after turn.
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+    for (name, desc, req) in SUMMARY_SECTIONS {
+        properties.insert(
+            name.to_string(),
+            json!({ "type": "string", "description": desc }),
+        );
+        if *req {
+            required.push(*name);
+        }
+    }
+    vec![crate::llm::NativeToolDefinition {
+        name: "write_table".to_string(),
+        description: "Write the ENTIRE context table in one call — fill every section with dense \
+            markdown bullets. This table replaces the raw history, so anything you omit is lost. \
+            You are only asked again to fill a required section you left empty or to compress to fit \
+            the budget."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        }),
+    }]
 }
 
 fn toml_block(body: &str) -> String {
     format!("\"\"\"\n{}\n\"\"\"", body.replace("\"\"\"", "'''"))
 }
 
-fn render_sections_draft(sections: &BTreeMap<&'static str, String>) -> String {
-    let body = SUMMARY_SECTIONS
-        .iter()
-        .map(|(name, _, req)| {
-            let v = match sections.get(name).map(String::as_str) {
-                Some(b) => toml_block(b),
-                None if *req => "\"\" # empty — required".to_string(),
-                None => "\"\" # empty".to_string(),
-            };
-            format!("{name} = {v}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("[compacted_window]\n{body}")
-}
 
 fn required_missing(sections: &BTreeMap<&'static str, String>) -> Vec<&'static str> {
     SUMMARY_SECTIONS

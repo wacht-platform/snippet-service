@@ -227,6 +227,15 @@ pub trait AgentModel: Send + Sync {
     fn is_configured(&self) -> bool {
         true
     }
+
+    /// Temporarily swap the model's reasoning effort, returning the prior value so
+    /// the caller can restore it. Compaction/summary/reflection run this down to a
+    /// minimal effort: those are mechanical tool-loops (~24 sequential calls), and
+    /// full chain-of-thought on a reasoning model just burns wall-clock. Default
+    /// no-op for models without a reasoning knob.
+    fn swap_reasoning_effort(&mut self, _effort: Option<String>) -> Option<String> {
+        None
+    }
 }
 
 #[async_trait]
@@ -247,6 +256,10 @@ impl<T: ?Sized + AgentModel + Send> AgentModel for Box<T> {
 
     fn is_configured(&self) -> bool {
         (**self).is_configured()
+    }
+
+    fn swap_reasoning_effort(&mut self, effort: Option<String>) -> Option<String> {
+        (**self).swap_reasoning_effort(effort)
     }
 }
 

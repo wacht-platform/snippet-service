@@ -109,6 +109,10 @@ impl AgentModel for ChatGptModel {
         self.tokens.is_some()
     }
 
+    fn swap_reasoning_effort(&mut self, effort: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.config.reasoning_effort, effort)
+    }
+
     fn supports_images(&self) -> bool {
         self.config.supports_images
     }

@@ -65,6 +65,10 @@ impl AgentModel for OpenAiCompatibleModel {
         !self.config.api_key.trim().is_empty()
     }
 
+    fn swap_reasoning_effort(&mut self, effort: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.config.reasoning_effort, effort)
+    }
+
     fn supports_images(&self) -> bool {
         self.config.supports_images
     }
