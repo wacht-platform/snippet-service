@@ -1,21 +1,55 @@
 name: release
 
-# Build the `snippet` CLI for Linux and macOS and attach the binaries to a
-# GitHub Release. Cut a release by pushing a version tag:
-#   git tag v0.1.0 && git push origin v0.1.0
-# `workflow_dispatch` also builds the binaries (as downloadable artifacts) on
-# demand without creating a release.
+# Auto-release on a version bump: whenever the `version` in Cargo.toml changes
+# (i.e. no `v<version>` tag exists yet), tag it, build the `snippet` CLI for
+# Linux and macOS, and publish a GitHub Release. Pushing to main WITHOUT bumping
+# the version does nothing (the tag already exists). `workflow_dispatch` releases
+# the current Cargo.toml version if it hasn't been released yet.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write # create the release / upload assets
+  contents: write # create the tag + release
 
 jobs:
+  check:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need existing tags
+
+      - name: Read version and decide
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "v$version is already tagged — nothing to release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version v$version — will release."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag the release
+        if: steps.v.outputs.release == 'true'
+        run: |
+          git tag "v${{ steps.v.outputs.version }}"
+          git push origin "v${{ steps.v.outputs.version }}"
+
   build:
     name: ${{ matrix.target }}
+    needs: check
+    if: needs.check.outputs.release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -59,20 +93,10 @@ jobs:
           shasum -a 256 "$asset" > "$asset.sha256" || sha256sum "$asset" > "$asset.sha256"
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
-      # Manual runs: keep the binaries as workflow artifacts.
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: snippet-${{ matrix.target }}
-          path: |
-            ${{ env.ASSET }}
-            ${{ env.ASSET }}.sha256
-
-      # Tag pushes: attach to the GitHub Release (created if it doesn't exist).
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.check.outputs.version }}
           files: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.sha256
