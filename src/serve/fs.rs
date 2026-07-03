@@ -204,10 +204,17 @@ pub(super) async fn delete_fs_path(State(d): State<Shared>, Query(a): Query<Auth
     }
 }
 
-// GET /fs/download?path= — stream a file's raw bytes (any type) for the app to
-// save to the device. Token-gated.
+// GET /fs/download?path= — serve a file's raw bytes (any type). Sets a real
+// content-type from the extension and honors HTTP Range requests (206 Partial
+// Content), so the app can stream/seek images, video, and audio — not just
+// download whole files. Token-gated.
 const MAX_FS_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
-pub(super) async fn download_fs_file(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Response {
+
+pub(super) async fn download_fs_file(
+    State(d): State<Shared>,
+    Query(q): Query<FsQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     if !d.authed(&q.token) {
         return unauthorized();
     }
@@ -222,14 +229,110 @@ pub(super) async fn download_fs_file(State(d): State<Shared>, Query(q): Query<Fs
     if meta.is_dir() {
         return (StatusCode::BAD_REQUEST, "path is a directory").into_response();
     }
-    if meta.len() > MAX_FS_DOWNLOAD_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "file too large to download").into_response();
+    let total = meta.len();
+    let ctype = content_type_for(&path);
+
+    // Range request → 206, STREAMING the requested slice (the whole range, not a
+    // capped chunk — capping made ExoPlayer stall). The body streams off disk, so
+    // a large range never buffers into memory.
+    if let Some(raw) = headers.get(axum::http::header::RANGE).and_then(|v| v.to_str().ok()) {
+        let Some((start, end)) = parse_byte_range(raw, total) else {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(axum::http::header::CONTENT_RANGE, format!("bytes */{total}"))],
+            )
+                .into_response();
+        };
+        let len = end - start + 1;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        let stream = tokio_util::io::ReaderStream::new(file.take(len));
+        let body = axum::body::Body::from_stream(stream);
+        return match axum::response::Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(axum::http::header::CONTENT_TYPE, ctype)
+            .header(axum::http::header::ACCEPT_RANGES, "bytes")
+            .header(axum::http::header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+            .header(axum::http::header::CONTENT_LENGTH, len.to_string())
+            .body(body)
+        {
+            Ok(resp) => resp,
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+    }
+
+    // No Range → the whole file (download-to-device path), size-capped.
+    if total > MAX_FS_DOWNLOAD_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "file too large — stream it with a range request instead").into_response();
     }
     match std::fs::read(&path) {
-        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
+        Ok(bytes) => (
+            [
+                (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+                (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
+
+/// Content-type from a file extension — enough for the app to render images,
+/// play video/audio, and view PDFs. Unknown types stay a generic download.
+fn content_type_for(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("heic" | "heif") => "image/heic",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mkv") => "video/x-matroska",
+        Some("avi") => "video/x-msvideo",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("m4a" | "aac") => "audio/mp4",
+        Some("ogg" | "oga") => "audio/ogg",
+        Some("flac") => "audio/flac",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse a single-range `Range: bytes=…` header against a known total size.
+/// Supports `start-end`, `start-`, and `-suffix`. Returns an inclusive (start,
+/// end) clamped to the file, or None if unsatisfiable.
+fn parse_byte_range(raw: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = raw.trim().strip_prefix("bytes=")?;
+    let (s, e) = spec.split_once('-')?;
+    let (start, end) = if s.is_empty() {
+        let suffix: u64 = e.trim().parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        (total.saturating_sub(suffix), total - 1)
+    } else {
+        let start: u64 = s.trim().parse().ok()?;
+        let end: u64 = if e.trim().is_empty() { total - 1 } else { e.trim().parse().ok()? };
+        (start, end.min(total - 1))
+    };
+    (start <= end && start < total).then_some((start, end))
+}
+
 
 /// Cap a single file read for the mobile viewer.
 const MAX_FS_FILE_BYTES: usize = 512 * 1024;
