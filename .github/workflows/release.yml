@@ -5,6 +5,11 @@ name: release
 # Linux and macOS, and publish a GitHub Release. Pushing to main WITHOUT bumping
 # the version does nothing (the tag already exists). `workflow_dispatch` releases
 # the current Cargo.toml version if it hasn't been released yet.
+#
+# Master switch: releasing is gated on the repo variable RELEASE_ENABLED. While
+# it is anything other than "true" (unset included), the workflow runs but never
+# tags/builds/publishes — a clean pause. Resume with:
+#   gh variable set RELEASE_ENABLED --body true
 on:
   push:
     branches: [main]
@@ -28,11 +33,16 @@ jobs:
       - name: Read version and decide
         id: v
         shell: bash
+        env:
+          RELEASE_ENABLED: ${{ vars.RELEASE_ENABLED }}
         run: |
           set -euo pipefail
           version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if git rev-parse "v$version" >/dev/null 2>&1; then
+          if [ "${RELEASE_ENABLED:-false}" != "true" ]; then
+            echo "Releases are paused (repo variable RELEASE_ENABLED != true) — nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif git rev-parse "v$version" >/dev/null 2>&1; then
             echo "v$version is already tagged — nothing to release."
             echo "release=false" >> "$GITHUB_OUTPUT"
           else
