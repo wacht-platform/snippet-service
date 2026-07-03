@@ -366,7 +366,7 @@ pub async fn run_serve(
 /// binary, wait for sessions to be idle, then hand off to the service manager.
 async fn self_update_loop(daemon: Shared, supervised: bool) {
     use std::time::Duration;
-    const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
+    const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
     let client = reqwest::Client::new();
     // The version already staged on disk THIS run. Without a supervisor the
     // running process keeps its old CARGO_PKG_VERSION, so `is_newer` would stay
