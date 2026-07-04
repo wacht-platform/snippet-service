@@ -122,6 +122,19 @@ impl Daemon {
         token.as_deref().is_some_and(|t| token_matches(t, &self.token))
     }
 
+    /// Re-read the on-disk config so provider profiles added or removed out-of-band
+    /// (from the TUI, or a hand-edit) are reflected here. `config.toml` is the
+    /// single source of truth: the TUI and this daemon are independent writers, so
+    /// we reload before every config read and before every read-modify-write —
+    /// otherwise our stale in-memory copy would hide the TUI's newly-added profiles
+    /// and clobber the ones it deleted. Keeps the last good config if a read/parse
+    /// transiently fails (never wipes profiles on a bad read).
+    async fn reload_config(&self) {
+        if let Ok(fresh) = SnippetConfig::load(&self.config_path).await {
+            *self.config.lock().unwrap() = fresh;
+        }
+    }
+
     /// Return a live session's input channel + state path, starting (resuming) it
     /// from disk if it isn't already running.
     async fn ensure_live(&self, id: &str) -> Option<(UnboundedSender<LoopInput>, PathBuf)> {
@@ -138,6 +151,7 @@ impl Daemon {
         }
         // Re-apply any persisted per-conversation model override; else the default.
         let profile = read_session_profile(&sp);
+        self.reload_config().await; // pick up profiles added from the TUI
         let cfg = {
             let c = self.config.lock().unwrap();
             let mut w = c.for_workspace(folder);
@@ -637,6 +651,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
     if !d.authed(&a.token) {
         return unauthorized();
     }
+    d.reload_config().await; // reflect profiles the TUI added/removed
     let c = d.config.lock().unwrap();
     let active = c.active_setup.clone();
     let mut profiles = Vec::new();
@@ -711,6 +726,7 @@ async fn put_profile(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
         )
             .into_response();
     }
+    d.reload_config().await; // modify the current on-disk config, not a stale copy
     let result = {
         let mut c = d.config.lock().unwrap();
         let name = req
@@ -773,6 +789,7 @@ async fn set_active(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): J
     if !d.authed(&a.token) {
         return unauthorized();
     }
+    d.reload_config().await; // don't clobber TUI-side profile edits
     let result = {
         let mut c = d.config.lock().unwrap();
         if !c.activate(&req.name) {
@@ -797,6 +814,7 @@ async fn delete_profile(State(d): State<Shared>, Query(q): Query<DeleteProfileQu
     if !d.authed(&q.token) {
         return unauthorized();
     }
+    d.reload_config().await; // start from current disk state so we don't resurrect TUI-deleted profiles
     let result = {
         let mut c = d.config.lock().unwrap();
         c.remove_profile(&q.name);
@@ -820,6 +838,7 @@ async fn set_session_model(State(d): State<Shared>, Query(a): Query<Auth>, Json(
     if !d.authed(&a.token) {
         return unauthorized();
     }
+    d.reload_config().await; // a profile just created in the TUI must be selectable
     let model_cfg = {
         let c = d.config.lock().unwrap();
         match c.setups.as_ref().and_then(|m| m.get(&req.profile)).cloned() {

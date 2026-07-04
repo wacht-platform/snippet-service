@@ -257,17 +257,34 @@ impl SnippetConfig {
     /// Migrate a lone `[model]` into a named profile if none exist, so the rest of
     /// the UI can treat every config as a profile.
     pub fn ensure_setups(&mut self) {
-        if self.setups.as_ref().map(|m| m.is_empty()).unwrap_or(true) {
-            let key = if self.model.provider.is_empty() {
-                "default".to_string()
-            } else {
-                self.model.provider.clone()
-            };
-            let mut map = BTreeMap::new();
-            map.insert(key.clone(), self.model.clone());
-            self.setups = Some(map);
-            self.active_setup = Some(key);
+        // Already have profiles → nothing to migrate.
+        if self.setups.as_ref().map(|m| !m.is_empty()).unwrap_or(false) {
+            return;
         }
+        // Only migrate a genuinely-configured lone `[model]` into a named profile.
+        // Skip only the untouched default placeholder (openai / gpt-4o / no key /
+        // default base_url) so a fresh config does NOT fabricate a phantom
+        // provider — the user starts with zero providers and adds their own. Any
+        // real deviation (a key, a different provider/model/base_url — including
+        // chatgpt's OAuth) is a user-configured model worth migrating.
+        let m = &self.model;
+        let placeholder = ModelConfig::default();
+        let is_placeholder = m.api_key.trim().is_empty()
+            && m.provider == placeholder.provider
+            && m.model == placeholder.model
+            && m.base_url == placeholder.base_url;
+        if is_placeholder {
+            return;
+        }
+        let key = if m.provider.is_empty() {
+            "default".to_string()
+        } else {
+            m.provider.clone()
+        };
+        let mut map = BTreeMap::new();
+        map.insert(key.clone(), self.model.clone());
+        self.setups = Some(map);
+        self.active_setup = Some(key);
     }
 
     /// A unique profile key derived from a provider name (`provider`, `provider-2`, …).
@@ -519,4 +536,39 @@ pub fn save_config(config: &SnippetConfig, path: &Path) -> Result<(), String> {
     std::fs::write(path, toml_str).map_err(|e| format!("write {}: {e}", path.display()))?;
     set_private(path);
     Ok(())
+}
+
+#[cfg(test)]
+mod ensure_setups_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_default_config_makes_no_phantom_profile() {
+        let mut c = SnippetConfig::default();
+        c.ensure_setups();
+        // The built-in openai placeholder (no key, no model) must not become a profile.
+        assert!(c.setups.as_ref().map(|m| m.is_empty()).unwrap_or(true), "phantom created: {:?}", c.setups);
+        assert!(c.active_setup.is_none());
+    }
+
+    #[test]
+    fn configured_lone_model_is_migrated() {
+        let mut c = SnippetConfig::default();
+        c.model.provider = "anthropic".into();
+        c.model.model = "claude-opus-4-8".into();
+        c.model.api_key = "sk-ant-x".into();
+        c.ensure_setups();
+        assert_eq!(c.active_setup.as_deref(), Some("anthropic"));
+        assert!(c.setups.as_ref().unwrap().contains_key("anthropic"));
+    }
+
+    #[test]
+    fn chatgpt_counts_as_configured_without_key() {
+        let mut c = SnippetConfig::default();
+        c.model.provider = "chatgpt".into();
+        c.model.model = String::new();
+        c.model.api_key = String::new();
+        c.ensure_setups();
+        assert_eq!(c.active_setup.as_deref(), Some("chatgpt"));
+    }
 }
