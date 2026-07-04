@@ -274,6 +274,10 @@ struct App {
     /// Collapsed pastes: (placeholder shown in the input, real content). A big
     /// paste shows as a compact chip and expands back on send.
     pasted_blocks: Vec<(String, String)>,
+    /// Pending file attachments (images/files) dropped or pasted — kept OUT of the
+    /// input text. Shown as a compact "📎 N attachments" line above the prompt and
+    /// appended to the message on send. Tuple: (is_image, absolute_path, filename).
+    attachments: Vec<(bool, String, String)>,
     status: String,
     /// Set by the startup self-update task to the version it installed; shown in
     /// the header as a "restart to apply" hint.
@@ -387,6 +391,7 @@ impl App {
             history_pos: None,
             history_draft: String::new(),
             pasted_blocks: Vec::new(),
+            attachments: Vec::new(),
             status,
             error: None,
             state: None,
@@ -1491,7 +1496,7 @@ impl App {
         let opts = q_options(question);
 
         let answer = if opts.is_empty() {
-            let typed = self.expand_input();
+            let typed = self.message_for_send();
             let typed = typed.trim().to_string();
             if typed.is_empty() {
                 self.status = "Type an answer, then press Enter.".to_string();
@@ -1543,6 +1548,7 @@ impl App {
         self.input.truncate(0);
         self.input_cursor = 0;
         self.pasted_blocks.clear();
+        self.attachments.clear();
     }
 
     /// Replace the whole input (e.g. from a slash-command autocomplete) and put
@@ -1722,14 +1728,8 @@ impl App {
             self.status = "No image on the clipboard — copy a screenshot first.".to_string();
             return;
         }
-        let n = self.pasted_blocks.len() + 1;
-        let marker = format!("[Image #{n}: screenshot]");
-        for c in marker.chars() {
-            self.input_insert(c);
-        }
-        // On send the chip expands to the temp path; the agent reads it via read_image.
-        self.pasted_blocks.push((marker, dest.display().to_string()));
-        self.status = String::new();
+        self.attachments.push((true, dest.display().to_string(), "screenshot".to_string()));
+        self.status = "📎 attached screenshot".to_string();
     }
 
     /// If `text` is exactly one existing file path (as a terminal pastes when you
@@ -1772,17 +1772,8 @@ impl App {
             self.status = format!("couldn't attach {fname}: {error}");
             return;
         }
-        let n = self.pasted_blocks.len() + 1;
-        let marker = if is_img {
-            format!("[Image #{n}: {fname}]")
-        } else {
-            format!("[File #{n}: {fname}]")
-        };
-        for c in marker.chars() {
-            self.input_insert(c);
-        }
-        self.pasted_blocks.push((marker, dest.display().to_string()));
-        self.status = String::new();
+        self.attachments.push((is_img, dest.display().to_string(), fname.to_string()));
+        self.status = format!("📎 attached {fname}");
     }
 
     /// Expand any paste chips in the current input back to their real content.
@@ -1794,8 +1785,40 @@ impl App {
         out
     }
 
+    /// The message to send: the expanded input plus any pending attachments, each
+    /// appended as an explicit marker (images → read_image, files → read) so the
+    /// agent opens them. Attachments live outside the input text and are cleared
+    /// with it on send.
+    fn message_for_send(&self) -> String {
+        let mut out = self.expand_input();
+        // Exactly the marker shape `strip_attachment_markers` hides from the
+        // transcript: `[attached image — …]` / `[attached file — …]` (the em-dash
+        // must immediately follow "image"/"file " — no filename before it).
+        for (is_img, path, _name) in &self.attachments {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&if *is_img {
+                format!("[attached image — call read_image on this exact path to view it: {path}]")
+            } else {
+                format!("[attached file — read it at this exact path: {path}]")
+            });
+        }
+        out
+    }
+
     fn input_backspace(&mut self) {
         if self.input_cursor == 0 {
+            // Nothing to the left in the text — pop the most recent attachment so
+            // a mis-attached file can be removed (the pill count drops by one).
+            if self.attachments.pop().is_some() {
+                let left = self.attachments.len();
+                self.status = if left == 0 {
+                    "attachment removed".to_string()
+                } else {
+                    format!("attachment removed · 📎 {left} left")
+                };
+            }
             return;
         }
         let start = self.input_byte_at(self.input_cursor - 1);
@@ -1890,7 +1913,7 @@ impl App {
             return;
         }
 
-        let text = self.expand_input();
+        let text = self.message_for_send();
         let text = text.trim().to_string();
         if text.is_empty() {
             if !self.agent_alive() {
@@ -3617,6 +3640,23 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// The compact "📎 N attachments" summary shown above the prompt when files are
+/// queued (they live outside the input text). None when there are none.
+fn attachment_line(app: &App) -> Option<Line<'static>> {
+    let n = app.attachments.len();
+    if n == 0 {
+        return None;
+    }
+    Some(Line::from(vec![
+        Span::raw("   "),
+        Span::styled(
+            format!("📎 {n} attachment{}", if n == 1 { "" } else { "s" }),
+            Style::default().fg(accent()),
+        ),
+        Span::styled("  ·  ⌫ removes", Style::default().fg(faint())),
+    ]))
+}
+
 fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     use ratatui::widgets::{Block, Borders};
 
@@ -3647,11 +3687,16 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 _ => "Type a prompt or a slash command…",
             }
         };
-        let line = Line::from(vec![
+        let prompt = Line::from(vec![
             Span::styled(" ❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
             Span::styled(placeholder, Style::default().fg(faint())),
         ]);
-        frame.render_widget(Paragraph::new(line).block(block), area);
+        let mut lines = Vec::new();
+        if let Some(a) = attachment_line(app) {
+            lines.push(a);
+        }
+        lines.push(prompt);
+        frame.render_widget(Paragraph::new(lines).block(block), area);
         return;
     }
 
@@ -3663,7 +3708,13 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let white = Style::default().fg(self::text());
     let cursor_style = Style::default().fg(Color::Black).bg(blue());
 
-    let mut lines = Vec::with_capacity(rows.len());
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    let attach_offset = if let Some(a) = attachment_line(app) {
+        lines.push(a);
+        1usize
+    } else {
+        0
+    };
     for (k, row) in rows.iter().enumerate() {
         let mut spans = Vec::new();
         if k == 0 {
@@ -3691,7 +3742,7 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     // Keep the cursor row on screen when the input is taller than the box.
     let visible = (area.height as usize).saturating_sub(2).max(1);
-    let scroll = cursor_row.saturating_sub(visible.saturating_sub(1)) as u16;
+    let scroll = (cursor_row + attach_offset).saturating_sub(visible.saturating_sub(1)) as u16;
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
@@ -3699,12 +3750,14 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 /// clamped so it grows with wrapped/multi-line input but never dominates the view.
 fn input_height(app: &App, width: u16) -> u16 {
     const MAX_ROWS: usize = 8;
+    // One extra row for the "📎 N attachments" summary when files are queued.
+    let attach: u16 = if app.attachments.is_empty() { 0 } else { 1 };
     if app.input.is_empty() {
-        return 3;
+        return 3 + attach;
     }
     let text_w = (width as usize).saturating_sub(3).max(1);
     let (rows, _) = layout_input(&app.input, app.input_cursor, text_w);
-    (rows.len().clamp(1, MAX_ROWS) as u16) + 2
+    (rows.len().clamp(1, MAX_ROWS) as u16) + 2 + attach
 }
 
 /// Wrap `input` into display rows at `width` columns, honoring explicit `\n` as
