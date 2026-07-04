@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
@@ -270,13 +270,22 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { self_update_loop(d, supervised).await });
     }
+    // The upload endpoint carries the file base64-encoded inside a JSON body, which
+    // inflates it by ~4/3. Size the request-body limit so a ~50 MB file still fits
+    // once encoded (≈67 MB) plus headroom for the JSON envelope. Every other route
+    // keeps axum's small default body limit.
+    const MAX_UPLOAD_FILE_BYTES: usize = 50 * 1024 * 1024;
+    const UPLOAD_BODY_LIMIT: usize = MAX_UPLOAD_FILE_BYTES / 3 * 4 + 64 * 1024;
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
-        .route("/fs/upload", post(upload_fs_file))
+        .route(
+            "/fs/upload",
+            post(upload_fs_file).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
         .route("/fs/write", post(write_fs_file))
         .route("/fs/mkdir", post(make_fs_dir))
         .route("/fs/delete", post(delete_fs_path))
