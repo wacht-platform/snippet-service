@@ -437,7 +437,7 @@ impl GeminiModel {
                     let bytes = match response.bytes().await {
                         Ok(bytes) => bytes,
                         Err(error) => {
-                            last_error = error.to_string();
+                            last_error = crate::llm::humanize_transport_error(&error);
                             if attempt < max_attempts {
                                 sleep(self.delay(attempt)).await;
                             }
@@ -446,8 +446,7 @@ impl GeminiModel {
                     };
                     if !status.is_success() {
                         let detail = String::from_utf8_lossy(&bytes);
-                        last_error =
-                            format!("HTTP {status}: {}", detail.chars().take(400).collect::<String>());
+                        last_error = crate::llm::humanize_http_error(status, detail.as_ref());
                         if is_retryable_status(status) && attempt < max_attempts {
                             sleep(self.delay(attempt)).await;
                             continue;
@@ -468,7 +467,7 @@ impl GeminiModel {
                     return Ok(parsed);
                 }
                 Err(error) => {
-                    last_error = error.to_string();
+                    last_error = crate::llm::humanize_transport_error(&error);
                     let retryable = error.is_timeout() || error.is_connect() || error.is_request();
                     if retryable && attempt < max_attempts {
                         sleep(self.delay(attempt)).await;
@@ -481,7 +480,7 @@ impl GeminiModel {
         }
 
         Err(ToolError::model_request(
-            format!("gemini request failed after {attempts} attempt(s): {last_error}"),
+            crate::llm::final_model_error(&last_error, attempts),
             !fatal,
         ))
     }
@@ -518,10 +517,7 @@ impl GeminiModel {
                     let status = response.status();
                     if !status.is_success() {
                         let detail = response.text().await.unwrap_or_default();
-                        last_error = format!(
-                            "HTTP {status}: {}",
-                            detail.chars().take(400).collect::<String>()
-                        );
+                        last_error = crate::llm::humanize_http_error(status, &detail);
                         if is_retryable_status(status) && attempt < max_attempts {
                             sleep(self.delay(attempt)).await;
                             continue;
@@ -549,7 +545,7 @@ impl GeminiModel {
                     }
                 }
                 Err(error) => {
-                    last_error = error.to_string();
+                    last_error = crate::llm::humanize_transport_error(&error);
                     let retryable = error.is_timeout() || error.is_connect() || error.is_request();
                     if retryable && attempt < max_attempts {
                         sleep(self.delay(attempt)).await;
@@ -563,7 +559,7 @@ impl GeminiModel {
 
         StreamBuffer::clear(sink);
         Err(ToolError::model_request(
-            format!("gemini streaming request failed after {attempts} attempt(s): {last_error}"),
+            crate::llm::final_model_error(&last_error, attempts),
             !fatal,
         ))
     }

@@ -258,7 +258,7 @@ impl AnthropicModel {
                     }
                     let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                     let response_body = response.text().await.unwrap_or_default();
-                    last_error = format!("HTTP {status}: {response_body}");
+                    last_error = crate::llm::humanize_http_error(status, &response_body);
                     if !is_retryable_status(status) {
                         fatal = true;
                         break;
@@ -275,7 +275,7 @@ impl AnthropicModel {
                     .await;
                 }
                 Err(error) => {
-                    last_error = error.to_string();
+                    last_error = crate::llm::humanize_transport_error(&error);
                     if !is_retryable_transport_error(&error) {
                         fatal = true;
                         break;
@@ -296,7 +296,7 @@ impl AnthropicModel {
 
         StreamBuffer::clear(sink);
         Err(ToolError::model_request(
-            format!("anthropic streaming request failed after {attempts} attempt(s): {last_error}"),
+            crate::llm::final_model_error(&last_error, attempts),
             !fatal,
         ))
     }
@@ -332,7 +332,7 @@ impl AnthropicModel {
                     }
 
                     let response_body = String::from_utf8_lossy(&bytes).to_string();
-                    last_error = format!("HTTP {status}: {response_body}");
+                    last_error = crate::llm::humanize_http_error(status, &response_body);
                     if !is_retryable_status(status) {
                         fatal = true;
                         break;
@@ -350,7 +350,7 @@ impl AnthropicModel {
                     .await;
                 }
                 Err(error) => {
-                    last_error = error.to_string();
+                    last_error = crate::llm::humanize_transport_error(&error);
                     if !is_retryable_transport_error(&error) {
                         fatal = true;
                         break;
@@ -370,7 +370,7 @@ impl AnthropicModel {
         }
 
         Err(ToolError::model_request(
-            format!("anthropic model request failed after {attempts} attempt(s): {last_error}"),
+            crate::llm::final_model_error(&last_error, attempts),
             !fatal,
         ))
     }

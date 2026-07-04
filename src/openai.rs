@@ -238,7 +238,7 @@ impl OpenAiCompatibleModel {
                     }
 
                     let response_body = String::from_utf8_lossy(&bytes).to_string();
-                    last_error = format!("HTTP {status}: {response_body}");
+                    last_error = crate::llm::humanize_http_error(status, &response_body);
                     if !is_retryable_status(status) {
                         fatal = true;
                         break;
@@ -256,7 +256,7 @@ impl OpenAiCompatibleModel {
                     .await;
                 }
                 Err(error) => {
-                    last_error = error.to_string();
+                    last_error = crate::llm::humanize_transport_error(&error);
                     if !is_retryable_transport_error(&error) {
                         fatal = true;
                         break;
@@ -276,7 +276,7 @@ impl OpenAiCompatibleModel {
         }
 
         Err(ToolError::model_request(
-            format!("model request failed after {attempts} attempt(s): {last_error}"),
+            crate::llm::final_model_error(&last_error, attempts),
             !fatal,
         ))
     }
@@ -355,7 +355,7 @@ async fn stream_chat_with_retries(
                 }
                 let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                 let response_body = response.text().await.unwrap_or_default();
-                last_error = format!("HTTP {status}: {response_body}");
+                last_error = crate::llm::humanize_http_error(status, &response_body);
                 if !is_retryable_status(status) {
                     fatal = true;
                     break;
@@ -366,7 +366,7 @@ async fn stream_chat_with_retries(
                 sleep(retry_delay(attempt, retry_after, initial_ms, max_ms)).await;
             }
             Err(error) => {
-                last_error = error.to_string();
+                last_error = crate::llm::humanize_transport_error(&error);
                 if !is_retryable_transport_error(&error) {
                     fatal = true;
                     break;
@@ -381,7 +381,7 @@ async fn stream_chat_with_retries(
 
     StreamBuffer::clear(sink);
     Err(ToolError::model_request(
-        format!("model streaming request failed after {attempts} attempt(s): {last_error}"),
+        crate::llm::final_model_error(&last_error, attempts),
         !fatal,
     ))
 }

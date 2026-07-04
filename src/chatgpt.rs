@@ -195,7 +195,7 @@ impl AgentModel for ChatGptModel {
                     }
                     let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                     let text = response.text().await.unwrap_or_default();
-                    last_error = format!("HTTP {status}: {text}");
+                    last_error = crate::llm::humanize_http_error(status, &text);
                     if !is_retryable_status(status) {
                         fatal = true;
                         break;
@@ -212,7 +212,7 @@ impl AgentModel for ChatGptModel {
                     .await;
                 }
                 Err(error) => {
-                    last_error = error.to_string();
+                    last_error = crate::llm::humanize_transport_error(&error);
                     if !is_retryable_transport_error(&error) {
                         fatal = true;
                         break;
@@ -235,7 +235,7 @@ impl AgentModel for ChatGptModel {
             StreamBuffer::clear(sink);
         }
         Err(ToolError::model_request(
-            format!("chatgpt request failed after {attempts} attempt(s): {last_error}"),
+            crate::llm::final_model_error(&last_error, attempts),
             !fatal,
         ))
     }

@@ -6,6 +6,124 @@ use serde_json::Value;
 
 use crate::tools::ToolError;
 
+/// Turn a failed model HTTP response into a short, human-readable explanation
+/// instead of dumping the raw status line and the provider's JSON error body at
+/// the user. We keep a compact hint — the status code, plus the provider's own
+/// message when we can pull it cleanly out of the body — but never the whole
+/// payload. Shared by every model adapter so errors read the same everywhere.
+pub(crate) fn humanize_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    let code = status.as_u16();
+    let headline = match code {
+        429 => "Rate limited — the provider is throttling requests. Wait a moment and try again.",
+        401 | 403 => "Authentication failed — check the API key (or sign in again) for this provider.",
+        402 => "Payment required — the provider reports you're out of credits or quota.",
+        400 | 422 => "The provider rejected the request as invalid.",
+        404 => "Not found — the model name or endpoint may be wrong.",
+        408 => "The provider timed out handling the request.",
+        413 => "The request was too large for the provider.",
+        500..=599 => "The provider is having server trouble. Try again shortly.",
+        _ => "The model request failed.",
+    };
+    match extract_provider_message(body) {
+        Some(msg) => format!("{headline} ({msg}; HTTP {code})"),
+        None => format!("{headline} (HTTP {code})"),
+    }
+}
+
+/// Best-effort pull of a concise message out of a provider error body. Handles
+/// the common shapes — `{"error":{"message":…,"type":…}}`, `{"message":…}`,
+/// `{"error":"…"}` — and truncates, so we never re-introduce a wall of JSON.
+fn extract_provider_message(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let pick = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.chars().take(160).collect::<String>())
+    };
+    let v: Value = serde_json::from_str(body).ok()?;
+    if let Some(err) = v.get("error") {
+        if let Some(m) = err.get("message").and_then(Value::as_str) {
+            return pick(m);
+        }
+        if let Some(t) = err.get("type").and_then(Value::as_str) {
+            return pick(t);
+        }
+        if let Some(s) = err.as_str() {
+            return pick(s);
+        }
+    }
+    v.get("message").and_then(Value::as_str).and_then(pick)
+}
+
+/// Friendly text for a transport-level failure (no HTTP response at all).
+pub(crate) fn humanize_transport_error(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "The request to the provider timed out.".to_string()
+    } else if error.is_connect() {
+        "Couldn't connect to the provider — check the network or the endpoint URL.".to_string()
+    } else {
+        "Couldn't reach the provider (network error).".to_string()
+    }
+}
+
+/// Compose the final user-facing model error. `last_error` is already a friendly
+/// sentence; we only tack on the retry count when we actually retried, so a
+/// first-try failure (e.g. a rate limit surfaced immediately) reads cleanly.
+pub(crate) fn final_model_error(last_error: &str, attempts: u32) -> String {
+    let last_error = last_error.trim();
+    let msg = if last_error.is_empty() {
+        "The model request failed."
+    } else {
+        last_error
+    };
+    if attempts > 1 {
+        format!("{msg} (after {attempts} attempts)")
+    } else {
+        msg.to_string()
+    }
+}
+
+#[cfg(test)]
+mod error_humanize_tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn rate_limit_reads_cleanly_without_leaking_json() {
+        // The exact shape a provider returned in the wild (429 + usage-limit error).
+        let body = r#"{"type":"error","error":{"type":"GoUsageLimitError","message":"usage limit reached"}}"#;
+        let msg = humanize_http_error(StatusCode::TOO_MANY_REQUESTS, body);
+        assert!(msg.starts_with("Rate limited"), "{msg}");
+        assert!(msg.contains("usage limit reached"), "{msg}");
+        assert!(msg.contains("HTTP 429"), "{msg}");
+        assert!(!msg.contains('{'), "must not dump raw JSON: {msg}");
+    }
+
+    #[test]
+    fn falls_back_to_error_type_when_no_message() {
+        let body = r#"{"error":{"type":"GoUsageLimitError"}}"#;
+        let msg = humanize_http_error(StatusCode::TOO_MANY_REQUESTS, body);
+        assert!(msg.contains("GoUsageLimitError"), "{msg}");
+    }
+
+    #[test]
+    fn auth_and_server_errors() {
+        let auth = humanize_http_error(StatusCode::UNAUTHORIZED, "");
+        assert!(auth.contains("Authentication failed") && auth.contains("HTTP 401"), "{auth}");
+        let server = humanize_http_error(StatusCode::BAD_GATEWAY, "not json");
+        assert!(server.contains("server trouble") && server.contains("HTTP 502"), "{server}");
+    }
+
+    #[test]
+    fn final_error_only_shows_count_when_retried() {
+        assert_eq!(final_model_error("Rate limited.", 1), "Rate limited.");
+        assert_eq!(final_model_error("Boom.", 3), "Boom. (after 3 attempts)");
+        assert_eq!(final_model_error("   ", 1), "The model request failed.");
+    }
+}
+
 /// Live text the model is currently streaming, shared between the model (writer)
 /// and the TUI (reader). The model appends visible text deltas as they arrive;
 /// the UI renders the in-progress text and clears it once the turn commits to
