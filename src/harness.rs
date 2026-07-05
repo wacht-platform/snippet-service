@@ -2431,11 +2431,15 @@ impl CodingHarness {
         });
         let _ = self.persist_state(state).await;
 
-        // Run the summarizer/reflection tool-loops at minimal reasoning effort:
-        // they're mechanical (~24 sequential calls worst case), and full
-        // chain-of-thought on a reasoning model turns compaction into minutes of
-        // thinking. Restore the session's effort before returning either way.
-        let prev_effort = model.swap_reasoning_effort(Some("low".to_string()));
+        // Run the summarizer/reflection tool-loops with reasoning turned OFF:
+        // they're mechanical (fill a structured table, then write memory entries),
+        // so chain-of-thought here just burns time. This matters most on the
+        // ChatGPT/Codex backend — it rejects "minimal", so "low" still reasons on
+        // every one of the ~9 calls (up to 4 summary + 5 reflection turns), which
+        // is what turned compaction into minutes. "off" makes normalize_effort
+        // drop the reasoning field entirely (Anthropic/Gemini likewise skip
+        // thinking). Restore the session's effort before returning either way.
+        let prev_effort = model.swap_reasoning_effort(Some("off".to_string()));
 
         let window_text = render_window(&prior_table, &older, &state.user_request, RECENT_FOCUS);
         let table = match self.run_agentic_summary(model, &window_text).await {
