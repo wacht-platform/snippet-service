@@ -2619,8 +2619,10 @@ impl CodingHarness {
         summary_table: &str,
     ) -> Result<(), ToolError> {
         // Tight cap — each turn is a full model round-trip and this runs after
-        // every main-session compaction (was 8).
-        const MAX_TURNS: usize = 5;
+        // every main-session compaction (was 8, then 5). Reflection should converge
+        // in 1–2 writes; a higher cap just let the model re-save the same entry
+        // over and over until it timed out on the cap.
+        const MAX_TURNS: usize = 3;
 
         let store = crate::memory::MemoryStore::for_workspace(self.context.workspace_root());
         let index_budget = self.config.memory_index_budget_chars;
@@ -2640,9 +2642,10 @@ impl CodingHarness {
             let index = store.read_index();
             let entries = store.list_entries();
             let user = format!(
-                "WORKSPACE: {ws}\n\nWHAT JUST HAPPENED (compacted session table):\n{summary_table}\n\nCURRENT MEMORY INDEX:\n{index}\n\nEXISTING ENTRIES: {entries}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS}. Make exactly one tool call. Extract what would help a FUTURE session here: the reusable PROCEDURE(s)/playbook(s) this session demonstrated (the steps that worked + gotchas) and any durable FACTS/pointers. Write them with memory_write and keep the index pointing to them with memory_index. Only finalize with nothing written if the session was genuinely trivial (a quick question, no real work).",
+                "WORKSPACE: {ws}\n\nWHAT JUST HAPPENED (compacted session table):\n{summary_table}\n\nCURRENT MEMORY INDEX:\n{index}\n\nEXISTING ENTRIES: {entries}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS} · {writes} write(s) so far. Make exactly one tool call. Capture what helps a FUTURE session here — the reusable PROCEDURE(s)/playbook(s) this session showed (steps that worked + gotchas) and any durable FACTS/pointers. Write each distinct thing ONCE with memory_write; NEVER re-save or 'polish' an entry you already wrote this pass. Once the durable value is captured (usually 1–2 writes) and the index points to it, call finalize. Only finalize with nothing written if the session was genuinely trivial.",
                 index = if index.trim().is_empty() { "(empty)".to_string() } else { index },
                 entries = if entries.is_empty() { "(none)".to_string() } else { entries.join(", ") },
+                writes = writes,
             );
             let messages = vec![
                 HarnessMessage::System { content: MEMORY_REFLECTOR_SYSTEM.to_string() },
@@ -2673,7 +2676,7 @@ impl CodingHarness {
                         Ok(()) => {
                             writes += 1;
                             self.debug_log(&format!("memory reflection: wrote entry `{id}` ({}b)", content.len()));
-                            format!("entry `{id}` saved — make sure the index points to it")
+                            format!("entry `{id}` saved. Do NOT re-write or 'polish' it. If the index needs it, call memory_index once — then finalize.")
                         }
                         Err(e) => e,
                     };
@@ -3201,8 +3204,9 @@ index = "memory_index(content) REPLACES the always-loaded index — keep it lean
 evidence = "exact paths, commands, and IDs verbatim; no speculation, no padding"
 
 [finalize]
+write_once = "write each entry ONCE. Do NOT re-save or 'polish' an entry you already wrote in this pass — it changes little and just burns turns. Aim for 1–2 writes total (an entry, then the index), then finalize."
 bias_to_capture = "if the session did REAL work (edits, debugging, a build, a multi-step task), it almost always demonstrated a reusable procedure or surfaced a durable fact — write at least one entry before finalizing. Finalizing with nothing written is only correct when the session was genuinely trivial."
-when = "finalize once the index and entries reflect the durable procedures/facts from this session"
+when = "finalize as soon as the index and entries reflect the durable procedures/facts from this session — usually within 1–2 writes"
 how = "call finalize (one tool call per turn)""#;
 
 fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
