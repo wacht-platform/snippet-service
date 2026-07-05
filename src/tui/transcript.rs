@@ -329,10 +329,7 @@ pub(super) fn strip_attachment_markers(text: &str) -> String {
 }
 
 pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    let mut cleaned = strip_attachment_markers(text);
-    if cleaned.is_empty() && text.contains("[attached ") {
-        cleaned = "📎 attachment".to_string();
-    }
+    let cleaned = strip_attachment_markers(text);
     let prefix = Span::styled(
         "› ",
         Style::default().fg(blue()).add_modifier(Modifier::BOLD),
@@ -351,10 +348,52 @@ pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
             ]));
         }
     }
-    if lines.is_empty() {
+    // Surface any attachments the message carried — kept visible even when it also
+    // had text, so a sent attachment doesn't vanish from the transcript (dimmed).
+    let (imgs, files) = count_attachments(text);
+    if imgs + files > 0 {
+        let leading = if lines.is_empty() {
+            prefix.clone()
+        } else {
+            Span::raw("  ")
+        };
+        lines.push(Line::from(vec![
+            leading,
+            Span::styled(attachment_summary(imgs, files), Style::default().fg(muted())),
+        ]));
+    } else if lines.is_empty() {
         lines.push(Line::from(vec![prefix]));
     }
     lines
+}
+
+/// Count `[attached image — …]` / `[attached file — …]` markers by kind.
+fn count_attachments(text: &str) -> (usize, usize) {
+    let (mut imgs, mut files) = (0usize, 0usize);
+    for line in text.lines() {
+        let t = line.trim_start();
+        if !t.ends_with(']') {
+            continue;
+        }
+        if t.starts_with("[attached image —") {
+            imgs += 1;
+        } else if t.starts_with("[attached file —") {
+            files += 1;
+        }
+    }
+    (imgs, files)
+}
+
+/// "📎 2 images · 1 file" from the per-kind counts.
+fn attachment_summary(imgs: usize, files: usize) -> String {
+    let mut parts = Vec::new();
+    if imgs > 0 {
+        parts.push(format!("{imgs} image{}", if imgs == 1 { "" } else { "s" }));
+    }
+    if files > 0 {
+        parts.push(format!("{files} file{}", if files == 1 { "" } else { "s" }));
+    }
+    format!("📎 {}", parts.join(" · "))
 }
 
 /// A leading glyph + optional label, then wrapped body text in one color.

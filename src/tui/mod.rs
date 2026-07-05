@@ -2822,11 +2822,13 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),                  // Header
+            Constraint::Length(1),                  // gap under header
             Constraint::Min(10),                     // Content
             Constraint::Length(sugg_h),              // Suggestions
             Constraint::Length(question_height(app)), // Question
             Constraint::Length(compact_h),          // Compaction progress
             Constraint::Length(approval_h),         // Approval prompt (above input)
+            Constraint::Length(1),                  // gap above input
             Constraint::Length(input_h),            // Input (grows with wrapped lines)
             Constraint::Length(1),                  // Status message
             Constraint::Length(1),                  // Footer (metadata)
@@ -2834,14 +2836,14 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         .split(area);
 
     let header_area = chunks[0];
-    let content_area = chunks[1];
-    let suggestions_area = chunks[2];
-    let question_area = chunks[3];
-    let compaction_area = chunks[4];
-    let approval_area = chunks[5];
-    let input_area = chunks[6];
-    let status_msg_area = chunks[7];
-    let footer_area = chunks[8];
+    let content_area = chunks[2];
+    let suggestions_area = chunks[3];
+    let question_area = chunks[4];
+    let compaction_area = chunks[5];
+    let approval_area = chunks[6];
+    let input_area = chunks[8];
+    let status_msg_area = chunks[9];
+    let footer_area = chunks[10];
 
     render_header(frame, header_area, app);
     render_history(frame, content_area, app);
@@ -3376,15 +3378,16 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    // Inset the transcript by a 2-column left margin for a consistent gutter (the
-    // header/footer/input sit at a 1-column margin, so content reads as nested).
+    // Inset the transcript with a symmetric gutter on BOTH sides so content sits
+    // in a comfortable column instead of running edge-to-edge (which reads dense).
+    let gutter = 4u16;
     let inner = Rect {
-        x: area.x + 2,
+        x: area.x + gutter,
         y: area.y,
-        width: area.width.saturating_sub(2),
+        width: area.width.saturating_sub(gutter * 2),
         height: area.height,
     };
-    let width = (inner.width as usize).saturating_sub(1).max(20);
+    let width = (inner.width as usize).max(20);
     let height = inner.height as usize;
 
     // Empty state: no conversation yet (and not in the login form) — show a small
