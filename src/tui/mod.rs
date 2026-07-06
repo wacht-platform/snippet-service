@@ -50,6 +50,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ("/rewind", "Restore the workspace to a checkpoint"),
     ("/model", "Connect or change the AI model"),
     ("/compact", "Compact older conversation history now"),
+    ("/goal", "Set an autonomous goal the agent drives to completion (/goal cancel to stop)"),
     ("/mode", "Toggle manual approval (bash & file edits ask y/n)"),
     ("/theme", "Switch the color theme"),
 ];
@@ -921,6 +922,32 @@ impl App {
                     }
                 } else {
                     self.status = "No active session to compact.".to_string();
+                }
+            }
+            "/goal" => {
+                let rest = text.strip_prefix("/goal").unwrap_or("").trim();
+                if rest.eq_ignore_ascii_case("cancel") || rest.eq_ignore_ascii_case("stop") {
+                    match &self.input_tx {
+                        Some(tx) => {
+                            let _ = tx.send(LoopInput::CancelGoal);
+                            self.status = "Cancelling the goal…".to_string();
+                        }
+                        None => self.status = "No active goal.".to_string(),
+                    }
+                } else if rest.is_empty() {
+                    self.status =
+                        "Usage: /goal <what to accomplish>   ·   /goal cancel".to_string();
+                } else {
+                    // The agent must be running to receive the goal; start it if idle.
+                    if !self.agent_alive() {
+                        self.spawn_loop(None, true);
+                    }
+                    match self.input_tx.clone() {
+                        Some(tx) if tx.send(LoopInput::SetGoal(rest.to_string())).is_ok() => {
+                            self.status = "Goal set — the agent will drive toward it. /goal cancel to stop.".to_string();
+                        }
+                        _ => self.status = "Couldn't start the agent loop for the goal.".to_string(),
+                    }
                 }
             }
             "/theme" => {

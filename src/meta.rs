@@ -14,18 +14,44 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 3] = ["note", "ask_user", "delegate_task"];
+pub const META_TOOL_NAMES: [&str; 4] = ["note", "ask_user", "delegate_task", "complete_goal"];
 
 pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
 }
 
 /// Tool definitions advertised to the conversation agent on top of the coding
-/// tools. There is no terminate/complete tool: the agent finishes a turn simply
-/// by replying with no tool calls, and talks to the user with text beside its
-/// working tool calls.
-pub fn conversation_meta_definitions() -> Vec<NativeToolDefinition> {
-    vec![note_tool(), ask_user_tool(), delegate_task_tool()]
+/// tools. Ordinarily there is no terminate/complete tool — the agent finishes a
+/// turn by replying with no tool calls. `complete_goal` is the one exception, and
+/// it's only offered while an autonomous `/goal` is active (so it can end it).
+pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinition> {
+    let mut tools = vec![note_tool(), ask_user_tool(), delegate_task_tool()];
+    if goal_active {
+        tools.push(complete_goal_tool());
+    }
+    tools
+}
+
+fn complete_goal_tool() -> NativeToolDefinition {
+    NativeToolDefinition {
+        name: "complete_goal".to_string(),
+        description: "End the current autonomous /goal. Call this ONLY when the goal is genuinely \
+            100% COMPLETE — every part done and verified — so the loop stops re-prompting you to \
+            continue. Pass a short `summary` of what you accomplished (shown to the user). Do NOT \
+            call it to pause, to ask a question, or while any work remains."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "A short summary of what the goal accomplished (shown to the user)."
+                }
+            },
+            "required": ["summary"],
+            "additionalProperties": false,
+        }),
+    }
 }
 
 /// Explicit completion tool for HEADLESS runs (delegated lanes, one-shot
@@ -170,7 +196,7 @@ fn delegate_task_tool() -> NativeToolDefinition {
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "Short label for the lane (a few words). Ignored when lane_id is set."
+                    "description": "A short, specific label YOU choose for this lane (2–5 words) that says what it's doing — e.g. 'audit auth flow', 'extract CLI modules', 'review error handling'. Shown to the user and in your [delegated_lanes] context, so make it descriptive, not generic ('investigate', 'task 1'). Required for a new lane; ignored when lane_id is set."
                 },
                 "description": {
                     "type": "string",

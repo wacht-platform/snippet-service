@@ -188,6 +188,107 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// An active `/goal`: the agent auto-continues toward it each idle turn (the loop
+/// re-prompts it as the user) until it's complete, the user cancels, or a rate
+/// limit is hit. It keeps its plans/artifacts/findings in `dir` under
+/// `.snippet/goals/…`. Persisted with the session so it survives restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Goal {
+    /// What the user asked the agent to accomplish.
+    pub text: String,
+    /// The agent's goal workspace dir (it picks/creates one under
+    /// `.snippet/goals/…`); empty until the agent has chosen it.
+    #[serde(default)]
+    pub dir: String,
+    #[serde(default)]
+    pub status: GoalStatus,
+    /// Autonomous (loop-driven, non-user) turns taken toward the goal — drives the
+    /// periodic self-evaluation checkpoint.
+    #[serde(default)]
+    pub autonomous_turns: usize,
+    /// When Paused by a rate limit, the unix epoch seconds the window resets (0 if
+    /// unknown) — shown to the user so they know when it can resume.
+    #[serde(default)]
+    pub resume_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    /// The agent is actively driving toward the goal (auto-continues).
+    #[default]
+    Active,
+    /// Rate-limited — the loop stopped auto-continuing until the window resets.
+    Paused,
+    /// The agent reported the goal 100% done.
+    Complete,
+    /// The user cancelled it.
+    Cancelled,
+}
+
+/// Autonomous goal turns between forced self-evaluations — the runaway guard for
+/// providers with no rate limit: the agent steps back, checks progress, and
+/// decides for itself whether to keep going.
+const GOAL_SELF_CHECK_EVERY: usize = 300;
+
+/// Where the agent keeps its goal scratch space, phrased for a directive.
+fn goal_dir_phrase(dir: &str) -> String {
+    if dir.trim().is_empty() {
+        "your goal workspace under `.snippet/goals/`".to_string()
+    } else {
+        format!("your goal workspace (`{dir}`)")
+    }
+}
+
+fn goal_start_directive(text: &str) -> String {
+    format!(
+        "[goal] The user has set you an AUTONOMOUS GOAL to drive to completion on your own — \
+you'll be re-prompted each turn to keep going.\n\n\
+GOAL: {text}\n\n\
+Do this now:\n\
+1. Set up a GOAL WORKSPACE — create a new folder (or reuse a relevant existing one) under \
+`.snippet/goals/`, and record its path in a `note`. This is durable scratch space that \
+SURVIVES compaction: keep your plan, todos, findings, decisions, and any artifacts there.\n\
+2. Write an initial PLAN + TODO list into that folder.\n\
+3. Start executing toward 100% completion.\n\n\
+Rules: keep going on your own; do NOT stop to ask for confirmation on ordinary steps. When the \
+goal is genuinely 100% complete, call `complete_goal` with a short summary. If you hit a hard \
+blocker you truly cannot resolve, say exactly what you need. Begin."
+    )
+}
+
+fn goal_continue_directive(text: &str, dir: &str) -> String {
+    format!(
+        "[goal] Continue toward your goal: {text}\n\
+Re-read your plan/todos/findings in {where}, pick the next unfinished step, and do it — update \
+the todos as you go. Keep going; don't stop or recap unless something material changed. When it's \
+100% complete, call `complete_goal`.",
+        where = goal_dir_phrase(dir)
+    )
+}
+
+fn goal_selfcheck_directive(text: &str, dir: &str, n: usize) -> String {
+    format!(
+        "[goal] SELF-CHECK — you've taken {n} autonomous turns on this goal. Step back and evaluate \
+honestly:\n\
+- Are you making REAL progress toward: {text}?\n\
+- Is your approach working, or are you looping/stuck?\n\
+- Re-read your plan/todos in {where}.\n\
+Then decide: if it's actually complete, call `complete_goal`; if you're genuinely blocked, state \
+exactly what you need; otherwise correct course if needed and CONTINUE. Proceed.",
+        where = goal_dir_phrase(dir)
+    )
+}
+
+fn goal_cancel_directive(text: &str, dir: &str) -> String {
+    format!(
+        "[goal] The user has CANCELLED this goal. STOP working toward it now. Give a brief summary of \
+what you accomplished and where you left off (your work is saved in {where}). Take no further \
+action on the goal: {text}",
+        where = goal_dir_phrase(dir)
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessState {
     pub version: u32,
@@ -203,6 +304,10 @@ pub struct HarnessState {
     /// `user_request`-derived label. Renaming (TUI/app) sets this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// An active `/goal` the agent is autonomously working toward (None = normal
+    /// interactive mode). See [`Goal`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<Goal>,
     pub messages: Vec<HarnessMessage>,
     pub events: Vec<HarnessEvent>,
     pub iterations: usize,
@@ -275,6 +380,10 @@ pub enum LoopInput {
     DropQueued,
     /// Rename the session (user-set title override).
     SetTitle(String),
+    /// Set (or replace) the autonomous `/goal` — the agent begins driving toward it.
+    SetGoal(String),
+    /// Cancel the active goal — the agent is told and winds down.
+    CancelGoal,
     /// Cancel the run.
     Interrupt,
 }
@@ -730,8 +839,13 @@ impl CodingHarness {
             } else if state.status == HarnessStatus::Interrupted {
                 break;
             } else {
-                // Idle or WaitingForInput: block until something wakes us.
+                // Idle or WaitingForInput. When a goal is Active and we're Idle (not
+                // blocked on a question), DRIVE the loop forward instead of waiting —
+                // but a queued real input or a lane report is handled first (biased).
+                let goal_driving = state.status == HarnessStatus::Idle
+                    && matches!(&state.goal, Some(g) if g.status == GoalStatus::Active);
                 tokio::select! {
+                    biased;
                     input = input_rx.recv() => match input {
                         Some(LoopInput::UserMessage(text)) | Some(LoopInput::Answer(text)) => {
                             let text = text.trim().to_string();
@@ -757,6 +871,15 @@ impl CodingHarness {
                             state.title = if t.is_empty() { None } else { Some(t.to_string()) };
                             self.persist(&mut state, &lanes).await?;
                         }
+                        Some(LoopInput::SetGoal(text)) => {
+                            self.begin_goal(&mut state, text);
+                            consecutive_errors = 0;
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::CancelGoal) => {
+                            self.end_goal(&mut state);
+                            self.persist(&mut state, &lanes).await?;
+                        }
                         // No tool call is pending while idle — nothing to approve.
                         Some(LoopInput::Approve) | Some(LoopInput::ApproveAll) | Some(LoopInput::Deny) => {}
                         // Nothing queued while idle.
@@ -773,6 +896,12 @@ impl CodingHarness {
                         if state.status == HarnessStatus::Idle {
                             state.status = HarnessStatus::Running;
                         }
+                        self.persist(&mut state, &lanes).await?;
+                    }
+                    _ = std::future::ready(()), if goal_driving => {
+                        // Autonomous goal, nothing else queued: take the next goal turn.
+                        self.drive_goal_turn(&mut state, &mut vars);
+                        consecutive_errors = 0;
                         self.persist(&mut state, &lanes).await?;
                     }
                 }
@@ -1086,8 +1215,82 @@ impl CodingHarness {
             // Approve/Deny are only meaningful while a tool call is awaiting approval
             // inside a step; arriving here (between turns) they're stray no-ops.
             LoopInput::Approve | LoopInput::ApproveAll | LoopInput::Deny => false,
+            LoopInput::SetGoal(text) => {
+                self.begin_goal(state, text);
+                false
+            }
+            LoopInput::CancelGoal => {
+                self.end_goal(state);
+                false
+            }
             LoopInput::Interrupt => true,
         }
+    }
+
+    /// Start (or replace) an autonomous goal and prompt the agent toward it now.
+    /// Called from `/goal` (idle or mid-run). The loop then re-drives the agent
+    /// each idle turn until the goal completes, the user cancels, or it's paused.
+    fn begin_goal(&self, state: &mut HarnessState, text: String) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        state.goal = Some(Goal {
+            text: text.clone(),
+            dir: String::new(),
+            status: GoalStatus::Active,
+            autonomous_turns: 0,
+            resume_at: 0,
+        });
+        state.messages.push(HarnessMessage::User {
+            content: goal_start_directive(&text),
+        });
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "goal_set".to_string(),
+            reasoning: text,
+        });
+        state.status = HarnessStatus::Running;
+    }
+
+    /// Cancel the active goal (user-initiated) — tell the agent to stop and wind down.
+    fn end_goal(&self, state: &mut HarnessState) {
+        let Some(goal) = state.goal.as_mut() else {
+            return;
+        };
+        goal.status = GoalStatus::Cancelled;
+        let (text, dir) = (goal.text.clone(), goal.dir.clone());
+        state.messages.push(HarnessMessage::User {
+            content: goal_cancel_directive(&text, &dir),
+        });
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "goal_cancelled".to_string(),
+            reasoning: text,
+        });
+        state.status = HarnessStatus::Running;
+    }
+
+    /// Take one autonomous turn toward the active goal: bump the counter and push
+    /// the continue/self-check directive as a fresh user turn. Called from the idle
+    /// point when a goal is Active and nothing else is pending.
+    fn drive_goal_turn(&self, state: &mut HarnessState, vars: &mut LoopVars) {
+        let (text, dir, n) = match state.goal.as_mut() {
+            Some(g) => {
+                g.autonomous_turns += 1;
+                (g.text.clone(), g.dir.clone(), g.autonomous_turns)
+            }
+            None => return,
+        };
+        let directive = if n % GOAL_SELF_CHECK_EVERY == 0 {
+            goal_selfcheck_directive(&text, &dir, n)
+        } else {
+            goal_continue_directive(&text, &dir)
+        };
+        state.messages.push(HarnessMessage::User { content: directive });
+        // A goal turn is a fresh turn: reset per-turn loop bookkeeping so discovery
+        // and progress tracking start clean (no checkpoint — the goal start already
+        // seeded one, and per-turn snapshots would flood the shadow git).
+        *vars = LoopVars::default();
+        state.status = HarnessStatus::Running;
     }
 
     fn inject_lane_result(
@@ -1157,7 +1360,11 @@ impl CodingHarness {
         sink: Option<&StreamHandle>,
         approval_rx: &mut mpsc::UnboundedReceiver<ApprovalDecision>,
     ) -> StepResult {
-        let definitions = self.definitions_for(conversation_mode);
+        let goal_active = state
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == GoalStatus::Active);
+        let definitions = self.definitions_for(conversation_mode, goal_active);
 
         // Unproductive backstop: too many tool-call turns in a row that did no
         // real work (notes / unknown tools). Wrap the run up cleanly rather than
@@ -1780,6 +1987,39 @@ impl CodingHarness {
                     MetaControl::Continue,
                 )
             }
+            "complete_goal" => {
+                let summary = arguments
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                match state.goal.as_mut() {
+                    Some(goal) if goal.status == GoalStatus::Active => {
+                        goal.status = GoalStatus::Complete;
+                        let text = goal.text.clone();
+                        state.events.push(HarnessEvent::SystemDecision {
+                            step: "goal_completed".to_string(),
+                            reasoning: if summary.is_empty() { text } else { summary.clone() },
+                        });
+                        (
+                            json!({"schema_version": 1, "status": "success", "data": {"completed": true}}),
+                            MetaControl::EndTurn {
+                                kind: TurnEndKind::Complete,
+                                final_text: Some(if summary.is_empty() {
+                                    "Goal complete.".to_string()
+                                } else {
+                                    summary
+                                }),
+                            },
+                        )
+                    }
+                    _ => (
+                        tool_error("complete_goal: there is no active goal to complete."),
+                        MetaControl::Continue,
+                    ),
+                }
+            }
             "ask_user" => match parse_ask_user(arguments) {
                 Ok(rendered) => {
                     let prompt_text = first_question_text(&rendered)
@@ -1865,12 +2105,16 @@ impl CodingHarness {
         }
     }
 
-    fn definitions_for(&self, conversation_mode: bool) -> Vec<crate::llm::NativeToolDefinition> {
+    fn definitions_for(
+        &self,
+        conversation_mode: bool,
+        goal_active: bool,
+    ) -> Vec<crate::llm::NativeToolDefinition> {
         let mut definitions = self.tools.definitions();
         if conversation_mode {
             // User-facing: meta tools (note/ask_user/delegate); no terminate tool —
-            // a plain reply ends the turn.
-            definitions.extend(meta::conversation_meta_definitions());
+            // a plain reply ends the turn. `complete_goal` is added only while a goal runs.
+            definitions.extend(meta::conversation_meta_definitions(goal_active));
         } else {
             // Headless (lanes / one-shot run): an explicit terminate_loop carries a
             // structured summary back to the caller.
@@ -2014,6 +2258,7 @@ impl CodingHarness {
             workspace: self.context.workspace_root().display().to_string(),
             user_request,
             title: None,
+            goal: None,
             messages,
             events,
             iterations: 0,
