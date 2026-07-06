@@ -289,6 +289,23 @@ action on the goal: {text}",
     )
 }
 
+/// Whether a model error is a rate/usage limit (429) — matches the humanized
+/// "Rate limited …" message plus a couple of raw fallbacks.
+fn is_rate_limit_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    message.starts_with("Rate limited") || m.contains("rate limit") || m.contains("429")
+}
+
+/// The soonest window reset (unix epoch secs) across a rate-limit snapshot, or None.
+fn earliest_reset(snap: &crate::llm::RateLimitSnapshot) -> Option<i64> {
+    [snap.primary.as_ref(), snap.secondary.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|w| w.resets_at)
+        .filter(|&t| t > 0)
+        .min()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessState {
     pub version: u32,
@@ -793,6 +810,27 @@ impl CodingHarness {
                         state.events.push(HarnessEvent::ModelError {
                             message: message.clone(),
                         });
+                        // Goal mode: a rate limit PAUSES the goal rather than failing
+                        // the session — the drive stops until the window resets. Record
+                        // when that is (from the last rate-limit snapshot) so the UI can
+                        // show it. The user can re-issue /goal to resume.
+                        if is_rate_limit_error(&message) {
+                            if let Some(goal) =
+                                state.goal.as_mut().filter(|g| g.status == GoalStatus::Active)
+                            {
+                                goal.status = GoalStatus::Paused;
+                                goal.resume_at =
+                                    state.rate_limit.as_ref().and_then(earliest_reset).unwrap_or(0);
+                                let text = goal.text.clone();
+                                state.events.push(HarnessEvent::SystemDecision {
+                                    step: "goal_paused".to_string(),
+                                    reasoning: format!("rate limited — goal paused: {text}"),
+                                });
+                                state.status = HarnessStatus::Idle;
+                                self.persist(&mut state, &lanes).await?;
+                                continue;
+                            }
+                        }
                         // Fatal errors never recover — fail at once, no backoff.
                         if !retryable {
                             state.status = HarnessStatus::Failed;

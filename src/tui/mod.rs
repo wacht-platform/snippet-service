@@ -3385,6 +3385,24 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         Span::styled(model.clone(), Style::default().fg(muted())),
         Span::raw(" "),
     ];
+    // Active-goal badge — the agent is autonomously driving toward a /goal.
+    let goal_label = app
+        .state
+        .as_ref()
+        .and_then(|s| s.goal.as_ref())
+        .and_then(|g| match g.status {
+            crate::harness::GoalStatus::Active => Some("◇ goal".to_string()),
+            crate::harness::GoalStatus::Paused => Some("◇ goal · paused".to_string()),
+            _ => None,
+        });
+    let goal_len = goal_label.as_ref().map(|l| l.chars().count() + 3).unwrap_or(0);
+    if let Some(l) = &goal_label {
+        spans.push(Span::styled("· ", Style::default().fg(muted())));
+        spans.push(Span::styled(
+            format!("{l} "),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
+    }
     // A self-update landed this session → a right-aligned "restart to apply" hint.
     let update = app.update_notice.lock().ok().and_then(|g| g.clone());
     let notice = update.map(|v| format!("⬆ updated to v{v} — restart to apply"));
@@ -3392,7 +3410,7 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     // Fill the rest of the row with a thin rule for a clean header rather than a
     // bare glyph floating in empty space (leaving room for any update hint).
-    let used = name.chars().count() + 3 + model.chars().count() + 1;
+    let used = name.chars().count() + 3 + model.chars().count() + 1 + goal_len;
     let rule = (area.width as usize).saturating_sub(used + 1 + notice_len);
     if rule > 0 {
         spans.push(Span::styled("─".repeat(rule), Style::default().fg(faint())));
