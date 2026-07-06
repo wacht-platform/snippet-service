@@ -141,7 +141,15 @@ impl AgentModel for OpenAiCompatibleModel {
 
         Ok(ModelOutput {
             calls,
-            content_text: choice.message.content,
+            content_text: choice.message.content.and_then(|c| {
+                // Strip inline <think>…</think> reasoning (MiniMax / DeepSeek-R1).
+                let mut s = ThinkSplitter::default();
+                let (mut visible, _) = s.feed(&c);
+                let (rest, _) = s.flush();
+                visible.push_str(&rest);
+                let visible = visible.trim().to_string();
+                (!visible.is_empty()).then_some(visible)
+            }),
             usage: response.usage.map(|u| crate::llm::TokenUsage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
@@ -389,6 +397,86 @@ async fn stream_chat_with_retries(
 /// Consume an OpenAI-style `chat.completions` SSE stream and assemble a
 /// `ModelOutput`. Content deltas push to `sink` live; tool-call deltas accumulate
 /// by index (id/name once, arguments fragment by fragment) and parse at the end.
+/// Splits a model's `content` into the visible answer vs inline `<think>…</think>`
+/// reasoning — the MiniMax / DeepSeek-R1 style where the model embeds its chain of
+/// thought in `content` instead of a separate `reasoning_content` field, so the raw
+/// tags otherwise leak into the answer. Stateful across streamed deltas: it holds
+/// back a partial tag at a chunk boundary, and handles an orphan `</think>`
+/// (reasoning streamed with no opening tag).
+#[derive(Default)]
+struct ThinkSplitter {
+    in_think: bool,
+    pending: String,
+}
+
+impl ThinkSplitter {
+    /// Feed one content chunk; returns (visible, thinking) to emit now.
+    fn feed(&mut self, chunk: &str) -> (String, String) {
+        let mut buf = std::mem::take(&mut self.pending);
+        buf.push_str(chunk);
+        let mut visible = String::new();
+        let mut thinking = String::new();
+        loop {
+            if self.in_think {
+                if let Some(pos) = buf.find("</think>") {
+                    thinking.push_str(&buf[..pos]);
+                    self.in_think = false;
+                    buf.drain(..pos + "</think>".len());
+                } else {
+                    let keep = partial_tag_suffix(&buf, "</think>");
+                    thinking.push_str(&buf[..buf.len() - keep]);
+                    self.pending = buf.split_off(buf.len() - keep);
+                    break;
+                }
+            } else {
+                let open = buf.find("<think>");
+                let close = buf.find("</think>");
+                match (open, close) {
+                    (Some(o), c) if c.map_or(true, |c| o <= c) => {
+                        visible.push_str(&buf[..o]);
+                        self.in_think = true;
+                        buf.drain(..o + "<think>".len());
+                    }
+                    (_, Some(c)) => {
+                        // Orphan </think> before any <think>: what preceded it was
+                        // reasoning the model streamed without an opening tag.
+                        thinking.push_str(&buf[..c]);
+                        buf.drain(..c + "</think>".len());
+                    }
+                    _ => {
+                        let keep = partial_tag_suffix(&buf, "<think>")
+                            .max(partial_tag_suffix(&buf, "</think>"));
+                        visible.push_str(&buf[..buf.len() - keep]);
+                        self.pending = buf.split_off(buf.len() - keep);
+                        break;
+                    }
+                }
+            }
+        }
+        (visible, thinking)
+    }
+
+    /// Emit any buffered remainder at end of stream.
+    fn flush(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.pending);
+        if self.in_think {
+            (String::new(), rest)
+        } else {
+            (rest, String::new())
+        }
+    }
+}
+
+/// Longest suffix of `s` that is a proper prefix of `tag` — bytes to hold back in
+/// case a tag is split across chunk boundaries.
+fn partial_tag_suffix(s: &str, tag: &str) -> usize {
+    let max = s.len().min(tag.len() - 1);
+    (1..=max)
+        .rev()
+        .find(|&k| s.is_char_boundary(s.len() - k) && tag.starts_with(&s[s.len() - k..]))
+        .unwrap_or(0)
+}
+
 async fn parse_openai_sse(
     response: reqwest::Response,
     sink: &StreamHandle,
@@ -399,6 +487,7 @@ async fn parse_openai_sse(
         args: String,
     }
     let mut text = String::new();
+    let mut splitter = ThinkSplitter::default();
     let mut calls: std::collections::BTreeMap<u64, PendingCall> = std::collections::BTreeMap::new();
     let mut finish_reason: Option<String> = None;
     let mut usage: Option<TokenUsage> = None;
@@ -456,8 +545,14 @@ async fn parse_openai_sse(
             .and_then(Value::as_str)
             .filter(|c| !c.is_empty())
         {
-            text.push_str(content);
-            StreamBuffer::append(sink, content);
+            let (visible, thinking) = splitter.feed(content);
+            if !thinking.is_empty() {
+                StreamBuffer::append_thinking(sink, &thinking);
+            }
+            if !visible.is_empty() {
+                text.push_str(&visible);
+                StreamBuffer::append(sink, &visible);
+            }
         }
         if let Some(tool_calls) = delta
             .and_then(|d| d.get("tool_calls"))
@@ -495,6 +590,17 @@ async fn parse_openai_sse(
             true,
         ));
     }
+
+    // Emit any tag-fragment held back at the final chunk boundary.
+    let (fv, ft) = splitter.flush();
+    if !ft.is_empty() {
+        StreamBuffer::append_thinking(sink, &ft);
+    }
+    if !fv.is_empty() {
+        text.push_str(&fv);
+        StreamBuffer::append(sink, &fv);
+    }
+    let text = text.trim().to_string();
 
     let calls = calls
         .into_values()
@@ -856,3 +962,58 @@ fn body_snippet(bytes: &[u8]) -> String {
     }
 }
 
+
+#[cfg(test)]
+mod think_splitter_tests {
+    use super::ThinkSplitter;
+
+    fn split_all(chunks: &[&str]) -> (String, String) {
+        let mut s = ThinkSplitter::default();
+        let (mut v, mut t) = (String::new(), String::new());
+        for c in chunks {
+            let (vv, tt) = s.feed(c);
+            v.push_str(&vv);
+            t.push_str(&tt);
+        }
+        let (fv, ft) = s.flush();
+        v.push_str(&fv);
+        t.push_str(&ft);
+        (v, t)
+    }
+
+    #[test]
+    fn whole_block() {
+        let (v, t) = split_all(&["<think>reasoning here</think>the answer"]);
+        assert_eq!(v, "the answer");
+        assert_eq!(t, "reasoning here");
+    }
+
+    #[test]
+    fn tag_split_across_chunks() {
+        let (v, t) = split_all(&["<thi", "nk>hidden</thi", "nk>visible"]);
+        assert_eq!(v, "visible");
+        assert_eq!(t, "hidden");
+    }
+
+    #[test]
+    fn orphan_close_no_open() {
+        // Model streamed reasoning first, then just </think>, then the answer.
+        let (v, t) = split_all(&["Let me fix it. Fast. </think>", "done"]);
+        assert_eq!(v, "done");
+        assert_eq!(t, "Let me fix it. Fast. ");
+    }
+
+    #[test]
+    fn no_tags_passthrough() {
+        let (v, t) = split_all(&["just a plain answer"]);
+        assert_eq!(v, "just a plain answer");
+        assert_eq!(t, "");
+    }
+
+    #[test]
+    fn unclosed_think_all_reasoning() {
+        let (v, t) = split_all(&["<think>still thinking..."]);
+        assert_eq!(v, "");
+        assert_eq!(t, "still thinking...");
+    }
+}
