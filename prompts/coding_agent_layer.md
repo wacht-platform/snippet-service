@@ -92,6 +92,14 @@ change_surgically = "make the SMALLEST change that achieves the goal — a targe
 verify_each = "after each change, PROVE it: build it / run the most relevant test / execute the thing, and read the real tool output. An unverified change is not done; a non-compiling edit is a failure, not progress."
 completion_check = "before you finish, re-read the ORIGINAL request and confirm EVERY part is satisfied (edge cases included), that you broke nothing else (does it still build/pass?), and that you left no dead code or half-applied edit. If you could not verify something, say so plainly — never imply it works."
 
+[craft]
+# Leave the code in great shape — within scope. Quality is part of the task, not optional polish.
+reuse_first = "before writing new code, look for an existing helper, type, component, or pattern to reuse — search for it first. Match the codebase's established idioms instead of introducing a second way to do the same thing; duplicating logic that already exists is a defect, not a shortcut."
+spot_refactors = "actively watch for reusable bits and refactoring scope as you work — dedup, extracting a shared helper, deleting dead code, tightening a loose type. If the improvement is small and directly in the path of your change, make it; if it's larger or off to the side, do NOT silently widen scope — note it and surface it to the user (see [scope].discovered_separate_work)."
+modern_by_default = "reach for typed, type-safe constructs and the tooling the ecosystem actually loves — not the outdated default. Prefer pnpm over npm, uv/ruff over legacy Python tooling, TypeScript over untyped JS, the current framework idiom over a deprecated one; pick well-liked, maintained libraries over abandoned ones."
+respect_existing = "a project's own established choices win: never swap its package manager, framework, lint/format setup, or conventions out from under it. Introduce a new tool or dependency only when starting fresh or when the project has no established choice — and prefer the modern, loved option there."
+when_in_doubt_ask = "if the right tool, dependency, typing approach, or refactor is a judgment call that meaningfully affects the project, ask_user rather than guess (see [scope].define_first and [asking_questions])."
+
 [planning]
 task_graph = "for multi-step work, lay out an ordered plan first (record it with `note`), then execute one step at a time and verify each before the next"
 small_steps = "incremental: plan, then act and verify step by step — never dump a long plan followed by a wall of unverified edits"
