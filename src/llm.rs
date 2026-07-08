@@ -6,6 +6,22 @@ use serde_json::Value;
 
 use crate::tools::ToolError;
 
+/// Shared HTTP client for every model provider. Sets a connect timeout and — the
+/// important part — a READ (idle) timeout: it fires only when NO bytes arrive for
+/// the window, so a hung provider ("stopped responding" mid-request) errors out
+/// and the agent recovers instead of wedging forever at `Running`. A read timeout
+/// (not a total timeout) never cuts off a long-but-active generation, since each
+/// received chunk resets it.
+pub fn model_http_client(user_agent: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(180));
+    if let Some(ua) = user_agent {
+        builder = builder.user_agent(ua);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Turn a failed model HTTP response into a short, human-readable explanation
 /// instead of dumping the raw status line and the provider's JSON error body at
 /// the user. We keep a compact hint — the status code, plus the provider's own

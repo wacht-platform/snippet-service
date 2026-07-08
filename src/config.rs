@@ -114,8 +114,10 @@ pub struct ModelConfig {
     /// inlined bytes, so text-only models don't 400. Set true for multimodal models.
     #[serde(default)]
     pub supports_images: bool,
-    /// Reasoning effort: "low" | "medium" | "high" | "off" (or unset). Mapped per
-    /// provider (OpenAI reasoning_effort, Gemini thinkingConfig, Anthropic thinking).
+    /// Reasoning effort: "low" | "medium" | "high" | "xhigh" | "off" (or unset).
+    /// Mapped per provider (OpenAI reasoning_effort, Gemini thinkingConfig, Anthropic
+    /// thinking). `xhigh` is the tier above `high` — honoured by models that support
+    /// it (e.g. gpt-5.1-codex-max, Claude, Gemini) and clamped to each provider's max.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// Model context window in tokens, for the status-bar usage gauge and

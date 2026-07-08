@@ -87,7 +87,7 @@ impl GeminiModel {
     pub fn new(config: GeminiConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: crate::llm::model_http_client(None),
             cache: None,
         }
     }
@@ -165,8 +165,10 @@ impl AgentModel for GeminiModel {
                     "off" if !is_g3 => {
                         thinking.insert("thinkingBudget".to_string(), json!(0));
                     }
-                    e @ ("low" | "medium" | "high") if is_g3 => {
-                        let level = if e == "high" { "high" } else { "low" };
+                    e @ ("low" | "medium" | "high" | "xhigh") if is_g3 => {
+                        // Gemini 3 exposes discrete levels; `high` is the ceiling, so
+                        // `xhigh` maps onto it too.
+                        let level = if e == "high" || e == "xhigh" { "high" } else { "low" };
                         thinking.insert("thinkingLevel".to_string(), json!(level));
                     }
                     "low" => {
@@ -177,6 +179,10 @@ impl AgentModel for GeminiModel {
                     }
                     "high" => {
                         thinking.insert("thinkingBudget".to_string(), json!(24576));
+                    }
+                    "xhigh" => {
+                        // Above `high` for Gemini 2.5 — the top of the Pro budget range.
+                        thinking.insert("thinkingBudget".to_string(), json!(32768));
                     }
                     _ => {}
                 }

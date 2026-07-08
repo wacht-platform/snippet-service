@@ -74,7 +74,7 @@ impl ChatGptModel {
     pub fn new(config: ChatGptConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: crate::llm::model_http_client(None),
             tokens: chatgpt_auth::load_blocking(),
             session_id: uuid::Uuid::new_v4().to_string(),
         }
@@ -166,9 +166,32 @@ impl AgentModel for ChatGptModel {
                         // Rate-limit usage is on the response headers (read before the
                         // SSE body consumes the response).
                         let rate_limit = parse_codex_rate_limits(response.headers());
-                        let mut output = parse_responses_sse(response, sink.as_ref()).await?;
-                        output.rate_limit = rate_limit;
-                        return Ok(output);
+                        match parse_responses_sse(response, sink.as_ref()).await {
+                            Ok(mut output) => {
+                                output.rate_limit = rate_limit;
+                                return Ok(output);
+                            }
+                            // A mid-stream break lands here AFTER a 200. Retry it like
+                            // a failed send (the sink is cleared at the top of each
+                            // attempt, so re-streaming is clean) instead of aborting.
+                            Err(e) => {
+                                if !e.retryable() {
+                                    return Err(e);
+                                }
+                                last_error = e.to_string();
+                                if attempt == max_attempts {
+                                    break;
+                                }
+                                sleep(retry_delay(
+                                    attempt,
+                                    None,
+                                    self.config.initial_retry_ms,
+                                    self.config.max_retry_ms,
+                                ))
+                                .await;
+                                continue;
+                            }
+                        }
                     }
                     // Expired/invalid token → refresh once, then retry without
                     // consuming a backoff attempt.
@@ -244,6 +267,9 @@ impl AgentModel for ChatGptModel {
 /// Normalize a reasoning-effort string for the Codex backend (it rejects
 /// "minimal"; "off"/empty disables reasoning entirely).
 fn normalize_effort(effort: Option<&str>) -> Option<String> {
+    // Values pass through to the Responses API verbatim (low/medium/high, plus
+    // `xhigh` on gpt-5.1-codex-max and later). `off`/empty omit the reasoning
+    // block; `minimal` isn't accepted by Codex, so it degrades to `low`.
     let e = effort?.trim();
     if e.is_empty() || e.eq_ignore_ascii_case("off") {
         return None;
@@ -513,7 +539,10 @@ async fn parse_responses_sse(
         }
     })
     .await
-    .map_err(|e| ToolError::msg(format!("chatgpt stream error: {e}")))?;
+    // A break while consuming the SSE body (dropped connection, body-decode
+    // error) is transient — mark it retryable so the request loop re-runs it
+    // instead of aborting (this silently killed memory reflection mid-compaction).
+    .map_err(|e| ToolError::model_request(format!("chatgpt stream error: {e}"), true))?;
 
     if let Some(err) = failure {
         if text.is_empty() && calls.is_empty() {

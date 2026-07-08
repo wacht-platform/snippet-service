@@ -33,7 +33,7 @@ impl AnthropicModel {
     pub fn new(config: AnthropicConfig) -> Self {
         Self {
             config,
-            client: reqwest::Client::new(),
+            client: crate::llm::model_http_client(None),
         }
     }
 }
@@ -604,6 +604,9 @@ fn anthropic_thinking_budget(effort: Option<&str>) -> Option<u32> {
         "low" => Some(2048),
         "medium" => Some(8192),
         "high" => Some(16384),
+        // A tier above `high` for models that reason harder when asked. Kept well
+        // under Claude's max thinking budget; `max_tokens` is bumped past it below.
+        "xhigh" => Some(32768),
         _ => None,
     }
 }

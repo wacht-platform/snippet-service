@@ -40,6 +40,11 @@ pub struct OpenAiCompatibleConfig {
 /// Coding, etc.) whitelist us; harmless to ungated providers.
 const DEFAULT_USER_AGENT: &str = "claude-cli/2.0.37 (external, cli)";
 
+/// OpenRouter app-attribution headers — `HTTP-Referer` + `X-Title` surface Snippet
+/// on OpenRouter's activity feed and app leaderboard. Sent only to OpenRouter.
+const OPENROUTER_REFERER: &str = "https://wacht.dev";
+const OPENROUTER_TITLE: &str = "Snippet";
+
 pub struct OpenAiCompatibleModel {
     config: OpenAiCompatibleConfig,
     client: reqwest::Client,
@@ -51,11 +56,13 @@ impl OpenAiCompatibleModel {
             .user_agent
             .clone()
             .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
-        let client = reqwest::Client::builder()
-            .user_agent(user_agent)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = crate::llm::model_http_client(Some(&user_agent));
         Self { config, client }
+    }
+
+    /// Whether this endpoint is OpenRouter — gates the app-attribution headers.
+    fn is_openrouter(&self) -> bool {
+        self.config.base_url.to_ascii_lowercase().contains("openrouter")
     }
 }
 
@@ -89,7 +96,11 @@ impl AgentModel for OpenAiCompatibleModel {
         // sink still assembles a full response from a throwaway buffer.
         if sink.is_some() || self.config.stream {
             let body = self.build_chat_request(messages, tools, force_tool, true);
-            let headers = vec![("authorization", format!("Bearer {}", self.config.api_key))];
+            let mut headers = vec![("authorization", format!("Bearer {}", self.config.api_key))];
+            if self.is_openrouter() {
+                headers.push(("HTTP-Referer", OPENROUTER_REFERER.to_string()));
+                headers.push(("X-Title", OPENROUTER_TITLE.to_string()));
+            }
             let detached = sink
                 .is_none()
                 .then(|| Arc::new(Mutex::new(StreamBuffer::default())));
@@ -224,14 +235,17 @@ impl OpenAiCompatibleModel {
 
         for attempt in 1..=max_attempts {
             attempts = attempt;
-            let response = self
+            let mut request = self
                 .client
                 .post(url)
                 .header(AUTHORIZATION, format!("Bearer {}", self.config.api_key))
-                .header(CONTENT_TYPE, "application/json")
-                .json(body)
-                .send()
-                .await;
+                .header(CONTENT_TYPE, "application/json");
+            if self.is_openrouter() {
+                request = request
+                    .header("HTTP-Referer", OPENROUTER_REFERER)
+                    .header("X-Title", OPENROUTER_TITLE);
+            }
+            let response = request.json(body).send().await;
 
             match response {
                 Ok(response) => {
@@ -359,7 +373,23 @@ async fn stream_chat_with_retries(
             Ok(response) => {
                 let status = response.status();
                 if status.is_success() {
-                    return parse_openai_sse(response, sink).await;
+                    match parse_openai_sse(response, sink).await {
+                        Ok(output) => return Ok(output),
+                        // A mid-stream break after a 200 (dropped connection, body
+                        // decode error) is transient — retry it like a failed send
+                        // rather than aborting the whole request.
+                        Err(e) => {
+                            if !e.retryable() {
+                                return Err(e);
+                            }
+                            last_error = e.to_string();
+                            if attempt == max_attempts {
+                                break;
+                            }
+                            sleep(retry_delay(attempt, None, initial_ms, max_ms)).await;
+                            continue;
+                        }
+                    }
                 }
                 let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                 let response_body = response.text().await.unwrap_or_default();
@@ -582,7 +612,9 @@ async fn parse_openai_sse(
         }
     })
     .await
-    .map_err(|error| ToolError::msg(format!("model stream error: {error}")))?;
+    // A break while consuming the SSE body (dropped connection, body-decode error)
+    // is transient — mark it retryable so the request loop re-runs it.
+    .map_err(|error| ToolError::model_request(format!("model stream error: {error}"), true))?;
 
     if let Some(err) = stream_error {
         return Err(ToolError::model_request(
