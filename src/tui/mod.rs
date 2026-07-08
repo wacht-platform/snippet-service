@@ -330,6 +330,23 @@ struct App {
     /// Was the agent busy on the previous tick? Drives the queue flush on the
     /// busy → not-busy edge.
     was_busy: bool,
+    /// Set the instant we hand the loop a new turn (send a message / spawn) and
+    /// cleared once the persisted state catches up. `self.state` is read from the
+    /// mtime-gated state file, so it lags the live loop: without this, a message
+    /// sent in that window sees a stale `Idle`, gets delivered mid-run, and the
+    /// harness folds it into a `[steer]` instead of a new turn — it "disappears".
+    /// Treating the agent as busy here makes the follow-up queue instead.
+    sent_turn_pending: bool,
+    /// The (provider, model) actually driving THIS chat — the per-chat profile
+    /// override when set, else the global default. Cached because resolving it
+    /// reads the profile sidecar from disk; refreshed on session switch / profile
+    /// change so the header and rate-limit gate never show the wrong model.
+    effective_model: (String, String),
+    /// Snapshot of the session list while the resume picker is open. Rebuilding it
+    /// re-reads + deserializes EVERY session file; doing that per keystroke/frame
+    /// made the picker laggy at scale. Populated on picker open, refreshed after
+    /// rename/delete, dropped on close.
+    conv_cache: Option<Vec<(String, String)>>,
     form_provider: String,
     form_api_key: String,
     form_model: String,
@@ -420,6 +437,9 @@ impl App {
             seen_compactions: usize::MAX, // uninitialized; first tick seeds it, no flash
 
             queued_inputs: std::collections::VecDeque::new(),
+            sent_turn_pending: false,
+            effective_model: (String::new(), String::new()),
+            conv_cache: None,
             was_busy: false,
             form_provider: String::new(),
             form_api_key: String::new(),
@@ -539,15 +559,29 @@ impl App {
         cfg
     }
 
+    /// Re-resolve the cached (provider, model) for the active chat. Call after
+    /// anything that can change it: session switch, profile activation, /model.
+    fn refresh_effective_model(&mut self) {
+        let cfg = self.effective_config();
+        self.effective_model = (cfg.model.provider.clone(), cfg.model.model.clone());
+    }
+
     /// Set a profile as the GLOBAL default (the model new chats use). A chat that
     /// has its own per-chat override keeps it (override wins), so we only restart
     /// the current loop when it has no override.
     fn activate_profile(&mut self, name: &str) {
+        // Switching the model restarts the loop — never kill a mid-turn run (a
+        // /goal or lane could be working). Same guard /model uses.
+        if self.agent_busy() {
+            self.status = "agent is working — stop it (Esc) before switching models".to_string();
+            return;
+        }
         if self.options.config.activate(name) {
             let _ = self.save_config_file();
             let has_override = crate::session::read_session_profile(&self.active_state_path).is_some();
             let resumed = if has_override { false } else { self.restart_loop_for_config() };
             self.screen = Screen::Main;
+            self.refresh_effective_model();
             self.status = if has_override {
                 format!(
                     "✓ global default · {} · {} (this chat keeps its own model)",
@@ -561,18 +595,27 @@ impl App {
                     if resumed { " · resumed" } else { "" },
                 )
             };
+        } else {
+            // Feedback even on the no-op path — a silent Enter reads as "broken".
+            self.status = format!("profile `{name}` not found (or already active)");
         }
     }
 
     /// Set a profile for THIS chat only (a persisted per-conversation override),
     /// without changing the global default. Restarts the chat's loop with it.
     fn activate_profile_local(&mut self, name: &str) {
+        if self.agent_busy() {
+            self.status = "agent is working — stop it (Esc) before switching models".to_string();
+            return;
+        }
         let Some(model) = self.options.config.setups.as_ref().and_then(|m| m.get(name)).cloned() else {
+            self.status = format!("profile `{name}` not found");
             return;
         };
         crate::session::write_session_profile(&self.active_state_path, name);
         let resumed = self.restart_loop_for_config();
         self.screen = Screen::Main;
+        self.refresh_effective_model();
         self.status = format!(
             "✓ this chat · {} · {}{}",
             model.provider,
@@ -720,24 +763,30 @@ impl App {
                     mod_time = m;
                 }
             }
+            // Skip a contentless default state — a fresh install otherwise shows a
+            // phantom "default session" entry with nothing to resume into.
+            let mut has_content = false;
             if let Ok(bytes) = std::fs::read(default_path) {
                 if let Ok(state) = crate::harness::deserialize_state(&bytes) {
+                    has_content = !state.user_request.is_empty() || !state.events.is_empty();
                     if !state.user_request.is_empty() {
                         desc = state.user_request.clone();
                     }
                 }
             }
-            let duration = std::time::SystemTime::now().duration_since(mod_time).unwrap_or_default();
-            let relative = if duration.as_secs() < 60 {
-                "just now".to_string()
-            } else if duration.as_secs() < 3600 {
-                format!("{}m ago", duration.as_secs() / 60)
-            } else if duration.as_secs() < 86400 {
-                format!("{}h ago", duration.as_secs() / 3600)
-            } else {
-                format!("{}d ago", duration.as_secs() / 86400)
-            };
-            list.push(("default".to_string(), desc, mod_time, relative));
+            if has_content {
+                let duration = std::time::SystemTime::now().duration_since(mod_time).unwrap_or_default();
+                let relative = if duration.as_secs() < 60 {
+                    "just now".to_string()
+                } else if duration.as_secs() < 3600 {
+                    format!("{}m ago", duration.as_secs() / 60)
+                } else if duration.as_secs() < 86400 {
+                    format!("{}h ago", duration.as_secs() / 3600)
+                } else {
+                    format!("{}d ago", duration.as_secs() / 86400)
+                };
+                list.push(("default".to_string(), desc, mod_time, relative));
+            }
         }
 
         list.sort_by(|a, b| b.2.cmp(&a.2));
@@ -809,11 +858,20 @@ impl App {
         self.state = None;
         self.scroll = 0;
         self.status = String::new();
+        // Drop anything held for the PREVIOUS conversation: queued messages must
+        // never fire into the newly-switched session, stale busy flags must not
+        // trigger a phantom flush, and a lingering error must not mask status.
+        self.queued_inputs.clear();
+        self.was_busy = false;
+        self.sent_turn_pending = false;
+        self.error = None;
         // Re-seed the compaction counter so the new conversation's EXISTING
         // compaction history doesn't fire the "new compaction" animation on its
         // first tick (same as startup). Also drop any leftover animation hold.
         self.seen_compactions = usize::MAX;
         self.compaction_anim_until = None;
+        // The new chat may carry its own model override — re-resolve the header label.
+        self.refresh_effective_model();
     }
 
     fn handle_slash_command(&mut self, text: &str) {
@@ -826,7 +884,15 @@ impl App {
         match cmd {
             "/new" => {
                 let name = if parts.len() > 1 {
-                    parts[1].to_string()
+                    let n = parts[1].to_string();
+                    // A name collision would silently OPEN the existing session
+                    // instead of creating a new one — surface it instead.
+                    if self.list_conversations().iter().any(|(existing, _)| existing == &n) {
+                        self.status =
+                            format!("`{n}` already exists — /resume {n} to open it, or pick another name");
+                        return;
+                    }
+                    n
                 } else {
                     uuid::Uuid::new_v4().to_string()
                 };
@@ -842,13 +908,26 @@ impl App {
 
                 match target_name {
                     // Switching to a named session tears down any resident agent
-                    // (in switch_conversation), so it works even mid-run.
-                    Some(name) => self.switch_conversation(&name),
+                    // (in switch_conversation), so it works even mid-run. Validate
+                    // FIRST: a typo must not abandon the current session into a
+                    // phantom empty one named after the typo.
+                    Some(name) => {
+                        if !self.list_conversations().iter().any(|(existing, _)| existing == &name) {
+                            self.status =
+                                format!("no session named `{name}` — bare /resume opens the picker");
+                            return;
+                        }
+                        self.switch_conversation(&name)
+                    }
                     None => {
                         // Bare /resume opens the picker (arrow keys, Enter to
                         // resume, `r` rename, `dd` delete) when there's anything
                         // to pick from.
-                        if !self.list_conversations().is_empty() {
+                        let convs = self.list_conversations();
+                        if !convs.is_empty() {
+                            // Snapshot once for the picker — per-keystroke rescans
+                            // of every session file made it laggy (see conv_cache).
+                            self.conv_cache = Some(convs);
                             self.screen = Screen::ResumeSelection;
                             self.resume_selected_index = 0;
                             self.resume_pending_delete = false;
@@ -1016,9 +1095,13 @@ impl App {
         };
         self.form_focus = order[next];
 
+        // Keyless endpoints are legitimate for openai-compatible (local Ollama,
+        // LM Studio…): fetch on a base_url alone there; other providers need a key.
+        let can_fetch = !self.form_api_key.trim().is_empty()
+            || (self.form_provider == "openai-compatible" && !self.form_base_url.trim().is_empty());
         if self.form_focus == SettingsField::Model
             && self.form_fetched_models.is_none()
-            && !self.form_api_key.trim().is_empty()
+            && can_fetch
         {
             self.trigger_models_fetch();
         }
@@ -1037,7 +1120,7 @@ impl App {
 
 
     fn login_cycle_reasoning(&mut self, forward: bool) {
-        const OPTIONS: [&str; 4] = ["off", "low", "medium", "high"];
+        const OPTIONS: [&str; 5] = ["off", "low", "medium", "high", "xhigh"];
         let current = self
             .form_reasoning_effort
             .as_deref()
@@ -1453,11 +1536,14 @@ impl App {
     /// `agent_alive()` is the wrong test for "is it safe to act now" — use this for
     /// guards like `/model` and `/rewind` so they aren't blocked when merely idle.
     fn agent_busy(&self) -> bool {
-        self.agent_alive()
-            && self.state.as_ref().is_some_and(|s| {
-                s.status == HarnessStatus::Running
-                    || s.lanes.iter().any(|l| l.status == LaneStatus::Running)
-            })
+        // `sent_turn_pending` covers the lag between handing off a turn and the
+        // state file reflecting Running — so a fast follow-up queues, not steers.
+        (self.sent_turn_pending && self.agent_alive())
+            || (self.agent_alive()
+                && self.state.as_ref().is_some_and(|s| {
+                    s.status == HarnessStatus::Running
+                        || s.lanes.iter().any(|l| l.status == LaneStatus::Running)
+                }))
     }
 
     /// True while the harness is mid-compaction (recent compaction-pass event + still
@@ -1559,6 +1645,11 @@ impl App {
         if let Some(tx) = self.input_tx.clone().filter(|_| self.agent_alive()) {
             if tx.send(LoopInput::Answer(text)).is_err() {
                 self.error = Some("agent loop is no longer accepting input".to_string());
+            } else {
+                // The answer resumes the turn — treat as busy so a fast follow-up
+                // queues rather than steering (mirrors submit_text).
+                self.sent_turn_pending = true;
+                self.was_busy = true;
             }
         }
         self.input_clear();
@@ -1716,8 +1807,9 @@ impl App {
 
     /// Grab an image from the system clipboard (a screenshot) and attach it: write
     /// it to the workspace temp dir and drop a chip that expands to its path on
-    /// send, so the agent can `read_image` it. macOS-only (uses `osascript`).
-    /// Multiple screenshots accumulate as separate chips.
+    /// send, so the agent can `read_image` it. macOS via `osascript`; Linux via
+    /// `wl-paste` (Wayland) or `xclip` (X11). Multiple screenshots accumulate as
+    /// separate chips.
     fn paste_clipboard_image(&mut self) {
         let dir = self
             .options
@@ -1731,28 +1823,51 @@ impl App {
             return;
         }
         let dest = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
-        // Write the clipboard's PNG data to `dest`; errors (no image on the
-        // clipboard) are caught and surfaced as a status message.
-        let script = format!(
-            "set f to open for access (POSIX file \"{}\") with write permission\n\
-             try\n\
-               write (the clipboard as «class PNGf») to f\n\
-               close access f\n\
-             on error errm\n\
-               close access f\n\
-               error errm\n\
-             end try",
-            dest.display()
-        );
-        let ran = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output();
-        let ok = matches!(&ran, Ok(out) if out.status.success())
-            && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false);
+
+        let ok = if cfg!(target_os = "macos") {
+            // Write the clipboard's PNG data to `dest`; errors (no image on the
+            // clipboard) are caught and surfaced as a status message.
+            let script = format!(
+                "set f to open for access (POSIX file \"{}\") with write permission\n\
+                 try\n\
+                   write (the clipboard as «class PNGf») to f\n\
+                   close access f\n\
+                 on error errm\n\
+                   close access f\n\
+                   error errm\n\
+                 end try",
+                dest.display()
+            );
+            let ran = std::process::Command::new("osascript").arg("-e").arg(&script).output();
+            matches!(&ran, Ok(out) if out.status.success())
+        } else {
+            // Linux: try Wayland's wl-paste, then X11's xclip. Each writes PNG
+            // bytes to stdout; capture into the dest file.
+            let mut wrote = false;
+            for (cmd, args) in [
+                ("wl-paste", vec!["--type", "image/png"]),
+                ("xclip", vec!["-selection", "clipboard", "-t", "image/png", "-o"]),
+            ] {
+                if let Ok(out) = std::process::Command::new(cmd).args(&args).output() {
+                    if out.status.success() && !out.stdout.is_empty() {
+                        wrote = std::fs::write(&dest, &out.stdout).is_ok();
+                        if wrote {
+                            break;
+                        }
+                    }
+                }
+            }
+            wrote
+        };
+        let ok = ok && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false);
         if !ok {
             let _ = std::fs::remove_file(&dest);
-            self.status = "No image on the clipboard — copy a screenshot first.".to_string();
+            self.status = if cfg!(target_os = "macos") {
+                "No image on the clipboard — copy a screenshot first.".to_string()
+            } else {
+                "No clipboard image — copy a screenshot first (needs wl-paste or xclip on Linux)."
+                    .to_string()
+            };
             return;
         }
         self.attachments.push((true, dest.display().to_string(), "screenshot".to_string()));
@@ -1998,12 +2113,21 @@ impl App {
             };
             if tx.send(input).is_err() {
                 self.error = Some("agent loop is no longer accepting input".to_string());
+            } else {
+                // The loop is now working; hold this locally until the state file
+                // confirms, so a fast follow-up queues instead of steering mid-run.
+                // `was_busy` too, so the flush edge still fires if the whole turn
+                // completes before the next state refresh.
+                self.sent_turn_pending = true;
+                self.was_busy = true;
             }
         } else {
             // Resume the existing conversation rather than starting fresh — after an
             // interrupt the agent has died but the transcript is intact; resume=false
             // would clobber it into a new conversation.
             self.spawn_loop(Some(text), true);
+            self.sent_turn_pending = true;
+            self.was_busy = true;
         }
     }
 
@@ -2026,6 +2150,9 @@ impl App {
         }
         self.error = None;
         self.scroll = 0;
+        // Fresh loop: clear any stale optimistic-busy flag (submit_text re-sets it
+        // when it spawns with a message).
+        self.sent_turn_pending = false;
         // Don't announce activity in the footer — the in-transcript spinner is the
         // live indicator, and the resident loop never "finishes" between turns so a
         // footer label here would just go stale.
@@ -2045,7 +2172,11 @@ impl App {
     }
 
     fn interrupt_or_quit(&mut self) {
-        if self.agent_alive() {
+        // Interrupt only while a turn is actually executing. The resident loop
+        // stays ALIVE between turns by design, so gating on agent_alive() made
+        // Ctrl+C unable to quit whenever a session was loaded — the terminal
+        // convention (Ctrl+C exits an idle program) applies when merely idle.
+        if self.agent_busy() {
             if let Some(tx) = &self.input_tx {
                 let _ = tx.send(LoopInput::Interrupt);
             }
@@ -2064,6 +2195,12 @@ impl App {
         let busy = self.agent_busy();
         if self.was_busy && !busy && !self.queued_inputs.is_empty() {
             self.flush_queued_input();
+        }
+        // Interrupting a turn usually leaves the resident loop ALIVE (idle), so the
+        // agent-finished branch never clears the "Interrupting..." footer — clear it
+        // here the moment the loop is observed no longer busy.
+        if !busy && self.status.starts_with("Interrupting") {
+            self.status = String::new();
         }
         self.was_busy = busy;
 
@@ -2191,6 +2328,9 @@ impl App {
                     return;
                 }
                 self.last_state_modified = Some(modified);
+                // The persisted state has caught up with our optimistic send — from
+                // here the real status governs busy/idle (and the flush edge).
+                self.sent_turn_pending = false;
                 // A newer persisted state means the turn that was streaming has
                 // committed its text into events — drop the live buffer so the
                 // committed copy doesn't render twice.
@@ -2232,6 +2372,7 @@ async fn run_app(
     options: TuiOptions,
 ) -> Result<ExitInfo, Box<dyn std::error::Error>> {
     let mut app = App::new(options);
+    app.refresh_effective_model();
     app.refresh_state().await;
     if app.options.config.resume_on_start || app.options.resume.is_some() {
         app.spawn_loop(None, true);
@@ -2294,6 +2435,11 @@ async fn run_app(
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    // An error banner shows until the user acts again — one keypress means it's
+    // been seen. Without this, `error` (cleared only on spawn) permanently masks
+    // every later status line ("queued (1)…", "Session deleted", …).
+    app.error = None;
+
     if app.login_active {
         handle_login_key(app, key);
         return;
@@ -2308,9 +2454,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                // Approve this and stop prompting for the rest of the run.
-                app.options.config.manual_approval = false;
-                let _ = app.save_config_file();
+                // Approve this and stop prompting for the rest of the RUN — run-scoped
+                // only. Never persist to the config: a one-key unblock must not
+                // silently remove the manual-approval gate for every future session.
                 if let Some(tx) = &app.input_tx {
                     let _ = tx.send(LoopInput::ApproveAll);
                 }
@@ -2349,6 +2495,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             // Paste a screenshot from the clipboard (macOS) as an attached image.
             KeyCode::Char('v') => {
                 app.paste_clipboard_image();
+                return;
+            }
+            // Cancel messages queued for after the current run.
+            KeyCode::Char('x') => {
+                if !app.queued_inputs.is_empty() {
+                    let n = app.queued_inputs.len();
+                    app.queued_inputs.clear();
+                    app.status =
+                        format!("cancelled {n} queued message{}", if n == 1 { "" } else { "s" });
+                }
                 return;
             }
             _ => {}
@@ -2463,7 +2619,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     if app.screen == Screen::ResumeSelection {
-        let convs = app.list_conversations();
+        // Use the snapshot taken when the picker opened (see conv_cache) —
+        // re-scanning every session file per keypress made the picker laggy.
+        let convs = match &app.conv_cache {
+            Some(c) => c.clone(),
+            None => {
+                let c = app.list_conversations();
+                app.conv_cache = Some(c.clone());
+                c
+            }
+        };
         if convs.is_empty() {
             match key.code {
                 KeyCode::Esc => {
@@ -2495,6 +2660,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     let name = convs[idx].0.clone();
                     let title = app.resume_rename.take().unwrap_or_default();
                     app.rename_conversation(&name, title.trim());
+                    app.conv_cache = Some(app.list_conversations());
                     let short: String = title.trim().chars().take(40).collect();
                     app.status = if short.is_empty() {
                         "Title cleared.".to_string()
@@ -2529,6 +2695,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 let (name, title) = convs[idx].clone();
                 if app.resume_pending_delete {
                     app.delete_conversation(&name);
+                    app.conv_cache = Some(app.list_conversations());
                     app.resume_pending_delete = false;
                     let remaining = convs.len() - 1;
                     if remaining == 0 {
@@ -2553,6 +2720,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Enter => {
                 app.resume_pending_delete = false;
+                app.conv_cache = None;
                 let selected_idx = app.resume_selected_index.min(convs.len().saturating_sub(1));
                 let name = convs[selected_idx].0.clone();
                 app.switch_conversation(&name);
@@ -2565,6 +2733,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Esc => {
                 app.resume_pending_delete = false;
+                app.conv_cache = None;
                 app.screen = Screen::Main;
                 app.status = "Type a task and press Enter.".to_string();
             }
@@ -3108,7 +3277,12 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     use ratatui::widgets::{Block, Borders};
 
-    let convs = app.list_conversations();
+    // Per-frame render: never rescan disk here — the picker key handler keeps
+    // conv_cache fresh (populated on open, refreshed after rename/delete).
+    let convs = match &app.conv_cache {
+        Some(c) => c.clone(),
+        None => app.list_conversations(),
+    };
 
     // Split area: Header (1), List (Min 10), Footer (1)
     let chunks = Layout::default()
@@ -3377,7 +3551,9 @@ fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) 
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let model = app.options.config.model.model.clone();
+    // The model actually driving THIS chat (per-chat override wins) — not the
+    // global default, which is misleading after "set model for this chat".
+    let model = app.effective_model.1.clone();
     let name = " snipett";
     let mut spans = vec![
         Span::styled(name, Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
@@ -3537,7 +3713,23 @@ fn q_options(question: &Value) -> Vec<(String, String)> {
 /// indices in range.
 fn ensure_q_init(app: &mut App) {
     let qs = questions_of(app);
-    let token = qs.iter().map(q_text).collect::<Vec<_>>().join("\u{1}");
+    // Fingerprint by ASK, not just question text: prefix with the count of
+    // user_question events so the agent asking the SAME question twice in a row
+    // still resets the picker (text alone left stale q_index/q_sel/q_answers).
+    let asks = app
+        .state
+        .as_ref()
+        .map(|s| {
+            s.events
+                .iter()
+                .filter(|e| matches!(e, HarnessEvent::UserQuestion { .. }))
+                .count()
+        })
+        .unwrap_or(0);
+    let token = format!(
+        "{asks}\u{1}{}",
+        qs.iter().map(q_text).collect::<Vec<_>>().join("\u{1}")
+    );
     if token != app.q_token {
         app.q_token = token;
         app.q_index = 0;
@@ -3740,6 +3932,7 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::styled(placeholder, Style::default().fg(faint())),
         ]);
         let mut lines = Vec::new();
+        lines.extend(queued_lines(app));
         if let Some(a) = attachment_line(app) {
             lines.push(a);
         }
@@ -3757,12 +3950,13 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let cursor_style = Style::default().fg(Color::Black).bg(blue());
 
     let mut lines = Vec::with_capacity(rows.len() + 1);
-    let attach_offset = if let Some(a) = attachment_line(app) {
+    let queued = queued_lines(app);
+    let mut attach_offset = queued.len();
+    lines.extend(queued);
+    if let Some(a) = attachment_line(app) {
         lines.push(a);
-        1usize
-    } else {
-        0
-    };
+        attach_offset += 1;
+    }
     for (k, row) in rows.iter().enumerate() {
         let mut spans = Vec::new();
         if k == 0 {
@@ -3794,18 +3988,58 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
+/// Messages held for after the current run — shown above the prompt so the user
+/// can SEE what will fire when the run ends (and cancel with Ctrl+X). Capped at
+/// 3 lines + an overflow count so the box never balloons.
+fn queued_lines(app: &App) -> Vec<Line<'static>> {
+    if app.queued_inputs.is_empty() {
+        return Vec::new();
+    }
+    let dim = Style::default().fg(muted());
+    let mut lines: Vec<Line<'static>> = app
+        .queued_inputs
+        .iter()
+        .take(3)
+        .map(|q| {
+            let first = q.lines().next().unwrap_or("");
+            let mut text: String = first.chars().take(70).collect();
+            if first.chars().count() > 70 || q.lines().count() > 1 {
+                text.push('…');
+            }
+            Line::from(vec![
+                Span::styled(" ⏳ ", Style::default().fg(warn())),
+                Span::styled(text, dim),
+            ])
+        })
+        .collect();
+    let extra = app.queued_inputs.len().saturating_sub(3);
+    let hint = if extra > 0 {
+        format!(" ⏳ +{extra} more queued · sends when the run finishes · Ctrl+X to cancel")
+    } else {
+        " queued — sends when the run finishes · Ctrl+X to cancel".to_string()
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(faint()))));
+    lines
+}
+
 /// Height (incl. top/bottom borders) the input box needs for the current prompt,
 /// clamped so it grows with wrapped/multi-line input but never dominates the view.
 fn input_height(app: &App, width: u16) -> u16 {
     const MAX_ROWS: usize = 8;
     // One extra row for the "📎 N attachments" summary when files are queued.
     let attach: u16 = if app.attachments.is_empty() { 0 } else { 1 };
+    // Queued-message preview rows (see queued_lines).
+    let queued: u16 = if app.queued_inputs.is_empty() {
+        0
+    } else {
+        (app.queued_inputs.len().min(3) + 1) as u16
+    };
     if app.input.is_empty() {
-        return 3 + attach;
+        return 3 + attach + queued;
     }
     let text_w = (width as usize).saturating_sub(3).max(1);
     let (rows, _) = layout_input(&app.input, app.input_cursor, text_w);
-    (rows.len().clamp(1, MAX_ROWS) as u16) + 2 + attach
+    (rows.len().clamp(1, MAX_ROWS) as u16) + 2 + attach + queued
 }
 
 /// Wrap `input` into display rows at `width` columns, honoring explicit `\n` as
@@ -4084,8 +4318,9 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let faint = Style::default().fg(faint());
 
     let mut right: Vec<Span<'static>> = Vec::new();
-    // ChatGPT-subscription rate-limit usage (parsed from response headers).
-    let rl = if app.options.config.model.provider == "chatgpt" {
+    // Provider rate-limit usage (parsed from response headers). Gate on the
+    // CHAT's effective provider, and show whenever the daemon reported one.
+    let rl = if app.effective_model.0 == "chatgpt" {
         st.and_then(|s| s.rate_limit.as_ref())
     } else {
         None
