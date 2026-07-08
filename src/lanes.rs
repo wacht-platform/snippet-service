@@ -197,9 +197,13 @@ impl LaneManager {
             ));
         }
         let Some(record) = self.records.iter_mut().find(|r| r.id == lane_id) else {
-            let known: Vec<&str> = self.records.iter().map(|r| r.id.as_str()).collect();
+            let known: Vec<String> = self
+                .records
+                .iter()
+                .map(|r| format!("\"{}\" ({})", r.title, r.id))
+                .collect();
             return Err(format!(
-                "no lane `{lane_id}` in this conversation. Known lanes: [{}]. Omit lane_id to start a new one.",
+                "no follow_up_id `{lane_id}` in this conversation. Known: [{}]. Omit lane_id to start a new one.",
                 known.join(", ")
             ));
         };

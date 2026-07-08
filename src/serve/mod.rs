@@ -183,9 +183,16 @@ impl Daemon {
                 return;
             }
         }
-        let text = match input {
-            LoopInput::UserMessage(t) | LoopInput::Answer(t) => t,
-            _ => return,
+        // The resident loop isn't alive — e.g. after a daemon restart, before this
+        // session has been activated this run. Revive it, then deliver the input.
+        // A text message starts the loop WITH that message as the first turn; any
+        // control input (compact / goal / mode / title) revives the parked loop and
+        // is FORWARDED to it. Previously everything but text was dropped here, so a
+        // phone-triggered compaction (or /goal, mode/title change) on a not-yet-live
+        // session silently did nothing.
+        let initial = match &input {
+            LoopInput::UserMessage(t) | LoopInput::Answer(t) => Some(t.clone()),
+            _ => None,
         };
         let (sp, profile) = match sessions.get(id) {
             Some(s) => (s.state_path.clone(), s.profile.clone()),
@@ -213,7 +220,13 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        let handle = start_session(&cfg, sp.clone(), Some(text), true, None);
+        let forward = initial.is_none();
+        let handle = start_session(&cfg, sp.clone(), initial, true, None);
+        // Control inputs weren't consumed as the first turn — hand them to the
+        // freshly-parked loop so it acts on them (idle-arm compaction, goal, etc.).
+        if forward {
+            let _ = handle.input_tx.send(input);
+        }
         sessions.insert(
             id.to_string(),
             LiveSession {

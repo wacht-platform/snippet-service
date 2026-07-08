@@ -435,7 +435,29 @@ impl Tool for EditFileTool {
             }
         }
 
-        // 3. No match — return a diagnostic with the file region so the model can fix
+        // 3. Backslash-escaping fallback. Many models (especially smaller ones)
+        // over-escape when emitting tool-call JSON: a file's `\n` (a literal
+        // backslash-n, e.g. inside a code-GENERATING template string) arrives as
+        // `\\n`, so it never matches. If collapsing doubled backslashes makes
+        // old_string a UNIQUE exact match, the model over-escaped uniformly — apply
+        // the edit with new_string collapsed the same way. Guarded to a single
+        // exact match so we never rewrite on a guess.
+        if !args.replace_all {
+            let old_c = collapse_double_backslashes(&args.old_string);
+            if old_c != args.old_string && content.matches(old_c.as_str()).count() == 1 {
+                let new_c = collapse_double_backslashes(&args.new_string);
+                let updated = content.replacen(old_c.as_str(), &new_c, 1);
+                tokio::fs::write(&path, updated).await?;
+                ctx.record_change(&path);
+                return Ok(ToolResult::success(json!({
+                    "path": args.path,
+                    "edited": true,
+                    "note": "matched after normalizing over-escaped backslashes (\\\\ → \\) — verify the result is what you intended",
+                })));
+            }
+        }
+
+        // 4. No match — return a diagnostic with the file region so the model can fix
         // its old_string instead of blindly retrying the same near-miss.
         Err(ToolError::msg(edit_diagnostic(&content, &args.old_string, &args.path)))
     }
@@ -443,6 +465,13 @@ impl Tool for EditFileTool {
 
 fn leading_ws(s: &str) -> &str {
     &s[..s.len() - s.trim_start().len()]
+}
+
+/// Collapse each doubled backslash (`\\`) to a single one. Weak models frequently
+/// over-escape backslashes when emitting tool-call JSON, so a file's `\n` arrives
+/// as `\\n`; reversing that recovers the intended bytes.
+fn collapse_double_backslashes(s: &str) -> String {
+    s.replace("\\\\", "\\")
 }
 
 enum Flex {
@@ -535,10 +564,25 @@ fn edit_diagnostic(content: &str, old: &str, path: &str) -> String {
                 .or_else(|| lines.iter().position(|l| l.trim().contains(first)))
         })
         .flatten();
-    let mut msg = format!(
-        "old_string not found in `{path}` — likely a whitespace/indentation diff. Copy the exact \
-         text from read_file, keep it small and unique."
-    );
+    // If collapsing doubled backslashes would locate the text, the model
+    // over-escaped — call that out specifically; it's the more actionable fix.
+    let backslash_hint = old.contains("\\\\") && {
+        let old_c = collapse_double_backslashes(old);
+        let first_c = old_c.split('\n').map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        !first_c.is_empty() && lines.iter().any(|l| l.trim().contains(first_c))
+    };
+    let mut msg = if backslash_hint {
+        format!(
+            "old_string not found in `{path}` — you OVER-ESCAPED backslashes: you sent `\\\\` where \
+             the file has a single `\\` (e.g. `\\\\n` vs the file's `\\n`). Send backslashes exactly \
+             as read_file shows them — do not double them."
+        )
+    } else {
+        format!(
+            "old_string not found in `{path}` — likely a whitespace/indentation diff. Copy the exact \
+             text from read_file, keep it small and unique."
+        )
+    };
     if let Some(idx) = near {
         let lo = idx.saturating_sub(1);
         let hi = (idx + 4).min(lines.len());
@@ -1899,5 +1943,31 @@ impl Tool for SkillTool {
                 args.name
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod edit_escaping_tests {
+    use super::collapse_double_backslashes;
+
+    #[test]
+    fn collapses_over_escaped_newline() {
+        // File source has `\n` (backslash-n); an over-escaping model sends `\\n`.
+        let model_sent = "\"}>\\\\n        <Audio";   // ...\\n...
+        let file_has   = "\"}>\\n        <Audio";      // ...\n...
+        assert_eq!(collapse_double_backslashes(model_sent), file_has);
+    }
+
+    #[test]
+    fn leaves_correct_escaping_untouched_when_no_doubles() {
+        let s = "const x = 1;\nreturn x;";
+        assert_eq!(collapse_double_backslashes(s), s);
+    }
+
+    #[test]
+    fn join_newline_case_from_screenshot() {
+        let model = r#".join("\\n");"#;   // model over-escaped
+        let file  = r#".join("\n");"#;    // file's actual bytes
+        assert_eq!(collapse_double_backslashes(model), file);
     }
 }

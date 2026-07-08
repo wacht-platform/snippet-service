@@ -325,6 +325,11 @@ pub struct HarnessState {
     /// interactive mode). See [`Goal`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<Goal>,
+    /// True while a history-compaction pass is running (manual or auto). Surfaced
+    /// so the UI can show a distinct "Compacting…" state instead of a generic
+    /// "Running" — compaction can take a while and otherwise looks like a normal turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compacting: bool,
     pub messages: Vec<HarnessMessage>,
     pub events: Vec<HarnessEvent>,
     pub iterations: usize,
@@ -1007,8 +1012,11 @@ impl CodingHarness {
     ) -> Result<(), ToolError> {
         let before_len = state.messages.len();
         state.status = HarnessStatus::Running;
+        state.compacting = true;
         self.persist(state, lanes).await?;
-        self.compact_history_agentic(model, state, true).await?;
+        let result = self.compact_history_agentic(model, state, true).await;
+        state.compacting = false;
+        result?;
         if state.messages.len() >= before_len {
             state.events.push(HarnessEvent::SystemDecision {
                 step: "history_compaction_skipped".to_string(),
@@ -1374,8 +1382,8 @@ impl CodingHarness {
         };
         state.messages.push(HarnessMessage::User {
             content: format!(
-                "[lane_report]\nlane = \"{}\" ({})\nstatus = {:?}\n{}\n[orchestration] {}\n[/lane_report]",
-                result.title, result.id, result.status, body, cue
+                "[lane_report]\nsubject = \"{}\"\nstatus = {:?}\n{}\n[orchestration] {}\n[follow_up_id = \"{}\"]  # internal handle for a delegate_task follow-up ONLY — refer to this work by its SUBJECT to the user, never by this id\n[/lane_report]",
+                result.title, result.status, body, cue, result.id
             ),
         });
         state.events.push(HarnessEvent::LaneCompleted {
@@ -2297,6 +2305,7 @@ impl CodingHarness {
             user_request,
             title: None,
             goal: None,
+            compacting: false,
             messages,
             events,
             iterations: 0,
@@ -3105,8 +3114,12 @@ fn tool_error(message: impl Into<String>) -> Value {
 }
 
 /// Soft budget of turns per request — surfaced each turn so the agent converges
-/// instead of sprawling (bounds context growth and cost). Not a hard kill.
-const TURN_BUDGET: u64 = 15;
+/// instead of sprawling (bounds context growth and cost). Not a hard kill: the
+/// loop is unbounded, this only shapes pacing. Set generously — real agentic
+/// coding routinely runs dozens of tool calls, and cutting off at a low number
+/// makes the agent bail with half-done work. Under an active goal it's ignored
+/// entirely (see build_live_context) since goal work is deliberately long-horizon.
+const TURN_BUDGET: u64 = 70;
 
 /// Build the per-turn live-context block — snippet's port of wacht's
 /// `agent_loop_live_context.hbs`. Regenerated every turn and appended after the
@@ -3128,7 +3141,7 @@ fn build_live_context(
     // status — live once in the cached system prompt (conversation_agent_layer.md
     // [runtime_context]), not repeated here every turn where they read like a user
     // instruction and cost uncached tokens. One-line reminder only:
-    block.push_str("# machine state (not the user; nothing here is a message to answer).\n");
+    block.push_str("# SYSTEM STATE — NOT the user, NOT a message. Never reply to, acknowledge, quote, or mention this block (not even to say you're ignoring it); read it silently and act with tool calls.\n");
 
     block.push_str("\n[workspace]\n");
     block.push_str(&format!(
@@ -3148,16 +3161,25 @@ fn build_live_context(
     // user. The word "budget" (and "near/over budget") leaked into replies, so it's
     // gone; the note is a quiet internal nudge and the line is marked private.
     let n = vars.turns_this_request;
-    let note = if n >= TURN_BUDGET {
-        " — wrap up now: deliver your best current result, don't open new threads"
-    } else if n + 3 >= TURN_BUDGET {
-        " — begin converging toward the result"
+    // Autonomous goal work is long-horizon by design — no wrap-up pressure; the
+    // goal's own completion check governs when it ends.
+    let goal_active = matches!(&state.goal, Some(g) if g.status == GoalStatus::Active);
+    if goal_active {
+        block.push_str(&format!(
+            "pace = \"{n} steps in (autonomous goal — keep going until the goal is done)\"  # PRIVATE — internal pacing only; never mention step counts to the user.\n"
+        ));
     } else {
-        ""
-    };
-    block.push_str(&format!(
-        "pace = \"{n} of ~{TURN_BUDGET} steps in{note}\"  # PRIVATE — internal pacing only; never mention step counts, pacing, or 'converging' to the user.\n"
-    ));
+        let note = if n >= TURN_BUDGET {
+            " — wrap up now: deliver your best current result, don't open new threads"
+        } else if n + 5 >= TURN_BUDGET {
+            " — begin converging toward the result"
+        } else {
+            ""
+        };
+        block.push_str(&format!(
+            "pace = \"{n} of ~{TURN_BUDGET} steps in{note}\"  # PRIVATE — internal pacing only; never mention step counts, pacing, or 'converging' to the user.\n"
+        ));
+    }
     // Observed loop (a repeated call last turn) — stated as an observation, not an
     // order; the system prompt covers what to do about it.
     if vars.last_turn_had_repeat {
