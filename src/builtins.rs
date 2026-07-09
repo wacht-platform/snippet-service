@@ -393,10 +393,12 @@ impl Tool for EditFileTool {
         let exact = content.matches(&args.old_string).count();
         if exact > 0 {
             if exact > 1 && !args.replace_all {
-                return Err(ToolError::msg(format!(
-                    "old_string matches {exact} places in `{}` — pass replace_all:true to change \
-                     every occurrence, or add surrounding lines so it's unique.",
-                    args.path
+                return Err(ToolError::msg(ambiguous_diagnostic(
+                    &content,
+                    match_lines(&content, &args.old_string),
+                    exact,
+                    &args.path,
+                    "",
                 )));
             }
             let updated = if args.replace_all {
@@ -424,11 +426,14 @@ impl Tool for EditFileTool {
                         "note": "matched ignoring indentation; re-indented to the file",
                     })));
                 }
-                Flex::Ambiguous(n) => {
-                    return Err(ToolError::msg(format!(
-                        "old_string matches {n} places in `{}` once indentation is ignored — add \
-                         surrounding lines so it's unique.",
-                        args.path
+                Flex::Ambiguous(starts) => {
+                    let n = starts.len();
+                    return Err(ToolError::msg(ambiguous_diagnostic(
+                        &content,
+                        starts,
+                        n,
+                        &args.path,
+                        " once indentation is ignored",
                     )));
                 }
                 Flex::NoMatch => {}
@@ -476,8 +481,58 @@ fn collapse_double_backslashes(s: &str) -> String {
 
 enum Flex {
     Replaced(String),
-    Ambiguous(usize),
+    /// 1-based first line of each matching block.
+    Ambiguous(Vec<usize>),
     NoMatch,
+}
+
+/// 1-based line number of each occurrence of `needle` in `content` (capped).
+fn match_lines(content: &str, needle: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
+    let mut from = 0usize;
+    while let Some(pos) = content[from..].find(needle) {
+        let at = from + pos;
+        lines.push(content[..at].matches('\n').count() + 1);
+        from = at + needle.len().max(1);
+        if lines.len() >= 5 {
+            break;
+        }
+    }
+    lines
+}
+
+/// Ambiguous-match error with the DISAMBIGUATORS in it: each match's line number
+/// plus the line right above it, ready to prepend to old_string. Without these
+/// the model knows the edit is ambiguous but has nothing to make it unique with —
+/// the classic retry loop.
+fn ambiguous_diagnostic(
+    content: &str,
+    starts: Vec<usize>,
+    n: usize,
+    path: &str,
+    qualifier: &str,
+) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut msg = format!(
+        "old_string matches {n} places in `{path}`{qualifier} — the text is identical at each. \
+         Either pass replace_all:true to change every occurrence, or make old_string unique by \
+         prepending the line ABOVE the one match you want:"
+    );
+    for start in starts.iter().take(5) {
+        let above = start
+            .checked_sub(2)
+            .and_then(|i| lines.get(i))
+            .map(|l| l.trim_end())
+            .filter(|l| !l.trim().is_empty());
+        match above {
+            Some(a) => {
+                let clipped: String = a.chars().take(90).collect();
+                msg.push_str(&format!("\n- match at line {start}, preceded by: {clipped}"));
+            }
+            None => msg.push_str(&format!("\n- match at line {start} (top of file / blank line above)")),
+        }
+    }
+    msg
 }
 
 /// Normalize a line for matching: drop leading/trailing whitespace AND collapse
@@ -547,7 +602,8 @@ fn flexible_replace(content: &str, old: &str, new: &str) -> Flex {
             }
             Flex::Replaced(joined)
         }
-        more => Flex::Ambiguous(more.len()),
+        // hits carry ORIGINAL 0-based line spans; report 1-based first lines.
+        more => Flex::Ambiguous(more.iter().map(|(first, _)| first + 1).collect()),
     }
 }
 
@@ -1969,5 +2025,29 @@ mod edit_escaping_tests {
         let model = r#".join("\\n");"#;   // model over-escaped
         let file  = r#".join("\n");"#;    // file's actual bytes
         assert_eq!(collapse_double_backslashes(model), file);
+    }
+}
+
+#[cfg(test)]
+mod ambiguous_diag_tests {
+    use super::{ambiguous_diagnostic, match_lines};
+
+    #[test]
+    fn locations_and_neighbors_in_message() {
+        let content = "fn a() {\n    id,\n}\nfn b() {\n    id,\n}\n";
+        let lines = match_lines(content, "    id,\n");
+        assert_eq!(lines, vec![2, 5]);
+        let msg = ambiguous_diagnostic(content, lines, 2, "x.rs", "");
+        assert!(msg.contains("match at line 2, preceded by: fn a() {"));
+        assert!(msg.contains("match at line 5, preceded by: fn b() {"));
+        assert!(msg.contains("replace_all:true"));
+    }
+
+    #[test]
+    fn top_of_file_match_handled() {
+        let content = "id,\nrest\nid,\n";
+        let lines = match_lines(content, "id,");
+        let msg = ambiguous_diagnostic(content, lines, 2, "x.rs", "");
+        assert!(msg.contains("line 1 (top of file"));
     }
 }
