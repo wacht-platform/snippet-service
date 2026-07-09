@@ -2131,20 +2131,16 @@ impl App {
         }
     }
 
-    /// Submit everything queued when the agent goes idle/stopped — as ONE
-    /// message. Sending them one-per-turn made later ones arrive as mid-run
-    /// steers into the turn started by the first; batched, the agent sees the
-    /// full set of instructions up front and plans one coherent turn.
+    /// Submit everything queued when the agent goes idle/stopped — as a BURST of
+    /// individual messages. The first opens the turn; the rest land before the
+    /// first model call and are folded in as steers, so the agent still sees the
+    /// full set up front in ONE turn, while each message keeps its own frame
+    /// (and its own attachments) instead of being blurred into a joined blob.
     fn flush_queued_input(&mut self) {
-        if self.queued_inputs.is_empty() {
-            return;
+        let held: Vec<String> = self.queued_inputs.drain(..).collect();
+        for text in held {
+            self.submit_text(text);
         }
-        let combined = self
-            .queued_inputs
-            .drain(..)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        self.submit_text(combined);
         self.status = String::new();
     }
 
@@ -4012,7 +4008,7 @@ fn queued_lines(app: &App) -> Vec<Line<'static>> {
     let header = if n == 1 {
         "queued — sends when the run finishes · Ctrl+X to cancel".to_string()
     } else {
-        format!("queued ({n}) — sends as one message when the run finishes · Ctrl+X to cancel")
+        format!("queued ({n}) — send together when the run finishes · Ctrl+X to cancel")
     };
     let mut lines = vec![Line::from(vec![
         rail.clone(),
