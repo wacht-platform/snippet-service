@@ -3844,7 +3844,6 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .next()
         .unwrap_or_default();
     lines.push(Line::from(vec![
-        Span::styled("? ", Style::default().fg(yellow).add_modifier(Modifier::BOLD)),
         Span::styled(q_line, Style::default().fg(self::text()).add_modifier(Modifier::BOLD)),
         Span::styled(counter, Style::default().fg(faint)),
     ]));

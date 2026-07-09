@@ -271,8 +271,9 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             marker_block("✗ ", "", danger(), message, width)
         }
         HarnessEvent::UserQuestion { questions } => {
+            // No "? " marker — questions almost always end with one already.
             let text = question_text(questions).unwrap_or_else(|| "(question)".to_string());
-            marker_block("? ", "", warn(), &text, width)
+            marker_block("", "", warn(), &text, width)
         }
         HarnessEvent::ApprovalRequest { .. } => {
             // While pending it's shown in the approval card above the input; the
