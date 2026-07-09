@@ -3157,17 +3157,24 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ])
         .split(area);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-            Span::styled("  ·  models", subtle()),
-            Span::styled(
-                format!("  ·  {} active lane{}", app.state.as_ref().map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count()).unwrap_or(0), if app.state.as_ref().map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count()).unwrap_or(0) == 1 { "" } else { "s" }),
-                Style::default().fg(lane()),
-            ),
-        ])),
-        chunks[0],
-    );
+    // Lane count only when something is actually running — "0 active lanes" on
+    // the models page was pure noise.
+    let active_lanes = app
+        .state
+        .as_ref()
+        .map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count())
+        .unwrap_or(0);
+    let mut header_spans = vec![
+        Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  models", subtle()),
+    ];
+    if active_lanes > 0 {
+        header_spans.push(Span::styled(
+            format!("  ·  {} active lane{}", active_lanes, if active_lanes == 1 { "" } else { "s" }),
+            Style::default().fg(lane()),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
 
     let names = app.options.config.profile_names();
     let total = names.len();

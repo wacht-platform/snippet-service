@@ -280,11 +280,12 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             // line for the bare request.
             Vec::new()
         }
-        HarnessEvent::LaneSpawned { id, title } => marker_block(
+        // Subject only — lane ids are internal plumbing, not for the transcript.
+        HarnessEvent::LaneSpawned { id: _, title } => marker_block(
             "→ ",
             "",
             lane(),
-            &format!("delegated {id}: {title}"),
+            &format!("delegated: {title}"),
             width,
         ),
         HarnessEvent::LaneCompleted {
@@ -462,10 +463,13 @@ pub(super) fn lane_completed_lines(
         LaneStatus::Failed => ("failed", danger()),
         LaneStatus::Running => ("running", lane()),
     };
+    // Subject only — the id is internal plumbing (kept in the signature for
+    // callers that still have it, unused for display).
+    let _ = id;
     let mut lines = vec![Line::from(vec![
         Span::styled("◆ ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!("lane {id} · {title} "),
+            format!("{title} "),
             Style::default().fg(self::text()).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("[{tag}]"), Style::default().fg(color)),

@@ -1768,7 +1768,8 @@ impl CodingHarness {
         });
         // Progress text on a tool turn is rendered immediately, in order — never
         // buffered or re-delivered (that was the old duplicate-answer source).
-        if let Some(text) = progress_text {
+        // (Clone: the delegation-only early end below reuses it as final_text.)
+        if let Some(text) = progress_text.clone() {
             state.events.push(HarnessEvent::AssistantText { text });
             vars.steps_since_visible = 0;
         } else {
@@ -1791,9 +1792,19 @@ impl CodingHarness {
             .count();
         let mut approval_index = 0usize;
 
+        // Delegation-only iterations end the turn on the spot (see below): the
+        // brief is handed off, the tool result says ending the turn is how to
+        // wait, so there's nothing productive left this turn — letting the model
+        // keep generating just yields narration until it stumbles into an empty
+        // reply. A failed delegation clears the flag so the model can react.
+        let mut only_delegations = true;
+        let mut delegations_ok = 0usize;
         for call in calls {
             let tool_name = call.tool_name.clone();
             let call_id = call.id.clone().unwrap_or_default();
+            if tool_name != "delegate_task" {
+                only_delegations = false;
+            }
             state.events.push(HarnessEvent::ToolCall {
                 tool_name: tool_name.clone(),
                 arguments: call.arguments.clone(),
@@ -1856,6 +1867,13 @@ impl CodingHarness {
                 }
                 let (result, control) =
                     self.dispatch_meta(state, lanes, watches, &tool_name, &call.arguments);
+                if tool_name == "delegate_task" {
+                    if result.get("status").and_then(Value::as_str) == Some("success") {
+                        delegations_ok += 1;
+                    } else {
+                        only_delegations = false;
+                    }
+                }
                 state.events.push(HarnessEvent::ToolResult {
                     tool_name: tool_name.clone(),
                     result: result.clone(),
@@ -2094,6 +2112,17 @@ impl CodingHarness {
                     });
                 }
             }
+        }
+
+        // Every call this iteration was a successful delegation → the wait takes
+        // effect NOW: end the turn so the agent goes idle and the lane reports
+        // wake it, instead of burning model iterations narrating that it's
+        // waiting. Any text beside the calls is the progress line.
+        if conversation_mode && only_delegations && delegations_ok > 0 {
+            return StepResult::TurnEnded {
+                kind: TurnEndKind::Complete,
+                final_text: progress_text,
+            };
         }
 
         StepResult::Continue
