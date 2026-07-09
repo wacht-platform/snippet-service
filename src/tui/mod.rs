@@ -39,8 +39,8 @@ use transcript::*;
 /// Meta tools render through their own dedicated events (Note / AssistantText /
 /// UserQuestion / LaneSpawned), so their raw tool-call/result rows are hidden to
 /// avoid duplication.
-const HIDDEN_TOOL_ROWS: [&str; 5] =
-    ["terminate_loop", "note", "notify_user", "ask_user", "delegate_task"];
+const HIDDEN_TOOL_ROWS: [&str; 7] =
+    ["terminate_loop", "note", "notify_user", "ask_user", "delegate_task", "complete_goal", "monitor"];
 
 /// Cap on bash/output preview lines shown inline before collapsing to a count.
 
@@ -4346,6 +4346,11 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(0);
     if running_lanes > 0 {
         right.push(Span::styled(format!("  ◆{}", running_lanes), Style::default().fg(lane())));
+    }
+    // Active file watches (`monitor`) — the agent is listening for appends.
+    let watching = st.map(|s| s.watches.len()).unwrap_or(0);
+    if watching > 0 {
+        right.push(Span::styled(format!("  ◉{}", watching), Style::default().fg(warn())));
     }
     let cache = st.map(|s| s.cache_read_tokens).unwrap_or(0);
     if cache > 0 {

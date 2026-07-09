@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 4] = ["note", "ask_user", "delegate_task", "complete_goal"];
+pub const META_TOOL_NAMES: [&str; 5] =
+    ["note", "ask_user", "delegate_task", "complete_goal", "monitor"];
 
 pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
@@ -25,11 +26,54 @@ pub fn is_meta_tool(name: &str) -> bool {
 /// turn by replying with no tool calls. `complete_goal` is the one exception, and
 /// it's only offered while an autonomous `/goal` is active (so it can end it).
 pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinition> {
-    let mut tools = vec![note_tool(), ask_user_tool(), delegate_task_tool()];
+    let mut tools = vec![note_tool(), ask_user_tool(), delegate_task_tool(), monitor_tool()];
     if goal_active {
         tools.push(complete_goal_tool());
     }
     tools
+}
+
+fn monitor_tool() -> NativeToolDefinition {
+    NativeToolDefinition {
+        name: "monitor".to_string(),
+        description: "Watch a file and be WOKEN with whatever text gets appended to it — the way \
+            to wait on output you don't control (a build log, test output, a long process's log, \
+            a file another program writes). Register the watch, then END YOUR TURN: going idle is \
+            how you wait; each append arrives later as a [file_watch] message carrying the new \
+            text. Do NOT poll the file with read_file in a loop. An optional `filter` regex makes \
+            the wake fire only when the appended text matches (e.g. \"error|FAILED|passed\") — \
+            non-matching output is consumed silently. Appends are debounced, so one burst = one \
+            wake. Remove the watch when it has served its purpose. Actions: add (default) | \
+            remove | list."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "remove", "list"],
+                    "description": "add registers a watch (default); remove deletes one (by watch_id, path, or label); list shows active watches."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File to watch (absolute, or relative to the workspace). May not exist yet — the watch fires once it's created and written."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "A short, specific subject YOU choose for this watch — e.g. 'watch the build log'. This is how it's shown to the user; always refer to it by this subject."
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "Optional regex; wake only when the appended chunk matches it. Omit to wake on every append."
+                },
+                "watch_id": {
+                    "type": "string",
+                    "description": "For action:\"remove\" — the id from the add result or the [file_watch] follow_up_id."
+                }
+            },
+            "required": []
+        }),
+    }
 }
 
 fn complete_goal_tool() -> NativeToolDefinition {

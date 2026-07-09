@@ -16,6 +16,7 @@ use crate::prompts::coding_system_prompt;
 use crate::signals::RuntimeSignal;
 use crate::shell_guard::{ShellVerdict, classify_shell_command};
 use crate::tools::{ToolContext, ToolError, ToolRegistry};
+use crate::watches::{WatchEvent, WatchManager, WatchRecord};
 
 /// How many tool-only steps may pass before the agent is nudged to emit a
 /// user-visible progress line. Ported from wacht's `STEER_VISIBILITY_NUDGE_WINDOW`.
@@ -338,6 +339,9 @@ pub struct HarnessState {
     /// Background delegated lanes (snapshot for display + resume).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lanes: Vec<LaneRecord>,
+    /// Active file watches (`monitor` meta-tool) — snapshot for display + resume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watches: Vec<WatchRecord>,
     /// The currently pending `ask_user` question set, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<Value>,
@@ -550,6 +554,11 @@ impl CodingHarness {
         // Lanes are inert without a factory; this channel is never driven here.
         let (lane_tx, _lane_rx) = mpsc::unbounded_channel::<LaneResult>();
         let mut lanes = self.new_lane_manager(None, lane_tx, &state);
+        // Watches are likewise inert on the one-shot path (nothing selects on the
+        // channel) — present only so the meta-tool dispatch signature is uniform.
+        let (watch_tx, _watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let mut watches =
+            WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
         let mut vars = LoopVars::default();
         let mut consecutive_errors = 0usize;
 
@@ -563,7 +572,7 @@ impl CodingHarness {
             self.persist(&mut state, &lanes).await?;
 
             match self
-                .step(model, &mut state, &mut lanes, &mut vars, false, None, &mut approval_rx)
+                .step(model, &mut state, &mut lanes, &mut watches, &mut vars, false, None, &mut approval_rx)
                 .await
             {
                 StepResult::Continue => {
@@ -640,6 +649,12 @@ impl CodingHarness {
             state.status = HarnessStatus::Idle;
         }
         let mut lanes = self.new_lane_manager(factory, lane_tx, &state);
+        // File watches (`monitor` meta-tool): re-arm any persisted from the state
+        // so a daemon/TUI restart resumes tailing where it left off.
+        let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
+        let mut watches =
+            WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
+        watches.restore(&state.watches);
         let mut vars = LoopVars::default();
         let mut consecutive_errors = 0usize;
         // Inputs that arrived while a step was running (the interrupt race consumes
@@ -717,8 +732,14 @@ impl CodingHarness {
                     self.persist(&mut state, &lanes).await?;
                     continue;
                 }
-                let (interrupted, wants_compact) =
-                    self.drain_pending(&mut state, &mut lanes, &mut input_rx, &mut lane_rx);
+                let (interrupted, wants_compact) = self.drain_pending(
+                    &mut state,
+                    &mut lanes,
+                    &mut watches,
+                    &mut input_rx,
+                    &mut lane_rx,
+                    &mut watch_rx,
+                );
                 if interrupted {
                     state.status = HarnessStatus::Interrupted;
                     state.events.push(HarnessEvent::SystemDecision {
@@ -757,6 +778,7 @@ impl CodingHarness {
                         model,
                         &mut state,
                         &mut lanes,
+                        &mut watches,
                         &mut vars,
                         true,
                         sink.as_ref(),
@@ -939,6 +961,16 @@ impl CodingHarness {
                         if state.status == HarnessStatus::Idle {
                             state.status = HarnessStatus::Running;
                         }
+                        self.persist(&mut state, &lanes).await?;
+                    }
+                    Some(event) = watch_rx.recv() => {
+                        // A watched file grew (and matched its filter) while idle —
+                        // wake the agent with the appended text.
+                        self.inject_watch_event(&mut state, &mut watches, &event);
+                        if state.status == HarnessStatus::Idle {
+                            state.status = HarnessStatus::Running;
+                        }
+                        consecutive_errors = 0;
                         self.persist(&mut state, &lanes).await?;
                     }
                     _ = std::future::ready(()), if goal_driving => {
@@ -1208,8 +1240,10 @@ impl CodingHarness {
         &self,
         state: &mut HarnessState,
         lanes: &mut LaneManager,
+        watches: &mut WatchManager,
         input_rx: &mut mpsc::UnboundedReceiver<LoopInput>,
         lane_rx: &mut mpsc::UnboundedReceiver<LaneResult>,
+        watch_rx: &mut mpsc::UnboundedReceiver<WatchEvent>,
     ) -> (bool, bool) {
         let mut interrupted = false;
         let mut wants_compact = false;
@@ -1222,6 +1256,9 @@ impl CodingHarness {
         }
         while let Ok(result) = lane_rx.try_recv() {
             self.inject_lane_result(state, lanes, &result);
+        }
+        while let Ok(event) = watch_rx.try_recv() {
+            self.inject_watch_event(state, watches, &event);
         }
         (interrupted, wants_compact)
     }
@@ -1339,6 +1376,36 @@ impl CodingHarness {
         state.status = HarnessStatus::Running;
     }
 
+    /// Fold a file-watch wake into history: advance the persisted tail offset and
+    /// inject a `[file_watch]` envelope carrying the appended text, mirroring how
+    /// lane reports arrive. The follow-up id is demoted to an internal handle so
+    /// the agent speaks of the watch by subject, never "watch-1".
+    fn inject_watch_event(
+        &self,
+        state: &mut HarnessState,
+        watches: &mut WatchManager,
+        event: &WatchEvent,
+    ) {
+        watches.advance_offset(&event.id, event.new_offset);
+        state.watches = watches.records().to_vec();
+        let skipped_note = if event.skipped > 0 {
+            format!("\n(…{} earlier bytes of this burst omitted — read the file for the full text)", event.skipped)
+        } else {
+            String::new()
+        };
+        state.messages.push(HarnessMessage::User {
+            content: format!(
+                "[file_watch]\nsubject = \"{}\"\npath = \"{}\"\nappended:{skipped_note}\n{}\n[orchestration] Act on this if it needs action; stay quiet and end the turn if it doesn't. Remove the watch (monitor action:\"remove\") once it has served its purpose.\n[follow_up_id = \"{}\"]  # internal handle for monitor remove ONLY — refer to this work by its SUBJECT to the user, never by this id\n[/file_watch]",
+                event.label, event.path, event.appended.trim_end(), event.id
+            ),
+        });
+        let preview: String = event.appended.trim().chars().take(120).collect();
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "file_watch".to_string(),
+            reasoning: format!("\"{}\" — {} grew: {preview}", event.label, event.path),
+        });
+    }
+
     fn inject_lane_result(
         &self,
         state: &mut HarnessState,
@@ -1401,6 +1468,7 @@ impl CodingHarness {
         model: &mut dyn AgentModel,
         state: &mut HarnessState,
         lanes: &mut LaneManager,
+        watches: &mut WatchManager,
         vars: &mut LoopVars,
         conversation_mode: bool,
         sink: Option<&StreamHandle>,
@@ -1759,7 +1827,7 @@ impl CodingHarness {
                     had_note = true;
                 }
                 let (result, control) =
-                    self.dispatch_meta(state, lanes, &tool_name, &call.arguments);
+                    self.dispatch_meta(state, lanes, watches, &tool_name, &call.arguments);
                 state.events.push(HarnessEvent::ToolResult {
                     tool_name: tool_name.clone(),
                     result: result.clone(),
@@ -2009,6 +2077,7 @@ impl CodingHarness {
         &self,
         state: &mut HarnessState,
         lanes: &mut LaneManager,
+        watches: &mut WatchManager,
         tool_name: &str,
         arguments: &Value,
     ) -> (Value, MetaControl) {
@@ -2144,6 +2213,99 @@ impl CodingHarness {
                 }
                 Err(error) => (tool_error(error), MetaControl::Continue),
             },
+            "monitor" => {
+                let action = arguments
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("add");
+                match action {
+                    "add" => {
+                        let Some(path) = arguments.get("path").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+                            return (tool_error("monitor add requires a `path`."), MetaControl::Continue);
+                        };
+                        let label = arguments
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(path);
+                        let filter = arguments.get("filter").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                        match watches.add(path, label, filter) {
+                            Ok(record) => {
+                                state.watches = watches.records().to_vec();
+                                state.events.push(HarnessEvent::SystemDecision {
+                                    step: "watch_added".to_string(),
+                                    reasoning: format!("watching \"{}\" ({})", record.label, record.path),
+                                });
+                                (
+                                    json!({
+                                        "schema_version": 1,
+                                        "status": "success",
+                                        "data": {
+                                            "watching": true,
+                                            "watch_id": record.id,
+                                            "label": record.label,
+                                            "path": record.path,
+                                            "note": "Tailing from the current end of file. Appended text arrives as a [file_watch] message (debounced per burst); ending your turn is how you wait for it.",
+                                        }
+                                    }),
+                                    MetaControl::Continue,
+                                )
+                            }
+                            Err(error) => (tool_error(error), MetaControl::Continue),
+                        }
+                    }
+                    "remove" => {
+                        let key = arguments
+                            .get("watch_id")
+                            .or_else(|| arguments.get("path"))
+                            .or_else(|| arguments.get("label"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let Some(key) = key else {
+                            return (tool_error("monitor remove needs a `watch_id`, `path`, or `label`."), MetaControl::Continue);
+                        };
+                        match watches.remove(key) {
+                            Ok(label) => {
+                                state.watches = watches.records().to_vec();
+                                state.events.push(HarnessEvent::SystemDecision {
+                                    step: "watch_removed".to_string(),
+                                    reasoning: format!("stopped watching \"{label}\""),
+                                });
+                                (
+                                    json!({
+                                        "schema_version": 1,
+                                        "status": "success",
+                                        "data": { "removed": true, "label": label }
+                                    }),
+                                    MetaControl::Continue,
+                                )
+                            }
+                            Err(error) => (tool_error(error), MetaControl::Continue),
+                        }
+                    }
+                    "list" => (
+                        json!({
+                            "schema_version": 1,
+                            "status": "success",
+                            "data": {
+                                "watches": watches.records().iter().map(|r| json!({
+                                    "watch_id": r.id,
+                                    "label": r.label,
+                                    "path": r.path,
+                                    "filter": r.filter,
+                                })).collect::<Vec<_>>(),
+                            }
+                        }),
+                        MetaControl::Continue,
+                    ),
+                    other => (
+                        tool_error(format!("monitor action must be add | remove | list, got `{other}`.")),
+                        MetaControl::Continue,
+                    ),
+                }
+            }
             other => (
                 tool_error(format!("`{other}` is not a recognized meta tool.")),
                 MetaControl::Continue,
@@ -2306,6 +2468,7 @@ impl CodingHarness {
             title: None,
             goal: None,
             compacting: false,
+            watches: Vec::new(),
             messages,
             events,
             iterations: 0,
