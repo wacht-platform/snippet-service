@@ -3434,7 +3434,13 @@ fn build_live_context(
         .filter(|l| l.status != LaneStatus::Running)
         .take(6)
         .collect();
-    if !running.is_empty() || !finished.is_empty() {
+    // Shown ONLY while at least one lane is still out: mid-fan-out, the finished
+    // list gives the orchestrator the "2 of 5 in" picture and follow-up handles.
+    // Once everything has reported, the section disappears — the reports are
+    // already folded into history (with follow_up_ids), and re-listing completed
+    // lanes every turn forever was pure re-stimulus that models kept narrating
+    // ("the 5 lanes are folded in…") long after the work was done.
+    if !running.is_empty() {
         block.push_str("\n[delegated_lanes]\n");
         block.push_str("# background sub-agents; reports wake you. Continue ANY finished one with delegate_task{lane_id} — it resumes with its context intact (prefer that over re-briefing from scratch).\n");
         for l in &running {
@@ -3448,12 +3454,10 @@ fn build_live_context(
             };
             block.push_str(&format!("- {} \"{}\" — {}\n", l.id, clip(&l.title, 40), status));
         }
-        if !running.is_empty() {
-            block.push_str(&format!(
-                "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — you go idle and each lane's report wakes you (no polling, no blocking). A short progress note to the user about what you kicked off is good. Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
-                running.len()
-            ));
-        }
+        block.push_str(&format!(
+            "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — you go idle and each lane's report wakes you (no polling, no blocking). A short progress note to the user about what you kicked off is good. Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
+            running.len()
+        ));
     }
 
     block.push_str("</runtime_context>\n");
