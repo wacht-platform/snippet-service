@@ -87,6 +87,8 @@ pub struct LaneManager {
     counter: usize,
     exa_api_key: Option<String>,
     handles: Vec<tokio::task::JoinHandle<()>>,
+    /// (id, title) of lanes ghosted by the last restore — see `drain_ghosts`.
+    ghosts: Vec<(String, String)>,
 }
 
 impl Drop for LaneManager {
@@ -115,23 +117,35 @@ impl LaneManager {
             counter: 0,
             exa_api_key,
             handles: Vec::new(),
+            ghosts: Vec::new(),
         }
     }
 
     /// Restore prior records (e.g. on resume) so the display reflects history.
     /// Lanes do NOT survive a process restart, so any record still marked Running
-    /// is a ghost — fail it so the orchestrator doesn't wait on it forever.
+    /// is a ghost — fail it so the orchestrator doesn't wait on it forever. The
+    /// ghosted (id, title) pairs are kept for `drain_ghosts`, so the interactive
+    /// loop can WAKE the orchestrator with a synthetic failure report (it was told
+    /// ending its turn is how it waits — a report that never comes would otherwise
+    /// leave it waiting until the user happens to speak).
     pub fn with_records(mut self, mut records: Vec<LaneRecord>) -> Self {
         for record in records.iter_mut() {
             if record.status == LaneStatus::Running {
                 record.status = LaneStatus::Failed;
                 record.error = Some("lane did not survive a restart".to_string());
                 record.finished_at = Some(Utc::now().to_rfc3339());
+                self.ghosts.push((record.id.clone(), record.title.clone()));
             }
         }
         self.counter = records.len();
         self.records = records;
         self
+    }
+
+    /// Lanes ghosted by the last `with_records` restore — one-shot handoff to the
+    /// caller so each can be surfaced to the orchestrator as a failure report.
+    pub fn drain_ghosts(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.ghosts)
     }
 
     pub fn enabled(&self) -> bool {

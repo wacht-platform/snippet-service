@@ -655,6 +655,34 @@ impl CodingHarness {
         let mut watches =
             WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
         watches.restore(&state.watches);
+        // Lanes that were mid-flight when the previous process died were just
+        // ghosted (Failed) by the restore. Surface each as a failure report and
+        // WAKE the orchestrator: it was told ending its turn is how it waits, so
+        // without this it would wait forever on a report that can never come.
+        // Its state file survived — the report's recovery options include a
+        // follow-up, which resumes the lane with everything it had learned.
+        let ghosts = lanes.drain_ghosts();
+        if !ghosts.is_empty() {
+            for (id, title) in ghosts {
+                let result = LaneResult {
+                    id,
+                    title,
+                    status: LaneStatus::Failed,
+                    summary: None,
+                    report: None,
+                    error: Some(
+                        "the process restarted while this lane was running — its live task is gone, \
+                         but its saved context survived; a delegate_task follow-up with this id \
+                         resumes it with everything it had learned"
+                            .to_string(),
+                    ),
+                };
+                self.inject_lane_result(&mut state, &mut lanes, &result);
+            }
+            if state.status == HarnessStatus::Idle {
+                state.status = HarnessStatus::Running;
+            }
+        }
         let mut vars = LoopVars::default();
         let mut consecutive_errors = 0usize;
         // Inputs that arrived while a step was running (the interrupt race consumes
