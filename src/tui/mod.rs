@@ -2131,17 +2131,21 @@ impl App {
         }
     }
 
-    /// Submit the next queued input when the agent goes idle/stopped. One per
-    /// busy→idle edge so each becomes its own turn (no mid-run steering).
+    /// Submit everything queued when the agent goes idle/stopped — as ONE
+    /// message. Sending them one-per-turn made later ones arrive as mid-run
+    /// steers into the turn started by the first; batched, the agent sees the
+    /// full set of instructions up front and plans one coherent turn.
     fn flush_queued_input(&mut self) {
-        if let Some(text) = self.queued_inputs.pop_front() {
-            self.submit_text(text);
-            self.status = if self.queued_inputs.is_empty() {
-                String::new()
-            } else {
-                format!("{} more queued", self.queued_inputs.len())
-            };
+        if self.queued_inputs.is_empty() {
+            return;
         }
+        let combined = self
+            .queued_inputs
+            .drain(..)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.submit_text(combined);
+        self.status = String::new();
     }
 
     fn spawn_loop(&mut self, initial: Option<String>, resume: bool) {
@@ -3995,37 +3999,43 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
-/// Messages held for after the current run — shown above the prompt so the user
-/// can SEE what will fire when the run ends (and cancel with Ctrl+X). Capped at
-/// 3 lines + an overflow count so the box never balloons.
+/// Messages held for after the current run — a quiet block above the prompt so
+/// the user can SEE what will fire (and cancel with Ctrl+X). Header first, then
+/// up to 3 previews behind a dim rail, then an overflow count. They send as ONE
+/// combined message on idle (see flush_queued_input).
 fn queued_lines(app: &App) -> Vec<Line<'static>> {
-    if app.queued_inputs.is_empty() {
+    let n = app.queued_inputs.len();
+    if n == 0 {
         return Vec::new();
     }
-    let dim = Style::default().fg(muted());
-    let mut lines: Vec<Line<'static>> = app
-        .queued_inputs
-        .iter()
-        .take(3)
-        .map(|q| {
-            let first = q.lines().next().unwrap_or("");
-            let mut text: String = first.chars().take(70).collect();
-            if first.chars().count() > 70 || q.lines().count() > 1 {
-                text.push('…');
-            }
-            Line::from(vec![
-                Span::styled(" ⏳ ", Style::default().fg(warn())),
-                Span::styled(text, dim),
-            ])
-        })
-        .collect();
-    let extra = app.queued_inputs.len().saturating_sub(3);
-    let hint = if extra > 0 {
-        format!(" ⏳ +{extra} more queued · sends when the run finishes · Ctrl+X to cancel")
+    let rail = Span::styled(" │ ", Style::default().fg(faint()));
+    let header = if n == 1 {
+        "queued — sends when the run finishes · Ctrl+X to cancel".to_string()
     } else {
-        " queued — sends when the run finishes · Ctrl+X to cancel".to_string()
+        format!("queued ({n}) — sends as one message when the run finishes · Ctrl+X to cancel")
     };
-    lines.push(Line::from(Span::styled(hint, Style::default().fg(faint()))));
+    let mut lines = vec![Line::from(vec![
+        rail.clone(),
+        Span::styled(header, Style::default().fg(faint())),
+    ])];
+    for q in app.queued_inputs.iter().take(3) {
+        let first = q.lines().next().unwrap_or("");
+        let mut text: String = first.chars().take(72).collect();
+        if first.chars().count() > 72 || q.lines().count() > 1 {
+            text.push('…');
+        }
+        lines.push(Line::from(vec![
+            rail.clone(),
+            Span::styled(text, Style::default().fg(muted())),
+        ]));
+    }
+    let extra = n.saturating_sub(3);
+    if extra > 0 {
+        lines.push(Line::from(vec![
+            rail,
+            Span::styled(format!("… +{extra} more"), Style::default().fg(faint())),
+        ]));
+    }
     lines
 }
 
@@ -4035,11 +4045,13 @@ fn input_height(app: &App, width: u16) -> u16 {
     const MAX_ROWS: usize = 8;
     // One extra row for the "📎 N attachments" summary when files are queued.
     let attach: u16 = if app.attachments.is_empty() { 0 } else { 1 };
-    // Queued-message preview rows (see queued_lines).
-    let queued: u16 = if app.queued_inputs.is_empty() {
+    // Queued-message preview rows (see queued_lines): header + up to 3 previews
+    // + an overflow line when more are held.
+    let qn = app.queued_inputs.len();
+    let queued: u16 = if qn == 0 {
         0
     } else {
-        (app.queued_inputs.len().min(3) + 1) as u16
+        (1 + qn.min(3) + usize::from(qn > 3)) as u16
     };
     if app.input.is_empty() {
         return 3 + attach + queued;
