@@ -1,9 +1,14 @@
-//! Agent Skills (the SKILL.md open standard). A skill is a folder under
-//! `~/.snippet/skills/<name>/` with a `SKILL.md`: YAML frontmatter (`name`,
-//! `description`) plus a markdown body. Progressive disclosure: the name +
-//! description are injected into the agent's context (level 1); the body is loaded
-//! on demand via the `skill` tool (level 2); bundled files/scripts are read or run
-//! with the normal read_file / bash tools (level 3).
+//! Agent Skills (the SKILL.md open standard). A skill is a folder with a
+//! `SKILL.md`: YAML frontmatter (`name`, `description`) plus a markdown body.
+//! Scanned roots, in priority order (earlier wins on a name clash):
+//! `~/.snippet/skills/`, `~/.claude/skills/`, `~/.codex/skills/` — the format
+//! is shared across Claude Code and Codex, so skills installed for either work
+//! here unchanged (deduped by name).
+//!
+//! Progressive disclosure: skills are NOT preloaded into context — the agent
+//! finds them on demand with `search_skills` (level 1: name + description),
+//! loads a body with `skill(name)` (level 2), and reads/runs bundled files with
+//! the normal read_file / bash tools (level 3).
 
 use std::path::{Path, PathBuf};
 
@@ -15,16 +20,36 @@ pub struct Skill {
     pub disable_model_invocation: bool,
 }
 
-/// Where skills live (global, per the user's setup).
+/// snippet's own skills root (also where skill-management writes would go).
 pub fn skills_root() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join(".snippet").join("skills")
 }
 
-/// Discover every skill under the skills root (folders with a readable SKILL.md
-/// that has a name + description).
+/// All roots scanned for skills, priority order — earlier wins on a name clash.
+/// Claude Code's and Codex's global skill folders use the same SKILL.md
+/// standard, so anything installed for them just works here.
+pub fn skills_roots() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    vec![
+        skills_root(),
+        home.join(".claude").join("skills"),
+        home.join(".codex").join("skills"),
+    ]
+}
+
+/// Discover every skill across all roots, deduped by name (first root wins).
 pub fn discover() -> Vec<Skill> {
-    discover_in(&skills_root())
+    let mut out: Vec<Skill> = Vec::new();
+    for root in skills_roots() {
+        for sk in discover_in(&root) {
+            if !out.iter().any(|e| e.name == sk.name) {
+                out.push(sk);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// Like [`discover`] but against an explicit root (used in tests).
@@ -35,6 +60,10 @@ pub fn discover_in(root: &Path) -> Vec<Skill> {
     };
     for e in entries.flatten() {
         if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        // Skip hidden dirs (e.g. Codex's ~/.codex/skills/.system tree).
+        if e.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
         let dir = e.path();
@@ -97,11 +126,16 @@ fn unquote(s: &str) -> String {
 /// the SKILL.md body. Returns (name, description) pairs, best first; when nothing
 /// matches (or the query is blank) it returns all skills, so discovery never dead-ends.
 pub fn search(query: &str) -> Vec<(String, String)> {
-    search_in(&skills_root(), query)
+    rank(discover(), query)
 }
 
 /// Like [`search`] but against an explicit root (used in tests).
 pub fn search_in(root: &Path, query: &str) -> Vec<(String, String)> {
+    rank(discover_in(root), query)
+}
+
+/// Score + order a skill set for a query (shared by search / search_in).
+fn rank(skills: Vec<Skill>, query: &str) -> Vec<(String, String)> {
     let terms: Vec<String> = query
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -109,7 +143,7 @@ pub fn search_in(root: &Path, query: &str) -> Vec<(String, String)> {
         .map(|s| s.to_string())
         .collect();
     let mut scored: Vec<(usize, String, String)> = Vec::new();
-    for sk in discover_in(root) {
+    for sk in skills {
         if sk.disable_model_invocation {
             continue;
         }
@@ -136,12 +170,15 @@ pub fn search_in(root: &Path, query: &str) -> Vec<(String, String)> {
 /// Load a skill's instructions (body, frontmatter stripped) plus a listing of its
 /// bundled files (level 2+). Used by the `skill` tool.
 pub fn load(name: &str) -> Option<(Skill, String, Vec<String>)> {
-    load_in(&skills_root(), name)
+    load_skill(discover().into_iter().find(|s| s.name == name)?)
 }
 
 /// Like [`load`] but against an explicit root (used in tests).
 pub fn load_in(root: &Path, name: &str) -> Option<(Skill, String, Vec<String>)> {
-    let sk = discover_in(root).into_iter().find(|s| s.name == name)?;
+    load_skill(discover_in(root).into_iter().find(|s| s.name == name)?)
+}
+
+fn load_skill(sk: Skill) -> Option<(Skill, String, Vec<String>)> {
     let raw = std::fs::read_to_string(&sk.path).ok()?;
     let body = strip_frontmatter(&raw);
     let files = bundled_files(&sk.dir);
