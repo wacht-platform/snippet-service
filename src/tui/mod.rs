@@ -3938,6 +3938,7 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             Span::styled(placeholder, Style::default().fg(faint())),
         ]);
         let mut lines = Vec::new();
+        lines.extend(lane_lines(app));
         lines.extend(queued_lines(app));
         if let Some(a) = attachment_line(app) {
             lines.push(a);
@@ -3956,8 +3957,10 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let cursor_style = Style::default().fg(Color::Black).bg(blue());
 
     let mut lines = Vec::with_capacity(rows.len() + 1);
+    let lanes_block = lane_lines(app);
     let queued = queued_lines(app);
-    let mut attach_offset = queued.len();
+    let mut attach_offset = lanes_block.len() + queued.len();
+    lines.extend(lanes_block);
     lines.extend(queued);
     if let Some(a) = attachment_line(app) {
         lines.push(a);
@@ -3992,6 +3995,53 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let visible = (area.height as usize).saturating_sub(2).max(1);
     let scroll = (cursor_row + attach_offset).saturating_sub(visible.saturating_sub(1)) as u16;
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+}
+
+/// Live lane status — running lanes listed above the prompt (same quiet style as
+/// the queue block) so "what's out working right now, since when" is always
+/// visible without digging through the transcript. Finished lanes don't linger
+/// here; their completion rows live in the transcript.
+fn lane_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(state) = &app.state else { return Vec::new() };
+    let running: Vec<&crate::lanes::LaneRecord> = state
+        .lanes
+        .iter()
+        .filter(|l| l.status == LaneStatus::Running)
+        .collect();
+    if running.is_empty() {
+        return Vec::new();
+    }
+    let rail = Span::styled(" │ ", Style::default().fg(faint()));
+    running
+        .iter()
+        .take(4)
+        .map(|l| {
+            let elapsed = chrono::DateTime::parse_from_rfc3339(&l.started_at)
+                .ok()
+                .map(|t| {
+                    let secs = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds().max(0);
+                    if secs < 60 {
+                        format!("{secs}s")
+                    } else {
+                        format!("{}m", secs / 60)
+                    }
+                })
+                .unwrap_or_default();
+            let mut title: String = l.title.chars().take(48).collect();
+            if l.title.chars().count() > 48 {
+                title.push('…');
+            }
+            Line::from(vec![
+                rail.clone(),
+                Span::styled("◆ ", Style::default().fg(lane())),
+                Span::styled(title, Style::default().fg(muted())),
+                Span::styled(
+                    format!(" — running {elapsed}"),
+                    Style::default().fg(faint()),
+                ),
+            ])
+        })
+        .collect()
 }
 
 /// Messages held for after the current run — a quiet block above the prompt so
@@ -4048,6 +4098,13 @@ fn input_height(app: &App, width: u16) -> u16 {
     } else {
         (1 + qn.min(3) + usize::from(qn > 3)) as u16
     };
+    // Live running-lane rows (see lane_lines), capped at 4.
+    let lanes_h: u16 = app
+        .state
+        .as_ref()
+        .map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count().min(4) as u16)
+        .unwrap_or(0);
+    let queued = queued + lanes_h;
     if app.input.is_empty() {
         return 3 + attach + queued;
     }
