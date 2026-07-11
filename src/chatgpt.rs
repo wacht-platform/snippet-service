@@ -20,6 +20,10 @@ use crate::tools::ToolError;
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
+// The Codex client identity (UA) is shared with the auth flows — see
+// chatgpt_auth::CODEX_USER_AGENT for why the 5.6 family requires it.
+use crate::chatgpt_auth::CODEX_USER_AGENT;
+
 /// Parse the Codex rate-limit usage headers (`x-codex-{primary,secondary}-*`) that
 /// ride on every /codex/responses response.
 fn parse_codex_rate_limits(
@@ -74,7 +78,7 @@ impl ChatGptModel {
     pub fn new(config: ChatGptConfig) -> Self {
         Self {
             config,
-            client: crate::llm::model_http_client(None),
+            client: crate::llm::model_http_client(Some(CODEX_USER_AGENT)),
             tokens: chatgpt_auth::load_blocking(),
             session_id: uuid::Uuid::new_v4().to_string(),
         }

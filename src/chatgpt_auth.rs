@@ -22,6 +22,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
 
+/// First-party Codex client identity. Newer Codex models (GPT-5.6 family, incl.
+/// Luna) are gated on it — without a codex_cli_rs-shaped User-Agent the backend
+/// returns "Model not found" even with `originator` set. Neutral 0.0.0 version:
+/// we must not claim a specific Codex release. Shared by EVERY ChatGPT-path
+/// request — model calls, token refresh, device-code, and browser login.
+pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.0.0 (snippet)";
+
+/// HTTP client for the ChatGPT auth endpoints, presenting the Codex identity.
+fn codex_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(CODEX_USER_AGENT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -289,7 +304,7 @@ async fn exchange_code(
 
 /// Refresh an expired access token using the stored refresh token.
 pub async fn refresh(prior: &ChatGptTokens) -> Result<ChatGptTokens, String> {
-    let client = reqwest::Client::new();
+    let client = codex_client();
     let body = json!({
         "client_id": CLIENT_ID,
         "grant_type": "refresh_token",
@@ -517,7 +532,7 @@ fn parse_interval(value: &serde_json::Value) -> u64 {
 }
 
 async fn request_device_code() -> Result<(String, String, u64), String> {
-    let client = reqwest::Client::new();
+    let client = codex_client();
     let resp = client
         .post(format!("{DEVICE_AUTH_API_BASE_URL}/deviceauth/usercode"))
         .json(&json!({ "client_id": CLIENT_ID }))
@@ -541,7 +556,7 @@ async fn request_device_code() -> Result<(String, String, u64), String> {
 }
 
 async fn poll_device_code(device_auth_id: &str, user_code: &str, interval: u64) -> Result<DeviceCodeTokenResponse, String> {
-    let client = reqwest::Client::new();
+    let client = codex_client();
     let started = Instant::now();
     loop {
         let resp = client
@@ -586,7 +601,7 @@ pub async fn begin_device_code_login() -> Result<DeviceCodeInfo, String> {
 /// reusing the same code that was shown to the user.
 pub async fn complete_device_code_login(info: DeviceCodeInfo) -> Result<ChatGptTokens, String> {
     let code = poll_device_code(&info.device_auth_id, &info.user_code, info.interval).await?;
-    let client = reqwest::Client::new();
+    let client = codex_client();
     let tokens = exchange_code(
         &client,
         &code.authorization_code,
@@ -616,7 +631,7 @@ async fn login_browser() -> Result<ChatGptTokens, String> {
         .await
         .map_err(|e| format!("callback task failed: {e}"))??;
 
-    let client = reqwest::Client::new();
+    let client = codex_client();
     let tokens = exchange_code(&client, &code, &verifier, &actual_redirect_uri).await?;
     save_blocking(&tokens)?;
     Ok(tokens)

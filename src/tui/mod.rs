@@ -4473,6 +4473,15 @@ fn get_provider_models(provider: &str) -> &'static [&'static str] {
         // openai-compatible points at an arbitrary endpoint — there are no
         // sensible static suggestions; the model list is fetched from its
         // /models endpoint (or typed by the user).
+        // ChatGPT-subscription Codex backend (OAuth, no key). The 5.6 family
+        // requires the codex client-identity headers (see chatgpt.rs).
+        "chatgpt" => &[
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.1-codex",
+            "gpt-5.4-mini",
+        ],
         "openai-compatible" => &[],
         _ => &[],
     }
