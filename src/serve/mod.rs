@@ -1093,6 +1093,14 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
                                     // `messages` (raw LLM history) is unused by the app — never wire it.
                                     if let Some(o) = v.as_object_mut() {
                                         o.remove("messages");
+                                        // ChatGPT usage is account-wide — overlay the shared global
+                                        // snapshot so every session shows the SAME figure, not just
+                                        // whichever chat last hit ChatGPT.
+                                        if let Some(g) = crate::chatgpt::read_global_usage() {
+                                            if let Ok(gv) = serde_json::to_value(&g) {
+                                                o.insert("rate_limit".into(), gv);
+                                            }
+                                        }
                                     }
                                     let count = state.events.len();
                                     let head = events_head_fp(&state);

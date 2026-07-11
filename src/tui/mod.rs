@@ -347,6 +347,9 @@ struct App {
     /// made the picker laggy at scale. Populated on picker open, refreshed after
     /// rename/delete, dropped on close.
     conv_cache: Option<Vec<(String, String)>>,
+    /// Account-wide ChatGPT usage (read from the shared sidecar), shown globally
+    /// whenever signed in — not tied to the active chat's own last request.
+    global_usage: Option<crate::llm::RateLimitSnapshot>,
     form_provider: String,
     form_api_key: String,
     form_model: String,
@@ -440,6 +443,7 @@ impl App {
             sent_turn_pending: false,
             effective_model: (String::new(), String::new()),
             conv_cache: None,
+            global_usage: None,
             was_busy: false,
             form_provider: String::new(),
             form_api_key: String::new(),
@@ -2190,6 +2194,12 @@ impl App {
         self.frame = self.frame.wrapping_add(1);
         self.refresh_state().await;
 
+        // Refresh the account-wide ChatGPT usage a few times a second (tiny file,
+        // signed-in users only) so the footer figure is global, not per-chat.
+        if self.frame % 8 == 0 && crate::chatgpt_auth::is_signed_in() {
+            self.global_usage = crate::chatgpt::read_global_usage();
+        }
+
         // Flush a queued input on the busy → not-busy edge: the run just finished or
         // was stopped, so submit the next held message as its own turn.
         let busy = self.agent_busy();
@@ -2457,8 +2467,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 // Approve this and stop prompting for the rest of the RUN — run-scoped
                 // only. Never persist to the config: a one-key unblock must not
                 // silently remove the manual-approval gate for every future session.
-                if let Some(tx) = &app.input_tx {
-                    let _ = tx.send(LoopInput::ApproveAll);
+                // Only offered when multiple approvals are pending (matches the bar).
+                let multi = app.pending_approval().map(|(_, _, _, t)| t > 1).unwrap_or(false);
+                if multi {
+                    if let Some(tx) = &app.input_tx {
+                        let _ = tx.send(LoopInput::ApproveAll);
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -3075,16 +3089,22 @@ fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     } else {
         summary
     };
-    let actions = Line::from(vec![
+    // "approve all" only makes sense with more than one pending in this batch.
+    let mut action_spans = vec![
         Span::styled("  ✓ y ", Style::default().fg(success()).add_modifier(Modifier::BOLD)),
         Span::styled("approve   ", subtle()),
-        Span::styled("⏩ a ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-        Span::styled("approve all   ", subtle()),
+    ];
+    if total > 1 {
+        action_spans.push(Span::styled("⏩ a ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
+        action_spans.push(Span::styled("approve all   ", subtle()));
+    }
+    action_spans.extend([
         Span::styled("✗ n ", Style::default().fg(danger()).add_modifier(Modifier::BOLD)),
         Span::styled("deny   ", subtle()),
         Span::styled("esc ", Style::default().fg(muted()).add_modifier(Modifier::BOLD)),
         Span::styled("stop", subtle()),
     ]);
+    let actions = Line::from(action_spans);
     let body = vec![
         Line::from(Span::styled(format!("  {prefix}{cmd}"), Style::default().fg(self::text()))),
         Line::from(""),
@@ -4389,13 +4409,12 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let faint = Style::default().fg(faint());
 
     let mut right: Vec<Span<'static>> = Vec::new();
-    // Provider rate-limit usage (parsed from response headers). Gate on the
-    // CHAT's effective provider, and show whenever the daemon reported one.
-    let rl = if app.effective_model.0 == "chatgpt" {
-        st.and_then(|s| s.rate_limit.as_ref())
-    } else {
-        None
-    };
+    // ChatGPT-subscription usage is account-wide — show the GLOBAL snapshot
+    // whenever signed in, regardless of which chat (or provider) is in view, so
+    // it never disappears just because the current chat hasn't hit ChatGPT.
+    let rl = crate::chatgpt_auth::is_signed_in()
+        .then(|| app.global_usage.as_ref())
+        .flatten();
     if let Some(rl) = rl {
         let mut parts = Vec::new();
         for w in [rl.primary.as_ref(), rl.secondary.as_ref()].into_iter().flatten() {

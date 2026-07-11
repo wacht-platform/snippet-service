@@ -26,6 +26,29 @@ use crate::chatgpt_auth::CODEX_USER_AGENT;
 
 /// Parse the Codex rate-limit usage headers (`x-codex-{primary,secondary}-*`) that
 /// ride on every /codex/responses response.
+/// Shared, account-wide ChatGPT usage snapshot — written on every Codex response
+/// so every session and the TUI show the SAME global figure regardless of which
+/// chat is in view. Lives next to the auth token in `~/.snippet/`.
+pub fn global_usage_path() -> std::path::PathBuf {
+    crate::chatgpt_auth::tokens_path().with_file_name("chatgpt_usage.json")
+}
+
+fn persist_global_usage(snap: &crate::llm::RateLimitSnapshot) {
+    let path = global_usage_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(bytes) = serde_json::to_vec(snap) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// Last account-wide ChatGPT usage snapshot (from any session), if any.
+pub fn read_global_usage() -> Option<crate::llm::RateLimitSnapshot> {
+    let raw = std::fs::read_to_string(global_usage_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
 fn parse_codex_rate_limits(
     headers: &reqwest::header::HeaderMap,
 ) -> Option<crate::llm::RateLimitSnapshot> {
@@ -168,8 +191,13 @@ impl AgentModel for ChatGptModel {
                     let status = response.status();
                     if status.is_success() {
                         // Rate-limit usage is on the response headers (read before the
-                        // SSE body consumes the response).
+                        // SSE body consumes the response). It's account-wide, so stash
+                        // the freshest snapshot in a shared file — any session / the
+                        // TUI can then show the SAME global figure, not a per-chat one.
                         let rate_limit = parse_codex_rate_limits(response.headers());
+                        if let Some(snap) = &rate_limit {
+                            persist_global_usage(snap);
+                        }
                         match parse_responses_sse(response, sink.as_ref()).await {
                             Ok(mut output) => {
                                 output.rate_limit = rate_limit;
