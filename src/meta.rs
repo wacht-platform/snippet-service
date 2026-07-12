@@ -165,9 +165,11 @@ fn ask_user_tool() -> NativeToolDefinition {
             confirmation, missing fact). Never end a turn with a question in plain text — use this \
             tool. Last resort: prefer resolving via other tools, context, or a sensible default. \
             Ends the turn and pauses until answered; one pending question set at a time. Each \
-            question needs an `id`, `text`, and `answer_kind.kind` chosen by the SHAPE of the \
-            answer: free_text (open-ended), single_choice (one of a known set; provide `choices`), \
-            yes_no (literal yes/no), or confirm (irreversible action gate)."
+            question needs `text` and `answer_kind.kind` chosen by the SHAPE of the answer: \
+            free_text (open-ended), single_choice (one of a known set; provide `choices`), \
+            yes_no (literal yes/no), or confirm (irreversible action gate). `id` is OPTIONAL — \
+            only useful to distinguish MULTIPLE questions asked together; omit it for a single \
+            question."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -175,11 +177,11 @@ fn ask_user_tool() -> NativeToolDefinition {
                 "questions": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "One or more questions presented together. IDs must be unique within the set.",
+                    "description": "One or more questions presented together.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Stable id; the answer references it."},
+                            "id": {"type": "string", "description": "OPTIONAL — defaults to the question's index. Only needed to distinguish multiple questions asked together; if you provide ids they must be unique."},
                             "text": {"type": "string", "description": "Question text shown to the user."},
                             "answer_kind": {
                                 "type": "object",
@@ -208,7 +210,7 @@ fn ask_user_tool() -> NativeToolDefinition {
                                 "required": ["kind"]
                             }
                         },
-                        "required": ["id", "text", "answer_kind"]
+                        "required": ["text", "answer_kind"]
                     }
                 },
                 "context": {
@@ -357,14 +359,19 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
         .ok_or_else(|| "ask_user requires a non-empty `questions` array.".to_string())?;
 
     let mut seen = std::collections::BTreeSet::new();
-    for question in questions {
+    let mut out: Vec<Value> = Vec::with_capacity(questions.len());
+    for (i, question) in questions.iter().enumerate() {
+        // `id` is OPTIONAL — it only exists to key answers when several questions
+        // are asked together. When the model omits it (the common single-question
+        // case), default to the index so it never has to invent ceremony ids.
         let id = question
             .get("id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| "ask_user: each question needs a non-empty `id`.".to_string())?;
-        if !seen.insert(id.to_string()) {
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("q{i}"));
+        if !seen.insert(id.clone()) {
             return Err(format!("ask_user: duplicate question id `{id}`."));
         }
         if question
@@ -394,10 +401,61 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
                 ));
             }
         }
+        // Emit with the effective id filled in, so clients always have one to key by.
+        let mut q = question.clone();
+        if let Some(obj) = q.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(id));
+        }
+        out.push(q);
     }
 
     Ok(json!({
-        "questions": questions,
+        "questions": out,
         "context": arguments.get("context").cloned().unwrap_or(Value::Null),
     }))
+}
+
+#[cfg(test)]
+mod ask_user_id_tests {
+    use super::parse_ask_user;
+    use serde_json::json;
+
+    #[test]
+    fn id_optional_defaults_to_index() {
+        let out = parse_ask_user(&json!({
+            "questions": [
+                {"text": "Which env?", "answer_kind": {"kind": "free_text"}},
+                {"text": "Confirm?", "answer_kind": {"kind": "yes_no"}}
+            ]
+        }))
+        .unwrap();
+        let qs = out["questions"].as_array().unwrap();
+        assert_eq!(qs[0]["id"], "q0");
+        assert_eq!(qs[1]["id"], "q1");
+    }
+
+    #[test]
+    fn provided_ids_kept_and_deduped() {
+        let out = parse_ask_user(&json!({
+            "questions": [{"id": "env", "text": "Which?", "answer_kind": {"kind": "free_text"}}]
+        }))
+        .unwrap();
+        assert_eq!(out["questions"][0]["id"], "env");
+
+        let dup = parse_ask_user(&json!({
+            "questions": [
+                {"id": "x", "text": "a", "answer_kind": {"kind": "free_text"}},
+                {"id": "x", "text": "b", "answer_kind": {"kind": "free_text"}}
+            ]
+        }));
+        assert!(dup.is_err());
+    }
+
+    #[test]
+    fn single_choice_still_needs_choices() {
+        assert!(parse_ask_user(&json!({
+            "questions": [{"text": "pick", "answer_kind": {"kind": "single_choice"}}]
+        }))
+        .is_err());
+    }
 }
