@@ -129,10 +129,13 @@ fn note_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "note".to_string(),
         description: "Write a private note to yourself, recorded in history so you can read it \
-            back on a later turn. Use it to plan a multi-step sequence, record an observation from \
-            a tool result, or anchor a decision. Notes do NOT execute work, are NOT shown to the \
-            user as an answer, and do NOT end the turn. After a note, act on the next turn — do not \
-            take notes repeatedly without making progress."
+            back on a later turn. Use it ONLY to plan a genuinely multi-step sequence, record an \
+            observation from a tool result, or anchor a decision during real work. Do NOT use it on \
+            a conversational turn — an acknowledgement, a preference the user stated, a simple \
+            question, or small talk have nothing to plan, so a note there is noise and (since it's \
+            a tool call) forces a needless extra reply. On those, just reply in plain text and stop. \
+            Notes do NOT execute work, are NOT shown to the user, and do NOT end the turn. After a \
+            note, act on the next turn — do not take notes repeatedly without making progress."
             .to_string(),
         input_schema: json!({
             "type": "object",
