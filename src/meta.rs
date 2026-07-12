@@ -40,11 +40,18 @@ fn monitor_tool() -> NativeToolDefinition {
             to wait on output you don't control (a build log, test output, a long process's log, \
             a file another program writes). Register the watch, then END YOUR TURN: going idle is \
             how you wait; each append arrives later as a [file_watch] message carrying the new \
-            text. Do NOT poll the file with read_file in a loop. An optional `filter` regex makes \
-            the wake fire only when the appended text matches (e.g. \"error|FAILED|passed\") — \
-            non-matching output is consumed silently. Appends are debounced, so one burst = one \
-            wake. Remove the watch when it has served its purpose. Actions: add (default) | \
-            remove | list."
+            text. Do NOT poll the file with read_file in a loop. \
+            ALWAYS set a `filter` regex — a bare watch wakes you on EVERY line the process writes \
+            and each wake costs a full model turn, so watching a chatty build/test log without a \
+            filter burns tokens fast. Filter for only the lines you actually need to act on: the \
+            OUTCOME and failures — e.g. \"error|ERROR|FAILED|panic|Exception\" for problems, \
+            \"BUILD SUCCESSFUL|passed|Compiled|Done|listening on\" for completion. Best of all, \
+            when YOU launch the process (via bash background:true), append your OWN sentinel and \
+            filter on it — e.g. run `<cmd>; echo \"__DONE__ exit=$?\" >> build.log` and set \
+            filter \"__DONE__\", so you wake exactly ONCE when it finishes (with the exit code) \
+            instead of on every log line. Non-matching output is consumed silently. Appends are \
+            debounced, so one burst = one wake. Remove the watch once it has served its purpose. \
+            Actions: add (default) | remove | list."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -64,7 +71,7 @@ fn monitor_tool() -> NativeToolDefinition {
                 },
                 "filter": {
                     "type": "string",
-                    "description": "Optional regex; wake only when the appended chunk matches it. Omit to wake on every append."
+                    "description": "Regex — wake ONLY when the appended text matches. Strongly recommended on every watch: without it you wake on every line (one model turn each), which wastes tokens on a chatty log. Target outcomes/failures (e.g. \"error|FAILED|__DONE__\"), ideally a completion sentinel you appended yourself. Omit only for a rarely-written file where every line matters."
                 },
                 "watch_id": {
                     "type": "string",
