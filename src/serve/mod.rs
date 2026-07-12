@@ -172,6 +172,56 @@ impl Daemon {
         Some((tx, sp))
     }
 
+    /// Rebuild a live session's model from the CURRENT config (call after a config
+    /// reload). Idle sessions are restarted in place — resume=true reloads their
+    /// persisted state, so nothing is lost and the app's socket keeps streaming.
+    /// A busy session is left alone (returns Busy) so a running turn isn't cut off.
+    async fn rebuild_session_model(&self, id: &str) -> RebuildOutcome {
+        let mut sessions = self.sessions.lock().await;
+        let Some(existing) = sessions.get(id) else {
+            return RebuildOutcome::Gone;
+        };
+        let sp = existing.state_path.clone();
+        let profile = existing.profile.clone();
+
+        // Don't restart mid-turn: only Idle / terminal states are safe.
+        let Ok(bytes) = std::fs::read(&sp) else {
+            return RebuildOutcome::Gone;
+        };
+        let Ok(state) = deserialize_state(&bytes) else {
+            return RebuildOutcome::Gone;
+        };
+        use crate::harness::HarnessStatus::*;
+        if matches!(state.status, Running | WaitingForInput) {
+            return RebuildOutcome::Busy;
+        }
+        let folder = PathBuf::from(&state.workspace);
+        if state.workspace.is_empty() || !folder.is_dir() {
+            return RebuildOutcome::Gone;
+        }
+        let cfg = {
+            let c = self.config.lock().unwrap();
+            let mut w = c.for_workspace(folder);
+            apply_profile(&mut w, &profile);
+            w
+        };
+        // Abort the old loop and respawn with the fresh model config (state resumes).
+        if let Some(old) = sessions.remove(id) {
+            old.join.abort();
+        }
+        let handle = start_session(&cfg, sp.clone(), None, true, None);
+        sessions.insert(
+            id.to_string(),
+            LiveSession {
+                input_tx: handle.input_tx,
+                join: handle.join,
+                state_path: sp,
+                profile,
+            },
+        );
+        RebuildOutcome::Rebuilt
+    }
+
     /// Send a loop input to a session. If its loop has ended (interrupt / failure),
     /// a new message revives it as the next turn — so the app can resume like the
     /// TUI does. Non-message inputs to a dead loop are dropped.
@@ -297,6 +347,13 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { self_update_loop(d, supervised).await });
     }
+    // Watch config.toml: when it changes (a profile edited in the app/TUI, an
+    // added model, image support toggled, …) reload it and rebuild the model of
+    // every live session so the change takes effect WITHOUT a manual model switch.
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { config_watch_loop(d).await });
+    }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
     // inflates it by ~4/3. Size the request-body limit so a ~50 MB file still fits
     // once encoded (≈67 MB) plus headroom for the JSON envelope. Every other route
@@ -396,6 +453,61 @@ pub async fn run_serve(
     let _ = std::fs::remove_file(state_json_path());
     let _ = std::fs::remove_file(pid_path());
     result
+}
+
+/// Watch the config file; on change, reload it and rebuild every live session's
+/// model so edits (image support, model swap, new profile) apply immediately.
+/// A running turn is never interrupted — a busy session stays queued and is
+/// rebuilt the moment it goes idle (its model is only used at the next turn
+/// anyway, so nothing is lost by waiting).
+async fn config_watch_loop(daemon: Shared) {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    let path = daemon.config_path.clone();
+    let mut last_mtime = tokio::fs::metadata(&path).await.ok().and_then(|m| m.modified().ok());
+    // Sessions whose model must be rebuilt but are currently busy — retried until idle.
+    let mut pending: HashSet<String> = HashSet::new();
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // Detect a config change (mtime).
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if let Ok(mtime) = meta.modified() {
+                if Some(mtime) != last_mtime {
+                    last_mtime = Some(mtime);
+                    daemon.reload_config().await;
+                    // Every live session may now have a different model — queue them all.
+                    let ids: Vec<String> = daemon.sessions.lock().await.keys().cloned().collect();
+                    eprintln!("config.toml changed — reloaded; rebuilding {} live session model(s)", ids.len());
+                    pending.extend(ids);
+                }
+            }
+        }
+
+        if pending.is_empty() {
+            continue;
+        }
+        // Apply to sessions that are safe to restart right now (not mid-turn).
+        let mut done = Vec::new();
+        for id in pending.iter() {
+            match daemon.rebuild_session_model(id).await {
+                RebuildOutcome::Rebuilt | RebuildOutcome::Gone => done.push(id.clone()),
+                RebuildOutcome::Busy => {} // retry next tick
+            }
+        }
+        for id in done {
+            pending.remove(&id);
+        }
+    }
+}
+
+/// Result of an attempt to rebuild a live session's model from the current config.
+enum RebuildOutcome {
+    Rebuilt,
+    Busy, // mid-turn — try again once idle
+    Gone, // session no longer live; nothing to do
 }
 
 /// Periodic self-update loop for the daemon. On a new release: replace the
