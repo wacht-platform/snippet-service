@@ -15,6 +15,9 @@ use crate::tools::ToolError;
 pub struct AnthropicConfig {
     pub api_key: String,
     pub model: String,
+    /// API root (no trailing `/v1/messages`). `https://api.anthropic.com` for the
+    /// real API; a custom host for an Anthropic-Messages-compatible gateway.
+    pub base_url: String,
     pub temperature: Option<f32>,
     pub max_retries: u32,
     pub initial_retry_ms: u64,
@@ -59,7 +62,12 @@ impl AgentModel for AnthropicModel {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
-        let url = "https://api.anthropic.com/v1/messages";
+        let base = if self.config.base_url.trim().is_empty() {
+            "https://api.anthropic.com"
+        } else {
+            self.config.base_url.trim_end_matches('/')
+        };
+        let url = &format!("{base}/v1/messages");
         if let Some(sink) = sink {
             return self.generate_streaming(url, messages, tools, force_tool, &sink).await;
         }

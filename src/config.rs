@@ -371,10 +371,18 @@ impl ModelConfig {
                     reasoning_effort: self.reasoning_effort.clone(),
                 }))
             }
-            "anthropic" => {
+            "anthropic" | "anthropic-compatible" => {
+                // Same Messages-API adapter; "anthropic-compatible" just points it
+                // at a custom base_url (a gateway/proxy speaking the Anthropic API).
+                let base_url = if self.provider == "anthropic-compatible" && !self.base_url.trim().is_empty() {
+                    self.base_url.trim_end_matches('/').to_string()
+                } else {
+                    "https://api.anthropic.com".to_string()
+                };
                 let config = AnthropicConfig {
                     api_key: self.api_key.clone(),
                     model: self.model.clone(),
+                    base_url,
                     temperature: self.temperature,
                     max_retries: self.max_retries,
                     initial_retry_ms: self.initial_retry_ms,
@@ -443,8 +451,15 @@ fn default_state_path() -> PathBuf {
 /// The providers `load` accepts for the active model. Config writers (the serve
 /// API, the TUI) must validate against this — persisting anything else bricks
 /// the next startup, since `load` hard-errors on it.
-pub const SUPPORTED_PROVIDERS: &[&str] =
-    &["openai-compatible", "openai", "anthropic", "gemini", "openrouter", "chatgpt"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &[
+    "openai-compatible",
+    "anthropic-compatible",
+    "openai",
+    "anthropic",
+    "gemini",
+    "openrouter",
+    "chatgpt",
+];
 
 pub fn provider_supported(provider: &str) -> bool {
     SUPPORTED_PROVIDERS.contains(&provider)

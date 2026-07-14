@@ -188,7 +188,13 @@ enum SettingsField {
 }
 
 /// Providers offered by the login form, in display order.
-const LOGIN_PROVIDERS: &[&str] = &["openai", "chatgpt", "anthropic", "gemini", "openrouter", "openai-compatible"];
+const LOGIN_PROVIDERS: &[&str] = &["openai", "chatgpt", "anthropic", "gemini", "openrouter", "openai-compatible", "anthropic-compatible"];
+
+/// Providers that talk to a user-supplied endpoint, so the login form shows the
+/// Base URL field (and can fetch models keyless).
+fn provider_needs_base_url(provider: &str) -> bool {
+    provider == "openai-compatible" || provider == "anthropic-compatible"
+}
 
 /// Single source of truth for a provider's default base URL and model.
 fn provider_defaults(provider: &str) -> (String, String) {
@@ -197,6 +203,8 @@ fn provider_defaults(provider: &str) -> (String, String) {
         // ChatGPT-subscription (OAuth) — no base URL / API key; model is a Codex slug.
         "chatgpt" => (String::new(), "gpt-5.1-codex".to_string()),
         "anthropic" => (String::new(), "claude-opus-4-8".to_string()),
+        // Anthropic-Messages-compatible gateway — user supplies base_url + model.
+        "anthropic-compatible" => (String::new(), String::new()),
         // Native Gemini adapter — no base URL (it has its own endpoint), like Anthropic.
         "gemini" => (String::new(), "gemini-3.5-flash".to_string()),
         "openrouter" => (
@@ -212,7 +220,7 @@ fn provider_defaults(provider: &str) -> (String, String) {
 fn provider_context_defaults(provider: &str) -> (u64, u8) {
     match provider {
         "openai" | "chatgpt" | "anthropic" | "gemini" => (250_000, 90),
-        "openai-compatible" => (130_000, 90),
+        "openai-compatible" | "anthropic-compatible" => (130_000, 90),
         // Keep openrouter aligned with the hosted-provider defaults unless the
         // user overrides it per profile.
         "openrouter" => (250_000, 90),
@@ -1075,7 +1083,7 @@ impl App {
             ];
         }
         let mut order = vec![SettingsField::Provider, SettingsField::ApiKey];
-        if self.form_provider == "openai-compatible" {
+        if provider_needs_base_url(&self.form_provider) {
             order.push(SettingsField::BaseUrl);
         }
         order.push(SettingsField::Model);
@@ -1102,7 +1110,7 @@ impl App {
         // Keyless endpoints are legitimate for openai-compatible (local Ollama,
         // LM Studio…): fetch on a base_url alone there; other providers need a key.
         let can_fetch = !self.form_api_key.trim().is_empty()
-            || (self.form_provider == "openai-compatible" && !self.form_base_url.trim().is_empty());
+            || (provider_needs_base_url(&self.form_provider) && !self.form_base_url.trim().is_empty());
         if self.form_focus == SettingsField::Model
             && self.form_fetched_models.is_none()
             && can_fetch
@@ -4292,7 +4300,7 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
 
     // Base URL (openai-compatible only)
-    if app.form_provider == "openai-compatible" {
+    if provider_needs_base_url(&app.form_provider) {
         let u_focus = focus == SettingsField::BaseUrl;
         let mut url_val = vec![Span::styled(
             app.form_base_url.clone(),
@@ -4320,7 +4328,7 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .clone()
         .unwrap_or_else(|| "medium".to_string());
     let reasoning_hint = match app.form_provider.as_str() {
-        "anthropic" => "thinking",
+        "anthropic" | "anthropic-compatible" => "thinking",
         "gemini" => "thinking",
         _ => "reasoning",
     };
@@ -4595,9 +4603,14 @@ async fn fetch_models_from_provider(
             }
             Ok(models)
         }
-        "anthropic" => {
-            let url = "https://api.anthropic.com/v1/models";
-            let res = client.get(url)
+        "anthropic" | "anthropic-compatible" => {
+            let base = if provider == "anthropic-compatible" && !base_url.trim().is_empty() {
+                base_url.trim_end_matches('/').to_string()
+            } else {
+                "https://api.anthropic.com".to_string()
+            };
+            let url = format!("{base}/v1/models");
+            let res = client.get(&url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
                 .send()
