@@ -40,6 +40,19 @@ pub struct OpenAiCompatibleConfig {
 /// Coding, etc.) whitelist us; harmless to ungated providers.
 const DEFAULT_USER_AGENT: &str = "claude-cli/2.0.37 (external, cli)";
 
+/// Chat-completions endpoint from a configured base URL. Tolerates a base the
+/// user pasted WITH /chat/completions already (otherwise it doubles up). We do
+/// NOT force /v1 — openai-compatible endpoints vary (root, /v1, /openai/v1, …),
+/// so the base is used as given.
+fn openai_chat_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else {
+        format!("{base}/chat/completions")
+    }
+}
+
 /// OpenRouter app-attribution headers — `HTTP-Referer` + `X-Title` surface Snippet
 /// on OpenRouter's activity feed and app leaderboard. Sent only to OpenRouter.
 const OPENROUTER_REFERER: &str = "https://wacht.dev";
@@ -87,10 +100,7 @@ impl AgentModel for OpenAiCompatibleModel {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let url = openai_chat_url(&self.config.base_url);
         // Stream when there's a live sink (interactive) or when the profile forces it
         // (stream-only providers like NVIDIA NIM MiniMax). A buffered caller with no
         // sink still assembles a full response from a throwaway buffer.
@@ -1047,5 +1057,20 @@ mod think_splitter_tests {
         let (v, t) = split_all(&["<think>still thinking..."]);
         assert_eq!(v, "");
         assert_eq!(t, "still thinking...");
+    }
+}
+
+#[cfg(test)]
+mod chat_url_tests {
+    use super::openai_chat_url;
+
+    #[test]
+    fn builds_and_dedups() {
+        assert_eq!(openai_chat_url("https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(openai_chat_url("https://api.openai.com/v1/"), "https://api.openai.com/v1/chat/completions");
+        // Root gateways (no /v1) are taken as-is — we don't guess a version path.
+        assert_eq!(openai_chat_url("https://gw.example.com"), "https://gw.example.com/chat/completions");
+        // Full endpoint pasted → no double.
+        assert_eq!(openai_chat_url("https://api.openai.com/v1/chat/completions"), "https://api.openai.com/v1/chat/completions");
     }
 }
