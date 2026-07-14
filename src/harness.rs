@@ -1594,6 +1594,14 @@ impl CodingHarness {
             vars.last_thought =
                 (!thought.is_empty()).then(|| thought.chars().take(1500).collect::<String>());
         }
+        // What we KNOW we sent this turn — a rough token estimate of the actual
+        // request. The provider-reported prompt count drives cost totals, but for
+        // OUR context gauge and the compaction gate we must not depend on it: some
+        // OpenAI/Anthropic-compatible GATEWAYS under-report input_tokens wildly
+        // (e.g. 261 for a 500k-token history), which pins the gauge at ~0% and
+        // stops compaction from ever firing — so history grows unbounded. Take the
+        // MAX of reported and estimate so the context size is never understated.
+        let estimated_prompt = estimate_prompt_tokens(&request_messages);
         if let Some(usage) = output.usage {
             state.total_tokens = state.total_tokens.saturating_add(usage.total_tokens);
             state.prompt_tokens = state.prompt_tokens.saturating_add(usage.prompt_tokens);
@@ -1601,7 +1609,11 @@ impl CodingHarness {
                 state.completion_tokens.saturating_add(usage.completion_tokens);
             state.cache_read_tokens =
                 state.cache_read_tokens.saturating_add(usage.cache_read_tokens);
-            state.last_prompt_tokens = usage.prompt_tokens;
+            state.last_prompt_tokens = usage.prompt_tokens.max(estimated_prompt);
+        } else {
+            // No usage at all (some compatible endpoints omit it) — estimate so the
+            // gauge and compaction still work.
+            state.last_prompt_tokens = estimated_prompt;
         }
         if output.rate_limit.is_some() {
             state.rate_limit = output.rate_limit.clone();
@@ -3882,6 +3894,33 @@ fn assemble_sections(sections: &BTreeMap<&'static str, String>) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("[compacted_window]\n{body}")
+}
+
+/// Rough token estimate of a request we're about to send — ~4 chars/token over
+/// all message content (text, tool-call arguments, tool results) plus a small
+/// per-message overhead. Used as a floor for `last_prompt_tokens` so the context
+/// gauge and compaction don't depend on a provider/gateway's (sometimes bogus)
+/// reported input_tokens. Deliberately conservative; exactness isn't needed.
+fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
+    let mut chars: usize = 0;
+    for m in messages {
+        chars += 8; // role/framing overhead per message
+        match m {
+            HarnessMessage::User { content }
+            | HarnessMessage::System { content }
+            | HarnessMessage::Summary { content, .. } => chars += content.len(),
+            HarnessMessage::Assistant { content, tool_calls } => {
+                chars += content.len();
+                for c in tool_calls {
+                    chars += c.name.len() + c.arguments.to_string().len() + 8;
+                }
+            }
+            HarnessMessage::ToolResult { tool_name, content, .. } => {
+                chars += tool_name.len() + content.to_string().len();
+            }
+        }
+    }
+    (chars / 4) as u64
 }
 
 fn clip(s: &str, n: usize) -> String {
