@@ -486,6 +486,20 @@ async fn parse_anthropic_sse(
                 if let Some(out) = event.pointer("/usage/output_tokens").and_then(Value::as_u64) {
                     output_tokens = out;
                 }
+                // Some Anthropic-COMPATIBLE gateways (e.g. OpenCode zen) put the
+                // FINAL, authoritative input/cache counts in message_delta, and
+                // report only a preliminary input_tokens in message_start. Native
+                // Anthropic omits these here, so this is a no-op there — but when
+                // present they're the accurate totals, so prefer them.
+                if let Some(inp) = event.pointer("/usage/input_tokens").and_then(Value::as_u64) {
+                    input_tokens = inp;
+                }
+                if let Some(cr) = event.pointer("/usage/cache_read_input_tokens").and_then(Value::as_u64) {
+                    cache_read = cr;
+                }
+                if let Some(cc) = event.pointer("/usage/cache_creation_input_tokens").and_then(Value::as_u64) {
+                    cache_creation = cc;
+                }
             }
             // Mid-stream failure (e.g. overloaded_error): the stream ends here.
             // Surface it — silently returning the partial accumulation made a
