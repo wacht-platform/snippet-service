@@ -62,12 +62,8 @@ impl AgentModel for AnthropicModel {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
-        let base = if self.config.base_url.trim().is_empty() {
-            "https://api.anthropic.com"
-        } else {
-            self.config.base_url.trim_end_matches('/')
-        };
-        let url = &format!("{base}/v1/messages");
+        let url = &anthropic_messages_url(&self.config.base_url);
+        let url = url.as_str();
         if let Some(sink) = sink {
             return self.generate_streaming(url, messages, tools, force_tool, &sink).await;
         }
@@ -607,6 +603,26 @@ struct AnthropicRequest {
 
 /// Map a unified reasoning-effort level to an Anthropic extended-thinking budget
 /// (tokens). `off`/unset/unknown → no extended thinking.
+/// Build the Messages endpoint from a configured base URL, tolerating whatever
+/// shape the user pasted (compatible gateways present the base URL inconsistently):
+///   ""                              → https://api.anthropic.com/v1/messages
+///   https://host                    → https://host/v1/messages
+///   https://host/v1  (incl. /v1/)   → https://host/v1/messages   (no double /v1)
+///   https://host/v1/messages        → used as-is
+fn anthropic_messages_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return "https://api.anthropic.com/v1/messages".to_string();
+    }
+    if base.ends_with("/messages") {
+        base.to_string()
+    } else if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
 fn anthropic_thinking_budget(effort: Option<&str>) -> Option<u32> {
     match effort?.to_ascii_lowercase().as_str() {
         "low" => Some(2048),
@@ -800,4 +816,22 @@ fn push_block(prepared: &mut Vec<AnthropicMessage>, role: &str, block: Anthropic
         role: role.to_string(),
         content: vec![block],
     });
+}
+
+#[cfg(test)]
+mod messages_url_tests {
+    use super::anthropic_messages_url;
+
+    #[test]
+    fn builds_expected_endpoints() {
+        assert_eq!(anthropic_messages_url(""), "https://api.anthropic.com/v1/messages");
+        assert_eq!(anthropic_messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        // The screenshot case: base already has /v1 (+ trailing slash) — no double /v1.
+        assert_eq!(anthropic_messages_url("https://opencode.ai/zen/go/v1/"), "https://opencode.ai/zen/go/v1/messages");
+        assert_eq!(anthropic_messages_url("https://opencode.ai/zen/go/v1"), "https://opencode.ai/zen/go/v1/messages");
+        // Full endpoint pasted → used as-is.
+        assert_eq!(anthropic_messages_url("https://opencode.ai/zen/go/v1/messages"), "https://opencode.ai/zen/go/v1/messages");
+        // Root only → /v1/messages appended.
+        assert_eq!(anthropic_messages_url("https://gw.example.com/anthropic"), "https://gw.example.com/anthropic/v1/messages");
+    }
 }

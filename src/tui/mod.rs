@@ -4604,12 +4604,17 @@ async fn fetch_models_from_provider(
             Ok(models)
         }
         "anthropic" | "anthropic-compatible" => {
-            let base = if provider == "anthropic-compatible" && !base_url.trim().is_empty() {
-                base_url.trim_end_matches('/').to_string()
+            let raw = if provider == "anthropic-compatible" && !base_url.trim().is_empty() {
+                base_url.trim().trim_end_matches('/').to_string()
             } else {
                 "https://api.anthropic.com".to_string()
             };
-            let url = format!("{base}/v1/models");
+            // Tolerate a base that already includes /v1 (matches the messages URL logic).
+            let url = if raw.ends_with("/v1") {
+                format!("{raw}/models")
+            } else {
+                format!("{raw}/v1/models")
+            };
             let res = client.get(&url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
