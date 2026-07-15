@@ -4417,10 +4417,10 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let faint = Style::default().fg(faint());
 
     let mut right: Vec<Span<'static>> = Vec::new();
-    // ChatGPT-subscription usage is account-wide — show the GLOBAL snapshot
-    // whenever signed in, regardless of which chat (or provider) is in view, so
-    // it never disappears just because the current chat hasn't hit ChatGPT.
-    let rl = crate::chatgpt_auth::is_signed_in()
+    // ChatGPT-subscription usage: account-wide snapshot (global), but shown only
+    // while THIS chat runs on the chatgpt provider — another provider's chat
+    // showing ChatGPT's monthly limits reads as the wrong model's quota.
+    let rl = (app.effective_model.0 == "chatgpt" && crate::chatgpt_auth::is_signed_in())
         .then(|| app.global_usage.as_ref())
         .flatten();
     if let Some(rl) = rl {

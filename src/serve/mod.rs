@@ -172,6 +172,25 @@ impl Daemon {
         Some((tx, sp))
     }
 
+    /// The provider actually driving a session: its per-chat profile's provider
+    /// when overridden, else the global active model's. Used to scope
+    /// provider-specific extras (e.g. the ChatGPT usage overlay) on the wire.
+    async fn session_provider(&self, id: &str) -> String {
+        let profile = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|s| s.profile.clone());
+        let c = self.config.lock().unwrap();
+        if let Some(name) = profile {
+            if let Some(m) = c.setups.as_ref().and_then(|s| s.get(&name)) {
+                return m.provider.clone();
+            }
+        }
+        c.model.provider.clone()
+    }
+
     /// Rebuild a live session's model from the CURRENT config (call after a config
     /// reload). Idle sessions are restarted in place — resume=true reloads their
     /// persisted state, so nothing is lost and the app's socket keeps streaming.
@@ -1189,7 +1208,11 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
     let (mut sender, mut receiver) = socket.split();
 
     // Push the HarnessState whenever it changes on disk (mtime poll, like the TUI).
+    let push_daemon = daemon.clone();
+    let push_session = session.clone();
     let push = tokio::spawn(async move {
+        let daemon = push_daemon;
+        let session = push_session;
         let mut last_mtime = None;
         let mut last_count: Option<usize> = None;
         let mut last_head: u64 = 0;
@@ -1205,13 +1228,19 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
                                     // `messages` (raw LLM history) is unused by the app — never wire it.
                                     if let Some(o) = v.as_object_mut() {
                                         o.remove("messages");
-                                        // ChatGPT usage is account-wide — overlay the shared global
-                                        // snapshot so every session shows the SAME figure, not just
-                                        // whichever chat last hit ChatGPT.
-                                        if let Some(g) = crate::chatgpt::read_global_usage() {
-                                            if let Ok(gv) = serde_json::to_value(&g) {
-                                                o.insert("rate_limit".into(), gv);
+                                        // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
+                                        // the account-wide overlay; every other provider gets NO
+                                        // rate_limit — including scrubbing a stale snapshot persisted
+                                        // before a model switch (it showed ChatGPT's monthly limits
+                                        // on an anthropic-compatible chat).
+                                        if daemon.session_provider(&session).await == "chatgpt" {
+                                            if let Some(g) = crate::chatgpt::read_global_usage() {
+                                                if let Ok(gv) = serde_json::to_value(&g) {
+                                                    o.insert("rate_limit".into(), gv);
+                                                }
                                             }
+                                        } else {
+                                            o.remove("rate_limit");
                                         }
                                     }
                                     let count = state.events.len();
