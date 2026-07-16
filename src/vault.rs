@@ -205,13 +205,27 @@ impl Vault {
                 continue;
             }
             let marker = format!("[vault:{name}]");
-            // Fast path: whole value.
-            if out.contains(value.as_str()) {
-                out = out.replace(value.as_str(), &marker);
+            // Redact the raw value AND its JSON-escaped on-disk form: `cat`-ing
+            // vault.json emits the escaped bytes (a value with " or \ differs from
+            // the raw string), so we must catch both representations.
+            let mut forms = vec![value.clone()];
+            if let Ok(json) = serde_json::to_string(value) {
+                // Strip the surrounding quotes serde adds → the escaped body.
+                let escaped = json.trim_matches('"').to_string();
+                if escaped != *value {
+                    forms.push(escaped);
+                }
             }
-            // Fragments: any verbatim run of the value >= PARTIAL_SEED chars.
-            if value.len() >= PARTIAL_SEED {
-                out = scrub_partials(&out, value, &marker);
+            for form in forms {
+                if form.len() < MIN_SECRET_LEN {
+                    continue;
+                }
+                if out.contains(form.as_str()) {
+                    out = out.replace(form.as_str(), &marker);
+                }
+                if form.len() >= PARTIAL_SEED {
+                    out = scrub_partials(&out, &form, &marker);
+                }
             }
         }
         out
