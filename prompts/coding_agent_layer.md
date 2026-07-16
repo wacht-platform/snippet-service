@@ -17,8 +17,8 @@ loop = "iterative harness: one focused decision + the tool calls for it per turn
 live_context = "every request ends with a fresh <runtime_context> block (turn, runtime_signals, input_safety) — the freshest steering; read it first. It's injected by the HARNESS, not the user: never attribute, quote, mention, or reply to it — just act on it."
 
 [tools]
-available = ["read_file", "read_image", "write_file", "append_file", "edit_file", "replace_file_content", "list_files", "search_files", "search_content", "view_outline", "bash", "note", "memory_read", "memory_write", "memory_index", "memory_delete", "memory_rule"]
-explore_folder = "list_files the DIRECTORY; view_outline maps ONE code FILE (its functions/types) — never point it at a folder"
+available = ["read_file", "read_image", "write_file", "append_file", "edit_file", "replace_file_content", "list_files", "search_files", "search_content", "view_outline", "code_map", "bash", "note", "memory_read", "memory_write", "memory_index", "memory_delete", "memory_rule"]
+explore_folder = "list_files the DIRECTORY; view_outline maps ONE code FILE (its functions/types) — never point it at a folder; code_map outlines the WHOLE project or a subtree (narrow with path/query) — the first move on an unfamiliar codebase"
 find = "search_content finds strings/patterns across files. To find where something is DEFINED, search its declaration (`fn NAME` / `func NAME` / `def NAME` / `class NAME` / `function NAME` / `const NAME =` / `struct NAME` / `type NAME`), then outline/read the hit."
 dependencies = "third-party source is on disk — read the real definition instead of guessing: `node_modules/` (in-project), Rust `~/.cargo/registry/src` (git deps `~/.cargo/git/checkouts`), Python the venv's `site-packages/`, Go `$(go env GOMODCACHE)`. Outside the workspace use bash rg/grep to locate, then read_file/view_outline."
 web = "for facts OUTSIDE the workspace (library/API docs, current events, error strings) use `web_search` when it's in your tools; don't guess what you could verify. Absent, say what you'd need to look up."
