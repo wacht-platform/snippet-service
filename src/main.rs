@@ -58,6 +58,91 @@ enum Command {
         #[arg(long, hide = true)]
         supervised: bool,
     },
+    /// Manage the secret vault (~/.snippet/vault.json). Secrets are usable by the
+    /// agent as $NAME in shell commands; values are injected into the child
+    /// process and redacted from everything the model sees.
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VaultAction {
+    /// Store a secret. The value is read from stdin (piped, or typed with echo
+    /// off on a TTY) so it never lands in shell history or process args.
+    Set { name: String },
+    /// Remove a secret.
+    Rm { name: String },
+    /// List secret names (never values).
+    Ls,
+}
+
+fn vault_cli(action: VaultAction) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let mut vault = snippet::vault::Vault::load();
+    match action {
+        VaultAction::Set { name } => {
+            let value = if std::io::stdin().is_terminal() {
+                // No-echo prompt on a TTY so the value isn't visible on screen.
+                print!("value for {name} (input hidden): ");
+                std::io::stdout().flush()?;
+                let value = rpassword_read()?;
+                println!();
+                value
+            } else {
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                line
+            };
+            vault.set(&name, value.trim())?;
+            println!("✓ stored `{name}` ({} secret{} in vault)", vault.names().len(), if vault.names().len() == 1 { "" } else { "s" });
+        }
+        VaultAction::Rm { name } => {
+            if vault.remove(&name)? {
+                println!("✓ removed `{name}`");
+            } else {
+                println!("no secret named `{name}`");
+            }
+        }
+        VaultAction::Ls => {
+            let names = vault.names();
+            if names.is_empty() {
+                println!("vault is empty — add one with: snippet vault set NAME");
+            } else {
+                for n in names {
+                    println!("{n}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a line from the TTY with echo disabled (crossterm raw mode) — no extra
+/// password-prompt dependency needed.
+fn rpassword_read() -> Result<String, Box<dyn std::error::Error>> {
+    use crossterm::event::{Event, KeyCode, KeyModifiers, read};
+    crossterm::terminal::enable_raw_mode()?;
+    let mut value = String::new();
+    let result = loop {
+        match read()? {
+            Event::Key(k) => match k.code {
+                KeyCode::Enter => break Ok(value.clone()),
+                KeyCode::Backspace => {
+                    value.pop();
+                }
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    break Err("aborted".into());
+                }
+                KeyCode::Char(c) => value.push(c),
+                _ => {}
+            },
+            _ => {}
+        }
+    };
+    crossterm::terminal::disable_raw_mode()?;
+    result
 }
 
 fn config_path(cli: &Cli) -> PathBuf {
@@ -80,6 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_path(&cli);
 
     match cli.command {
+        Some(Command::Vault { action }) => return vault_cli(action),
         Some(Command::Serve {
             port,
             token,

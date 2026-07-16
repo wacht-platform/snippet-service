@@ -1422,13 +1422,16 @@ impl CodingHarness {
         } else {
             String::new()
         };
+        // Watched files can carry vault secrets too (a process logging its env) —
+        // scrub the appended text like any tool result.
+        let appended = crate::vault::Vault::load().scrub_str(event.appended.trim_end());
         state.messages.push(HarnessMessage::User {
             content: format!(
                 "[file_watch]\nsubject = \"{}\"\npath = \"{}\"\nappended:{skipped_note}\n{}\n[orchestration] Act on this if it needs action; stay quiet and end the turn if it doesn't. Remove the watch (monitor action:\"remove\") once it has served its purpose.\n[follow_up_id = \"{}\"]  # internal handle for monitor remove ONLY — refer to this work by its SUBJECT to the user, never by this id\n[/file_watch]",
-                event.label, event.path, event.appended.trim_end(), event.id
+                event.label, event.path, appended, event.id
             ),
         });
-        let preview: String = event.appended.trim().chars().take(120).collect();
+        let preview: String = appended.trim().chars().take(120).collect();
         state.events.push(HarnessEvent::SystemDecision {
             step: "file_watch".to_string(),
             reasoning: format!("\"{}\" — {} grew: {preview}", event.label, event.path),
@@ -2065,7 +2068,7 @@ impl CodingHarness {
             // end-of-step persist in the run loop is authoritative.
             let _ = self.persist(state, lanes).await;
 
-            let result = match self
+            let mut result = match self
                 .tools
                 .execute(&self.context, &tool_name, call.arguments)
                 .await
@@ -2080,6 +2083,15 @@ impl CodingHarness {
                     }
                 }),
             };
+            // Vault choke point: every tool result is scrubbed before it enters the
+            // conversation — secret values become [vault:NAME], so even `echo $KEY`
+            // (or reading a file that contains one) never puts a value in context.
+            {
+                let vault = crate::vault::Vault::load();
+                if !vault.is_empty() {
+                    vault.scrub_value(&mut result);
+                }
+            }
             if result.get("status").and_then(Value::as_str) == Some("error") {
                 failed_results += 1;
             }
@@ -3450,6 +3462,17 @@ fn build_live_context(
         "cwd = \"{}\"  # base for relative paths + shell; not a jail — read/edit any absolute or ~ path.\n",
         workspace.display()
     ));
+
+    // Vault secrets: names only. Values are injected into bash child processes
+    // and scrubbed from every tool result — the model never sees them.
+    let vault_names = crate::vault::Vault::load().names();
+    if !vault_names.is_empty() {
+        block.push_str("\n[vault]\n");
+        block.push_str(&format!(
+            "secrets = \"{}\"  # use as $NAME in bash — values are injected at spawn and REDACTED from all output; never try to print one, it will only ever appear as [vault:NAME].\n",
+            vault_names.join(", ")
+        ));
+    }
 
     // Surface the model's prior-turn reasoning so it can build on it instead of
     // re-deriving (experimental; conversation only).

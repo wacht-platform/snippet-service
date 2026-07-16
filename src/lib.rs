@@ -27,6 +27,7 @@ pub mod skills;
 pub mod tools;
 pub mod tui;
 pub mod update;
+pub mod vault;
 pub mod watches;
 
 pub use harness::{

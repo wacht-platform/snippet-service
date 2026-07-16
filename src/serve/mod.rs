@@ -400,6 +400,7 @@ pub async fn run_serve(
         .route("/config/active", post(set_active))
         .route("/config/delegate", post(set_delegate))
         .route("/provider/models", post(provider_models))
+        .route("/vault", get(vault_list).put(vault_set).delete(vault_delete))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
         .route("/session/exec", post(exec_in_session))
@@ -948,6 +949,51 @@ async fn set_active(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): J
     };
     match result {
         Ok(_) => Json(serde_json::json!({ "active": req.name })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct VaultSetReq {
+    name: String,
+    value: String,
+}
+
+// GET /vault — secret NAMES only; values never leave the daemon.
+async fn vault_list(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(serde_json::json!({ "names": crate::vault::Vault::load().names() })).into_response()
+}
+
+// PUT /vault — store a secret (from the app's vault screen; TLS/tunnel carries it).
+async fn vault_set(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<VaultSetReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let mut vault = crate::vault::Vault::load();
+    match vault.set(&req.name, &req.value) {
+        Ok(()) => Json(serde_json::json!({ "stored": req.name })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct VaultNameQ {
+    name: String,
+    token: Option<String>,
+}
+
+// DELETE /vault?name= — remove a secret.
+async fn vault_delete(State(d): State<Shared>, Query(q): Query<VaultNameQ>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let mut vault = crate::vault::Vault::load();
+    match vault.remove(&q.name) {
+        Ok(true) => Json(serde_json::json!({ "removed": q.name })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such secret").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

@@ -877,6 +877,10 @@ impl Tool for BashTool {
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: BashArgs = expect_object("bash", arguments)?;
+        // Vault secrets referenced as $NAME are injected into the CHILD env only —
+        // the command string and the result never carry values (results are also
+        // scrubbed at the harness choke point).
+        let vault_env = crate::vault::Vault::load().env_for_command(&args.command);
 
         if args.background {
             let id = crate::bg::new_id();
@@ -894,6 +898,7 @@ impl Tool for BashTool {
                 .arg(&args.command)
                 .current_dir(ctx.workspace_root())
                 .env("SNIPPET_SHADOW_GIT", crate::checkpoint::shadow_dir(ctx.workspace_root()))
+                .envs(vault_env)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log))
                 .stderr(Stdio::from(log_err))
@@ -925,6 +930,7 @@ impl Tool for BashTool {
             // The shadow checkpoint repo's git-dir, so the agent can review its own
             // changes: `git --git-dir=$SNIPPET_SHADOW_GIT --work-tree=. diff checkpoint`.
             .env("SNIPPET_SHADOW_GIT", crate::checkpoint::shadow_dir(ctx.workspace_root()))
+            .envs(vault_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
