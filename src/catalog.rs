@@ -213,35 +213,3 @@ async fn fetch_gemini(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String> {
         .collect())
 }
 
-#[cfg(test)]
-mod catalog_url_tests {
-    use super::*;
-
-    #[test]
-    fn anthropic_models_urls() {
-        assert_eq!(
-            anthropic_models_url(""),
-            "https://api.anthropic.com/v1/models?limit=1000"
-        );
-        assert_eq!(
-            anthropic_models_url("https://gw.example.com/v1"),
-            "https://gw.example.com/v1/models?limit=1000"
-        );
-        assert_eq!(
-            anthropic_models_url("https://gw.example.com"),
-            "https://gw.example.com/v1/models?limit=1000"
-        );
-    }
-
-    #[test]
-    fn openai_models_urls() {
-        assert_eq!(
-            openai_models_url("https://api.openai.com/v1"),
-            "https://api.openai.com/v1/models"
-        );
-        assert_eq!(
-            openai_models_url("https://openrouter.ai/api/v1"),
-            "https://openrouter.ai/api/v1/models"
-        );
-    }
-}

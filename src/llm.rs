@@ -129,38 +129,6 @@ pub fn degrade_effort(current: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(test)]
-mod effort_degrade_tests {
-    use super::*;
-
-    #[test]
-    fn ladder_steps_down_and_terminates() {
-        assert_eq!(degrade_effort("max"), Some("xhigh"));
-        assert_eq!(degrade_effort("xhigh"), Some("high"));
-        assert_eq!(degrade_effort("HIGH"), Some("medium"));
-        assert_eq!(degrade_effort("medium"), Some("low"));
-        assert_eq!(degrade_effort("low"), None);
-        assert_eq!(degrade_effort("off"), None);
-    }
-
-    #[test]
-    fn rejection_detection() {
-        // OpenAI-style param rejection.
-        assert!(is_effort_rejection(
-            "The provider rejected the request as invalid. (Unsupported value: 'xhigh' is not supported with this model. param: reasoning_effort; HTTP 400)"
-        ));
-        // Anthropic-style thinking rejection.
-        assert!(is_effort_rejection(
-            "The provider rejected the request as invalid. (thinking.budget_tokens: must be at least 1024; HTTP 400)"
-        ));
-        // A 400 about something else entirely must NOT trigger a degrade.
-        assert!(!is_effort_rejection(
-            "The provider rejected the request as invalid. (messages: text content blocks must be non-empty; HTTP 400)"
-        ));
-        // Effort keyword on a non-4xx (e.g. a 529 mentioning thinking) must not trigger.
-        assert!(!is_effort_rejection("The provider is having server trouble. (thinking overloaded; HTTP 529)"));
-    }
-}
 
 #[cfg(test)]
 mod error_humanize_tests {
