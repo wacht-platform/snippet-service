@@ -2022,13 +2022,7 @@ impl CodingHarness {
                 call.arguments
                     .get("command")
                     .and_then(Value::as_str)
-                    .map(|c| {
-                        crate::vault::Vault::load()
-                            .env_for_command(c)
-                            .into_iter()
-                            .map(|(n, _)| n)
-                            .collect()
-                    })
+                    .map(|c| crate::vault::Vault::load().referenced_names(c))
                     .unwrap_or_default()
             } else {
                 Vec::new()

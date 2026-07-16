@@ -20,6 +20,31 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+/// True when `name` appears in `command` as a whole identifier token — bounded
+/// by anything that isn't `[A-Za-z0-9_]` (or a string edge). So `DATABASE_URL`
+/// matches inside `os.environ['DATABASE_URL']`, `$DATABASE_URL`, `${DATABASE_URL}`,
+/// `process.env.DATABASE_URL`, or bare — but NOT inside `MY_DATABASE_URL_X`.
+fn references_token(command: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let h = command.as_bytes();
+    let n = name.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(rel) = command[from..].find(name) {
+        let s = from + rel;
+        let e = s + n.len();
+        let left = s == 0 || !ident(h[s - 1]);
+        let right = e == h.len() || !ident(h[e]);
+        if left && right {
+            return true;
+        }
+        from = s + 1;
+    }
+    false
+}
+
 pub fn vault_path() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -181,16 +206,27 @@ impl Vault {
         Ok(())
     }
 
-    /// Env vars to inject for a shell command: only the secrets it actually
-    /// references (`$NAME` / `${NAME}`), so an unrelated script doesn't get the
-    /// whole vault in its environment.
+    /// Env vars to inject for a shell command: only the secrets it references, so
+    /// an unrelated script doesn't get the whole vault in its environment. A
+    /// reference is the secret NAME appearing as an identifier token — this
+    /// catches every access form, not just `$NAME`: `${NAME}`, Python
+    /// `os.environ['NAME']`, Node `process.env.NAME`, a sourced `.env`, etc.
     pub fn env_for_command(&self, command: &str) -> Vec<(String, String)> {
         self.secrets
             .iter()
-            .filter(|(name, _)| {
-                command.contains(&format!("${name}")) || command.contains(&format!("${{{name}}}"))
-            })
+            .filter(|(name, _)| references_token(command, name))
             .map(|(n, v)| (n.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Names of secrets a command references (any form). Drives the "using a
+    /// secret always needs approval" gate — broader than injection needs, so a
+    /// command that merely reads a secret via a language env API is still gated.
+    pub fn referenced_names(&self, command: &str) -> Vec<String> {
+        self.secrets
+            .keys()
+            .filter(|name| references_token(command, name))
+            .cloned()
             .collect()
     }
 
