@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod bg;
 pub mod builtins;
+pub mod catalog;
 pub mod chatgpt;
 pub mod chatgpt_auth;
 pub mod checkpoint;

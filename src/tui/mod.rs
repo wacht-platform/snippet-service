@@ -1150,7 +1150,7 @@ impl App {
 
 
     fn login_cycle_reasoning(&mut self, forward: bool) {
-        const OPTIONS: [&str; 5] = ["off", "low", "medium", "high", "xhigh"];
+        const OPTIONS: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
         let current = self
             .form_reasoning_effort
             .as_deref()

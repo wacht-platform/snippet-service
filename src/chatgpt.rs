@@ -300,8 +300,8 @@ impl AgentModel for ChatGptModel {
 /// "minimal"; "off"/empty disables reasoning entirely).
 fn normalize_effort(effort: Option<&str>) -> Option<String> {
     // Values pass through to the Responses API verbatim (low/medium/high, plus
-    // `xhigh` on gpt-5.1-codex-max and later). `off`/empty omit the reasoning
-    // block; `minimal` isn't accepted by Codex, so it degrades to `low`.
+    // `xhigh` on gpt-5.1-codex-max and later, `max` on gpt-5.6+). `off`/empty omit
+    // the reasoning block; `minimal` isn't accepted by Codex, so it degrades to `low`.
     let e = effort?.trim();
     if e.is_empty() || e.eq_ignore_ascii_case("off") {
         return None;

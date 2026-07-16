@@ -1562,27 +1562,52 @@ impl CodingHarness {
 
         // "No tool calls = done": a plain-text turn ends the run, so we never force
         // a tool call — the model finishes simply by replying without one.
-        let mut output = match model
-            .generate(&request_messages, &definitions, false, sink.cloned())
-            .await
-        {
-            Ok(output) => output,
-            Err(error) => {
-                // The failed request consumed the drained signals — restore them
-                // so the retry carries the same steering.
-                vars.pending_signals = signals_backup;
-                // Adapters embed the full HTTP body; show only a concise first line.
-                let raw = error.to_string();
-                let line = raw.lines().next().unwrap_or(&raw);
-                let message = if line.chars().count() > 240 {
-                    format!("{}…", line.chars().take(240).collect::<String>())
-                } else {
-                    line.to_string()
-                };
-                return StepResult::ModelError {
-                    retryable: error.retryable(),
-                    message,
-                };
+        let mut output = loop {
+            match model
+                .generate(&request_messages, &definitions, false, sink.cloned())
+                .await
+            {
+                Ok(output) => break output,
+                Err(error) => {
+                    // Unsupported reasoning tier: no provider (except Anthropic)
+                    // lets us discover supported effort levels up front, so the
+                    // reliable path is to degrade at runtime — step the model's
+                    // effort down one tier and retry. The swap pins the lower tier
+                    // on the model instance for the rest of the session, so the
+                    // cost is one failed request per tier, once.
+                    let raw = error.to_string();
+                    if crate::llm::is_effort_rejection(&raw) {
+                        if let Some(current) = model.swap_reasoning_effort(None) {
+                            let next = crate::llm::degrade_effort(&current);
+                            model.swap_reasoning_effort(next.map(str::to_string));
+                            state.events.push(HarnessEvent::SystemDecision {
+                                step: format!(
+                                    "reasoning effort `{current}` rejected by the model — retrying at `{}`",
+                                    next.unwrap_or("provider default")
+                                ),
+                                reasoning: raw.lines().next().unwrap_or(&raw).chars().take(200).collect(),
+                            });
+                            let _ = self.persist_state(state).await;
+                            continue;
+                        }
+                        // No effort was set — not degradable; fall through to the
+                        // normal error path (swap above already restored None).
+                    }
+                    // The failed request consumed the drained signals — restore
+                    // them so the retry carries the same steering.
+                    vars.pending_signals = signals_backup;
+                    // Adapters embed the full HTTP body; show only a concise first line.
+                    let line = raw.lines().next().unwrap_or(&raw);
+                    let message = if line.chars().count() > 240 {
+                        format!("{}…", line.chars().take(240).collect::<String>())
+                    } else {
+                        line.to_string()
+                    };
+                    return StepResult::ModelError {
+                        retryable: error.retryable(),
+                        message,
+                    };
+                }
             }
         };
         // Capture this turn's reasoning (from the sink) so the next turn's live

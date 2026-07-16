@@ -623,7 +623,7 @@ struct AnthropicRequest {
 ///   https://host                    → https://host/v1/messages
 ///   https://host/v1  (incl. /v1/)   → https://host/v1/messages   (no double /v1)
 ///   https://host/v1/messages        → used as-is
-fn anthropic_messages_url(base_url: &str) -> String {
+pub(crate) fn anthropic_messages_url(base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
         return "https://api.anthropic.com/v1/messages".to_string();
@@ -642,9 +642,10 @@ fn anthropic_thinking_budget(effort: Option<&str>) -> Option<u32> {
         "low" => Some(2048),
         "medium" => Some(8192),
         "high" => Some(16384),
-        // A tier above `high` for models that reason harder when asked. Kept well
+        // Tiers above `high` for models that reason harder when asked. Kept well
         // under Claude's max thinking budget; `max_tokens` is bumped past it below.
         "xhigh" => Some(32768),
+        "max" => Some(63999),
         _ => None,
     }
 }

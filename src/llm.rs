@@ -101,6 +101,67 @@ pub(crate) fn final_model_error(last_error: &str, attempts: u32) -> String {
     }
 }
 
+/// True when a model error means the configured reasoning effort / thinking
+/// setting itself was rejected — an invalid-request (400/422) response whose
+/// provider message names the reasoning knob. No provider except Anthropic
+/// exposes which effort tiers a model supports, so this is the reliable
+/// cross-provider signal: try the configured tier, and step down on rejection.
+pub fn is_effort_rejection(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    let invalid = m.contains("http 400") || m.contains("http 422");
+    invalid
+        && (m.contains("reasoning_effort")
+            || m.contains("reasoning.effort")
+            || m.contains("reasoning effort")
+            || m.contains("thinking")
+            || m.contains("budget_tokens"))
+}
+
+/// One step down the effort ladder. `None` = the ladder is exhausted; the
+/// caller drops the reasoning knob entirely (provider default / no thinking).
+pub fn degrade_effort(current: &str) -> Option<&'static str> {
+    match current.to_ascii_lowercase().as_str() {
+        "max" => Some("xhigh"),
+        "xhigh" => Some("high"),
+        "high" => Some("medium"),
+        "medium" => Some("low"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod effort_degrade_tests {
+    use super::*;
+
+    #[test]
+    fn ladder_steps_down_and_terminates() {
+        assert_eq!(degrade_effort("max"), Some("xhigh"));
+        assert_eq!(degrade_effort("xhigh"), Some("high"));
+        assert_eq!(degrade_effort("HIGH"), Some("medium"));
+        assert_eq!(degrade_effort("medium"), Some("low"));
+        assert_eq!(degrade_effort("low"), None);
+        assert_eq!(degrade_effort("off"), None);
+    }
+
+    #[test]
+    fn rejection_detection() {
+        // OpenAI-style param rejection.
+        assert!(is_effort_rejection(
+            "The provider rejected the request as invalid. (Unsupported value: 'xhigh' is not supported with this model. param: reasoning_effort; HTTP 400)"
+        ));
+        // Anthropic-style thinking rejection.
+        assert!(is_effort_rejection(
+            "The provider rejected the request as invalid. (thinking.budget_tokens: must be at least 1024; HTTP 400)"
+        ));
+        // A 400 about something else entirely must NOT trigger a degrade.
+        assert!(!is_effort_rejection(
+            "The provider rejected the request as invalid. (messages: text content blocks must be non-empty; HTTP 400)"
+        ));
+        // Effort keyword on a non-4xx (e.g. a 529 mentioning thinking) must not trigger.
+        assert!(!is_effort_rejection("The provider is having server trouble. (thinking overloaded; HTTP 529)"));
+    }
+}
+
 #[cfg(test)]
 mod error_humanize_tests {
     use super::*;

@@ -399,6 +399,7 @@ pub async fn run_serve(
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
         .route("/config/delegate", post(set_delegate))
+        .route("/provider/models", post(provider_models))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
         .route("/session/exec", post(exec_in_session))
@@ -948,6 +949,69 @@ async fn set_active(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): J
     match result {
         Ok(_) => Json(serde_json::json!({ "active": req.name })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ProviderModelsReq {
+    /// Existing profile to list models for; its stored key/base URL are used.
+    #[serde(default)]
+    name: Option<String>,
+    /// Ad-hoc lookup for a profile being created in an editor (not yet saved).
+    /// `api_key` falls back to the named profile's stored key when empty.
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+// POST /provider/models — query the provider's own models API (key stays
+// server-side) and return a normalized catalog: real model IDs plus whatever
+// capabilities the provider reports (effort tiers on Anthropic, reasoning
+// support on OpenRouter, context windows where available).
+async fn provider_models(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ProviderModelsReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let mut cfg = {
+        let c = d.config.lock().unwrap();
+        let stored = req
+            .name
+            .as_deref()
+            .and_then(|n| c.setups.as_ref().and_then(|m| m.get(n)).cloned());
+        match stored {
+            Some(m) => m,
+            None if req.provider.is_some() => crate::config::ModelConfig {
+                provider: req.provider.clone().unwrap_or_default(),
+                ..Default::default()
+            },
+            None => return (StatusCode::NOT_FOUND, "no such profile").into_response(),
+        }
+    };
+    // Editor-supplied overrides win over the stored profile's values.
+    if let Some(p) = req.provider {
+        cfg.provider = p;
+    }
+    if let Some(b) = req.base_url {
+        if !b.trim().is_empty() {
+            cfg.base_url = b;
+        }
+    }
+    if let Some(k) = req.api_key {
+        if !k.trim().is_empty() {
+            cfg.api_key = k;
+        }
+    }
+    match crate::catalog::fetch_models(&cfg).await {
+        Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
     }
 }
 

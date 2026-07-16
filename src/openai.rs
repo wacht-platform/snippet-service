@@ -44,7 +44,7 @@ const DEFAULT_USER_AGENT: &str = "claude-cli/2.0.37 (external, cli)";
 /// user pasted WITH /chat/completions already (otherwise it doubles up). We do
 /// NOT force /v1 — openai-compatible endpoints vary (root, /v1, /openai/v1, …),
 /// so the base is used as given.
-fn openai_chat_url(base_url: &str) -> String {
+pub(crate) fn openai_chat_url(base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
     if base.ends_with("/chat/completions") {
         base.to_string()
