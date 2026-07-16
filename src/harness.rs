@@ -2012,28 +2012,90 @@ impl CodingHarness {
                 }
             }
 
+            // A bash command that references a vault secret ($NAME) ALWAYS requires
+            // explicit user confirmation — a secret is about to be injected into a
+            // process, so it's gated regardless of approval_mode / manual_approval /
+            // a prior Approve-All. In a delegated lane / headless run there's no user
+            // to confirm, so we deny it (the secret-using step must be done on the
+            // interactive thread where the user can see and approve it).
+            let vault_secrets_used: Vec<String> = if tool_name == "bash" {
+                call.arguments
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(|c| {
+                        crate::vault::Vault::load()
+                            .env_for_command(c)
+                            .into_iter()
+                            .map(|(n, _)| n)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !vault_secrets_used.is_empty() && !conversation_mode {
+                let result = json!({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error": {
+                        "code": "vault_needs_confirmation",
+                        "message": format!(
+                            "Using vault secret(s) [{}] requires user confirmation, which isn't available in a delegated/headless run. Don't run this here — report that this step needs the secret, so it's done on the main thread where the user can approve it.",
+                            vault_secrets_used.join(", ")
+                        )
+                    }
+                });
+                state.events.push(HarnessEvent::ToolResult {
+                    tool_name: tool_name.clone(),
+                    result: result.clone(),
+                });
+                state.messages.push(HarnessMessage::ToolResult {
+                    tool_call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: result,
+                });
+                continue;
+            }
+            let force_vault_approval = !vault_secrets_used.is_empty();
+
             // Manual mode: pause for the user's approval before a mutating tool runs.
             // Approvals queue across a batch (index/total); Deny skips this one with a
             // denial result so the model adapts. Interrupt cancels the whole step.
-            if state.approval_mode == ApprovalMode::Manual
-                && MUTATING_TOOLS.contains(&tool_name.as_str())
+            // A vault-secret call is ALSO gated here even in Auto mode.
+            if force_vault_approval
+                || (state.approval_mode == ApprovalMode::Manual
+                    && MUTATING_TOOLS.contains(&tool_name.as_str()))
             {
                 approval_index += 1;
                 // Discard stale decisions (double-taps, key repeat) queued before
                 // this prompt existed — an unconsumed leftover would instantly
-                // "approve" an action the user never saw.
+                // "approve" an action the user never saw. A prior Approve-All never
+                // reaches here for a vault call: the drain clears it and force_vault
+                // re-prompts, so Approve-All can't silently authorize a secret.
                 while approval_rx.try_recv().is_ok() {}
+                let summary = if force_vault_approval {
+                    format!(
+                        "⚠ uses vault secret(s) [{}] — {}",
+                        vault_secrets_used.join(", "),
+                        approval_summary(&tool_name, &call.arguments)
+                    )
+                } else {
+                    approval_summary(&tool_name, &call.arguments)
+                };
                 state.events.push(HarnessEvent::ApprovalRequest {
                     tool_name: tool_name.clone(),
-                    summary: approval_summary(&tool_name, &call.arguments),
+                    summary,
                     index: approval_index,
-                    total: total_mutating,
+                    total: total_mutating.max(approval_index),
                 });
                 state.status = HarnessStatus::WaitingForInput;
                 let _ = self.persist(state, lanes).await;
                 let decision = approval_rx.recv().await;
                 state.status = HarnessStatus::Running;
-                if matches!(decision, Some(ApprovalDecision::ApproveAll)) {
+                // Approve-All flips to Auto for ordinary mutating calls — but NOT off
+                // a vault prompt: a secret must never silently authorize the session
+                // into an unattended mode, and vault calls re-prompt anyway.
+                if matches!(decision, Some(ApprovalDecision::ApproveAll)) && !force_vault_approval {
                     state.approval_mode = ApprovalMode::Auto;
                 }
                 let approved = matches!(
