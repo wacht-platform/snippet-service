@@ -123,6 +123,11 @@ impl Tool for ReadFileTool {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ReadFileArgs = expect_object("read_file", arguments)?;
         let path = ctx.resolve_workspace_path(&args.path)?;
+        if crate::vault::is_protected_path(&path) {
+            return Err(ToolError::msg(
+                "the vault file is off-limits — secret VALUES are never readable. Use a secret as $NAME in bash; its value is injected into the process and redacted from output.",
+            ));
+        }
         let content = tokio::fs::read_to_string(&path).await?;
         ctx.mark_read(&path);
 

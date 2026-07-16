@@ -32,6 +32,88 @@ pub fn vault_path() -> PathBuf {
 /// text with false-positive redactions (and isn't much of a secret).
 const MIN_SECRET_LEN: usize = 4;
 
+/// True when `path` is the vault file itself — off-limits to agent tools.
+/// (Defense in depth: even if read some other way, the output scrubber redacts
+/// the values, whole or fragmented.)
+pub fn is_protected_path(path: &std::path::Path) -> bool {
+    let vault = vault_path();
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(path) == canon(&vault)
+}
+
+/// Seed length for partial-value detection: any verbatim fragment of a secret
+/// at least this long is redacted. Shorter overlaps are indistinguishable from
+/// ordinary text (a 5-char coincidence is noise, not a leak) — 8 keeps false
+/// positives near zero for token-shaped secrets while making fragment
+/// exfiltration useless.
+const PARTIAL_SEED: usize = 8;
+
+/// Redact every span of `text` that matches a run of `value` at least
+/// PARTIAL_SEED bytes long. Seeds on 8-grams of the value, then extends each
+/// hit maximally in both directions so a long fragment becomes ONE marker.
+fn scrub_partials(text: &str, value: &str, marker: &str) -> String {
+    use std::collections::HashMap;
+    let tb = text.as_bytes();
+    let vb = value.as_bytes();
+    let n = tb.len();
+    if n < PARTIAL_SEED {
+        return text.to_string();
+    }
+    let mut seeds: HashMap<&[u8], Vec<usize>> = HashMap::new();
+    for i in 0..=vb.len() - PARTIAL_SEED {
+        seeds.entry(&vb[i..i + PARTIAL_SEED]).or_default().push(i);
+    }
+    let mut redact = vec![false; n];
+    let mut any = false;
+    let mut i = 0;
+    while i + PARTIAL_SEED <= n {
+        if let Some(offsets) = seeds.get(&tb[i..i + PARTIAL_SEED]) {
+            // Extend the best alignment as far as the bytes keep matching.
+            let mut best: Option<(usize, usize)> = None;
+            for &off in offsets {
+                let (mut s_t, mut s_v) = (i, off);
+                while s_t > 0 && s_v > 0 && tb[s_t - 1] == vb[s_v - 1] {
+                    s_t -= 1;
+                    s_v -= 1;
+                }
+                let (mut e_t, mut e_v) = (i + PARTIAL_SEED, off + PARTIAL_SEED);
+                while e_t < n && e_v < vb.len() && tb[e_t] == vb[e_v] {
+                    e_t += 1;
+                    e_v += 1;
+                }
+                if best.is_none_or(|(bs, be)| e_t - s_t > be - bs) {
+                    best = Some((s_t, e_t));
+                }
+            }
+            if let Some((s, e)) = best {
+                redact[s..e].fill(true);
+                any = true;
+                i = e;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !any {
+        return text.to_string();
+    }
+    // Rebuild: each contiguous redacted run collapses to one marker.
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut j = 0;
+    while j < n {
+        if redact[j] {
+            out.extend_from_slice(marker.as_bytes());
+            while j < n && redact[j] {
+                j += 1;
+            }
+        } else {
+            out.push(tb[j]);
+            j += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
     secrets: BTreeMap<String, String>,
@@ -112,12 +194,24 @@ impl Vault {
             .collect()
     }
 
-    /// Replace every occurrence of every secret value with `[vault:NAME]`.
+    /// Replace every occurrence of every secret value — whole OR partial — with
+    /// `[vault:NAME]`. Partial matters: `cut -c1-12 vault.json`, `${KEY:0:10}`,
+    /// `head -c`, hexdump-adjacent tricks all emit fragments, and leaking a
+    /// secret 8 chars at a time is still leaking it.
     pub fn scrub_str(&self, text: &str) -> String {
         let mut out = text.to_string();
         for (name, value) in &self.secrets {
-            if value.len() >= MIN_SECRET_LEN && out.contains(value.as_str()) {
-                out = out.replace(value.as_str(), &format!("[vault:{name}]"));
+            if value.len() < MIN_SECRET_LEN {
+                continue;
+            }
+            let marker = format!("[vault:{name}]");
+            // Fast path: whole value.
+            if out.contains(value.as_str()) {
+                out = out.replace(value.as_str(), &marker);
+            }
+            // Fragments: any verbatim run of the value >= PARTIAL_SEED chars.
+            if value.len() >= PARTIAL_SEED {
+                out = scrub_partials(&out, value, &marker);
             }
         }
         out
