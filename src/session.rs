@@ -46,8 +46,11 @@ pub fn start_session(
     let memory_entry_budget_chars = config.memory_entry_budget_chars;
     let memory_max_entries = config.memory_max_entries;
     let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
+    // Delegated lanes may run on a different profile than the active session
+    // model (see `delegate_setup`) — a cheaper model for parallel grunt work or
+    // a stronger one for hard sub-tasks. Falls back to the active model.
     let factory: ModelFactory = {
-        let mc = model_config.clone();
+        let mc = config.delegate_model_config();
         Arc::new(move || mc.build_model())
     };
     let sp = state_path.clone();

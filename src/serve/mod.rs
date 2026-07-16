@@ -398,6 +398,7 @@ pub async fn run_serve(
         .route("/config", get(get_config))
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
+        .route("/config/delegate", post(set_delegate))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
         .route("/session/exec", post(exec_in_session))
@@ -785,6 +786,8 @@ struct ProfileView {
 struct ConfigView {
     profiles: Vec<ProfileView>,
     active: Option<String>,
+    /// Profile that delegated lanes run on; null → they use the active model.
+    delegate: Option<String>,
     theme: Option<String>,
     manual_approval: bool,
     hostname: String,
@@ -818,6 +821,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
     Json(ConfigView {
         profiles,
         active,
+        delegate: c.delegate_setup.clone(),
         theme: c.theme.clone(),
         manual_approval: c.manual_approval,
         hostname: d.hostname.clone(),
@@ -943,6 +947,36 @@ async fn set_active(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): J
     };
     match result {
         Ok(_) => Json(serde_json::json!({ "active": req.name })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DelegateReq {
+    /// Profile for delegated lanes. Empty/null clears it (delegation → active model).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+// POST /config/delegate — set (or clear) the profile that delegated lanes run on.
+async fn set_delegate(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<DelegateReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await; // don't clobber TUI-side profile edits
+    let name = req.name.filter(|n| !n.trim().is_empty());
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        if let Some(n) = name.as_deref() {
+            if !c.setups.as_ref().is_some_and(|m| m.contains_key(n)) {
+                return (StatusCode::NOT_FOUND, "no such profile").into_response();
+            }
+        }
+        c.delegate_setup = name.clone();
+        save_config(&c, &d.config_path)
+    };
+    match result {
+        Ok(_) => Json(serde_json::json!({ "delegate": name })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

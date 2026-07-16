@@ -613,6 +613,24 @@ impl App {
         }
     }
 
+    /// Toggle a profile as the delegation model — the one `delegate_task` sub-agents
+    /// run on. Selecting the current delegate clears it (delegation falls back to the
+    /// active model). Takes effect on the next session/lane; no running loop is killed.
+    fn toggle_delegate_profile(&mut self, name: &str) {
+        let cfg = &mut self.options.config;
+        if cfg.delegate_setup.as_deref() == Some(name) {
+            cfg.delegate_setup = None;
+            self.status = format!("delegation → active model (cleared “{name}”)");
+        } else if cfg.setups.as_ref().is_some_and(|m| m.contains_key(name)) {
+            cfg.delegate_setup = Some(name.to_string());
+            self.status = format!("✓ lanes delegate to “{name}”");
+        } else {
+            self.status = format!("profile `{name}` not found");
+            return;
+        }
+        let _ = self.save_config_file();
+    }
+
     /// Set a profile for THIS chat only (a persisted per-conversation override),
     /// without changing the global default. Restarts the chat's loop with it.
     fn activate_profile_local(&mut self, name: &str) {
@@ -2584,6 +2602,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     app.activate_profile(&name); // global default for all chats
                 }
             }
+            KeyCode::Char('l') => {
+                if app.profiles_selected_index < total {
+                    let name = names[app.profiles_selected_index].clone();
+                    app.toggle_delegate_profile(&name);
+                }
+            }
             KeyCode::Char('a') => app.open_profile_editor(None),
             KeyCode::Char('e') => {
                 if app.profiles_selected_index < total {
@@ -3207,6 +3231,7 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let names = app.options.config.profile_names();
     let total = names.len();
     let active = app.options.config.active_setup.clone().unwrap_or_default();
+    let delegate = app.options.config.delegate_setup.clone().unwrap_or_default();
     let setups = app.options.config.setups.as_ref();
     let sel = app.profiles_selected_index.min(total); // index `total` == the Add row
 
@@ -3241,6 +3266,9 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         ];
         if is_active {
             head.push(Span::styled("   ● active", Style::default().fg(success())));
+        }
+        if !delegate.is_empty() && *name == delegate {
+            head.push(Span::styled("   ⇣ delegate", Style::default().fg(lane())));
         }
         lines.push(Line::from(head));
         if let Some(cfg) = setups.and_then(|m| m.get(name)) {
@@ -3283,7 +3311,7 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑/↓ move  ·  ↵ this chat  ·  g global default  ·  e edit  ·  a add  ·  d delete  ·  Esc",
+            "↑/↓ move  ·  ↵ this chat  ·  g global  ·  l delegate  ·  e edit  ·  a add  ·  d delete  ·  Esc",
             subtle(),
         ))),
         chunks[2],

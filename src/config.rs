@@ -56,6 +56,12 @@ pub struct SnippetConfig {
     /// mirrored into `model` for the runtime.
     #[serde(default, alias = "active_profile", alias = "active_setup", skip_serializing_if = "Option::is_none")]
     pub active_setup: Option<String>,
+    /// Profile used for delegated lanes (`delegate_task`). When it names a known
+    /// profile, sub-agents run on that model instead of the active one — e.g. a
+    /// cheaper/faster model for parallel grunt work, or a stronger one for hard
+    /// sub-tasks. Unset (or an unknown name) → delegation uses the active model.
+    #[serde(default, alias = "delegate_profile", skip_serializing_if = "Option::is_none")]
+    pub delegate_setup: Option<String>,
     /// Exa API key for the `web_search` / `web_read` tools. When set, web search is
     /// enabled; absent, the tools aren't offered to the model. Declared before the
     /// `model` table so it serializes as a top-level key (TOML requires scalars
@@ -146,6 +152,7 @@ impl Default for SnippetConfig {
             resume_on_start: false,
             manual_approval: false,
             active_setup: None,
+            delegate_setup: None,
             setups: None,
             model: ModelConfig::default(),
             exa_api_key: None,
@@ -340,6 +347,18 @@ impl SnippetConfig {
                 None => self.active_setup = None,
             }
         }
+    }
+
+    /// The model config for delegated lanes. Uses the `delegate_setup` profile
+    /// when it names a known one; otherwise falls back to the active model, so
+    /// delegation keeps working unchanged when no separate profile is chosen.
+    pub fn delegate_model_config(&self) -> ModelConfig {
+        if let Some(name) = self.delegate_setup.as_deref() {
+            if let Some(cfg) = self.setups.as_ref().and_then(|m| m.get(name)) {
+                return cfg.clone();
+            }
+        }
+        self.model.clone()
     }
 }
 
