@@ -119,6 +119,8 @@ pub enum HarnessEvent {
     AssistantText { text: String },
     /// A private note-to-self the agent recorded.
     Note { entry: String },
+    /// The agent presented a file to the user (an openable card in the UIs).
+    FilePresented { path: String, caption: Option<String> },
     /// A runtime-injected correction after recoverable failures.
     SystemDecision { step: String, reasoning: String },
     ModelError { message: String },
@@ -2192,6 +2194,52 @@ impl CodingHarness {
                 });
                 (
                     json!({"schema_version": 1, "status": "success", "data": {"noted": true}}),
+                    MetaControl::Continue,
+                )
+            }
+            "present_file" => {
+                let path = arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let Some(path) = path else {
+                    return (
+                        tool_error("present_file requires a `path`."),
+                        MetaControl::Continue,
+                    );
+                };
+                let resolved = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
+                } else {
+                    self.context.workspace_root().join(path)
+                };
+                // Only real files get presented — a hallucinated or not-yet-written
+                // path fails loudly so the agent writes the file first.
+                if !resolved.is_file() {
+                    return (
+                        tool_error(format!(
+                            "present_file: `{path}` does not exist — write the file before presenting it."
+                        )),
+                        MetaControl::Continue,
+                    );
+                }
+                let caption = arguments
+                    .get("caption")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let shown = resolved.display().to_string();
+                state.events.push(HarnessEvent::FilePresented {
+                    path: shown.clone(),
+                    caption,
+                });
+                (
+                    json!({"schema_version": 1, "status": "success", "data": {
+                        "presented": shown,
+                        "note": "shown to the user as an openable file card; continue your turn as usual",
+                    }}),
                     MetaControl::Continue,
                 )
             }

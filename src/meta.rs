@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 5] =
-    ["note", "ask_user", "delegate_task", "complete_goal", "monitor"];
+pub const META_TOOL_NAMES: [&str; 6] =
+    ["note", "ask_user", "delegate_task", "complete_goal", "monitor", "present_file"];
 
 pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
@@ -26,11 +26,33 @@ pub fn is_meta_tool(name: &str) -> bool {
 /// turn by replying with no tool calls. `complete_goal` is the one exception, and
 /// it's only offered while an autonomous `/goal` is active (so it can end it).
 pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinition> {
-    let mut tools = vec![note_tool(), ask_user_tool(), delegate_task_tool(), monitor_tool()];
+    let mut tools =
+        vec![note_tool(), ask_user_tool(), delegate_task_tool(), monitor_tool(), present_file_tool()];
     if goal_active {
         tools.push(complete_goal_tool());
     }
     tools
+}
+
+fn present_file_tool() -> NativeToolDefinition {
+    NativeToolDefinition {
+        name: "present_file".to_string(),
+        description: "Present a file to the user: it appears in the conversation as an openable \
+            file card (in both the TUI and the app). Use it when a deliverable IS a file — a \
+            report you wrote, a generated artifact, a diff, an image — instead of pasting its \
+            contents into chat. The file must already exist (write it first). Present only the \
+            file(s) that are the deliverable, not every file you touched. Presenting does not \
+            end your turn — you still deliver your answer text as usual."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The file to present — workspace-relative or absolute."},
+                "caption": {"type": "string", "description": "Optional one-line caption shown with the file."}
+            },
+            "required": ["path"]
+        }),
+    }
 }
 
 fn monitor_tool() -> NativeToolDefinition {

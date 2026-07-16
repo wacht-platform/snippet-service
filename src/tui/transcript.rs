@@ -245,6 +245,13 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
         }
         HarnessEvent::AssistantText { text } => render_prose(text, width),
         HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", muted(), entry, width),
+        HarnessEvent::FilePresented { path, caption } => {
+            let text = match caption {
+                Some(c) => format!("{path} — {c}"),
+                None => path.clone(),
+            };
+            marker_block("▤ ", "file  ", accent(), &text, width)
+        }
         HarnessEvent::SystemDecision { step, reasoning } => {
             if step == "history_compaction_pass" {
                 // Keep the live banner only during the turn; the durable

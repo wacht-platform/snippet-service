@@ -39,8 +39,8 @@ use transcript::*;
 /// Meta tools render through their own dedicated events (Note / AssistantText /
 /// UserQuestion / LaneSpawned), so their raw tool-call/result rows are hidden to
 /// avoid duplication.
-const HIDDEN_TOOL_ROWS: [&str; 7] =
-    ["terminate_loop", "note", "notify_user", "ask_user", "delegate_task", "complete_goal", "monitor"];
+const HIDDEN_TOOL_ROWS: [&str; 8] =
+    ["terminate_loop", "note", "notify_user", "ask_user", "delegate_task", "complete_goal", "monitor", "present_file"];
 
 /// Cap on bash/output preview lines shown inline before collapsing to a count.
 
@@ -1949,12 +1949,49 @@ impl App {
     }
 
     /// Expand any paste chips in the current input back to their real content.
+    /// A paste bigger than this goes to a scratch FILE and is sent as an
+    /// attachment path instead of inline text — the agent greps/reads it
+    /// surgically, and the conversation doesn't carry the whole wall forever.
+    const PASTE_ATTACH_CHARS: usize = 4000;
+    const PASTE_ATTACH_LINES: usize = 60;
+
     fn expand_input(&self) -> String {
         let mut out = self.input.clone();
         for (marker, content) in &self.pasted_blocks {
-            out = out.replace(marker, content);
+            let lines = content.lines().count();
+            let big = content.chars().count() > Self::PASTE_ATTACH_CHARS
+                || lines > Self::PASTE_ATTACH_LINES;
+            let replacement = if big {
+                match self.write_paste_file(content) {
+                    Ok(path) => format!(
+                        "[attached file — pasted text ({lines} lines); read it at this exact path: {path}]"
+                    ),
+                    // Couldn't write the scratch file — fall back to inline so
+                    // the message still carries the content.
+                    Err(_) => content.clone(),
+                }
+            } else {
+                content.clone()
+            };
+            out = out.replace(marker, &replacement);
         }
         out
+    }
+
+    /// Persist one big pasted block under the workspace scratch dir and return
+    /// its path (same lifecycle as attached screenshots).
+    fn write_paste_file(&self, content: &str) -> std::io::Result<String> {
+        let dir = self
+            .options
+            .config
+            .workspace
+            .join(".snippet")
+            .join("scratch")
+            .join("pastes");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("paste-{}.txt", &uuid::Uuid::new_v4().to_string()[..8]));
+        std::fs::write(&path, content)?;
+        Ok(path.display().to_string())
     }
 
     /// The message to send: the expanded input plus any pending attachments, each
