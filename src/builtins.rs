@@ -860,7 +860,7 @@ impl Tool for BashTool {
         NativeToolDefinition {
             name: "bash".to_string(),
             description:
-                "Run a shell command in the workspace. Keep output narrow and deterministic. Use max_lines or max_bytes to limit output. Set background=true for long-lived processes (dev servers, watchers): it returns immediately, redirects output to a log file, and tracks the process in the live background-process list — tail the log or `kill <pid>` to manage it."
+                "Run a shell command in the workspace. Keep output narrow and deterministic. Use max_lines or max_bytes to limit output. Set background=true for long-lived processes (dev servers, watchers): it returns immediately, redirects output to a log file, and tracks the process in the live background-process list — tail the log or `kill <pid>` to manage it. For interactive/async apps you must control programmatically (a browser, a REPL, an emulator), do NOT script the whole interaction in one shot: start the app once with background=true, then drive it surgically across small follow-up calls (browser via its remote-debugging port, REPL via a fifo stdin), reading the new output between steps, and kill the pid when done."
                     .to_string(),
             input_schema: object_schema(
                 json!({

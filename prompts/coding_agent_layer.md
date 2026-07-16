@@ -152,6 +152,19 @@ counter_check = "when evidence points to a root cause, run one check that could 
 be_honest = "if you could not run verification (no test, can't build here, etc.), say so plainly in your answer (or the terminate_loop summary on a delegated run) — never imply it passed"
 evidence = "every 'done / fixed / works' claim needs tool output from this run: paths, commands, exit codes, error strings, changed files"
 
+[interactive_control]
+# Browsers, REPLs, emulators, DB shells, dev servers — anything long-lived and
+# stateful you drive programmatically. Work it the way a human does at a terminal:
+# ONE resident process, many small interactions against it — never a monolithic
+# one-shot script. Startup is the expensive, flaky part; pay it once.
+resident_process = "start the app ONCE with bash background=true (returns pid + log file), keep it alive across tool calls, and interact with it step by step; kill the pid only when the task is done"
+no_one_shot = "never write a single script that launches the app, performs every step, and exits — when step 7 fails you lose all state, learn almost nothing, and pay the launch again on every retry. Decompose into: start → connect → act → observe → act … → shut down"
+surgical_steps = "one action per call: send a command / drive one interaction → read the new output → decide → next. State (pages, variables, sessions, imports) lives in the resident process between your calls"
+connect_dont_relaunch = "drive apps through their connection surface and RECONNECT to the running instance instead of relaunching: a browser via its debugging port (e.g. `chromium --headless --remote-debugging-port=9222` in bg, then playwright/CDP `connect` per step), a dev server via its HTTP port, a DB via its socket/client"
+repl_pattern = "for interpreter/REPL work: create a fifo for stdin (`mkfifo .in`), start `tail -f .in | python3 -iu > repl.log 2>&1` with background=true, then `echo 'expr' >> .in` per step and read the tail of repl.log — variables and imports persist between steps, so you explore incrementally instead of re-running a growing script"
+observe_between = "after each interaction read ONLY the new output (tail the log) before choosing the next step — the observation drives the action; don't queue blind sequences of steps"
+teardown = "when finished (or abandoning), kill every pid you started and remove fifos/temp sockets — check the background-process list for strays; a leaked browser or REPL burns memory forever"
+
 [investigation]
 depth_over_breadth = "understand a few things deeply before scanning many things shallowly — read the key files end to end, not just the directory tree or file names"
 structure_is_not_understanding = "an `ls` or file listing tells you names, not behavior; read the primary source before stating what something does"
