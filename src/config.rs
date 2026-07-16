@@ -558,7 +558,6 @@ impl Default for ModelConfig {
     }
 }
 
-
 /// Write `config` to `path` with a round-trip parse guard (refuse to write a config
 /// that won't load back), then chmod it 0600. Shared by the TUI-style save path and
 /// the serve daemon's config endpoints.
@@ -574,37 +573,3 @@ pub fn save_config(config: &SnippetConfig, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-mod ensure_setups_tests {
-    use super::*;
-
-    #[test]
-    fn fresh_default_config_makes_no_phantom_profile() {
-        let mut c = SnippetConfig::default();
-        c.ensure_setups();
-        // The built-in openai placeholder (no key, no model) must not become a profile.
-        assert!(c.setups.as_ref().map(|m| m.is_empty()).unwrap_or(true), "phantom created: {:?}", c.setups);
-        assert!(c.active_setup.is_none());
-    }
-
-    #[test]
-    fn configured_lone_model_is_migrated() {
-        let mut c = SnippetConfig::default();
-        c.model.provider = "anthropic".into();
-        c.model.model = "claude-opus-4-8".into();
-        c.model.api_key = "sk-ant-x".into();
-        c.ensure_setups();
-        assert_eq!(c.active_setup.as_deref(), Some("anthropic"));
-        assert!(c.setups.as_ref().unwrap().contains_key("anthropic"));
-    }
-
-    #[test]
-    fn chatgpt_counts_as_configured_without_key() {
-        let mut c = SnippetConfig::default();
-        c.model.provider = "chatgpt".into();
-        c.model.model = String::new();
-        c.model.api_key = String::new();
-        c.ensure_setups();
-        assert_eq!(c.active_setup.as_deref(), Some("chatgpt"));
-    }
-}

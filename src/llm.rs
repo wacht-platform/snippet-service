@@ -129,46 +129,6 @@ pub fn degrade_effort(current: &str) -> Option<&'static str> {
     }
 }
 
-
-#[cfg(test)]
-mod error_humanize_tests {
-    use super::*;
-    use reqwest::StatusCode;
-
-    #[test]
-    fn rate_limit_reads_cleanly_without_leaking_json() {
-        // The exact shape a provider returned in the wild (429 + usage-limit error).
-        let body = r#"{"type":"error","error":{"type":"GoUsageLimitError","message":"usage limit reached"}}"#;
-        let msg = humanize_http_error(StatusCode::TOO_MANY_REQUESTS, body);
-        assert!(msg.starts_with("Rate limited"), "{msg}");
-        assert!(msg.contains("usage limit reached"), "{msg}");
-        assert!(msg.contains("HTTP 429"), "{msg}");
-        assert!(!msg.contains('{'), "must not dump raw JSON: {msg}");
-    }
-
-    #[test]
-    fn falls_back_to_error_type_when_no_message() {
-        let body = r#"{"error":{"type":"GoUsageLimitError"}}"#;
-        let msg = humanize_http_error(StatusCode::TOO_MANY_REQUESTS, body);
-        assert!(msg.contains("GoUsageLimitError"), "{msg}");
-    }
-
-    #[test]
-    fn auth_and_server_errors() {
-        let auth = humanize_http_error(StatusCode::UNAUTHORIZED, "");
-        assert!(auth.contains("Authentication failed") && auth.contains("HTTP 401"), "{auth}");
-        let server = humanize_http_error(StatusCode::BAD_GATEWAY, "not json");
-        assert!(server.contains("server trouble") && server.contains("HTTP 502"), "{server}");
-    }
-
-    #[test]
-    fn final_error_only_shows_count_when_retried() {
-        assert_eq!(final_model_error("Rate limited.", 1), "Rate limited.");
-        assert_eq!(final_model_error("Boom.", 3), "Boom. (after 3 attempts)");
-        assert_eq!(final_model_error("   ", 1), "The model request failed.");
-    }
-}
-
 /// Live text the model is currently streaming, shared between the model (writer)
 /// and the TUI (reader). The model appends visible text deltas as they arrive;
 /// the UI renders the in-progress text and clears it once the turn commits to

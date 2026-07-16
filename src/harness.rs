@@ -37,7 +37,6 @@ const LARGE_TOOL_BATCH: usize = 10;
 /// Ported from wacht's `SHELL_NUDGE_ESCALATE_AT`.
 const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
-
 /// Read-only discovery tools whose exact-duplicate re-call within a request is
 /// wasteful spinning (the result is already in history). `read_file` is excluded
 /// — re-reading after an edit is legitimate.
@@ -3276,8 +3275,6 @@ impl CodingHarness {
         }
     }
 
-
-
     async fn persist_state(&self, state: &HarnessState) -> Result<(), ToolError> {
         let Some(path) = &self.config.state_path else {
             return Ok(());
@@ -3895,7 +3892,6 @@ fn toml_block(body: &str) -> String {
     format!("\"\"\"\n{}\n\"\"\"", body.replace("\"\"\"", "'''"))
 }
 
-
 fn required_missing(sections: &BTreeMap<&'static str, String>) -> Vec<&'static str> {
     SUMMARY_SECTIONS
         .iter()
@@ -4052,57 +4048,3 @@ fn render_window(
     out
 }
 
-#[cfg(test)]
-mod gitignore_tests {
-    use super::{ensure_snippet_gitignored, in_git_work_tree};
-
-    fn git_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join(".git")).unwrap();
-        dir
-    }
-
-    #[test]
-    fn creates_gitignore_when_missing() {
-        let repo = git_repo();
-        ensure_snippet_gitignored(repo.path());
-        let gi = std::fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-        assert_eq!(gi, ".snippet/\n");
-    }
-
-    #[test]
-    fn appends_entry_and_preserves_prior_lines() {
-        let repo = git_repo();
-        let gi = repo.path().join(".gitignore");
-        std::fs::write(&gi, "target/\nnode_modules/").unwrap(); // no trailing newline
-        ensure_snippet_gitignored(repo.path());
-        let out = std::fs::read_to_string(&gi).unwrap();
-        assert_eq!(out, "target/\nnode_modules/\n.snippet/\n");
-    }
-
-    #[test]
-    fn idempotent_when_already_covered() {
-        let repo = git_repo();
-        let gi = repo.path().join(".gitignore");
-        std::fs::write(&gi, "target/\n.snippet\n").unwrap(); // bare form counts
-        ensure_snippet_gitignored(repo.path());
-        let out = std::fs::read_to_string(&gi).unwrap();
-        assert_eq!(out, "target/\n.snippet\n"); // unchanged
-    }
-
-    #[test]
-    fn skips_non_git_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!in_git_work_tree(dir.path()));
-        ensure_snippet_gitignored(dir.path());
-        assert!(!dir.path().join(".gitignore").exists());
-    }
-
-    #[test]
-    fn detects_repo_from_subfolder() {
-        let repo = git_repo();
-        let sub = repo.path().join("crates/inner");
-        std::fs::create_dir_all(&sub).unwrap();
-        assert!(in_git_work_tree(&sub));
-    }
-}

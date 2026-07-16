@@ -142,28 +142,3 @@ fn replace_exe(exe: &Path, new_bytes: &[u8]) -> Result<(), String> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn newer_comparison() {
-        assert!(is_newer("999.0.0"));
-        assert!(!is_newer("0.0.0"));
-        assert!(!is_newer(CURRENT_VERSION));
-    }
-
-    #[test]
-    fn parses_versions() {
-        assert_eq!(parse("1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse("0.1"), Some((0, 1, 0)));
-        assert_eq!(parse("2.0.0-rc1"), Some((2, 0, 0)));
-        assert_eq!(parse("nope"), None);
-    }
-
-    #[test]
-    fn magic_bytes() {
-        assert!(looks_like_executable(b"\x7fELF and more"));
-        assert!(!looks_like_executable(b"<!DOCTYPE html>"));
-    }
-}

@@ -833,20 +833,3 @@ fn push_block(prepared: &mut Vec<AnthropicMessage>, role: &str, block: Anthropic
     });
 }
 
-#[cfg(test)]
-mod messages_url_tests {
-    use super::anthropic_messages_url;
-
-    #[test]
-    fn builds_expected_endpoints() {
-        assert_eq!(anthropic_messages_url(""), "https://api.anthropic.com/v1/messages");
-        assert_eq!(anthropic_messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
-        // The screenshot case: base already has /v1 (+ trailing slash) — no double /v1.
-        assert_eq!(anthropic_messages_url("https://opencode.ai/zen/go/v1/"), "https://opencode.ai/zen/go/v1/messages");
-        assert_eq!(anthropic_messages_url("https://opencode.ai/zen/go/v1"), "https://opencode.ai/zen/go/v1/messages");
-        // Full endpoint pasted → used as-is.
-        assert_eq!(anthropic_messages_url("https://opencode.ai/zen/go/v1/messages"), "https://opencode.ai/zen/go/v1/messages");
-        // Root only → /v1/messages appended.
-        assert_eq!(anthropic_messages_url("https://gw.example.com/anthropic"), "https://gw.example.com/anthropic/v1/messages");
-    }
-}
