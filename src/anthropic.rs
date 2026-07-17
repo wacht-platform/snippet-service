@@ -95,12 +95,18 @@ impl AgentModel for AnthropicModel {
         Ok(ModelOutput {
             calls,
             content_text,
-            usage: response.usage.map(|u| crate::llm::TokenUsage {
-                prompt_tokens: u.input_tokens,
-                completion_tokens: u.output_tokens,
-                total_tokens: u.input_tokens.saturating_add(u.output_tokens),
-                cache_read_tokens: u.cache_read_input_tokens,
-                cache_creation_tokens: u.cache_creation_input_tokens,
+            usage: response.usage.map(|u| {
+                let full_input = u
+                    .input_tokens
+                    .saturating_add(u.cache_read_input_tokens)
+                    .saturating_add(u.cache_creation_input_tokens);
+                crate::llm::TokenUsage {
+                    prompt_tokens: full_input,
+                    completion_tokens: u.output_tokens,
+                    total_tokens: full_input.saturating_add(u.output_tokens),
+                    cache_read_tokens: u.cache_read_input_tokens,
+                    cache_creation_tokens: u.cache_creation_input_tokens,
+                }
             }),
             // Anthropic signals a token-cap cut-off as `max_tokens`; normalize so
             // `ModelOutput::is_truncated` catches it like the OpenAI `length`.
@@ -541,12 +547,17 @@ async fn parse_anthropic_sse(
     Ok(ModelOutput {
         calls,
         content_text: (!text.is_empty()).then_some(text),
-        usage: Some(TokenUsage {
-            prompt_tokens: input_tokens,
-            completion_tokens: output_tokens,
-            total_tokens: input_tokens.saturating_add(output_tokens),
-            cache_read_tokens: cache_read,
-            cache_creation_tokens: cache_creation,
+        usage: Some({
+            let full_input = input_tokens
+                .saturating_add(cache_read)
+                .saturating_add(cache_creation);
+            TokenUsage {
+                prompt_tokens: full_input,
+                completion_tokens: output_tokens,
+                total_tokens: full_input.saturating_add(output_tokens),
+                cache_read_tokens: cache_read,
+                cache_creation_tokens: cache_creation,
+            }
         }),
         finish_reason: stop_reason,
         rate_limit: None,

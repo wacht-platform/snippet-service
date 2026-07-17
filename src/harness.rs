@@ -10,7 +10,9 @@ use tokio::time::sleep;
 
 use crate::inline::{extract_inline_tool_submissions, looks_like_inline_tool_submission};
 use crate::lanes::{LaneManager, LaneRecord, LaneResult, LaneStatus, ModelFactory};
-use crate::llm::{AgentModel, GeneratedToolCall, HarnessMessage, StreamBuffer, StreamHandle};
+use crate::llm::{
+    AgentModel, GeneratedToolCall, HarnessMessage, NativeToolDefinition, StreamBuffer, StreamHandle,
+};
 use crate::meta::{self, parse_ask_user, parse_delegate_brief};
 use crate::prompts::coding_system_prompt;
 use crate::signals::RuntimeSignal;
@@ -1623,27 +1625,21 @@ impl CodingHarness {
             vars.last_thought =
                 (!thought.is_empty()).then(|| thought.chars().take(1500).collect::<String>());
         }
-        // What we KNOW we sent this turn — a rough token estimate of the actual
-        // request. The provider-reported prompt count drives cost totals, but for
-        // OUR context gauge and the compaction gate we must not depend on it: some
-        // OpenAI/Anthropic-compatible GATEWAYS under-report input_tokens wildly
-        // (e.g. 261 for a 500k-token history), which pins the gauge at ~0% and
-        // stops compaction from ever firing — so history grows unbounded. Take the
-        // MAX of reported and estimate so the context size is never understated.
-        let estimated_prompt = estimate_prompt_tokens(&request_messages);
-        if let Some(usage) = output.usage {
+        let estimated_prompt =
+            estimate_prompt_tokens(&request_messages) + tools_token_overhead(&definitions);
+        let anchor_tokens = if let Some(usage) = output.usage {
             state.total_tokens = state.total_tokens.saturating_add(usage.total_tokens);
             state.prompt_tokens = state.prompt_tokens.saturating_add(usage.prompt_tokens);
             state.completion_tokens =
                 state.completion_tokens.saturating_add(usage.completion_tokens);
             state.cache_read_tokens =
                 state.cache_read_tokens.saturating_add(usage.cache_read_tokens);
-            state.last_prompt_tokens = usage.prompt_tokens.max(estimated_prompt);
+            usage.prompt_tokens.max(estimated_prompt)
         } else {
-            // No usage at all (some compatible endpoints omit it) — estimate so the
-            // gauge and compaction still work.
-            state.last_prompt_tokens = estimated_prompt;
-        }
+            estimated_prompt
+        };
+        let anchor_msg_len = state.messages.len();
+        state.last_prompt_tokens = anchor_tokens;
         if output.rate_limit.is_some() {
             state.rate_limit = output.rate_limit.clone();
         }
@@ -2230,6 +2226,10 @@ impl CodingHarness {
                 final_text: progress_text,
             };
         }
+
+        let tail = anchor_msg_len.min(state.messages.len());
+        let trailing = estimate_prompt_tokens(&state.messages[tail..]);
+        state.last_prompt_tokens = anchor_tokens.saturating_add(trailing);
 
         StepResult::Continue
     }
@@ -4049,6 +4049,14 @@ fn assemble_sections(sections: &BTreeMap<&'static str, String>) -> String {
 /// per-message overhead. Used as a floor for `last_prompt_tokens` so the context
 /// gauge and compaction don't depend on a provider/gateway's (sometimes bogus)
 /// reported input_tokens. Deliberately conservative; exactness isn't needed.
+fn tools_token_overhead(defs: &[NativeToolDefinition]) -> u64 {
+    let chars: usize = defs
+        .iter()
+        .map(|d| d.name.len() + d.description.len() + d.input_schema.to_string().len() + 8)
+        .sum();
+    (chars / 4) as u64
+}
+
 fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
     let mut chars: usize = 0;
     for m in messages {
