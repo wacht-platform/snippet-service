@@ -401,6 +401,9 @@ pub async fn run_serve(
         .route("/config/delegate", post(set_delegate))
         .route("/provider/models", post(provider_models))
         .route("/vault", get(vault_list).put(vault_set).delete(vault_delete))
+        .route("/xai/login", post(xai_login))
+        .route("/xai/status", get(xai_status))
+        .route("/xai/logout", post(xai_logout))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
         .route("/session/exec", post(exec_in_session))
@@ -960,6 +963,51 @@ struct VaultSetReq {
 }
 
 // GET /vault — secret NAMES only; values never leave the daemon.
+// POST /xai/login — begin the xAI device-code flow and poll for approval in the
+// background (saving the token on success). Returns the code + URL for the app to
+// show; the app then polls /xai/status until signed_in flips true.
+async fn xai_login(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::xai_auth::begin_device_code_login().await {
+        Ok(device) => {
+            let poll = device.clone();
+            tokio::spawn(async move {
+                if let Ok(tokens) = crate::xai_auth::poll_for_tokens(poll).await {
+                    let _ = crate::xai_auth::save_blocking(&tokens);
+                }
+            });
+            Json(serde_json::json!({
+                "user_code": device.user_code,
+                "verification_uri": device.verification_uri,
+                "expires_in": device.expires_in_s,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+// GET /xai/status — whether an xAI subscription token is stored.
+async fn xai_status(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(serde_json::json!({ "signed_in": crate::xai_auth::is_signed_in() })).into_response()
+}
+
+// POST /xai/logout — drop the stored xAI token.
+async fn xai_logout(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::xai_auth::logout_blocking() {
+        Ok(()) => Json(serde_json::json!({ "signed_in": false })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 async fn vault_list(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
