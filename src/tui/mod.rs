@@ -379,6 +379,12 @@ struct App {
     /// In-flight device-code *begin* task (fetches the code to display), polled in `tick`.
     chatgpt_device_begin_handle:
         Option<tokio::task::JoinHandle<Result<crate::chatgpt_auth::DeviceCodeInfo, String>>>,
+    /// xAI (Grok/X subscription) device-code sign-in — same shape as ChatGPT's.
+    xai_login_handle:
+        Option<tokio::task::JoinHandle<Result<crate::xai_auth::XaiTokens, String>>>,
+    xai_device_code: Option<crate::xai_auth::DeviceCodeInfo>,
+    xai_device_begin_handle:
+        Option<tokio::task::JoinHandle<Result<crate::xai_auth::DeviceCodeInfo, String>>>,
     models_fetch_status: String,
     original_config: Option<crate::config::SnippetConfig>,
     last_state_modified: Option<std::time::SystemTime>,
@@ -469,6 +475,9 @@ impl App {
             chatgpt_login_handle: None,
             chatgpt_device_code: None,
             chatgpt_device_begin_handle: None,
+            xai_login_handle: None,
+            xai_device_code: None,
+            xai_device_begin_handle: None,
             models_fetch_status: String::new(),
             update_notice: std::sync::Arc::new(std::sync::Mutex::new(None)),
             original_config: None,
@@ -1092,8 +1101,8 @@ impl App {
 
     /// Tab order of the login form fields (Base URL only for openai-compatible).
     fn login_focus_order(&self) -> Vec<SettingsField> {
-        // ChatGPT-subscription signs in via OAuth — no API key / base URL fields.
-        if self.form_provider == "chatgpt" {
+        // Subscription providers sign in via OAuth — no API key / base URL fields.
+        if self.form_provider == "chatgpt" || self.form_provider == "xai" {
             return vec![
                 SettingsField::Provider,
                 SettingsField::Model,
@@ -1287,6 +1296,11 @@ impl App {
             self.start_chatgpt_login(crate::chatgpt_auth::ChatGptLoginMethod::Browser);
             return;
         }
+        // xAI subscription — device-code sign-in, no API key.
+        if self.form_provider == "xai" {
+            self.start_xai_login();
+            return;
+        }
         if self.form_api_key.trim().is_empty() {
             self.form_focus = SettingsField::ApiKey;
             self.status = "An API key is required to connect.".to_string();
@@ -1388,6 +1402,55 @@ impl App {
                 );
             }
             Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Begin xAI (Grok/X subscription) sign-in — device-code only. Reuses an
+    /// existing sign-in; otherwise fetches a code (shown by `tick`) and polls.
+    fn start_xai_login(&mut self) {
+        if self.xai_login_handle.is_some() || self.xai_device_begin_handle.is_some() {
+            self.status = "xAI sign-in already in progress — finish the device-code flow first.".to_string();
+            return;
+        }
+        if crate::xai_auth::is_signed_in() {
+            self.finish_xai_login();
+            return;
+        }
+        self.xai_device_code = None;
+        self.status = "Starting xAI device-code sign-in…".to_string();
+        self.xai_device_begin_handle =
+            Some(tokio::spawn(async move { crate::xai_auth::begin_device_code_login().await }));
+    }
+
+    /// Persist the xai provider + model once signed in and connect.
+    fn finish_xai_login(&mut self) {
+        if self.form_model.trim().is_empty() {
+            self.form_model = "grok-4".to_string();
+        }
+        self.form_api_key = String::new();
+        self.form_base_url = String::new();
+        self.xai_device_code = None;
+        match self.save_settings_to_file() {
+            Ok(_) => {
+                self.close_login(false);
+                let resumed = self.restart_loop_for_config();
+                self.status = format!(
+                    "✓ Signed in to xAI — {}{}",
+                    self.options.config.model.model,
+                    if resumed { " · resumed" } else { "" },
+                );
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn logout_xai(&mut self) {
+        match crate::xai_auth::logout_blocking() {
+            Ok(()) => {
+                self.xai_device_code = None;
+                self.status = "Signed out of xAI".to_string();
+            }
+            Err(e) => self.status = format!("xAI sign-out failed: {e}"),
         }
     }
 
@@ -2373,6 +2436,56 @@ impl App {
             }
         }
 
+        // xAI device-code: the begin task fetched the code → show it and poll.
+        if self
+            .xai_device_begin_handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false)
+        {
+            let handle = self.xai_device_begin_handle.take().expect("checked is_some");
+            match handle.await {
+                Ok(Ok(info)) => {
+                    copy_to_clipboard(&info.user_code);
+                    self.status = format!(
+                        "Code {} copied — open {} and paste it. Waiting for sign-in…",
+                        info.user_code, info.verification_uri
+                    );
+                    let poll = info.clone();
+                    self.xai_device_code = Some(info);
+                    self.xai_login_handle = Some(tokio::spawn(async move {
+                        let tokens = crate::xai_auth::poll_for_tokens(poll).await?;
+                        crate::xai_auth::save_blocking(&tokens)?;
+                        Ok::<_, String>(tokens)
+                    }));
+                }
+                Ok(Err(error)) => self.status = format!("xAI device-code start failed: {error}"),
+                Err(error) => self.status = format!("xAI device-code task crashed: {error}"),
+            }
+        }
+        if self
+            .xai_login_handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false)
+        {
+            let handle = self.xai_login_handle.take().expect("checked is_some");
+            match handle.await {
+                Ok(Ok(_)) => {
+                    self.xai_device_code = None;
+                    self.finish_xai_login();
+                }
+                Ok(Err(error)) => {
+                    self.xai_device_code = None;
+                    self.status = format!("xAI sign-in failed: {error}");
+                }
+                Err(error) => {
+                    self.xai_device_code = None;
+                    self.status = format!("xAI sign-in task crashed: {error}");
+                }
+            }
+        }
+
         if self
             .agent
             .as_ref()
@@ -3028,6 +3141,16 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
             copy_to_clipboard(&url);
             app.status = "Copied sign-in URL to clipboard.".to_string();
         }
+        KeyCode::Char('c') if app.xai_device_code.is_some() => {
+            let code = app.xai_device_code.as_ref().unwrap().user_code.clone();
+            copy_to_clipboard(&code);
+            app.status = format!("Copied code {code} to clipboard.");
+        }
+        KeyCode::Char('u') if app.xai_device_code.is_some() => {
+            let url = app.xai_device_code.as_ref().unwrap().verification_uri.clone();
+            copy_to_clipboard(&url);
+            app.status = "Copied sign-in URL to clipboard.".to_string();
+        }
         KeyCode::Esc => {
             app.close_login(true);
             app.status = String::new();
@@ -3045,6 +3168,11 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
             && app.form_provider == "chatgpt" =>
         {
             app.logout_chatgpt();
+        }
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL)
+            && app.form_provider == "xai" =>
+        {
+            app.logout_xai();
         }
         KeyCode::Enter => app.login_connect(),
         KeyCode::Tab => app.login_move_focus(true),
@@ -4322,8 +4450,44 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         chooser(app.form_provider.clone(), p_focus, ""),
     ));
 
-    // ChatGPT-subscription signs in via OAuth — no API key / base URL.
-    if app.form_provider == "chatgpt" {
+    // xAI (Grok/X subscription) signs in via a device code — no API key / base URL.
+    if app.form_provider == "xai" {
+        let signed_in = crate::xai_auth::is_signed_in();
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("    xAI account", Style::default().fg(w).add_modifier(Modifier::BOLD)),
+            Span::styled("  ·  SuperGrok / X Premium subscription", Style::default().fg(dim)),
+        ]));
+        if signed_in {
+            lines.push(Line::from(Span::styled(
+                "    ✓ signed in".to_string(),
+                Style::default().fg(success()),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    Enter = use this account  ·  Ctrl-L = sign out".to_string(),
+                Style::default().fg(faint),
+            )));
+        } else if let Some(info) = &app.xai_device_code {
+            lines.push(Line::from(Span::styled(
+                format!("    Device code: {}", info.user_code),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("    Open {} to complete sign-in", info.verification_uri),
+                Style::default().fg(w),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    c = copy code  ·  u = copy URL".to_string(),
+                Style::default().fg(faint),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "    Enter = sign in with SuperGrok / X Premium".to_string(),
+                Style::default().fg(accent),
+            )));
+        }
+        lines.push(Line::from(""));
+    } else if app.form_provider == "chatgpt" {
         let signed_in = crate::chatgpt_auth::is_signed_in();
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
