@@ -1883,6 +1883,9 @@ pub struct MemoryPatternTool;
 
 #[derive(Debug, Deserialize)]
 struct MemoryPatternArgs {
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
     content: String,
 }
 
@@ -1892,20 +1895,20 @@ impl Tool for MemoryPatternTool {
         NativeToolDefinition {
             name: "memory_pattern".to_string(),
             description: "Save a REUSABLE PATTERN — a generalizable technique that transfers to ANY \
-                project, not a fact about this one. Each pattern is a tight line: the SITUATION it \
-                applies to → the APPROACH → briefly WHY. Examples: 'stuck async app (browser/REPL) → \
+                project, not a fact about this one. A pattern is ONE tight line: the SITUATION it \
+                applies to → the APPROACH → briefly WHY. Example: 'stuck async app (browser/REPL) → \
                 run it as one resident bg process, drive it step by step, tear down after — one-shot \
-                scripts lose all state on failure'; 'provider rejects a request setting → degrade it \
-                and retry, don't fail the run'. These are GLOBAL and always loaded into every \
-                session. This REPLACES the whole pattern list (they're all in your context under \
-                REUSABLE PATTERNS), so include every one you want to keep plus the new/updated one; \
-                fold a refinement into the matching pattern rather than adding a near-duplicate. \
-                Empty content clears them. Patterns are cross-project techniques; use memory_rule for \
-                always-obey directives and memory_write for facts/playbooks about THIS workspace."
+                scripts lose all state on failure'. Patterns are GLOBAL and always loaded into every \
+                session (yours are under REUSABLE PATTERNS). action='add' (default) appends one new \
+                pattern — other sessions also write here, so never rewrite the list just to add. \
+                Refining or merging existing patterns → action='replace' with the full curated list. \
+                action='clear' wipes them. Use memory_rule for always-obey directives and \
+                memory_write for facts/playbooks about THIS workspace."
                 .to_string(),
             input_schema: object_schema(
                 json!({
-                    "content": {"type": "string", "description": "the full reusable-pattern list (markdown bullets), each: situation → approach → why"}
+                    "action": {"type": "string", "enum": ["add", "replace", "clear"], "description": "add (default): append one pattern line; replace: rewrite the full list (consolidation only); clear: remove all"},
+                    "content": {"type": "string", "description": "add: one pattern line (situation → approach → why); replace: the full pattern list"}
                 }),
                 &["content"],
             ),
@@ -1915,10 +1918,28 @@ impl Tool for MemoryPatternTool {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         require_main_owner(ctx)?;
         let args: MemoryPatternArgs = expect_object("memory_pattern", arguments)?;
-        crate::memory::MemoryStore::global()
-            .write_patterns(&args.content, crate::memory::patterns_budget())
-            .map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({ "saved": true })))
+        let store = crate::memory::MemoryStore::global();
+        let budget = crate::memory::patterns_budget();
+        match args.action.as_deref().unwrap_or("add") {
+            "add" => {
+                let added = store.add_pattern(&args.content, budget).map_err(ToolError::msg)?;
+                Ok(ToolResult::success(json!({
+                    "saved": added,
+                    "note": if added { "pattern added" } else { "identical pattern already stored" },
+                })))
+            }
+            "replace" => {
+                store.write_patterns(&args.content, budget).map_err(ToolError::msg)?;
+                Ok(ToolResult::success(json!({ "saved": true, "note": "pattern list replaced" })))
+            }
+            "clear" => {
+                store.write_patterns("", budget).map_err(ToolError::msg)?;
+                Ok(ToolResult::success(json!({ "saved": true, "note": "patterns cleared" })))
+            }
+            other => Err(ToolError::msg(format!(
+                "action must be add, replace, or clear — got '{other}'"
+            ))),
+        }
     }
 }
 

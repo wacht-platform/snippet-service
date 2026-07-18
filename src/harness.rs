@@ -3368,12 +3368,13 @@ impl CodingHarness {
                 }
                 "memory_pattern" => {
                     let content = arg_str("content");
-                    feedback = match global.write_patterns(&content, crate::memory::patterns_budget()) {
-                        Ok(()) => {
+                    feedback = match global.add_pattern(&content, crate::memory::patterns_budget()) {
+                        Ok(true) => {
                             writes += 1;
-                            self.debug_log("memory reflection: updated global patterns");
-                            "reusable patterns updated. If nothing else remains, finalize.".to_string()
+                            self.debug_log("memory reflection: added global pattern");
+                            "pattern added. If nothing else remains, finalize.".to_string()
                         }
+                        Ok(false) => "identical pattern already stored — don't re-add it; finalize if done.".to_string(),
                         Err(e) => e,
                     };
                 }
@@ -3908,7 +3909,7 @@ purpose = "carry forward what helps FUTURE sessions — in THIS folder (facts/pl
 
 [what_to_keep]
 durable = "workspace scope: stable facts (architecture, where things live, conventions), pointers to key files, and how-to PLAYBOOKS for recurring tasks here (steps that worked + gotchas)"
-patterns = "GLOBAL scope: a generalizable TECHNIQUE this session demonstrated that transfers to any project — situation → approach → why. Save via memory_pattern (include existing patterns + the new/refined one). This is the reusable, cross-project knowledge; extract it whenever the session showed a technique worth reapplying, not just a project fact."
+patterns = "GLOBAL scope: a generalizable TECHNIQUE this session demonstrated that transfers to any project — one line, situation → approach → why. APPEND it with memory_pattern; skip when an existing pattern already covers it. Extract one whenever the session showed a technique worth reapplying anywhere, not just a project fact."
 learning = "when this session revealed a better way or a pitfall, fold it into the relevant playbook (workspace) or pattern (global) so next time is faster"
 skip = "ephemeral task state, one-off details, and anything already obvious from the code — that belongs in the session table, not here"
 
@@ -3967,10 +3968,10 @@ fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
         },
         NativeToolDefinition {
             name: "memory_pattern".to_string(),
-            description: "Replace the GLOBAL reusable-pattern list: generalizable techniques (situation → approach → why) that transfer to ANY project, not facts about this workspace. Include the existing patterns plus any new/refined one; keep each tight.".to_string(),
+            description: "APPEND one GLOBAL reusable pattern: a generalizable technique (one line: situation → approach → why) that transfers to ANY project — not a fact about this workspace. Skip it if an existing pattern already covers the technique.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": { "content": { "type": "string" } },
+                "properties": { "content": { "type": "string", "description": "one pattern line: situation → approach → why" } },
                 "required": ["content"],
                 "additionalProperties": false
             }),

@@ -112,6 +112,39 @@ impl MemoryStore {
         fs::read_to_string(self.patterns_path()).unwrap_or_default()
     }
 
+    pub fn add_pattern(&self, line: &str, budget: usize) -> Result<bool, String> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Err("pattern is empty".to_string());
+        }
+        if line.lines().count() > 1 {
+            return Err("add one pattern per call (a single line: situation → approach → why)".to_string());
+        }
+        let current = self.read_patterns();
+        if current.lines().any(|l| l.trim() == line) {
+            return Ok(false);
+        }
+        let new_len = current.chars().count() + line.chars().count() + 1;
+        if new_len > budget {
+            return Err(format!(
+                "patterns would be {} chars over the {budget}-char budget — consolidate first with action='replace' (merge overlapping patterns, drop the least reusable)",
+                new_len - budget
+            ));
+        }
+        if let Some(dir) = self.patterns_path().parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.patterns_path())
+            .map_err(|e| e.to_string())?;
+        let sep = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
+        f.write_all(format!("{sep}{line}\n").as_bytes()).map_err(|e| e.to_string())?;
+        Ok(true)
+    }
+
     pub fn write_patterns(&self, content: &str, budget: usize) -> Result<(), String> {
         let len = content.chars().count();
         if len > budget {
