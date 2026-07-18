@@ -287,7 +287,17 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             marker_block("↳", accent(), &strip_attachment_markers(text), width)
         }
         HarnessEvent::AssistantText { text } => indent_block(render_prose(text, width.saturating_sub(SPINE)), SPINE),
-        HarnessEvent::Note { entry } => marker_block("✎", muted(), entry, width),
+        HarnessEvent::Note { entry } => {
+            // The agent's private scratchpad — recede it (faint + italic) so it
+            // reads as a quiet aside, not content on par with the answer.
+            let mut lines = marker_block("✎", faint(), entry, width);
+            for line in &mut lines {
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(Modifier::ITALIC | Modifier::DIM);
+                }
+            }
+            lines
+        }
         HarnessEvent::FilePresented { path, caption } => {
             let text = match caption {
                 Some(c) => format!("{path} — {c}"),
@@ -372,7 +382,9 @@ pub(super) fn strip_attachment_markers(text: &str) -> String {
 
 pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     let cleaned = strip_attachment_markers(text);
-    let body = Style::default().fg(self::text());
+    // Your messages are the brightest, boldest text — the conversation's spine, so
+    // your questions stand out from the agent's replies at a glance.
+    let body = Style::default().fg(self::text()).add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line<'static>> = wrap_one(&cleaned, width.saturating_sub(SPINE))
         .into_iter()
         .map(|seg| Line::from(vec![Span::raw(" ".repeat(SPINE)), Span::styled(seg, body)]))

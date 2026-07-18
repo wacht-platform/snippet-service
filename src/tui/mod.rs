@@ -290,6 +290,10 @@ struct App {
     /// appended to the message on send. Tuple: (is_image, absolute_path, filename).
     attachments: Vec<(bool, String, String)>,
     status: String,
+    /// Auto-dismiss bookkeeping for the transient status line: when it changes we
+    /// stamp `status_since`, and `tick` clears the message a few seconds later.
+    status_shown: String,
+    status_since: Option<std::time::Instant>,
     /// Set by the startup self-update task to the version it installed; shown in
     /// the header as a "restart to apply" hint.
     update_notice: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -430,6 +434,8 @@ impl App {
             pasted_blocks: Vec::new(),
             attachments: Vec::new(),
             status,
+            status_shown: String::new(),
+            status_since: None,
             error: None,
             state: None,
             agent: None,
@@ -2323,6 +2329,20 @@ impl App {
     async fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.refresh_state().await;
+
+        // Transient status line auto-dismisses: stamp it when it changes, clear it
+        // a few seconds later so confirmations ("✓ … resumed") don't linger.
+        if self.status != self.status_shown {
+            self.status_shown = self.status.clone();
+            self.status_since = (!self.status.is_empty()).then(std::time::Instant::now);
+        }
+        if let Some(since) = self.status_since {
+            if since.elapsed() > Duration::from_secs(4) {
+                self.status.clear();
+                self.status_shown.clear();
+                self.status_since = None;
+            }
+        }
 
         // Refresh the account-wide ChatGPT usage a few times a second (tiny file,
         // signed-in users only) so the footer figure is global, not per-chat.
