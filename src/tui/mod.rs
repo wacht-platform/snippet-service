@@ -1139,7 +1139,9 @@ impl App {
         // Keyless endpoints are legitimate for openai-compatible (local Ollama,
         // LM Studio…): fetch on a base_url alone there; other providers need a key.
         let can_fetch = !self.form_api_key.trim().is_empty()
-            || (provider_needs_base_url(&self.form_provider) && !self.form_base_url.trim().is_empty());
+            || (provider_needs_base_url(&self.form_provider) && !self.form_base_url.trim().is_empty())
+            // xAI has no key/base URL — fetch once signed in via the subscription.
+            || (self.form_provider == "xai" && crate::xai_auth::is_signed_in());
         if self.form_focus == SettingsField::Model
             && self.form_fetched_models.is_none()
             && can_fetch
@@ -4911,6 +4913,34 @@ async fn fetch_models_from_provider(
                 req = req.bearer_auth(api_key);
             }
             let res = req.send().await.map_err(|e| e.to_string())?;
+            if !res.status().is_success() {
+                return Err(format!("HTTP status {}", res.status()));
+            }
+            let data: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            let mut models = Vec::new();
+            if let Some(arr) = data.get("data").and_then(|d| d.as_array()) {
+                for item in arr {
+                    if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                        models.push(id.to_string());
+                    }
+                }
+            }
+            models.sort();
+            if models.is_empty() {
+                return Err("No models found".to_string());
+            }
+            Ok(models)
+        }
+        "xai" => {
+            let token = crate::xai_auth::access_token()
+                .await
+                .map_err(|e| format!("sign in to xAI first: {e}"))?;
+            let res = client
+                .get("https://api.x.ai/v1/models")
+                .bearer_auth(token)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             if !res.status().is_success() {
                 return Err(format!("HTTP status {}", res.status()));
             }
