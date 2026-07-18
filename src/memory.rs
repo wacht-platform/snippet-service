@@ -19,13 +19,19 @@ use std::path::{Path, PathBuf};
 const MEMORY_DIRNAME: &str = "memory";
 const INDEX_FILE: &str = "index.md";
 const RULES_FILE: &str = "rules.md";
+const PATTERNS_FILE: &str = "patterns.md";
 const ENTRIES_DIR: &str = "entries";
 const MAX_ID_LEN: usize = 64;
+const PATTERNS_BUDGET_CHARS: usize = 5_000;
+
+pub fn patterns_budget() -> usize {
+    PATTERNS_BUDGET_CHARS
+}
 /// Standing rules are injected verbatim into EVERY session, so they're hard-capped
 /// small (not user-tunable) — they're directives, not a knowledge store.
 const RULES_BUDGET_CHARS: usize = 2_000;
 
-const BLOCK_HEADER: &str = "[workspace_memory]\nDurable memory for this work, built across sessions. STANDING RULES are always in force — follow them in every reply. The REFERENCE INDEX points to fuller entries you load on demand with memory_read(id). Maintain rules with memory_rule, entries with memory_write, the index with memory_index. Verify a load-bearing detail against the live code before relying on it.";
+const BLOCK_HEADER: &str = "[workspace_memory]\nDurable memory built across sessions. STANDING RULES are always in force — follow them in every reply. REUSABLE PATTERNS are cross-project techniques — apply the fitting one instead of re-deriving. The REFERENCE INDEX points to fuller entries you load on demand with memory_read(id). Maintain rules with memory_rule, patterns with memory_pattern, entries with memory_write, the index with memory_index. Verify a load-bearing detail against the live code before relying on it.";
 
 const EMPTY_BLOCK: &str = "[workspace_memory]\n(empty) — no durable memory yet. As you learn how this project is built, its conventions and gotchas, or how to do recurring tasks here, save them with memory_write(id, content) plus a pointer line via memory_index. For an always-followed directive (e.g. a user preference like 'in emails, don't use dashes'), use memory_rule(scope, content): scope='global' applies in every workspace, 'workspace' only here. Entries load on demand via memory_read(id).";
 
@@ -96,6 +102,29 @@ impl MemoryStore {
 
     fn rules_path(&self) -> PathBuf {
         self.root.join(RULES_FILE)
+    }
+
+    fn patterns_path(&self) -> PathBuf {
+        self.root.join(PATTERNS_FILE)
+    }
+
+    pub fn read_patterns(&self) -> String {
+        fs::read_to_string(self.patterns_path()).unwrap_or_default()
+    }
+
+    pub fn write_patterns(&self, content: &str, budget: usize) -> Result<(), String> {
+        let len = content.chars().count();
+        if len > budget {
+            return Err(format!(
+                "patterns are {} chars over the {budget}-char budget — keep each pattern to a tight situation → technique → why; drop the least-reusable ones",
+                len - budget
+            ));
+        }
+        if content.trim().is_empty() {
+            let _ = fs::remove_file(self.patterns_path());
+            return Ok(());
+        }
+        write_atomic(&self.patterns_path(), content)
     }
 
     fn entries_dir(&self) -> PathBuf {
@@ -261,14 +290,22 @@ fn combined_rules(workspace_root: &Path) -> Option<String> {
 /// REFERENCE INDEX. Returns the empty hint when there's nothing at all yet.
 pub fn render_session_memory(workspace_root: &Path, index_budget: usize) -> Option<String> {
     let rules = combined_rules(workspace_root);
+    let patterns = {
+        let p = MemoryStore::global().read_patterns();
+        (!p.trim().is_empty()).then(|| p.trim().to_string())
+    };
     let index = MemoryStore::for_workspace(workspace_root).index_body(index_budget);
-    if rules.is_none() && index.is_none() {
+    if rules.is_none() && patterns.is_none() && index.is_none() {
         return Some(EMPTY_BLOCK.to_string());
     }
     let mut out = String::from(BLOCK_HEADER);
     if let Some(r) = rules {
         out.push_str("\n\nSTANDING RULES — always follow these, in every reply (global + this folder):\n");
         out.push_str(&r);
+    }
+    if let Some(p) = patterns {
+        out.push_str("\n\nREUSABLE PATTERNS — techniques learned across projects; apply the fitting one instead of re-deriving, adapt as needed:\n");
+        out.push_str(&p);
     }
     if let Some(i) = index {
         out.push_str("\n\nREFERENCE INDEX — load an entry with memory_read(id):\n");

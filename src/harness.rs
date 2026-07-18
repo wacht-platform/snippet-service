@@ -3286,9 +3286,10 @@ impl CodingHarness {
         // every main-session compaction (was 8, then 5). Reflection should converge
         // in 1–2 writes; a higher cap just let the model re-save the same entry
         // over and over until it timed out on the cap.
-        const MAX_TURNS: usize = 3;
+        const MAX_TURNS: usize = 4;
 
         let store = crate::memory::MemoryStore::for_workspace(self.context.workspace_root());
+        let global = crate::memory::MemoryStore::global();
         let index_budget = self.config.memory_index_budget_chars;
         let entry_budget = self.config.memory_entry_budget_chars;
         let max_entries = self.config.memory_max_entries;
@@ -3305,10 +3306,12 @@ impl CodingHarness {
         for turn in 1..=MAX_TURNS {
             let index = store.read_index();
             let entries = store.list_entries();
+            let patterns = global.read_patterns();
             let user = format!(
-                "WORKSPACE: {ws}\n\nWHAT JUST HAPPENED (compacted session table):\n{summary_table}\n\nCURRENT MEMORY INDEX:\n{index}\n\nEXISTING ENTRIES: {entries}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS} · {writes} write(s) so far. Make exactly one tool call. Capture what helps a FUTURE session here — the reusable PROCEDURE(s)/playbook(s) this session showed (steps that worked + gotchas) and any durable FACTS/pointers. Write each distinct thing ONCE with memory_write; NEVER re-save or 'polish' an entry you already wrote this pass. Once the durable value is captured (usually 1–2 writes) and the index points to it, call finalize. Only finalize with nothing written if the session was genuinely trivial.",
+                "WORKSPACE: {ws}\n\nWHAT JUST HAPPENED (compacted session table):\n{summary_table}\n\nCURRENT MEMORY INDEX:\n{index}\n\nEXISTING ENTRIES: {entries}\n\nCURRENT REUSABLE PATTERNS (global):\n{patterns}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS} · {writes} write(s) so far. Make exactly one tool call. Capture what helps a FUTURE session: (a) workspace FACTS/pointers and how-to PLAYBOOK(s) for THIS project via memory_write; (b) any GENERALIZABLE PATTERN this session demonstrated — a reusable technique (situation → approach → why) that would help in ANY project — via memory_pattern (include the existing patterns plus the new/refined one). Write each distinct thing ONCE; NEVER re-save or 'polish' something you already wrote this pass. Once the durable value is captured (usually 1–2 writes) and the index points to workspace entries, call finalize. Only finalize with nothing written if the session was genuinely trivial.",
                 index = if index.trim().is_empty() { "(empty)".to_string() } else { index },
                 entries = if entries.is_empty() { "(none)".to_string() } else { entries.join(", ") },
+                patterns = if patterns.trim().is_empty() { "(none yet)".to_string() } else { patterns },
                 writes = writes,
             );
             let messages = vec![
@@ -3360,6 +3363,17 @@ impl CodingHarness {
                     let id = arg_str("id");
                     feedback = match store.delete_entry(&id) {
                         Ok(()) => format!("entry `{id}` deleted"),
+                        Err(e) => e,
+                    };
+                }
+                "memory_pattern" => {
+                    let content = arg_str("content");
+                    feedback = match global.write_patterns(&content, crate::memory::patterns_budget()) {
+                        Ok(()) => {
+                            writes += 1;
+                            self.debug_log("memory reflection: updated global patterns");
+                            "reusable patterns updated. If nothing else remains, finalize.".to_string()
+                        }
                         Err(e) => e,
                     };
                 }
@@ -3888,13 +3902,14 @@ const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
 
 const MEMORY_REFLECTOR_SYSTEM: &str = r#"# memory_reflector
 [identity]
-role = "worker that curates a coding agent's PERSISTENT, per-workspace memory"
-input = "each turn: the workspace path, a compacted table of the session that just ran, the current memory index, the existing entry ids, your last tool result, and the turn counter"
-purpose = "carry forward only what will help FUTURE sessions in THIS exact folder"
+role = "worker that curates a coding agent's PERSISTENT memory — per-workspace facts/playbooks AND a global library of reusable patterns"
+input = "each turn: the workspace path, a compacted table of the session that just ran, the current memory index, the existing entry ids, the current global patterns, your last tool result, and the turn counter"
+purpose = "carry forward what helps FUTURE sessions — in THIS folder (facts/playbooks) and in ANY project (reusable patterns)"
 
 [what_to_keep]
-durable = "stable facts (architecture, where things live, conventions), pointers to key files/resources, and how-to PLAYBOOKS for recurring tasks (the steps that worked + the gotchas)"
-learning = "when this session revealed a better way or a pitfall, fold it into the relevant playbook so next time is faster"
+durable = "workspace scope: stable facts (architecture, where things live, conventions), pointers to key files, and how-to PLAYBOOKS for recurring tasks here (steps that worked + gotchas)"
+patterns = "GLOBAL scope: a generalizable TECHNIQUE this session demonstrated that transfers to any project — situation → approach → why. Save via memory_pattern (include existing patterns + the new/refined one). This is the reusable, cross-project knowledge; extract it whenever the session showed a technique worth reapplying, not just a project fact."
+learning = "when this session revealed a better way or a pitfall, fold it into the relevant playbook (workspace) or pattern (global) so next time is faster"
 skip = "ephemeral task state, one-off details, and anything already obvious from the code — that belongs in the session table, not here"
 
 [how]
@@ -3949,6 +3964,16 @@ fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
             name: "memory_delete".to_string(),
             description: "Delete an entry by id (also drop its line from the index).".to_string(),
             input_schema: id_schema,
+        },
+        NativeToolDefinition {
+            name: "memory_pattern".to_string(),
+            description: "Replace the GLOBAL reusable-pattern list: generalizable techniques (situation → approach → why) that transfer to ANY project, not facts about this workspace. Include the existing patterns plus any new/refined one; keep each tight.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "content": { "type": "string" } },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
         },
         NativeToolDefinition {
             name: "finalize".to_string(),
