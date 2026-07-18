@@ -188,7 +188,13 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        let rendered = event_lines(event, content_w);
+        // A lane's final report can be a whole page of text; render it collapsed to
+        // a short preview unless the user has expanded lane output (Ctrl-O).
+        let rendered = if let HarnessEvent::LaneCompleted { id, title, status, summary } = event {
+            lane_completed_lines(id, title, *status, summary.as_deref(), content_w, app.lanes_expanded)
+        } else {
+            event_lines(event, content_w)
+        };
         if rendered.is_empty() {
             continue;
         }
@@ -344,7 +350,7 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             title,
             status,
             summary,
-        } => lane_completed_lines(id, title, *status, summary.as_deref(), width),
+        } => lane_completed_lines(id, title, *status, summary.as_deref(), width, false),
         HarnessEvent::ToolCall {
             tool_name,
             arguments,
@@ -500,12 +506,18 @@ pub(super) fn marker_block(
     lines
 }
 
+/// Lines shown from a completed lane's report before it's collapsed. A delegated
+/// agent's final message is often a full page; the transcript shows this many
+/// lines with a "+N more · ^O" hint until the user expands (`expanded`).
+const LANE_PREVIEW_LINES: usize = 3;
+
 pub(super) fn lane_completed_lines(
     id: &str,
     title: &str,
     status: LaneStatus,
     summary: Option<&str>,
     width: usize,
+    expanded: bool,
 ) -> Vec<Line<'static>> {
     let (tag, color) = match status {
         LaneStatus::Completed => ("done", success()),
@@ -524,10 +536,20 @@ pub(super) fn lane_completed_lines(
         Span::styled(format!("[{tag}]"), Style::default().fg(color)),
     ])];
     if let Some(summary) = summary.filter(|s| !s.trim().is_empty()) {
-        lines.extend(result_block(
-            vec![(summary.to_string(), subtle())],
-            width,
-        ));
+        let body = result_block(vec![(summary.to_string(), subtle())], width);
+        if expanded || body.len() <= LANE_PREVIEW_LINES {
+            lines.extend(body);
+        } else {
+            let hidden = body.len() - LANE_PREVIEW_LINES;
+            lines.extend(body.into_iter().take(LANE_PREVIEW_LINES));
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(AGENT)),
+                Span::styled(
+                    format!("… +{hidden} more line{} · ^O to expand", if hidden == 1 { "" } else { "s" }),
+                    Style::default().fg(faint()).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
     }
     lines
 }

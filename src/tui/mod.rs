@@ -294,6 +294,10 @@ struct App {
     /// stamp `status_since`, and `tick` clears the message a few seconds later.
     status_shown: String,
     status_since: Option<std::time::Instant>,
+    /// When true, completed delegation lanes show their full result inline;
+    /// otherwise the transcript shows a short preview with a "press ^O" hint so a
+    /// lane's verbose final report doesn't flood the screen. Toggled with Ctrl-O.
+    lanes_expanded: bool,
     /// Set by the startup self-update task to the version it installed; shown in
     /// the header as a "restart to apply" hint.
     update_notice: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -436,6 +440,7 @@ impl App {
             status,
             status_shown: String::new(),
             status_since: None,
+            lanes_expanded: false,
             error: None,
             state: None,
             agent: None,
@@ -2709,6 +2714,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             // Paste a screenshot from the clipboard (macOS) as an attached image.
             KeyCode::Char('v') => {
                 app.paste_clipboard_image();
+                return;
+            }
+            // Expand / collapse the full output of completed delegation lanes.
+            KeyCode::Char('o') => {
+                app.lanes_expanded = !app.lanes_expanded;
+                app.status = if app.lanes_expanded {
+                    "lane output expanded".to_string()
+                } else {
+                    "lane output collapsed".to_string()
+                };
                 return;
             }
             // Cancel messages queued for after the current run.
