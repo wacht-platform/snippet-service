@@ -212,14 +212,12 @@ pub(super) fn render_md_table(
     // shrinking the widest columns first when they don't fit.
     let sep_total = 3 * ncols.saturating_sub(1);
     let avail = width.saturating_sub(sep_total).max(ncols * 3);
-    let natural_sum: usize = natural.iter().sum::<usize>().max(1);
-    let widths: Vec<usize> = if natural_sum <= avail {
-        natural.clone()
-    } else {
-        let mut w: Vec<usize> = natural
-            .iter()
-            .map(|&n| (n * avail / natural_sum).max(3))
-            .collect();
+    // Water-fill: start from natural widths and only ever shave the single widest
+    // column. Narrow columns keep their full width until every column is as wide,
+    // so a giant column wrapping doesn't force short ones (e.g. `oauth-relay`) to
+    // wrap a character early.
+    let widths: Vec<usize> = {
+        let mut w = natural.clone();
         let mut total: usize = w.iter().sum();
         while total > avail {
             let idx = (0..ncols).max_by_key(|&i| w[i]).unwrap_or(0);
