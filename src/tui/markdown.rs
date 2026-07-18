@@ -72,6 +72,14 @@ pub(super) fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
             i += 1;
             continue;
         }
+        if is_thematic_break(trimmed) {
+            out.push(Line::from(Span::styled(
+                "─".repeat(width.max(1)),
+                Style::default().fg(faint()),
+            )));
+            i += 1;
+            continue;
+        }
         if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
             let runs = parse_inline_md(rest, base);
             let mut bullet = wrap_runs(runs, width.saturating_sub(2));
@@ -164,10 +172,23 @@ pub(super) fn render_md_table(
     body: &[Vec<String>],
     width: usize,
 ) -> Vec<Line<'static>> {
-    let ncols = header
-        .len()
-        .max(body.iter().map(|r| r.len()).max().unwrap_or(0))
-        .max(1);
+    // The header/delimiter row is authoritative for column count (GFM). A ragged
+    // body row with extra cells folds its overflow back into the last column so a
+    // single malformed row can't explode the whole table into empty columns.
+    let ncols = header.len().max(1);
+    let body: Vec<Vec<String>> = body
+        .iter()
+        .map(|row| {
+            if row.len() > ncols {
+                let mut r: Vec<String> = row[..ncols - 1].to_vec();
+                r.push(row[ncols - 1..].join(" "));
+                r
+            } else {
+                row.clone()
+            }
+        })
+        .collect();
+    let body = &body[..];
     let header_style = Style::default().fg(self::text()).add_modifier(Modifier::BOLD);
     let body_style = Style::default().fg(self::text());
     let faint = Style::default().fg(faint());
@@ -254,6 +275,25 @@ pub(super) fn render_md_table(
         out.extend(render_row(row, false));
     }
     out
+}
+
+/// A thematic break (`---`, `***`, `___`): three or more of a single marker
+/// char, spaces allowed between. Rendered as a horizontal rule.
+pub(super) fn is_thematic_break(line: &str) -> bool {
+    let t = line.trim();
+    let marker = match t.chars().next() {
+        Some(c @ ('-' | '*' | '_')) => c,
+        _ => return false,
+    };
+    let mut count = 0;
+    for ch in t.chars() {
+        if ch == marker {
+            count += 1;
+        } else if ch != ' ' {
+            return false;
+        }
+    }
+    count >= 3
 }
 
 pub(super) fn heading_text(line: &str) -> Option<&str> {
