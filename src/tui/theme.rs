@@ -21,6 +21,18 @@ pub(super) struct ThemePreset {
     pub(super) theme: Theme,
 }
 
+pub(super) const TERMINAL_INK: Theme = Theme {
+    accent: Color::Rgb(224, 164, 88),
+    text: Color::Rgb(232, 236, 234),
+    muted: Color::Rgb(170, 178, 174),
+    faint: Color::Rgb(108, 115, 112),
+    success: Color::Rgb(123, 196, 154),
+    danger: Color::Rgb(232, 106, 106),
+    warn: Color::Rgb(224, 164, 88),
+    lane: Color::Rgb(122, 180, 190),
+    code: Color::Rgb(224, 196, 132),
+};
+
 pub(super) const MIDNIGHT: Theme = Theme {
     accent: Color::Rgb(96, 165, 250),
     text: Color::Rgb(222, 225, 230),
@@ -142,6 +154,7 @@ pub(super) const SOLARIZED: Theme = Theme {
 };
 
 pub(super) const PRESETS: &[ThemePreset] = &[
+    ThemePreset { name: "terminal-ink", label: "Terminal Ink (amber)", theme: TERMINAL_INK },
     ThemePreset { name: "midnight", label: "Midnight (dark)", theme: MIDNIGHT },
     ThemePreset { name: "light", label: "Light", theme: LIGHT },
     ThemePreset { name: "high-contrast", label: "High-contrast", theme: HIGH_CONTRAST },
@@ -160,7 +173,7 @@ pub(super) fn theme() -> Theme {
     PRESETS
         .get(THEME_INDEX.load(Ordering::Relaxed))
         .map(|p| p.theme)
-        .unwrap_or(MIDNIGHT)
+        .unwrap_or(TERMINAL_INK)
 }
 
 pub(super) fn set_theme_index(i: usize) {

@@ -58,6 +58,9 @@ enum Command {
         #[arg(long, hide = true)]
         supervised: bool,
     },
+    /// Internal: dump a sample transcript to stdout for design review.
+    #[command(hide = true)]
+    RenderPreview,
     /// Manage the secret vault (~/.snippet/vault.json). Secrets are usable by the
     /// agent as $NAME in shell commands; values are injected into the child
     /// process and redacted from everything the model sees.
@@ -65,6 +68,51 @@ enum Command {
         #[command(subcommand)]
         action: VaultAction,
     },
+    /// Sign in to xAI with a SuperGrok / X Premium subscription to use Grok models
+    /// (device-code OAuth). Then add a profile with provider = "xai".
+    Xai {
+        #[command(subcommand)]
+        action: XaiAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum XaiAction {
+    /// Sign in via the browser device-code flow.
+    Login,
+    /// Sign out (remove the stored token).
+    Logout,
+    /// Show whether you're signed in.
+    Status,
+}
+
+fn xai_cli(action: XaiAction) -> Result<(), Box<dyn std::error::Error>> {
+    use snippet::xai_auth;
+    match action {
+        XaiAction::Status => {
+            println!("{}", if xai_auth::is_signed_in() { "signed in to xAI" } else { "not signed in — run `snippet xai login`" });
+            Ok(())
+        }
+        XaiAction::Logout => {
+            xai_auth::logout_blocking()?;
+            println!("✓ signed out of xAI");
+            Ok(())
+        }
+        XaiAction::Login => {
+            let rt = runtime()?;
+            rt.block_on(async {
+                let device = xai_auth::begin_device_code_login().await?;
+                println!("\n  To sign in, open:\n\n    {}\n", device.verification_uri);
+                println!("  and enter the code:  {}\n", device.user_code);
+                println!("  Waiting for authorization…");
+                let tokens = xai_auth::poll_for_tokens(device).await?;
+                xai_auth::save_blocking(&tokens)?;
+                println!("\n✓ signed in to xAI. Add a model profile with provider = \"xai\" (e.g. model = grok-4).");
+                Ok::<(), String>(())
+            })?;
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -165,7 +213,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_path(&cli);
 
     match cli.command {
+        Some(Command::RenderPreview) => {
+            println!("{}", snippet::tui::transcript::preview_transcript(64));
+            return Ok(());
+        }
         Some(Command::Vault { action }) => return vault_cli(action),
+        Some(Command::Xai { action }) => return xai_cli(action),
         Some(Command::Serve {
             port,
             token,

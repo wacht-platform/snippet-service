@@ -33,6 +33,10 @@ pub struct OpenAiCompatibleConfig {
     /// stream-only providers (e.g. NVIDIA NIM MiniMax) work on the buffered
     /// serve/app/lanes path instead of returning an empty non-streaming completion.
     pub stream: bool,
+    /// Authenticate with the xAI (Grok/X) subscription: before each request the
+    /// stored OAuth token is loaded and refreshed if stale, then used as the
+    /// bearer key. `api_key` is ignored when this is set.
+    pub oauth_xai: bool,
 }
 
 /// Default UA for OpenAI-compatible endpoints. Mirrors Claude Code's
@@ -82,7 +86,11 @@ impl OpenAiCompatibleModel {
 #[async_trait]
 impl AgentModel for OpenAiCompatibleModel {
     fn is_configured(&self) -> bool {
-        !self.config.api_key.trim().is_empty()
+        if self.config.oauth_xai {
+            crate::xai_auth::is_signed_in()
+        } else {
+            !self.config.api_key.trim().is_empty()
+        }
     }
 
     fn swap_reasoning_effort(&mut self, effort: Option<String>) -> Option<String> {
@@ -100,6 +108,14 @@ impl AgentModel for OpenAiCompatibleModel {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
+        // xAI subscription: pull a fresh (auto-refreshed) OAuth token per request
+        // and use it as the bearer key. Runs only when signed in via `xai login`.
+        if self.config.oauth_xai {
+            match crate::xai_auth::access_token().await {
+                Ok(token) => self.config.api_key = token,
+                Err(e) => return Err(ToolError::model_request(e, false)),
+            }
+        }
         let url = openai_chat_url(&self.config.base_url);
         // Stream when there's a live sink (interactive) or when the profile forces it
         // (stream-only providers like NVIDIA NIM MiniMax). A buffered caller with no

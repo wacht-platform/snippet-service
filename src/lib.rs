@@ -28,6 +28,7 @@ pub mod tools;
 pub mod tui;
 pub mod update;
 pub mod vault;
+pub mod xai_auth;
 pub mod watches;
 
 pub use harness::{

@@ -434,6 +434,15 @@ impl ModelConfig {
                     max_retry_ms: self.max_retry_ms,
                 }))
             }
+            "xai" | "grok" => {
+                let mut config: OpenAiCompatibleConfig = self.clone().into();
+                config.base_url = "https://api.x.ai/v1".to_string();
+                config.oauth_xai = true;
+                if config.model.is_empty() {
+                    config.model = "grok-4".to_string();
+                }
+                Box::new(OpenAiCompatibleModel::new(config))
+            }
             _ => {
                 Box::new(OpenAiCompatibleModel::new(self.clone().into()))
             }
@@ -455,6 +464,7 @@ impl From<ModelConfig> for OpenAiCompatibleConfig {
             supports_images: value.supports_images,
             reasoning_effort: value.reasoning_effort,
             stream: value.stream,
+            oauth_xai: false,
         }
     }
 }
@@ -478,6 +488,7 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
     "gemini",
     "openrouter",
     "chatgpt",
+    "xai",
 ];
 
 pub fn provider_supported(provider: &str) -> bool {

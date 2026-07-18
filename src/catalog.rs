@@ -62,6 +62,14 @@ pub async fn fetch_models(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String
             c.base_url = "https://openrouter.ai/api/v1".to_string();
             fetch_openai_compatible(&c).await
         }
+        "xai" | "grok" => {
+            let mut c = cfg.clone();
+            c.base_url = "https://api.x.ai/v1".to_string();
+            if let Ok(token) = crate::xai_auth::access_token().await {
+                c.api_key = token;
+            }
+            fetch_openai_compatible(&c).await
+        }
         "gemini" => fetch_gemini(cfg).await,
         // Codex subscription backend has no models endpoint.
         "chatgpt" => Ok(Vec::new()),

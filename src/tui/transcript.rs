@@ -2,48 +2,73 @@ use super::*;
 use super::markdown::*;
 use super::theme::*;
 
-/// The empty-state splash: a shimmering wordmark, a waving bar row, and a hint —
-/// animated by the frame counter so the idle screen feels alive.
-pub(super) fn empty_state_lines(frame_n: usize, width: usize) -> Vec<Line<'static>> {
-    let f = frame_n;
+/// The empty-state welcome: calm, left-aligned context + a compact command
+/// legend. No animation — a quiet starting page in the Terminal Ink palette.
+pub(super) fn empty_state_lines(cwd: &str, model: &str, width: usize) -> Vec<Line<'static>> {
+    let _ = width;
+    let pad = "   ";
+    let dim = Style::default().fg(faint());
+    let label = Style::default().fg(muted());
+    let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // The wordmark with a highlight that sweeps across it.
-    let word: Vec<char> = "snipett".chars().collect();
-    let sweep = (f / 2) % (word.len() + 6);
-    let mut title = Vec::new();
-    for (i, c) in word.iter().enumerate() {
-        let style = if i == sweep {
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(self::text()).add_modifier(Modifier::BOLD)
-        };
-        title.push(Span::styled(c.to_string(), style));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{pad}▍ "), Style::default().fg(accent())),
+        Span::styled("snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("{pad}  a coding agent in your terminal"),
+        dim,
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(""));
+
+    let row = |k: &str, v: String| {
+        Line::from(vec![
+            Span::styled(format!("{pad}{k:<10}"), dim),
+            Span::styled(v, label),
+        ])
+    };
+    lines.push(row("workspace", cwd.to_string()));
+    lines.push(row("model", if model.is_empty() { "—".into() } else { model.to_string() }));
+    lines.push(Line::from(""));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("{pad}"), dim),
+        Span::styled("Type a task and press ", label),
+        Span::styled("⏎", Style::default().fg(accent())),
+        Span::styled(" to begin.", label),
+    ]));
+    lines.push(Line::from(""));
+
+    let cmd = |c: &str| Span::styled(c.to_string(), Style::default().fg(accent()));
+    let sep = || Span::styled("   ·   ", dim);
+    lines.push(Line::from(vec![
+        Span::styled(pad.to_string(), dim),
+        cmd("/model"), sep(),
+        cmd("/theme"), sep(),
+        cmd("/goal"), sep(),
+        cmd("/resume"), sep(),
+        cmd("/help"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(format!("{pad}"), dim),
+        Span::styled("⏎ send   ·   ⇧⏎ newline   ·   / for commands", dim),
+    ]));
+    lines
+}
+
+/// Arm the speaker tag when the turn's speaker changes (so the next rendered line
+/// gets the "You"/"Snippet" tag). A blank line separates one turn from the next.
+fn set_speaker(lines: &mut Vec<Line<'static>>, speaker: &mut Option<bool>, tag_pending: &mut bool, agent: bool) {
+    if *speaker == Some(agent) {
+        return;
     }
-
-    // A small equalizer wave that ripples left→right.
-    const BARS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
-    let mut wave = Vec::new();
-    for i in 0..11usize {
-        let phase = (f / 2 + i * 2) % 14;
-        let h = if phase < 7 { phase } else { 14 - phase }; // triangle 0..6..0
-        wave.push(Span::styled(BARS[h.min(7)].to_string(), Style::default().fg(accent())));
-        wave.push(Span::raw(" "));
+    if speaker.is_some() {
+        lines.push(Line::from(""));
     }
-
-    vec![
-        center_line(Line::from(title), width),
-        Line::from(""),
-        center_line(Line::from(wave), width),
-        Line::from(""),
-        Line::from(""),
-        center_line(
-            Line::from(Span::styled(
-                "type a task and press Enter   ·   / for commands",
-                subtle(),
-            )),
-            width,
-        ),
-    ]
+    *speaker = Some(agent);
+    *tag_pending = true;
 }
 
 pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
@@ -63,12 +88,19 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // its result, then the next call…) packs tightly with no gaps — so a burst of
     // reads/greps collapses instead of spreading down the screen. Prose still gets
     // breathing room before and after a tool run.
-    let mut first = true;
+    // Mobile-app grammar: each turn opens with a "you" / "snippet" header, content
+    // sits flush beneath it, and the header (not blank lines) separates speakers.
+    let mut speaker: Option<bool> = None; // Some(true)=agent, Some(false)=you
     let mut prev_tool_row = false;
 
+    // Content is rendered in a column to the RIGHT of the fixed speaker tag.
+    let content_w = width.saturating_sub(TAG_W).max(20);
+    let mut tag_pending = false;
+
     if !has_user_events && !state.user_request.is_empty() {
-        lines.extend(user_lines(&state.user_request, width));
-        first = false;
+        speaker = Some(false);
+        tag_pending = true;
+        push_tagged(&mut lines, user_lines(&state.user_request, content_w), false, &mut tag_pending);
     }
 
     // After a compaction, clear the screen above it: render only from the last
@@ -95,16 +127,13 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             if count > 1 {
                 last = format!("{last}  (×{count})");
             }
-            if !first {
-                lines.push(Line::from(""));
-            }
-            lines.extend(marker_block("✗ ", "", danger(), &last, width));
+            set_speaker(&mut lines, &mut speaker, &mut tag_pending, true);
+            push_tagged(&mut lines, marker_block("✗", danger(), &last, content_w), true, &mut tag_pending);
             prev_tool_row = false;
-            first = false;
             continue;
         }
 
-        // Tool call: render `● Verb  arg` and, when the next event is a one-line
+        // Tool call: render `● verb  arg` and, when the next event is a one-line
         // result for it, merge that summary onto the same row, right-aligned.
         if let HarnessEvent::ToolCall { tool_name, arguments } = event {
             if HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
@@ -116,24 +145,20 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 }
                 continue;
             }
-            let mut call_lines = tool_call_lines(tool_name, arguments, width);
-            // The result is pushed right after the call, so a call with NO following
-            // result is the in-flight one (persisted just before execution). When the
-            // result is present and one-line, merge it onto the row; when it's still
-            // running, show a live spinner so a slow tool isn't a black box.
+            let mut call_lines = tool_call_lines(tool_name, arguments, content_w);
             let result_follows = matches!(events.peek(), Some(HarnessEvent::ToolResult { .. }));
             if result_follows {
                 if call_lines.len() == 1 {
                     if let Some(HarnessEvent::ToolResult { tool_name: rn, result }) = events.peek() {
                         if !HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
                             if let Some(summary) = tool_result_oneliner(rn, result) {
-                                let pad = width
+                                let pad = content_w
                                     .saturating_sub(call_lines[0].width() + summary.chars().count());
                                 if pad >= 2 {
                                     call_lines[0].spans.push(Span::raw(" ".repeat(pad)));
                                     call_lines[0]
                                         .spans
-                                        .push(Span::styled(summary, Style::default().fg(muted())));
+                                        .push(Span::styled(summary, Style::default().fg(faint())));
                                     events.next();
                                 }
                             }
@@ -145,44 +170,37 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 let label = format!("{spinner} running");
                 let style = Style::default().fg(accent());
                 if call_lines.len() == 1
-                    && width > call_lines[0].width() + label.chars().count() + 2
+                    && content_w > call_lines[0].width() + label.chars().count() + 2
                 {
-                    let pad = width - call_lines[0].width() - label.chars().count();
+                    let pad = content_w - call_lines[0].width() - label.chars().count();
                     call_lines[0].spans.push(Span::raw(" ".repeat(pad)));
                     call_lines[0].spans.push(Span::styled(label, style));
                 } else {
                     call_lines.push(Line::from(vec![
-                        Span::raw("  "),
+                        Span::raw(" ".repeat(AGENT)),
                         Span::styled(label, style),
                     ]));
                 }
             }
-            if !first && !prev_tool_row {
-                lines.push(Line::from(""));
-            }
-            lines.extend(call_lines);
+            set_speaker(&mut lines, &mut speaker, &mut tag_pending, true);
+            push_tagged(&mut lines, call_lines, true, &mut tag_pending);
             prev_tool_row = true;
-            first = false;
             continue;
         }
 
-        let rendered = event_lines(event, width);
+        let rendered = event_lines(event, content_w);
         if rendered.is_empty() {
             continue;
         }
-        let is_tool_row = matches!(
+        let is_user = matches!(event, HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. });
+        set_speaker(&mut lines, &mut speaker, &mut tag_pending, !is_user);
+        push_tagged(&mut lines, rendered, !is_user, &mut tag_pending);
+        prev_tool_row = matches!(
             event,
-            HarnessEvent::ToolCall { .. }
-                | HarnessEvent::ToolResult { .. }
-                | HarnessEvent::InvalidToolCall { .. }
+            HarnessEvent::ToolResult { .. } | HarnessEvent::InvalidToolCall { .. }
         );
-        if !first && !(prev_tool_row && is_tool_row) {
-            lines.push(Line::from(""));
-        }
-        lines.extend(rendered);
-        prev_tool_row = is_tool_row;
-        first = false;
     }
+    let _ = prev_tool_row;
 
     // Reasoning/thinking the model returned, shown dimmed and distinct from the
     // answer. DEBUG: rendered whenever present (not just while working) and never
@@ -210,7 +228,7 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
-            lines.extend(render_prose(live, width));
+            lines.extend(indent_block(render_prose(live, width.saturating_sub(SPINE)), SPINE));
         }
         // Compaction has its own animated bar directly above the input box
         // (render_compaction_bar) — suppress the generic "working…" line then so
@@ -236,21 +254,46 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
 pub(super) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+pub(super) const SPINE: usize = 0;
+const AGENT: usize = 2;
+const VERB_W: usize = 8;
+
+fn user_gutter() -> Span<'static> {
+    Span::styled("❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD))
+}
+
+fn agent_gutter(glyph: &str, color: Color) -> Span<'static> {
+    Span::styled(
+        format!("{}{glyph} ", " ".repeat(SPINE)),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn indent_block(lines: Vec<Line<'static>>, cols: usize) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|mut l| {
+            l.spans.insert(0, Span::raw(" ".repeat(cols)));
+            l
+        })
+        .collect()
+}
+
 /// Map one event to a block of styled, wrapped lines. Empty = hidden.
 pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
     match event {
         HarnessEvent::UserInput { text } => user_lines(text, width),
         HarnessEvent::Steer { text } => {
-            marker_block("↳ ", "steer  ", accent(), &strip_attachment_markers(text), width)
+            marker_block("↳", accent(), &strip_attachment_markers(text), width)
         }
-        HarnessEvent::AssistantText { text } => render_prose(text, width),
-        HarnessEvent::Note { entry } => marker_block("✎ ", "note  ", muted(), entry, width),
+        HarnessEvent::AssistantText { text } => indent_block(render_prose(text, width.saturating_sub(SPINE)), SPINE),
+        HarnessEvent::Note { entry } => marker_block("✎", muted(), entry, width),
         HarnessEvent::FilePresented { path, caption } => {
             let text = match caption {
                 Some(c) => format!("{path} — {c}"),
                 None => path.clone(),
             };
-            marker_block("▤ ", "file  ", accent(), &text, width)
+            marker_block("▤", accent(), &text, width)
         }
         HarnessEvent::SystemDecision { step, reasoning } => {
             if step == "history_compaction_pass" {
@@ -265,22 +308,16 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
                 // The verbose token detail lives in the debug log, not here.
                 compaction_divider(width)
             } else {
-                marker_block(
-                    "⚙ ",
-                    "",
-                    warn(),
-                    &format!("{step} — {reasoning}"),
-                    width,
-                )
+                marker_block("⚙", warn(), &format!("{step} — {reasoning}"), width)
             }
         }
         HarnessEvent::ModelError { message } => {
-            marker_block("✗ ", "", danger(), message, width)
+            marker_block("✗", danger(), message, width)
         }
         HarnessEvent::UserQuestion { questions } => {
             // No "? " marker — questions almost always end with one already.
             let text = question_text(questions).unwrap_or_else(|| "(question)".to_string());
-            marker_block("", "", warn(), &text, width)
+            marker_block("?", warn(), &text, width)
         }
         HarnessEvent::ApprovalRequest { .. } => {
             // While pending it's shown in the approval card above the input; the
@@ -289,13 +326,9 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             Vec::new()
         }
         // Subject only — lane ids are internal plumbing, not for the transcript.
-        HarnessEvent::LaneSpawned { id: _, title } => marker_block(
-            "→ ",
-            "",
-            lane(),
-            &format!("delegated: {title}"),
-            width,
-        ),
+        HarnessEvent::LaneSpawned { id: _, title } => {
+            marker_block("→", lane(), &format!("delegated: {title}"), width)
+        }
         HarnessEvent::LaneCompleted {
             id,
             title,
@@ -339,41 +372,47 @@ pub(super) fn strip_attachment_markers(text: &str) -> String {
 
 pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     let cleaned = strip_attachment_markers(text);
-    let prefix = Span::styled(
-        "› ",
-        Style::default().fg(blue()).add_modifier(Modifier::BOLD),
-    );
-    let mut lines = Vec::new();
-    for (i, seg) in wrap_one(&cleaned, width.saturating_sub(2)).into_iter().enumerate() {
-        if i == 0 {
-            lines.push(Line::from(vec![
-                prefix.clone(),
-                Span::styled(seg, Style::default().fg(self::text())),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(seg, Style::default().fg(self::text())),
-            ]));
-        }
-    }
-    // Surface any attachments the message carried — kept visible even when it also
-    // had text, so a sent attachment doesn't vanish from the transcript (dimmed).
+    let body = Style::default().fg(self::text());
+    let mut lines: Vec<Line<'static>> = wrap_one(&cleaned, width.saturating_sub(SPINE))
+        .into_iter()
+        .map(|seg| Line::from(vec![Span::raw(" ".repeat(SPINE)), Span::styled(seg, body)]))
+        .collect();
     let (imgs, files) = count_attachments(text);
     if imgs + files > 0 {
-        let leading = if lines.is_empty() {
-            prefix.clone()
-        } else {
-            Span::raw("  ")
-        };
         lines.push(Line::from(vec![
-            leading,
+            Span::raw(" ".repeat(SPINE)),
             Span::styled(attachment_summary(imgs, files), Style::default().fg(muted())),
         ]));
-    } else if lines.is_empty() {
-        lines.push(Line::from(vec![prefix]));
     }
     lines
+}
+
+const TAG_W: usize = 2;
+
+/// The inline speaker marker that opens a turn — a slim colored bar (amber for the
+/// agent, muted for you) in a fixed gutter, so content hangs in an even column.
+fn tag_span(agent: bool) -> Span<'static> {
+    let color = if agent { accent() } else { muted() };
+    Span::styled("▍ ", Style::default().fg(color))
+}
+
+fn tag_pad() -> Span<'static> {
+    Span::raw(" ".repeat(TAG_W))
+}
+
+/// Prepend the speaker column to a rendered block: the tag on the first line of a
+/// turn, blank padding on the rest (so a multi-line message hangs in one column).
+fn push_tagged(lines: &mut Vec<Line<'static>>, inner: Vec<Line<'static>>, agent: bool, tag_pending: &mut bool) {
+    for mut line in inner {
+        let prefix = if *tag_pending {
+            *tag_pending = false;
+            tag_span(agent)
+        } else {
+            tag_pad()
+        };
+        line.spans.insert(0, prefix);
+        lines.push(line);
+    }
 }
 
 /// Count `[attached image — …]` / `[attached file — …]` markers by kind.
@@ -424,34 +463,24 @@ pub(super) fn compaction_divider(width: usize) -> Vec<Line<'static>> {
 
 pub(super) fn marker_block(
     glyph: &str,
-    label: &str,
     color: Color,
     text: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let glyph_w = glyph.chars().count() + label.chars().count();
     let body_style = Style::default().fg(color);
     let mut lines = Vec::new();
-    for (i, seg) in wrap_one(text, width.saturating_sub(glyph_w))
+    for (i, seg) in wrap_one(text, width.saturating_sub(AGENT))
         .into_iter()
         .enumerate()
     {
         if i == 0 {
-            let mut spans = vec![Span::styled(
-                glyph.to_string(),
-                body_style.add_modifier(Modifier::BOLD),
-            )];
-            if !label.is_empty() {
-                spans.push(Span::styled(
-                    label.to_string(),
-                    body_style.add_modifier(Modifier::BOLD),
-                ));
-            }
-            spans.push(Span::styled(seg, body_style));
-            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![
+                agent_gutter(glyph, color),
+                Span::styled(seg, body_style),
+            ]));
         } else {
             lines.push(Line::from(vec![
-                Span::raw(" ".repeat(glyph_w)),
+                Span::raw(" ".repeat(AGENT)),
                 Span::styled(seg, body_style),
             ]));
         }
@@ -475,7 +504,7 @@ pub(super) fn lane_completed_lines(
     // callers that still have it, unused for display).
     let _ = id;
     let mut lines = vec![Line::from(vec![
-        Span::styled("◆ ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        agent_gutter("◆", color),
         Span::styled(
             format!("{title} "),
             Style::default().fg(self::text()).add_modifier(Modifier::BOLD),
@@ -501,30 +530,37 @@ pub(super) fn tool_call_lines(tool_name: &str, arguments: &Value, width: usize) 
 /// and the argument muted, wrapping the argument under a hanging indent.
 pub(super) fn tool_call_head_lines(tool_name: &str, arguments: &Value, width: usize) -> Vec<Line<'static>> {
     let (verb, arg) = tool_call_parts(tool_name, arguments);
-    let head = format!("{verb}  ");
-    let indent = 2 + head.chars().count();
-    let arg_budget = width.saturating_sub(indent).max(8);
+    let verb = verb.to_lowercase();
+    // Terminals have one glyph size, so "smaller" is faked with intensity: the
+    // whole tool row renders DIM (most emulators drop it a visual weight class),
+    // verb slightly brighter than the argument, and only the amber `●` at full
+    // strength. Prose stays bright and un-dimmed — a clear size-like hierarchy.
+    let verb_style = Style::default().fg(muted()).add_modifier(Modifier::DIM);
+    let arg_style = Style::default().fg(faint()).add_modifier(Modifier::DIM);
+    let field = VERB_W.max(verb.chars().count());
+    let arg_col = AGENT + field;
+    let arg_budget = width.saturating_sub(arg_col).max(8);
 
+    let dot = Span::styled(
+        format!("{}● ", " ".repeat(SPINE)),
+        Style::default().fg(accent()).add_modifier(Modifier::DIM),
+    );
     if arg.trim().is_empty() {
-        return vec![Line::from(vec![
-            Span::styled("● ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-            Span::styled(verb, Style::default().fg(self::text()).add_modifier(Modifier::BOLD)),
-        ])];
+        return vec![Line::from(vec![dot, Span::styled(verb, verb_style)])];
     }
 
     let mut lines = Vec::new();
     for (i, seg) in wrap_one(&arg, arg_budget).into_iter().enumerate() {
         if i == 0 {
             lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-                Span::styled(verb.clone(), Style::default().fg(self::text()).add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(seg, Style::default().fg(muted())),
+                dot.clone(),
+                Span::styled(format!("{verb:<field$}"), verb_style),
+                Span::styled(seg, arg_style),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::raw(" ".repeat(indent)),
-                Span::styled(seg, Style::default().fg(muted())),
+                Span::raw(" ".repeat(arg_col)),
+                Span::styled(seg, arg_style),
             ]));
         }
     }
@@ -655,6 +691,26 @@ pub(super) fn tool_result_lines(tool_name: &str, result: &Value, width: usize) -
     let status = result.get("status").and_then(Value::as_str).unwrap_or("");
     let data = result.get("data").unwrap_or(result);
 
+    // Oversized output was spilled to a scratch file (no stdout/data here) — say so
+    // explicitly instead of falling through to a misleading "no output".
+    if result.get("truncated").and_then(Value::as_bool).unwrap_or(false) {
+        let chars = result
+            .pointer("/original_stats/char_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let where_ = result
+            .get("saved_output_path")
+            .and_then(Value::as_str)
+            .map(|p| format!(" → {p}"))
+            .unwrap_or_default();
+        let head = if chars > 0 {
+            format!("output too large ({} chars){where_}", fmt_si(chars))
+        } else {
+            format!("output too large{where_}")
+        };
+        return result_block(vec![(head, subtle().add_modifier(Modifier::ITALIC))], width);
+    }
+
     if status == "error" {
         let message = result
             .get("error")
@@ -730,9 +786,6 @@ pub(super) fn tool_result_lines(tool_name: &str, result: &Value, width: usize) -
 }
 
 pub(super) fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
-    // Keep bash output minimal: one summary line + a tiny preview, never the full
-    // dump (the model still has the complete output; the UI just shouldn't flood).
-    const BASH_PREVIEW: usize = 3;
     let success = data.get("success").and_then(Value::as_bool).unwrap_or(false);
     let exit = data
         .get("exit_code")
@@ -741,15 +794,14 @@ pub(super) fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
     let stdout = data.get("stdout").and_then(Value::as_str).unwrap_or("");
     let stderr = data.get("stderr").and_then(Value::as_str).unwrap_or("");
 
-    let output: Vec<&str> = stdout
+    let total = stdout
         .lines()
         .chain(stderr.lines())
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let total = output.len();
+        .filter(|l| !l.trim().is_empty())
+        .count();
 
-    // Single concise summary line (red on failure).
+    // Just a one-line summary — the command is already the call row above, and the
+    // model has the full output; the UI doesn't echo it.
     let noun = if total == 1 { "line" } else { "lines" };
     let summary = match (success, total) {
         (true, 0) => "ran · no output".to_string(),
@@ -758,20 +810,7 @@ pub(super) fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
         (false, n) => format!("exited {exit} · {n} {noun}"),
     };
     let summary_style = if success { subtle() } else { Style::default().fg(danger()) };
-    let mut items = vec![(summary, summary_style)];
-
-    // Glimpse: the first few lines only.
-    let shown = total.min(BASH_PREVIEW);
-    for line in &output[..shown] {
-        items.push((line.to_string(), subtle()));
-    }
-    if total > shown {
-        items.push((
-            format!("… +{} more lines", total - shown),
-            subtle().add_modifier(Modifier::ITALIC),
-        ));
-    }
-    items
+    vec![(summary, summary_style)]
 }
 
 /// Render result/output logical lines under a `⎿` gutter, wrapped to width.
@@ -795,18 +834,59 @@ pub(super) fn result_block_inner(
     let mut first = true;
     for (text, style) in items {
         let segs = if verbatim {
-            wrap_code_line(&text, width.saturating_sub(4))
+            wrap_code_line(&text, width.saturating_sub(AGENT + 2))
         } else {
-            wrap_one(&text, width.saturating_sub(4))
+            wrap_one(&text, width.saturating_sub(AGENT + 2))
         };
         for seg in segs {
-            let prefix = if first { "  ⎿ " } else { "    " };
+            let prefix = if first {
+                format!("{}↳ ", " ".repeat(AGENT))
+            } else {
+                " ".repeat(AGENT + 2)
+            };
             lines.push(Line::from(vec![
-                Span::styled(prefix.to_string(), subtle()),
-                Span::styled(seg, style),
+                Span::styled(prefix, Style::default().fg(faint()).add_modifier(Modifier::DIM)),
+                Span::styled(seg, style.add_modifier(Modifier::DIM)),
             ]));
             first = false;
         }
     }
     lines
+}
+
+pub fn preview_transcript(width: usize) -> String {
+    fn plain2(lines: &[Line<'static>]) -> String {
+        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+    let mut pre = String::from("===== EMPTY STATE =====\n");
+    pre.push_str(&plain2(&empty_state_lines("~/code/wacht", "grok 4.5 (high)", width)));
+    pre.push_str("\n\n===== TRANSCRIPT =====\n");
+
+    use serde_json::json;
+    fn plain(lines: &[Line<'static>]) -> String {
+        lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n")
+    }
+    let cw = width.saturating_sub(TAG_W);
+    let mut all: Vec<Line<'static>> = Vec::new();
+    let mut tp = true;
+    push_tagged(&mut all, user_lines("you good bro?", cw), false, &mut tp);
+    all.push(Line::from("")); tp = true;
+    push_tagged(&mut all, render_prose("Haha yeah, doing great! What do you want to build?", cw), true, &mut tp);
+    all.push(Line::from("")); tp = true;
+    push_tagged(&mut all, user_lines("fix the auth timeout bug", cw), false, &mut tp);
+    all.push(Line::from("")); tp = true;
+    let calls = [
+        ("read_file", json!({"path":"src/auth.rs"}), Some("142 lines")),
+        ("edit_file", json!({"path":"src/auth.rs","old_string":"5","new_string":"30"}), None),
+    ];
+    for (name, args, summary) in calls {
+        let mut cl = tool_call_head_lines(name, &args, cw);
+        if let Some(sm) = summary {
+            let pad = cw.saturating_sub(cl[0].width() + sm.chars().count());
+            if pad >= 2 { cl[0].spans.push(Span::raw(" ".repeat(pad))); cl[0].spans.push(Span::raw(sm.to_string())); }
+        }
+        push_tagged(&mut all, cl, true, &mut tp);
+    }
+    push_tagged(&mut all, render_prose("Bumped the 5s timeout to 30s and the tests pass now.", cw), true, &mut tp);
+    format!("{pre}{}", plain(&all))
 }

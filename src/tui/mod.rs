@@ -30,7 +30,7 @@ use crate::lanes::LaneStatus;
 
 mod markdown;
 mod theme;
-mod transcript;
+pub mod transcript;
 
 use markdown::*;
 use theme::*;
@@ -188,7 +188,7 @@ enum SettingsField {
 }
 
 /// Providers offered by the login form, in display order.
-const LOGIN_PROVIDERS: &[&str] = &["openai", "chatgpt", "anthropic", "gemini", "openrouter", "openai-compatible", "anthropic-compatible"];
+const LOGIN_PROVIDERS: &[&str] = &["openai", "chatgpt", "xai", "anthropic", "gemini", "openrouter", "openai-compatible", "anthropic-compatible"];
 
 /// Providers that talk to a user-supplied endpoint, so the login form shows the
 /// Base URL field (and can fetch models keyless).
@@ -203,6 +203,8 @@ fn provider_defaults(provider: &str) -> (String, String) {
         // ChatGPT-subscription (OAuth) — no base URL / API key; model is a Codex slug.
         "chatgpt" => (String::new(), "gpt-5.1-codex".to_string()),
         "anthropic" => (String::new(), "claude-opus-4-8".to_string()),
+        // xAI (Grok/X subscription) — OAuth via `snippet xai login`; no base URL/key.
+        "xai" => (String::new(), "grok-4".to_string()),
         // Anthropic-Messages-compatible gateway — user supplies base_url + model.
         "anthropic-compatible" => (String::new(), String::new()),
         // Native Gemini adapter — no base URL (it has its own endpoint), like Anthropic.
@@ -219,7 +221,7 @@ fn provider_defaults(provider: &str) -> (String, String) {
 
 fn provider_context_defaults(provider: &str) -> (u64, u8) {
     match provider {
-        "openai" | "chatgpt" | "anthropic" | "gemini" => (250_000, 90),
+        "openai" | "chatgpt" | "anthropic" | "gemini" | "xai" => (250_000, 90),
         "openai-compatible" | "anthropic-compatible" => (130_000, 90),
         // Keep openrouter aligned with the hosted-provider defaults unless the
         // user overrides it per profile.
@@ -3115,6 +3117,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         .split(area);
 
     let header_area = chunks[0];
+    let header_rule_area = chunks[1];
     let content_area = chunks[2];
     let suggestions_area = chunks[3];
     let question_area = chunks[4];
@@ -3125,6 +3128,13 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let footer_area = chunks[10];
 
     render_header(frame, header_area, app);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(header_rule_area.width as usize),
+            Style::default().fg(faint()),
+        ))),
+        header_rule_area,
+    );
     render_history(frame, content_area, app);
     if sugg_h > 0 {
         render_suggestions(frame, suggestions_area, app);
@@ -3396,7 +3406,7 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
 
     // Render Header
     let header_text = vec![
-        Span::styled("● snipett", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
+        Span::styled("● snippet", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
         Span::styled("  |  Select a session to resume", Style::default().fg(self::text())),
     ];
     frame.render_widget(Paragraph::new(Line::from(header_text)), chunks[0]);
@@ -3476,7 +3486,7 @@ fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
         .split(area);
 
     let header = vec![
-        Span::styled(" snipett", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
         Span::styled("  ·  theme", subtle()),
     ];
     frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
@@ -3651,17 +3661,12 @@ fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) 
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    // The model actually driving THIS chat (per-chat override wins) — not the
-    // global default, which is misleading after "set model for this chat".
     let model = app.effective_model.1.clone();
-    let name = " snipett";
-    let mut spans = vec![
-        Span::styled(name, Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-        Span::styled(" · ", Style::default().fg(muted())),
-        Span::styled(model.clone(), Style::default().fg(muted())),
-        Span::raw(" "),
+    let mut left = vec![
+        Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  ", Style::default().fg(faint())),
+        Span::styled(model, Style::default().fg(muted())),
     ];
-    // Active-goal badge — the agent is autonomously driving toward a /goal.
     let goal_label = app
         .state
         .as_ref()
@@ -3671,37 +3676,44 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             crate::harness::GoalStatus::Paused => Some("◇ goal · paused".to_string()),
             _ => None,
         });
-    let goal_len = goal_label.as_ref().map(|l| l.chars().count() + 3).unwrap_or(0);
     if let Some(l) = &goal_label {
-        spans.push(Span::styled("· ", Style::default().fg(muted())));
-        spans.push(Span::styled(
-            format!("{l} "),
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-        ));
+        left.push(Span::styled("  ·  ", Style::default().fg(faint())));
+        left.push(Span::styled(l.clone(), Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
     }
-    // A self-update landed this session → a right-aligned "restart to apply" hint.
-    let update = app.update_notice.lock().ok().and_then(|g| g.clone());
-    let notice = update.map(|v| format!("⬆ updated to v{v} — restart to apply"));
-    let notice_len = notice.as_ref().map(|n| n.chars().count() + 1).unwrap_or(0);
 
-    // Fill the rest of the row with a thin rule for a clean header rather than a
-    // bare glyph floating in empty space (leaving room for any update hint).
-    let used = name.chars().count() + 3 + model.chars().count() + 1 + goal_len;
-    let rule = (area.width as usize).saturating_sub(used + 1 + notice_len);
-    if rule > 0 {
-        spans.push(Span::styled("─".repeat(rule), Style::default().fg(faint())));
+    let mut right: Vec<Span<'static>> = Vec::new();
+    let update = app.update_notice.lock().ok().and_then(|g| g.clone());
+    if let Some(v) = update {
+        right.push(Span::styled(format!("⬆ v{v} — restart to apply   "), Style::default().fg(accent())));
     }
-    if let Some(notice) = notice {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(notice, Style::default().fg(accent())));
+    if let Some(st) = app.state.as_ref() {
+        if st.context_window > 0 {
+            let pct = ((st.last_prompt_tokens as f64 / st.context_window as f64) * 100.0)
+                .round()
+                .clamp(0.0, 100.0) as u64;
+            let color = if pct >= 90 { danger() } else if pct >= 75 { warn() } else { muted() };
+            right.push(Span::styled(format!("{pct}% ctx "), Style::default().fg(color)));
+        }
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    let left_line = Line::from(left);
+    let right_line = Line::from(right);
+    let right_w = right_line.width() as u16;
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(right_w + 1)])
+        .split(area);
+    frame.render_widget(Paragraph::new(left_line), cols[0]);
+    frame.render_widget(
+        Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
+        cols[1],
+    );
 }
 
 fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    // Inset the transcript with a symmetric gutter on BOTH sides so content sits
-    // in a comfortable column instead of running edge-to-edge (which reads dense).
-    let gutter = 4u16;
+    // A small breathing gutter from the terminal edge (the transcript carries its
+    // own left rhythm, so this stays minimal — a big outer inset over-padded it).
+    let gutter = 1u16;
     let inner = Rect {
         x: area.x + gutter,
         y: area.y,
@@ -3719,8 +3731,10 @@ fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .as_ref()
             .map_or(true, |s| s.events.is_empty() && s.user_request.trim().is_empty());
     if empty {
-        let block = empty_state_lines(app.frame, width);
-        let top = height.saturating_sub(block.len()) / 2;
+        let block = empty_state_lines(&app.cwd_display, &app.effective_model.1, width);
+        // Sit a little above the vertical middle so it reads as a starting page,
+        // not floating dead-center.
+        let top = (height.saturating_sub(block.len()) / 3).max(1);
         let mut lines: Vec<Line<'static>> = std::iter::repeat(Line::from("")).take(top).collect();
         lines.extend(block);
         frame.render_widget(Paragraph::new(lines), inner);
@@ -4517,18 +4531,15 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
     let cache = st.map(|s| s.cache_read_tokens).unwrap_or(0);
     if cache > 0 {
-        right.push(Span::styled(format!(" ↻{}", fmt_si(cache)), dim));
+        right.push(Span::styled(format!("  ↻{}", fmt_si(cache)), dim));
     }
-    right.push(Span::styled(" · ", faint));
-    right.push(Span::styled(
-        format!("ctx {} ", fmt_si(st.map(|s| s.last_prompt_tokens).unwrap_or(0))),
-        dim,
-    ));
+    right.push(Span::raw(" "));
 
     let mut left = vec![Span::styled(format!(" {}", app.cwd_display), dim)];
-    if app.is_manual_mode() {
-        left.push(Span::styled("  ⚠ manual", Style::default().fg(warn())));
-    }
+    left.push(Span::styled(
+        if app.is_manual_mode() { "  ⚠ manual" } else { "  auto" },
+        if app.is_manual_mode() { Style::default().fg(warn()) } else { faint },
+    ));
     let right_line = Line::from(right);
     let right_w = right_line.width() as u16;
 
