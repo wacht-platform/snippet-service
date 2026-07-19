@@ -58,9 +58,6 @@ enum Command {
         #[arg(long, hide = true)]
         supervised: bool,
     },
-    /// Internal: dump a sample transcript to stdout for design review.
-    #[command(hide = true)]
-    RenderPreview,
     /// Manage the secret vault (~/.snippet/vault.json). Secrets are usable by the
     /// agent as $NAME in shell commands; values are injected into the child
     /// process and redacted from everything the model sees.
@@ -168,10 +165,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_path(&cli);
 
     match cli.command {
-        Some(Command::RenderPreview) => {
-            println!("{}", snippet::tui::transcript::preview_transcript(64));
-            return Ok(());
-        }
         Some(Command::Vault { action }) => return vault_cli(action),
         Some(Command::Serve {
             port,
