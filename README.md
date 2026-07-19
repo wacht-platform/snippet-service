@@ -11,9 +11,9 @@ One Rust binary: a durable terminal UI *and* a headless daemon you can remote-co
 [![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](#install)
 [![built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
-[![mobile & desktop app](https://img.shields.io/badge/remote-mobile%20%26%20desktop%20app-6c5ce7.svg)](https://github.com/wacht-platform/snippet-native)
+[![mobile & desktop app](https://img.shields.io/badge/remote-mobile%20%26%20desktop%20app-6c5ce7.svg)](https://github.com/wacht-platform/snippet-mobile)
 
-[Install](#install) · [Use the TUI](#use-the-tui) · [Remote control](#remote-control-from-anywhere) · [Models](#configure-your-models) · [How it works](#how-it-works) · [Mobile app](https://github.com/wacht-platform/snippet-native)
+[Install](#install) · [Use the TUI](#use-the-tui) · [Remote control](#remote-control-from-anywhere) · [Models](#configure-your-models) · [How it works](#how-it-works) · [Mobile app](https://github.com/wacht-platform/snippet-mobile)
 
 _Built by the team behind [Wacht](https://wacht.dev) — open-source infrastructure for AI-native apps._
 
@@ -28,7 +28,7 @@ No cloud middleman, no lock-in, no subscription of ours. Your keys, your machine
 ## Features
 
 - **Terminal-native** — a fast, durable TUI. Loop state is persisted (compressed msgpack) with automatic **checkpoints**, so you can resume any conversation exactly where you left off and **rewind** a bad turn.
-- **Drive it from your phone or Mac** — run `snippet serve` on your dev box and control it from the [mobile/desktop app](https://github.com/wacht-platform/snippet-native) over an authenticated [cloudflared](https://github.com/cloudflare/cloudflared) tunnel: chat, browse & edit files, view git diffs, run commands, manage checkpoints.
+- **Drive it from your phone or Mac** — run `snippet serve` on your dev box and control it from the [mobile/desktop app](https://github.com/wacht-platform/snippet-mobile) over an authenticated [cloudflared](https://github.com/cloudflare/cloudflared) tunnel: chat, browse & edit files, view git diffs, run commands, manage checkpoints.
 - **Any model** — `anthropic`, `openai`, `gemini`, `openrouter`, `openai-compatible` (local models included), or a **ChatGPT subscription** (OAuth, no API key). Configure several providers as **profiles** and switch the active one — even **per conversation**.
 - **Real tool surface** — read/write/edit, shell, recursive regex search, structural code mapping, image reading, and web search (with an Exa key).
 - **Parallel sub-agents** — the agent orchestrates scoped work across background **lanes** that share the workspace and report back with exact `file:line` references, keeping its own context lean.
@@ -97,7 +97,7 @@ snippet serve --status     # reprint the QR / connection string
 snippet serve --stop       # stop cleanly (tears the tunnel down)
 ```
 
-It prints a **QR code + connection string** (`{url, token}`) — scan or paste it into the [**snippet mobile & desktop app**](https://github.com/wacht-platform/snippet-native) (Android + macOS) and you're driving your machine's agent from your pocket. Every endpoint is gated by a bearer token (constant-time comparison); secrets are stored `0600` and never returned by the API.
+It prints a **QR code + connection string** (`{url, token}`) — scan or paste it into the [**snippet mobile & desktop app**](https://github.com/wacht-platform/snippet-mobile) (Android + macOS) and you're driving your machine's agent from your pocket. Every endpoint is gated by a bearer token (constant-time comparison); secrets are stored `0600` and never returned by the API.
 
 **Flags:** `--port` (default 8787) · `--token` (auto-generated) · `--host` (default `127.0.0.1`; use `0.0.0.0` for a fixed public IP) · `--no-tunnel` (localhost only) · `--public-url` (bring your own tunnel).
 
@@ -164,7 +164,7 @@ Per-profile knobs include `reasoning_effort`, `temperature`, `supports_images`, 
 
 ## Mobile & desktop app
 
-The remote client lives in its own repo → [**wacht-platform/snippet-native**](https://github.com/wacht-platform/snippet-native) (Android + macOS). Grab the APK, scan the QR from `snippet serve`, and you're connected.
+The remote client lives in its own repo → [**wacht-platform/snippet-mobile**](https://github.com/wacht-platform/snippet-mobile) (Android + macOS). Grab the APK, scan the QR from `snippet serve`, and you're connected.
 
 ## From the team behind Wacht
 
