@@ -120,6 +120,78 @@ fn process_elapsed_seconds(pid: u32) -> Option<i64> {
     Some(days * 86_400 + h * 3_600 + m * 60 + s)
 }
 
+#[derive(Serialize)]
+pub struct BgStatus {
+    pub id: String,
+    pub command: String,
+    pub pid: u32,
+    pub started_at: String,
+    pub log: String,
+    pub running: bool,
+    /// Exit code / "signal" once it has exited; None while running.
+    pub status: Option<String>,
+}
+
+/// Snapshot the background-process registry for a client (non-mutating, unlike
+/// `render_live` which prunes exited records for the agent).
+pub fn list(workspace: &Path) -> Vec<BgStatus> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(bg_dir(workspace)) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(txt) = std::fs::read_to_string(&path) else { continue };
+        let Ok(entry) = serde_json::from_str::<BgEntry>(&txt) else { continue };
+        let running = pid_is_recorded_process(entry.pid, &entry.started_at);
+        let status = if running {
+            None
+        } else {
+            std::fs::read_to_string(status_path(workspace, &entry.id))
+                .ok()
+                .map(|s| s.trim().to_string())
+        };
+        out.push(BgStatus {
+            id: entry.id,
+            command: entry.command,
+            pid: entry.pid,
+            started_at: entry.started_at,
+            log: entry.log,
+            running,
+            status,
+        });
+    }
+    out.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    out
+}
+
+/// Terminate a recorded background process (its group if it leads one, else the
+/// process). No-op if the record is gone or already exited.
+pub fn kill_by_id(workspace: &Path, id: &str) -> std::io::Result<()> {
+    let path = bg_dir(workspace).join(format!("{id}.json"));
+    let txt = std::fs::read_to_string(&path)?;
+    let entry: BgEntry = serde_json::from_str(&txt)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if pid_alive(entry.pid) {
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(format!("-{}", entry.pid))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(entry.pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    Ok(())
+}
+
 /// Render the live background-process list for the agent's runtime context.
 /// Running ones are listed; exited ones are surfaced once, then their record is
 /// pruned (the log file is kept for inspection). Returns None when there are none.

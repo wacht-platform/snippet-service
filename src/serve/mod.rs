@@ -404,6 +404,9 @@ pub async fn run_serve(
         .route("/xai/login", post(xai_login))
         .route("/xai/status", get(xai_status))
         .route("/xai/logout", post(xai_logout))
+        .route("/chatgpt/login", post(chatgpt_login))
+        .route("/chatgpt/status", get(chatgpt_status))
+        .route("/chatgpt/logout", post(chatgpt_logout))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
         .route("/session/exec", post(exec_in_session))
@@ -419,6 +422,9 @@ pub async fn run_serve(
         .route("/git/checkout", post(git_checkout))
         .route("/git/push", post(git_push))
         .route("/git/pull", post(git_pull))
+        .route("/bg", post(bg_list))
+        .route("/bg/kill", post(bg_kill))
+        .route("/bg/log", post(bg_log))
         .route("/git/stash", post(git_stash))
         .with_state(daemon);
     let addr: SocketAddr = format!("{host}:{port}")
@@ -1008,6 +1014,50 @@ async fn xai_logout(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
     }
 }
 
+// POST /chatgpt/login — begin the ChatGPT device-code flow; poll + save in the
+// background. Returns the code + URL for the app to show.
+async fn chatgpt_login(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::chatgpt_auth::begin_device_code_login().await {
+        Ok(device) => {
+            let user_code = device.user_code.clone();
+            let url = device.verification_url.clone();
+            tokio::spawn(async move {
+                if let Ok(tokens) = crate::chatgpt_auth::complete_device_code_login(device).await {
+                    let _ = crate::chatgpt_auth::save_blocking(&tokens);
+                }
+            });
+            Json(serde_json::json!({
+                "user_code": user_code,
+                "verification_uri": url,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),
+    }
+}
+
+// GET /chatgpt/status — whether a ChatGPT subscription token is stored.
+async fn chatgpt_status(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(serde_json::json!({ "signed_in": crate::chatgpt_auth::is_signed_in() })).into_response()
+}
+
+// POST /chatgpt/logout — drop the stored ChatGPT token.
+async fn chatgpt_logout(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::chatgpt_auth::logout_blocking() {
+        Ok(()) => Json(serde_json::json!({ "signed_in": false })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
 async fn vault_list(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
@@ -1291,6 +1341,64 @@ async fn exec_in_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(re
 /// Resolve the directory git should run in. The value is either a session id
 /// (→ that session's workspace) or, for git on a plain folder with no session
 /// (e.g. the file explorer), a direct directory path.
+#[derive(Deserialize)]
+struct BgReq {
+    session: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    tail: Option<usize>,
+}
+
+// POST /bg {session} — snapshot of the session's background processes.
+async fn bg_list(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<BgReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match resolve_session_dir(&req.session) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    Json(serde_json::json!({ "processes": crate::bg::list(&dir) })).into_response()
+}
+
+// POST /bg/kill {session, id} — terminate one background process.
+async fn bg_kill(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<BgReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match resolve_session_dir(&req.session) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let Some(id) = req.id.as_deref() else {
+        return (StatusCode::BAD_REQUEST, "id required").into_response();
+    };
+    match crate::bg::kill_by_id(&dir, id) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})).into_response(),
+    }
+}
+
+// POST /bg/log {session, id, tail?} — tail a background process's log.
+async fn bg_log(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<BgReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match resolve_session_dir(&req.session) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let Some(id) = req.id.as_deref() else {
+        return (StatusCode::BAD_REQUEST, "id required").into_response();
+    };
+    let text = std::fs::read_to_string(crate::bg::log_path(&dir, id)).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(req.tail.unwrap_or(400));
+    Json(serde_json::json!({ "log": lines[start..].join("\n"), "truncated": start > 0 }))
+        .into_response()
+}
+
 fn resolve_session_dir(session: &str) -> Result<PathBuf, Response> {
     if let Some(sp) = state_path_for_id(session) {
         if let Ok(bytes) = std::fs::read(&sp) {
