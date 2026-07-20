@@ -1643,6 +1643,10 @@ impl CodingHarness {
             vars.last_thought =
                 (!thought.is_empty()).then(|| thought.chars().take(1500).collect::<String>());
         }
+        // Prefer provider-reported prompt tokens when present. The manual estimate is
+        // only a fallback for gateways that omit/zero usage — never a floor over
+        // real API numbers (it used to max() with a base64-inflated estimate and
+        // push the context gauge to 100% after a few images).
         let estimated_prompt =
             estimate_prompt_tokens(&request_messages) + tools_token_overhead(&definitions);
         let anchor_tokens = if let Some(usage) = output.usage {
@@ -1652,7 +1656,11 @@ impl CodingHarness {
                 state.completion_tokens.saturating_add(usage.completion_tokens);
             state.cache_read_tokens =
                 state.cache_read_tokens.saturating_add(usage.cache_read_tokens);
-            usage.prompt_tokens.max(estimated_prompt)
+            if usage.prompt_tokens > 0 {
+                usage.prompt_tokens
+            } else {
+                estimated_prompt
+            }
         } else {
             estimated_prompt
         };
@@ -4089,10 +4097,13 @@ fn assemble_sections(sections: &BTreeMap<&'static str, String>) -> String {
 }
 
 /// Rough token estimate of a request we're about to send — ~4 chars/token over
-/// all message content (text, tool-call arguments, tool results) plus a small
-/// per-message overhead. Used as a floor for `last_prompt_tokens` so the context
-/// gauge and compaction don't depend on a provider/gateway's (sometimes bogus)
-/// reported input_tokens. Deliberately conservative; exactness isn't needed.
+/// text content (tool-call arguments, tool results) plus a small per-message
+/// overhead. Fallback only when the provider omits usage; when usage is present
+/// the harness trusts `prompt_tokens` directly.
+///
+/// Inlined `image_base64` is stripped before counting (providers send images as
+/// multimodal parts, not as text). Each image adds a flat vision-token pad so a
+/// no-usage gateway still sees *some* image cost instead of zero or megabytes/4.
 fn tools_token_overhead(defs: &[NativeToolDefinition]) -> u64 {
     let chars: usize = defs
         .iter()
@@ -4101,8 +4112,14 @@ fn tools_token_overhead(defs: &[NativeToolDefinition]) -> u64 {
     (chars / 4) as u64
 }
 
+/// Flat per-image pad used only by the manual estimate fallback. Real billing
+/// varies by model/resolution; this is deliberately coarse — better than
+/// counting base64 as text (~chars/4) which overstates by ~10–50×.
+const ESTIMATED_VISION_TOKENS_PER_IMAGE: u64 = 1_200;
+
 fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
     let mut chars: usize = 0;
+    let mut images: u64 = 0;
     for m in messages {
         chars += 8; // role/framing overhead per message
         match m {
@@ -4116,11 +4133,16 @@ fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
                 }
             }
             HarnessMessage::ToolResult { tool_name, content, .. } => {
-                chars += tool_name.len() + content.to_string().len();
+                chars += tool_name.len();
+                let (cleaned, image) = crate::llm::split_inlined_image(content);
+                chars += cleaned.to_string().len();
+                if image.is_some() {
+                    images += 1;
+                }
             }
         }
     }
-    (chars / 4) as u64
+    (chars / 4) as u64 + images.saturating_mul(ESTIMATED_VISION_TOKENS_PER_IMAGE)
 }
 
 fn clip(s: &str, n: usize) -> String {
