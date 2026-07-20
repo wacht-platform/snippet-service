@@ -701,6 +701,10 @@ impl CodingHarness {
                 let was_running = prior_status == HarnessStatus::Running;
                 let mut had_user_msg = false;
                 let mut wants_compact = false;
+                // Mode/title/goal tweaks must hit disk so attach clients refresh —
+                // without this, a lone SetMode while parked never persisted and
+                // the desktop chip stayed stale until some later event.
+                let mut needs_persist = false;
                 for input in std::mem::take(&mut pending_inputs) {
                     match input {
                         // Buffered /compact must actually run — `apply_input`
@@ -729,6 +733,15 @@ impl CodingHarness {
                             }
                         }
                         other => {
+                            if matches!(
+                                other,
+                                LoopInput::SetMode(_)
+                                    | LoopInput::SetTitle(_)
+                                    | LoopInput::SetGoal(_)
+                                    | LoopInput::CancelGoal
+                            ) {
+                                needs_persist = true;
+                            }
                             self.apply_input(&mut state, other);
                         }
                     }
@@ -744,7 +757,12 @@ impl CodingHarness {
                 }
                 if had_user_msg || was_running {
                     state.status = HarnessStatus::Running;
-                } else if wants_compact {
+                    // Running path persists below; still flush meta now so a
+                    // mid-run /mode flip reaches clients before the next step ends.
+                    if needs_persist {
+                        self.persist(&mut state, &lanes).await?;
+                    }
+                } else if wants_compact || needs_persist {
                     // Compaction ran while parked — return to the parked status
                     // rather than waking the model with nothing new.
                     state.status = prior_status;

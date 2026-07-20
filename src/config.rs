@@ -438,6 +438,9 @@ impl ModelConfig {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
                 config.base_url = "https://api.x.ai/v1".to_string();
                 config.oauth_xai = true;
+                // Grok models are multimodal — default on when the profile left
+                // the flag unset/false by accident (older defaults were safe-off).
+                config.supports_images = true;
                 if config.model.is_empty() {
                     config.model = "grok-4".to_string();
                 }
