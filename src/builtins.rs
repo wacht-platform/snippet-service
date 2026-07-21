@@ -104,9 +104,11 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a UTF-8 text file from the workspace. Page large files with a line \
-                range (start_line/end_line) or a 1-based char window (start_char/end_char). Returns \
-                total_lines, total_chars and a slice_hash for the returned slice."
+            description: "Read a file from the workspace. Text: UTF-8 with optional line/char paging \
+                (start_line/end_line or start_char/end_char). Images (png/jpg/webp/gif/bmp/svg): \
+                auto-routes to vision — same as read_image — so you SEE the pixels; no need to \
+                pick the other tool. Returns total_lines/total_chars/slice_hash for text, or \
+                mime/size_bytes for images."
                 .to_string(),
             input_schema: object_schema(
                 json!({
@@ -129,7 +131,35 @@ impl Tool for ReadFileTool {
                 "the vault file is off-limits — secret VALUES are never readable. Use a secret as $NAME in bash; its value is injected into the process and redacted from output.",
             ));
         }
-        let content = tokio::fs::read_to_string(&path).await?;
+        // Image path (or binary that sniffs as one): same envelope as read_image so
+        // the harness inlines vision bytes. Models often call read_file on screenshots.
+        let head = {
+            use tokio::io::AsyncReadExt;
+            let mut f = tokio::fs::File::open(&path).await?;
+            let mut buf = vec![0u8; 512];
+            let n = f.read(&mut buf).await?;
+            buf.truncate(n);
+            buf
+        };
+        if let Some(mime) = sniff_image_mime(&head) {
+            let bytes = tokio::fs::read(&path).await?;
+            ctx.mark_read(&path);
+            return Ok(ToolResult::success(json!({
+                "path": args.path,
+                "mime": mime,
+                "size_bytes": bytes.len(),
+                "via": "read_file",
+            })));
+        }
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(ToolError::msg(format!(
+                    "not a UTF-8 text file ({e}). For images use read_image (or read_file on png/jpg/webp/gif/bmp/svg — those auto-route to vision)."
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
         ctx.mark_read(&path);
 
         let total_lines = content.lines().count();
@@ -330,9 +360,8 @@ impl Tool for ReadImageTool {
         NativeToolDefinition {
             name: "read_image".to_string(),
             description: "Load an image file (png/jpg/webp/gif/bmp/svg) so you can SEE it — the \
-                image is attached to your context and you can describe, analyze, or act on its \
-                contents. Use this for screenshots, diagrams, mockups, or any image path the user \
-                points you at. Call it once per image (multiple images are fine)."
+                image is attached to your context. Prefer this when you know the path is an image; \
+                read_file on the same path also auto-routes to vision. Call once per image."
                 .to_string(),
             input_schema: object_schema(json!({"path": {"type": "string"}}), &["path"]),
         }

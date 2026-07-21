@@ -1107,10 +1107,10 @@ impl CodingHarness {
         Ok(())
     }
 
-    /// Stamp base64 image bytes onto `read_image` tool results so the model can
-    /// actually SEE the image. Done per-turn on the cloned request only (never
-    /// persisted), so state stays lean and images re-inline fresh each turn.
-    /// Providers turn the inlined bytes into real image blocks.
+    /// Stamp base64 image bytes onto vision tool results so the model can SEE the
+    /// image. Covers `read_image` and `read_file` when it auto-routed an image
+    /// (envelope has `/data/mime` + path, no text `content`). Done per-turn on
+    /// the cloned request only (never persisted).
     fn inline_images(&self, messages: &mut [HarnessMessage], supports_images: bool) {
         use base64::{Engine, engine::general_purpose::STANDARD};
         // Skip absurdly large images so a request can't balloon unboundedly.
@@ -1124,6 +1124,20 @@ impl CodingHarness {
         const IMAGE_TURN_WINDOW: usize = 3;
         // Safety cap across the inlined set so one batch can't balloon a request.
         const MAX_TOTAL_IMAGE_BYTES: usize = 24 * 1024 * 1024;
+
+        /// Vision envelope: read_image always; read_file when it sniffed an image.
+        fn is_vision_result(tool_name: &str, content: &Value) -> bool {
+            match tool_name {
+                "read_image" => true,
+                "read_file" => {
+                    content.pointer("/data/mime").and_then(Value::as_str).is_some()
+                        && content.pointer("/data/path").and_then(Value::as_str).is_some()
+                        && content.pointer("/data/content").is_none()
+                }
+                _ => false,
+            }
+        }
+
         let mut assistant_turns = 0usize;
         let mut cutoff = 0usize;
         for (i, m) in messages.iter().enumerate().rev() {
@@ -1143,7 +1157,7 @@ impl CodingHarness {
             let HarnessMessage::ToolResult { tool_name, content, .. } = message else {
                 continue;
             };
-            if tool_name != "read_image" || index < cutoff {
+            if !is_vision_result(tool_name, content) || index < cutoff {
                 continue;
             }
             let Some(path) = content.pointer("/data/path").and_then(Value::as_str) else {
@@ -1165,7 +1179,7 @@ impl CodingHarness {
             let HarnessMessage::ToolResult { tool_name, content, .. } = message else {
                 continue;
             };
-            if tool_name != "read_image" {
+            if !is_vision_result(tool_name, content) {
                 continue;
             }
             let Some(path) = content
@@ -1195,7 +1209,7 @@ impl CodingHarness {
                     data.insert(
                         "image_note".to_string(),
                         Value::String(format!(
-                            "[image at {path} was shown in an earlier turn — call read_image again if you need to see it now]"
+                            "[image at {path} was shown in an earlier turn — call read_file or read_image again if you need to see it now]"
                         )),
                     );
                 }

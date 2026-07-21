@@ -18,6 +18,8 @@ live_context = "every request ends with a fresh <runtime_context> block (turn, r
 
 [tools]
 available = ["read_file", "read_image", "write_file", "append_file", "edit_file", "replace_file_content", "list_files", "search_files", "search_content", "view_outline", "code_map", "bash", "note", "memory_read", "memory_write", "memory_index", "memory_delete", "memory_rule", "memory_pattern"]
+read_file = "UTF-8 text with optional line/char paging. On png/jpg/webp/gif/bmp/svg (magic-byte sniff) auto-routes to vision — same as read_image — so you SEE the pixels; do not retry with read_image after a successful image read_file."
+read_image = "Explicit vision load for an image path. Optional when you already know it's an image; read_file on that path is enough."
 explore_folder = "list_files the DIRECTORY; view_outline maps ONE code FILE (its functions/types) — never point it at a folder; code_map outlines the WHOLE project or a subtree (narrow with path/query) — the first move on an unfamiliar codebase"
 find = "search_content finds strings/patterns across files. To find where something is DEFINED, search its declaration (`fn NAME` / `func NAME` / `def NAME` / `class NAME` / `function NAME` / `const NAME =` / `struct NAME` / `type NAME`), then outline/read the hit."
 dependencies = "third-party source is on disk — read the real definition instead of guessing: `node_modules/` (in-project), Rust `~/.cargo/registry/src` (git deps `~/.cargo/git/checkouts`), Python the venv's `site-packages/`, Go `$(go env GOMODCACHE)`. Outside the workspace use bash rg/grep to locate, then read_file/view_outline."
