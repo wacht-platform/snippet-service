@@ -353,10 +353,29 @@ fn print_browser_json(
     value: &serde_json::Value,
     pretty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(value)?);
+    let rendered = if pretty {
+        serde_json::to_string_pretty(value)?
     } else {
-        println!("{}", serde_json::to_string(value)?);
+        serde_json::to_string(value)?
+    };
+    const MAX_INLINE_BYTES: usize = 32 * 1024;
+    if rendered.len() > MAX_INLINE_BYTES {
+        let path = std::env::temp_dir().join(format!(
+            "snippet-browser-response-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, rendered.as_bytes())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": path,
+                "truncated": true,
+                "bytes": rendered.len(),
+                "message": "Response saved to a temporary file because it exceeded the inline output limit"
+            })
+        );
+    } else {
+        println!("{rendered}");
     }
     Ok(())
 }
