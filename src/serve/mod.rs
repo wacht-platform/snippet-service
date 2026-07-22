@@ -737,16 +737,13 @@ async fn browser_command(
             "result": result,
         }))
         .into_response(),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "ok": false,
-                "device_name": req.device_name,
-                "method": req.method,
-                "error": error,
-            })),
-        )
-            .into_response(),
+        Err(error) => Json(serde_json::json!({
+            "ok": false,
+            "device_name": req.device_name,
+            "method": req.method,
+            "error": error,
+        }))
+        .into_response(),
     }
 }
 
