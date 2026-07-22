@@ -9,25 +9,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
+use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
-use crate::harness::{LoopInput, deserialize_state};
+use crate::config::{save_config, workspaces_root, ModelConfig, SnippetConfig};
+use crate::harness::{deserialize_state, LoopInput};
 use crate::session::{
-    list_device_sessions, read_session_profile, start_session, state_path_for_id,
-    write_session_profile,
+    list_device_sessions, read_session_profile, start_session_with_browser_summary,
+    state_path_for_id, write_session_profile,
 };
 
+mod browser;
 mod fs;
 mod git;
 mod lifecycle;
@@ -36,6 +37,7 @@ mod tunnel;
 pub use self::lifecycle::*;
 pub use self::tunnel::ensure_cloudflared_foreground;
 
+use self::browser::{BrowserManager, RegisterMessage};
 use self::fs::*;
 use self::git::*;
 use self::tunnel::{ensure_cloudflared, start_cloudflared_quick};
@@ -88,6 +90,8 @@ struct Daemon {
     /// Serializes git WRITE operations daemon-wide so a user's git action can't
     /// race the agent's edits (or another git write) on the same index.
     git_write: Mutex<()>,
+    /// Connected browser-extension sockets and their pending command waiters.
+    browser: BrowserManager,
 }
 
 /// The machine's hostname, used as the app's default instance name.
@@ -119,7 +123,9 @@ fn token_matches(provided: &str, expected: &str) -> bool {
 
 impl Daemon {
     fn authed(&self, token: &Option<String>) -> bool {
-        token.as_deref().is_some_and(|t| token_matches(t, &self.token))
+        token
+            .as_deref()
+            .is_some_and(|t| token_matches(t, &self.token))
     }
 
     /// Re-read the on-disk config so provider profiles added or removed out-of-band
@@ -158,7 +164,14 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        let handle = start_session(&cfg, sp.clone(), None, true, None);
+        let handle = start_session_with_browser_summary(
+            &cfg,
+            sp.clone(),
+            None,
+            true,
+            None,
+            Some(self.browser.summary_provider()),
+        );
         let tx = handle.input_tx.clone();
         sessions.insert(
             id.to_string(),
@@ -228,7 +241,14 @@ impl Daemon {
         if let Some(old) = sessions.remove(id) {
             old.join.abort();
         }
-        let handle = start_session(&cfg, sp.clone(), None, true, None);
+        let handle = start_session_with_browser_summary(
+            &cfg,
+            sp.clone(),
+            None,
+            true,
+            None,
+            Some(self.browser.summary_provider()),
+        );
         sessions.insert(
             id.to_string(),
             LiveSession {
@@ -290,7 +310,14 @@ impl Daemon {
             w
         };
         let forward = initial.is_none();
-        let handle = start_session(&cfg, sp.clone(), initial, true, None);
+        let handle = start_session_with_browser_summary(
+            &cfg,
+            sp.clone(),
+            initial,
+            true,
+            None,
+            Some(self.browser.summary_provider()),
+        );
         // Control inputs weren't consumed as the first turn — hand them to the
         // freshly-parked loop so it acts on them (idle-arm compaction, goal, etc.).
         if forward {
@@ -354,6 +381,7 @@ pub async fn run_serve(
         hostname: machine_hostname(),
         sessions: Mutex::new(HashMap::new()),
         git_write: Mutex::new(()),
+        browser: BrowserManager::default(),
     });
 
     // Background self-update: periodically check for a newer release, replace the
@@ -395,12 +423,18 @@ pub async fn run_serve(
         .route("/fs/download", get(download_fs_file))
         .route("/attach", get(attach_ws))
         .route("/events", get(events_ws))
+        .route("/browser/ws", get(browser_ws))
+        .route("/browsers", get(list_browsers))
+        .route("/browser/command", post(browser_command))
         .route("/config", get(get_config))
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
         .route("/config/delegate", post(set_delegate))
         .route("/provider/models", post(provider_models))
-        .route("/vault", get(vault_list).put(vault_set).delete(vault_delete))
+        .route(
+            "/vault",
+            get(vault_list).put(vault_set).delete(vault_delete),
+        )
         .route("/xai/login", post(xai_login))
         .route("/xai/status", get(xai_status))
         .route("/xai/logout", post(xai_logout))
@@ -465,7 +499,9 @@ pub async fn run_serve(
     // This stdout is a LOG (the daemonized worker's serve.log / the journal in
     // supervised mode), never a user terminal — the launcher and `--status` print
     // the real QR from serve.json. Keep the token out of it.
-    println!("serve up at {public_url} (token elided — `snippet serve --status` shows the connection)");
+    println!(
+        "serve up at {public_url} (token elided — `snippet serve --status` shows the connection)"
+    );
     write_serve_state(&public_url, &token_for_print);
 
     // Run until the listener dies or we get SIGTERM/SIGINT (`serve --stop`); either
@@ -496,7 +532,10 @@ async fn config_watch_loop(daemon: Shared) {
     use std::time::Duration;
 
     let path = daemon.config_path.clone();
-    let mut last_mtime = tokio::fs::metadata(&path).await.ok().and_then(|m| m.modified().ok());
+    let mut last_mtime = tokio::fs::metadata(&path)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok());
     // Sessions whose model must be rebuilt but are currently busy — retried until idle.
     let mut pending: HashSet<String> = HashSet::new();
 
@@ -511,7 +550,10 @@ async fn config_watch_loop(daemon: Shared) {
                     daemon.reload_config().await;
                     // Every live session may now have a different model — queue them all.
                     let ids: Vec<String> = daemon.sessions.lock().await.keys().cloned().collect();
-                    eprintln!("config.toml changed — reloaded; rebuilding {} live session model(s)", ids.len());
+                    eprintln!(
+                        "config.toml changed — reloaded; rebuilding {} live session model(s)",
+                        ids.len()
+                    );
                     pending.extend(ids);
                 }
             }
@@ -562,7 +604,10 @@ async fn self_update_loop(daemon: Shared, supervised: bool) {
         if !crate::update::is_newer(&latest) || staged.as_deref() == Some(latest.as_str()) {
             continue;
         }
-        if crate::update::download_and_replace(&client, &latest).await.is_err() {
+        if crate::update::download_and_replace(&client, &latest)
+            .await
+            .is_err()
+        {
             continue;
         }
         staged = Some(latest);
@@ -644,6 +689,210 @@ struct ListQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct BrowserCommandReq {
+    #[serde(alias = "deviceName")]
+    device_name: String,
+    method: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+/// GET /browsers — currently connected browser extensions.
+async fn list_browsers(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(serde_json::json!({
+        "browsers": d.browser.list().await,
+    }))
+    .into_response()
+}
+
+/// POST /browser/command — authenticated relay used by the future CLI.
+async fn browser_command(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<BrowserCommandReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.device_name.trim().is_empty() || req.method.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "device_name and method are required",
+        )
+            .into_response();
+    }
+    match d
+        .browser
+        .send_command_for_device_name(&req.device_name, &req.method, req.args)
+        .await
+    {
+        Ok(result) => Json(serde_json::json!({
+            "ok": true,
+            "device_name": req.device_name,
+            "method": req.method,
+            "result": result,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "device_name": req.device_name,
+                "method": req.method,
+                "error": error,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// WS /browser/ws?token= — extension-initiated command channel.
+async fn browser_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    ws.on_upgrade(move |socket| handle_browser_ws(socket, d))
+}
+
+async fn handle_browser_ws(socket: WebSocket, daemon: Shared) {
+    let (mut sender, mut receiver) = socket.split();
+    let Some(Ok(Message::Text(first))) = receiver.next().await else {
+        return;
+    };
+    let Ok(register_value) = serde_json::from_str::<serde_json::Value>(first.as_str()) else {
+        let _ = sender
+            .send(Message::Text(
+                serde_json::json!({"type": "error", "error": "first message must be JSON"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    };
+    if register_value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("register")
+    {
+        let _ = sender
+            .send(Message::Text(
+                serde_json::json!({"type": "error", "error": "first message must be register"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    }
+    let Ok(registration) = serde_json::from_value::<RegisterMessage>(register_value) else {
+        let _ = sender
+            .send(Message::Text(
+                serde_json::json!({"type": "error", "error": "invalid register message"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    };
+    let (outbound, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let info = match daemon.browser.register(registration, outbound).await {
+        Ok(info) => info,
+        Err(error) => {
+            let _ = sender
+                .send(Message::Text(
+                    serde_json::json!({"type": "error", "error": error})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            return;
+        }
+    };
+    let browser_id = info.browser_id.clone();
+    if sender
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "registered",
+                "protocol": 1,
+                "browser": info.browser,
+                "deviceName": info.device_name,
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .is_err()
+    {
+        daemon.browser.unregister(&browser_id).await;
+        return;
+    }
+
+    let send_task = tokio::spawn(async move {
+        while let Some(message) = outbound_rx.recv().await {
+            if sender.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(Ok(message)) = receiver.next().await {
+        match message {
+            Message::Text(text) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(text.as_str()) else {
+                    continue;
+                };
+                match value.get("type").and_then(serde_json::Value::as_str) {
+                    Some("heartbeat") | Some("pong") => {
+                        daemon.browser.touch(&browser_id).await;
+                    }
+                    Some("result") => {
+                        let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
+                            continue;
+                        };
+                        let ok = value
+                            .get("ok")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        daemon
+                            .browser
+                            .complete(
+                                id,
+                                ok,
+                                value.get("result").cloned(),
+                                value
+                                    .get("error")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string),
+                            )
+                            .await;
+                        daemon.browser.touch(&browser_id).await;
+                    }
+                    Some("tab_event") => daemon.browser.touch(&browser_id).await,
+                    _ => {}
+                }
+            }
+            Message::Ping(payload) => {
+                daemon.browser.touch(&browser_id).await;
+                let _ = daemon
+                    .browser
+                    .send_message(&browser_id, Message::Pong(payload))
+                    .await;
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    send_task.abort();
+    daemon.browser.unregister(&browser_id).await;
+}
+
 // GET /sessions[?folder=] — device sessions (optionally scoped to one folder),
 // each with a `running` flag. Metadata comes from per-session sidecars, so this
 // no longer decompresses every conversation.
@@ -713,7 +962,11 @@ fn default_true() -> bool {
 }
 
 // POST /sessions {folder, resume?} — open a folder, start/resume its session.
-async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<OpenReq>) -> Response {
+async fn open_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<OpenReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -739,7 +992,11 @@ async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req):
     } else {
         (base_state.clone(), req.resume)
     };
-    let id = sp.strip_prefix(workspaces_root()).unwrap_or(&sp).display().to_string();
+    let id = sp
+        .strip_prefix(workspaces_root())
+        .unwrap_or(&sp)
+        .display()
+        .to_string();
     // Effective model: a persisted per-conversation override is AUTHORITATIVE on
     // resume — the app re-sends a profile on plain navigation (foregrounding,
     // reopening the chat), and honoring it silently reverted the model the user
@@ -756,7 +1013,14 @@ async fn open_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req):
 
     let mut sessions = d.sessions.lock().await;
     if !sessions.contains_key(&id) {
-        let handle = start_session(&cfg, sp.clone(), None, resume, None);
+        let handle = start_session_with_browser_summary(
+            &cfg,
+            sp.clone(),
+            None,
+            resume,
+            None,
+            Some(d.browser.summary_provider()),
+        );
         if persisted.is_none() {
             if let Some(name) = req.profile.as_ref() {
                 write_session_profile(&sp, name); // seed the initial override
@@ -865,7 +1129,11 @@ struct ProfileReq {
 
 // PUT /config/profile — add/update an API-key provider profile; persists to disk.
 // An omitted/blank api_key keeps any existing key (so editing doesn't wipe it).
-async fn put_profile(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ProfileReq>) -> Response {
+async fn put_profile(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ProfileReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -944,7 +1212,11 @@ struct ActiveReq {
 }
 
 // POST /config/active — set the global active profile (default for new sessions).
-async fn set_active(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ActiveReq>) -> Response {
+async fn set_active(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ActiveReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1066,7 +1338,11 @@ async fn vault_list(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
 }
 
 // PUT /vault — store a secret (from the app's vault screen; TLS/tunnel carries it).
-async fn vault_set(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<VaultSetReq>) -> Response {
+async fn vault_set(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<VaultSetReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1167,7 +1443,11 @@ struct DelegateReq {
 }
 
 // POST /config/delegate — set (or clear) the profile that delegated lanes run on.
-async fn set_delegate(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<DelegateReq>) -> Response {
+async fn set_delegate(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<DelegateReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1220,7 +1500,11 @@ struct SessionModelReq {
 
 // POST /session/model {session, profile} — switch one conversation's model until
 // daemon restart: rebuild its loop on the chosen profile, resuming from disk.
-async fn set_session_model(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<SessionModelReq>) -> Response {
+async fn set_session_model(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<SessionModelReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1247,7 +1531,14 @@ async fn set_session_model(State(d): State<Shared>, Query(a): Query<Auth>, Json(
     if let Some(old) = sessions.remove(&req.session) {
         old.join.abort();
     }
-    let handle = start_session(&cfg, sp.clone(), None, true, None);
+    let handle = start_session_with_browser_summary(
+        &cfg,
+        sp.clone(),
+        None,
+        true,
+        None,
+        Some(d.browser.summary_provider()),
+    );
     write_session_profile(&sp, &req.profile); // persist so it survives restart
     sessions.insert(
         req.session.clone(),
@@ -1270,7 +1561,11 @@ struct RewindReq {
 // POST /session/rewind {session, checkpoint} — restore the workspace files to a
 // checkpoint (the conversation continues; only the work-tree reverts), mirroring
 // the TUI's /rewind.
-async fn rewind_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<RewindReq>) -> Response {
+async fn rewind_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<RewindReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1280,7 +1575,8 @@ async fn rewind_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
     };
     let checkpoint = req.checkpoint.clone();
     let result =
-        tokio::task::spawn_blocking(move || crate::checkpoint::restore(&workspace, &checkpoint)).await;
+        tokio::task::spawn_blocking(move || crate::checkpoint::restore(&workspace, &checkpoint))
+            .await;
     match result {
         Ok(Ok(())) => Json(serde_json::json!({ "restored": req.checkpoint })).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1296,7 +1592,11 @@ struct ExecReq {
 
 // POST /session/exec {session, command} — run a shell command in the session's
 // workspace and return its output. Token-gated; runs as the daemon user.
-async fn exec_in_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ExecReq>) -> Response {
+async fn exec_in_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ExecReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1323,7 +1623,7 @@ async fn exec_in_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(re
             return Json(serde_json::json!({
                 "exit_code": -1, "stdout": "", "stderr": "timed out after 60s", "truncated": false,
             }))
-            .into_response()
+            .into_response();
         }
     };
     let (stdout, t1) = clip_output(&out.stdout, 20_000);
@@ -1351,7 +1651,11 @@ struct BgReq {
 }
 
 // POST /bg {session} — snapshot of the session's background processes.
-async fn bg_list(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<BgReq>) -> Response {
+async fn bg_list(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<BgReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1363,7 +1667,11 @@ async fn bg_list(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json
 }
 
 // POST /bg/kill {session, id} — terminate one background process.
-async fn bg_kill(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<BgReq>) -> Response {
+async fn bg_kill(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<BgReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1381,7 +1689,11 @@ async fn bg_kill(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json
 }
 
 // POST /bg/log {session, id, tail?} — tail a background process's log.
-async fn bg_log(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<BgReq>) -> Response {
+async fn bg_log(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<BgReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1435,7 +1747,11 @@ struct DeleteReq {
 
 // POST /session/delete {session} — stop the live loop (if any) and delete the
 // session's conversation file.
-async fn delete_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<DeleteReq>) -> Response {
+async fn delete_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<DeleteReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1461,7 +1777,11 @@ struct RenameReq {
 // POST /session/rename {session, title} — set the session's title override. A live
 // session goes through its loop so the in-memory state stays in sync; otherwise the
 // state file is edited directly (without reviving the loop).
-async fn rename_session(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<RenameReq>) -> Response {
+async fn rename_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<RenameReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1490,7 +1810,11 @@ struct AttachQuery {
 }
 
 // WS /attach?session= — stream this session's HarnessState + receive LoopInput.
-async fn attach_ws(ws: WebSocketUpgrade, State(d): State<Shared>, Query(q): Query<AttachQuery>) -> Response {
+async fn attach_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(q): Query<AttachQuery>,
+) -> Response {
     if !d.authed(&q.token) {
         return unauthorized();
     }
@@ -1568,7 +1892,10 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
                                             o.remove("events");
                                             o.insert("wire".into(), serde_json::json!("delta"));
                                             o.insert("new_events".into(), tail);
-                                            o.insert("event_count".into(), serde_json::json!(count));
+                                            o.insert(
+                                                "event_count".into(),
+                                                serde_json::json!(count),
+                                            );
                                         }
                                     }
                                     last_count = Some(count);
@@ -1625,7 +1952,11 @@ fn events_fp_at(state: &crate::harness::HarnessState, idx: usize) -> u64 {
 // WS /events — device-wide notification firehose. Emits a compact event whenever a
 // session leaves the running state (asked a question / needs approval / stopped /
 // errored), so the app can notify even for sessions it isn't actively watching.
-async fn events_ws(ws: WebSocketUpgrade, State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+async fn events_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -1672,7 +2003,11 @@ async fn handle_events_ws(socket: WebSocket) {
             last.retain(|k, _| seen.contains(k));
             first = false;
             for e in out {
-                if sender.send(Message::Text(e.to_string().into())).await.is_err() {
+                if sender
+                    .send(Message::Text(e.to_string().into()))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }

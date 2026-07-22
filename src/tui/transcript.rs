@@ -264,10 +264,6 @@ pub(super) const SPINE: usize = 0;
 const AGENT: usize = 2;
 const VERB_W: usize = 8;
 
-fn user_gutter() -> Span<'static> {
-    Span::styled("❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD))
-}
-
 fn agent_gutter(glyph: &str, color: Color) -> Span<'static> {
     Span::styled(
         format!("{}{glyph} ", " ".repeat(SPINE)),

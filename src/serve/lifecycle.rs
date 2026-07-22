@@ -122,8 +122,11 @@ pub fn launch_and_show(
 /// Resolves on SIGTERM/SIGINT; pends forever if the handlers can't be installed
 /// (so the server arm of the select still wins).
 pub(super) async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let (mut term, mut intr) = match (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let (mut term, mut intr) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
         (Ok(t), Ok(i)) => (t, i),
         _ => return std::future::pending().await,
     };
@@ -136,7 +139,10 @@ pub(super) async fn shutdown_signal() {
 fn read_serve_state() -> Option<(String, String)> {
     let bytes = std::fs::read(state_json_path()).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    Some((v["url"].as_str()?.to_string(), v["token"].as_str()?.to_string()))
+    Some((
+        v["url"].as_str()?.to_string(),
+        v["token"].as_str()?.to_string(),
+    ))
 }
 
 /// The running daemon's pid, if the pidfile points at a live process that is
@@ -144,7 +150,11 @@ fn read_serve_state() -> Option<(String, String)> {
 /// get recycled — without the identity check, `--stop` would SIGTERM whatever
 /// unrelated process inherited the number, and `serve` would refuse to start.
 fn running_pid() -> Option<u32> {
-    let pid: u32 = std::fs::read_to_string(pid_path()).ok()?.trim().parse().ok()?;
+    let pid: u32 = std::fs::read_to_string(pid_path())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     let comm = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
         .output()
@@ -170,7 +180,10 @@ pub fn stop() -> Result<(), String> {
         return Err("snippet serve is not running".to_string());
     };
     // SIGTERM the daemon; its handler tears down the tunnel before exiting.
-    let _ = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+    let _ = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status();
     let _ = std::fs::remove_file(pid_path());
     let _ = std::fs::remove_file(state_json_path());
     println!("stopped snippet serve (pid {pid})");
@@ -374,7 +387,10 @@ pub fn uninstall_service() -> Result<(), String> {
         if plist.exists() {
             let uid = current_uid();
             if let Some(uid) = &uid {
-                let _ = run("launchctl", &["bootout", &format!("gui/{uid}/{}", SERVICE_LABEL)]);
+                let _ = run(
+                    "launchctl",
+                    &["bootout", &format!("gui/{uid}/{}", SERVICE_LABEL)],
+                );
             }
             let _ = run("launchctl", &["unload", "-w", &plist.display().to_string()]);
             std::fs::remove_file(&plist).map_err(|e| format!("remove plist: {e}"))?;
@@ -386,7 +402,10 @@ pub fn uninstall_service() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let unit = systemd_unit_path();
-        let _ = run("systemctl", &["--user", "disable", "--now", "snippet-serve.service"]);
+        let _ = run(
+            "systemctl",
+            &["--user", "disable", "--now", "snippet-serve.service"],
+        );
         if unit.exists() {
             std::fs::remove_file(&unit).map_err(|e| format!("remove unit: {e}"))?;
             println!("✓ Removed systemd user unit: {}", unit.display());
@@ -449,7 +468,9 @@ pub(super) fn current_uid() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(target_os = "macos")]
@@ -458,7 +479,10 @@ fn install_launchd(exe: &std::path::Path, args: &[String]) -> Result<(), String>
     if let Some(dir) = plist.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let mut prog = format!("    <string>{}</string>\n", xml_escape(&exe.display().to_string()));
+    let mut prog = format!(
+        "    <string>{}</string>\n",
+        xml_escape(&exe.display().to_string())
+    );
     for a in args {
         prog.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
     }
@@ -543,8 +567,9 @@ fn systemd_unit_path() -> PathBuf {
 #[cfg(target_os = "linux")]
 fn sh_quote(s: &str) -> String {
     let safe = !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'='));
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'=')
+        });
     if safe {
         s.to_string()
     } else {
@@ -587,8 +612,13 @@ WantedBy=default.target
     std::fs::write(&unit, content).map_err(|e| format!("write unit: {e}"))?;
 
     let _ = run("systemctl", &["--user", "daemon-reload"]);
-    if !run("systemctl", &["--user", "enable", "--now", "snippet-serve.service"]) {
-        return Err("systemctl --user enable failed (is a user systemd session available?)".to_string());
+    if !run(
+        "systemctl",
+        &["--user", "enable", "--now", "snippet-serve.service"],
+    ) {
+        return Err(
+            "systemctl --user enable failed (is a user systemd session available?)".to_string(),
+        );
     }
     // Survive logout / start at boot without an active login session.
     if let Ok(user) = std::env::var("USER") {

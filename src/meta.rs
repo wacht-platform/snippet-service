@@ -276,8 +276,8 @@ fn delegate_task_tool() -> NativeToolDefinition {
             steps. The brief must name BOTH the scope to inspect/act on AND the concrete deliverable \
             expected; a vague brief produces vague work. \
             Ending your turn IS how you WAIT for lanes — you go idle and each report wakes you (no \
-            polling). Keep the user posted with a short progress note; just don't present your \
-            COMPLETE/final answer while lanes you need are still running (your [delegated_lanes] \
+            polling). Go idle while lanes run; each report wakes you. Do not add a routine progress note or announce delegation. \
+            Just don't present your COMPLETE/final answer while lanes you need are still running (your [delegated_lanes] \
             context lists them). Fold each report in and synthesize once they're in — progressively \
             or all at once. Only skip delegation for trivial one-step actions you can just do yourself. \
             CONTINUING: pass `lane_id` (from an earlier delegation) to send a FOLLOW-UP to a finished \

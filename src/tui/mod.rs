@@ -4100,7 +4100,6 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let accent = accent();
     let faint = faint();
     let dim = muted();
-    let yellow = warn();
 
     let width = (area.width as usize).max(20);
     let counter = if qs.len() > 1 {

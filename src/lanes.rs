@@ -16,11 +16,12 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::tools::coding_tools;
 use crate::harness::{CodingHarness, HarnessConfig};
+use crate::lane_log::LaneLog;
 use crate::llm::AgentModel;
 use crate::prompts::coding_system_prompt;
 use crate::tools::ToolContext;
+use crate::tools::coding_tools;
 
 /// Builds a fresh model instance for a child lane run. The TUI supplies one that
 /// constructs an `OpenAiCompatibleModel` from config; one-shot library callers
@@ -274,11 +275,15 @@ impl LaneManager {
             )
             .await
             .unwrap_or_else(|_| {
-                Err(format!(
+                let error = format!(
                     "lane timed out after {} minutes and was aborted — its partial work (if any) \
                      is in the workspace; re-delegate a narrower brief if the task is still needed",
                     LANE_TIMEOUT.as_secs() / 60
-                ))
+                );
+                if let Ok(mut log) = crate::lane_log::LaneLog::open(&lane_id) {
+                    let _ = log.write_end(&lane_id, "failed", None, Some(&error), None);
+                }
+                Err(error)
             });
             let lane_result = match result {
                 Ok((summary, report)) => LaneResult {
@@ -305,7 +310,11 @@ impl LaneManager {
 
     /// Fold a completed lane's terminal report into its record.
     pub fn record_result(&mut self, result: &LaneResult) {
-        if let Some(record) = self.records.iter_mut().find(|record| record.id == result.id) {
+        if let Some(record) = self
+            .records
+            .iter_mut()
+            .find(|record| record.id == result.id)
+        {
             record.status = result.status;
             record.summary = result.summary.clone();
             record.report = result.report.clone();
@@ -327,14 +336,35 @@ async fn run_lane(
     read_only: bool,
 ) -> Result<(String, String), String> {
     let mut model = factory();
+    let mut log = LaneLog::open(&owner).ok();
+    if let Some(log) = log.as_mut() {
+        let _ = log.write_start(&owner, &brief, read_only);
+    }
     let workspace_for_grounding = workspace_root.clone();
-    let context = ToolContext::with_owner(workspace_root, owner).map_err(|error| error.to_string())?;
-    let mut tools = coding_tools(exa_api_key.clone(), crate::memory::MemoryLimits::read_only());
+    let context = match ToolContext::with_owner(workspace_root, &owner) {
+        Ok(context) => context,
+        Err(error) => {
+            let message = error.to_string();
+            if let Some(log) = log.as_mut() {
+                let _ = log.write_end(&owner, "failed", None, Some(&message), None);
+            }
+            return Err(message);
+        }
+    };
+    let mut tools = coding_tools(
+        exa_api_key.clone(),
+        crate::memory::MemoryLimits::read_only(),
+    );
     if read_only {
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.
         // The shell remains for inspection — the brief tells the lane its role.
-        for tool in ["write_file", "edit_file", "append_file", "replace_file_content"] {
+        for tool in [
+            "write_file",
+            "edit_file",
+            "append_file",
+            "replace_file_content",
+        ] {
             tools.remove(tool);
         }
     }
@@ -362,10 +392,21 @@ async fn run_lane(
          for every location, symbol, definition, or finding you identify — report WHERE things are, not \
          just that they exist, so the orchestrator can navigate straight to them without re-searching."
     );
-    let outcome = harness
-        .run(&mut *model, brief)
-        .await
-        .map_err(|error| error.to_string())?;
+    let outcome = match harness.run(&mut *model, brief).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let message = error.to_string();
+            if let Some(log) = log.as_mut() {
+                let _ = log.write_end(&owner, "failed", None, Some(&message), None);
+            }
+            return Err(message);
+        }
+    };
+    if let Some(log) = log.as_mut() {
+        for event in &outcome.events {
+            let _ = log.write_event(event);
+        }
+    }
     let summary = outcome
         .final_text
         .clone()
@@ -377,6 +418,15 @@ async fn run_lane(
     if let Some(check) = verify_grounding(&workspace_for_grounding, &report) {
         report.push_str("\n\n");
         report.push_str(&check);
+    }
+    if let Some(log) = log.as_mut() {
+        let _ = log.write_end(
+            &owner,
+            "completed",
+            Some(outcome.iterations),
+            None,
+            outcome.final_text.as_deref(),
+        );
     }
     Ok((summary, report))
 }
@@ -392,7 +442,10 @@ fn verify_grounding(workspace: &std::path::Path, text: &str) -> Option<String> {
     let mut invalid: Vec<String> = Vec::new();
     for cap in re.captures_iter(text) {
         let path_str = cap.get(1).map(|m| m.as_str()).unwrap_or_default();
-        let line: usize = cap.get(2).and_then(|m| m.as_str().parse().ok()).unwrap_or(0);
+        let line: usize = cap
+            .get(2)
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
         // Require a real-looking path (letters, not a decimal like `3.5:1`).
         if line == 0 || !path_str.chars().any(|c| c.is_ascii_alphabetic()) {
             continue;
@@ -460,7 +513,10 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
     let mut changed: Vec<String> = Vec::new();
     for event in &outcome.events {
         match event {
-            HarnessEvent::ToolCall { tool_name, arguments } => {
+            HarnessEvent::ToolCall {
+                tool_name,
+                arguments,
+            } => {
                 // Track files the lane actually operated on — the concrete results.
                 if matches!(
                     tool_name.as_str(),
@@ -500,7 +556,10 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
 
     if !actions.is_empty() {
         const CAP: usize = 80;
-        out.push_str(&format!("\n\nActions taken ({} tool calls):", actions.len()));
+        out.push_str(&format!(
+            "\n\nActions taken ({} tool calls):",
+            actions.len()
+        ));
         for (i, action) in actions.iter().take(CAP).enumerate() {
             out.push_str(&format!("\n{}. {action}", i + 1));
         }
@@ -528,8 +587,14 @@ fn action_label(tool_name: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
     let detail = match tool_name {
         "bash" => arg("command"),
-        "read_file" | "read_image" | "write_file" | "append_file" | "edit_file"
-        | "replace_file_content" | "view_outline" | "list_files" => arg("path"),
+        "read_file"
+        | "read_image"
+        | "write_file"
+        | "append_file"
+        | "edit_file"
+        | "replace_file_content"
+        | "view_outline"
+        | "list_files" => arg("path"),
         "search_content" | "search_files" | "web_search" => arg("query"),
         "web_read" => arg("url"),
         "delegate_task" => arg("title"),

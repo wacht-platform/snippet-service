@@ -22,8 +22,6 @@ pub enum RuntimeSignal {
     ToolCallLoop { count: usize },
     /// The model called a tool that isn't in the available set.
     UnknownTool { name: String, available: String },
-    /// Several tool-only steps with no word to the user.
-    VisibilityLapse,
     /// Shell was used to do work a dedicated file tool does better. Carries the
     /// specific guidance for what was detected (redirect / sed -i / tee / cat).
     ShellDiscipline { message: String },
@@ -33,8 +31,6 @@ pub enum RuntimeSignal {
     NoteLoop { count: usize },
     /// A very large batch of tool calls was issued in one turn.
     BatchBackpressure { batch_size: usize },
-    /// A user message just arrived — state the working intent before continuing.
-    StateIntent,
     /// Several consecutive turns of failing tool calls (or near the unproductive
     /// backstop): step back and re-think creatively, or ask for help.
     StuckEscalation {
@@ -53,12 +49,10 @@ impl RuntimeSignal {
             Self::ResponseTruncated => "response_truncated",
             Self::ToolCallLoop { .. } => "tool_call_loop",
             Self::UnknownTool { .. } => "unknown_tool",
-            Self::VisibilityLapse => "user_visibility",
             Self::ShellDiscipline { .. } => "shell_discipline",
             Self::ShellDisciplineEscalated { .. } => "shell_discipline",
             Self::NoteLoop { .. } => "note_loop",
             Self::BatchBackpressure { .. } => "batch_backpressure",
-            Self::StateIntent => "state_intent",
             Self::StuckEscalation { .. } => "stuck_escalation",
         }
     }
@@ -85,10 +79,6 @@ impl RuntimeSignal {
                 "`{name}` is not an available tool. Use one of these by exact name: [{available}]. \
                  If none fit, reply in plain text."
             ),
-            Self::VisibilityLapse =>
-                "no user-visible message in the last few steps; add one short progress line beside \
-                 your next tool call unless it is a tiny read."
-                    .to_string(),
             Self::ResponseTruncated =>
                 "your previous response was cut off at the output-token limit. It was NOT treated as \
                  final. Continue with a concrete tool call, or keep the next reply shorter so it \
@@ -109,12 +99,6 @@ impl RuntimeSignal {
                 "you issued {batch_size} tool calls in one turn. Large fan-outs are hard to verify \
                  and recover from — prefer a few focused calls, read the results, then continue."
             ),
-            Self::StateIntent =>
-                "a new user message just arrived. Call `note` once stating your intent — one or two \
-                 sentences covering any work you were mid-way through (so it survives the \
-                 interruption) and what you will do next for this message — then proceed (you may \
-                 batch it with your first real step)."
-                    .to_string(),
             Self::StuckEscalation { failed_turns, can_ask_user } => {
                 let escape = if *can_ask_user {
                     "if you genuinely cannot proceed (missing access, credentials, information, or \

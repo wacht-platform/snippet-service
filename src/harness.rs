@@ -15,14 +15,10 @@ use crate::llm::{
 };
 use crate::meta::{self, parse_ask_user, parse_delegate_brief};
 use crate::prompts::coding_system_prompt;
-use crate::signals::RuntimeSignal;
 use crate::shell_guard::{ShellVerdict, classify_shell_command};
+use crate::signals::RuntimeSignal;
 use crate::tools::{ToolContext, ToolError, ToolRegistry};
 use crate::watches::{WatchEvent, WatchManager, WatchRecord};
-
-/// How many tool-only steps may pass before the agent is nudged to emit a
-/// user-visible progress line. Ported from wacht's `STEER_VISIBILITY_NUDGE_WINDOW`.
-const VISIBILITY_NUDGE_WINDOW: usize = 4;
 
 /// Consecutive tool-call turns with no real work before the run is wrapped up.
 /// Ported from wacht's `MAX_UNPRODUCTIVE_TURNS`.
@@ -42,7 +38,12 @@ const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 /// Read-only discovery tools whose exact-duplicate re-call within a request is
 /// wasteful spinning (the result is already in history). `read_file` is excluded
 /// — re-reading after an edit is legitimate.
-const DEDUP_TOOLS: [&str; 4] = ["list_files", "search_content", "search_files", "view_outline"];
+const DEDUP_TOOLS: [&str; 4] = [
+    "list_files",
+    "search_content",
+    "search_files",
+    "view_outline",
+];
 
 /// Tools that change the workspace; running one invalidates the dedup set so
 /// re-discovery afterward is allowed.
@@ -115,19 +116,37 @@ impl Default for HarnessConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HarnessEvent {
-    UserInput { text: String },
+    UserInput {
+        text: String,
+    },
     /// A mid-run user message injected while the agent was working (steering).
-    Steer { text: String },
-    AssistantText { text: String },
+    Steer {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
     /// A private note-to-self the agent recorded.
-    Note { entry: String },
+    Note {
+        entry: String,
+    },
     /// The agent presented a file to the user (an openable card in the UIs).
-    FilePresented { path: String, caption: Option<String> },
+    FilePresented {
+        path: String,
+        caption: Option<String>,
+    },
     /// A runtime-injected correction after recoverable failures.
-    SystemDecision { step: String, reasoning: String },
-    ModelError { message: String },
+    SystemDecision {
+        step: String,
+        reasoning: String,
+    },
+    ModelError {
+        message: String,
+    },
     /// The agent asked the user a question and the turn is paused.
-    UserQuestion { questions: Value },
+    UserQuestion {
+        questions: Value,
+    },
     /// In manual mode, a mutating tool is awaiting approval. `index`/`total` track
     /// position within a batch of tool calls so the UI can show "action 2 of 3".
     ApprovalRequest {
@@ -137,7 +156,10 @@ pub enum HarnessEvent {
         total: usize,
     },
     /// A delegated lane was started.
-    LaneSpawned { id: String, title: String },
+    LaneSpawned {
+        id: String,
+        title: String,
+    },
     /// A delegated lane reported back.
     LaneCompleted {
         id: String,
@@ -145,9 +167,18 @@ pub enum HarnessEvent {
         status: LaneStatus,
         summary: Option<String>,
     },
-    ToolCall { tool_name: String, arguments: Value },
-    ToolResult { tool_name: String, result: Value },
-    InvalidToolCall { tool_name: String, error: String },
+    ToolCall {
+        tool_name: String,
+        arguments: Value,
+    },
+    ToolResult {
+        tool_name: String,
+        result: Value,
+    },
+    InvalidToolCall {
+        tool_name: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -264,9 +295,9 @@ blocker you truly cannot resolve, say exactly what you need. Begin."
 fn goal_continue_directive(text: &str, dir: &str) -> String {
     format!(
         "[goal] Continue toward your goal: {text}\n\
-Re-read your plan/todos/findings in {where}, pick the next unfinished step, and do it — update \
-the todos as you go. Keep going; don't stop or recap unless something material changed. When it's \
-100% complete, call `complete_goal`.",
+    Re-read your plan/todos/findings in {where}, pick the next unfinished step, and do it — update \
+    the todos as you go. Keep going; don't stop or recap unless something material changed. When it's \
+    100% complete, call `complete_goal`.",
         where = goal_dir_phrase(dir)
     )
 }
@@ -274,12 +305,12 @@ the todos as you go. Keep going; don't stop or recap unless something material c
 fn goal_selfcheck_directive(text: &str, dir: &str, n: usize) -> String {
     format!(
         "[goal] SELF-CHECK — you've taken {n} autonomous turns on this goal. Step back and evaluate \
-honestly:\n\
-- Are you making REAL progress toward: {text}?\n\
-- Is your approach working, or are you looping/stuck?\n\
-- Re-read your plan/todos in {where}.\n\
-Then decide: if it's actually complete, call `complete_goal`; if you're genuinely blocked, state \
-exactly what you need; otherwise correct course if needed and CONTINUE. Proceed.",
+    honestly:\n\
+    - Are you making REAL progress toward: {text}?\n\
+    - Is your approach working, or are you looping/stuck?\n\
+    - Re-read your plan/todos in {where}.\n\
+    Then decide: if it's actually complete, call `complete_goal`; if you're genuinely blocked, state \
+    exactly what you need; otherwise correct course if needed and CONTINUE. Proceed.",
         where = goal_dir_phrase(dir)
     )
 }
@@ -287,8 +318,8 @@ exactly what you need; otherwise correct course if needed and CONTINUE. Proceed.
 fn goal_cancel_directive(text: &str, dir: &str) -> String {
     format!(
         "[goal] The user has CANCELLED this goal. STOP working toward it now. Give a brief summary of \
-what you accomplished and where you left off (your work is saved in {where}). Take no further \
-action on the goal: {text}",
+    what you accomplished and where you left off (your work is saved in {where}). Take no further \
+    action on the goal: {text}",
         where = goal_dir_phrase(dir)
     )
 }
@@ -451,8 +482,6 @@ enum RecoveryAction {
 
 #[derive(Default)]
 struct LoopVars {
-    /// Tool-only steps since the agent last said something visible.
-    steps_since_visible: usize,
     /// Signals raised this turn, drained into next turn's live context.
     pending_signals: Vec<RuntimeSignal>,
     /// Signature of the previous turn's tool calls, for loop detection.
@@ -501,7 +530,10 @@ enum StepResult {
     /// The model request failed. `retryable` is false for fatal errors
     /// (auth/permission/not-found/bad-request) so the loop gives up at once
     /// instead of re-running the whole step and flooding the transcript.
-    ModelError { message: String, retryable: bool },
+    ModelError {
+        message: String,
+        retryable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -560,8 +592,7 @@ impl CodingHarness {
         // Watches are likewise inert on the one-shot path (nothing selects on the
         // channel) — present only so the meta-tool dispatch signature is uniform.
         let (watch_tx, _watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
-        let mut watches =
-            WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
+        let mut watches = WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
         let mut vars = LoopVars::default();
         let mut consecutive_errors = 0usize;
 
@@ -575,7 +606,16 @@ impl CodingHarness {
             self.persist(&mut state, &lanes).await?;
 
             match self
-                .step(model, &mut state, &mut lanes, &mut watches, &mut vars, false, None, &mut approval_rx)
+                .step(
+                    model,
+                    &mut state,
+                    &mut lanes,
+                    &mut watches,
+                    &mut vars,
+                    false,
+                    None,
+                    &mut approval_rx,
+                )
                 .await
             {
                 StepResult::Continue => {
@@ -655,8 +695,7 @@ impl CodingHarness {
         // File watches (`monitor` meta-tool): re-arm any persisted from the state
         // so a daemon/TUI restart resumes tailing where it left off.
         let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
-        let mut watches =
-            WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
+        let mut watches = WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
         watches.restore(&state.watches);
         // Lanes that were mid-flight when the previous process died were just
         // ghosted (Failed) by the restore. Surface each as a failure report and
@@ -747,13 +786,11 @@ impl CodingHarness {
                     }
                 }
                 if had_user_msg {
-                    // A steer is still a user message — nudge an intent
-                    // restatement next turn so the interruption is captured.
-                    vars.pending_signals.push(RuntimeSignal::StateIntent);
                     vars.empty_reply_reprompts = 0;
                 }
                 if wants_compact {
-                    self.run_manual_compaction(model, &mut state, &lanes).await?;
+                    self.run_manual_compaction(model, &mut state, &lanes)
+                        .await?;
                 }
                 if had_user_msg || was_running {
                     state.status = HarnessStatus::Running;
@@ -799,7 +836,8 @@ impl CodingHarness {
                     break;
                 }
                 if wants_compact {
-                    self.run_manual_compaction(model, &mut state, &lanes).await?;
+                    self.run_manual_compaction(model, &mut state, &lanes)
+                        .await?;
                 }
 
                 state.iterations += 1;
@@ -879,7 +917,6 @@ impl CodingHarness {
                             TurnEndKind::Ask => HarnessStatus::WaitingForInput,
                             TurnEndKind::Complete => HarnessStatus::Idle,
                         };
-                        vars.steps_since_visible = 0;
                         self.persist(&mut state, &lanes).await?;
                     }
                     StepResult::ModelError { message, retryable } => {
@@ -891,12 +928,17 @@ impl CodingHarness {
                         // when that is (from the last rate-limit snapshot) so the UI can
                         // show it. The user can re-issue /goal to resume.
                         if is_rate_limit_error(&message) {
-                            if let Some(goal) =
-                                state.goal.as_mut().filter(|g| g.status == GoalStatus::Active)
+                            if let Some(goal) = state
+                                .goal
+                                .as_mut()
+                                .filter(|g| g.status == GoalStatus::Active)
                             {
                                 goal.status = GoalStatus::Paused;
-                                goal.resume_at =
-                                    state.rate_limit.as_ref().and_then(earliest_reset).unwrap_or(0);
+                                goal.resume_at = state
+                                    .rate_limit
+                                    .as_ref()
+                                    .and_then(earliest_reset)
+                                    .unwrap_or(0);
                                 let text = goal.text.clone();
                                 state.events.push(HarnessEvent::SystemDecision {
                                     step: "goal_paused".to_string(),
@@ -1075,10 +1117,7 @@ impl CodingHarness {
             },
         });
         state.events.push(HarnessEvent::UserInput { text });
-        // Every user message → restate intent next turn.
-        vars.pending_signals.push(RuntimeSignal::StateIntent);
         state.status = HarnessStatus::Running;
-        vars.steps_since_visible = 0;
         vars.empty_reply_reprompts = 0;
     }
 
@@ -1130,8 +1169,14 @@ impl CodingHarness {
             match tool_name {
                 "read_image" => true,
                 "read_file" => {
-                    content.pointer("/data/mime").and_then(Value::as_str).is_some()
-                        && content.pointer("/data/path").and_then(Value::as_str).is_some()
+                    content
+                        .pointer("/data/mime")
+                        .and_then(Value::as_str)
+                        .is_some()
+                        && content
+                            .pointer("/data/path")
+                            .and_then(Value::as_str)
+                            .is_some()
                         && content.pointer("/data/content").is_none()
                 }
                 _ => false,
@@ -1154,7 +1199,10 @@ impl CodingHarness {
         let mut allowed: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut total_inlined = 0usize;
         for (index, message) in messages.iter().enumerate().rev() {
-            let HarnessMessage::ToolResult { tool_name, content, .. } = message else {
+            let HarnessMessage::ToolResult {
+                tool_name, content, ..
+            } = message
+            else {
                 continue;
             };
             if !is_vision_result(tool_name, content) || index < cutoff {
@@ -1176,7 +1224,10 @@ impl CodingHarness {
             allowed.insert(index);
         }
         for (index, message) in messages.iter_mut().enumerate() {
-            let HarnessMessage::ToolResult { tool_name, content, .. } = message else {
+            let HarnessMessage::ToolResult {
+                tool_name, content, ..
+            } = message
+            else {
                 continue;
             };
             if !is_vision_result(tool_name, content) {
@@ -1239,10 +1290,12 @@ impl CodingHarness {
         let snap_label = label.clone();
         // `git add -A` + commit-tree can take a while on a large workspace — run it
         // off the async runtime so it never stalls streaming or other lanes.
-        let id = tokio::task::spawn_blocking(move || crate::checkpoint::snapshot(&workspace, &snap_label))
-            .await
-            .ok()
-            .flatten();
+        let id = tokio::task::spawn_blocking(move || {
+            crate::checkpoint::snapshot(&workspace, &snap_label)
+        })
+        .await
+        .ok()
+        .flatten();
         if let Some(id) = id {
             state.checkpoints.push(CheckpointRecord {
                 id,
@@ -1355,7 +1408,11 @@ impl CodingHarness {
             LoopInput::DropQueued => false,
             LoopInput::SetTitle(title) => {
                 let t = title.trim();
-                state.title = if t.is_empty() { None } else { Some(t.to_string()) };
+                state.title = if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                };
                 false
             }
             // Approve/Deny are only meaningful while a tool call is awaiting approval
@@ -1431,7 +1488,9 @@ impl CodingHarness {
         } else {
             goal_continue_directive(&text, &dir)
         };
-        state.messages.push(HarnessMessage::User { content: directive });
+        state
+            .messages
+            .push(HarnessMessage::User { content: directive });
         // A goal turn is a fresh turn: reset per-turn loop bookkeeping so discovery
         // and progress tracking start clean (no checkpoint — the goal start already
         // seeded one, and per-turn snapshots would flood the shadow git).
@@ -1452,7 +1511,10 @@ impl CodingHarness {
         watches.advance_offset(&event.id, event.new_offset);
         state.watches = watches.records().to_vec();
         let skipped_note = if event.skipped > 0 {
-            format!("\n(…{} earlier bytes of this burst omitted — read the file for the full text)", event.skipped)
+            format!(
+                "\n(…{} earlier bytes of this burst omitted — read the file for the full text)",
+                event.skipped
+            )
         } else {
             String::new()
         };
@@ -1494,7 +1556,10 @@ impl CodingHarness {
                 "FAILED: {}\nRecover deliberately: follow up THIS lane (delegate_task with lane_id=\"{}\") \
                  with a narrower or corrected brief — it keeps everything it learned — or do the slice \
                  yourself if it's small. Don't silently drop this part of the work.",
-                result.error.clone().unwrap_or_else(|| "unknown error".to_string()),
+                result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_string()),
                 result.id,
             ),
             LaneStatus::Running => "still running".to_string(),
@@ -1557,12 +1622,6 @@ impl CodingHarness {
             };
         }
 
-        // Visibility lapse: too many tool-only steps without a word to the user.
-        if vars.steps_since_visible >= VISIBILITY_NUDGE_WINDOW {
-            vars.pending_signals.push(RuntimeSignal::VisibilityLapse);
-            vars.steps_since_visible = 0;
-        }
-
         // This turn counts against the current request's soft turn budget.
         vars.turns_this_request = vars.turns_this_request.saturating_add(1);
 
@@ -1588,7 +1647,13 @@ impl CodingHarness {
         // role on providers with no mid-conversation system role — the framing in
         // build_live_context is the portable half of the fix.)
         request_messages.push(HarnessMessage::System {
-            content: build_live_context(state, vars, conversation_mode, self.context.workspace_root()),
+            content: build_live_context(
+                state,
+                vars,
+                conversation_mode,
+                self.context.workspace_root(),
+                self.context.browser_summary(),
+            ),
         });
 
         // Clear any leftover live-stream text before this turn streams into it; the
@@ -1666,10 +1731,12 @@ impl CodingHarness {
         let anchor_tokens = if let Some(usage) = output.usage {
             state.total_tokens = state.total_tokens.saturating_add(usage.total_tokens);
             state.prompt_tokens = state.prompt_tokens.saturating_add(usage.prompt_tokens);
-            state.completion_tokens =
-                state.completion_tokens.saturating_add(usage.completion_tokens);
-            state.cache_read_tokens =
-                state.cache_read_tokens.saturating_add(usage.cache_read_tokens);
+            state.completion_tokens = state
+                .completion_tokens
+                .saturating_add(usage.completion_tokens);
+            state.cache_read_tokens = state
+                .cache_read_tokens
+                .saturating_add(usage.cache_read_tokens);
             if usage.prompt_tokens > 0 {
                 usage.prompt_tokens
             } else {
@@ -1707,7 +1774,10 @@ impl CodingHarness {
                 // mention markup — keep it as prose, ignore the salvage.
                 let residual_short = residual.trim().chars().count() <= 240;
                 if residual_short
-                    && inline.calls.iter().any(|c| is_plausible_tool_name(&c.tool_name))
+                    && inline
+                        .calls
+                        .iter()
+                        .any(|c| is_plausible_tool_name(&c.tool_name))
                 {
                     if !residual.trim().is_empty() {
                         progress_text = Some(residual);
@@ -1756,7 +1826,9 @@ impl CodingHarness {
                         tool_calls: Vec::new(),
                     });
                     state.events.push(HarnessEvent::AssistantText { text });
-                    vars.steps_since_visible = 0;
+                    if let Some(sink) = sink {
+                        StreamBuffer::set_text_visible(sink, true);
+                    }
                 }
                 return StepResult::Continue;
             }
@@ -1768,13 +1840,19 @@ impl CodingHarness {
                     tool_calls: Vec::new(),
                 });
                 state.events.push(HarnessEvent::AssistantText { text });
-                vars.steps_since_visible = 0;
+                if let Some(sink) = sink {
+                    StreamBuffer::set_text_visible(sink, true);
+                }
             }
             // Conversation agent: don't end with NO visible reply when the agent
             // hasn't actually answered since the last user message (e.g. it only
             // left a note and then returned an empty turn). Re-prompt for a real
             // reply a couple of times before giving up.
-            let empty_reply = progress_text.as_deref().map(str::trim).unwrap_or("").is_empty();
+            let empty_reply = progress_text
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty();
             if conversation_mode
                 && empty_reply
                 && !replied_since_last_user(&state.events)
@@ -1815,9 +1893,14 @@ impl CodingHarness {
         while vars.recent_tool_signatures.len() > 8 {
             vars.recent_tool_signatures.pop_front();
         }
-        let windowed = vars.recent_tool_signatures.iter().filter(|s| **s == signature).count();
+        let windowed = vars
+            .recent_tool_signatures
+            .iter()
+            .filter(|s| **s == signature)
+            .count();
         if windowed >= 3 && vars.repeated_tool_count < 2 {
-            vars.pending_signals.push(RuntimeSignal::ToolCallLoop { count: windowed });
+            vars.pending_signals
+                .push(RuntimeSignal::ToolCallLoop { count: windowed });
         }
 
         // Assign every call a stable id and record the native assistant turn: the
@@ -1848,9 +1931,6 @@ impl CodingHarness {
         // (Clone: the delegation-only early end below reuses it as final_text.)
         if let Some(text) = progress_text.clone() {
             state.events.push(HarnessEvent::AssistantText { text });
-            vars.steps_since_visible = 0;
-        } else {
-            vars.steps_since_visible += 1;
         }
 
         // Per-turn productivity tracking, drives note-loop / unproductive /
@@ -1925,7 +2005,12 @@ impl CodingHarness {
                             content: s.to_string(),
                             tool_calls: Vec::new(),
                         });
-                        state.events.push(HarnessEvent::AssistantText { text: s.to_string() });
+                        state.events.push(HarnessEvent::AssistantText {
+                            text: s.to_string(),
+                        });
+                        if let Some(sink) = sink {
+                            StreamBuffer::set_text_visible(sink, true);
+                        }
                     }
                     return StepResult::TurnEnded {
                         kind: TurnEndKind::Complete,
@@ -2001,8 +2086,7 @@ impl CodingHarness {
             // mutation below clears the set, so re-discovery after a change still
             // works; read_file/bash are excluded — re-reads after edits are legit.)
             let signature = format!("{}:{}", tool_name, call.arguments);
-            if DEDUP_TOOLS.contains(&tool_name.as_str())
-                && vars.executed_calls.contains(&signature)
+            if DEDUP_TOOLS.contains(&tool_name.as_str()) && vars.executed_calls.contains(&signature)
             {
                 // Already ran this exact discovery call; skip re-running it. But we
                 // must STILL answer the call_id: an assistant tool_calls message with
@@ -2037,9 +2121,10 @@ impl CodingHarness {
                         shell_nudged_this_turn = true;
                         vars.shell_nudge_count += 1;
                         if vars.shell_nudge_count >= SHELL_NUDGE_ESCALATE_AT {
-                            vars.pending_signals.push(RuntimeSignal::ShellDisciplineEscalated {
-                                count: vars.shell_nudge_count,
-                            });
+                            vars.pending_signals
+                                .push(RuntimeSignal::ShellDisciplineEscalated {
+                                    count: vars.shell_nudge_count,
+                                });
                         } else {
                             vars.pending_signals
                                 .push(RuntimeSignal::ShellDiscipline { message });
@@ -2384,7 +2469,11 @@ impl CodingHarness {
                         let text = goal.text.clone();
                         state.events.push(HarnessEvent::SystemDecision {
                             step: "goal_completed".to_string(),
-                            reasoning: if summary.is_empty() { text } else { summary.clone() },
+                            reasoning: if summary.is_empty() {
+                                text
+                            } else {
+                                summary.clone()
+                            },
                         });
                         (
                             json!({"schema_version": 1, "status": "success", "data": {"completed": true}}),
@@ -2489,8 +2578,16 @@ impl CodingHarness {
                     .unwrap_or("add");
                 match action {
                     "add" => {
-                        let Some(path) = arguments.get("path").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
-                            return (tool_error("monitor add requires a `path`."), MetaControl::Continue);
+                        let Some(path) = arguments
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        else {
+                            return (
+                                tool_error("monitor add requires a `path`."),
+                                MetaControl::Continue,
+                            );
                         };
                         let label = arguments
                             .get("label")
@@ -2498,13 +2595,20 @@ impl CodingHarness {
                             .map(str::trim)
                             .filter(|s| !s.is_empty())
                             .unwrap_or(path);
-                        let filter = arguments.get("filter").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                        let filter = arguments
+                            .get("filter")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
                         match watches.add(path, label, filter) {
                             Ok(record) => {
                                 state.watches = watches.records().to_vec();
                                 state.events.push(HarnessEvent::SystemDecision {
                                     step: "watch_added".to_string(),
-                                    reasoning: format!("watching \"{}\" ({})", record.label, record.path),
+                                    reasoning: format!(
+                                        "watching \"{}\" ({})",
+                                        record.label, record.path
+                                    ),
                                 });
                                 (
                                     json!({
@@ -2533,7 +2637,12 @@ impl CodingHarness {
                             .map(str::trim)
                             .filter(|s| !s.is_empty());
                         let Some(key) = key else {
-                            return (tool_error("monitor remove needs a `watch_id`, `path`, or `label`."), MetaControl::Continue);
+                            return (
+                                tool_error(
+                                    "monitor remove needs a `watch_id`, `path`, or `label`.",
+                                ),
+                                MetaControl::Continue,
+                            );
                         };
                         match watches.remove(key) {
                             Ok(label) => {
@@ -2570,7 +2679,9 @@ impl CodingHarness {
                         MetaControl::Continue,
                     ),
                     other => (
-                        tool_error(format!("monitor action must be add | remove | list, got `{other}`.")),
+                        tool_error(format!(
+                            "monitor action must be add | remove | list, got `{other}`."
+                        )),
                         MetaControl::Continue,
                     ),
                 }
@@ -2684,8 +2795,9 @@ impl CodingHarness {
                     // (Anthropic, DeepSeek) 400 on that history forever after.
                     // Repair on load so a resumed session is always well-formed.
                     repair_unanswered_tool_calls(&mut state.messages);
-                    if let Some(request) =
-                        user_request.map(|r| r.trim().to_string()).filter(|r| !r.is_empty())
+                    if let Some(request) = user_request
+                        .map(|r| r.trim().to_string())
+                        .filter(|r| !r.is_empty())
                     {
                         state.status = HarnessStatus::Running;
                         state.final_text = None;
@@ -2712,7 +2824,9 @@ impl CodingHarness {
         }
 
         let now = Utc::now().to_rfc3339();
-        let request = user_request.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+        let request = user_request
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
         let mut messages = vec![HarnessMessage::System {
             content: seeded_system,
         }];
@@ -2790,9 +2904,8 @@ impl CodingHarness {
         const MAX_COMPACTION_PASSES: usize = 4;
 
         let window = self.config.context_window_tokens.max(1);
-        let threshold = window
-            .saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64)
-            / 100;
+        let threshold =
+            window.saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64) / 100;
         if !force && (threshold == 0 || state.last_prompt_tokens < threshold) {
             return Ok(());
         }
@@ -2826,7 +2939,9 @@ impl CodingHarness {
             preview_text(&raw, limit)
         };
 
-        let summarize_window = |messages: &[HarnessMessage], user_request: &str| -> (String, String, usize) {
+        let summarize_window = |messages: &[HarnessMessage],
+                                user_request: &str|
+         -> (String, String, usize) {
             let mut objective = Vec::new();
             let mut actions = Vec::new();
             let mut outcomes = Vec::new();
@@ -2847,13 +2962,12 @@ impl CodingHarness {
                 match message {
                     HarnessMessage::User { content } => {
                         let text = preview_text(content, 320);
-                        push_unique(
-                            &mut objective,
-                            format!("- USER {text}"),
-                            MAX_SECTION_ITEMS,
-                        );
+                        push_unique(&mut objective, format!("- USER {text}"), MAX_SECTION_ITEMS);
                     }
-                    HarnessMessage::Assistant { content, tool_calls } => {
+                    HarnessMessage::Assistant {
+                        content,
+                        tool_calls,
+                    } => {
                         let content = content.trim();
                         if !content.is_empty() {
                             push_unique(
@@ -2874,15 +2988,21 @@ impl CodingHarness {
                             );
                         }
                     }
-                    HarnessMessage::ToolResult { tool_name, content, .. } => {
+                    HarnessMessage::ToolResult {
+                        tool_name, content, ..
+                    } => {
                         let rendered = preview_json(content, 420);
                         push_unique(
                             &mut outcomes,
                             format!("- Tool result {tool_name}: {rendered}"),
                             MAX_SECTION_ITEMS,
                         );
-                        if rendered.to_ascii_lowercase().contains("\"status\":\"error\"")
-                            || rendered.to_ascii_lowercase().contains("\"status\": \"error\"")
+                        if rendered
+                            .to_ascii_lowercase()
+                            .contains("\"status\":\"error\"")
+                            || rendered
+                                .to_ascii_lowercase()
+                                .contains("\"status\": \"error\"")
                             || rendered.to_ascii_lowercase().contains("\"error\"")
                         {
                             push_unique(
@@ -2928,7 +3048,10 @@ impl CodingHarness {
             }
 
             if objective.is_empty() && !user_request.trim().is_empty() {
-                objective.push(format!("- Original request: {}", preview_text(user_request, 320)));
+                objective.push(format!(
+                    "- Original request: {}",
+                    preview_text(user_request, 320)
+                ));
             }
 
             let section = |title: &str, items: &[String]| -> String {
@@ -2953,7 +3076,10 @@ impl CodingHarness {
             // forward. Approximate at ~3.5 chars/token and trim the tail if over.
             const COMPACTION_BUDGET_CHARS: usize = 21_000;
             if summary.chars().count() > COMPACTION_BUDGET_CHARS {
-                summary = summary.chars().take(COMPACTION_BUDGET_CHARS).collect::<String>()
+                summary = summary
+                    .chars()
+                    .take(COMPACTION_BUDGET_CHARS)
+                    .collect::<String>()
                     + "\n…[compacted summary trimmed to fit the 6k-token budget]";
             }
 
@@ -2964,8 +3090,13 @@ impl CodingHarness {
             );
             for message in recent_tail.iter().take(8) {
                 let line = match message {
-                    HarnessMessage::User { content } => format!("- user: {}", preview_text(content, 220)),
-                    HarnessMessage::Assistant { content, tool_calls } => {
+                    HarnessMessage::User { content } => {
+                        format!("- user: {}", preview_text(content, 220))
+                    }
+                    HarnessMessage::Assistant {
+                        content,
+                        tool_calls,
+                    } => {
                         let content = content.trim();
                         if !content.is_empty() {
                             format!("- assistant: {}", preview_text(content, 220))
@@ -2979,13 +3110,17 @@ impl CodingHarness {
                             continue;
                         }
                     }
-                    HarnessMessage::ToolResult { tool_name, content, .. } => {
+                    HarnessMessage::ToolResult {
+                        tool_name, content, ..
+                    } => {
                         format!("- tool {tool_name}: {}", preview_json(content, 220))
                     }
                     HarnessMessage::Summary { kind, content } => {
                         format!("- {kind}: {}", preview_text(content, 220))
                     }
-                    HarnessMessage::System { content } => format!("- system: {}", preview_text(content, 220)),
+                    HarnessMessage::System { content } => {
+                        format!("- system: {}", preview_text(content, 220))
+                    }
                 };
                 recent.push_str(&line);
                 recent.push('\n');
@@ -3106,14 +3241,15 @@ impl CodingHarness {
         const MIN_COMPACTABLE_MESSAGES: usize = 14;
 
         let window = self.config.context_window_tokens.max(1);
-        let threshold = window
-            .saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64)
-            / 100;
+        let threshold =
+            window.saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64) / 100;
         if !force && (threshold == 0 || state.last_prompt_tokens < threshold) {
             return Ok(());
         }
 
-        let Some(HarnessMessage::System { content: system_prompt }) = state.messages.first().cloned()
+        let Some(HarnessMessage::System {
+            content: system_prompt,
+        }) = state.messages.first().cloned()
         else {
             return Ok(());
         };
@@ -3151,7 +3287,10 @@ impl CodingHarness {
         // Surface the compaction animation while the summarizer works.
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compaction_pass".to_string(),
-            reasoning: format!("Compacting {} messages into the context table.", older.len()),
+            reasoning: format!(
+                "Compacting {} messages into the context table.",
+                older.len()
+            ),
         });
         let _ = self.persist_state(state).await;
 
@@ -3172,7 +3311,9 @@ impl CodingHarness {
             // Note: the heuristic path does NOT run the memory reflection pass.
             Err(e) => {
                 model.swap_reasoning_effort(prev_effort);
-                self.debug_log(&format!("agentic summary failed → heuristic compaction (memory reflection skipped): {e}"));
+                self.debug_log(&format!(
+                    "agentic summary failed → heuristic compaction (memory reflection skipped): {e}"
+                ));
                 return self.compact_history(state, force).await;
             }
         };
@@ -3195,8 +3336,13 @@ impl CodingHarness {
         // The whole conversation is now the table — no verbatim tail (except the
         // pending user message(s) above).
         state.messages = vec![
-            HarnessMessage::System { content: system_prompt },
-            HarnessMessage::Summary { kind: "compacted_window".to_string(), content: table },
+            HarnessMessage::System {
+                content: system_prompt,
+            },
+            HarnessMessage::Summary {
+                kind: "compacted_window".to_string(),
+                content: table,
+            },
         ];
         state.messages.extend(trailing_user);
         state.events.push(HarnessEvent::SystemDecision {
@@ -3276,15 +3422,25 @@ impl CodingHarness {
                 format!(
                     "CONVERSATION TO COMPACT — fold ALL of it into one table:\n{window_text}\n\n\
                      Call write_table ONCE with every section filled.{}",
-                    if feedback.is_empty() { String::new() } else { format!("\n\n{feedback}") }
+                    if feedback.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\n{feedback}")
+                    }
                 )
             };
             let messages = vec![
-                HarnessMessage::System { content: SUMMARIZER_SYSTEM.to_string() },
+                HarnessMessage::System {
+                    content: SUMMARIZER_SYSTEM.to_string(),
+                },
                 HarnessMessage::User { content: user },
             ];
             let output = model.generate(&messages, &tools, true, None).await?;
-            let Some(call) = output.calls.first().filter(|c| c.tool_name == "write_table") else {
+            let Some(call) = output
+                .calls
+                .first()
+                .filter(|c| c.tool_name == "write_table")
+            else {
                 feedback = "Call write_table once, filling every section.".to_string();
                 continue;
             };
@@ -3369,13 +3525,27 @@ impl CodingHarness {
             let patterns = global.read_patterns();
             let user = format!(
                 "WORKSPACE: {ws}\n\nWHAT JUST HAPPENED (compacted session table):\n{summary_table}\n\nCURRENT MEMORY INDEX:\n{index}\n\nEXISTING ENTRIES: {entries}\n\nCURRENT REUSABLE PATTERNS (global):\n{patterns}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS} · {writes} write(s) so far. Make exactly one tool call. Capture what helps a FUTURE session: (a) workspace FACTS/pointers and how-to PLAYBOOK(s) for THIS project via memory_write; (b) any GENERALIZABLE PATTERN this session demonstrated — a reusable technique (situation → approach → why) that would help in ANY project — via memory_pattern (include the existing patterns plus the new/refined one). Write each distinct thing ONCE; NEVER re-save or 'polish' something you already wrote this pass. Once the durable value is captured (usually 1–2 writes) and the index points to workspace entries, call finalize. Only finalize with nothing written if the session was genuinely trivial.",
-                index = if index.trim().is_empty() { "(empty)".to_string() } else { index },
-                entries = if entries.is_empty() { "(none)".to_string() } else { entries.join(", ") },
-                patterns = if patterns.trim().is_empty() { "(none yet)".to_string() } else { patterns },
+                index = if index.trim().is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    index
+                },
+                entries = if entries.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    entries.join(", ")
+                },
+                patterns = if patterns.trim().is_empty() {
+                    "(none yet)".to_string()
+                } else {
+                    patterns
+                },
                 writes = writes,
             );
             let messages = vec![
-                HarnessMessage::System { content: MEMORY_REFLECTOR_SYSTEM.to_string() },
+                HarnessMessage::System {
+                    content: MEMORY_REFLECTOR_SYSTEM.to_string(),
+                },
                 HarnessMessage::User { content: user },
             ];
             let output = model.generate(&messages, &tools, true, None).await?;
@@ -3383,10 +3553,18 @@ impl CodingHarness {
                 feedback = "no tool call received — call exactly one tool".to_string();
                 continue;
             };
-            let arg_str = |k: &str| call.arguments.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let arg_str = |k: &str| {
+                call.arguments
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
             match call.tool_name.as_str() {
                 "finalize" => {
-                    self.debug_log(&format!("memory reflection: finalized after {writes} write(s)"));
+                    self.debug_log(&format!(
+                        "memory reflection: finalized after {writes} write(s)"
+                    ));
                     return Ok(());
                 }
                 "memory_read" => {
@@ -3402,8 +3580,13 @@ impl CodingHarness {
                     feedback = match store.write_entry(&id, &content, entry_budget, max_entries) {
                         Ok(()) => {
                             writes += 1;
-                            self.debug_log(&format!("memory reflection: wrote entry `{id}` ({}b)", content.len()));
-                            format!("entry `{id}` saved. Do NOT re-write or 'polish' it. If the index needs it, call memory_index once — then finalize.")
+                            self.debug_log(&format!(
+                                "memory reflection: wrote entry `{id}` ({}b)",
+                                content.len()
+                            ));
+                            format!(
+                                "entry `{id}` saved. Do NOT re-write or 'polish' it. If the index needs it, call memory_index once — then finalize."
+                            )
                         }
                         Err(e) => e,
                     };
@@ -3428,20 +3611,26 @@ impl CodingHarness {
                 }
                 "memory_pattern" => {
                     let content = arg_str("content");
-                    feedback = match global.add_pattern(&content, crate::memory::patterns_budget()) {
+                    feedback = match global.add_pattern(&content, crate::memory::patterns_budget())
+                    {
                         Ok(true) => {
                             writes += 1;
                             self.debug_log("memory reflection: added global pattern");
                             "pattern added. If nothing else remains, finalize.".to_string()
                         }
-                        Ok(false) => "identical pattern already stored — don't re-add it; finalize if done.".to_string(),
+                        Ok(false) => {
+                            "identical pattern already stored — don't re-add it; finalize if done."
+                                .to_string()
+                        }
                         Err(e) => e,
                     };
                 }
                 other => feedback = format!("unknown tool `{other}`"),
             }
         }
-        self.debug_log(&format!("memory reflection: hit turn cap after {writes} write(s)"));
+        self.debug_log(&format!(
+            "memory reflection: hit turn cap after {writes} write(s)"
+        ));
         Ok(())
     }
 
@@ -3577,6 +3766,7 @@ fn build_live_context(
     vars: &mut LoopVars,
     conversation_mode: bool,
     workspace: &std::path::Path,
+    browser_summary: Option<String>,
 ) -> String {
     let signals = std::mem::take(&mut vars.pending_signals);
     let mut block = String::from("<runtime_context>\n");
@@ -3593,6 +3783,20 @@ fn build_live_context(
         "cwd = \"{}\"  # base for relative paths + shell; not a jail — read/edit any absolute or ~ path.\n",
         workspace.display()
     ));
+
+    block.push_str("\n[session]\n");
+    let title = state
+        .title
+        .as_deref()
+        .map(sanitize_one_line)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "(untitled)".to_string());
+    block.push_str(&format!("title = \"{title}\"\n"));
+
+    if let Some(browser_summary) = browser_summary.as_deref() {
+        block.push('\n');
+        block.push_str(browser_summary);
+    }
 
     // Vault secrets: names only. Values are injected into bash child processes
     // and scrubbed from every tool result — the model never sees them.
@@ -3729,7 +3933,7 @@ fn build_live_context(
             ));
         }
         block.push_str(&format!(
-            "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — you go idle and each lane's report wakes you (no polling, no blocking). A short progress note to the user about what you kicked off is good. Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
+            "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — go idle while lanes run; each report wakes you (no polling, no routine progress message). Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
             running.len()
         ));
     }
@@ -3770,17 +3974,34 @@ fn derive_input_safety_signals(input: &str) -> Vec<String> {
         (
             "safety_bypass",
             "attempt to bypass safety constraints detected",
-            &["disable safety", "jailbreak", "bypass policy", "no restrictions"],
+            &[
+                "disable safety",
+                "jailbreak",
+                "bypass policy",
+                "no restrictions",
+            ],
         ),
         (
             "secret_exfiltration",
             "request may involve secrets, credentials, or token exfiltration",
-            &["api key", "access token", "password", "private key", "secret"],
+            &[
+                "api key",
+                "access token",
+                "password",
+                "private key",
+                "secret",
+            ],
         ),
         (
             "destructive_operations",
             "potential destructive operation request detected",
-            &["drop database", "delete all", "rm -rf", "truncate table", "wipe"],
+            &[
+                "drop database",
+                "delete all",
+                "rm -rf",
+                "truncate table",
+                "wipe",
+            ],
         ),
     ];
 
@@ -3821,7 +4042,10 @@ fn first_question_text(rendered: &Value) -> Option<String> {
 
 fn backoff_delay(attempt: usize, base_ms: u64, max_ms: u64) -> Duration {
     let shift = (attempt.saturating_sub(1)).min(7) as u32;
-    let delay = base_ms.max(1).saturating_mul(1u64 << shift).min(max_ms.max(1));
+    let delay = base_ms
+        .max(1)
+        .saturating_mul(1u64 << shift)
+        .min(max_ms.max(1));
     Duration::from_millis(delay)
 }
 
@@ -3850,9 +4074,12 @@ fn ensure_snippet_gitignored(workspace: &Path) {
     }
     let gitignore = workspace.join(".gitignore");
     let covered = |content: &str| {
-        content
-            .lines()
-            .any(|line| matches!(line.trim(), ".snippet" | ".snippet/" | "/.snippet" | "/.snippet/"))
+        content.lines().any(|line| {
+            matches!(
+                line.trim(),
+                ".snippet" | ".snippet/" | "/.snippet" | "/.snippet/"
+            )
+        })
     };
     match std::fs::read_to_string(&gitignore) {
         Ok(content) => {
@@ -3906,8 +4133,8 @@ fn normalize_tool_aliases(calls: &mut [GeneratedToolCall]) {
 }
 
 pub fn serialize_state(state: &HarnessState) -> Result<Vec<u8>, String> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write;
 
     // `to_vec_named` encodes structs as field-name → value maps. The positional
@@ -3917,9 +4144,11 @@ pub fn serialize_state(state: &HarnessState) -> Result<Vec<u8>, String> {
     let raw_bytes = rmp_serde::to_vec_named(state)
         .map_err(|e| format!("failed to serialize state to MessagePack: {e}"))?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&raw_bytes)
+    encoder
+        .write_all(&raw_bytes)
         .map_err(|e| format!("failed to compress state with Gzip: {e}"))?;
-    let compressed_bytes = encoder.finish()
+    let compressed_bytes = encoder
+        .finish()
         .map_err(|e| format!("failed to finalize Gzip compression: {e}"))?;
     Ok(compressed_bytes)
 }
@@ -3942,22 +4171,46 @@ pub fn deserialize_state(bytes: &[u8]) -> Result<HarnessState, String> {
         return Ok(state);
     }
 
-    Err("failed to deserialize state: not a valid compressed MessagePack or legacy JSON".to_string())
+    Err(
+        "failed to deserialize state: not a valid compressed MessagePack or legacy JSON"
+            .to_string(),
+    )
 }
 
 // --- Agentic compaction: the living "context table" ---
 
 /// (name, description, required) — the sections the summarizer maintains.
 const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
-    ("objective", "what the user ultimately wants, and for whom", true),
+    (
+        "objective",
+        "what the user ultimately wants, and for whom",
+        true,
+    ),
     (
         "state",
         "where things stand now: files changed, what works/doesn't, plus exact paths/IDs/values worth keeping verbatim",
         true,
     ),
-    ("actions", "what was actually done, in order — the condensed trail", false),
-    ("decisions", "key decisions and user corrections, verbatim where wording matters", false),
-    ("open_issues", "exact error strings and genuinely unresolved/open work", false),
+    (
+        "task_progress",
+        "for every task described as started, in progress, or underway: state what is completed, what remains, and a measurable amount or percentage when available; never say only that it started",
+        true,
+    ),
+    (
+        "actions",
+        "what was actually done, in order — the condensed trail; include completion status for each started task",
+        false,
+    ),
+    (
+        "decisions",
+        "key decisions and user corrections, verbatim where wording matters",
+        false,
+    ),
+    (
+        "open_issues",
+        "exact error strings and genuinely unresolved/open work",
+        false,
+    ),
     ("next_steps", "what to do next", false),
 ];
 
@@ -4055,6 +4308,7 @@ state = "the CURRENT state: which files were created/changed, what works, what's
 specifics = "every exact path, identifier, function/type/symbol name, command, config value, URL, version, and error string — copy these literally, never paraphrase them"
 decisions = "key decisions and the user's corrections in their OWN words"
 open = "genuinely unresolved problems and in-flight work"
+progress = "for EVERY task you mention as started, underway, or in progress, explicitly record: completed scope, remaining scope, and a measurable amount/percentage/count when available; if the amount is unknown, say that plainly. Never leave a task as merely 'started'."
 next = "the immediate next step, so the agent resumes without re-deriving it"
 recent_bias = "spend MORE detail on the most recent activity than on old activity — precise current state + what was mid-flight + the next action; that is what lets the agent continue seamlessly"
 
@@ -4063,7 +4317,7 @@ noise = "resolved intermediate steps, superseded/abandoned attempts, verbose too
 
 [method]
 fold = "if a PRIOR TABLE is present, update it in place — keep what's still true, add what's new, delete what's stale or superseded; do not just append"
-dense = "terse markdown bullets, not prose. Facts and values, not sentences. No preamble, no narration of this process, no filler adjectives."
+dense = "terse markdown bullets, not prose. Facts and values, not sentences. No preamble, no narration of this process, no filler adjectives. For each task described as started or in progress, include completed scope, remaining scope, and measurable progress when available."
 budget = "the whole table must fit ~6k tokens. If told it is OVER BUDGET, compress the largest/oldest sections first (drop the lowest-value detail) while keeping every exact value and the recent thread — never re-expand."
 
 [how]
@@ -4109,7 +4363,10 @@ fn required_missing(sections: &BTreeMap<&'static str, String>) -> Vec<&'static s
     SUMMARY_SECTIONS
         .iter()
         .filter(|(name, _, req)| {
-            *req && sections.get(name).map(|s| s.trim().is_empty()).unwrap_or(true)
+            *req && sections
+                .get(name)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
         })
         .map(|(n, ..)| *n)
         .collect()
@@ -4160,13 +4417,18 @@ fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
             HarnessMessage::User { content }
             | HarnessMessage::System { content }
             | HarnessMessage::Summary { content, .. } => chars += content.len(),
-            HarnessMessage::Assistant { content, tool_calls } => {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 chars += content.len();
                 for c in tool_calls {
                     chars += c.name.len() + c.arguments.to_string().len() + 8;
                 }
             }
-            HarnessMessage::ToolResult { tool_name, content, .. } => {
+            HarnessMessage::ToolResult {
+                tool_name, content, ..
+            } => {
                 chars += tool_name.len();
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
                 chars += cleaned.to_string().len();
@@ -4216,7 +4478,10 @@ fn render_window(
         out.push_str(prior_table.trim());
         out.push_str("\n\n");
     } else if !user_request.trim().is_empty() {
-        out.push_str(&format!("ORIGINAL REQUEST: {}\n\n", clip(user_request, 600)));
+        out.push_str(&format!(
+            "ORIGINAL REQUEST: {}\n\n",
+            clip(user_request, 600)
+        ));
     }
     out.push_str("CONVERSATION TO SUMMARIZE:\n");
     // Overall budget: this window is re-sent on EVERY summarizer turn (up to 16),
@@ -4235,18 +4500,30 @@ fn render_window(
         }
         let line = match m {
             HarnessMessage::User { content } => format!("USER: {}", clip(content, 600)),
-            HarnessMessage::Assistant { content, tool_calls } => {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 let mut s = String::new();
                 if !content.trim().is_empty() {
                     s.push_str(&format!("ASSISTANT: {}", clip(content, 600)));
                 }
                 for c in tool_calls {
-                    s.push_str(&format!("\nTOOL_CALL {}({})", c.name, clip(&c.arguments.to_string(), 300)));
+                    s.push_str(&format!(
+                        "\nTOOL_CALL {}({})",
+                        c.name,
+                        clip(&c.arguments.to_string(), 300)
+                    ));
                 }
                 s
             }
-            HarnessMessage::ToolResult { tool_name, content, .. } => {
-                format!("TOOL_RESULT {tool_name}: {}", clip(&content.to_string(), 600))
+            HarnessMessage::ToolResult {
+                tool_name, content, ..
+            } => {
+                format!(
+                    "TOOL_RESULT {tool_name}: {}",
+                    clip(&content.to_string(), 600)
+                )
             }
             HarnessMessage::Summary { kind, content } => format!("[{kind}] {}", clip(content, 600)),
             HarnessMessage::System { content } => format!("SYSTEM: {}", clip(content, 300)),
@@ -4282,4 +4559,3 @@ fn render_window(
     }
     out
 }
-

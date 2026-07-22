@@ -1,17 +1,6 @@
 use super::*;
 use super::theme::*;
 
-/// Center a line horizontally within `width` by left-padding to half the slack.
-pub(super) fn center_line(line: Line<'static>, width: usize) -> Line<'static> {
-    let pad = width.saturating_sub(line.width()) / 2;
-    if pad == 0 {
-        return line;
-    }
-    let mut spans = vec![Span::raw(" ".repeat(pad))];
-    spans.extend(line.spans);
-    Line::from(spans)
-}
-
 // --- Markdown-lite prose rendering (assistant text) ---
 
 pub(super) fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {

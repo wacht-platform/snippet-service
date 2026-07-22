@@ -138,6 +138,9 @@ pub fn degrade_effort(current: &str) -> Option<&'static str> {
 pub struct StreamBuffer {
     /// The visible answer the model is streaming.
     pub text: String,
+    /// Whether the buffered text is ready for the UI. Text is held back until
+    /// the harness knows whether the model turn is a final answer or a tool turn.
+    pub text_visible: bool,
     /// Reasoning/thinking tokens, when the provider returns them — shown dimmed,
     /// separate from the answer. Best-effort: empty for models that don't emit it.
     pub thinking: String,
@@ -162,12 +165,23 @@ impl StreamBuffer {
     pub fn clear(handle: &StreamHandle) {
         if let Ok(mut buf) = handle.lock() {
             buf.text.clear();
+            buf.text_visible = false;
             buf.thinking.clear();
         }
     }
 
+    /// Mark the current response text as a user-visible final answer.
+    pub fn set_text_visible(handle: &StreamHandle, visible: bool) {
+        if let Ok(mut buf) = handle.lock() {
+            buf.text_visible = visible;
+        }
+    }
+
     pub fn snapshot(handle: &StreamHandle) -> String {
-        handle.lock().map(|buf| buf.text.clone()).unwrap_or_default()
+        handle
+            .lock()
+            .map(|buf| buf.text_visible.then(|| buf.text.clone()).unwrap_or_default())
+            .unwrap_or_default()
     }
 
     pub fn snapshot_thinking(handle: &StreamHandle) -> String {

@@ -106,7 +106,11 @@ pub(super) struct FsDeleteReq {
 
 // POST /fs/write {path, content, prev_hash?} — atomic write (temp + rename) with
 // optimistic-concurrency conflict detection. Token-gated; UTF-8 text only.
-pub(super) async fn write_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsWriteReq>) -> Response {
+pub(super) async fn write_fs_file(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<FsWriteReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -138,25 +142,41 @@ pub(super) async fn write_fs_file(State(d): State<Shared>, Query(a): Query<Auth>
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
     }
-    let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let parent = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     if let Err(e) = std::fs::create_dir_all(&parent) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("create dir: {e}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create dir: {e}"),
+        )
+            .into_response();
     }
     let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let tmp = parent.join(format!(".{fname}.snippet.tmp"));
     let bytes = req.content.into_bytes();
     if let Err(e) = std::fs::write(&tmp, &bytes) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("write temp: {e}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write temp: {e}"),
+        )
+            .into_response();
     }
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
     }
-    Json(serde_json::json!({"ok": true, "hash": hash_bytes(&bytes), "size": bytes.len()})).into_response()
+    Json(serde_json::json!({"ok": true, "hash": hash_bytes(&bytes), "size": bytes.len()}))
+        .into_response()
 }
 
 // POST /fs/mkdir {path} — create a new directory (token-gated).
-pub(super) async fn make_fs_dir(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsMkdirReq>) -> Response {
+pub(super) async fn make_fs_dir(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<FsMkdirReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -172,13 +192,21 @@ pub(super) async fn make_fs_dir(State(d): State<Shared>, Query(a): Query<Auth>, 
             .into_response();
     }
     if let Err(e) = std::fs::create_dir_all(&path) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("create dir: {e}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create dir: {e}"),
+        )
+            .into_response();
     }
     Json(serde_json::json!({"ok": true, "path": path.to_string_lossy()})).into_response()
 }
 
 // POST /fs/delete {path} — remove a file or directory (recursive). Token-gated.
-pub(super) async fn delete_fs_path(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<FsDeleteReq>) -> Response {
+pub(super) async fn delete_fs_path(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<FsDeleteReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -223,7 +251,9 @@ pub(super) async fn download_fs_file(
     };
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, "not found").into_response()
+        }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     if meta.is_dir() {
@@ -235,11 +265,17 @@ pub(super) async fn download_fs_file(
     // Range request → 206, STREAMING the requested slice (the whole range, not a
     // capped chunk — capping made ExoPlayer stall). The body streams off disk, so
     // a large range never buffers into memory.
-    if let Some(raw) = headers.get(axum::http::header::RANGE).and_then(|v| v.to_str().ok()) {
+    if let Some(raw) = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
         let Some((start, end)) = parse_byte_range(raw, total) else {
             return (
                 StatusCode::RANGE_NOT_SATISFIABLE,
-                [(axum::http::header::CONTENT_RANGE, format!("bytes */{total}"))],
+                [(
+                    axum::http::header::CONTENT_RANGE,
+                    format!("bytes */{total}"),
+                )],
             )
                 .into_response();
         };
@@ -258,7 +294,10 @@ pub(super) async fn download_fs_file(
             .status(StatusCode::PARTIAL_CONTENT)
             .header(axum::http::header::CONTENT_TYPE, ctype)
             .header(axum::http::header::ACCEPT_RANGES, "bytes")
-            .header(axum::http::header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+            .header(
+                axum::http::header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{total}"),
+            )
             .header(axum::http::header::CONTENT_LENGTH, len.to_string())
             .body(body)
         {
@@ -269,7 +308,11 @@ pub(super) async fn download_fs_file(
 
     // No Range → the whole file (download-to-device path), size-capped.
     if total > MAX_FS_DOWNLOAD_BYTES {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "file too large — stream it with a range request instead").into_response();
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file too large — stream it with a range request instead",
+        )
+            .into_response();
     }
     match std::fs::read(&path) {
         Ok(bytes) => (
@@ -287,7 +330,12 @@ pub(super) async fn download_fs_file(
 /// Content-type from a file extension — enough for the app to render images,
 /// play video/audio, and view PDFs. Unknown types stay a generic download.
 fn content_type_for(path: &std::path::Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("gif") => "image/gif",
@@ -327,12 +375,15 @@ fn parse_byte_range(raw: &str, total: u64) -> Option<(u64, u64)> {
         (total.saturating_sub(suffix), total - 1)
     } else {
         let start: u64 = s.trim().parse().ok()?;
-        let end: u64 = if e.trim().is_empty() { total - 1 } else { e.trim().parse().ok()? };
+        let end: u64 = if e.trim().is_empty() {
+            total - 1
+        } else {
+            e.trim().parse().ok()?
+        };
         (start, end.min(total - 1))
     };
     (start <= end && start < total).then_some((start, end))
 }
-
 
 /// Cap a single file read for the mobile viewer.
 const MAX_FS_FILE_BYTES: usize = 512 * 1024;
@@ -350,7 +401,9 @@ pub(super) async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuer
             let size = m.len();
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
-                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
             };
             let truncated = bytes.len() > MAX_FS_FILE_BYTES;
             let slice = &bytes[..bytes.len().min(MAX_FS_FILE_BYTES)];
@@ -361,7 +414,15 @@ pub(super) async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuer
             } else {
                 String::from_utf8_lossy(slice).to_string()
             };
-            Json(FileContent { path: path.display().to_string(), content, size, truncated, binary, hash: hash_bytes(&bytes) }).into_response()
+            Json(FileContent {
+                path: path.display().to_string(),
+                content,
+                size,
+                truncated,
+                binary,
+                hash: hash_bytes(&bytes),
+            })
+            .into_response()
         }
         Ok(_) => (StatusCode::BAD_REQUEST, "not a file").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
@@ -382,7 +443,11 @@ pub(super) struct UploadReq {
 // POST /fs/upload {data_base64, name?} — save an uploaded file (e.g. an image the
 // user posts from the app) to a temp dir and return its absolute path, which the
 // agent can then view with `read_image` (or read).
-pub(super) async fn upload_fs_file(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<UploadReq>) -> Response {
+pub(super) async fn upload_fs_file(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<UploadReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -404,7 +469,11 @@ pub(super) async fn upload_fs_file(State(d): State<Shared>, Query(a): Query<Auth
             .and_then(|n| n.to_str())
             .filter(|n| !n.is_empty());
         let Some(name) = name else {
-            return (StatusCode::BAD_REQUEST, "name required when uploading to a directory").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                "name required when uploading to a directory",
+            )
+                .into_response();
         };
         let p = PathBuf::from(dir).join(name);
         if p.exists() {
@@ -435,5 +504,6 @@ pub(super) async fn upload_fs_file(State(d): State<Shared>, Query(a): Query<Auth
     if let Err(e) = std::fs::write(&path, &bytes) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
-    Json(serde_json::json!({"path": path.display().to_string(), "size": bytes.len()})).into_response()
+    Json(serde_json::json!({"path": path.display().to_string(), "size": bytes.len()}))
+        .into_response()
 }

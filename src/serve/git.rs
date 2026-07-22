@@ -8,7 +8,10 @@ use super::*;
 
 /// Run `git -C <dir> <args...>` (no shell) with a timeout. Returns
 /// (exit_code, stdout, stderr, truncated).
-async fn run_git<I, S>(dir: &std::path::Path, args: I) -> Result<(i32, String, String, bool), String>
+async fn run_git<I, S>(
+    dir: &std::path::Path,
+    args: I,
+) -> Result<(i32, String, String, bool), String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
@@ -51,7 +54,11 @@ pub(super) struct GitReq {
 }
 
 // POST /git/status {session} — branch, upstream, ahead/behind, and changed files.
-pub(super) async fn git_status(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitReq>) -> Response {
+pub(super) async fn git_status(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -63,7 +70,9 @@ pub(super) async fn git_status(State(d): State<Shared>, Query(a): Query<Auth>, J
     // the app can show what's inside a new folder.
     match run_git(&dir, ["status", "--porcelain=v1", "-b", "-z", "-uall"]).await {
         Ok((0, stdout, _, _)) => Json(parse_status(&stdout)).into_response(),
-        Ok((_, _, stderr, _)) => Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response(),
+        Ok((_, _, stderr, _)) => {
+            Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -161,7 +170,11 @@ pub(super) struct GitDiffReq {
 }
 
 // POST /git/diff {session, file?, staged?, untracked?} — unified diff (clipped).
-pub(super) async fn git_diff(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitDiffReq>) -> Response {
+pub(super) async fn git_diff(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitDiffReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -175,7 +188,13 @@ pub(super) async fn git_diff(State(d): State<Shared>, Query(a): Query<Auth>, Jso
             return (StatusCode::BAD_REQUEST, "untracked diff needs a file").into_response();
         };
         // /dev/null → file shows the entire file as additions.
-        vec!["diff".into(), "--no-index".into(), "--".into(), "/dev/null".into(), f.to_string()]
+        vec![
+            "diff".into(),
+            "--no-index".into(),
+            "--".into(),
+            "/dev/null".into(),
+            f.to_string(),
+        ]
     } else {
         let mut a = vec!["diff".into()];
         if req.staged {
@@ -208,7 +227,11 @@ pub(super) struct GitLogReq {
 }
 
 // POST /git/log {session, limit?} — recent commits as structured records.
-pub(super) async fn git_log(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitLogReq>) -> Response {
+pub(super) async fn git_log(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitLogReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -234,13 +257,19 @@ pub(super) async fn git_log(State(d): State<Shared>, Query(a): Query<Auth>, Json
                 .collect();
             Json(serde_json::json!({"ok": true, "commits": commits})).into_response()
         }
-        Ok((_, _, stderr, _)) => Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response(),
+        Ok((_, _, stderr, _)) => {
+            Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
 
 // POST /git/branches {session} — local branches + which is current.
-pub(super) async fn git_branches(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitReq>) -> Response {
+pub(super) async fn git_branches(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -261,9 +290,12 @@ pub(super) async fn git_branches(State(d): State<Shared>, Query(a): Query<Auth>,
                     name.to_string()
                 })
                 .collect();
-            Json(serde_json::json!({"ok": true, "current": current, "branches": branches})).into_response()
+            Json(serde_json::json!({"ok": true, "current": current, "branches": branches}))
+                .into_response()
         }
-        Ok((_, _, stderr, _)) => Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response(),
+        Ok((_, _, stderr, _)) => {
+            Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -278,7 +310,11 @@ pub(super) struct GitStageReq {
 }
 
 // POST /git/stage {session, paths?, all?} — `git add`.
-pub(super) async fn git_stage(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitStageReq>) -> Response {
+pub(super) async fn git_stage(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitStageReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -293,7 +329,11 @@ pub(super) async fn git_stage(State(d): State<Shared>, Query(a): Query<Auth>, Js
         args.push("--".into());
         args.extend(req.paths.iter().cloned());
     } else {
-        return (StatusCode::BAD_REQUEST, "no paths (pass paths[] or all:true)").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "no paths (pass paths[] or all:true)",
+        )
+            .into_response();
     }
     let _lock = d.git_write.lock().await;
     match run_git(&dir, &args).await {
@@ -310,7 +350,11 @@ pub(super) struct GitUnstageReq {
 }
 
 // POST /git/unstage {session, paths?} — `git restore --staged` (all if none given).
-pub(super) async fn git_unstage(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitUnstageReq>) -> Response {
+pub(super) async fn git_unstage(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitUnstageReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -340,7 +384,11 @@ pub(super) struct GitCommitReq {
 }
 
 // POST /git/commit {session, message, amend?} — commit the staged index.
-pub(super) async fn git_commit(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitCommitReq>) -> Response {
+pub(super) async fn git_commit(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitCommitReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -371,7 +419,11 @@ pub(super) struct GitCheckoutReq {
 }
 
 // POST /git/checkout {session, target, create?} — switch (or create) a branch.
-pub(super) async fn git_checkout(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitCheckoutReq>) -> Response {
+pub(super) async fn git_checkout(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitCheckoutReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -395,7 +447,11 @@ pub(super) async fn git_checkout(State(d): State<Shared>, Query(a): Query<Auth>,
 }
 
 // POST /git/push {session} — push the current branch (uses the box's git creds).
-pub(super) async fn git_push(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitReq>) -> Response {
+pub(super) async fn git_push(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -411,7 +467,11 @@ pub(super) async fn git_push(State(d): State<Shared>, Query(a): Query<Auth>, Jso
 }
 
 // POST /git/pull {session} — fast-forward-only pull (surfaces non-ff for the user).
-pub(super) async fn git_pull(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitReq>) -> Response {
+pub(super) async fn git_pull(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -434,7 +494,11 @@ pub(super) struct GitStashReq {
 }
 
 // POST /git/stash {session, op?} — op = push (default) | pop | list | drop.
-pub(super) async fn git_stash(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<GitStashReq>) -> Response {
+pub(super) async fn git_stash(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitStashReq>,
+) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
@@ -447,7 +511,13 @@ pub(super) async fn git_stash(State(d): State<Shared>, Query(a): Query<Auth>, Js
         "list" => "list",
         "drop" => "drop",
         "push" | "save" | "" => "push",
-        other => return (StatusCode::BAD_REQUEST, format!("unknown stash op `{other}`")).into_response(),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown stash op `{other}`"),
+            )
+                .into_response()
+        }
     };
     let _lock = d.git_write.lock().await;
     match run_git(&dir, ["stash", sub]).await {

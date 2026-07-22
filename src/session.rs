@@ -15,7 +15,7 @@ use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, dese
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
 use crate::prompts::conversation_system_prompt;
-use crate::tools::ToolContext;
+use crate::tools::{BrowserSummaryProvider, ToolContext};
 
 pub struct SessionHandle {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
@@ -32,6 +32,20 @@ pub fn start_session(
     initial: Option<String>,
     resume: bool,
     stream: Option<StreamHandle>,
+) -> SessionHandle {
+    start_session_with_browser_summary(config, state_path, initial, resume, stream, None)
+}
+
+/// Spawn a session with an optional live browser-registry summary provider.
+/// The provider is read synchronously while building each turn's runtime context;
+/// it never performs network or tool calls.
+pub fn start_session_with_browser_summary(
+    config: &SnippetConfig,
+    state_path: PathBuf,
+    initial: Option<String>,
+    resume: bool,
+    stream: Option<StreamHandle>,
+    browser_summary: Option<BrowserSummaryProvider>,
 ) -> SessionHandle {
     let (input_tx, rx) = mpsc::unbounded_channel();
 
@@ -57,7 +71,11 @@ pub fn start_session(
 
     let join = tokio::spawn(async move {
         let mut model = model_config.build_model();
-        let context = ToolContext::new(workspace).map_err(|e| e.to_string())?;
+        let context = match browser_summary {
+            Some(provider) => ToolContext::with_browser_summary(workspace, provider),
+            None => ToolContext::new(workspace),
+        }
+        .map_err(|e| e.to_string())?;
         let harness = CodingHarness::new(
             HarnessConfig {
                 system_prompt: conversation_system_prompt(),

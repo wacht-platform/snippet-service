@@ -151,8 +151,7 @@ fn clean_doc(s: &str) -> String {
 /// Python docstring = the first string statement inside the body.
 fn python_docstring(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
     let body = node.child_by_field_name("body")?;
-    let mut cursor = body.walk();
-    for child in body.children(&mut cursor) {
+    if let Some(child) = body.named_child(0) {
         if child.kind() == "expression_statement" {
             let mut inner_cursor = child.walk();
             for inner in child.children(&mut inner_cursor) {
@@ -163,7 +162,6 @@ fn python_docstring(node: tree_sitter::Node, src: &[u8]) -> Option<String> {
                 }
             }
         }
-        break; // only the first statement can be a docstring
     }
     None
 }

@@ -9,6 +9,7 @@ pub mod config;
 pub mod gemini;
 pub mod harness;
 pub mod inline;
+mod lane_log;
 pub mod lanes;
 pub mod llm;
 pub mod memory;
@@ -21,15 +22,15 @@ pub mod sanitize;
 pub mod serve;
 pub mod session;
 pub mod shell_guard;
-pub mod sse;
 pub mod signals;
 pub mod skills;
+pub mod sse;
 pub mod tools;
 pub mod tui;
 pub mod update;
 pub mod vault;
-pub mod xai_auth;
 pub mod watches;
+pub mod xai_auth;
 
 pub use harness::{
     CodingHarness, HarnessConfig, HarnessEvent, HarnessOutcome, HarnessState, HarnessStatus,

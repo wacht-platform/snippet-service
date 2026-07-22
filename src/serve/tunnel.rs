@@ -14,7 +14,12 @@ pub(super) async fn start_cloudflared_quick(
     let out = std::fs::File::create(&log).map_err(|e| format!("cloudflared log: {e}"))?;
     let err = out.try_clone().map_err(|e| e.to_string())?;
     let mut child = tokio::process::Command::new(bin)
-        .args(["tunnel", "--no-autoupdate", "--url", &format!("http://localhost:{port}")])
+        .args([
+            "tunnel",
+            "--no-autoupdate",
+            "--url",
+            &format!("http://localhost:{port}"),
+        ])
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err))
         .spawn()
@@ -37,8 +42,10 @@ pub(super) async fn start_cloudflared_quick(
 fn extract_trycloudflare_url(s: &str) -> Option<String> {
     for line in s.lines() {
         if let Some(i) = line.find("https://") {
-            let url: String =
-                line[i..].chars().take_while(|c| !c.is_whitespace()).collect();
+            let url: String = line[i..]
+                .chars()
+                .take_while(|c| !c.is_whitespace())
+                .collect();
             if url.contains("trycloudflare.com") {
                 return Some(url.trim_end_matches(['.', ',']).to_string());
             }
@@ -80,7 +87,9 @@ fn cloudflared_asset() -> Result<&'static str, String> {
         ("macos", "x86_64") => Ok("cloudflared-darwin-amd64.tgz"),
         ("linux", "x86_64") => Ok("cloudflared-linux-amd64"),
         ("linux", "aarch64") => Ok("cloudflared-linux-arm64"),
-        (os, arch) => Err(format!("no cloudflared build for {os}/{arch} — install it manually")),
+        (os, arch) => Err(format!(
+            "no cloudflared build for {os}/{arch} — install it manually"
+        )),
     }
 }
 
@@ -128,7 +137,10 @@ async fn download_cloudflared(dest: &std::path::Path) -> Result<(), String> {
 
     let asset = cloudflared_asset()?;
     let url = format!("https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}");
-    println!("  Fetching cloudflared (one-time) for {}…", std::env::consts::OS);
+    println!(
+        "  Fetching cloudflared (one-time) for {}…",
+        std::env::consts::OS
+    );
 
     let resp = reqwest::Client::new()
         .get(&url)
@@ -149,7 +161,10 @@ async fn download_cloudflared(dest: &std::path::Path) -> Result<(), String> {
         tick = tick.wrapping_add(1);
         draw_download_progress(FRAMES[tick % FRAMES.len()], bytes.len() as u64, total);
     }
-    println!("\r\x1b[2K  ✓ cloudflared downloaded ({:.1} MB)", bytes.len() as f64 / 1_000_000.0);
+    println!(
+        "\r\x1b[2K  ✓ cloudflared downloaded ({:.1} MB)",
+        bytes.len() as f64 / 1_000_000.0
+    );
 
     let dir = bin_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;

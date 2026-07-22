@@ -10,7 +10,10 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 const MAX_INLINE_CHARS: usize = 40_000;
 
-pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLimits) -> ToolRegistry {
+pub fn coding_tools(
+    exa_api_key: Option<String>,
+    memory: crate::memory::MemoryLimits,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.insert(ReadFileTool);
     registry.insert(ReadImageTool);
@@ -32,7 +35,9 @@ pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLi
     }
     // web_search / web_read are offered only when an Exa key is configured.
     if let Some(key) = exa_api_key.filter(|k| !k.trim().is_empty()) {
-        registry.insert(WebSearchTool { api_key: key.clone() });
+        registry.insert(WebSearchTool {
+            api_key: key.clone(),
+        });
         registry.insert(WebReadTool { api_key: key });
     }
     // Per-workspace memory: read is offered whenever enabled; writes only to the
@@ -44,7 +49,9 @@ pub fn coding_tools(exa_api_key: Option<String>, memory: crate::memory::MemoryLi
                 entry_budget: memory.entry_budget_chars,
                 max_entries: memory.max_entries,
             });
-            registry.insert(MemoryIndexTool { index_budget: memory.index_budget_chars });
+            registry.insert(MemoryIndexTool {
+                index_budget: memory.index_budget_chars,
+            });
             registry.insert(MemoryDeleteTool);
             registry.insert(MemoryRuleTool);
             registry.insert(MemoryPatternTool);
@@ -104,12 +111,13 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a file from the workspace. Text: UTF-8 with optional line/char paging \
+            description:
+                "Read a file from the workspace. Text: UTF-8 with optional line/char paging \
                 (start_line/end_line or start_char/end_char). Images (png/jpg/webp/gif/bmp/svg): \
                 auto-routes to vision — same as read_image — so you SEE the pixels; no need to \
                 pick the other tool. Returns total_lines/total_chars/slice_hash for text, or \
                 mime/size_bytes for images."
-                .to_string(),
+                    .to_string(),
             input_schema: object_schema(
                 json!({
                     "path": {"type": "string"},
@@ -171,7 +179,11 @@ impl Tool for ReadFileTool {
             let start = args.start_char.unwrap_or(1).max(1);
             // `clamp(start, total)` panics if start > total (e.g. an empty file), so
             // bound `end` independently and only slice when the window is in range.
-            let end = args.end_char.unwrap_or(total_chars).min(total_chars).max(start);
+            let end = args
+                .end_char
+                .unwrap_or(total_chars)
+                .min(total_chars)
+                .max(start);
             let slice: String = if start <= total_chars {
                 chars[start - 1..end].iter().collect()
             } else {
@@ -443,13 +455,14 @@ impl Tool for EditFileTool {
             };
             tokio::fs::write(&path, updated).await?;
             ctx.record_change(&path);
-            return Ok(ToolResult::success(json!({"path": args.path, "edited": true})));
+            return Ok(ToolResult::success(
+                json!({"path": args.path, "edited": true}),
+            ));
         }
 
-        // 2. Whitespace-flexible fallback (single edit): match line-by-line ignoring
-        // each line's indentation, then re-indent new_string to the file's actual
-        // indentation. Rescues the common failure where the text is right but the
-        // indentation is a few spaces off — instead of looping on "not found".
+        // 2. Whitespace-flexible fallback (single edit): normalize only insignificant
+        // source whitespace, preserve the exact source span, and insert new_string
+        // unchanged. Non-whitespace source tokens must still match exactly.
         if !args.replace_all {
             match flexible_replace(&content, &args.old_string, &args.new_string) {
                 Flex::Replaced(updated) => {
@@ -458,7 +471,7 @@ impl Tool for EditFileTool {
                     return Ok(ToolResult::success(json!({
                         "path": args.path,
                         "edited": true,
-                        "note": "matched ignoring indentation; re-indented to the file",
+                        "note": "matched after whitespace normalization; replacement preserved unchanged",
                     })));
                 }
                 Flex::Ambiguous(starts) => {
@@ -475,43 +488,14 @@ impl Tool for EditFileTool {
             }
         }
 
-        // 3. Backslash-escaping fallback. Many models (especially smaller ones)
-        // over-escape when emitting tool-call JSON: a file's `\n` (a literal
-        // backslash-n, e.g. inside a code-GENERATING template string) arrives as
-        // `\\n`, so it never matches. If collapsing doubled backslashes makes
-        // old_string a UNIQUE exact match, the model over-escaped uniformly — apply
-        // the edit with new_string collapsed the same way. Guarded to a single
-        // exact match so we never rewrite on a guess.
-        if !args.replace_all {
-            let old_c = collapse_double_backslashes(&args.old_string);
-            if old_c != args.old_string && content.matches(old_c.as_str()).count() == 1 {
-                let new_c = collapse_double_backslashes(&args.new_string);
-                let updated = content.replacen(old_c.as_str(), &new_c, 1);
-                tokio::fs::write(&path, updated).await?;
-                ctx.record_change(&path);
-                return Ok(ToolResult::success(json!({
-                    "path": args.path,
-                    "edited": true,
-                    "note": "matched after normalizing over-escaped backslashes (\\\\ → \\) — verify the result is what you intended",
-                })));
-            }
-        }
-
-        // 4. No match — return a diagnostic with the file region so the model can fix
+        // 3. No match — return a diagnostic with the file region so the model can fix
         // its old_string instead of blindly retrying the same near-miss.
-        Err(ToolError::msg(edit_diagnostic(&content, &args.old_string, &args.path)))
+        Err(ToolError::msg(edit_diagnostic(
+            &content,
+            &args.old_string,
+            &args.path,
+        )))
     }
-}
-
-fn leading_ws(s: &str) -> &str {
-    &s[..s.len() - s.trim_start().len()]
-}
-
-/// Collapse each doubled backslash (`\\`) to a single one. Weak models frequently
-/// over-escape backslashes when emitting tool-call JSON, so a file's `\n` arrives
-/// as `\\n`; reversing that recovers the intended bytes.
-fn collapse_double_backslashes(s: &str) -> String {
-    s.replace("\\\\", "\\")
 }
 
 enum Flex {
@@ -562,90 +546,137 @@ fn ambiguous_diagnostic(
         match above {
             Some(a) => {
                 let clipped: String = a.chars().take(90).collect();
-                msg.push_str(&format!("\n- match at line {start}, preceded by: {clipped}"));
+                msg.push_str(&format!(
+                    "\n- match at line {start}, preceded by: {clipped}"
+                ));
             }
-            None => msg.push_str(&format!("\n- match at line {start} (top of file / blank line above)")),
+            None => msg.push_str(&format!(
+                "\n- match at line {start} (top of file / blank line above)"
+            )),
         }
     }
     msg
 }
 
-/// Normalize a line for matching: drop leading/trailing whitespace AND collapse
-/// internal whitespace runs to a single space. So `  foo( x )` and `foo(  x  )`
-/// compare equal. A blank/whitespace-only line normalizes to "".
-fn norm_line(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+struct NormalizedSource {
+    /// Whitespace is represented by one separator; all non-whitespace bytes are
+    /// copied exactly from the source.
+    text: String,
+    /// Source start offset for each byte in `text`.
+    starts: Vec<usize>,
+    /// Source end offset for each byte in `text`.
+    ends: Vec<usize>,
 }
 
-/// Whitespace-tolerant single-block replace, line-by-line (no byte math). Matches
-/// `old` against the file ignoring indentation, internal whitespace runs, AND
-/// blank-line differences (blank lines are skipped on both sides). When exactly
-/// one block matches, rebuilds the file with `new` in its place, re-indented to
-/// the matched block's indentation. Skips CRLF files so it never rewrites line
-/// endings; those fall through to the diagnostic.
-fn flexible_replace(content: &str, old: &str, new: &str) -> Flex {
-    if content.contains('\r') {
-        return Flex::NoMatch;
-    }
-    let file_lines: Vec<&str> = content.lines().collect();
+/// Normalize only insignificant source whitespace while retaining the source byte span
+/// for every normalized match. Outside quoted strings, whitespace around punctuation
+/// is ignored and whitespace between identifier characters becomes one separator.
+/// Whitespace inside quoted strings is preserved exactly, so string contents cannot
+/// be changed by a lenient source match.
+fn normalize_source(source: &str) -> NormalizedSource {
+    let mut text = String::new();
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    let mut pending_ws: Option<(usize, usize)> = None;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut previous_word = false;
 
-    // The needle: old's non-blank lines, normalized.
-    let needle: Vec<String> = old.lines().map(norm_line).filter(|l| !l.is_empty()).collect();
+    let mut emit = |ch: char, start: usize, end: usize| {
+        text.push(ch);
+        starts.extend(std::iter::repeat_n(start, ch.len_utf8()));
+        ends.extend(std::iter::repeat_n(end, ch.len_utf8()));
+    };
+
+    for (start, ch) in source.char_indices() {
+        let end = start + ch.len_utf8();
+        if let Some(active_quote) = quote {
+            emit(ch, start, end);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            previous_word = false;
+            continue;
+        }
+
+        let current_word = ch.is_alphanumeric() || ch == '_';
+        if ch == '\'' || ch == '"' || ch == '`' {
+            pending_ws = None;
+            quote = Some(ch);
+            emit(ch, start, end);
+            previous_word = false;
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            pending_ws = Some(match pending_ws {
+                Some((ws_start, _)) => (ws_start, end),
+                None => (start, end),
+            });
+            continue;
+        }
+
+        if let Some((ws_start, ws_end)) = pending_ws.take() {
+            if previous_word && current_word {
+                emit(' ', ws_start, ws_end);
+            }
+        }
+        emit(ch, start, end);
+        previous_word = current_word;
+    }
+
+    NormalizedSource { text, starts, ends }
+}
+
+/// Whitespace-tolerant source-span replace. The source and old_string are
+/// normalized only for comparison; the exact source byte range is then replaced
+/// with new_string unchanged. This means indentation, line wrapping, and blank
+/// lines may differ, but a changed identifier, operator, or expression cannot
+/// match accidentally. A unique match is required.
+fn flexible_replace(content: &str, old: &str, new: &str) -> Flex {
+    let needle = normalize_source(old).text;
     if needle.is_empty() {
         return Flex::NoMatch;
     }
-    // File's non-blank lines, normalized, paired with their original line index.
-    let file_nb: Vec<(usize, String)> = file_lines
-        .iter()
-        .enumerate()
-        .map(|(i, l)| (i, norm_line(l)))
-        .filter(|(_, l)| !l.is_empty())
-        .collect();
-    let m = needle.len();
-    if file_nb.len() < m {
-        return Flex::NoMatch;
+    let source = normalize_source(content);
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0usize;
+    while let Some(pos) = source.text[from..].find(&needle) {
+        let start = from + pos;
+        let end = start + needle.len();
+        hits.push((source.starts[start], source.ends[end - 1]));
+        from = start + needle.len().max(1);
     }
 
-    // Find windows of file non-blank lines equal to the needle; record the
-    // ORIGINAL span (first..=last, including any interior blank lines).
-    let mut hits: Vec<(usize, usize)> = Vec::new();
-    for start in 0..=file_nb.len() - m {
-        if (0..m).all(|k| file_nb[start + k].1 == needle[k]) {
-            hits.push((file_nb[start].0, file_nb[start + m - 1].0));
-        }
-    }
     match hits.as_slice() {
         [] => Flex::NoMatch,
-        &[(first, last)] => {
-            let file_indent = leading_ws(file_lines[first]);
-            let old_indent =
-                leading_ws(old.lines().find(|l| !l.trim().is_empty()).unwrap_or(""));
-            let new_block = new.lines().map(|line| {
-                if line.trim().is_empty() {
-                    String::new()
-                } else {
-                    let body = line.strip_prefix(old_indent).unwrap_or(line);
-                    format!("{file_indent}{body}")
-                }
-            });
-            let mut out: Vec<String> = file_lines[..first].iter().map(|s| s.to_string()).collect();
-            out.extend(new_block);
-            out.extend(file_lines[last + 1..].iter().map(|s| s.to_string()));
-            let mut joined = out.join("\n");
-            if content.ends_with('\n') {
-                joined.push('\n');
-            }
-            Flex::Replaced(joined)
+        &[(start, end)] => {
+            let mut updated = String::with_capacity(content.len() + new.len());
+            updated.push_str(&content[..start]);
+            updated.push_str(new);
+            updated.push_str(&content[end..]);
+            Flex::Replaced(updated)
         }
-        // hits carry ORIGINAL 0-based line spans; report 1-based first lines.
-        more => Flex::Ambiguous(more.iter().map(|(first, _)| first + 1).collect()),
+        more => Flex::Ambiguous(
+            more.iter()
+                .map(|(start, _)| content[..*start].matches('\n').count() + 1)
+                .collect(),
+        ),
     }
 }
 
 /// A helpful "not found" message: point the model at the file region near the
 /// first line of its old_string so it can copy the exact text.
 fn edit_diagnostic(content: &str, old: &str, path: &str) -> String {
-    let first = old.split('\n').map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let first = old
+        .split('\n')
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
     let lines: Vec<&str> = content.lines().collect();
     let near = (!first.is_empty())
         .then(|| {
@@ -655,25 +686,10 @@ fn edit_diagnostic(content: &str, old: &str, path: &str) -> String {
                 .or_else(|| lines.iter().position(|l| l.trim().contains(first)))
         })
         .flatten();
-    // If collapsing doubled backslashes would locate the text, the model
-    // over-escaped — call that out specifically; it's the more actionable fix.
-    let backslash_hint = old.contains("\\\\") && {
-        let old_c = collapse_double_backslashes(old);
-        let first_c = old_c.split('\n').map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-        !first_c.is_empty() && lines.iter().any(|l| l.trim().contains(first_c))
-    };
-    let mut msg = if backslash_hint {
-        format!(
-            "old_string not found in `{path}` — you OVER-ESCAPED backslashes: you sent `\\\\` where \
-             the file has a single `\\` (e.g. `\\\\n` vs the file's `\\n`). Send backslashes exactly \
-             as read_file shows them — do not double them."
-        )
-    } else {
-        format!(
-            "old_string not found in `{path}` — likely a whitespace/indentation diff. Copy the exact \
-             text from read_file, keep it small and unique."
-        )
-    };
+
+    let mut msg = format!(
+        "old_string not found in `{path}` — source matching ignores only whitespace (indentation, line breaks, and repeated spaces). Copy the exact non-whitespace text from read_file, keep it small and unique, and do not resend the same near-match."
+    );
     if let Some(idx) = near {
         let lo = idx.saturating_sub(1);
         let hi = (idx + 4).min(lines.len());
@@ -793,11 +809,12 @@ impl Tool for SearchFilesTool {
         let search_root = ctx.resolve_workspace_path(&args.path)?;
         let workspace_root = ctx.workspace_root().to_path_buf();
         let pattern_lower = args.pattern.to_lowercase();
-        let ext_set: Option<std::collections::HashSet<String>> = args.extensions.as_ref().map(|exts| {
-            exts.iter()
-                .map(|e| e.trim_start_matches('.').to_lowercase())
-                .collect()
-        });
+        let ext_set: Option<std::collections::HashSet<String>> =
+            args.extensions.as_ref().map(|exts| {
+                exts.iter()
+                    .map(|e| e.trim_start_matches('.').to_lowercase())
+                    .collect()
+            });
         let max_results = args.max_results;
         let path_label = args.path.clone();
         let pattern_label = args.pattern.clone();
@@ -932,7 +949,10 @@ impl Tool for BashTool {
                 .arg("-lc")
                 .arg(&args.command)
                 .current_dir(ctx.workspace_root())
-                .env("SNIPPET_SHADOW_GIT", crate::checkpoint::shadow_dir(ctx.workspace_root()))
+                .env(
+                    "SNIPPET_SHADOW_GIT",
+                    crate::checkpoint::shadow_dir(ctx.workspace_root()),
+                )
                 .envs(vault_env)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log))
@@ -943,7 +963,10 @@ impl Tool for BashTool {
             let status_path = crate::bg::status_path(ctx.workspace_root(), &id);
             tokio::spawn(async move {
                 let code = match child.wait().await {
-                    Ok(s) => s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string()),
+                    Ok(s) => s
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".to_string()),
                     Err(_) => "?".to_string(),
                 };
                 let _ = std::fs::write(status_path, code);
@@ -964,7 +987,10 @@ impl Tool for BashTool {
             .current_dir(ctx.workspace_root())
             // The shadow checkpoint repo's git-dir, so the agent can review its own
             // changes: `git --git-dir=$SNIPPET_SHADOW_GIT --work-tree=. diff checkpoint`.
-            .env("SNIPPET_SHADOW_GIT", crate::checkpoint::shadow_dir(ctx.workspace_root()))
+            .env(
+                "SNIPPET_SHADOW_GIT",
+                crate::checkpoint::shadow_dir(ctx.workspace_root()),
+            )
             .envs(vault_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -982,7 +1008,10 @@ impl Tool for BashTool {
 
         // Apply line limit before byte limit if specified
         let (stdout_truncated, stderr_truncated) = if let Some(max_lines) = args.max_lines {
-            (truncate_lines(&stdout_str, max_lines), truncate_lines(&stderr_str, max_lines))
+            (
+                truncate_lines(&stdout_str, max_lines),
+                truncate_lines(&stderr_str, max_lines),
+            )
         } else {
             (
                 truncate_bytes(&stdout_str, args.max_bytes / 2),
@@ -1129,12 +1158,13 @@ impl Tool for SearchContentTool {
             }),
         };
 
-        let ext_set: Option<std::collections::HashSet<String>> = args.extensions.as_ref().map(|exts| {
-            exts.iter()
-                .map(|e| e.trim_start_matches('.').to_lowercase())
-                .collect()
-        });
-        
+        let ext_set: Option<std::collections::HashSet<String>> =
+            args.extensions.as_ref().map(|exts| {
+                exts.iter()
+                    .map(|e| e.trim_start_matches('.').to_lowercase())
+                    .collect()
+            });
+
         // Clamp so the result stays under the inline ceiling and is never spilled to
         // a scratch file (which would drop the `count` and render as "0 matches").
         let max_results = args.max_results.min(150);
@@ -1162,7 +1192,11 @@ impl Tool for SearchContentTool {
                     let hit = match &matcher {
                         Matcher::Regex(re) => re.is_match(line),
                         Matcher::Literal(q) => {
-                            let l = if case_sensitive { line.to_string() } else { line.to_lowercase() };
+                            let l = if case_sensitive {
+                                line.to_string()
+                            } else {
+                                line.to_lowercase()
+                            };
                             l.contains(q)
                         }
                     };
@@ -1207,7 +1241,10 @@ impl Tool for SearchContentTool {
                     };
                     let name = entry.file_name().to_string_lossy().to_string();
                     if file_type.is_dir() {
-                        if !matches!(name.as_str(), ".git" | "target" | "node_modules" | ".snippet") {
+                        if !matches!(
+                            name.as_str(),
+                            ".git" | "target" | "node_modules" | ".snippet"
+                        ) {
                             stack.push(entry.path());
                         }
                         continue;
@@ -1311,8 +1348,12 @@ impl Tool for CodeMapTool {
                     break;
                 }
                 file_count += 1;
-                let Ok(content) = std::fs::read_to_string(path) else { continue };
-                let Some(symbols) = crate::outline::outline_source(&ext, &content) else { continue };
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let Some(symbols) = crate::outline::outline_source(&ext, &content) else {
+                    continue;
+                };
                 let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
                 let mut items: Vec<String> = Vec::new();
                 for s in &symbols {
@@ -1417,7 +1458,8 @@ impl Tool for ViewOutlineTool {
         let content = tokio::fs::read_to_string(&path).await?;
         ctx.mark_read(&path);
 
-        let ext = path.extension()
+        let ext = path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
@@ -1495,52 +1537,182 @@ impl Tool for ReplaceFileContentTool {
         let args: ReplaceFileContentArgs = expect_object("replace_file_content", arguments)?;
         let path = ctx.resolve_workspace_path(&args.path)?;
         ctx.check_write(&path)?;
-        
+
         let content = tokio::fs::read_to_string(&path).await?;
         let lines: Vec<&str> = content.lines().collect();
-        
-        if args.start_line == 0
-            || args.start_line > lines.len()
-            || args.end_line > lines.len()
-            || args.start_line > args.end_line
-        {
+
+        // Line numbers come from a previous read and can be stale after an
+        // insertion/deletion elsewhere in the file. Keep the supplied range as
+        // the fast path, but let the unique target text be the real anchor.
+        let range_valid =
+            args.start_line > 0 && args.start_line <= args.end_line && args.end_line <= lines.len();
+        if range_valid {
+            let actual_target = lines[args.start_line - 1..args.end_line].join("\n");
+            if actual_target == args.target_content {
+                let start = line_start_offset(&content, args.start_line);
+                let end = line_end_offset(&content, args.end_line);
+                return write_replaced_content(ctx, &path, &args, &content, start, end, None).await;
+            }
+        }
+
+        // If the range moved, relocate an exact target only when it occurs once.
+        // This avoids silently editing the wrong copy when a block is duplicated.
+        let exact_matches: Vec<(usize, usize)> = content
+            .match_indices(&args.target_content)
+            .filter_map(|(start, target)| {
+                let end = start + target.len();
+                let at_line_start = start == 0 || content.as_bytes()[start - 1] == b'\n';
+                let at_line_end = end == content.len() || content.as_bytes()[end] == b'\n';
+                (at_line_start && at_line_end).then_some((start, end))
+            })
+            .collect();
+        if exact_matches.len() == 1 {
+            let (start, end) = exact_matches[0];
+            return write_replaced_content(
+                ctx,
+                &path,
+                &args,
+                &content,
+                start,
+                end,
+                Some(format!(
+                    "matched target content after the supplied line range [{}-{}] moved",
+                    args.start_line, args.end_line
+                )),
+            )
+            .await;
+        }
+        if exact_matches.len() > 1 {
             return Err(ToolError::msg(format!(
-                "Invalid line range [{}-{}] for file with {} lines (lines are 1-based)",
-                args.start_line, args.end_line, lines.len()
+                "Target content was not at line range [{}-{}], and matches {} places in `{}`. Re-read the file and include a unique surrounding line.",
+                args.start_line,
+                args.end_line,
+                exact_matches.len(),
+                args.path
             )));
         }
-        
-        let slice = &lines[args.start_line - 1..args.end_line];
-        let actual_target = slice.join("\n");
-        
-        if actual_target.trim() != args.target_content.trim() {
-            return Err(ToolError::msg(format!(
-                "Target content mismatch at line range [{}-{}]. Expected:\n{:?}\nBut found:\n{:?}",
-                args.start_line, args.end_line, args.target_content, actual_target
-            )));
+
+        // read_file presents CRLF blocks as LF-separated lines. Match that form
+        // too, then replace by line offsets so the file's existing line endings
+        // remain intact.
+        let target_lines: Vec<&str> = args.target_content.lines().collect();
+        let normalized_target = target_lines.join("\n");
+        let mut normalized_matches = Vec::new();
+        if !target_lines.is_empty() && target_lines.len() <= lines.len() {
+            for start_line in 0..=lines.len() - target_lines.len() {
+                let candidate = lines[start_line..start_line + target_lines.len()].join("\n");
+                if candidate == normalized_target {
+                    normalized_matches.push((start_line + 1, start_line + target_lines.len()));
+                }
+            }
         }
-        
-        let mut new_lines = Vec::new();
-        if args.start_line > 1 {
-            new_lines.extend_from_slice(&lines[0..args.start_line - 1]);
+        match normalized_matches.as_slice() {
+            [(start_line, end_line)] => {
+                let start = line_start_offset(&content, *start_line);
+                let end = line_end_offset(&content, *end_line);
+                write_replaced_content(
+                    ctx,
+                    &path,
+                    &args,
+                    &content,
+                    start,
+                    end,
+                    Some(format!(
+                        "matched target content after the supplied line range [{}-{}] moved",
+                        args.start_line, args.end_line
+                    )),
+                )
+                .await
+            }
+            [] => Err(ToolError::msg(replace_content_diagnostic(&content, &args))),
+            matches => Err(ToolError::msg(format!(
+                "Target content was not at line range [{}-{}], and matches {} places in `{}` after normalizing line endings. Re-read the file and include a unique surrounding line.",
+                args.start_line,
+                args.end_line,
+                matches.len(),
+                args.path
+            ))),
         }
-        new_lines.push(&args.replacement_content);
-        if args.end_line < lines.len() {
-            new_lines.extend_from_slice(&lines[args.end_line..]);
-        }
-        
-        let mut updated = new_lines.join("\n");
-        if content.ends_with('\n') && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        tokio::fs::write(&path, updated).await?;
-        ctx.record_change(&path);
-        
-        Ok(ToolResult::success(json!({
-            "path": args.path,
-            "replaced": true
-        })))
     }
+}
+
+fn line_start_offset(content: &str, line: usize) -> usize {
+    if line <= 1 {
+        return 0;
+    }
+    content
+        .match_indices('\n')
+        .nth(line - 2)
+        .map(|(offset, _)| offset + 1)
+        .unwrap_or(content.len())
+}
+
+fn line_end_offset(content: &str, line: usize) -> usize {
+    let start = line_start_offset(content, line);
+    let end = content[start..]
+        .find('\n')
+        .map(|offset| start + offset)
+        .unwrap_or(content.len());
+    // Keep CRLF's carriage return with the following line ending.
+    if end > start && content.as_bytes().get(end - 1) == Some(&b'\r') {
+        end - 1
+    } else {
+        end
+    }
+}
+
+async fn write_replaced_content(
+    ctx: &ToolContext,
+    path: &std::path::Path,
+    args: &ReplaceFileContentArgs,
+    content: &str,
+    start: usize,
+    end: usize,
+    note: Option<String>,
+) -> Result<ToolResult, ToolError> {
+    let replacement = if content[end..].starts_with("\r\n") {
+        args.replacement_content
+            .strip_suffix("\r\n")
+            .unwrap_or(&args.replacement_content)
+    } else if content[end..].starts_with('\n') {
+        args.replacement_content
+            .strip_suffix('\n')
+            .unwrap_or(&args.replacement_content)
+    } else {
+        &args.replacement_content
+    };
+    let mut updated = String::with_capacity(content.len() - (end - start) + replacement.len());
+    updated.push_str(&content[..start]);
+    updated.push_str(replacement);
+    updated.push_str(&content[end..]);
+    tokio::fs::write(path, updated).await?;
+    ctx.record_change(path);
+
+    let mut result = json!({"path": args.path, "replaced": true});
+    if let Some(note) = note {
+        result["note"] = json!(note);
+    }
+    Ok(ToolResult::success(result))
+}
+
+fn replace_content_diagnostic(content: &str, args: &ReplaceFileContentArgs) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = args.start_line.saturating_sub(2).min(lines.len());
+    let end = (args.end_line + 2).min(lines.len());
+    let region = if start < end {
+        lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("{:>4}| {line}", start + index + 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        "(requested range is outside the current file)".to_string()
+    };
+    format!(
+        "Target content was not found in `{}`. The supplied line range [{}-{}] is stale or the target differs in whitespace/escaping. Re-read the current lines and send a unique target_content.\n\nCurrent text near that range:\n{}",
+        args.path, args.start_line, args.end_line, region
+    )
 }
 
 pub struct WebSearchTool {
@@ -1801,8 +1973,12 @@ impl Tool for MemoryReadTool {
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: MemoryReadArgs = expect_object("memory_read", arguments)?;
-        let content = memory_store(ctx).read_entry(&args.id).map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({ "id": args.id, "content": content })))
+        let content = memory_store(ctx)
+            .read_entry(&args.id)
+            .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(
+            json!({ "id": args.id, "content": content }),
+        ))
     }
 }
 
@@ -1822,11 +1998,12 @@ impl Tool for MemoryWriteTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "memory_write".to_string(),
-            description: "Create or replace a workspace memory ENTRY — a durable fact, pointer, or \
+            description:
+                "Create or replace a workspace memory ENTRY — a durable fact, pointer, or \
                 how-to playbook for THIS folder that should help future sessions. Use a short \
                 kebab-case id. After writing, add or update a one-line pointer to it via \
                 memory_index so it stays discoverable."
-                .to_string(),
+                    .to_string(),
             input_schema: object_schema(
                 json!({
                     "id": {"type": "string", "description": "kebab-case slug, e.g. build-and-test"},
@@ -1861,21 +2038,21 @@ impl Tool for MemoryIndexTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "memory_index".to_string(),
-            description: "Replace the always-loaded workspace memory INDEX. Keep it lean: one short \
+            description:
+                "Replace the always-loaded workspace memory INDEX. Keep it lean: one short \
                 line per entry — a label, a one-line summary, and the entry id to load with \
                 memory_read. Must fit the index budget (oversize writes are rejected)."
-                .to_string(),
-            input_schema: object_schema(
-                json!({ "content": {"type": "string"} }),
-                &["content"],
-            ),
+                    .to_string(),
+            input_schema: object_schema(json!({ "content": {"type": "string"} }), &["content"]),
         }
     }
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         require_main_owner(ctx)?;
         let args: MemoryIndexArgs = expect_object("memory_index", arguments)?;
-        memory_store(ctx).write_index(&args.content, self.index_budget).map_err(ToolError::msg)?;
+        memory_store(ctx)
+            .write_index(&args.content, self.index_budget)
+            .map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({ "saved": true })))
     }
 }
@@ -1903,8 +2080,12 @@ impl Tool for MemoryDeleteTool {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         require_main_owner(ctx)?;
         let args: MemoryDeleteArgs = expect_object("memory_delete", arguments)?;
-        memory_store(ctx).delete_entry(&args.id).map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({ "id": args.id, "deleted": true })))
+        memory_store(ctx)
+            .delete_entry(&args.id)
+            .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(
+            json!({ "id": args.id, "deleted": true }),
+        ))
     }
 }
 
@@ -1951,19 +2132,27 @@ impl Tool for MemoryPatternTool {
         let budget = crate::memory::patterns_budget();
         match args.action.as_deref().unwrap_or("add") {
             "add" => {
-                let added = store.add_pattern(&args.content, budget).map_err(ToolError::msg)?;
+                let added = store
+                    .add_pattern(&args.content, budget)
+                    .map_err(ToolError::msg)?;
                 Ok(ToolResult::success(json!({
                     "saved": added,
                     "note": if added { "pattern added" } else { "identical pattern already stored" },
                 })))
             }
             "replace" => {
-                store.write_patterns(&args.content, budget).map_err(ToolError::msg)?;
-                Ok(ToolResult::success(json!({ "saved": true, "note": "pattern list replaced" })))
+                store
+                    .write_patterns(&args.content, budget)
+                    .map_err(ToolError::msg)?;
+                Ok(ToolResult::success(
+                    json!({ "saved": true, "note": "pattern list replaced" }),
+                ))
             }
             "clear" => {
                 store.write_patterns("", budget).map_err(ToolError::msg)?;
-                Ok(ToolResult::success(json!({ "saved": true, "note": "patterns cleared" })))
+                Ok(ToolResult::success(
+                    json!({ "saved": true, "note": "patterns cleared" }),
+                ))
             }
             other => Err(ToolError::msg(format!(
                 "action must be add, replace, or clear — got '{other}'"
@@ -2017,7 +2206,9 @@ impl Tool for MemoryRuleTool {
         store
             .write_rules(&args.content, crate::memory::rules_budget())
             .map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({ "scope": args.scope, "saved": true })))
+        Ok(ToolResult::success(
+            json!({ "scope": args.scope, "saved": true }),
+        ))
     }
 }
 
@@ -2107,3 +2298,39 @@ impl Tool for SkillTool {
     }
 }
 
+
+#[cfg(test)]
+mod edit_matching_tests {
+    use super::{Flex, flexible_replace};
+
+    #[test]
+    fn flexible_replace_ignores_only_source_whitespace() {
+        let source = "const value = build(\n    first,\tsecond\n);\n";
+        let old = "  const   value = build(first, second);  ";
+        let replacement = "const value = replacement(first, second);";
+
+        let Flex::Replaced(updated) = flexible_replace(source, old, replacement) else {
+            panic!("whitespace-normalized source should match");
+        };
+        assert_eq!(updated, format!("{replacement}\n"));
+    }
+
+    #[test]
+    fn flexible_replace_rejects_changed_source_tokens() {
+        let source = "const value = build(first, second);\n";
+        let old = "const value = build(first, changed);";
+
+        assert!(matches!(flexible_replace(source, old, "replacement"), Flex::NoMatch));
+    }
+
+    #[test]
+    fn flexible_replace_rejects_ambiguous_normalized_source() {
+        let source = "const value = build(first, second);\n\nconst value = build(first, second);\n";
+        let old = "const value = build(first, second);";
+
+        let Flex::Ambiguous(lines) = flexible_replace(source, old, "replacement") else {
+            panic!("repeated normalized source should be ambiguous");
+        };
+        assert_eq!(lines, vec![1, 3]);
+    }
+}
