@@ -41,8 +41,14 @@ pub struct LaneRecord {
     pub id: String,
     pub title: String,
     pub status: LaneStatus,
+    /// The original handoff/brief given to this lane, before reporting instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// The full verified report returned by the lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub started_at: String,
@@ -184,7 +190,9 @@ impl LaneManager {
             id: id.clone(),
             title: title.to_string(),
             status: LaneStatus::Running,
+            handoff: Some(brief.to_string()),
             summary: None,
+            report: None,
             error: None,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
@@ -230,6 +238,9 @@ impl LaneManager {
         // following up is exactly how to revive it.
         record.status = LaneStatus::Running;
         record.finished_at = None;
+        record.handoff = Some(brief.to_string());
+        record.summary = None;
+        record.report = None;
         record.error = None;
         let (title, read_only) = (record.title.clone(), record.read_only);
         self.launch(lane_id, &title, brief, true, read_only);
@@ -297,6 +308,7 @@ impl LaneManager {
         if let Some(record) = self.records.iter_mut().find(|record| record.id == result.id) {
             record.status = result.status;
             record.summary = result.summary.clone();
+            record.report = result.report.clone();
             record.error = result.error.clone();
             record.finished_at = Some(Utc::now().to_rfc3339());
         }
