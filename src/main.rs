@@ -361,6 +361,24 @@ fn print_browser_json(
     Ok(())
 }
 
+fn save_screenshot_tmp(value: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+    use base64::Engine as _;
+    let data_url = value
+        .pointer("/result/dataUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("screenshot response did not contain result.dataUrl")?;
+    let (header, encoded) = data_url
+        .split_once(",")
+        .ok_or("invalid screenshot data URL")?;
+    if !header.starts_with("data:image/") || !header.ends_with(";base64") {
+        return Err("unsupported screenshot data URL".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    let path = std::env::temp_dir().join(format!("snippet-screenshot-{}.png", uuid::Uuid::new_v4().simple()));
+    std::fs::write(&path, bytes)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn mime_type(path: &std::path::Path) -> &'static str {
     match path
         .extension()
@@ -423,7 +441,12 @@ async fn browser_cli(action: BrowserAction) -> Result<(), Box<dyn std::error::Er
                 &state.token,
             )
             .await?;
-            print_browser_json(&value, true)
+            if method == "page.screenshot" {
+                let path = save_screenshot_tmp(&value)?;
+                print_browser_json(&serde_json::json!({"path": path}), true)
+            } else {
+                print_browser_json(&value, true)
+            }
         }
         BrowserAction::Snapshot {
             device_name,
