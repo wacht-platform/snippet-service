@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 6] =
-    ["note", "ask_user", "delegate_task", "complete_goal", "monitor", "present_file"];
+pub const META_TOOL_NAMES: [&str; 7] =
+    ["note", "ask_user", "delegate_task", "complete_goal", "monitor", "present_file", "set_session_title"];
 
 pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
@@ -27,11 +27,29 @@ pub fn is_meta_tool(name: &str) -> bool {
 /// it's only offered while an autonomous `/goal` is active (so it can end it).
 pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinition> {
     let mut tools =
-        vec![note_tool(), ask_user_tool(), delegate_task_tool(), monitor_tool(), present_file_tool()];
+        vec![note_tool(), ask_user_tool(), delegate_task_tool(), monitor_tool(), present_file_tool(), set_session_title_tool()];
     if goal_active {
         tools.push(complete_goal_tool());
     }
     tools
+}
+
+fn set_session_title_tool() -> NativeToolDefinition {
+    NativeToolDefinition {
+        name: "set_session_title".to_string(),
+        description: "Change the title of the current session. Use a short, descriptive title that reflects the user's request or the work underway. This is a harmless conversation action and does not require approval.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "The new session title. Use an empty string to clear the custom title."
+                }
+            },
+            "required": ["title"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn present_file_tool() -> NativeToolDefinition {

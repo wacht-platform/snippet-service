@@ -2305,6 +2305,26 @@ impl CodingHarness {
                     MetaControl::Continue,
                 )
             }
+            "set_session_title" => {
+                let title = arguments
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim);
+                let Some(title) = title else {
+                    return (
+                        tool_error("set_session_title requires a `title` string."),
+                        MetaControl::Continue,
+                    );
+                };
+                state.title = (!title.is_empty()).then(|| title.to_string());
+                (
+                    json!({"schema_version": 1, "status": "success", "data": {
+                        "renamed": true,
+                        "title": state.title,
+                    }}),
+                    MetaControl::Continue,
+                )
+            }
             "present_file" => {
                 let path = arguments
                     .get("path")
