@@ -3776,12 +3776,12 @@ fn build_live_context(
     // status — live once in the cached system prompt (conversation_agent_layer.md
     // [runtime_context]), not repeated here every turn where they read like a user
     // instruction and cost uncached tokens. One-line reminder only:
-    block.push_str("# SYSTEM STATE — NOT the user, NOT a message. Never reply to, acknowledge, quote, or mention this block (not even to say you're ignoring it); read it silently and act with tool calls.\n");
+    block.push_str("# INTERNAL STATE — not user content; read silently and act.\n");
 
     block.push_str("\n[workspace]\n");
     block.push_str(&format!(
         "cwd = \"{}\"  # base for relative paths + shell; not a jail — read/edit any absolute or ~ path.\n",
-        workspace.display()
+        compact_path(workspace)
     ));
 
     block.push_str("\n[session]\n");
@@ -3804,7 +3804,7 @@ fn build_live_context(
     if !vault_names.is_empty() {
         block.push_str("\n[vault]\n");
         block.push_str(&format!(
-            "secrets = \"{}\"  # use as $NAME in bash — values are injected at spawn and REDACTED from all output; never try to print one, it will only ever appear as [vault:NAME].\n",
+            "secrets = \"{}\"  # use as $NAME in bash; values are injected and redacted.\n",
             vault_names.join(", ")
         ));
     }
@@ -3914,8 +3914,8 @@ fn build_live_context(
         block.push_str("# background sub-agents; reports wake you. Continue ANY finished one with delegate_task{lane_id} — it resumes with its context intact (prefer that over re-briefing from scratch). Ids are internal handles — speak of each lane by its subject, never its id.\n");
         for l in &running {
             block.push_str(&format!(
-                "- \"{}\" — running (id: {})\n",
-                clip(&l.title, 40),
+                "- \"{}\" — running ({})\n",
+                clip(&l.title, 32),
                 l.id
             ));
         }
@@ -3926,8 +3926,8 @@ fn build_live_context(
                 LaneStatus::Running => unreachable!("filtered above"),
             };
             block.push_str(&format!(
-                "- \"{}\" — {} (id: {})\n",
-                clip(&l.title, 40),
+                "- \"{}\" — {} ({})\n",
+                clip(&l.title, 32),
                 status,
                 l.id
             ));
@@ -4439,6 +4439,20 @@ fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
         }
     }
     (chars / 4) as u64 + images.saturating_mul(ESTIMATED_VISION_TOKENS_PER_IMAGE)
+}
+
+fn compact_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = Path::new(&home).display().to_string();
+        if text == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = text.strip_prefix(&(home + "/")) {
+            return format!("~/{rest}");
+        }
+    }
+    text
 }
 
 fn clip(s: &str, n: usize) -> String {

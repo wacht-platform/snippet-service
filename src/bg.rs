@@ -206,8 +206,13 @@ pub fn render_live(workspace: &Path) -> Option<String> {
         let Ok(txt) = std::fs::read_to_string(&path) else { continue };
         let Ok(entry) = serde_json::from_str::<BgEntry>(&txt) else { continue };
         let cmd = entry.command.replace('\n', " ");
+        let log = entry
+            .log
+            .strip_prefix(workspace.to_string_lossy().as_ref())
+            .map(|p| p.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| entry.log.clone());
         if pid_is_recorded_process(entry.pid, &entry.started_at) {
-            lines.push(format!("- [{}] `{}` — pid {}, running. log: {}", entry.id, cmd, entry.pid, entry.log));
+            lines.push(format!("- [{}] `{}` — pid {}, running. log: {}", entry.id, cmd, entry.pid, log));
         } else {
             // Exited: report the captured exit status, then drop the record (keep the log).
             let code = std::fs::read_to_string(status_path(workspace, &entry.id)).ok().map(|s| s.trim().to_string());

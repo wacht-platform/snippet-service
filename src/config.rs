@@ -68,6 +68,10 @@ pub struct SnippetConfig {
     /// before any table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exa_api_key: Option<String>,
+    /// AssemblyAI API key for mobile voice transcription. Keep this in the local
+    /// config.toml; it is never returned by the remote config endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assemblyai_api_key: Option<String>,
     /// TUI color theme name (e.g. "midnight", "light", "high-contrast", "ember").
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +160,7 @@ impl Default for SnippetConfig {
             setups: None,
             model: ModelConfig::default(),
             exa_api_key: None,
+            assemblyai_api_key: None,
             theme: None,
             memory_enabled: default_memory_enabled(),
             memory_index_budget_chars: default_memory_index_budget_chars(),

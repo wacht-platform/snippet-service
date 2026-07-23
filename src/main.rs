@@ -86,6 +86,12 @@ enum BrowserAction {
         #[arg(long)]
         json: bool,
     },
+    /// Print the browser-control manual for agents and humans.
+    Manual {
+        /// Print machine-readable JSON instead of Markdown.
+        #[arg(long)]
+        json: bool,
+    },
     /// Relay an arbitrary extension method through the daemon.
     Call {
         /// Connected device name shown by `snippet browser list`.
@@ -149,6 +155,25 @@ enum BrowserAction {
         /// Use Chrome's real pointer path instead of HTML5 drag events.
         #[arg(long)]
         cdp: bool,
+    },
+    /// Drag between viewport CSS-pixel coordinates without snapshot references.
+    DragCoordinates {
+        /// Connected device name shown by `snippet browser list`.
+        #[arg(long, alias = "browser")]
+        device_name: String,
+        #[arg(long)]
+        tab: i64,
+        #[arg(long)]
+        x1: f64,
+        #[arg(long)]
+        y1: f64,
+        #[arg(long)]
+        x2: f64,
+        #[arg(long)]
+        y2: f64,
+        /// Number of bounded intermediate pointer positions (2-100).
+        #[arg(long, default_value_t = 8)]
+        steps: u32,
     },
     /// Upload one local file into a file input element reference.
     Upload {
@@ -382,6 +407,13 @@ fn print_browser_json(
 
 fn save_screenshot_tmp(value: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
     use base64::Engine as _;
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        let error = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("browser screenshot command failed");
+        return Err(error.to_string().into());
+    }
     let data_url = value
         .pointer("/result/dataUrl")
         .and_then(serde_json::Value::as_str)
@@ -421,9 +453,58 @@ fn mime_type(path: &std::path::Path) -> &'static str {
     }
 }
 
+fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let manual = serde_json::json!({
+        "workflow": [
+            "Run snippet browser list --json and use the exact device_name.",
+            "Run tabs.query, take the numeric result[].id as TAB_ID.",
+            "For page actions, always pass tabId: TAB_ID.",
+            "Take page.snapshot before using refs; refs expire after navigation or DOM changes.",
+            "Perform one action, inspect its result, then take a new snapshot if needed.",
+            "Never invent browser methods or use Runtime.evaluate directly; use page.eval.",
+            "For network inspection, call netwatch.start with tabId, then getEvents, and stop when finished."
+        ],
+        "methods": {
+            "tabs.query": "{active:true} is optional; returns tab objects. Use result[].id.",
+            "tabs.get": "Requires {tabId:number}.",
+            "tabs.update": "Requires {tabId:number,url:string}.",
+            "page.snapshot": "Requires {tabId:number}; returns refs such as e42.",
+            "page.click": "Requires {tabId:number,ref:string}; optional mode dom or cdp.",
+            "page.type": "Requires {tabId:number,ref:string,text:string}; optional append.",
+            "page.key": "Requires {tabId:number,key:string}; this is the only keyboard method.",
+            "page.drag": "Requires {tabId:number,from:string,to:string}; drags between snapshot refs; optional mode cdp.",
+            "page.dragCoordinates": "Requires {tabId:number,x1:number,y1:number,x2:number,y2:number}; viewport CSS pixels, optional steps 2-100.",
+            "page.eval": "Requires {tabId:number,expression:string}; do not call Runtime.evaluate.",
+            "page.screenshot": "Requires {tabId:number}; Firefox requires the tab to be active.",
+            "netwatch.start": "Requires {tabId:number}; starts bounded metadata-only network capture for that tab.",
+            "netwatch.pause": "Pauses capture while retaining the watcher and buffered events.",
+            "netwatch.resume": "Resumes capture for the active watcher.",
+            "netwatch.getEvents": "Returns and removes buffered request/response/error metadata; optional {limit:number}.",
+            "netwatch.stop": "Stops capture and releases the Chrome debugger attachment."
+        },
+        "errors": {
+            "missing_tabId": "Stop. Run tabs.query and use the returned numeric id; never guess an id.",
+            "method_not_allowed": "Stop. Use only a method listed by browser list capabilities or this manual; do not retry a renamed/invented method.",
+            "stale_ref": "Run page.snapshot again and use a fresh ref.",
+            "inactive_firefox_tab": "Activate the target tab, then retry page.eval or page.screenshot once.",
+            "network": "netwatch captures bounded metadata only (URL, method, type, status, errors); it does not capture request or response bodies."
+        }
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&manual)?);
+    } else {
+        println!("BROWSER MANUAL\n\n{}", serde_json::to_string_pretty(&manual)?);
+    }
+    Ok(())
+}
+
 async fn browser_cli(action: BrowserAction) -> Result<(), Box<dyn std::error::Error>> {
+    if let BrowserAction::Manual { json } = action {
+        return browser_manual(json);
+    }
     let state = browser_connection()?;
     match action {
+        BrowserAction::Manual { .. } => unreachable!("manual handled before daemon connection"),
         BrowserAction::Uri { json } => {
             let uri = browser_ws_uri(&state)?;
             if json {
@@ -519,6 +600,22 @@ async fn browser_cli(action: BrowserAction) -> Result<(), Box<dyn std::error::Er
             device_name,
             "page.drag",
             serde_json::json!({"tabId": tab, "from": from, "to": to, "mode": if cdp { "cdp" } else { "html5" }}),
+        )
+        .await,
+        BrowserAction::DragCoordinates {
+            device_name,
+            tab,
+            x1,
+            y1,
+            x2,
+            y2,
+            steps,
+        } => browser_command_cli(
+            &state.url,
+            &state.token,
+            device_name,
+            "page.dragCoordinates",
+            serde_json::json!({"tabId": tab, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "steps": steps}),
         )
         .await,
         BrowserAction::Upload {

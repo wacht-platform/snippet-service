@@ -33,6 +33,7 @@ mod fs;
 mod git;
 mod lifecycle;
 mod tunnel;
+mod transcribe;
 
 pub use self::lifecycle::*;
 pub use self::tunnel::ensure_cloudflared_foreground;
@@ -41,6 +42,7 @@ use self::browser::{BrowserManager, RegisterMessage};
 use self::fs::*;
 use self::git::*;
 use self::tunnel::{ensure_cloudflared, start_cloudflared_quick};
+
 
 struct LiveSession {
     input_tx: UnboundedSender<LoopInput>,
@@ -261,10 +263,19 @@ impl Daemon {
         RebuildOutcome::Rebuilt
     }
 
-    /// Send a loop input to a session. If its loop has ended (interrupt / failure),
-    /// a new message revives it as the next turn — so the app can resume like the
-    /// TUI does. Non-message inputs to a dead loop are dropped.
+    /// Send a loop input to a session. Audio attachment markers are expanded here,
+    /// before the input reaches the harness, so every model/provider receives the
+    /// same transcript plus the original attachment reference.
     async fn deliver(&self, id: &str, input: LoopInput) {
+        let input = match input {
+            LoopInput::UserMessage(text) => match transcribe::prepare_message(self, text.clone()).await {
+                Ok(text) => LoopInput::UserMessage(text),
+                Err(error) => LoopInput::UserMessage(format!(
+                    "{text}\n\n[Audio transcription unavailable: {error}. The original audio attachment remains available.]"
+                )),
+            },
+            other => other,
+        };
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(id) {
             if !s.join.is_finished() {

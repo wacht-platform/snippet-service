@@ -135,7 +135,11 @@ supports_images = false          # set true for multimodal models
 stream = true                    # some endpoints only emit output when streamed
 ```
 
-Per-profile knobs include `reasoning_effort`, `temperature`, `supports_images`, `context_window` + `compact_at_pct` (when to auto-compact), `cache_prompt`, and `user_agent`. Set `exa_api_key` at the top level to enable web search.
+Per-profile knobs include `reasoning_effort`, `temperature`, `supports_images`, `context_window` + `compact_at_pct` (when to auto-compact), `cache_prompt`, and `user_agent`. Set `exa_api_key` at the top level to enable web search. Set `assemblyai_api_key` at the top level to enable mobile voice transcription; the key is used only by the daemon and is not returned by `/config`. For example:
+
+```toml
+assemblyai_api_key = "..."
+```
 
 ## How it works
 
