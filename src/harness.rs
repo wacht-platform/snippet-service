@@ -449,6 +449,8 @@ pub enum LoopInput {
     CancelGoal,
     /// Cancel the run.
     Interrupt,
+    /// Rewind to a checkpoint — truncate events and checkpoints to that point.
+    Rewind { checkpoint: String },
 }
 
 // --- Runtime corrections (ported from executor/runtime/step_control.rs) ---
@@ -1039,6 +1041,15 @@ impl CodingHarness {
                             self.end_goal(&mut state);
                             self.persist(&mut state, &lanes).await?;
                         }
+                        Some(LoopInput::Rewind { checkpoint }) => {
+                            // Find the checkpoint and truncate state to that point
+                            if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint) {
+                                let event_index = cp.event_index;
+                                state.events.truncate(event_index);
+                                state.checkpoints.retain(|c| c.event_index <= event_index);
+                                self.persist(&mut state, &lanes).await?;
+                            }
+                        }
                         // No tool call is pending while idle — nothing to approve.
                         Some(LoopInput::Approve) | Some(LoopInput::ApproveAll) | Some(LoopInput::Deny) => {}
                         // Nothing queued while idle.
@@ -1428,6 +1439,15 @@ impl CodingHarness {
             }
             LoopInput::CancelGoal => {
                 self.end_goal(state);
+                false
+            }
+            LoopInput::Rewind { checkpoint } => {
+                // Find the checkpoint and truncate state to that point
+                if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint) {
+                    let event_index = cp.event_index;
+                    state.events.truncate(event_index);
+                    state.checkpoints.retain(|c| c.event_index <= event_index);
+                }
                 false
             }
             LoopInput::Interrupt => true,
