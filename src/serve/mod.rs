@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::config::{save_config, workspaces_root, ModelConfig, SnippetConfig};
-use crate::harness::{deserialize_state, LoopInput};
+use crate::harness::{deserialize_state, serialize_state, LoopInput};
 use crate::session::{
     list_device_sessions, read_session_profile, start_session_with_browser_summary,
     state_path_for_id, write_session_profile,
@@ -1567,8 +1567,7 @@ struct RewindReq {
 }
 
 // POST /session/rewind {session, checkpoint} — restore the workspace files to a
-// checkpoint (the conversation continues; only the work-tree reverts), mirroring
-// the TUI's /rewind.
+// checkpoint and truncate conversation history to that point.
 async fn rewind_session(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -1577,16 +1576,46 @@ async fn rewind_session(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let (_sp, workspace) = match load_session_workspace(&req.session) {
+    let (sp, workspace) = match load_session_workspace(&req.session) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let checkpoint = req.checkpoint.clone();
-    let result =
-        tokio::task::spawn_blocking(move || crate::checkpoint::restore(&workspace, &checkpoint))
-            .await;
+    let checkpoint_id = req.checkpoint.clone();
+    
+    // Read the current state
+    let Ok(bytes) = tokio::fs::read(&sp).await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to read session state").into_response();
+    };
+    let Ok(mut state) = deserialize_state(&bytes) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to parse session state").into_response();
+    };
+    
+    // Find the checkpoint and get its event_index
+    let Some(checkpoint) = state.checkpoints.iter().find(|c| c.id == checkpoint_id) else {
+        return (StatusCode::NOT_FOUND, "checkpoint not found").into_response();
+    };
+    let event_index = checkpoint.event_index;
+    
+    // Truncate events and checkpoints
+    state.events.truncate(event_index);
+    state.checkpoints.retain(|c| c.event_index <= event_index);
+    
+    // Persist the updated state
+    let Ok(updated_bytes) = serialize_state(&state) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to serialize state").into_response();
+    };
+    if let Err(_) = tokio::fs::write(&sp, updated_bytes).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to write state").into_response();
+    }
+    
+    // Restore workspace files
+    let checkpoint_for_restore = checkpoint_id.clone();
+    let result = tokio::task::spawn_blocking(move || crate::checkpoint::restore(&workspace, &checkpoint_for_restore)).await;
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({ "restored": req.checkpoint })).into_response(),
+        Ok(Ok(())) => Json(serde_json::json!({ 
+            "restored": checkpoint_id,
+            "events_truncated": event_index 
+        })).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

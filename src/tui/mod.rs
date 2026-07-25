@@ -2632,8 +2632,8 @@ async fn run_app(
                 }
                 // Mouse wheel scrolls the transcript (chat canvas).
                 Event::Mouse(me) => match me.kind {
-                    MouseEventKind::ScrollUp => app.scroll_up(3),
-                    MouseEventKind::ScrollDown => app.scroll_down(3),
+                    MouseEventKind::ScrollUp => app.scroll_up(1),
+                    MouseEventKind::ScrollDown => app.scroll_down(1),
                     _ => {}
                 },
                 _ => {}
