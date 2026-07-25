@@ -1601,7 +1601,9 @@ async fn rewind_session(
 
         if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint_id) {
             let event_index = cp.event_index;
+            let message_index = cp.message_index;
             state.events.truncate(event_index);
+            state.messages.truncate(message_index);
             state.checkpoints.retain(|c| c.event_index <= event_index);
 
             let Ok(updated_bytes) = serialize_state(&state) else {

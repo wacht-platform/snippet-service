@@ -419,6 +419,9 @@ pub struct CheckpointRecord {
     /// Event count when checkpoint was taken — for truncating history on rewind.
     #[serde(default)]
     pub event_index: usize,
+    /// Message count when checkpoint was taken — for truncating conversation on rewind.
+    #[serde(default)]
+    pub message_index: usize,
 }
 
 /// Inputs the interactive driver receives from its UI (or, headless, over the
@@ -1045,7 +1048,9 @@ impl CodingHarness {
                             // Find the checkpoint and truncate state to that point
                             if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint) {
                                 let event_index = cp.event_index;
+                                let message_index = cp.message_index;
                                 state.events.truncate(event_index);
+                                state.messages.truncate(message_index);
                                 state.checkpoints.retain(|c| c.event_index <= event_index);
                                 self.persist(&mut state, &lanes).await?;
                             }
@@ -1316,6 +1321,7 @@ impl CodingHarness {
                 label,
                 created_at: chrono::Utc::now().to_rfc3339(),
                 event_index: state.events.len(),
+                message_index: state.messages.len(),
             });
             // Cap retained records so a long session doesn't bloat persisted state.
             const MAX_CHECKPOINTS: usize = 8;
@@ -1445,7 +1451,9 @@ impl CodingHarness {
                 // Find the checkpoint and truncate state to that point
                 if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint) {
                     let event_index = cp.event_index;
+                    let message_index = cp.message_index;
                     state.events.truncate(event_index);
+                    state.messages.truncate(message_index);
                     state.checkpoints.retain(|c| c.event_index <= event_index);
                 }
                 false

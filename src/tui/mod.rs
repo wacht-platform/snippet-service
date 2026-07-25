@@ -874,12 +874,13 @@ impl App {
             self.status = format!("No checkpoint matching '{id_prefix}'.");
             return;
         };
-        let (id, label, event_index) = (checkpoint.id.clone(), checkpoint.label.clone(), checkpoint.event_index);
+        let (id, label, event_index, message_index) = (checkpoint.id.clone(), checkpoint.label.clone(), checkpoint.event_index, checkpoint.message_index);
         let workspace = self.options.config.workspace.clone();
         match crate::checkpoint::restore(&workspace, &id) {
             Ok(()) => {
                 // Truncate conversation history to the checkpoint point
                 state.events.truncate(event_index);
+                state.messages.truncate(message_index);
                 // Drop checkpoints taken after this one (their workspace state is gone)
                 state.checkpoints.retain(|c| c.event_index <= event_index);
                 self.status = format!("Rewound workspace and history to: {label}");
