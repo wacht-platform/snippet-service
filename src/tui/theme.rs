@@ -22,15 +22,15 @@ pub(super) struct ThemePreset {
 }
 
 pub(super) const TERMINAL_INK: Theme = Theme {
-    accent: Color::Rgb(224, 164, 88),
-    text: Color::Rgb(232, 236, 234),
-    muted: Color::Rgb(170, 178, 174),
-    faint: Color::Rgb(108, 115, 112),
-    success: Color::Rgb(123, 196, 154),
-    danger: Color::Rgb(232, 106, 106),
-    warn: Color::Rgb(224, 164, 88),
-    lane: Color::Rgb(122, 180, 190),
-    code: Color::Rgb(224, 196, 132),
+    accent: Color::Rgb(177, 185, 249),
+    text: Color::Rgb(220, 224, 232),
+    muted: Color::Rgb(140, 148, 165),
+    faint: Color::Rgb(88, 96, 115),
+    success: Color::Rgb(126, 196, 154),
+    danger: Color::Rgb(224, 108, 117),
+    warn: Color::Rgb(214, 182, 106),
+    lane: Color::Rgb(139, 233, 253),
+    code: Color::Rgb(200, 180, 140),
 };
 
 pub(super) const MIDNIGHT: Theme = Theme {
@@ -153,8 +153,32 @@ pub(super) const SOLARIZED: Theme = Theme {
     code: Color::Rgb(203, 75, 22),
 };
 
+pub(super) const CLAUDE: Theme = Theme {
+    accent: Color::Rgb(177, 185, 249),
+    text: Color::Rgb(210, 215, 225),
+    muted: Color::Rgb(130, 140, 160),
+    faint: Color::Rgb(80, 90, 110),
+    success: Color::Rgb(120, 200, 150),
+    danger: Color::Rgb(220, 110, 120),
+    warn: Color::Rgb(210, 180, 110),
+    lane: Color::Rgb(140, 230, 250),
+    code: Color::Rgb(190, 170, 130),
+};
+
+pub(super) const MINIMAL: Theme = Theme {
+    accent: Color::Rgb(150, 160, 180),
+    text: Color::Rgb(200, 210, 220),
+    muted: Color::Rgb(120, 130, 145),
+    faint: Color::Rgb(75, 85, 100),
+    success: Color::Rgb(130, 190, 160),
+    danger: Color::Rgb(210, 120, 130),
+    warn: Color::Rgb(200, 170, 120),
+    lane: Color::Rgb(150, 210, 230),
+    code: Color::Rgb(180, 165, 140),
+};
+
 pub(super) const PRESETS: &[ThemePreset] = &[
-    ThemePreset { name: "terminal-ink", label: "Terminal Ink (amber)", theme: TERMINAL_INK },
+    ThemePreset { name: "terminal-ink", label: "Terminal Ink (blue)", theme: TERMINAL_INK },
     ThemePreset { name: "midnight", label: "Midnight (dark)", theme: MIDNIGHT },
     ThemePreset { name: "light", label: "Light", theme: LIGHT },
     ThemePreset { name: "high-contrast", label: "High-contrast", theme: HIGH_CONTRAST },
@@ -165,6 +189,8 @@ pub(super) const PRESETS: &[ThemePreset] = &[
     ThemePreset { name: "tokyo-night", label: "Tokyo Night", theme: TOKYO_NIGHT },
     ThemePreset { name: "catppuccin", label: "Catppuccin", theme: CATPPUCCIN },
     ThemePreset { name: "solarized", label: "Solarized Dark", theme: SOLARIZED },
+    ThemePreset { name: "claude", label: "Claude", theme: CLAUDE },
+    ThemePreset { name: "minimal", label: "Minimal", theme: MINIMAL },
 ];
 
 pub(super) static THEME_INDEX: AtomicUsize = AtomicUsize::new(0);

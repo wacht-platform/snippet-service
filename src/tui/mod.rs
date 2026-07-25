@@ -3828,8 +3828,7 @@ fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let model = app.effective_model.1.clone();
     let mut left = vec![
-        Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-        Span::styled("  ·  ", Style::default().fg(faint())),
+        Span::styled("▸ snippet ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
         Span::styled(model, Style::default().fg(muted())),
     ];
     let goal_label = app
@@ -3857,7 +3856,11 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .round()
                 .clamp(0.0, 100.0) as u64;
             let color = if pct >= 90 { danger() } else if pct >= 75 { warn() } else { muted() };
-            right.push(Span::styled(format!("{pct}% ctx "), Style::default().fg(color)));
+            // Progress bar: 10 chars wide
+            let filled = (pct / 10) as usize;
+            let empty = 10 - filled;
+            let bar = format!("{}{} {}%", "█".repeat(filled), "░".repeat(empty), pct);
+            right.push(Span::styled(format!("ctx {} ", bar), Style::default().fg(color)));
         }
     }
 
