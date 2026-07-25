@@ -384,10 +384,20 @@ impl Tool for ReadImageTool {
         let path = ctx.resolve_workspace_path(&args.path)?;
         let bytes = tokio::fs::read(&path).await?;
         ctx.mark_read(&path);
-        let mime = sniff_image_mime(&bytes).unwrap_or("application/octet-stream");
+        let mime = sniff_image_mime(&bytes);
+        let mime_str = mime.unwrap_or("application/octet-stream");
+        if mime.is_none() || bytes.len() < 8 {
+            return Err(ToolError::msg(&format!(
+                "Invalid or empty image file at '{}'. Size: {} bytes, detected MIME: {}. \
+                 The file may be corrupted, empty, or not a valid image format.",
+                args.path,
+                bytes.len(),
+                mime_str
+            )));
+        }
         Ok(ToolResult::success(json!({
             "path": args.path,
-            "mime": mime,
+            "mime": mime_str,
             "size_bytes": bytes.len(),
         })))
     }

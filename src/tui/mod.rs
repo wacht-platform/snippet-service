@@ -861,7 +861,7 @@ impl App {
             self.status = "Agent is working — stop it (Esc) before rewinding.".to_string();
             return;
         }
-        let Some(state) = &self.state else {
+        let Some(state) = &mut self.state else {
             self.status = "No active session.".to_string();
             return;
         };
@@ -874,10 +874,16 @@ impl App {
             self.status = format!("No checkpoint matching '{id_prefix}'.");
             return;
         };
-        let (id, label) = (checkpoint.id.clone(), checkpoint.label.clone());
+        let (id, label, event_index) = (checkpoint.id.clone(), checkpoint.label.clone(), checkpoint.event_index);
         let workspace = self.options.config.workspace.clone();
         match crate::checkpoint::restore(&workspace, &id) {
-            Ok(()) => self.status = format!("Rewound workspace to: {label}"),
+            Ok(()) => {
+                // Truncate conversation history to the checkpoint point
+                state.events.truncate(event_index);
+                // Drop checkpoints taken after this one (their workspace state is gone)
+                state.checkpoints.retain(|c| c.event_index <= event_index);
+                self.status = format!("Rewound workspace and history to: {label}");
+            }
             Err(error) => self.error = Some(format!("rewind failed: {error}")),
         }
     }

@@ -416,6 +416,9 @@ pub struct CheckpointRecord {
     /// The user prompt this checkpoint was taken before (truncated).
     pub label: String,
     pub created_at: String,
+    /// Event count when checkpoint was taken — for truncating history on rewind.
+    #[serde(default)]
+    pub event_index: usize,
 }
 
 /// Inputs the interactive driver receives from its UI (or, headless, over the
@@ -1301,6 +1304,7 @@ impl CodingHarness {
                 id,
                 label,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                event_index: state.events.len(),
             });
             // Cap retained records so a long session doesn't bloat persisted state.
             const MAX_CHECKPOINTS: usize = 8;
