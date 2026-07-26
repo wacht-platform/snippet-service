@@ -94,6 +94,9 @@ struct Daemon {
     git_write: Mutex<()>,
     /// Connected browser-extension sockets and their pending command waiters.
     browser: BrowserManager,
+    /// Recent message nonces for dedup: `"session:nonce"` → first-seen time.
+    /// Prevents duplicate steers/messages when the client resends after a reconnect.
+    seen_nonces: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 /// The machine's hostname, used as the app's default instance name.
@@ -128,6 +131,24 @@ impl Daemon {
         token
             .as_deref()
             .is_some_and(|t| token_matches(t, &self.token))
+    }
+
+    /// Returns true if this nonce is new (not a duplicate within the last 60s).
+    /// Stores it for future checks and prunes stale entries opportunistically.
+    fn accept_nonce(&self, session_id: &str, nonce: &str) -> bool {
+        let key = format!("{session_id}:{nonce}");
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(60);
+        let mut map = self.seen_nonces.lock().unwrap();
+        // Prune stale entries opportunistically (amortized O(n) every call is fine
+        // for a small map; it only holds entries from the last 60s).
+        map.retain(|_, t| now.duration_since(*t) < ttl);
+        if map.contains_key(&key) {
+            false // duplicate — skip
+        } else {
+            map.insert(key, now);
+            true
+        }
     }
 
     /// Re-read the on-disk config so provider profiles added or removed out-of-band
@@ -393,6 +414,7 @@ pub async fn run_serve(
         sessions: Mutex::new(HashMap::new()),
         git_write: Mutex::new(()),
         browser: BrowserManager::default(),
+        seen_nonces: std::sync::Mutex::new(HashMap::new()),
     });
 
     // Background self-update: periodically check for a newer release, replace the
@@ -1960,9 +1982,26 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
     });
 
     // Inbound: JSON LoopInput → the session's channel.
+    // Each message may carry an optional "nonce" field for client-side dedup:
+    // on reconnect the client resends unacked messages with the same nonce so
+    // the server can drop duplicates instead of injecting duplicate steers.
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(t) => {
+                // Parse as raw Value first to extract the nonce without
+                // changing the LoopInput serde format.
+                let dominated = serde_json::from_str::<serde_json::Value>(t.as_str());
+                if let Ok(val) = dominated {
+                    // Extract and check nonce for dedup (only for user_message).
+                    if let Some(nonce) = val.get("nonce").and_then(|n| n.as_str()) {
+                        if let Some(kind) = val.get("kind").and_then(|k| k.as_str()) {
+                            if kind == "user_message" && !daemon.accept_nonce(&session, nonce) {
+                                continue; // duplicate — drop silently
+                            }
+                        }
+                    }
+                }
+                // Normal path: deserialize into LoopInput and deliver.
                 if let Ok(input) = serde_json::from_str::<LoopInput>(t.as_str()) {
                     daemon.deliver(&session, input).await;
                 }

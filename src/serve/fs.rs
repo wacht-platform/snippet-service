@@ -236,8 +236,6 @@ pub(super) async fn delete_fs_path(
 // content-type from the extension and honors HTTP Range requests (206 Partial
 // Content), so the app can stream/seek images, video, and audio — not just
 // download whole files. Token-gated.
-const MAX_FS_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
-
 pub(super) async fn download_fs_file(
     State(d): State<Shared>,
     Query(q): Query<FsQuery>,
@@ -306,24 +304,28 @@ pub(super) async fn download_fs_file(
         };
     }
 
-    // No Range → the whole file (download-to-device path), size-capped.
-    if total > MAX_FS_DOWNLOAD_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "file too large — stream it with a range request instead",
-        )
-            .into_response();
-    }
-    match std::fs::read(&path) {
-        Ok(bytes) => (
-            [
-                (axum::http::header::CONTENT_TYPE, ctype.to_string()),
-                (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // No Range → stream the whole file. No size cap: the body streams off
+    // disk via ReaderStream so memory stays bounded regardless of file size.
+    {
+        use tokio::io::AsyncSeekExt;
+        let mut file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        };
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(0)).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = axum::body::Body::from_stream(stream);
+        match axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, ctype)
+            .header(axum::http::header::CONTENT_LENGTH, total.to_string())
+            .header(axum::http::header::ACCEPT_RANGES, "bytes")
+            .body(body)
+        {
+            Ok(resp) => resp,
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
     }
 }
 
