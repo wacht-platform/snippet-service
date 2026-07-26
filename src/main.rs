@@ -156,6 +156,18 @@ enum BrowserAction {
         #[arg(long)]
         cdp: bool,
     },
+    /// Drag from one snapshot element reference to another using HTML5 drag events.
+    DragHtml5 {
+        /// Connected device name shown by `snippet browser list`.
+        #[arg(long, alias = "browser")]
+        device_name: String,
+        #[arg(long)]
+        tab: i64,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
     /// Drag between viewport CSS-pixel coordinates without snapshot references.
     DragCoordinates {
         /// Connected device name shown by `snippet browser list`.
@@ -487,6 +499,7 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "page.type": "Requires {tabId:number,ref:string,text:string}; optional append.",
             "page.key": "Requires {tabId:number,key:string}; this is the only keyboard method.",
             "page.drag": "Requires {tabId:number,from:string,to:string}; drags between snapshot refs; optional mode cdp.",
+            "page.dragHtml5": "Requires {tabId:number,from:string,to:string}; uses HTML5 drag events between snapshot refs.",
             "page.dragCoordinates": "Requires {tabId:number,x1:number,y1:number,x2:number,y2:number}; viewport CSS pixels, optional steps 2-100.",
             "page.scroll": "Requires {tabId:number}; use {x:number,y:number} for viewport scrolling or {ref:string} to scroll an element into view.",
             "page.geometry": "Requires {tabId:number,ref:string}; returns the element center and rect.",
@@ -635,6 +648,19 @@ async fn browser_cli(action: BrowserAction) -> Result<(), Box<dyn std::error::Er
             device_name,
             "page.drag",
             serde_json::json!({"tabId": tab, "from": from, "to": to, "mode": if cdp { "cdp" } else { "html5" }}),
+        )
+        .await,
+        BrowserAction::DragHtml5 {
+            device_name,
+            tab,
+            from,
+            to,
+        } => browser_command_cli(
+            &state.url,
+            &state.token,
+            device_name,
+            "page.dragHtml5",
+            serde_json::json!({"tabId": tab, "from": from, "to": to}),
         )
         .await,
         BrowserAction::DragCoordinates {
