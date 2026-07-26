@@ -177,6 +177,32 @@ pub(super) const MINIMAL: Theme = Theme {
     code: Color::Rgb(180, 165, 140),
 };
 
+// Rosé Pine — moody dark blue-purple with soft rose accents. Cozy, elegant, low-strain.
+pub(super) const ROSE_PINE: Theme = Theme {
+    accent: Color::Rgb(235, 111, 146),   // love (rose)
+    text: Color::Rgb(224, 222, 244),     // text
+    muted: Color::Rgb(144, 140, 170),    // subtle
+    faint: Color::Rgb(110, 106, 134),    // muted
+    success: Color::Rgb(156, 207, 216),  // foam
+    danger: Color::Rgb(235, 111, 146),   // love
+    warn: Color::Rgb(246, 193, 119),     // gold
+    lane: Color::Rgb(127, 172, 180),     // pine
+    code: Color::Rgb(235, 188, 186),     // rose
+};
+
+// Everforest Dark — earthy green-gray warmth. Calm, natural, easy on the eyes.
+pub(super) const EVERFOREST: Theme = Theme {
+    accent: Color::Rgb(167, 192, 128),   // green
+    text: Color::Rgb(211, 198, 170),     // fg
+    muted: Color::Rgb(138, 155, 142),    // grey1
+    faint: Color::Rgb(86, 99, 95),       // grey2
+    success: Color::Rgb(167, 192, 128),  // green
+    danger: Color::Rgb(230, 126, 128),   // red
+    warn: Color::Rgb(219, 188, 127),     // orange
+    lane: Color::Rgb(127, 187, 179),     // blue
+    code: Color::Rgb(214, 153, 182),     // purple
+};
+
 pub(super) const PRESETS: &[ThemePreset] = &[
     ThemePreset { name: "terminal-ink", label: "Terminal Ink (blue)", theme: TERMINAL_INK },
     ThemePreset { name: "midnight", label: "Midnight (dark)", theme: MIDNIGHT },
@@ -191,6 +217,8 @@ pub(super) const PRESETS: &[ThemePreset] = &[
     ThemePreset { name: "solarized", label: "Solarized Dark", theme: SOLARIZED },
     ThemePreset { name: "claude", label: "Claude", theme: CLAUDE },
     ThemePreset { name: "minimal", label: "Minimal", theme: MINIMAL },
+    ThemePreset { name: "rose-pine", label: "Rosé Pine", theme: ROSE_PINE },
+    ThemePreset { name: "everforest", label: "Everforest", theme: EVERFOREST },
 ];
 
 pub(super) static THEME_INDEX: AtomicUsize = AtomicUsize::new(0);
