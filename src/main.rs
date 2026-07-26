@@ -374,6 +374,20 @@ async fn browser_http(
     Ok(value)
 }
 
+fn browser_command_error(value: &serde_json::Value) -> Option<String> {
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        Some(
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("browser command failed")
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 fn print_browser_json(
     value: &serde_json::Value,
     pretty: bool,
@@ -474,6 +488,24 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "page.key": "Requires {tabId:number,key:string}; this is the only keyboard method.",
             "page.drag": "Requires {tabId:number,from:string,to:string}; drags between snapshot refs; optional mode cdp.",
             "page.dragCoordinates": "Requires {tabId:number,x1:number,y1:number,x2:number,y2:number}; viewport CSS pixels, optional steps 2-100.",
+            "page.scroll": "Requires {tabId:number}; use {x:number,y:number} for viewport scrolling or {ref:string} to scroll an element into view.",
+            "page.geometry": "Requires {tabId:number,ref:string}; returns the element center and rect.",
+            "page.clickCoordinate": "Requires {tabId:number,x:number,y:number}; uses Chrome CDP pointer input when available.",
+            "page.mouse.click": "Requires {tabId:number,x:number,y:number}; Chrome uses Input.dispatchMouseEvent.",
+            "page.mouse.move": "Requires {tabId:number,x:number,y:number}; optional steps and fromX/fromY.",
+            "page.mouse.down": "Requires {tabId:number,x:number,y:number}; optional button.",
+            "page.mouse.up": "Requires {tabId:number,x:number,y:number}; optional button.",
+            "page.mouse.wheel": "Requires {tabId:number,x:number,y:number}; provide deltaX and/or deltaY.",
+            "page.listFrames": "Requires {tabId:number}; returns frame ids. Pass frameId to page.snapshot and content-script actions.",
+            "page.upload": "Requires {tabId:number,ref:string,files:[{name,type,data}]}; data is base64.",
+            "page.getCookies": "Requires {tabId:number}; returns cookies for the tab URL.",
+            "page.setCookie": "Requires {tabId:number,name:string,value:string}; provide url or use the tab URL.",
+            "page.removeCookies": "Requires {tabId:number,name:string}; optionally provide domain and path.",
+            "page.handleDialog": "Chrome only; requires {tabId:number,accept:boolean}; enable dialog events first.",
+            "page.enableDialogs": "Chrome only; requires {tabId:number}; keeps dialog event capture active until disconnect.",
+            "page.startConsole": "Chrome only; requires {tabId:number}; starts bounded console event capture.",
+            "page.getConsole": "Chrome only; optional {limit:number}; returns buffered console events.",
+            "page.stopConsole": "Chrome only; stops capture and releases its debugger use.",
             "page.eval": "Requires {tabId:number,expression:string}; do not call Runtime.evaluate.",
             "page.screenshot": "Requires {tabId:number}; Firefox requires the tab to be active.",
             "netwatch.start": "Requires {tabId:number}; starts bounded metadata-only network capture for that tab.",
@@ -541,6 +573,9 @@ async fn browser_cli(action: BrowserAction) -> Result<(), Box<dyn std::error::Er
                 &state.token,
             )
             .await?;
+            if let Some(error) = browser_command_error(&value) {
+                return Err(error.into());
+            }
             if method == "page.screenshot" {
                 let path = save_screenshot_tmp(&value)?;
                 print_browser_json(&serde_json::json!({"path": path}), true)
@@ -658,6 +693,9 @@ async fn browser_command_cli(
         token,
     )
     .await?;
+    if let Some(error) = browser_command_error(&value) {
+        return Err(error.into());
+    }
     print_browser_json(&value, true)
 }
 
