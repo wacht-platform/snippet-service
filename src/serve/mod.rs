@@ -419,13 +419,16 @@ pub async fn run_serve(
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
-    // in-flight is lost), then restart via the service manager to run the new
-    // code. Supervised only — a bare daemonized process has no supervisor to
-    // bring it back, so there we update the binary and leave applying it to the
-    // next manual restart.
+    // in-flight is lost), then restart to run the new code.
     if !crate::update::disabled() {
         let d = daemon.clone();
         tokio::spawn(async move { self_update_loop(d, supervised).await });
+    }
+    // Binary watch: detect external replacement (manual `cp` + `mv`) and
+    // auto-restart so the new binary takes effect within ~30s.
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { binary_watch_loop(d, supervised).await });
     }
     // Watch config.toml: when it changes (a profile edited in the app/TUI, an
     // added model, image support toggled, …) reload it and rebuild the model of
@@ -644,16 +647,89 @@ async fn self_update_loop(daemon: Shared, supervised: bool) {
             continue;
         }
         staged = Some(latest);
-        // Binary replaced on disk. Supervised: wait for a clean moment, then let
-        // the service manager restart us onto it. Unsupervised: it's staged and
-        // takes effect on the next manual restart (we can't safely self-restart
-        // with nothing to bring us back).
+        // Binary replaced on disk. Wait for idle, then restart.
+        wait_for_idle(&daemon).await;
         if supervised {
-            wait_for_idle(&daemon).await;
             trigger_restart();
+        } else {
+            self_restart_process();
+        }
+        return;
+    }
+}
+
+/// Watch the on-disk binary for external replacement (manual `cp` + `mv`).
+/// When the inode or mtime of the exe path differs from what we were started
+/// with, the binary has been swapped — restart to pick it up.
+async fn binary_watch_loop(daemon: Shared, supervised: bool) {
+    use std::time::Duration;
+    const CHECK_EVERY: Duration = Duration::from_secs(30);
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    // Snapshot the inode + mtime at startup.
+    let initial_meta = match std::fs::metadata(&exe) {
+        Ok(m) => Some((inode_from_meta(&m), mtime_from_meta(&m))),
+        Err(_) => None,
+    };
+    let (initial_inode, initial_mtime) = match initial_meta {
+        Some(v) => v,
+        None => return,
+    };
+    loop {
+        tokio::time::sleep(CHECK_EVERY).await;
+        let meta = match std::fs::metadata(&exe) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let cur_inode = inode_from_meta(&meta);
+        let cur_mtime = mtime_from_meta(&meta);
+        if cur_inode != initial_inode || cur_mtime != initial_mtime {
+            // Binary replaced externally. Wait for idle sessions, then restart.
+            wait_for_idle(&daemon).await;
+            if supervised {
+                trigger_restart();
+            } else {
+                self_restart_process();
+            }
             return;
         }
     }
+}
+
+#[cfg(unix)]
+fn inode_from_meta(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.ino()
+}
+#[cfg(not(unix))]
+fn inode_from_meta(_m: &std::fs::Metadata) -> u64 {
+    0
+}
+
+#[cfg(unix)]
+fn mtime_from_meta(m: &std::fs::Metadata) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    m.mtime()
+}
+#[cfg(not(unix))]
+fn mtime_from_meta(_m: &std::fs::Metadata) -> i64 {
+    0
+}
+
+/// Spawn a fresh copy of ourselves (same argv) and exit. For unsupervised
+/// daemons when the binary has been replaced on disk — the new process picks
+/// up the new file at the same path.
+fn self_restart_process() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let _ = std::process::Command::new(&exe)
+        .args(&args)
+        .spawn();
+    std::process::exit(0);
 }
 
 /// Whether any live session is mid-turn (persisted status `Running`).

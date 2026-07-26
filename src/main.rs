@@ -46,6 +46,9 @@ enum Command {
         /// Show the running daemon's status + its QR / connection string.
         #[arg(long)]
         status: bool,
+        /// Restart the running daemon (stop then start on the new binary).
+        #[arg(long)]
+        restart: bool,
         /// Install as an OS service that auto-starts on boot/login (launchd on macOS,
         /// systemd --user on Linux), baking in the other flags you pass here.
         #[arg(long)]
@@ -742,6 +745,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             host,
             stop,
             status,
+            restart,
             enable,
             disable,
             supervised,
@@ -749,6 +753,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Lifecycle commands are synchronous and need no config/runtime.
             if stop {
                 return serve::stop().map_err(Into::into);
+            }
+            if restart {
+                serve::stop().ok(); // best-effort: may not be running
+                // Fall through to launch a fresh daemon below.
             }
             if status {
                 return serve::status().map_err(Into::into);
