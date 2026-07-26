@@ -658,13 +658,39 @@ async fn self_update_loop(daemon: Shared, supervised: bool) {
     }
 }
 
+/// Resolve the real filesystem path of the running binary, bypassing
+/// `/proc/self/exe` which keeps the old inode after `mv`.
+fn resolve_exe_path() -> Option<std::path::PathBuf> {
+    // Try reading /proc/self/maps to find our own binary path, which
+    // always reflects the current on-disk path.
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            // current_exe() returns the path string (e.g. /home/.../snippet)
+            // even though /proc/self/exe points at the old inode — the PathBuf
+            // itself is just the string, so stat() on it will follow the
+            // current directory entry.
+            if exe.exists() {
+                return Some(exe);
+            }
+        }
+        // Fallback: parse /proc/self/exe symlink target to get the path string.
+        let link = std::fs::read_link("/proc/self/exe").ok()?;
+        return Some(link);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe().ok()
+    }
+}
+
 /// Watch the on-disk binary for external replacement (manual `cp` + `mv`).
 /// When the inode or mtime of the exe path differs from what we were started
 /// with, the binary has been swapped — restart to pick it up.
 async fn binary_watch_loop(daemon: Shared, supervised: bool) {
     use std::time::Duration;
     const CHECK_EVERY: Duration = Duration::from_secs(30);
-    let exe = match std::env::current_exe() {
+    let exe = match resolve_exe_path() {
         Ok(p) => p,
         Err(_) => return,
     };
@@ -718,18 +744,20 @@ fn mtime_from_meta(_m: &std::fs::Metadata) -> i64 {
     0
 }
 
-/// Spawn a fresh copy of ourselves (same argv) and exit. For unsupervised
-/// daemons when the binary has been replaced on disk — the new process picks
-/// up the new file at the same path.
+/// Replace the current process with a fresh execution of itself. On Unix this
+/// uses `exec()` so the PID, env vars (including `__SNIPPET_SERVE_WORKER`), and
+/// file descriptors are preserved — the new binary picks up exactly where we
+/// left off.
 fn self_restart_process() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
+    use std::os::unix::process::CommandExt;
+    let exe = match resolve_exe_path() {
+        Some(p) => p,
+        None => return,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let _ = std::process::Command::new(&exe)
-        .args(&args)
-        .spawn();
-    std::process::exit(0);
+    // exec() replaces us in-place; it only returns on failure.
+    let err = std::process::Command::new(&exe).args(&args).exec();
+    eprintln!("failed to exec restart: {err}");
 }
 
 /// Whether any live session is mid-turn (persisted status `Running`).
