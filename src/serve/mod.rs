@@ -691,8 +691,8 @@ async fn binary_watch_loop(daemon: Shared, supervised: bool) {
     use std::time::Duration;
     const CHECK_EVERY: Duration = Duration::from_secs(30);
     let exe = match resolve_exe_path() {
-        Ok(p) => p,
-        Err(_) => return,
+        Some(p) => p,
+        None => return,
     };
     // Snapshot the inode + mtime at startup.
     let initial_meta = match std::fs::metadata(&exe) {

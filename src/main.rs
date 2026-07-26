@@ -56,8 +56,8 @@ enum Command {
         /// Remove the auto-start service installed by --enable.
         #[arg(long)]
         disable: bool,
-        /// Internal: run the server in the foreground under a service manager (no
-        /// daemonize); the manager owns supervision/restart.
+        /// Internal: kept for backward compat with existing service files
+        /// (systemd/launchd pass this). Ignored — serve is always foreground now.
         #[arg(long, hide = true)]
         supervised: bool,
     },
@@ -776,48 +776,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(Into::into);
             }
             let token = serve::resolve_token(token);
-            if supervised {
-                // Foreground under a service manager (launchd/systemd): skip the
-                // launcher/worker split and the daemonize — the manager supervises
-                // us. Settings come from serve.toml (written by `--enable`); host/
-                // port fall back to CLI defaults, an explicit url flag still wins,
-                // and an absent file → plain defaults (a fresh serve).
-                let s = serve::ServeSettings::load();
-                let host = s.host.unwrap_or(host);
-                let port = s.port.unwrap_or(port);
-                let no_tunnel = no_tunnel || s.no_tunnel;
-                let public_url = public_url.or(s.public_url);
-                let tunnel = serve::resolve_tunnel(no_tunnel, public_url);
-                serve::write_own_pidfile();
-                return runtime()?.block_on(async {
-                    let config = SnippetConfig::load(&config_path).await?;
-                    // Supervised: a service manager can restart us onto a new binary.
-                    serve::run_serve(config, config_path, &host, port, token, tunnel, true)
-                        .await
-                        .map_err::<Box<dyn std::error::Error>, _>(Into::into)
-                });
+            // Always run foreground. Background via `nohup snippet serve &` or
+            // `snippet serve --enable` (systemd/launchd). Settings from serve.toml
+            // (written by --enable) override CLI defaults when present.
+            let s = serve::ServeSettings::load();
+            let host = s.host.unwrap_or(host);
+            let port = s.port.unwrap_or(port);
+            let no_tunnel = no_tunnel || s.no_tunnel;
+            let public_url = public_url.or(s.public_url);
+            let tunnel = serve::resolve_tunnel(no_tunnel, public_url.clone());
+            serve::write_own_pidfile();
+            // Fetch cloudflared if using the default quick tunnel.
+            let needs_cf = !no_tunnel && public_url.is_none();
+            if needs_cf {
+                serve::ensure_cloudflared_foreground()?;
             }
-            if std::env::var_os("__SNIPPET_SERVE_WORKER").is_some() {
-                // Detached worker: become a daemon, then run the server.
-                let tunnel = serve::resolve_tunnel(no_tunnel, public_url);
-                serve::daemonize_self()?;
-                runtime()?.block_on(async {
-                    let config = SnippetConfig::load(&config_path).await?;
-                    // Daemonized without a supervisor: update in place, apply on next restart.
-                    serve::run_serve(config, config_path, &host, port, token, tunnel, false)
-                        .await
-                        .map_err::<Box<dyn std::error::Error>, _>(Into::into)
-                })
-            } else {
-                // Launcher: fetch cloudflared (visible), spawn the worker, print the QR.
-                // Only the default quick-tunnel route needs cloudflared.
-                let needs_cf = !no_tunnel && public_url.is_none();
-                if needs_cf {
-                    serve::ensure_cloudflared_foreground()?;
-                }
-                serve::launch_and_show(&host, port, &token, no_tunnel, public_url, &config_path)
-                    .map_err(Into::into)
-            }
+            let supervised = true; // treat all foreground as supervised
+            runtime()?.block_on(async {
+                let config = SnippetConfig::load(&config_path).await?;
+                serve::run_serve(config, config_path, &host, port, token, tunnel, supervised)
+                    .await
+                    .map_err::<Box<dyn std::error::Error>, _>(Into::into)
+            })
         }
         None => runtime()?.block_on(async {
             let config = SnippetConfig::load(&config_path).await?;
