@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,8 +94,9 @@ struct Daemon {
     git_write: Mutex<()>,
     /// Connected browser-extension sockets and their pending command waiters.
     browser: BrowserManager,
-    /// Recent message nonces for dedup: `"session:nonce"` → first-seen time.
-    /// Prevents duplicate steers/messages when the client resends after a reconnect.
+    /// Recent idempotency nonces for inbound client inputs: `"session:nonce"` →
+    /// first-seen time. Prevents duplicate user messages and decision retries when
+    /// the mobile client resends after a reconnect.
     seen_nonces: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
@@ -133,22 +134,53 @@ impl Daemon {
             .is_some_and(|t| token_matches(t, &self.token))
     }
 
-    /// Returns true if this nonce is new (not a duplicate within the last 60s).
-    /// Stores it for future checks and prunes stale entries opportunistically.
-    fn accept_nonce(&self, session_id: &str, nonce: &str) -> bool {
+    /// Returns true if this nonce is new. The ledger is persisted beside the
+    /// conversation state so a daemon restart cannot accept the same retry twice.
+    fn accept_nonce(&self, session_id: &str, nonce: &str, state_path: &Path) -> bool {
         let key = format!("{session_id}:{nonce}");
-        let now = std::time::Instant::now();
-        let ttl = std::time::Duration::from_secs(60);
         let mut map = self.seen_nonces.lock().unwrap();
-        // Prune stale entries opportunistically (amortized O(n) every call is fine
-        // for a small map; it only holds entries from the last 60s).
-        map.retain(|_, t| now.duration_since(*t) < ttl);
         if map.contains_key(&key) {
-            false // duplicate — skip
-        } else {
-            map.insert(key, now);
-            true
+            return false;
         }
+
+        let ledger_path = state_path.with_extension("nonces.json");
+        let mut persisted = std::fs::read_to_string(&ledger_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
+        if persisted.iter().any(|n| n == nonce) {
+            map.insert(key, std::time::Instant::now());
+            return false;
+        }
+
+        // Bound the durable ledger. Nonces are unique client request IDs, so
+        // retaining the most recent 512 is enough to cover reconnect retries
+        // without allowing an unbounded sidecar to grow.
+        persisted.push(nonce.to_string());
+        if persisted.len() > 512 {
+            let drop_count = persisted.len() - 512;
+            persisted.drain(..drop_count);
+        }
+        let persisted_bytes = match serde_json::to_vec(&persisted) {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+        let tmp = ledger_path.with_extension("nonces.json.tmp");
+        let persisted_ok = (|| {
+            let mut file = std::fs::File::create(&tmp).ok()?;
+            use std::io::Write;
+            file.write_all(&persisted_bytes).ok()?;
+            file.sync_all().ok()?;
+            std::fs::rename(&tmp, &ledger_path).ok()?;
+            Some(())
+        })()
+        .is_some();
+        if !persisted_ok {
+            let _ = std::fs::remove_file(&tmp);
+            return false;
+        }
+        map.insert(key, std::time::Instant::now());
+        true
     }
 
     /// Re-read the on-disk config so provider profiles added or removed out-of-band
@@ -2003,9 +2035,11 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
     // Push the HarnessState whenever it changes on disk (mtime poll, like the TUI).
     let push_daemon = daemon.clone();
     let push_session = session.clone();
+    let push_state_path = state_path.clone();
     let push = tokio::spawn(async move {
         let daemon = push_daemon;
         let session = push_session;
+        let state_path = push_state_path;
         let mut last_mtime = None;
         let mut last_count: Option<usize> = None;
         let mut last_head: u64 = 0;
@@ -2086,9 +2120,8 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
     });
 
     // Inbound: JSON LoopInput → the session's channel.
-    // Each message may carry an optional "nonce" field for client-side dedup:
-    // on reconnect the client resends unacked messages with the same nonce so
-    // the server can drop duplicates instead of injecting duplicate steers.
+    // Each idempotent client input may carry a nonce. On reconnect the mobile
+    // client resends with the same nonce so the server drops duplicates.
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(t) => {
@@ -2096,10 +2129,17 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
                 // changing the LoopInput serde format.
                 let dominated = serde_json::from_str::<serde_json::Value>(t.as_str());
                 if let Ok(val) = dominated {
-                    // Extract and check nonce for dedup (only for user_message).
                     if let Some(nonce) = val.get("nonce").and_then(|n| n.as_str()) {
                         if let Some(kind) = val.get("kind").and_then(|k| k.as_str()) {
-                            if kind == "user_message" && !daemon.accept_nonce(&session, nonce) {
+                            // User messages and approval/question answers are both
+                            // retried across reconnects and must be idempotent.
+                            let idempotent = matches!(
+                                kind,
+                                "user_message" | "answer" | "approve" | "approve_all" | "deny"
+                            );
+                            if idempotent
+                                && !daemon.accept_nonce(&session, nonce, &state_path)
+                            {
                                 continue; // duplicate — drop silently
                             }
                         }
@@ -2206,4 +2246,38 @@ async fn handle_events_ws(socket: WebSocket) {
         }
     }
     push.abort();
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_daemon() -> Daemon {
+        Daemon {
+            config: std::sync::Mutex::new(SnippetConfig::default()),
+            config_path: PathBuf::new(),
+            token: String::new(),
+            hostname: String::from("test"),
+            sessions: Mutex::new(HashMap::new()),
+            git_write: Mutex::new(()),
+            browser: BrowserManager::default(),
+            seen_nonces: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn nonce_is_rejected_after_daemon_state_is_recreated() {
+        let dir = tempdir().expect("temporary directory");
+        let state_path = dir.path().join("state.json");
+        let first = test_daemon();
+
+        assert!(first.accept_nonce("session", "nonce-1", &state_path));
+        assert!(!first.accept_nonce("session", "nonce-1", &state_path));
+
+        let restarted = test_daemon();
+        assert!(!restarted.accept_nonce("session", "nonce-1", &state_path));
+        assert!(restarted.accept_nonce("session", "nonce-2", &state_path));
+    }
 }

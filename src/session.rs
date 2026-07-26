@@ -272,6 +272,7 @@ pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
 pub fn remove_session_files(state_path: &Path) {
     let _ = std::fs::remove_file(state_path);
     let _ = std::fs::remove_file(meta_path(state_path));
+    let _ = std::fs::remove_file(state_path.with_extension("nonces.json"));
     let _ = std::fs::remove_file(profile_sidecar(state_path));
 }
 
