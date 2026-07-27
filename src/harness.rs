@@ -88,6 +88,10 @@ pub struct HarnessConfig {
     pub memory_max_entries: usize,
     /// Run a bounded learning/reflection pass during compaction (main session only).
     pub memory_reflect_on_compaction: bool,
+    /// Optional live progress sink used by delegated lanes. Progress is operational
+    /// status only (tool names/paths, never prompts) and is not user-addressable.
+    pub progress_tx: Option<mpsc::UnboundedSender<crate::lanes::LaneProgress>>,
+    pub progress_id: Option<String>,
 }
 
 impl Default for HarnessConfig {
@@ -109,6 +113,8 @@ impl Default for HarnessConfig {
             memory_entry_budget_chars: 12_000,
             memory_max_entries: 128,
             memory_reflect_on_compaction: true,
+            progress_tx: None,
+            progress_id: None,
         }
     }
 }
@@ -453,7 +459,9 @@ pub enum LoopInput {
     /// Cancel the run.
     Interrupt,
     /// Rewind to a checkpoint — truncate events and checkpoints to that point.
-    Rewind { checkpoint: String },
+    Rewind {
+        checkpoint: String,
+    },
 }
 
 // --- Runtime corrections (ported from executor/runtime/step_control.rs) ---
@@ -596,7 +604,8 @@ impl CodingHarness {
 
         // Lanes are inert without a factory; this channel is never driven here.
         let (lane_tx, _lane_rx) = mpsc::unbounded_channel::<LaneResult>();
-        let mut lanes = self.new_lane_manager(None, lane_tx, &state);
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel::<crate::lanes::LaneProgress>();
+        let mut lanes = self.new_lane_manager(None, lane_tx, progress_tx, &state);
         // Watches are likewise inert on the one-shot path (nothing selects on the
         // channel) — present only so the meta-tool dispatch signature is uniform.
         let (watch_tx, _watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
@@ -685,6 +694,8 @@ impl CodingHarness {
         sink: Option<StreamHandle>,
     ) -> Result<HarnessState, ToolError> {
         let (lane_tx, mut lane_rx) = mpsc::unbounded_channel::<LaneResult>();
+        let (progress_tx, mut progress_rx) =
+            mpsc::unbounded_channel::<crate::lanes::LaneProgress>();
         let mut state = self.load_or_initialize_state(initial_request).await?;
         self.compact_history_if_needed(model, &mut state).await?;
         // A reopened terminal state (completed / failed / interrupted) starts idle
@@ -699,40 +710,23 @@ impl CodingHarness {
         ) {
             state.status = HarnessStatus::Idle;
         }
-        let mut lanes = self.new_lane_manager(factory, lane_tx, &state);
+        let had_interrupted_lanes = state
+            .lanes
+            .iter()
+            .any(|lane| lane.status == LaneStatus::Running);
+        let mut lanes = self.new_lane_manager(factory, lane_tx, progress_tx, &state);
+        // Child tasks do not survive a process restart, but each lane's harness
+        // state does. Relaunch every lane that was persisted as running from its
+        // last saved boundary and wake the parent so it can track the resumed work.
+        if had_interrupted_lanes {
+            lanes.resume_interrupted();
+            state.status = HarnessStatus::Running;
+        }
         // File watches (`monitor` meta-tool): re-arm any persisted from the state
         // so a daemon/TUI restart resumes tailing where it left off.
         let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
         let mut watches = WatchManager::new(self.context.workspace_root().to_path_buf(), watch_tx);
         watches.restore(&state.watches);
-        // Lanes that were mid-flight when the previous process died were just
-        // ghosted (Failed) by the restore. Surface each as a failure report and
-        // WAKE the orchestrator: it was told ending its turn is how it waits, so
-        // without this it would wait forever on a report that can never come.
-        // Its state file survived — the report's recovery options include a
-        // follow-up, which resumes the lane with everything it had learned.
-        let ghosts = lanes.drain_ghosts();
-        if !ghosts.is_empty() {
-            for (id, title) in ghosts {
-                let result = LaneResult {
-                    id,
-                    title,
-                    status: LaneStatus::Failed,
-                    summary: None,
-                    report: None,
-                    error: Some(
-                        "the process restarted while this lane was running — its live task is gone, \
-                         but its saved context survived; a delegate_task follow-up with this id \
-                         resumes it with everything it had learned"
-                            .to_string(),
-                    ),
-                };
-                self.inject_lane_result(&mut state, &mut lanes, &result);
-            }
-            if state.status == HarnessStatus::Idle {
-                state.status = HarnessStatus::Running;
-            }
-        }
         let mut vars = LoopVars::default();
         let mut consecutive_errors = 0usize;
         // Inputs that arrived while a step was running (the interrupt race consumes
@@ -832,6 +826,7 @@ impl CodingHarness {
                     &mut watches,
                     &mut input_rx,
                     &mut lane_rx,
+                    &mut progress_rx,
                     &mut watch_rx,
                 );
                 if interrupted {
@@ -1071,6 +1066,10 @@ impl CodingHarness {
                         if state.status == HarnessStatus::Idle {
                             state.status = HarnessStatus::Running;
                         }
+                        self.persist(&mut state, &lanes).await?;
+                    }
+                    Some(progress) = progress_rx.recv() => {
+                        lanes.record_progress(&progress);
                         self.persist(&mut state, &lanes).await?;
                     }
                     Some(event) = watch_rx.recv() => {
@@ -1351,6 +1350,7 @@ impl CodingHarness {
         &self,
         factory: Option<ModelFactory>,
         lane_tx: mpsc::UnboundedSender<LaneResult>,
+        progress_tx: mpsc::UnboundedSender<crate::lanes::LaneProgress>,
         state: &HarnessState,
     ) -> LaneManager {
         let lane_root = self
@@ -1365,6 +1365,7 @@ impl CodingHarness {
             self.context.workspace_root().to_path_buf(),
             lane_root,
             lane_tx,
+            progress_tx,
             self.config.exa_api_key.clone(),
         )
         .with_records(state.lanes.clone())
@@ -1380,6 +1381,7 @@ impl CodingHarness {
         watches: &mut WatchManager,
         input_rx: &mut mpsc::UnboundedReceiver<LoopInput>,
         lane_rx: &mut mpsc::UnboundedReceiver<LaneResult>,
+        progress_rx: &mut mpsc::UnboundedReceiver<crate::lanes::LaneProgress>,
         watch_rx: &mut mpsc::UnboundedReceiver<WatchEvent>,
     ) -> (bool, bool) {
         let mut interrupted = false;
@@ -1393,6 +1395,9 @@ impl CodingHarness {
         }
         while let Ok(result) = lane_rx.try_recv() {
             self.inject_lane_result(state, lanes, &result);
+        }
+        while let Ok(progress) = progress_rx.try_recv() {
+            lanes.record_progress(&progress);
         }
         while let Ok(event) = watch_rx.try_recv() {
             self.inject_watch_event(state, watches, &event);
@@ -1691,6 +1696,13 @@ impl CodingHarness {
         // Clear any leftover live-stream text before this turn streams into it; the
         // sink is present only for the interactive conversation (lanes/one-shot
         // pass None and stay buffered).
+        self.lane_progress(
+            "model",
+            format!(
+                "waiting for model response (iteration {})",
+                state.iterations
+            ),
+        );
         if let Some(sink) = sink {
             StreamBuffer::clear(sink);
         }
@@ -1998,6 +2010,7 @@ impl CodingHarness {
                 tool_name: tool_name.clone(),
                 arguments: call.arguments.clone(),
             });
+            self.lane_progress("tool_call", format!("running {tool_name}"));
 
             // Headless explicit completion: a lane / one-shot run ends with a
             // structured `summary` (folded back into the caller). Not advertised to
@@ -2813,14 +2826,6 @@ impl CodingHarness {
                     // latest workspace memory (guarded: no-op if messages[0] isn't System).
                     if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
                         *content = seeded_system.clone();
-                    }
-                    // tokio tasks don't survive a process restart; surface lost lanes.
-                    for lane in state.lanes.iter_mut() {
-                        if lane.status == LaneStatus::Running {
-                            lane.status = LaneStatus::Failed;
-                            lane.error =
-                                Some("lane lost on resume (process restarted)".to_string());
-                        }
                     }
                     // A crash mid tool-batch persists an assistant `tool_calls`
                     // message whose later calls never got results; strict providers
@@ -3668,6 +3673,17 @@ impl CodingHarness {
 
     /// Append a line to `<state_dir>/debug.log` for tracing model/loop behaviour.
     /// No-op when no state path is configured.
+    fn lane_progress(&self, kind: &str, text: impl Into<String>) {
+        let (Some(tx), Some(id)) = (&self.config.progress_tx, &self.config.progress_id) else {
+            return;
+        };
+        let _ = tx.send(crate::lanes::LaneProgress {
+            id: id.clone(),
+            kind: kind.to_string(),
+            text: text.into(),
+        });
+    }
+
     fn debug_log(&self, line: &str) {
         let Some(path) = self.config.state_path.as_ref() else {
             return;

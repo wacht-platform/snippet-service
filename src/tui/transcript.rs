@@ -376,13 +376,13 @@ pub(super) fn render_dispatch_tree(
     for lane_item in lanes {
         let act = match lane_item.status {
             crate::lanes::LaneStatus::Completed => "✓ done".to_string(),
-            crate::lanes::LaneStatus::Running => {
-                if let Some(sum) = &lane_item.summary {
-                    sum.chars().take(col_w.saturating_sub(1)).collect()
-                } else {
-                    "working…".to_string()
-                }
-            }
+            crate::lanes::LaneStatus::Running => lane_item
+                .activity
+                .as_deref()
+                .unwrap_or("working…")
+                .chars()
+                .take(col_w.saturating_sub(1))
+                .collect(),
             crate::lanes::LaneStatus::Failed => "failed".to_string(),
         };
         let pad = col_w.saturating_sub(act.chars().count()) / 2;
@@ -798,6 +798,20 @@ pub(super) fn tool_call_preview(tool_name: &str, arguments: &Value, width: usize
                 if new_total > MAX {
                     items.push((format!("  … +{} more", new_total - MAX), subtle()));
                 }
+            }
+        }
+        "append_file" => {
+            let content = arg("content");
+            let total = content.lines().count();
+
+            items.push((format!("→ {}", path), path_style));
+            items.push(("".to_string(), subtle()));
+            for line in content.lines().take(MAX) {
+                items.push((format!("  {}", line), green));
+            }
+            if total > MAX {
+                items.push(("".to_string(), subtle()));
+                items.push((format!("  … +{} more lines", total - MAX), subtle()));
             }
         }
         _ => return Vec::new(),

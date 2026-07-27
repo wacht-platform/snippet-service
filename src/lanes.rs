@@ -36,6 +36,20 @@ pub enum LaneStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaneActivity {
+    pub at: String,
+    pub kind: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaneProgress {
+    pub id: String,
+    pub kind: String,
+    pub text: String,
+}
+
 /// Persisted, render-friendly snapshot of a lane (kept in `HarnessState`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LaneRecord {
@@ -55,6 +69,16 @@ pub struct LaneRecord {
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    /// Latest safe operational activity, never a user-addressable prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_at: Option<String>,
+    /// Small durable tail for the read-only live lane viewer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity_log: Vec<LaneActivity>,
     /// Investigation lane: file-mutation tools removed. Sticky across follow-ups.
     #[serde(default)]
     pub read_only: bool,
@@ -90,12 +114,11 @@ pub struct LaneManager {
     workspace_root: PathBuf,
     lane_root: PathBuf,
     result_tx: mpsc::UnboundedSender<LaneResult>,
+    progress_tx: mpsc::UnboundedSender<LaneProgress>,
     records: Vec<LaneRecord>,
     counter: usize,
     exa_api_key: Option<String>,
     handles: Vec<tokio::task::JoinHandle<()>>,
-    /// (id, title) of lanes ghosted by the last restore — see `drain_ghosts`.
-    ghosts: Vec<(String, String)>,
 }
 
 impl Drop for LaneManager {
@@ -113,6 +136,7 @@ impl LaneManager {
         workspace_root: PathBuf,
         lane_root: PathBuf,
         result_tx: mpsc::UnboundedSender<LaneResult>,
+        progress_tx: mpsc::UnboundedSender<LaneProgress>,
         exa_api_key: Option<String>,
     ) -> Self {
         Self {
@@ -120,39 +144,19 @@ impl LaneManager {
             workspace_root,
             lane_root,
             result_tx,
+            progress_tx,
             records: Vec::new(),
             counter: 0,
             exa_api_key,
             handles: Vec::new(),
-            ghosts: Vec::new(),
         }
     }
 
     /// Restore prior records (e.g. on resume) so the display reflects history.
-    /// Lanes do NOT survive a process restart, so any record still marked Running
-    /// is a ghost — fail it so the orchestrator doesn't wait on it forever. The
-    /// ghosted (id, title) pairs are kept for `drain_ghosts`, so the interactive
-    /// loop can WAKE the orchestrator with a synthetic failure report (it was told
-    /// ending its turn is how it waits — a report that never comes would otherwise
-    /// leave it waiting until the user happens to speak).
-    pub fn with_records(mut self, mut records: Vec<LaneRecord>) -> Self {
-        for record in records.iter_mut() {
-            if record.status == LaneStatus::Running {
-                record.status = LaneStatus::Failed;
-                record.error = Some("lane did not survive a restart".to_string());
-                record.finished_at = Some(Utc::now().to_rfc3339());
-                self.ghosts.push((record.id.clone(), record.title.clone()));
-            }
-        }
+    pub fn with_records(mut self, records: Vec<LaneRecord>) -> Self {
         self.counter = records.len();
         self.records = records;
         self
-    }
-
-    /// Lanes ghosted by the last `with_records` restore — one-shot handoff to the
-    /// caller so each can be surfaced to the orchestrator as a failure report.
-    pub fn drain_ghosts(&mut self) -> Vec<(String, String)> {
-        std::mem::take(&mut self.ghosts)
     }
 
     pub fn enabled(&self) -> bool {
@@ -197,6 +201,10 @@ impl LaneManager {
             error: None,
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
+            activity: None,
+            activity_kind: None,
+            activity_at: None,
+            activity_log: Vec::new(),
             read_only,
         });
         self.launch(&id, title, brief, false, read_only);
@@ -252,6 +260,7 @@ impl LaneManager {
     fn launch(&mut self, id: &str, title: &str, brief: &str, resume: bool, read_only: bool) {
         let factory = self.factory.clone().expect("checked by callers");
         let result_tx = self.result_tx.clone();
+        let progress_tx = self.progress_tx.clone();
         let workspace_root = self.workspace_root.clone();
         let state_path = self.lane_root.join(format!("{id}.json"));
         let brief = brief.to_string();
@@ -271,6 +280,7 @@ impl LaneManager {
                     exa_api_key,
                     resume,
                     read_only,
+                    progress_tx,
                 ),
             )
             .await
@@ -308,6 +318,52 @@ impl LaneManager {
         self.handles.push(handle);
     }
 
+    pub fn record_progress(&mut self, progress: &LaneProgress) {
+        let Some(record) = self.records.iter_mut().find(|r| r.id == progress.id) else {
+            return;
+        };
+        let activity = LaneActivity {
+            at: Utc::now().to_rfc3339(),
+            kind: progress.kind.clone(),
+            text: progress.text.chars().take(240).collect(),
+        };
+        record.activity = Some(activity.text.clone());
+        record.activity_kind = Some(activity.kind.clone());
+        record.activity_at = Some(activity.at.clone());
+        record.activity_log.push(activity);
+        const MAX_ACTIVITY: usize = 24;
+        if record.activity_log.len() > MAX_ACTIVITY {
+            let drop_count = record.activity_log.len() - MAX_ACTIVITY;
+            record.activity_log.drain(..drop_count);
+        }
+    }
+
+    /// Relaunch lanes that were running when the parent process stopped.
+    pub fn resume_interrupted(&mut self) {
+        let ids: Vec<(String, String, bool)> = self
+            .records
+            .iter()
+            .filter(|r| r.status == LaneStatus::Running)
+            .map(|r| (r.id.clone(), r.title.clone(), r.read_only))
+            .collect();
+        for (id, title, read_only) in ids {
+            self.record_progress(&LaneProgress {
+                id: id.clone(),
+                kind: "restart".to_string(),
+                text: "resuming from the last saved checkpoint".to_string(),
+            });
+            let handoff = self
+                .records
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.handoff.clone())
+                .unwrap_or_else(|| {
+                    "Continue the delegated task from the saved lane state.".to_string()
+                });
+            self.launch(&id, &title, &handoff, true, read_only);
+        }
+    }
+
     /// Fold a completed lane's terminal report into its record.
     pub fn record_result(&mut self, result: &LaneResult) {
         if let Some(record) = self
@@ -320,6 +376,25 @@ impl LaneManager {
             record.report = result.report.clone();
             record.error = result.error.clone();
             record.finished_at = Some(Utc::now().to_rfc3339());
+            let text = match result.status {
+                LaneStatus::Completed => "completed",
+                LaneStatus::Failed => "failed",
+                LaneStatus::Running => "running",
+            };
+            let activity = LaneActivity {
+                at: Utc::now().to_rfc3339(),
+                kind: "lifecycle".to_string(),
+                text: text.to_string(),
+            };
+            record.activity = Some(activity.text.clone());
+            record.activity_kind = Some(activity.kind.clone());
+            record.activity_at = Some(activity.at.clone());
+            record.activity_log.push(activity);
+            const MAX_ACTIVITY: usize = 24;
+            if record.activity_log.len() > MAX_ACTIVITY {
+                let drop_count = record.activity_log.len() - MAX_ACTIVITY;
+                record.activity_log.drain(..drop_count);
+            }
         }
     }
 }
@@ -334,6 +409,7 @@ async fn run_lane(
     exa_api_key: Option<String>,
     resume: bool,
     read_only: bool,
+    progress_tx: mpsc::UnboundedSender<LaneProgress>,
 ) -> Result<(String, String), String> {
     let mut model = factory();
     let mut log = LaneLog::open(&owner).ok();
@@ -374,6 +450,8 @@ async fn run_lane(
             state_path: Some(state_path),
             resume,
             exa_api_key,
+            progress_tx: Some(progress_tx),
+            progress_id: Some(owner.clone()),
             ..HarnessConfig::default()
         },
         tools,
@@ -615,5 +693,72 @@ fn truncate_text(text: &str, max: usize) -> String {
     } else {
         let head: String = text.chars().take(max).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_record() -> LaneRecord {
+        LaneRecord {
+            id: "lane-1".to_string(),
+            title: "audit".to_string(),
+            status: LaneStatus::Running,
+            handoff: Some("inspect the service".to_string()),
+            summary: None,
+            report: None,
+            error: None,
+            started_at: "2025-01-01T00:00:00Z".to_string(),
+            finished_at: None,
+            activity: None,
+            activity_kind: None,
+            activity_at: None,
+            activity_log: Vec::new(),
+            read_only: true,
+        }
+    }
+
+    #[test]
+    fn activity_log_is_bounded_and_keeps_latest_entries() {
+        let (result_tx, _result_rx) = mpsc::unbounded_channel();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        let mut manager = LaneManager::new(
+            None,
+            PathBuf::from("."),
+            PathBuf::from("."),
+            result_tx,
+            progress_tx,
+            None,
+        )
+        .with_records(vec![test_record()]);
+
+        for i in 0..30 {
+            manager.record_progress(&LaneProgress {
+                id: "lane-1".to_string(),
+                kind: "tool_call".to_string(),
+                text: format!("running tool {i}"),
+            });
+        }
+
+        let record = &manager.records()[0];
+        assert_eq!(record.activity_log.len(), 24);
+        assert_eq!(record.activity_log.first().unwrap().text, "running tool 6");
+        assert_eq!(record.activity.as_deref(), Some("running tool 29"));
+    }
+
+    #[test]
+    fn lane_record_accepts_state_written_before_activity_fields() {
+        let mut value = serde_json::to_value(test_record()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("activity");
+        object.remove("activity_kind");
+        object.remove("activity_at");
+        object.remove("activity_log");
+        object.remove("read_only");
+        let restored: LaneRecord = serde_json::from_value(value).unwrap();
+        assert!(restored.activity.is_none());
+        assert!(restored.activity_log.is_empty());
+        assert!(!restored.read_only);
     }
 }
