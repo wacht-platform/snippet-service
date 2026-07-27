@@ -278,119 +278,82 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 pub(super) fn render_dispatch_tree(
     lanes: &[crate::lanes::LaneRecord],
     main_model: &str,
-    _width: usize,
+    width: usize,
 ) -> Vec<Line<'static>> {
     if lanes.is_empty() {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let col_w = 14usize;
-    let n = lanes.len();
-    
-    let root_label = if main_model.is_empty() { "opus" } else { main_model };
-    let root_str = format!("☉ {root_label}");
-    let total_w = n * col_w;
-    let center_x = total_w / 2;
-    
-    let pad_root = center_x.saturating_sub(root_str.chars().count() / 2);
-    out.push(Line::from(vec![
-        Span::raw(" ".repeat(pad_root)),
-        Span::styled(root_str, Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-    ]));
-    
-    out.push(Line::from(vec![
-        Span::raw(" ".repeat(center_x)),
-        Span::styled("│", Style::default().fg(faint())),
-    ]));
-    
-    if n > 1 {
-        let mut branch_spans = Vec::new();
-        let left_pad = col_w / 2;
-        branch_spans.push(Span::raw(" ".repeat(left_pad)));
-        branch_spans.push(Span::styled("┌", Style::default().fg(faint())));
-        for i in 0..n.saturating_sub(1) {
-            let seg_w = col_w.saturating_sub(1);
-            let half = seg_w / 2;
-            let rest = seg_w.saturating_sub(half).saturating_sub(1);
-            branch_spans.push(Span::styled("─".repeat(half), Style::default().fg(faint())));
-            if i * col_w + col_w / 2 + half + 1 == center_x {
-                branch_spans.push(Span::styled("┼", Style::default().fg(faint())));
-            } else {
-                branch_spans.push(Span::styled("┬", Style::default().fg(faint())));
-            }
-            branch_spans.push(Span::styled("─".repeat(rest), Style::default().fg(faint())));
+
+    let content_width = width.max(40);
+    let trim = |text: &str, limit: usize| -> String {
+        let text = text.trim();
+        if text.chars().count() <= limit {
+            text.to_string()
+        } else if limit <= 1 {
+            "…".to_string()
+        } else {
+            format!("{}…", text.chars().take(limit - 1).collect::<String>())
         }
-        branch_spans.push(Span::styled("┐", Style::default().fg(faint())));
-        out.push(Line::from(branch_spans));
-    }
-    
-    let mut diamond_spans = Vec::new();
+    };
+    let status_for = |record: &crate::lanes::LaneRecord| -> (&'static str, Color, &'static str) {
+        match record.status {
+            crate::lanes::LaneStatus::Running => ("●", lane(), "running"),
+            crate::lanes::LaneStatus::Completed => ("●", success(), "done"),
+            crate::lanes::LaneStatus::Failed => ("●", danger(), "failed"),
+        }
+    };
+
+    let model = if main_model.trim().is_empty() {
+        "default"
+    } else {
+        main_model.trim()
+    };
+    let mut out = Vec::with_capacity(lanes.len() * 2 + 2);
+    out.push(Line::from(vec![
+        Span::styled(
+            "▸ delegated lanes",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "  {} · {}",
+                lanes.len(),
+                trim(model, content_width.saturating_sub(28))
+            ),
+            subtle(),
+        ),
+    ]));
+
     for lane_item in lanes {
-        let (dia, dia_color) = match lane_item.status {
-            crate::lanes::LaneStatus::Completed => ("◆", success()),
-            crate::lanes::LaneStatus::Running => ("●", lane()),
-            crate::lanes::LaneStatus::Failed => ("✖", danger()),
+        let (dot, dot_color, state) = status_for(lane_item);
+        let title = trim(&lane_item.title, content_width.saturating_sub(20).max(12));
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(dot, Style::default().fg(dot_color)),
+            Span::styled(format!(" {state:<7}"), Style::default().fg(dot_color)),
+            Span::styled(
+                title,
+                Style::default().fg(text()).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        let activity = match lane_item.status {
+            crate::lanes::LaneStatus::Running => {
+                lane_item.activity.as_deref().unwrap_or("working…")
+            }
+            crate::lanes::LaneStatus::Completed => {
+                lane_item.summary.as_deref().unwrap_or("completed")
+            }
+            crate::lanes::LaneStatus::Failed => lane_item.error.as_deref().unwrap_or("failed"),
         };
-        let pad = col_w.saturating_sub(1) / 2;
-        diamond_spans.push(Span::raw(" ".repeat(pad)));
-        diamond_spans.push(Span::styled(dia, Style::default().fg(dia_color)));
-        diamond_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + 1))));
+        out.push(Line::from(vec![
+            Span::raw("       "),
+            Span::styled(
+                trim(activity, content_width.saturating_sub(7).max(16)),
+                Style::default().fg(muted()),
+            ),
+        ]));
     }
-    out.push(Line::from(diamond_spans));
-
-    let mut face_spans = Vec::new();
-    for lane_item in lanes {
-        let face = match lane_item.status {
-            crate::lanes::LaneStatus::Completed => "(✓◡✓)",
-            crate::lanes::LaneStatus::Running => "(●_●)",
-            crate::lanes::LaneStatus::Failed => "(✖_✖)",
-        };
-        let pad = col_w.saturating_sub(face.chars().count()) / 2;
-        face_spans.push(Span::raw(" ".repeat(pad)));
-        face_spans.push(Span::styled(face, Style::default().fg(text()).add_modifier(Modifier::BOLD)));
-        face_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + face.chars().count()))));
-    }
-    out.push(Line::from(face_spans));
-
-    let mut name_spans = Vec::new();
-    for lane_item in lanes {
-        let name = &lane_item.id;
-        let pad = col_w.saturating_sub(name.chars().count()) / 2;
-        name_spans.push(Span::raw(" ".repeat(pad)));
-        name_spans.push(Span::styled(name.clone(), Style::default().fg(text()).add_modifier(Modifier::BOLD)));
-        name_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + name.chars().count()))));
-    }
-    out.push(Line::from(name_spans));
-
-    let mut model_spans = Vec::new();
-    for _ in lanes {
-        let model_label = "sonnet";
-        let pad = col_w.saturating_sub(model_label.chars().count()) / 2;
-        model_spans.push(Span::raw(" ".repeat(pad)));
-        model_spans.push(Span::styled(model_label, Style::default().fg(lane())));
-        model_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + model_label.chars().count()))));
-    }
-    out.push(Line::from(model_spans));
-
-    let mut act_spans = Vec::new();
-    for lane_item in lanes {
-        let act = match lane_item.status {
-            crate::lanes::LaneStatus::Completed => "✓ done".to_string(),
-            crate::lanes::LaneStatus::Running => lane_item
-                .activity
-                .as_deref()
-                .unwrap_or("working…")
-                .chars()
-                .take(col_w.saturating_sub(1))
-                .collect(),
-            crate::lanes::LaneStatus::Failed => "failed".to_string(),
-        };
-        let pad = col_w.saturating_sub(act.chars().count()) / 2;
-        act_spans.push(Span::raw(" ".repeat(pad)));
-        act_spans.push(Span::styled(act.clone(), Style::default().fg(muted())));
-        act_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + act.chars().count()))));
-    }
-    out.push(Line::from(act_spans));
 
     out
 }
