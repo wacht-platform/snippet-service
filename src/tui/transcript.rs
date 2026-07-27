@@ -94,10 +94,15 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let content_w = width.saturating_sub(TAG_W).max(20);
     let mut tag_pending = false;
 
-    if !has_user_events && !state.user_request.is_empty() {
-        speaker = Some(false);
-        tag_pending = true;
-        push_tagged(&mut lines, user_lines(&state.user_request, content_w), false, &mut tag_pending);
+    if !has_user_events {
+        if let Some(request) = state
+            .initial_request()
+            .filter(|text| !text.trim().is_empty())
+        {
+            speaker = Some(false);
+            tag_pending = true;
+            push_tagged(&mut lines, user_lines(request, content_w), false, &mut tag_pending);
+        }
     }
 
     // After a compaction, clear the screen above it: render only from the last
