@@ -206,19 +206,19 @@ pub(super) const EVERFOREST: Theme = Theme {
 pub(super) const PRESETS: &[ThemePreset] = &[
     ThemePreset { name: "terminal-ink", label: "Terminal Ink (blue)", theme: TERMINAL_INK },
     ThemePreset { name: "midnight", label: "Midnight (dark)", theme: MIDNIGHT },
-    ThemePreset { name: "light", label: "Light", theme: LIGHT },
-    ThemePreset { name: "high-contrast", label: "High-contrast", theme: HIGH_CONTRAST },
-    ThemePreset { name: "ember", label: "Ember (warm)", theme: EMBER },
-    ThemePreset { name: "nord", label: "Nord", theme: NORD },
     ThemePreset { name: "dracula", label: "Dracula", theme: DRACULA },
-    ThemePreset { name: "gruvbox", label: "Gruvbox", theme: GRUVBOX },
     ThemePreset { name: "tokyo-night", label: "Tokyo Night", theme: TOKYO_NIGHT },
+    ThemePreset { name: "nord", label: "Nord", theme: NORD },
     ThemePreset { name: "catppuccin", label: "Catppuccin", theme: CATPPUCCIN },
+    ThemePreset { name: "ember", label: "Ember (warm)", theme: EMBER },
+    ThemePreset { name: "gruvbox", label: "Gruvbox", theme: GRUVBOX },
     ThemePreset { name: "solarized", label: "Solarized Dark", theme: SOLARIZED },
     ThemePreset { name: "claude", label: "Claude", theme: CLAUDE },
     ThemePreset { name: "minimal", label: "Minimal", theme: MINIMAL },
     ThemePreset { name: "rose-pine", label: "Rosé Pine", theme: ROSE_PINE },
     ThemePreset { name: "everforest", label: "Everforest", theme: EVERFOREST },
+    ThemePreset { name: "light", label: "Light", theme: LIGHT },
+    ThemePreset { name: "high-contrast", label: "High-contrast", theme: HIGH_CONTRAST },
 ];
 
 pub(super) static THEME_INDEX: AtomicUsize = AtomicUsize::new(0);

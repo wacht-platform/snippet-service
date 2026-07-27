@@ -4,57 +4,54 @@ use super::theme::*;
 
 /// The empty-state welcome: calm, left-aligned context + a compact command
 /// legend. No animation — a quiet starting page in the Terminal Ink palette.
-pub(super) fn empty_state_lines(cwd: &str, model: &str, width: usize) -> Vec<Line<'static>> {
-    let _ = width;
-    let pad = "   ";
-    let dim = Style::default().fg(faint());
-    let label = Style::default().fg(muted());
+pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-
-    lines.push(Line::from(vec![
-        Span::styled(format!("{pad}▍ "), Style::default().fg(accent())),
-        Span::styled("snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(Span::styled(
-        format!("{pad}  a coding agent in your terminal"),
-        dim,
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
-
-    let row = |k: &str, v: String| {
+    let width = width.max(50);
+    
+    let center = |s: &str, style: Style| -> Line<'static> {
+        let len = s.chars().count();
+        let pad = width.saturating_sub(len) / 2;
         Line::from(vec![
-            Span::styled(format!("{pad}{k:<10}"), dim),
-            Span::styled(v, label),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(s.to_string(), style),
         ])
     };
-    lines.push(row("workspace", cwd.to_string()));
-    lines.push(row("model", if model.is_empty() { "—".into() } else { model.to_string() }));
+
+    let title_style = Style::default().fg(Color::Rgb(165, 180, 252)).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::Rgb(71, 85, 105));
+
     lines.push(Line::from(""));
+    lines.push(center("t                                          T", dim));
+    lines.push(center("G                                           ", dim));
     lines.push(Line::from(""));
 
-    lines.push(Line::from(vec![
-        Span::styled(format!("{pad}"), dim),
-        Span::styled("Type a task and press ", label),
-        Span::styled("⏎", Style::default().fg(accent())),
-        Span::styled(" to begin.", label),
-    ]));
+    let green = Style::default().fg(Color::Rgb(74, 222, 128));
+    let cyan = Style::default().fg(Color::Rgb(125, 207, 245));
+    let purple = Style::default().fg(Color::Rgb(189, 147, 249));
+
+    // Crisp Vector Catgirl Pet Mascot Artwork
+    lines.push(center("          /\\___/\\       /\\___/\\          ", purple));
+    lines.push(center("         (  o.o  )     (  o.o  )  ~♥     ", green));
+    lines.push(center("          >  ^  <       >  ^  <          ", cyan));
+    lines.push(center("      . - ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ - .      ", green));
+    lines.push(center("    /   .-----------------------.   \\    ", green));
+    lines.push(center("   /   /    (◕ ◡ ◕)   SNIPPET    \\   \\   ", cyan.add_modifier(Modifier::BOLD)));
+    lines.push(center("  |   |     \\  ♥  /   MATRIX PET  |   |  ", purple));
+    lines.push(center("   \\   \\     `---'               /   /   ", green));
+    lines.push(center("     ~ - . _ . _ . _ . _ . _ . - ~       ", green));
     lines.push(Line::from(""));
 
-    let cmd = |c: &str| Span::styled(c.to_string(), Style::default().fg(accent()));
-    let sep = || Span::styled("   ·   ", dim);
-    lines.push(Line::from(vec![
-        Span::styled(pad.to_string(), dim),
-        cmd("/model"), sep(),
-        cmd("/theme"), sep(),
-        cmd("/goal"), sep(),
-        cmd("/resume"), sep(),
-        cmd("/help"),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(format!("{pad}"), dim),
-        Span::styled("⏎ send   ·   ⇧⏎ newline   ·   / for commands", dim),
-    ]));
+    // Block Pixel Title SNIPPET
+    lines.push(center("███████ ███    ██ ███████ ███████ ██████  ███████ ████████", title_style));
+    lines.push(center("██      ████   ██    ███  ██      ██   ██ ██         ██   ", title_style));
+    lines.push(center("███████ ██ ██  ██   ███   █████   ██████  █████      ██   ", title_style));
+    lines.push(center("     ██ ██  ██ ██  ███    ██      ██      ██         ██   ", title_style));
+    lines.push(center("███████ ██   ████ ███████ ███████ ██      ███████    ██   ", title_style));
+    lines.push(Line::from(""));
+
+    lines.push(center("g                                          g", dim));
+    lines.push(center("   t                                        ", dim));
+
     lines
 }
 
@@ -133,8 +130,7 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Tool call: render `● verb  arg` and, when the next event is a one-line
-        // result for it, merge that summary onto the same row, right-aligned.
+        // Tool call: render `• verb arg` cleanly without double-tagging
         if let HarnessEvent::ToolCall { tool_name, arguments } = event {
             if HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
                 // Drop the paired hidden result too, so no orphan row renders.
@@ -145,24 +141,34 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 }
                 continue;
             }
-            let mut call_lines = tool_call_lines(tool_name, arguments, content_w);
+
+            set_speaker(&mut lines, &mut speaker, &mut tag_pending, true);
+
+            // If transitioning from prose text to a tool call, add a blank line above the tool run
+            if !prev_tool_row && !lines.is_empty() && lines.last().map_or(true, |l| !l.spans.is_empty()) {
+                lines.push(Line::from(""));
+            }
+
+            let mut call_lines = tool_call_lines(tool_name, arguments, content_w, app.lanes_expanded);
             let result_follows = matches!(events.peek(), Some(HarnessEvent::ToolResult { .. }));
             if result_follows {
-                if call_lines.len() == 1 {
-                    if let Some(HarnessEvent::ToolResult { tool_name: rn, result }) = events.peek() {
-                        if !HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
-                            if let Some(summary) = tool_result_oneliner(rn, result) {
-                                let pad = content_w
-                                    .saturating_sub(call_lines[0].width() + summary.chars().count());
-                                if pad >= 2 {
-                                    call_lines[0].spans.push(Span::raw(" ".repeat(pad)));
-                                    call_lines[0]
-                                        .spans
-                                        .push(Span::styled(summary, Style::default().fg(faint())));
-                                    events.next();
-                                }
+                if let Some(HarnessEvent::ToolResult { tool_name: rn, result }) = events.peek() {
+                    if !HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
+                        let summary = tool_result_oneliner(rn, result).unwrap_or_else(|| {
+                            if result.get("status").and_then(Value::as_str) == Some("error") {
+                                "failed".to_string()
+                            } else {
+                                "done".to_string()
                             }
-                        }
+                        });
+                        let pad = content_w
+                            .saturating_sub(call_lines[0].width() + summary.chars().count())
+                            .max(2);
+                        call_lines[0].spans.push(Span::raw(" ".repeat(pad)));
+                        call_lines[0]
+                            .spans
+                            .push(Span::styled(summary, Style::default().fg(faint())));
+                        events.next();
                     }
                 }
             } else if state.status == HarnessStatus::Running {
@@ -182,8 +188,8 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     ]));
                 }
             }
-            set_speaker(&mut lines, &mut speaker, &mut tag_pending, true);
-            push_tagged(&mut lines, call_lines, true, &mut tag_pending);
+            // Push tool call lines directly so • aligns flush with transcript column
+            lines.extend(call_lines);
             prev_tool_row = true;
             continue;
         }
@@ -199,12 +205,15 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
         let is_user = matches!(event, HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. });
+        
         set_speaker(&mut lines, &mut speaker, &mut tag_pending, !is_user);
+
+        // Add vertical spacing between tool runs and prose text
+        if prev_tool_row && !lines.is_empty() && lines.last().map_or(true, |l| !l.spans.is_empty()) {
+            lines.push(Line::from(""));
+        }
         push_tagged(&mut lines, rendered, !is_user, &mut tag_pending);
-        prev_tool_row = matches!(
-            event,
-            HarnessEvent::ToolResult { .. } | HarnessEvent::InvalidToolCall { .. }
-        );
+        prev_tool_row = false;
     }
     let _ = prev_tool_row;
 
@@ -220,6 +229,14 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         for seg in wrap_one(thinking, width.saturating_sub(2)) {
             lines.push(Line::from(Span::styled(seg, Style::default().fg(muted()))));
         }
+    }
+
+    // Render multi-agent dispatch tree graph if sub-agent lanes exist
+    if !state.lanes.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.extend(render_dispatch_tree(&state.lanes, &app.effective_model.1, width));
     }
 
     // Live "working…" feedback at the tail while the agent is processing (or a lane is).
@@ -256,6 +273,126 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // Append inline login Q&A if active
     lines.extend(login_lines(app, width));
     lines
+}
+
+pub(super) fn render_dispatch_tree(
+    lanes: &[crate::lanes::LaneRecord],
+    main_model: &str,
+    _width: usize,
+) -> Vec<Line<'static>> {
+    if lanes.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let col_w = 14usize;
+    let n = lanes.len();
+    
+    let root_label = if main_model.is_empty() { "opus" } else { main_model };
+    let root_str = format!("☉ {root_label}");
+    let total_w = n * col_w;
+    let center_x = total_w / 2;
+    
+    let pad_root = center_x.saturating_sub(root_str.chars().count() / 2);
+    out.push(Line::from(vec![
+        Span::raw(" ".repeat(pad_root)),
+        Span::styled(root_str, Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+    ]));
+    
+    out.push(Line::from(vec![
+        Span::raw(" ".repeat(center_x)),
+        Span::styled("│", Style::default().fg(faint())),
+    ]));
+    
+    if n > 1 {
+        let mut branch_spans = Vec::new();
+        let left_pad = col_w / 2;
+        branch_spans.push(Span::raw(" ".repeat(left_pad)));
+        branch_spans.push(Span::styled("┌", Style::default().fg(faint())));
+        for i in 0..n.saturating_sub(1) {
+            let seg_w = col_w.saturating_sub(1);
+            let half = seg_w / 2;
+            let rest = seg_w.saturating_sub(half).saturating_sub(1);
+            branch_spans.push(Span::styled("─".repeat(half), Style::default().fg(faint())));
+            if i * col_w + col_w / 2 + half + 1 == center_x {
+                branch_spans.push(Span::styled("┼", Style::default().fg(faint())));
+            } else {
+                branch_spans.push(Span::styled("┬", Style::default().fg(faint())));
+            }
+            branch_spans.push(Span::styled("─".repeat(rest), Style::default().fg(faint())));
+        }
+        branch_spans.push(Span::styled("┐", Style::default().fg(faint())));
+        out.push(Line::from(branch_spans));
+    }
+    
+    let mut diamond_spans = Vec::new();
+    for lane_item in lanes {
+        let (dia, dia_color) = match lane_item.status {
+            crate::lanes::LaneStatus::Completed => ("◆", success()),
+            crate::lanes::LaneStatus::Running => ("●", lane()),
+            crate::lanes::LaneStatus::Failed => ("✖", danger()),
+        };
+        let pad = col_w.saturating_sub(1) / 2;
+        diamond_spans.push(Span::raw(" ".repeat(pad)));
+        diamond_spans.push(Span::styled(dia, Style::default().fg(dia_color)));
+        diamond_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + 1))));
+    }
+    out.push(Line::from(diamond_spans));
+
+    let mut face_spans = Vec::new();
+    for lane_item in lanes {
+        let face = match lane_item.status {
+            crate::lanes::LaneStatus::Completed => "(✓◡✓)",
+            crate::lanes::LaneStatus::Running => "(●_●)",
+            crate::lanes::LaneStatus::Failed => "(✖_✖)",
+        };
+        let pad = col_w.saturating_sub(face.chars().count()) / 2;
+        face_spans.push(Span::raw(" ".repeat(pad)));
+        face_spans.push(Span::styled(face, Style::default().fg(text()).add_modifier(Modifier::BOLD)));
+        face_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + face.chars().count()))));
+    }
+    out.push(Line::from(face_spans));
+
+    let mut name_spans = Vec::new();
+    for lane_item in lanes {
+        let name = &lane_item.id;
+        let pad = col_w.saturating_sub(name.chars().count()) / 2;
+        name_spans.push(Span::raw(" ".repeat(pad)));
+        name_spans.push(Span::styled(name.clone(), Style::default().fg(text()).add_modifier(Modifier::BOLD)));
+        name_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + name.chars().count()))));
+    }
+    out.push(Line::from(name_spans));
+
+    let mut model_spans = Vec::new();
+    for _ in lanes {
+        let model_label = "sonnet";
+        let pad = col_w.saturating_sub(model_label.chars().count()) / 2;
+        model_spans.push(Span::raw(" ".repeat(pad)));
+        model_spans.push(Span::styled(model_label, Style::default().fg(lane())));
+        model_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + model_label.chars().count()))));
+    }
+    out.push(Line::from(model_spans));
+
+    let mut act_spans = Vec::new();
+    for lane_item in lanes {
+        let act = match lane_item.status {
+            crate::lanes::LaneStatus::Completed => "✓ done".to_string(),
+            crate::lanes::LaneStatus::Running => {
+                if let Some(sum) = &lane_item.summary {
+                    sum.chars().take(col_w.saturating_sub(1)).collect()
+                } else {
+                    "working…".to_string()
+                }
+            }
+            crate::lanes::LaneStatus::Failed => "failed".to_string(),
+        };
+        let pad = col_w.saturating_sub(act.chars().count()) / 2;
+        act_spans.push(Span::raw(" ".repeat(pad)));
+        act_spans.push(Span::styled(act.clone(), Style::default().fg(muted())));
+        act_spans.push(Span::raw(" ".repeat(col_w.saturating_sub(pad + act.chars().count()))));
+    }
+    out.push(Line::from(act_spans));
+
+    out
 }
 
 pub(super) const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -354,7 +491,7 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             if HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
                 return Vec::new();
             }
-            tool_call_lines(tool_name, arguments, width)
+            tool_call_lines(tool_name, arguments, width, false)
         }
         HarnessEvent::ToolResult { tool_name, result } => {
             if HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
@@ -406,8 +543,11 @@ const TAG_W: usize = 2;
 /// The inline speaker marker that opens a turn — a slim colored bar (amber for the
 /// agent, muted for you) in a fixed gutter, so content hangs in an even column.
 fn tag_span(agent: bool) -> Span<'static> {
-    let color = if agent { accent() } else { muted() };
-    Span::styled("▍ ", Style::default().fg(color))
+    if agent {
+        Span::styled("✦ ", Style::default().fg(accent()))
+    } else {
+        Span::styled("> ", Style::default().fg(text()).add_modifier(Modifier::BOLD))
+    }
 }
 
 fn tag_pad() -> Span<'static> {
@@ -550,9 +690,11 @@ pub(super) fn lane_completed_lines(
     lines
 }
 
-pub(super) fn tool_call_lines(tool_name: &str, arguments: &Value, width: usize) -> Vec<Line<'static>> {
+pub(super) fn tool_call_lines(tool_name: &str, arguments: &Value, width: usize, expanded: bool) -> Vec<Line<'static>> {
     let mut lines = tool_call_head_lines(tool_name, arguments, width);
-    lines.extend(tool_call_preview(tool_name, arguments, width));
+    if expanded {
+        lines.extend(tool_call_preview(tool_name, arguments, width));
+    }
     lines
 }
 
@@ -572,8 +714,8 @@ pub(super) fn tool_call_head_lines(tool_name: &str, arguments: &Value, width: us
     let arg_budget = width.saturating_sub(arg_col).max(8);
 
     let dot = Span::styled(
-        format!("{}● ", " ".repeat(SPINE)),
-        Style::default().fg(accent()).add_modifier(Modifier::DIM),
+        format!("{}• ", " ".repeat(SPINE)),
+        Style::default().fg(faint()).add_modifier(Modifier::DIM),
     );
     if arg.trim().is_empty() {
         return vec![Line::from(vec![dot, Span::styled(verb, verb_style)])];
@@ -726,15 +868,15 @@ pub(super) fn tool_result_oneliner(tool_name: &str, result: &Value) -> Option<St
         "replace_file_content" => "replaced".to_string(),
         "search_content" => format!("{} matches", count("count")),
         "web_search" => format!("{} results", count("count")),
-        "web_read" => format!("{} chars", s("text").chars().count()),
-        "view_outline" => {
-            if data.get("is_directory").and_then(Value::as_bool).unwrap_or(false) {
-                let n = data.get("entries").and_then(Value::as_array).map(|e| e.len()).unwrap_or(0);
-                format!("{n} entries")
-            } else {
-                let n = data.get("outline").and_then(Value::as_array).map(|o| o.len()).unwrap_or(0);
-                format!("{n} decls")
-            }
+        "list_dir" | "list" => {
+            let n = data.get("entries").and_then(Value::as_array).map(|e| e.len()).unwrap_or_else(|| {
+                s("content").lines().count()
+            });
+            format!("{n} {}", if n == 1 { "entry" } else { "entries" })
+        }
+        "bash" | "run_command" => {
+            let n = s("output").lines().count();
+            format!("{n} {}", if n == 1 { "line" } else { "lines" })
         }
         _ => return None,
     };

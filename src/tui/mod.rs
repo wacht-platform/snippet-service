@@ -31,6 +31,7 @@ use crate::lanes::LaneStatus;
 mod markdown;
 mod theme;
 pub mod transcript;
+pub mod mascot;
 
 use markdown::*;
 use theme::*;
@@ -174,6 +175,7 @@ enum Screen {
     ResumeSelection,
     ThemeSelection,
     Profiles,
+    AgentsModal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +338,7 @@ struct App {
     /// Profiles screen cursor; which profile (if any) the editor is editing; and
     /// whether closing the editor should return to the profiles list.
     profiles_selected_index: usize,
+    agents_modal_selected_index: usize,
     editing_profile: Option<String>,
     return_to_profiles: bool,
     /// Hold the compaction animation until this instant (time-based, so a fast
@@ -461,6 +464,7 @@ impl App {
             theme_original_index: 0,
             model_picker_index: 0,
             profiles_selected_index: 0,
+            agents_modal_selected_index: 0,
             editing_profile: None,
             return_to_profiles: false,
             compaction_anim_until: None,
@@ -1691,13 +1695,7 @@ impl App {
         }
     }
 
-    /// True when the active model is in manual (approval) mode.
-    fn is_manual_mode(&self) -> bool {
-        self.state
-            .as_ref()
-            .map(|s| s.approval_mode == crate::harness::ApprovalMode::Manual)
-            .unwrap_or(self.options.config.manual_approval)
-    }
+
 
 
     fn scroll_up(&mut self, lines: usize) {
@@ -2723,6 +2721,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.paste_clipboard_image();
                 return;
             }
+            // Toggle Agents Modal overlay
+            KeyCode::Char('a') => {
+                if app.screen == Screen::AgentsModal {
+                    app.screen = Screen::Main;
+                } else {
+                    app.screen = Screen::AgentsModal;
+                    app.agents_modal_selected_index = 0;
+                }
+                return;
+            }
             // Expand / collapse the full output of completed delegation lanes.
             KeyCode::Char('o') => {
                 app.lanes_expanded = !app.lanes_expanded;
@@ -2743,7 +2751,33 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 }
                 return;
             }
+            // Ctrl-K: Clear input text buffer
+            KeyCode::Char('k') => {
+                app.input.clear();
+                app.input_cursor = 0;
+                app.status = "input cleared".to_string();
+                return;
+            }
             _ => {}
+        }
+
+        if app.screen == Screen::AgentsModal {
+            let count = app.state.as_ref().map(|s| s.lanes.len()).unwrap_or(0);
+            match key.code {
+                KeyCode::Esc => {
+                    app.screen = Screen::Main;
+                }
+                KeyCode::Up => {
+                    app.agents_modal_selected_index = app.agents_modal_selected_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if count > 0 {
+                        app.agents_modal_selected_index = (app.agents_modal_selected_index + 1).min(count.saturating_sub(1));
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
         // Readline-style line editing for the prompt (main screen only).
         if app.screen == Screen::Main && !app.login_active {
@@ -3321,6 +3355,134 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     render_input(frame, input_area, app);
     render_status_message(frame, status_msg_area, app);
     render_status(frame, footer_area, app);
+    if app.screen == Screen::AgentsModal {
+        render_agents_modal(frame, area, app);
+    }
+}
+
+fn render_agents_modal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+    
+    let modal_area = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(12),
+            Constraint::Percentage(75),
+            Constraint::Percentage(13),
+        ])
+        .split(area)[1];
+    
+    let modal_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Percentage(80),
+            Constraint::Percentage(10),
+        ])
+        .split(modal_area)[1];
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent()))
+        .title(" 🤖 Agents Modal ");
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(24), Constraint::Min(30)])
+        .split(inner);
+
+    let left_pane = chunks[0];
+    let right_pane = chunks[1];
+
+    let lanes = app.state.as_ref().map(|s| &s.lanes);
+    let mut left_lines = vec![
+        Line::from(Span::styled("🤖 Agents", Style::default().fg(accent()).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+
+    if let Some(lanes) = lanes {
+        if lanes.is_empty() {
+            left_lines.push(Line::from(Span::styled(" (no active agents)", Style::default().fg(muted()))));
+        } else {
+            for (idx, lane_item) in lanes.iter().enumerate() {
+                let dot = match lane_item.status {
+                    crate::lanes::LaneStatus::Running => Span::styled("🟢 ", Style::default().fg(success())),
+                    crate::lanes::LaneStatus::Completed => Span::styled("⚪ ", Style::default().fg(muted())),
+                    crate::lanes::LaneStatus::Failed => Span::styled("🔴 ", Style::default().fg(danger())),
+                };
+                let is_sel = idx == app.agents_modal_selected_index;
+                let name_style = if is_sel {
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(text())
+                };
+                let prefix = if is_sel { "▶ 📁 " } else { "  📁 " };
+                left_lines.push(Line::from(vec![
+                    Span::styled(prefix, name_style),
+                    Span::styled(lane_item.id.clone(), name_style),
+                    Span::raw(" "),
+                    dot,
+                ]));
+            }
+        }
+    } else {
+        left_lines.push(Line::from(Span::styled(" (no active session)", Style::default().fg(muted()))));
+    }
+
+    left_lines.push(Line::from(""));
+    left_lines.push(Line::from(""));
+    left_lines.push(Line::from(Span::styled("[↑↓] agent  ·  [Esc] close", Style::default().fg(faint()))));
+
+    frame.render_widget(Paragraph::new(left_lines), left_pane);
+
+    let mut right_lines = Vec::new();
+    if let Some(lanes) = lanes {
+        if let Some(lane_item) = lanes.get(app.agents_modal_selected_index) {
+            let status_badge = match lane_item.status {
+                crate::lanes::LaneStatus::Running => Span::styled(" 🟢 ONLINE", Style::default().fg(success()).add_modifier(Modifier::BOLD)),
+                crate::lanes::LaneStatus::Completed => Span::styled(" ⚪ IDLE", Style::default().fg(muted()).add_modifier(Modifier::BOLD)),
+                crate::lanes::LaneStatus::Failed => Span::styled(" 🔴 FAILED", Style::default().fg(danger()).add_modifier(Modifier::BOLD)),
+            };
+            right_lines.push(Line::from(vec![
+                Span::styled(format!("📁 {} ", lane_item.id), Style::default().fg(text()).add_modifier(Modifier::BOLD)),
+                status_badge,
+            ]));
+            right_lines.push(Line::from(""));
+
+            let summary = lane_item.summary.as_deref().unwrap_or("running tasks");
+            right_lines.push(Line::from(vec![
+                Span::styled("⠋ ", Style::default().fg(accent())),
+                Span::styled(format!("{} · explore · 🤖 sonnet · ember", summary), Style::default().fg(muted())),
+            ]));
+            right_lines.push(Line::from(""));
+
+            if let Some(handoff) = &lane_item.handoff {
+                for line_str in markdown::wrap_one(handoff, (right_pane.width as usize).saturating_sub(4)) {
+                    right_lines.push(Line::from(Span::styled(line_str, Style::default().fg(text()))));
+                }
+                right_lines.push(Line::from(""));
+            }
+
+            if let Some(report) = &lane_item.report {
+                right_lines.push(Line::from(Span::styled("Report & Logs:", Style::default().fg(accent()).add_modifier(Modifier::BOLD))));
+                for line_str in markdown::wrap_one(report, (right_pane.width as usize).saturating_sub(4)) {
+                    right_lines.push(Line::from(Span::styled(format!("... {}", line_str), Style::default().fg(muted()))));
+                }
+            }
+        } else {
+            right_lines.push(Line::from(Span::styled("Select an agent from the left pane.", Style::default().fg(muted()))));
+        }
+    } else {
+        right_lines.push(Line::from(Span::styled("No active background agents.", Style::default().fg(muted()))));
+    }
+
+    frame.render_widget(Paragraph::new(right_lines), right_pane);
 }
 
 /// The approval prompt shown above the input while a mutating tool awaits y/n.
@@ -3557,16 +3719,13 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, Borders};
+    use ratatui::widgets::{Block, BorderType, Borders};
 
-    // Per-frame render: never rescan disk here — the picker key handler keeps
-    // conv_cache fresh (populated on open, refreshed after rename/delete).
     let convs = match &app.conv_cache {
         Some(c) => c.clone(),
         None => app.list_conversations(),
     };
 
-    // Split area: Header (1), List (Min 10), Footer (1)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3576,22 +3735,18 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
         ])
         .split(area);
 
-    // Render Header
     let header_text = vec![
-        Span::styled("● snippet", Style::default().fg(blue()).add_modifier(Modifier::BOLD)),
-        Span::styled("  |  Select a session to resume", Style::default().fg(self::text())),
+        Span::styled("✦ > snippet", Style::default().fg(lane()).add_modifier(Modifier::BOLD)),
+        Span::styled("  │  Select a session to resume", Style::default().fg(text())),
     ];
     frame.render_widget(Paragraph::new(Line::from(header_text)), chunks[0]);
 
-    // Render List — windowed so a long list never clips the selection off-screen.
     let mut lines = Vec::new();
     if convs.is_empty() {
         lines.push(Line::from(Span::styled("  No saved conversations found.", subtle())));
     } else {
         let total = convs.len();
         let selected_idx = app.resume_selected_index.min(total - 1);
-        // chunks[1] borders (TOP|BOTTOM) take 2 rows; reserve 2 more for the
-        // ↑/↓ "N more" hints so the visible window always fits.
         let visible = (chunks[1].height as usize).saturating_sub(4).max(1);
         let start = if selected_idx >= visible {
             selected_idx + 1 - visible
@@ -3609,14 +3764,14 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
             let is_selected = start + offset == selected_idx;
             let line = if is_selected {
                 Line::from(vec![
-                    Span::styled("▍ ", Style::default().fg(accent())),
-                    Span::styled(format!("{:<38} ", name), Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                    Span::styled("▶ 📁 ", Style::default().fg(accent())),
+                    Span::styled(format!("{:<36} ", name), Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
                     Span::styled(desc.to_string(), subtle()),
                 ])
             } else {
                 Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(format!("{:<38} ", name), Style::default().fg(self::text())),
+                    Span::styled("  📁 ", Style::default().fg(muted())),
+                    Span::styled(format!("{:<36} ", name), Style::default().fg(text())),
                     Span::styled(desc.to_string(), Style::default().fg(faint())),
                 ])
             };
@@ -3631,7 +3786,8 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     }
 
     let list_block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(faint()));
 
     frame.render_widget(Paragraph::new(lines).block(list_block), chunks[1]);
@@ -3647,7 +3803,7 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
 /// The `/theme` picker: presets with a live color swatch; arrowing previews the
 /// whole UI in that theme (set in the key handler), Enter applies + persists.
 fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, Borders};
+    use ratatui::widgets::{Block, BorderType, Borders};
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3658,14 +3814,13 @@ fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
         .split(area);
 
     let header = vec![
-        Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-        Span::styled("  ·  theme", subtle()),
+        Span::styled("✦ > snippet", Style::default().fg(lane()).add_modifier(Modifier::BOLD)),
+        Span::styled("  │  Select Theme Palette", Style::default().fg(text())),
     ];
     frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
 
     let total = PRESETS.len();
     let sel = app.theme_selected_index.min(total.saturating_sub(1));
-    // Window so a long preset list never clips the selection off-screen.
     let visible = (chunks[1].height as usize).saturating_sub(4).max(1);
     let start = if sel >= visible { sel + 1 - visible } else { 0 };
     let end = (start + visible).min(total);
@@ -3681,7 +3836,7 @@ fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     for (idx, preset) in PRESETS.iter().enumerate().take(end).skip(start) {
         let selected = idx == sel;
         let bar = if selected {
-            Span::styled("▍ ", Style::default().fg(accent()))
+            Span::styled("▶ ", Style::default().fg(accent()))
         } else {
             Span::raw("  ")
         };
@@ -3690,9 +3845,8 @@ fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
         } else {
             Style::default().fg(self::text())
         };
-        // Swatch in THIS preset's own colors, so each row previews its palette.
         let t = preset.theme;
-        let mut spans = vec![bar, Span::styled(format!("{:<18}", preset.label), label_style)];
+        let mut spans = vec![bar, Span::styled(format!("{:<22}", preset.label), label_style)];
         for color in [t.accent, t.success, t.warn, t.danger, t.lane, t.code] {
             spans.push(Span::styled("●", Style::default().fg(color)));
             spans.push(Span::raw(" "));
@@ -3707,11 +3861,12 @@ fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     }
 
     let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(faint()));
     frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
 
-    let footer = "↑/↓ preview  ·  Enter apply  ·  Esc cancel";
+    let footer = "[↑/↓] preview  ·  [Enter] apply  ·  [Esc] cancel";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer, subtle()))),
         chunks[2],
@@ -3834,41 +3989,38 @@ fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) 
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let model = app.effective_model.1.clone();
-    let mut left = vec![
-        Span::styled("▸ snippet ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-        Span::styled(model, Style::default().fg(muted())),
-    ];
-    let goal_label = app
-        .state
-        .as_ref()
-        .and_then(|s| s.goal.as_ref())
-        .and_then(|g| match g.status {
-            crate::harness::GoalStatus::Active => Some("◇ goal".to_string()),
-            crate::harness::GoalStatus::Paused => Some("◇ goal · paused".to_string()),
-            _ => None,
-        });
-    if let Some(l) = &goal_label {
-        left.push(Span::styled("  ·  ", Style::default().fg(faint())));
-        left.push(Span::styled(l.clone(), Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
+    let has_events = app.state.as_ref().map(|s| !s.events.is_empty()).unwrap_or(false);
+
+    if !has_events {
+        let right_line = Line::from(vec![
+            Span::styled("->9", Style::default().fg(faint())),
+        ]);
+        frame.render_widget(
+            Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
+            area,
+        );
+        return;
     }
 
-    let mut right: Vec<Span<'static>> = Vec::new();
+    let prompt_text = app
+        .state
+        .as_ref()
+        .map(|s| s.user_request.trim())
+        .filter(|req| !req.is_empty())
+        .unwrap_or("snippet");
+
+    let left = vec![
+        Span::styled("☉ > ", Style::default().fg(Color::Rgb(125, 207, 245)).add_modifier(Modifier::BOLD)),
+        Span::styled(prompt_text, Style::default().fg(text()).add_modifier(Modifier::BOLD)),
+    ];
+
+    let mut right: Vec<Span<'static>> = vec![
+        Span::styled(format!("-> {model}"), Style::default().fg(Color::Rgb(125, 207, 245))),
+    ];
+
     let update = app.update_notice.lock().ok().and_then(|g| g.clone());
     if let Some(v) = update {
-        right.push(Span::styled(format!("⬆ v{v} — restart to apply   "), Style::default().fg(accent())));
-    }
-    if let Some(st) = app.state.as_ref() {
-        if st.context_window > 0 {
-            let pct = ((st.last_prompt_tokens as f64 / st.context_window as f64) * 100.0)
-                .round()
-                .clamp(0.0, 100.0) as u64;
-            let color = if pct >= 90 { danger() } else if pct >= 75 { warn() } else { muted() };
-            // Progress bar: 10 chars wide
-            let filled = (pct / 10) as usize;
-            let empty = 10 - filled;
-            let bar = format!("{}{} {}%", "█".repeat(filled), "░".repeat(empty), pct);
-            right.push(Span::styled(format!("ctx {} ", bar), Style::default().fg(color)));
-        }
+        right.insert(0, Span::styled(format!("⬆ v{v}   "), Style::default().fg(accent())));
     }
 
     let left_line = Line::from(left);
@@ -4206,17 +4358,15 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
 
     if app.input.is_empty() {
-        // When a free-text ask_user question is pending, prompt for the answer.
-        let placeholder = {
-            let qs = questions_of(app);
-            match qs.get(app.q_index.min(qs.len().saturating_sub(1))) {
-                Some(q) if q_options(q).is_empty() => "Type your answer, then press ↵…",
-                _ => "Type a prompt or a slash command…",
-            }
-        };
+        let has_events = app.state.as_ref().map(|s| !s.events.is_empty()).unwrap_or(false);
+
+        if !has_events {
+            return;
+        }
+
         let prompt = Line::from(vec![
-            Span::styled(" ❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-            Span::styled(placeholder, Style::default().fg(faint())),
+            Span::styled("✦ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled("type a prompt to steer...", Style::default().fg(muted())),
         ]);
         let mut lines = Vec::new();
         lines.extend(lane_lines(app));
@@ -4250,9 +4400,9 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     for (k, row) in rows.iter().enumerate() {
         let mut spans = Vec::new();
         if k == 0 {
-            spans.push(Span::styled(" ❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled("✦ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
         } else {
-            spans.push(Span::raw("   "));
+            spans.push(Span::raw("  "));
         }
         if k == cursor_row {
             let rchars: Vec<char> = row.chars().collect();
@@ -4698,58 +4848,44 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    // cwd on the left, token accounting on the right. The model now lives in the
-    // header, so it's dropped here. Arrow glyphs (↑ ↓ ↻) are width-1 everywhere;
-    // no emoji (they spill a cell and misalign the row).
     let st = app.state.as_ref();
     let dim = Style::default().fg(muted());
-    let faint = Style::default().fg(faint());
+    let faint_style = Style::default().fg(faint());
+
+    let folder_name = std::path::Path::new(&app.options.config.workspace)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+
+    let left: Vec<Span<'static>> = vec![
+        Span::styled("◇ ", Style::default().fg(accent())),
+        Span::styled(format!("{} ", if app.effective_model.1.is_empty() { "opus" } else { &app.effective_model.1 }), Style::default().fg(text()).add_modifier(Modifier::BOLD)),
+        Span::styled("[medium] ", dim),
+        Span::styled("· ∿ main  ", faint_style),
+        // Workspace rounded pill tab
+        Span::styled("", Style::default().fg(Color::Rgb(245, 158, 11))),
+        Span::styled(format!("📁 {folder_name}"), Style::default().fg(Color::Black).bg(Color::Rgb(245, 158, 11)).add_modifier(Modifier::BOLD)),
+        Span::styled("", Style::default().fg(Color::Rgb(245, 158, 11))),
+    ];
 
     let mut right: Vec<Span<'static>> = Vec::new();
-    // ChatGPT-subscription usage: account-wide snapshot (global), but shown only
-    // while THIS chat runs on the chatgpt provider — another provider's chat
-    // showing ChatGPT's monthly limits reads as the wrong model's quota.
-    let rl = (app.effective_model.0 == "chatgpt" && crate::chatgpt_auth::is_signed_in())
-        .then(|| app.global_usage.as_ref())
-        .flatten();
-    if let Some(rl) = rl {
-        let mut parts = Vec::new();
-        for w in [rl.primary.as_ref(), rl.secondary.as_ref()].into_iter().flatten() {
-            let left = (100.0 - w.used_percent).clamp(0.0, 100.0);
-            parts.push(format!("{} {:.0}%", rate_window_label(w.window_minutes), left));
-        }
-        if !parts.is_empty() {
-            right.push(Span::styled(format!("◷ {} left", parts.join(" · ")), Style::default().fg(warn())));
-            right.push(Span::styled("   ", faint));
-        }
-    }
-    right.extend([
-        Span::styled(format!("↑{}", fmt_si(st.map(|s| s.prompt_tokens).unwrap_or(0))), dim),
-        Span::raw(" "),
-        Span::styled(format!("↓{}", fmt_si(st.map(|s| s.completion_tokens).unwrap_or(0))), dim),
-    ]);
-    let running_lanes = st
-        .map(|s| s.lanes.iter().filter(|lane| lane.status == LaneStatus::Running).count())
-        .unwrap_or(0);
-    if running_lanes > 0 {
-        right.push(Span::styled(format!("  ◆{}", running_lanes), Style::default().fg(lane())));
-    }
-    // Active file watches (`monitor`) — the agent is listening for appends.
-    let watching = st.map(|s| s.watches.len()).unwrap_or(0);
-    if watching > 0 {
-        right.push(Span::styled(format!("  ◉{}", watching), Style::default().fg(warn())));
-    }
-    let cache = st.map(|s| s.cache_read_tokens).unwrap_or(0);
-    if cache > 0 {
-        right.push(Span::styled(format!("  ↻{}", fmt_si(cache)), dim));
-    }
-    right.push(Span::raw(" "));
 
-    let mut left = vec![Span::styled(format!(" {}", app.cwd_display), dim)];
-    left.push(Span::styled(
-        if app.is_manual_mode() { "  ⚠ manual" } else { "  auto" },
-        if app.is_manual_mode() { Style::default().fg(warn()) } else { faint },
-    ));
+    let ctx_pct = st
+        .map(|s| {
+            if s.context_window > 0 {
+                ((s.last_prompt_tokens as f64 / s.context_window as f64) * 100.0).round() as usize
+            } else {
+                5
+            }
+        })
+        .unwrap_or(5);
+
+    right.extend([
+        Span::styled(format!("[□□□□□□] {}% · ", ctx_pct), Style::default().fg(text())),
+        Span::styled("∿ ^K", faint_style),
+    ]);
+
+    let left_line = Line::from(left);
     let right_line = Line::from(right);
     let right_w = right_line.width() as u16;
 
@@ -4758,30 +4894,14 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Min(10), Constraint::Length(right_w + 1)])
         .split(area);
 
-    frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
+    frame.render_widget(Paragraph::new(left_line), cols[0]);
     frame.render_widget(
         Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
         cols[1],
     );
 }
 
-/// Short label for a rate-limit window length (minutes), ±5% tolerance.
-fn rate_window_label(minutes: i64) -> String {
-    let near = |t: i64| (minutes - t).abs() as f64 <= (t as f64) * 0.05;
-    if near(300) {
-        "5h".to_string()
-    } else if near(1440) {
-        "daily".to_string()
-    } else if near(10080) {
-        "wk".to_string()
-    } else if near(43200) {
-        "mo".to_string()
-    } else if minutes > 0 {
-        format!("{}h", (minutes / 60).max(1))
-    } else {
-        "limit".to_string()
-    }
-}
+
 
 /// SI-ish formatting for token counts: 91M, 425k, 128k, 512.
 fn fmt_si(n: u64) -> String {

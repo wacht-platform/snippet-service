@@ -748,7 +748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             restart,
             enable,
             disable,
-            supervised,
+            supervised: _,
         }) => {
             // Lifecycle commands are synchronous and need no config/runtime.
             if stop {

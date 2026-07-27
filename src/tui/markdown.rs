@@ -178,7 +178,7 @@ pub(super) fn render_md_table(
         })
         .collect();
     let body = &body[..];
-    let header_style = Style::default().fg(self::text()).add_modifier(Modifier::BOLD);
+    let header_style = Style::default().fg(accent()).add_modifier(Modifier::BOLD);
     let body_style = Style::default().fg(self::text());
     let faint = Style::default().fg(faint());
 
@@ -197,14 +197,9 @@ pub(super) fn render_md_table(
         }
     }
 
-    // Column separator is " │ " (3 cols). Fit natural widths into the budget,
-    // shrinking the widest columns first when they don't fit.
-    let sep_total = 3 * ncols.saturating_sub(1);
-    let avail = width.saturating_sub(sep_total).max(ncols * 3);
-    // Water-fill: start from natural widths and only ever shave the single widest
-    // column. Narrow columns keep their full width until every column is as wide,
-    // so a giant column wrapping doesn't force short ones (e.g. `oauth-relay`) to
-    // wrap a character early.
+    // Border column spacing: "│ " (2) + " │ " (3) * (ncols - 1) + " │" (2)
+    let border_total = 4 + 3 * ncols.saturating_sub(1);
+    let avail = width.saturating_sub(border_total).max(ncols * 3);
     let widths: Vec<usize> = {
         let mut w = natural.clone();
         let mut total: usize = w.iter().sum();
@@ -234,7 +229,7 @@ pub(super) fn render_md_table(
         let height = wrapped.iter().map(|w| w.len()).max().unwrap_or(1);
         (0..height)
             .map(|k| {
-                let mut spans: Vec<Span<'static>> = Vec::new();
+                let mut spans: Vec<Span<'static>> = vec![Span::styled("│ ", faint)];
                 for c in 0..ncols {
                     if c > 0 {
                         spans.push(Span::styled(" │ ", faint));
@@ -244,23 +239,55 @@ pub(super) fn render_md_table(
                         None => spans.push(Span::raw(" ".repeat(widths[c]))),
                     }
                 }
+                spans.push(Span::styled(" │", faint));
                 Line::from(spans)
             })
             .collect()
     };
 
-    let mut out = render_row(header, true);
-    let mut rule: Vec<Span<'static>> = Vec::new();
+    let mut out = Vec::new();
+
+    // Top border line: ┌──────┬──────┐
+    let mut top_border = vec![Span::styled("┌─", faint)];
     for c in 0..ncols {
         if c > 0 {
-            rule.push(Span::styled("─┼─", faint));
+            top_border.push(Span::styled("─┬─", faint));
         }
-        rule.push(Span::styled("─".repeat(widths[c]), faint));
+        top_border.push(Span::styled("─".repeat(widths[c]), faint));
     }
-    out.push(Line::from(rule));
+    top_border.push(Span::styled("─┐", faint));
+    out.push(Line::from(top_border));
+
+    // Header row
+    out.extend(render_row(header, true));
+
+    // Separator line: ├──────┼──────┤
+    let mut mid_border = vec![Span::styled("├─", faint)];
+    for c in 0..ncols {
+        if c > 0 {
+            mid_border.push(Span::styled("─┼─", faint));
+        }
+        mid_border.push(Span::styled("─".repeat(widths[c]), faint));
+    }
+    mid_border.push(Span::styled("─┤", faint));
+    out.push(Line::from(mid_border));
+
+    // Body rows
     for row in body {
         out.extend(render_row(row, false));
     }
+
+    // Bottom border line: └──────┴──────┘
+    let mut bot_border = vec![Span::styled("└─", faint)];
+    for c in 0..ncols {
+        if c > 0 {
+            bot_border.push(Span::styled("─┴─", faint));
+        }
+        bot_border.push(Span::styled("─".repeat(widths[c]), faint));
+    }
+    bot_border.push(Span::styled("─┘", faint));
+    out.push(Line::from(bot_border));
+
     out
 }
 

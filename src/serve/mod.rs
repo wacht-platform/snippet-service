@@ -678,7 +678,10 @@ async fn self_update_loop(daemon: Shared, supervised: bool) {
         {
             continue;
         }
-        staged = Some(latest);
+        #[allow(unused_assignments)]
+        {
+            staged = Some(latest);
+        }
         // Binary replaced on disk. Wait for idle, then restart.
         wait_for_idle(&daemon).await;
         if supervised {
