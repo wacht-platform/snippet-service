@@ -10,14 +10,21 @@ pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workspace.hash(&mut hasher);
     let hash = hasher.finish();
-    let name = workspace.file_name().and_then(|n| n.to_str()).unwrap_or("workspace");
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let name = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(format!(".snippet/workspaces/{name}-{hash:x}/state.json"))
 }
 
 /// Root holding every workspace's session state.
 pub fn workspaces_root() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".snippet").join("workspaces")
 }
 
@@ -32,10 +39,10 @@ pub fn set_private(path: &Path) {
     let _ = path;
 }
 
+use crate::anthropic::{AnthropicConfig, AnthropicModel};
+use crate::gemini::{GeminiConfig, GeminiModel};
 use crate::llm::AgentModel;
-use crate::openai::{OpenAiCompatibleModel, OpenAiCompatibleConfig};
-use crate::anthropic::{AnthropicModel, AnthropicConfig};
-use crate::gemini::{GeminiModel, GeminiConfig};
+use crate::openai::{OpenAiCompatibleConfig, OpenAiCompatibleModel};
 use crate::tools::ToolError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,13 +61,22 @@ pub struct SnippetConfig {
     pub manual_approval: bool,
     /// Name of the active profile in `setups`. The active profile's config is
     /// mirrored into `model` for the runtime.
-    #[serde(default, alias = "active_profile", alias = "active_setup", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "active_profile",
+        alias = "active_setup",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub active_setup: Option<String>,
     /// Profile used for delegated lanes (`delegate_task`). When it names a known
     /// profile, sub-agents run on that model instead of the active one — e.g. a
     /// cheaper/faster model for parallel grunt work, or a stronger one for hard
     /// sub-tasks. Unset (or an unknown name) → delegation uses the active model.
-    #[serde(default, alias = "delegate_profile", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "delegate_profile",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub delegate_setup: Option<String>,
     /// Exa API key for the `web_search` / `web_read` tools. When set, web search is
     /// enabled; absent, the tools aren't offered to the model. Declared before the
@@ -93,7 +109,12 @@ pub struct SnippetConfig {
     /// Saved provider profiles, keyed by name. Multiple can be configured; one is
     /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
     /// stays valid (tables must follow top-level scalars).
-    #[serde(default, alias = "profiles", alias = "setups", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "profiles",
+        alias = "setups",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub setups: Option<BTreeMap<String, ModelConfig>>,
     #[serde(default)]
     pub model: ModelConfig,
@@ -174,7 +195,7 @@ impl Default for SnippetConfig {
 impl SnippetConfig {
     pub async fn load(path: impl AsRef<Path>) -> Result<Self, ToolError> {
         let path = path.as_ref();
-        
+
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
@@ -188,7 +209,10 @@ impl SnippetConfig {
                     ToolError::msg(format!("failed to serialize default config: {err}"))
                 })?;
                 tokio::fs::write(path, toml_str).await.map_err(|err| {
-                    ToolError::msg(format!("failed to write default config to `{}`: {err}", path.display()))
+                    ToolError::msg(format!(
+                        "failed to write default config to `{}`: {err}",
+                        path.display()
+                    ))
                 })?;
                 set_private(path);
                 let mut config = default_config;
@@ -303,7 +327,12 @@ impl SnippetConfig {
 
     /// A unique profile key derived from a provider name (`provider`, `provider-2`, …).
     pub fn unique_profile_key(&self, provider: &str) -> String {
-        let exists = |k: &str| self.setups.as_ref().map(|m| m.contains_key(k)).unwrap_or(false);
+        let exists = |k: &str| {
+            self.setups
+                .as_ref()
+                .map(|m| m.contains_key(k))
+                .unwrap_or(false)
+        };
         if !exists(provider) {
             return provider.to_string();
         }
@@ -372,7 +401,9 @@ impl ModelConfig {
         match self.provider.as_str() {
             "openai" => {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
-                if config.base_url == "https://api.openai.com/v1" || config.base_url == "https://inference.signalstac.xyz/v1" {
+                if config.base_url == "https://api.openai.com/v1"
+                    || config.base_url == "https://inference.signalstac.xyz/v1"
+                {
                     config.base_url = "https://api.openai.com/v1".to_string();
                 }
                 Box::new(OpenAiCompatibleModel::new(config))
@@ -398,7 +429,9 @@ impl ModelConfig {
             "anthropic" | "anthropic-compatible" => {
                 // Same Messages-API adapter; "anthropic-compatible" just points it
                 // at a custom base_url (a gateway/proxy speaking the Anthropic API).
-                let base_url = if self.provider == "anthropic-compatible" && !self.base_url.trim().is_empty() {
+                let base_url = if self.provider == "anthropic-compatible"
+                    && !self.base_url.trim().is_empty()
+                {
                     self.base_url.trim_end_matches('/').to_string()
                 } else {
                     "https://api.anthropic.com".to_string()
@@ -430,14 +463,16 @@ impl ModelConfig {
                 if model.is_empty() {
                     model = "gpt-5.1-codex".to_string();
                 }
-                Box::new(crate::chatgpt::ChatGptModel::new(crate::chatgpt::ChatGptConfig {
-                    model,
-                    reasoning_effort: self.reasoning_effort.clone(),
-                    supports_images: true, // ChatGPT/Codex models are multimodal
-                    max_retries: self.max_retries,
-                    initial_retry_ms: self.initial_retry_ms,
-                    max_retry_ms: self.max_retry_ms,
-                }))
+                Box::new(crate::chatgpt::ChatGptModel::new(
+                    crate::chatgpt::ChatGptConfig {
+                        model,
+                        reasoning_effort: self.reasoning_effort.clone(),
+                        supports_images: true, // ChatGPT/Codex models are multimodal
+                        max_retries: self.max_retries,
+                        initial_retry_ms: self.initial_retry_ms,
+                        max_retry_ms: self.max_retry_ms,
+                    },
+                ))
             }
             "xai" | "grok" => {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
@@ -451,9 +486,7 @@ impl ModelConfig {
                 }
                 Box::new(OpenAiCompatibleModel::new(config))
             }
-            _ => {
-                Box::new(OpenAiCompatibleModel::new(self.clone().into()))
-            }
+            _ => Box::new(OpenAiCompatibleModel::new(self.clone().into())),
         }
     }
 }
@@ -591,4 +624,3 @@ pub fn save_config(config: &SnippetConfig, path: &Path) -> Result<(), String> {
     set_private(path);
     Ok(())
 }
-

@@ -15,7 +15,9 @@ use crate::llm::{
     AgentModel, GeneratedToolCall, HarnessMessage, ModelOutput, NativeToolDefinition, StreamBuffer,
     StreamHandle, TokenUsage,
 };
-use crate::openai::{is_retryable_status, is_retryable_transport_error, retry_after_delay, retry_delay};
+use crate::openai::{
+    is_retryable_status, is_retryable_transport_error, retry_after_delay, retry_delay,
+};
 use crate::tools::ToolError;
 
 const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -54,10 +56,16 @@ fn parse_codex_rate_limits(
 ) -> Option<crate::llm::RateLimitSnapshot> {
     use crate::llm::{RateLimitSnapshot, RateLimitWindow};
     let f64_at = |name: String| {
-        headers.get(&name).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<f64>().ok())
+        headers
+            .get(&name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<f64>().ok())
     };
     let i64_at = |name: String| {
-        headers.get(&name).and_then(|v| v.to_str().ok()).and_then(|s| s.parse::<i64>().ok())
+        headers
+            .get(&name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
     };
     let window = |p: &str| {
         let used = f64_at(format!("x-codex-{p}-used-percent")).unwrap_or(0.0);
@@ -109,7 +117,11 @@ impl ChatGptModel {
 
     /// Refresh the access token if it's missing or near expiry, persisting it.
     async fn ensure_fresh(&mut self) -> Result<&ChatGptTokens, ToolError> {
-        let stale = self.tokens.as_ref().map(ChatGptTokens::is_stale).unwrap_or(false);
+        let stale = self
+            .tokens
+            .as_ref()
+            .map(ChatGptTokens::is_stale)
+            .unwrap_or(false);
         if stale {
             if let Some(prior) = self.tokens.clone() {
                 match chatgpt_auth::refresh(&prior).await {
@@ -168,10 +180,9 @@ impl AgentModel for ChatGptModel {
             if let Some(sink) = sink.as_ref() {
                 StreamBuffer::clear(sink);
             }
-            let tokens = self
-                .tokens
-                .clone()
-                .ok_or_else(|| ToolError::model_request("ChatGPT sign-in missing".to_string(), false))?;
+            let tokens = self.tokens.clone().ok_or_else(|| {
+                ToolError::model_request("ChatGPT sign-in missing".to_string(), false)
+            })?;
 
             let request = self
                 .client
@@ -241,7 +252,9 @@ impl AgentModel for ChatGptModel {
                                 }
                                 Err(e) => {
                                     return Err(ToolError::model_request(
-                                        format!("ChatGPT token refresh failed: {e} — sign in again."),
+                                        format!(
+                                            "ChatGPT token refresh failed: {e} — sign in again."
+                                        ),
                                         false,
                                     ));
                                 }
@@ -334,19 +347,23 @@ fn build_responses_request(
             HarnessMessage::System { content } => {
                 input.push(message_item(
                     "user",
-                    &format!("[runtime_signal]\n{content}\n[/runtime_signal]"),
+                    &format!("[steering]\n{content}\n[/steering]"),
                 ));
             }
             HarnessMessage::User { content } => {
                 input.push(message_item("user", content));
             }
-            HarnessMessage::Assistant { content, tool_calls } => {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 if !content.is_empty() {
                     input.push(message_item("assistant", content));
                 }
                 for call in tool_calls {
-                    let args = serde_json::to_string(&crate::llm::arguments_as_object(&call.arguments))
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let args =
+                        serde_json::to_string(&crate::llm::arguments_as_object(&call.arguments))
+                            .unwrap_or_else(|_| "{}".to_string());
                     if !call.id.is_empty() {
                         seen_calls.insert(call.id.clone());
                     }
@@ -364,7 +381,8 @@ fn build_responses_request(
                 content,
             } => {
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
-                let output = serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                let output =
+                    serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
                 if tool_call_id.is_empty() {
                     // Legacy state with no native call id — render as user text.
                     input.push(message_item(
@@ -422,7 +440,10 @@ fn build_responses_request(
                 .and_then(Value::as_str)
                 .map(|id| !id.is_empty() && !output_ids.contains(id))
                 .unwrap_or(false);
-        let call_id = item.get("call_id").and_then(Value::as_str).map(str::to_string);
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         reconciled.push(item);
         if missing {
             reconciled.push(json!({
@@ -463,8 +484,14 @@ fn build_responses_request(
         obj.insert("tools".to_string(), json!(tools_json));
     }
     if let Some(effort) = normalize_effort(config.reasoning_effort.as_deref()) {
-        obj.insert("reasoning".to_string(), json!({ "effort": effort, "summary": "auto" }));
-        obj.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+        obj.insert(
+            "reasoning".to_string(),
+            json!({ "effort": effort, "summary": "auto" }),
+        );
+        obj.insert(
+            "include".to_string(),
+            json!(["reasoning.encrypted_content"]),
+        );
     }
     body
 }
@@ -507,7 +534,11 @@ async fn parse_responses_sse(
         };
         match chunk.get("type").and_then(Value::as_str).unwrap_or("") {
             "response.output_text.delta" => {
-                if let Some(delta) = chunk.get("delta").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+                if let Some(delta) = chunk
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|d| !d.is_empty())
+                {
                     text.push_str(delta);
                     if let Some(sink) = sink {
                         StreamBuffer::append(sink, delta);
@@ -515,19 +546,27 @@ async fn parse_responses_sse(
                 }
             }
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                if let (Some(sink), Some(delta)) =
-                    (sink, chunk.get("delta").and_then(Value::as_str).filter(|d| !d.is_empty()))
-                {
+                if let (Some(sink), Some(delta)) = (
+                    sink,
+                    chunk
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .filter(|d| !d.is_empty()),
+                ) {
                     StreamBuffer::append_thinking(sink, delta);
                 }
             }
             "response.output_item.done" => {
                 let item = chunk.get("item");
-                if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call") {
+                if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call")
+                {
                     let item = item.expect("checked");
                     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
                     if !name.is_empty() {
-                        let args_str = item.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                        let args_str = item
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("{}");
                         let arguments = serde_json::from_str::<Value>(args_str)
                             .unwrap_or_else(|_| Value::String(args_str.to_string()));
                         let id = item
@@ -547,7 +586,10 @@ async fn parse_responses_sse(
                 if let Some(u) = chunk.pointer("/response/usage").filter(|u| u.is_object()) {
                     usage = Some(TokenUsage {
                         prompt_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-                        completion_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                        completion_tokens: u
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
                         total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
                         cache_read_tokens: u
                             .pointer("/input_tokens_details/cached_tokens")

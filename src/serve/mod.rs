@@ -9,20 +9,20 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
-use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::config::{save_config, workspaces_root, ModelConfig, SnippetConfig};
-use crate::harness::{deserialize_state, serialize_state, LoopInput};
+use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
+use crate::harness::{LoopInput, deserialize_state, serialize_state};
 use crate::session::{
     list_device_sessions, read_session_profile, start_session_with_browser_summary,
     state_path_for_id, write_session_profile,
@@ -32,8 +32,9 @@ mod browser;
 mod fs;
 mod git;
 mod lifecycle;
-mod tunnel;
+pub mod sidecar;
 mod transcribe;
+mod tunnel;
 
 pub use self::lifecycle::*;
 pub use self::tunnel::ensure_cloudflared_foreground;
@@ -43,7 +44,6 @@ use self::fs::*;
 use self::git::*;
 use self::tunnel::{ensure_cloudflared, start_cloudflared_quick};
 
-
 struct LiveSession {
     input_tx: UnboundedSender<LoopInput>,
     join: JoinHandle<Result<crate::harness::HarnessState, String>>,
@@ -51,6 +51,22 @@ struct LiveSession {
     /// The profile this session's model was built from (per-conversation override,
     /// in-memory only — reverts to the global active profile on daemon restart).
     profile: Option<String>,
+    /// Live token stream for attached clients (TUI/mobile). Shared with the
+    /// harness so /attach can push partial answer/thinking without waiting for
+    /// the next state.json write.
+    stream: crate::llm::StreamHandle,
+}
+
+fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<String>) -> LiveSession {
+    LiveSession {
+        input_tx: handle.input_tx,
+        join: handle.join,
+        state_path: handle.state_path,
+        profile,
+        stream: handle.stream.unwrap_or_else(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(crate::llm::StreamBuffer::default()))
+        }),
+    }
 }
 
 /// Apply a named profile's model to a workspace config (no-op if the name isn't a
@@ -198,10 +214,17 @@ impl Daemon {
 
     /// Return a live session's input channel + state path, starting (resuming) it
     /// from disk if it isn't already running.
-    async fn ensure_live(&self, id: &str) -> Option<(UnboundedSender<LoopInput>, PathBuf)> {
+    async fn ensure_live(
+        &self,
+        id: &str,
+    ) -> Option<(
+        UnboundedSender<LoopInput>,
+        PathBuf,
+        crate::llm::StreamHandle,
+    )> {
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(id) {
-            return Some((s.input_tx.clone(), s.state_path.clone()));
+            return Some((s.input_tx.clone(), s.state_path.clone(), s.stream.clone()));
         }
         let sp = state_path_for_id(id)?;
         let bytes = std::fs::read(&sp).ok()?;
@@ -224,20 +247,16 @@ impl Daemon {
             sp.clone(),
             None,
             true,
-            None,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            ))),
             Some(self.browser.summary_provider()),
         );
         let tx = handle.input_tx.clone();
-        sessions.insert(
-            id.to_string(),
-            LiveSession {
-                input_tx: handle.input_tx,
-                join: handle.join,
-                state_path: sp.clone(),
-                profile,
-            },
-        );
-        Some((tx, sp))
+        let live = live_from_handle(handle, profile);
+        let stream = live.stream.clone();
+        sessions.insert(id.to_string(), live);
+        Some((tx, sp, stream))
     }
 
     /// The provider actually driving a session: its per-chat profile's provider
@@ -301,18 +320,12 @@ impl Daemon {
             sp.clone(),
             None,
             true,
-            None,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            ))),
             Some(self.browser.summary_provider()),
         );
-        sessions.insert(
-            id.to_string(),
-            LiveSession {
-                input_tx: handle.input_tx,
-                join: handle.join,
-                state_path: sp,
-                profile,
-            },
-        );
+        sessions.insert(id.to_string(), live_from_handle(handle, profile));
         RebuildOutcome::Rebuilt
     }
 
@@ -321,12 +334,14 @@ impl Daemon {
     /// same transcript plus the original attachment reference.
     async fn deliver(&self, id: &str, input: LoopInput) {
         let input = match input {
-            LoopInput::UserMessage(text) => match transcribe::prepare_message(self, text.clone()).await {
-                Ok(text) => LoopInput::UserMessage(text),
-                Err(error) => LoopInput::UserMessage(format!(
-                    "{text}\n\n[Audio transcription unavailable: {error}. The original audio attachment remains available.]"
-                )),
-            },
+            LoopInput::UserMessage(text) => {
+                match transcribe::prepare_message(self, text.clone()).await {
+                    Ok(text) => LoopInput::UserMessage(text),
+                    Err(error) => LoopInput::UserMessage(format!(
+                        "{text}\n\n[Audio transcription unavailable: {error}. The original audio attachment remains available.]"
+                    )),
+                }
+            }
             other => other,
         };
         let mut sessions = self.sessions.lock().await;
@@ -379,7 +394,9 @@ impl Daemon {
             sp.clone(),
             initial,
             true,
-            None,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            ))),
             Some(self.browser.summary_provider()),
         );
         // Control inputs weren't consumed as the first turn — hand them to the
@@ -387,15 +404,7 @@ impl Daemon {
         if forward {
             let _ = handle.input_tx.send(input);
         }
-        sessions.insert(
-            id.to_string(),
-            LiveSession {
-                input_tx: handle.input_tx,
-                join: handle.join,
-                state_path: sp,
-                profile,
-            },
-        );
+        sessions.insert(id.to_string(), live_from_handle(handle, profile));
     }
 }
 
@@ -435,6 +444,13 @@ pub async fn run_serve(
     tunnel: Tunnel,
     supervised: bool,
 ) -> Result<(), String> {
+    // If the binary was replaced externally (mv/cp) and the hash in the lock
+    // file doesn't match, exit so systemd/launchd restarts with the new binary.
+    // The hash is stamped after a successful startup.
+    if crate::serve::lifecycle::binary_hash_changed() {
+        eprintln!("binary updated — exiting for service restart");
+        std::process::exit(1);
+    }
     let token_for_print = token.clone();
     let mut config = config;
     config.ensure_setups();
@@ -511,6 +527,7 @@ pub async fn run_serve(
         .route("/chatgpt/logout", post(chatgpt_logout))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))
+        .route("/session/fork", post(fork_session))
         .route("/session/exec", post(exec_in_session))
         .route("/session/delete", post(delete_session))
         .route("/session/rename", post(rename_session))
@@ -570,7 +587,9 @@ pub async fn run_serve(
     println!(
         "serve up at {public_url} (token elided — `snippet serve --status` shows the connection)"
     );
-    write_serve_state(&public_url, &token_for_print);
+    write_serve_state(&public_url, &token_for_print, host, port);
+    // Record the binary hash so the next startup can detect external updates.
+    crate::serve::lifecycle::stamp_binary_hash();
 
     // Run until the listener dies or we get SIGTERM/SIGINT (`serve --stop`); either
     // way tear down the tunnel so cloudflared doesn't linger, and clear our pidfile.
@@ -1018,7 +1037,24 @@ async fn handle_browser_ws(socket: WebSocket, daemon: Shared) {
                     continue;
                 };
                 match value.get("type").and_then(serde_json::Value::as_str) {
-                    Some("heartbeat") | Some("pong") => {
+                    Some("heartbeat") => {
+                        daemon.browser.touch(&browser_id).await;
+                        let _ = daemon
+                            .browser
+                            .send_message(
+                                &browser_id,
+                                Message::Text(
+                                    serde_json::json!({
+                                        "type": "heartbeat_ack",
+                                        "at": value.get("at").cloned().unwrap_or(serde_json::Value::Null),
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ),
+                            )
+                            .await;
+                    }
+                    Some("pong") => {
                         daemon.browser.touch(&browser_id).await;
                     }
                     Some("result") => {
@@ -1187,7 +1223,9 @@ async fn open_session(
             sp.clone(),
             None,
             resume,
-            None,
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            ))),
             Some(d.browser.summary_provider()),
         );
         if persisted.is_none() {
@@ -1195,15 +1233,7 @@ async fn open_session(
                 write_session_profile(&sp, name); // seed the initial override
             }
         }
-        sessions.insert(
-            id.clone(),
-            LiveSession {
-                input_tx: handle.input_tx,
-                join: handle.join,
-                state_path: sp.clone(),
-                profile,
-            },
-        );
+        sessions.insert(id.clone(), live_from_handle(handle, profile));
     }
     Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
 }
@@ -1705,18 +1735,15 @@ async fn set_session_model(
         sp.clone(),
         None,
         true,
-        None,
+        Some(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::llm::StreamBuffer::default(),
+        ))),
         Some(d.browser.summary_provider()),
     );
     write_session_profile(&sp, &req.profile); // persist so it survives restart
     sessions.insert(
         req.session.clone(),
-        LiveSession {
-            input_tx: handle.input_tx,
-            join: handle.join,
-            state_path: sp,
-            profile: Some(req.profile.clone()),
-        },
+        live_from_handle(handle, Some(req.profile.clone())),
     );
     Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
 }
@@ -1727,8 +1754,10 @@ struct RewindReq {
     checkpoint: String,
 }
 
-// POST /session/rewind {session, checkpoint} — restore the workspace files to a
-// checkpoint and truncate conversation history to that point.
+// POST /session/rewind {session, checkpoint} — restore workspace files AND
+// truncate conversation history to that checkpoint. Always updates the state
+// file so clients (mobile/TUI) see the truncated transcript immediately; also
+// notifies a live loop when present so in-memory state matches.
 async fn rewind_session(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -1743,46 +1772,66 @@ async fn rewind_session(
     };
     let checkpoint_id = req.checkpoint.clone();
 
-    // If there's a live session, send the rewind input to it so it truncates
-    // its in-memory state. Otherwise, update the state file directly.
-    let sessions = d.sessions.lock().await;
-    if let Some(s) = sessions.get(&req.session) {
-        if !s.join.is_finished() {
-            let _ = s.input_tx.send(LoopInput::Rewind { checkpoint: checkpoint_id.clone() });
-        }
-    } else {
-        // No live session — update the state file directly
-        drop(sessions);
-        let Ok(bytes) = tokio::fs::read(&sp).await else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to read session state").into_response();
-        };
-        let Ok(mut state) = deserialize_state(&bytes) else {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to parse session state").into_response();
-        };
+    // Load current state from disk (authoritative for history indices).
+    let Ok(bytes) = tokio::fs::read(&sp).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read session state",
+        )
+            .into_response();
+    };
+    let Ok(mut state) = deserialize_state(&bytes) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to parse session state",
+        )
+            .into_response();
+    };
 
-        if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint_id) {
-            let event_index = cp.event_index;
-            let message_index = cp.message_index;
-            state.events.truncate(event_index);
-            state.messages.truncate(message_index);
-            state.checkpoints.retain(|c| c.event_index <= event_index);
+    let label = match state.apply_checkpoint_rewind(&checkpoint_id) {
+        Ok(label) => label,
+        Err(_) => return (StatusCode::NOT_FOUND, "checkpoint not found").into_response(),
+    };
 
-            let Ok(updated_bytes) = serialize_state(&state) else {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "failed to serialize state").into_response();
-            };
-            if let Err(_) = tokio::fs::write(&sp, updated_bytes).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "failed to write state").into_response();
+    // Persist truncated history first so any client re-read sees the cut.
+    let Ok(updated_bytes) = serialize_state(&state) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to serialize state",
+        )
+            .into_response();
+    };
+    if tokio::fs::write(&sp, &updated_bytes).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to write state").into_response();
+    }
+    crate::session::write_session_meta(&sp, &state);
+
+    // Keep a live loop in sync (it may overwrite disk on its next persist otherwise).
+    {
+        let sessions = d.sessions.lock().await;
+        if let Some(s) = sessions.get(&req.session) {
+            if !s.join.is_finished() {
+                let _ = s.input_tx.send(LoopInput::Rewind {
+                    checkpoint: checkpoint_id.clone(),
+                });
             }
-        } else {
-            return (StatusCode::NOT_FOUND, "checkpoint not found").into_response();
         }
     }
 
-    // Restore workspace files
+    // Restore workspace files to the shadow commit.
     let checkpoint_for_restore = checkpoint_id.clone();
-    let result = tokio::task::spawn_blocking(move || crate::checkpoint::restore(&workspace, &checkpoint_for_restore)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::checkpoint::restore(&workspace, &checkpoint_for_restore)
+    })
+    .await;
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({ "restored": checkpoint_id })).into_response(),
+        Ok(Ok(())) => Json(serde_json::json!({
+            "restored": checkpoint_id,
+            "label": label,
+            "event_end": state.events.len(),
+            "message_end": state.messages.len(),
+        }))
+        .into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -2008,6 +2057,125 @@ async fn rename_session(
 }
 
 #[derive(Deserialize)]
+struct ForkReq {
+    session: String,
+    /// Checkpoint id (or unique prefix) — same cut as `/session/rewind`.
+    #[serde(default)]
+    checkpoint: Option<String>,
+    /// Inclusive event index to keep through (snapped to a provider-safe boundary).
+    #[serde(default)]
+    event_index: Option<usize>,
+}
+
+// POST /session/fork {session, checkpoint?|event_index?} — branch a NEW conversation
+// at the chosen history point. Source session is left untouched. Workspace files are
+// shared (not snapshotted); only conversation history is forked.
+async fn fork_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ForkReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(sp) = state_path_for_id(&req.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+
+    // Prefer live in-memory state when the session is running so the fork sees
+    // events that may not have flushed yet; fall back to the on-disk snapshot.
+    let state = {
+        let sessions = d.sessions.lock().await;
+        if let Some(live) = sessions.get(&req.session) {
+            if !live.join.is_finished() {
+                if let Ok(bytes) = std::fs::read(&live.state_path) {
+                    if let Ok(s) = deserialize_state(&bytes) {
+                        s
+                    } else {
+                        drop(sessions);
+                        match std::fs::read(&sp)
+                            .ok()
+                            .and_then(|b| deserialize_state(&b).ok())
+                        {
+                            Some(s) => s,
+                            None => {
+                                return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state")
+                                    .into_response();
+                            }
+                        }
+                    }
+                } else {
+                    drop(sessions);
+                    match std::fs::read(&sp)
+                        .ok()
+                        .and_then(|b| deserialize_state(&b).ok())
+                    {
+                        Some(s) => s,
+                        None => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "session state unreadable",
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+            } else {
+                drop(sessions);
+                match std::fs::read(&sp)
+                    .ok()
+                    .and_then(|b| deserialize_state(&b).ok())
+                {
+                    Some(s) => s,
+                    None => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "session state unreadable",
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        } else {
+            drop(sessions);
+            match std::fs::read(&sp)
+                .ok()
+                .and_then(|b| deserialize_state(&b).ok())
+            {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "session state unreadable",
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    let point = match crate::session::resolve_fork_point(
+        &state,
+        req.checkpoint.as_deref(),
+        req.event_index,
+    ) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    match crate::session::write_forked_conversation(&sp, &state, point) {
+        Ok(forked) => Json(serde_json::json!({
+            "id": forked.id,
+            "title": forked.title,
+            "event_end": forked.event_end,
+            "message_end": forked.message_end,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct AttachQuery {
     token: Option<String>,
     session: String,
@@ -2023,35 +2191,41 @@ async fn attach_ws(
         return unauthorized();
     }
     match d.ensure_live(&q.session).await {
-        Some((_, state_path)) => {
+        Some((_, state_path, stream)) => {
             let daemon = d.clone();
             let session = q.session.clone();
-            ws.on_upgrade(move |socket| handle_ws(socket, daemon, session, state_path))
+            ws.on_upgrade(move |socket| handle_ws(socket, daemon, session, state_path, stream))
         }
         None => (StatusCode::NOT_FOUND, "no such session").into_response(),
     }
 }
 
-async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_path: PathBuf) {
+async fn handle_ws(
+    socket: WebSocket,
+    daemon: Shared,
+    session: String,
+    state_path: PathBuf,
+    stream: crate::llm::StreamHandle,
+) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Push the HarnessState whenever it changes on disk (mtime poll, like the TUI).
+    // Push HarnessState on disk mtime change + live stream frames between persists.
     let push_daemon = daemon.clone();
     let push_session = session.clone();
     let push_state_path = state_path.clone();
+    let push_stream = stream.clone();
     let push = tokio::spawn(async move {
         let daemon = push_daemon;
         let session = push_session;
         let state_path = push_state_path;
+        let stream = push_stream;
         let mut last_mtime = None;
-        let mut last_count: Option<usize> = None;
-        let mut last_head: u64 = 0;
-        let mut last_tail: u64 = 0;
+        let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
+        let mut last_stream_fp: u64 = 0;
         loop {
             if let Ok(meta) = tokio::fs::metadata(&state_path).await {
                 if let Ok(mtime) = meta.modified() {
                     if Some(mtime) != last_mtime {
-                        last_mtime = Some(mtime);
                         if let Ok(bytes) = tokio::fs::read(&state_path).await {
                             if let Ok(state) = deserialize_state(&bytes) {
                                 if let Ok(mut v) = serde_json::to_value(&state) {
@@ -2074,25 +2248,20 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
                                         }
                                     }
                                     let count = state.events.len();
-                                    let head = events_head_fp(&state);
-                                    // Full snapshot on connect / compaction (head changed) /
-                                    // shrink / REWRITE — an interrupt rolls events back and
-                                    // appends, which can land on the same count with different
-                                    // content; verify the last event the client saw is intact.
-                                    let snapshot = match last_count {
-                                        None => true,
-                                        Some(lc) => {
-                                            head != last_head
-                                                || count < lc
-                                                || events_fp_at(&state, lc.wrapping_sub(1))
-                                                    != last_tail
-                                        }
+                                    // Compare typed events directly. The previous implementation
+                                    // serialized the entire prefix to JSON on every update, even
+                                    // though the state was already deserialized.
+                                    let snapshot = if last_events.is_empty() {
+                                        true
+                                    } else {
+                                        count < last_events.len()
+                                            || state.events[..last_events.len()] != last_events[..]
                                     };
                                     if let Some(o) = v.as_object_mut() {
                                         if snapshot {
                                             o.insert("wire".into(), serde_json::json!("snapshot"));
                                         } else {
-                                            let start = last_count.unwrap_or(0);
+                                            let start = last_events.len();
                                             let tail = serde_json::to_value(&state.events[start..])
                                                 .unwrap_or_default();
                                             o.remove("events");
@@ -2104,16 +2273,45 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
                                             );
                                         }
                                     }
-                                    last_count = Some(count);
-                                    last_head = head;
-                                    last_tail = events_fp_at(&state, count.wrapping_sub(1));
+                                    last_events = state.events.clone();
                                     if let Ok(json) = serde_json::to_string(&v) {
                                         if sender.send(Message::Text(json.into())).await.is_err() {
                                             break;
                                         }
+                                        // Mark this mtime handled only after the full
+                                        // state was read and delivered. Atomic state
+                                        // replacement can briefly make the read miss;
+                                        // leaving it unset retries that version next poll.
+                                        last_mtime = Some(mtime);
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            // Live token stream (partial answer/thinking) — independent of state.json.
+            {
+                use std::hash::{Hash, Hasher};
+                let snap = crate::llm::StreamBuffer::snapshot(&stream);
+                let think = crate::llm::StreamBuffer::snapshot_thinking(&stream);
+                let visible = stream.try_lock().map(|b| b.text_visible).unwrap_or(false);
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                snap.hash(&mut h);
+                think.hash(&mut h);
+                visible.hash(&mut h);
+                let fp = h.finish();
+                if fp != last_stream_fp {
+                    last_stream_fp = fp;
+                    let frame = serde_json::json!({
+                        "wire": "stream",
+                        "text": snap,
+                        "thinking": think,
+                        "text_visible": visible,
+                    });
+                    if let Ok(json) = serde_json::to_string(&frame) {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
                         }
                     }
                 }
@@ -2140,9 +2338,7 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
                                 kind,
                                 "user_message" | "answer" | "approve" | "approve_all" | "deny"
                             );
-                            if idempotent
-                                && !daemon.accept_nonce(&session, nonce, &state_path)
-                            {
+                            if idempotent && !daemon.accept_nonce(&session, nonce, &state_path) {
                                 continue; // duplicate — drop silently
                             }
                         }
@@ -2158,24 +2354,6 @@ async fn handle_ws(socket: WebSocket, daemon: Shared, session: String, state_pat
         }
     }
     push.abort();
-}
-
-/// Fingerprint of the event log's head — detects compaction (history replaced)
-/// vs a plain append. Stable across appends; changes when events[0] changes.
-fn events_head_fp(state: &crate::harness::HarnessState) -> u64 {
-    events_fp_at(state, 0)
-}
-
-/// Fingerprint of the event at `idx` (0 when out of range / empty).
-fn events_fp_at(state: &crate::harness::HarnessState, idx: usize) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    if let Some(event) = state.events.get(idx) {
-        if let Ok(s) = serde_json::to_string(event) {
-            s.hash(&mut h);
-        }
-    }
-    h.finish()
 }
 
 // WS /events — device-wide notification firehose. Emits a compact event whenever a
@@ -2250,7 +2428,6 @@ async fn handle_events_ws(socket: WebSocket) {
     }
     push.abort();
 }
-
 
 #[cfg(test)]
 mod tests {

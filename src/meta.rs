@@ -14,8 +14,15 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 7] =
-    ["note", "ask_user", "delegate_task", "complete_goal", "monitor", "present_file", "set_session_title"];
+pub const META_TOOL_NAMES: [&str; 7] = [
+    "note",
+    "ask_user",
+    "delegate_task",
+    "complete_goal",
+    "monitor",
+    "present_file",
+    "set_session_title",
+];
 
 pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
@@ -26,8 +33,14 @@ pub fn is_meta_tool(name: &str) -> bool {
 /// turn by replying with no tool calls. `complete_goal` is the one exception, and
 /// it's only offered while an autonomous `/goal` is active (so it can end it).
 pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinition> {
-    let mut tools =
-        vec![note_tool(), ask_user_tool(), delegate_task_tool(), monitor_tool(), present_file_tool(), set_session_title_tool()];
+    let mut tools = vec![
+        note_tool(),
+        ask_user_tool(),
+        delegate_task_tool(),
+        monitor_tool(),
+        present_file_tool(),
+        set_session_title_tool(),
+    ];
     if goal_active {
         tools.push(complete_goal_tool());
     }
@@ -338,7 +351,11 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
-    let read_only = match arguments.get("access").and_then(Value::as_str).map(str::trim) {
+    let read_only = match arguments
+        .get("access")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
         None | Some("") | Some("full") => false,
         Some("read_only") => true,
         Some(other) => {
@@ -355,7 +372,9 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         .to_string();
     // A follow-up reuses the existing lane's title; a new lane needs one.
     if title.is_empty() && lane_id.is_none() {
-        return Err("delegate_task requires a non-empty `title` (or a `lane_id` to follow up).".to_string());
+        return Err(
+            "delegate_task requires a non-empty `title` (or a `lane_id` to follow up).".to_string(),
+        );
     }
 
     let description = arguments
@@ -454,4 +473,3 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
         "context": arguments.get("context").cloned().unwrap_or(Value::Null),
     }))
 }
-

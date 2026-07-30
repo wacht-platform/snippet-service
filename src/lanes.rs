@@ -106,6 +106,12 @@ const MAX_ACTIVE_LANES: usize = 8;
 /// told that ending its turn is how it waits — waits forever.
 const LANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Finished lanes older than this are dropped from the session snapshot and disk.
+const LANE_FINISHED_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Cap on retained finished lanes (Running never counts). Oldest finished drop first.
+const MAX_FINISHED_LANES: usize = 32;
+
 /// Owns lane lifecycle for one conversation run. Lives in the interactive loop's
 /// local scope (not in the immutable `CodingHarness`). Aborts any still-running
 /// lanes when dropped (the run was interrupted / ended).
@@ -153,9 +159,18 @@ impl LaneManager {
     }
 
     /// Restore prior records (e.g. on resume) so the display reflects history.
+    /// Runs housekeeping so aged-out finished lanes (and orphan disk files) do not
+    /// accumulate across resumes.
     pub fn with_records(mut self, records: Vec<LaneRecord>) -> Self {
-        self.counter = records.len();
+        // Counter must keep rising past historical ids even after prune, so new
+        // spawns never collide with on-disk `lane-N.json` from dropped records.
+        self.counter = records
+            .iter()
+            .filter_map(|r| r.id.strip_prefix("lane-")?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
         self.records = records;
+        let _ = self.housekeep();
         self
     }
 
@@ -396,7 +411,134 @@ impl LaneManager {
                 record.activity_log.drain(..drop_count);
             }
         }
+        // Best-effort: drop temp diagnostic JSONL once the lane is terminal.
+        if result.status != LaneStatus::Running {
+            let _ = LaneLog::cleanup_lane(&result.id);
+            // Bound finished-lane growth (TTL + count) and sweep orphan disk state.
+            let _ = self.housekeep();
+        }
     }
+
+    /// Drop finished lanes past TTL / over the finished-count cap, delete their
+    /// on-disk harness state, and sweep orphan `lane-*.json` files under
+    /// `lane_root` that are no longer referenced. Never touches Running lanes.
+    /// Returns how many finished records were removed from the in-memory list.
+    pub fn housekeep(&mut self) -> usize {
+        let now = Utc::now();
+        let ttl = chrono::Duration::from_std(LANE_FINISHED_TTL)
+            .unwrap_or_else(|_| chrono::Duration::days(7));
+
+        let mut finished_idx: Vec<(usize, chrono::DateTime<Utc>)> = Vec::new();
+        for (i, rec) in self.records.iter().enumerate() {
+            if rec.status == LaneStatus::Running {
+                continue;
+            }
+            let when = rec
+                .finished_at
+                .as_deref()
+                .and_then(parse_rfc3339)
+                .or_else(|| parse_rfc3339(&rec.started_at))
+                .unwrap_or(now);
+            finished_idx.push((i, when));
+        }
+
+        // Age-out first.
+        let mut drop: std::collections::HashSet<usize> = finished_idx
+            .iter()
+            .filter(|(_, when)| now.signed_duration_since(*when) > ttl)
+            .map(|(i, _)| *i)
+            .collect();
+
+        // Then enforce max finished count (oldest first among survivors).
+        let mut survivors: Vec<(usize, chrono::DateTime<Utc>)> = finished_idx
+            .into_iter()
+            .filter(|(i, _)| !drop.contains(i))
+            .collect();
+        if survivors.len() > MAX_FINISHED_LANES {
+            survivors.sort_by_key(|(_, when)| *when); // oldest first
+            let excess = survivors.len() - MAX_FINISHED_LANES;
+            for (i, _) in survivors.into_iter().take(excess) {
+                drop.insert(i);
+            }
+        }
+
+        if drop.is_empty() {
+            // Still sweep orphans (e.g. files left after a crash / older builds).
+            self.sweep_orphan_lane_files();
+            return 0;
+        }
+
+        let removed_ids: Vec<String> = drop
+            .iter()
+            .filter_map(|&i| self.records.get(i).map(|r| r.id.clone()))
+            .collect();
+        let mut idxs: Vec<usize> = drop.into_iter().collect();
+        idxs.sort_unstable();
+        for i in idxs.into_iter().rev() {
+            self.records.remove(i);
+        }
+        for id in &removed_ids {
+            self.delete_lane_files(id);
+            let _ = LaneLog::cleanup_lane(id);
+        }
+        self.sweep_orphan_lane_files();
+        removed_ids.len()
+    }
+
+    fn delete_lane_files(&self, id: &str) {
+        if !is_safe_lane_file_id(id) {
+            return;
+        }
+        let base = self.lane_root.join(id);
+        let _ = std::fs::remove_file(base.with_extension("json"));
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.meta.json", base.display())));
+        // Some writers use `lane-N.meta.json` beside `lane-N.json`.
+        let _ = std::fs::remove_file(self.lane_root.join(format!("{id}.meta.json")));
+        let _ = std::fs::remove_file(self.lane_root.join(format!("{id}.json")));
+    }
+
+    /// Remove `lane-*.json` / `lane-*.meta.json` under lane_root that are not
+    /// referenced by any current record (including Running).
+    fn sweep_orphan_lane_files(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.lane_root) else {
+            return;
+        };
+        let keep: std::collections::HashSet<&str> =
+            self.records.iter().map(|r| r.id.as_str()).collect();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // lane-12.json / lane-12.meta.json
+            let id = if let Some(rest) = name.strip_suffix(".meta.json") {
+                rest
+            } else if let Some(rest) = name.strip_suffix(".json") {
+                rest
+            } else {
+                continue;
+            };
+            if !id.starts_with("lane-") || !is_safe_lane_file_id(id) {
+                continue;
+            }
+            if keep.contains(id) {
+                continue;
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn parse_rfc3339(s: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn is_safe_lane_file_id(id: &str) -> bool {
+    // lane-<digits> only — never allow path separators or `..`.
+    let Some(rest) = id.strip_prefix("lane-") else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -435,12 +577,7 @@ async fn run_lane(
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.
         // The shell remains for inspection — the brief tells the lane its role.
-        for tool in [
-            "write_file",
-            "edit_file",
-            "append_file",
-            "replace_file_content",
-        ] {
+        for tool in ["write_file", "edit_file", "append_file"] {
             tools.remove(tool);
         }
     }
@@ -598,7 +735,7 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
                 // Track files the lane actually operated on — the concrete results.
                 if matches!(
                     tool_name.as_str(),
-                    "write_file" | "edit_file" | "append_file" | "replace_file_content"
+                    "write_file" | "edit_file" | "append_file"
                 ) {
                     if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
                         if !changed.iter().any(|p| p == path) {
@@ -665,14 +802,8 @@ fn action_label(tool_name: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
     let detail = match tool_name {
         "bash" => arg("command"),
-        "read_file"
-        | "read_image"
-        | "write_file"
-        | "append_file"
-        | "edit_file"
-        | "replace_file_content"
-        | "view_outline"
-        | "list_files" => arg("path"),
+        "read_file" | "read_image" | "write_file" | "append_file" | "edit_file"
+        | "view_outline" | "list_files" => arg("path"),
         "search_content" | "search_files" | "web_search" => arg("query"),
         "web_read" => arg("url"),
         "delegate_task" => arg("title"),
@@ -760,5 +891,138 @@ mod tests {
         assert!(restored.activity.is_none());
         assert!(restored.activity_log.is_empty());
         assert!(!restored.read_only);
+    }
+
+    fn finished_record(id: &str, finished_at: &str) -> LaneRecord {
+        let mut r = test_record();
+        r.id = id.to_string();
+        r.status = LaneStatus::Completed;
+        r.finished_at = Some(finished_at.to_string());
+        r.started_at = finished_at.to_string();
+        r
+    }
+
+    fn empty_manager(lane_root: PathBuf) -> LaneManager {
+        let (result_tx, _result_rx) = mpsc::unbounded_channel();
+        let (progress_tx, _progress_rx) = mpsc::unbounded_channel();
+        LaneManager::new(
+            None,
+            PathBuf::from("."),
+            lane_root,
+            result_tx,
+            progress_tx,
+            None,
+        )
+    }
+
+    #[test]
+    fn housekeep_drops_finished_past_ttl_keeps_running() {
+        let dir = std::env::temp_dir().join(format!("snippet-lane-hk-ttl-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let old = "2015-01-01T00:00:00Z";
+        let recent = Utc::now().to_rfc3339();
+        let mgr = empty_manager(dir.clone()).with_records(vec![
+            finished_record("lane-1", old),
+            {
+                let mut run = test_record();
+                run.id = "lane-2".into();
+                run.status = LaneStatus::Running;
+                run.finished_at = None;
+                run
+            },
+            finished_record("lane-3", &recent),
+        ]);
+        // with_records already housekeeps — old finished should be gone.
+        let ids: Vec<_> = mgr.records().iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"lane-1"),
+            "ttl-expired finished must drop: {ids:?}"
+        );
+        assert!(ids.contains(&"lane-2"), "running must stay: {ids:?}");
+        assert!(
+            ids.contains(&"lane-3"),
+            "recent finished must stay: {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeep_enforces_max_finished_count() {
+        let dir = std::env::temp_dir().join(format!("snippet-lane-hk-cap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Build MAX_FINISHED_LANES + 5 finished, all "now" so TTL doesn't bite.
+        let now = Utc::now();
+        let mut recs = Vec::new();
+        for i in 1..=(MAX_FINISHED_LANES + 5) {
+            // Stagger finished_at so oldest are lane-1..lane-5
+            let when = (now - chrono::Duration::seconds(i as i64)).to_rfc3339();
+            recs.push(finished_record(&format!("lane-{i}"), &when));
+        }
+        // One running must survive regardless of count.
+        let mut run = test_record();
+        run.id = format!("lane-{}", MAX_FINISHED_LANES + 100);
+        run.status = LaneStatus::Running;
+        recs.push(run);
+
+        let mgr = empty_manager(dir.clone()).with_records(recs);
+        let finished: Vec<_> = mgr
+            .records()
+            .iter()
+            .filter(|r| r.status != LaneStatus::Running)
+            .collect();
+        assert_eq!(finished.len(), MAX_FINISHED_LANES);
+        assert!(
+            mgr.records()
+                .iter()
+                .any(|r| r.status == LaneStatus::Running),
+            "running lane must be retained"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn housekeep_deletes_disk_files_and_orphans() {
+        let dir = std::env::temp_dir().join(format!("snippet-lane-hk-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Referenced recent finished + orphan file with no record.
+        let recent = Utc::now().to_rfc3339();
+        std::fs::write(dir.join("lane-1.json"), b"{}").unwrap();
+        std::fs::write(dir.join("lane-1.meta.json"), b"{}").unwrap();
+        std::fs::write(dir.join("lane-99.json"), b"orphan").unwrap();
+        std::fs::write(dir.join("lane-99.meta.json"), b"orphan").unwrap();
+        // Ancient finished with files — should drop record + files.
+        std::fs::write(dir.join("lane-2.json"), b"old").unwrap();
+        std::fs::write(dir.join("lane-2.meta.json"), b"old").unwrap();
+
+        let mgr = empty_manager(dir.clone()).with_records(vec![
+            finished_record("lane-1", &recent),
+            finished_record("lane-2", "2015-06-01T00:00:00Z"),
+        ]);
+
+        let ids: Vec<_> = mgr.records().iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids, vec!["lane-1".to_string()]);
+        assert!(dir.join("lane-1.json").exists());
+        assert!(
+            !dir.join("lane-2.json").exists(),
+            "ttl drop must delete files"
+        );
+        assert!(!dir.join("lane-99.json").exists(), "orphan must be swept");
+        assert!(!dir.join("lane-99.meta.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_records_preserves_counter_past_pruned_ids() {
+        let dir = std::env::temp_dir().join(format!("snippet-lane-hk-ctr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mgr = empty_manager(dir.clone()).with_records(vec![
+            finished_record("lane-40", "2015-01-01T00:00:00Z"), // pruned by TTL
+            finished_record("lane-41", &Utc::now().to_rfc3339()),
+        ]);
+        // Next spawn id should be lane-42, not lane-1.
+        assert_eq!(mgr.counter, 41);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -80,4 +80,38 @@ impl LaneLog {
             "final_text": final_text,
         }))
     }
+
+    /// Remove diagnostic JSONL logs for a finished lane. This deliberately only
+    /// touches files in the dedicated temp log directory; lane workspace files
+    /// are user work and are never removed by lane housekeeping.
+    pub fn cleanup_lane(lane_id: &str) -> io::Result<usize> {
+        if !safe_lane_id(lane_id) {
+            return Ok(0);
+        }
+        let dir = std::env::temp_dir().join("snippet-lane-logs");
+        let prefix = format!("{lane_id}-");
+        let mut removed = 0;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".jsonl") && entry.path().is_file() {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+}
+
+fn safe_lane_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
 }

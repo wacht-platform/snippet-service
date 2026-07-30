@@ -1,5 +1,5 @@
-use super::*;
 use super::theme::*;
+use super::*;
 
 // --- Markdown-lite prose rendering (assistant text) ---
 
@@ -23,7 +23,8 @@ pub(super) fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
         // Markdown table: a `|`-delimited header row immediately followed by a
         // `|---|:--:|` separator row of the same column count. Render aligned with
         // wrapped cells instead of dumping raw pipes.
-        if !in_code && raw.contains('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+        if !in_code && raw.contains('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1])
+        {
             let header = split_table_cells(raw);
             let sep = split_table_cells(lines[i + 1]);
             if !header.is_empty() && header.len() == sep.len() {
@@ -69,14 +70,16 @@ pub(super) fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
             i += 1;
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
             let runs = parse_inline_md(rest, base);
             let mut bullet = wrap_runs(runs, width.saturating_sub(2));
             if let Some(first) = bullet.first_mut() {
-                first.spans.insert(
-                    0,
-                    Span::styled("• ", Style::default().fg(blue())),
-                );
+                first
+                    .spans
+                    .insert(0, Span::styled("• ", Style::default().fg(blue())));
             }
             for line in bullet.iter_mut().skip(1) {
                 line.spans.insert(0, Span::raw("  "));
@@ -185,7 +188,8 @@ pub(super) fn render_md_table(
     let runs_for = |s: &str, header_row: bool| {
         parse_inline_md(s, if header_row { header_style } else { body_style })
     };
-    let runs_w = |runs: &[(String, Style)]| runs.iter().map(|(t, _)| t.chars().count()).sum::<usize>();
+    let runs_w =
+        |runs: &[(String, Style)]| runs.iter().map(|(t, _)| t.chars().count()).sum::<usize>();
 
     let mut natural = vec![1usize; ncols];
     for (c, h) in header.iter().enumerate().take(ncols) {
@@ -223,7 +227,9 @@ pub(super) fn render_md_table(
                     wl.push(Line::from(""));
                 }
                 let align = aligns.get(c).copied().unwrap_or(CellAlign::Left);
-                wl.into_iter().map(|l| pad_table_line(l, widths[c], align)).collect()
+                wl.into_iter()
+                    .map(|l| pad_table_line(l, widths[c], align))
+                    .collect()
             })
             .collect();
         let height = wrapped.iter().map(|w| w.len()).max().unwrap_or(1);

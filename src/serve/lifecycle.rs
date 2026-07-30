@@ -1,5 +1,79 @@
 use super::*;
 
+/// File lock for coordinating binary updates. The running serve daemon holds a
+/// SHARED lock on this file while the installer takes an EXCLUSIVE lock to atomically
+/// write a new binary hash. On startup, serve compares the stored hash against the
+/// running binary — a mismatch means "I was replaced, restart me."
+pub fn lock_path() -> PathBuf {
+    snippet_dir().join("serve.lock")
+}
+
+/// Acquire a shared flock on the lock file. Returns the file handle (lock is held
+/// for the lifetime of the process). Used by the running serve daemon.
+pub fn acquire_shared_lock() -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let dir = snippet_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path())
+        .ok()?;
+    unsafe {
+        let ret = libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB);
+        if ret == 0 { Some(file) } else { None }
+    }
+}
+
+/// Compare the running binary's hash against the stored hash in the lock file.
+/// If they differ, the binary was updated externally — restart is needed.
+pub fn binary_hash_changed() -> bool {
+    let Some(current_hash) = compute_binary_hash() else {
+        return false;
+    };
+    let stored = std::fs::read_to_string(lock_path()).unwrap_or_default();
+    let stored = stored.trim();
+    // Empty or missing stored hash → first run, don't restart.
+    if stored.is_empty() {
+        return false;
+    }
+    current_hash != stored
+}
+
+/// Write the current binary's hash into the lock file (under an exclusive lock).
+/// Called by the installer after copying the new binary.
+pub fn stamp_binary_hash() {
+    use std::os::unix::io::AsRawFd;
+    let dir = snippet_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path())
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+    }
+    if let Some(hash) = compute_binary_hash() {
+        let _ = std::fs::write(lock_path(), hash);
+    }
+    // Lock released when file drops.
+}
+
+fn compute_binary_hash() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let bytes = std::fs::read(&exe).ok()?;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
+}
+
 pub(super) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -21,14 +95,61 @@ pub(super) fn state_json_path() -> PathBuf {
     snippet_dir().join("serve.json")
 }
 
+/// Binary modification stamp — used to detect updates and auto-restart.
+fn binary_stamp_path() -> PathBuf {
+    snippet_dir().join("serve.binary.stamp")
+}
+
+/// Check if the binary has been updated since the last serve start.
+/// Returns true if the binary is newer than the stored stamp (or no stamp exists).
+pub fn binary_updated() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let mtime = match std::fs::metadata(&exe).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    // No stamp → first run, don't restart.
+    let Ok(stamp) = std::fs::read_to_string(binary_stamp_path()) else {
+        return false;
+    };
+    let stamp: std::time::SystemTime = match stamp.trim().parse::<u64>().ok() {
+        Some(secs) => std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+        None => return false,
+    };
+    mtime > stamp
+}
+
+/// Record the current binary's mtime so next startup can detect updates.
+pub fn stamp_binary() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let Ok(mtime) = std::fs::metadata(&exe).and_then(|m| m.modified()) else {
+        return;
+    };
+    let Ok(secs) = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+    else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(snippet_dir());
+    let _ = std::fs::write(binary_stamp_path(), secs.to_string());
+}
+
 /// Persist the live connection (url + token) so the launching parent and
 /// `serve --status` can reprint the QR. Written 0600 — it holds the auth token.
-pub(super) fn write_serve_state(public_url: &str, token: &str) {
+pub(super) fn write_serve_state(public_url: &str, token: &str, api_host: &str, api_port: u16) {
     let _ = std::fs::create_dir_all(snippet_dir());
     let payload = serde_json::json!({
         "url": public_url,
         "token": token,
         "pid": std::process::id(),
+        "api_url": format!("http://{api_host}:{api_port}"),
     });
     let path = state_json_path();
     if std::fs::write(&path, payload.to_string()).is_ok() {
@@ -122,7 +243,7 @@ pub fn launch_and_show(
 /// Resolves on SIGTERM/SIGINT; pends forever if the handlers can't be installed
 /// (so the server arm of the select still wins).
 pub(super) async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let (mut term, mut intr) = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
@@ -626,7 +747,235 @@ WantedBy=default.target
     }
 
     println!("✓ Installed systemd user unit: {}", unit.display());
-    println!("  Enabled + started; lingering on so it survives logout.  Disable: snippet serve --disable");
+    println!(
+        "  Enabled + started; lingering on so it survives logout.  Disable: snippet serve --disable"
+    );
     print_service_connection();
     Ok(())
+}
+
+/// True when the OS auto-start unit/agent is already on disk.
+fn service_unit_installed() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return systemd_unit_path().exists();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return launch_agent_path().exists();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Start an already-installed auto-start service (no reinstall, no console spam).
+fn start_installed_service() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        if !run("systemctl", &["--user", "start", "snippet-serve.service"]) {
+            // enable --now covers a unit that exists but was disabled.
+            if !run(
+                "systemctl",
+                &["--user", "enable", "--now", "snippet-serve.service"],
+            ) {
+                return Err("systemctl --user start/enable snippet-serve failed".to_string());
+            }
+        }
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist = launch_agent_path();
+        let plist_s = plist.display().to_string();
+        if let Some(uid) = current_uid() {
+            let target = format!("gui/{uid}/{SERVICE_LABEL}");
+            let _ = run("launchctl", &["kickstart", "-k", &target]);
+            if run("launchctl", &["print", &target]) {
+                return Ok(());
+            }
+            let _ = run("launchctl", &["bootstrap", &format!("gui/{uid}"), &plist_s]);
+            let _ = run("launchctl", &["enable", &target]);
+            let _ = run("launchctl", &["kickstart", "-k", &target]);
+            return Ok(());
+        }
+        let _ = run("launchctl", &["load", "-w", &plist_s]);
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err("auto-start is only supported on macOS and Linux".to_string())
+    }
+}
+
+/// Quiet install used by the TUI: same as `install_service` defaults, no QR/status prints.
+fn install_service_quiet(config_path: &std::path::Path) -> Result<(), String> {
+    let settings = ServeSettings::load();
+    let host = settings
+        .host
+        .clone()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = settings.port.unwrap_or(8787);
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    ServeSettings {
+        host: Some(host),
+        port: Some(port),
+        public_url: settings.public_url.clone(),
+        no_tunnel: settings.no_tunnel,
+    }
+    .save()?;
+    let args = service_args(config_path);
+    // Don't stop() here — caller already knows nothing is answering /health.
+    #[cfg(target_os = "macos")]
+    {
+        install_launchd_quiet(&exe, &args)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        install_systemd_quiet(&exe, &args)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (&exe, &args);
+        Err("auto-start is only supported on macOS and Linux".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_systemd_quiet(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
+    let unit = systemd_unit_path();
+    if let Some(dir) = unit.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut exec = sh_quote(&exe.display().to_string());
+    for a in args {
+        exec.push(' ');
+        exec.push_str(&sh_quote(a));
+    }
+    let home = home_dir().display().to_string();
+    let path_env = format!("{home}/.snippet/bin:/usr/local/bin:/usr/bin:/bin");
+    let content = format!(
+        r#"[Unit]
+Description=snippet serve (remote-control daemon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exec}
+WorkingDirectory={home}
+Environment=HOME={home}
+Environment=PATH={path_env}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+"#,
+    );
+    std::fs::write(&unit, content).map_err(|e| format!("write unit: {e}"))?;
+    let _ = run("systemctl", &["--user", "daemon-reload"]);
+    if !run(
+        "systemctl",
+        &["--user", "enable", "--now", "snippet-serve.service"],
+    ) {
+        return Err(
+            "systemctl --user enable failed (is a user systemd session available?)".to_string(),
+        );
+    }
+    if let Ok(user) = std::env::var("USER") {
+        let _ = run("loginctl", &["enable-linger", &user]);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd_quiet(exe: &std::path::Path, args: &[String]) -> Result<(), String> {
+    // Reuse the normal writer; suppress connection spam by not calling print_*.
+    // install_launchd prints — duplicate the essential load steps only.
+    let plist = launch_agent_path();
+    if let Some(dir) = plist.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut prog = format!(
+        "    <string>{}</string>\n",
+        xml_escape(&exe.display().to_string())
+    );
+    for a in args {
+        prog.push_str(&format!("    <string>{}</string>\n", xml_escape(a)));
+    }
+    let home = home_dir().display().to_string();
+    let path_env = format!("{home}/.snippet/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
+    let log = log_path().display().to_string();
+    let content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+{prog}  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>{home_x}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>{home_x}</string>
+    <key>PATH</key>
+    <string>{path_x}</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{log_x}</string>
+  <key>StandardErrorPath</key>
+  <string>{log_x}</string>
+</dict>
+</plist>
+"#,
+        label = SERVICE_LABEL,
+        prog = prog,
+        home_x = xml_escape(&home),
+        path_x = xml_escape(&path_env),
+        log_x = xml_escape(&log),
+    );
+    std::fs::write(&plist, content).map_err(|e| format!("write plist: {e}"))?;
+    let plist_s = plist.display().to_string();
+    if let Some(uid) = current_uid() {
+        let target = format!("gui/{uid}/{SERVICE_LABEL}");
+        let _ = run("launchctl", &["bootout", &target]);
+        if !run("launchctl", &["bootstrap", &format!("gui/{uid}"), &plist_s]) {
+            let _ = run("launchctl", &["unload", &plist_s]);
+            if !run("launchctl", &["load", "-w", &plist_s]) {
+                return Err("launchctl could not load the agent".to_string());
+            }
+        } else {
+            let _ = run("launchctl", &["enable", &target]);
+        }
+    } else {
+        let _ = run("launchctl", &["unload", &plist_s]);
+        if !run("launchctl", &["load", "-w", &plist_s]) {
+            return Err("launchctl could not load the agent".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Make sure the serve OS service is installed, enabled, and started.
+/// No-op path when the unit already exists: just `start` / `enable --now`.
+/// Used by the TUI so opening the app always brings the daemon up.
+pub fn ensure_service(config_path: &std::path::Path) -> Result<(), String> {
+    if service_unit_installed() {
+        start_installed_service()
+    } else {
+        install_service_quiet(config_path)
+    }
 }

@@ -246,7 +246,10 @@ struct TokenResponse {
     expires_in: Option<i64>,
 }
 
-fn tokens_from_response(resp: TokenResponse, prior: Option<&ChatGptTokens>) -> Result<ChatGptTokens, String> {
+fn tokens_from_response(
+    resp: TokenResponse,
+    prior: Option<&ChatGptTokens>,
+) -> Result<ChatGptTokens, String> {
     let access_token = resp
         .access_token
         .or_else(|| prior.map(|p| p.access_token.clone()))
@@ -298,7 +301,10 @@ async fn exchange_code(
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("token exchange failed: HTTP {status}: {body}"));
     }
-    let parsed: TokenResponse = resp.json().await.map_err(|e| format!("parse token JSON: {e}"))?;
+    let parsed: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse token JSON: {e}"))?;
     tokens_from_response(parsed, None)
 }
 
@@ -321,7 +327,10 @@ pub async fn refresh(prior: &ChatGptTokens) -> Result<ChatGptTokens, String> {
         let text = resp.text().await.unwrap_or_default();
         return Err(format!("token refresh failed: HTTP {status}: {text}"));
     }
-    let parsed: TokenResponse = resp.json().await.map_err(|e| format!("parse refresh JSON: {e}"))?;
+    let parsed: TokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse refresh JSON: {e}"))?;
     let refreshed = tokens_from_response(parsed, Some(prior))?;
     save_blocking(&refreshed)?;
     Ok(refreshed)
@@ -361,13 +370,16 @@ async fn wait_for_callback(state: &str) -> Result<(String, String), String> {
         if !target.starts_with("/auth/callback") {
             // Ignore stray requests (favicon, etc.) and keep listening.
             let _ = stream
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await;
             continue;
         }
 
         let query = target.split('?').nth(1).unwrap_or("");
-        let mut params: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut params: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for pair in query.split('&') {
             if let Some((k, v)) = pair.split_once('=') {
                 params.insert(pct_decode(k), pct_decode(v));
@@ -555,7 +567,11 @@ async fn request_device_code() -> Result<(String, String, u64), String> {
     ))
 }
 
-async fn poll_device_code(device_auth_id: &str, user_code: &str, interval: u64) -> Result<DeviceCodeTokenResponse, String> {
+async fn poll_device_code(
+    device_auth_id: &str,
+    user_code: &str,
+    interval: u64,
+) -> Result<DeviceCodeTokenResponse, String> {
     let client = codex_client();
     let started = Instant::now();
     loop {

@@ -79,7 +79,10 @@ impl OpenAiCompatibleModel {
 
     /// Whether this endpoint is OpenRouter — gates the app-attribution headers.
     fn is_openrouter(&self) -> bool {
-        self.config.base_url.to_ascii_lowercase().contains("openrouter")
+        self.config
+            .base_url
+            .to_ascii_lowercase()
+            .contains("openrouter")
     }
 }
 
@@ -130,7 +133,10 @@ impl AgentModel for OpenAiCompatibleModel {
             let detached = sink
                 .is_none()
                 .then(|| Arc::new(Mutex::new(StreamBuffer::default())));
-            let sink_ref = sink.as_ref().or(detached.as_ref()).expect("a sink is present");
+            let sink_ref = sink
+                .as_ref()
+                .or(detached.as_ref())
+                .expect("a sink is present");
             return stream_chat_with_retries(
                 &self.client,
                 &url,
@@ -150,13 +156,17 @@ impl AgentModel for OpenAiCompatibleModel {
         // gateways (notably NVIDIA NIM) return HTTP 200 with an error payload or an empty
         // `choices` array; swallowing the body makes the failure undebuggable.
         let response: ChatResponse = serde_json::from_slice(&bytes).map_err(|error| {
-            ToolError::msg(format!("could not parse model response: {error}; {}", body_snippet(&bytes)))
+            ToolError::msg(format!(
+                "could not parse model response: {error}; {}",
+                body_snippet(&bytes)
+            ))
         })?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| ToolError::msg(format!("model response had no choices; {}", body_snippet(&bytes))))?;
+        let choice = response.choices.into_iter().next().ok_or_else(|| {
+            ToolError::msg(format!(
+                "model response had no choices; {}",
+                body_snippet(&bytes)
+            ))
+        })?;
         let calls = choice
             .message
             .tool_calls
@@ -224,8 +234,8 @@ impl OpenAiCompatibleModel {
         // (OpenAI o-series) support `required` with reasoning, so keep it there.
         let model_l = self.config.model.to_lowercase();
         let base_l = self.config.base_url.to_lowercase();
-        let deepseek_thinking =
-            reasoning_effort.is_some() && (model_l.contains("deepseek") || base_l.contains("deepseek"));
+        let deepseek_thinking = reasoning_effort.is_some()
+            && (model_l.contains("deepseek") || base_l.contains("deepseek"));
         // Providers that reject `tool_choice: "required"`: DeepSeek thinking mode (400
         // "Thinking mode does not support this tool_choice") and NVIDIA NIM, which
         // dropped `required` on its OpenAI-compatible endpoint. Degrade to auto — the
@@ -239,7 +249,8 @@ impl OpenAiCompatibleModel {
             temperature: self.config.temperature,
             // `required` needs tools to choose from, else providers reject it; and
             // DeepSeek thinking mode rejects it outright (see above).
-            tool_choice: (force_tool && !tools.is_empty() && !no_forced_tool_choice).then_some("required"),
+            tool_choice: (force_tool && !tools.is_empty() && !no_forced_tool_choice)
+                .then_some("required"),
             reasoning_effort,
             // Opt into usage accounting on OpenRouter so cache-read tokens surface.
             usage: self
@@ -249,7 +260,9 @@ impl OpenAiCompatibleModel {
                 .then_some(UsageRequest { include: true }),
             stream: stream.then_some(true),
             // Streaming usage only arrives with include_usage on stream_options.
-            stream_options: stream.then_some(StreamOptions { include_usage: true }),
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
         }
     }
 
@@ -570,7 +583,10 @@ async fn parse_openai_sse(
         if let Some(u) = chunk.get("usage").filter(|u| u.is_object()) {
             usage = Some(TokenUsage {
                 prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
-                completion_tokens: u.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+                completion_tokens: u
+                    .get("completion_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
                 cache_read_tokens: u
                     .pointer("/prompt_tokens_details/cached_tokens")
@@ -621,7 +637,11 @@ async fn parse_openai_sse(
                     name: String::new(),
                     args: String::new(),
                 });
-                if let Some(id) = call.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                if let Some(id) = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
                     entry.id = id.to_string();
                 }
                 if let Some(name) = call
@@ -690,8 +710,8 @@ fn build_chat_messages(messages: &[HarnessMessage]) -> Vec<ChatMessage> {
     let mut pending_images: Vec<ChatMessage> = Vec::new();
     for (index, message) in messages.iter().enumerate() {
         for chat_message in chat_messages_from_harness(index, message) {
-            let is_image =
-                chat_message.role == "user" && matches!(chat_message.content, Some(Value::Array(_)));
+            let is_image = chat_message.role == "user"
+                && matches!(chat_message.content, Some(Value::Array(_)));
             if is_image {
                 pending_images.push(chat_message);
             } else if chat_message.role == "tool" {
@@ -716,7 +736,12 @@ fn ensure_tool_results(out: &mut Vec<ChatMessage>) {
     let mut i = 0;
     while i < out.len() {
         let ids: Vec<String> = if out[i].role == "assistant" {
-            out[i].tool_calls.iter().map(|c| c.id.clone()).filter(|s| !s.is_empty()).collect()
+            out[i]
+                .tool_calls
+                .iter()
+                .map(|c| c.id.clone())
+                .filter(|s| !s.is_empty())
+                .collect()
         } else {
             Vec::new()
         };
@@ -758,10 +783,13 @@ fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<Cha
         }
         HarnessMessage::System { content } => vec![ChatMessage::text(
             "user",
-            &format!("[runtime_signal]\n{content}\n[/runtime_signal]"),
+            &format!("[steering]\n{content}\n[/steering]"),
         )],
         HarnessMessage::User { content } => vec![ChatMessage::text("user", content)],
-        HarnessMessage::Assistant { content, tool_calls } => {
+        HarnessMessage::Assistant {
+            content,
+            tool_calls,
+        } => {
             let out_calls = tool_calls
                 .iter()
                 .map(|call| OutToolCall {
@@ -793,7 +821,9 @@ fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<Cha
                 // a text block so old sessions still load.
                 vec![ChatMessage::text(
                     "user",
-                    &format!("[tool_result]\ntool = \"{tool_name}\"\noutput = {body}\n[/tool_result]"),
+                    &format!(
+                        "[tool_result]\ntool = \"{tool_name}\"\noutput = {body}\n[/tool_result]"
+                    ),
                 )]
             } else {
                 // Tool messages can't carry images, so an inlined image follows as
@@ -1019,4 +1049,3 @@ fn body_snippet(bytes: &[u8]) -> String {
         format!("body: {preview}")
     }
 }
-

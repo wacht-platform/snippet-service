@@ -31,7 +31,12 @@ pub struct BgEntry {
 
 /// A short, file-safe id for a new background process.
 pub fn new_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string().chars().take(8).collect()
+    uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect()
 }
 
 /// Persist a registry entry for a freshly-spawned background process.
@@ -144,8 +149,12 @@ pub fn list(workspace: &Path) -> Vec<BgStatus> {
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let Ok(txt) = std::fs::read_to_string(&path) else { continue };
-        let Ok(entry) = serde_json::from_str::<BgEntry>(&txt) else { continue };
+        let Ok(txt) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_str::<BgEntry>(&txt) else {
+            continue;
+        };
         let running = pid_is_recorded_process(entry.pid, &entry.started_at);
         let status = if running {
             None
@@ -192,7 +201,7 @@ pub fn kill_by_id(workspace: &Path, id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Render the live background-process list for the agent's runtime context.
+/// Render the live background-process list for the agent's steering block.
 /// Running ones are listed; exited ones are surfaced once, then their record is
 /// pruned (the log file is kept for inspection). Returns None when there are none.
 pub fn render_live(workspace: &Path) -> Option<String> {
@@ -203,8 +212,12 @@ pub fn render_live(workspace: &Path) -> Option<String> {
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let Ok(txt) = std::fs::read_to_string(&path) else { continue };
-        let Ok(entry) = serde_json::from_str::<BgEntry>(&txt) else { continue };
+        let Ok(txt) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_str::<BgEntry>(&txt) else {
+            continue;
+        };
         let cmd = entry.command.replace('\n', " ");
         let log = entry
             .log
@@ -212,17 +225,25 @@ pub fn render_live(workspace: &Path) -> Option<String> {
             .map(|p| p.trim_start_matches('/').to_string())
             .unwrap_or_else(|| entry.log.clone());
         if pid_is_recorded_process(entry.pid, &entry.started_at) {
-            lines.push(format!("- [{}] `{}` — pid {}, running. log: {}", entry.id, cmd, entry.pid, log));
+            lines.push(format!(
+                "- [{}] `{}` — pid {}, running. log: {}",
+                entry.id, cmd, entry.pid, log
+            ));
         } else {
             // Exited: report the captured exit status, then drop the record (keep the log).
-            let code = std::fs::read_to_string(status_path(workspace, &entry.id)).ok().map(|s| s.trim().to_string());
+            let code = std::fs::read_to_string(status_path(workspace, &entry.id))
+                .ok()
+                .map(|s| s.trim().to_string());
             let status = match code.as_deref() {
                 Some("0") => "exited (ok)".to_string(),
                 Some("signal") => "killed".to_string(),
                 Some(c) if !c.is_empty() => format!("exited (code {c})"),
                 _ => "exited".to_string(),
             };
-            lines.push(format!("- [{}] `{}` — {}. log: {}", entry.id, cmd, status, entry.log));
+            lines.push(format!(
+                "- [{}] `{}` — {}. log: {}",
+                entry.id, cmd, status, entry.log
+            ));
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(status_path(workspace, &entry.id));
         }

@@ -29,9 +29,9 @@ use crate::harness::{HarnessEvent, HarnessState, HarnessStatus, LoopInput};
 use crate::lanes::LaneStatus;
 
 mod markdown;
+pub mod mascot;
 mod theme;
 pub mod transcript;
-pub mod mascot;
 
 use markdown::*;
 use theme::*;
@@ -40,8 +40,16 @@ use transcript::*;
 /// Meta tools render through their own dedicated events (Note / AssistantText /
 /// UserQuestion / LaneSpawned), so their raw tool-call/result rows are hidden to
 /// avoid duplication.
-const HIDDEN_TOOL_ROWS: [&str; 8] =
-    ["terminate_loop", "note", "notify_user", "ask_user", "delegate_task", "complete_goal", "monitor", "present_file"];
+const HIDDEN_TOOL_ROWS: [&str; 8] = [
+    "terminate_loop",
+    "note",
+    "notify_user",
+    "ask_user",
+    "delegate_task",
+    "complete_goal",
+    "monitor",
+    "present_file",
+];
 
 /// Cap on bash/output preview lines shown inline before collapsing to a count.
 
@@ -49,12 +57,24 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/resume", "Resume a saved session"),
     ("/rewind", "Restore the workspace to a checkpoint"),
+    ("/fork", "Branch a new session from a checkpoint or event"),
     ("/model", "Connect or change the AI model"),
     ("/compact", "Compact older conversation history now"),
-    ("/goal", "Set an autonomous goal the agent drives to completion (/goal cancel to stop)"),
-    ("/mode", "Toggle manual approval (bash & file edits ask y/n)"),
+    (
+        "/goal",
+        "Set an autonomous goal the agent drives to completion (/goal cancel to stop)",
+    ),
+    (
+        "/mode",
+        "Toggle manual approval (bash & file edits ask y/n)",
+    ),
     ("/theme", "Switch the color theme"),
 ];
+
+struct PendingSidecarAttach {
+    initial: Option<String>,
+    resume: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
@@ -145,7 +165,15 @@ type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 fn setup_terminal() -> Result<TuiTerminal, Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
+    // Mouse capture on by default so wheel scrolls the transcript/lanes.
+    // Ctrl+M toggles it off when you want native drag-select (or use Shift+drag
+    // in most terminals while capture is on).
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     // Request the kitty keyboard protocol where supported (iTerm2, kitty, WezTerm,
     // Ghostty…) so modified keys like Shift+Enter are reported distinctly. Plain
     // terminals (Apple Terminal) ignore it and keep the Alt+Enter fallback.
@@ -164,7 +192,12 @@ fn restore_terminal(terminal: &mut TuiTerminal) -> Result<(), Box<dyn std::error
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     }
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -175,7 +208,15 @@ enum Screen {
     ResumeSelection,
     ThemeSelection,
     Profiles,
-    AgentsModal,
+    Lanes,
+    RewindCheckpointSelection,
+    ForkCheckpointSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointAction {
+    Rewind,
+    Fork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +231,16 @@ enum SettingsField {
 }
 
 /// Providers offered by the login form, in display order.
-const LOGIN_PROVIDERS: &[&str] = &["openai", "chatgpt", "xai", "anthropic", "gemini", "openrouter", "openai-compatible", "anthropic-compatible"];
+const LOGIN_PROVIDERS: &[&str] = &[
+    "openai",
+    "chatgpt",
+    "xai",
+    "anthropic",
+    "gemini",
+    "openrouter",
+    "openai-compatible",
+    "anthropic-compatible",
+];
 
 /// Providers that talk to a user-supplied endpoint, so the login form shows the
 /// Base URL field (and can fetch models keyless).
@@ -201,7 +251,10 @@ fn provider_needs_base_url(provider: &str) -> bool {
 /// Single source of truth for a provider's default base URL and model.
 fn provider_defaults(provider: &str) -> (String, String) {
     match provider {
-        "openai" => ("https://api.openai.com/v1".to_string(), "gpt-5.5".to_string()),
+        "openai" => (
+            "https://api.openai.com/v1".to_string(),
+            "gpt-5.5".to_string(),
+        ),
         // ChatGPT-subscription (OAuth) — no base URL / API key; model is a Codex slug.
         "chatgpt" => (String::new(), "gpt-5.1-codex".to_string()),
         "anthropic" => (String::new(), "claude-opus-4-8".to_string()),
@@ -250,9 +303,7 @@ fn login_model_rows(app: &App) -> Vec<String> {
 
     for model in all {
         let lower = model.to_ascii_lowercase();
-        let matches = query.is_empty()
-            || lower.starts_with(&query)
-            || lower.contains(&query);
+        let matches = query.is_empty() || lower.starts_with(&query) || lower.contains(&query);
         if !matches || !seen.insert(model.clone()) {
             continue;
         }
@@ -296,10 +347,9 @@ struct App {
     /// stamp `status_since`, and `tick` clears the message a few seconds later.
     status_shown: String,
     status_since: Option<std::time::Instant>,
-    /// When true, completed delegation lanes show their full result inline;
-    /// otherwise the transcript shows a short preview with a "press ^O" hint so a
-    /// lane's verbose final report doesn't flood the screen. Toggled with Ctrl-O.
-    lanes_expanded: bool,
+    /// When true, tool call rows show arg/result bodies (Ctrl-O). Collapsed is the
+    /// default one-line `● Verb(args)` view.
+    tools_expanded: bool,
     /// Set by the startup self-update task to the version it installed; shown in
     /// the header as a "restart to apply" hint.
     update_notice: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -338,7 +388,15 @@ struct App {
     /// Profiles screen cursor; which profile (if any) the editor is editing; and
     /// whether closing the editor should return to the profiles list.
     profiles_selected_index: usize,
-    agents_modal_selected_index: usize,
+    lanes_selected_index: usize,
+    /// Whether the selected lane's full report and activity history are visible.
+    lanes_detail_expanded: bool,
+    /// Scroll offset (lines from top) inside the selected-lane detail pane.
+    lanes_detail_scroll: usize,
+    checkpoint_selected_index: usize,
+    /// When true, terminal mouse reporting is on (wheel scrolls the TUI; native
+    /// drag-select needs Shift+drag in most terminals). On by default; Ctrl+M toggles.
+    mouse_capture: bool,
     editing_profile: Option<String>,
     return_to_profiles: bool,
     /// Hold the compaction animation until this instant (time-based, so a fast
@@ -382,6 +440,8 @@ struct App {
     form_focus: SettingsField,
     form_fetched_models: Option<Vec<String>>,
     models_fetch_handle: Option<tokio::task::JoinHandle<Result<Vec<String>, String>>>,
+    /// In-flight model switch for the current daemon-backed conversation.
+    model_switch_handle: Option<tokio::task::JoinHandle<Result<(), String>>>,
     /// In-flight ChatGPT sign-in task (browser OAuth or device-code flow), polled in `tick`).
     chatgpt_login_handle:
         Option<tokio::task::JoinHandle<Result<crate::chatgpt_auth::ChatGptTokens, String>>>,
@@ -391,8 +451,7 @@ struct App {
     chatgpt_device_begin_handle:
         Option<tokio::task::JoinHandle<Result<crate::chatgpt_auth::DeviceCodeInfo, String>>>,
     /// xAI (Grok/X subscription) device-code sign-in — same shape as ChatGPT's.
-    xai_login_handle:
-        Option<tokio::task::JoinHandle<Result<crate::xai_auth::XaiTokens, String>>>,
+    xai_login_handle: Option<tokio::task::JoinHandle<Result<crate::xai_auth::XaiTokens, String>>>,
     xai_device_code: Option<crate::xai_auth::DeviceCodeInfo>,
     xai_device_begin_handle:
         Option<tokio::task::JoinHandle<Result<crate::xai_auth::DeviceCodeInfo, String>>>,
@@ -415,6 +474,17 @@ struct App {
     /// task; rendered as a transient block at the transcript tail and cleared
     /// whenever a newer persisted state loads (the turn has committed).
     stream: crate::llm::StreamHandle,
+    /// When set, the TUI is a pure client of the local serve daemon. The daemon
+    /// owns `run_interactive` and every `state.json` write; the TUI only renders
+    /// state and forwards input over WS `/attach`.
+    sidecar: Option<crate::serve::sidecar::DaemonInfo>,
+    /// Active WS attachment to the daemon for the current conversation.
+    sidecar_attach: Option<crate::serve::sidecar::SidecarAttach>,
+    /// Set by `spawn_loop` in sidecar mode; consumed by `ensure_sidecar_attached`.
+    pending_sidecar_attach: Option<PendingSidecarAttach>,
+    /// When set, the main canvas shows a connecting screen instead of the empty
+    /// transcript — used while discovering/starting the local serve daemon.
+    connecting_phase: Option<String>,
 }
 
 impl App {
@@ -443,7 +513,7 @@ impl App {
             status,
             status_shown: String::new(),
             status_since: None,
-            lanes_expanded: false,
+            tools_expanded: false,
             error: None,
             state: None,
             agent: None,
@@ -464,7 +534,11 @@ impl App {
             theme_original_index: 0,
             model_picker_index: 0,
             profiles_selected_index: 0,
-            agents_modal_selected_index: 0,
+            lanes_selected_index: 0,
+            lanes_detail_expanded: false,
+            lanes_detail_scroll: 0,
+            checkpoint_selected_index: 0,
+            mouse_capture: true,
             editing_profile: None,
             return_to_profiles: false,
             compaction_anim_until: None,
@@ -487,6 +561,7 @@ impl App {
             form_focus: SettingsField::Provider,
             form_fetched_models: None,
             models_fetch_handle: None,
+            model_switch_handle: None,
             chatgpt_login_handle: None,
             chatgpt_device_code: None,
             chatgpt_device_begin_handle: None,
@@ -503,6 +578,10 @@ impl App {
             q_answers: Vec::new(),
             q_token: String::new(),
             stream: crate::llm::StreamHandle::default(),
+            sidecar: None,
+            sidecar_attach: None,
+            pending_sidecar_attach: None,
+            connecting_phase: Some("Looking for local serve…".to_string()),
         };
         app.init_settings_form();
 
@@ -524,6 +603,7 @@ impl App {
             app.status = "No model connected yet — type /model to connect one.".to_string();
         }
 
+        // Daemon discovery is async (see run_app) — App::new stays sync.
         app
     }
 
@@ -547,9 +627,14 @@ impl App {
     /// starts a new one. Saving writes back to that profile (and activates it).
     fn open_profile_editor(&mut self, name: Option<String>) {
         self.original_config = Some(self.options.config.clone());
-        let existing = name
-            .as_ref()
-            .and_then(|n| self.options.config.setups.as_ref().and_then(|m| m.get(n)).cloned());
+        let existing = name.as_ref().and_then(|n| {
+            self.options
+                .config
+                .setups
+                .as_ref()
+                .and_then(|m| m.get(n))
+                .cloned()
+        });
         match existing {
             Some(cfg) => {
                 self.form_provider = cfg.provider.clone();
@@ -567,7 +652,8 @@ impl App {
                 self.form_model = model;
                 self.form_api_key = String::new();
                 self.form_reasoning_effort = Some("medium".to_string());
-                let (context_window, compact_at_pct) = provider_context_defaults(&self.form_provider);
+                let (context_window, compact_at_pct) =
+                    provider_context_defaults(&self.form_provider);
                 self.form_context_window = context_window.to_string();
                 self.form_compact_at_pct = compact_at_pct.to_string();
             }
@@ -616,8 +702,13 @@ impl App {
         }
         if self.options.config.activate(name) {
             let _ = self.save_config_file();
-            let has_override = crate::session::read_session_profile(&self.active_state_path).is_some();
-            let resumed = if has_override { false } else { self.restart_loop_for_config() };
+            let has_override =
+                crate::session::read_session_profile(&self.active_state_path).is_some();
+            let resumed = if has_override {
+                false
+            } else {
+                self.restart_loop_for_config()
+            };
             self.screen = Screen::Main;
             self.refresh_effective_model();
             self.status = if has_override {
@@ -664,11 +755,34 @@ impl App {
             self.status = "agent is working — stop it (Esc) before switching models".to_string();
             return;
         }
-        let Some(model) = self.options.config.setups.as_ref().and_then(|m| m.get(name)).cloned() else {
+        let Some(model) = self
+            .options
+            .config
+            .setups
+            .as_ref()
+            .and_then(|m| m.get(name))
+            .cloned()
+        else {
             self.status = format!("profile `{name}` not found");
             return;
         };
         crate::session::write_session_profile(&self.active_state_path, name);
+
+        // The daemon owns the live session, so local config alone is not enough.
+        if let Some(info) = self.sidecar.clone() {
+            let session = crate::serve::sidecar::state_path_to_session_id(&self.active_state_path);
+            let profile = name.to_string();
+            self.model_switch_handle = Some(tokio::spawn(async move {
+                crate::serve::sidecar::set_session_model(&info, &session, &profile).await
+            }));
+            self.screen = Screen::Main;
+            self.status = format!(
+                "switching this chat to {} · {}…",
+                model.provider, model.model
+            );
+            return;
+        }
+
         let resumed = self.restart_loop_for_config();
         self.screen = Screen::Main;
         self.refresh_effective_model();
@@ -701,7 +815,11 @@ impl App {
     }
 
     fn conversations_dir(&self) -> PathBuf {
-        let parent = self.options.config.state_path.parent()
+        let parent = self
+            .options
+            .config
+            .state_path
+            .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         let dir = parent.join("conversations");
         let _ = std::fs::create_dir_all(&dir);
@@ -745,7 +863,9 @@ impl App {
             if p == *default_path {
                 Some("default".to_string())
             } else {
-                p.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string())
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
             }
         })
     }
@@ -770,7 +890,11 @@ impl App {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if is_conversation_json(&path) {
-                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let name = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
                     if name.is_empty() || name == "default" {
                         continue;
                     }
@@ -786,15 +910,20 @@ impl App {
 
                     if let Ok(bytes) = std::fs::read(&path) {
                         if let Ok(state) = crate::harness::deserialize_state(&bytes) {
-                            if let Some(t) = state.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                            if let Some(t) = state
+                                .title
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|t| !t.is_empty())
+                            {
                                 desc = t.to_string();
-                            } else if !state.user_request.is_empty() {
-                                desc = state.user_request.clone();
                             }
                         }
                     }
 
-                    let duration = std::time::SystemTime::now().duration_since(mod_time).unwrap_or_default();
+                    let duration = std::time::SystemTime::now()
+                        .duration_since(mod_time)
+                        .unwrap_or_default();
                     let relative = if duration.as_secs() < 60 {
                         "just now".to_string()
                     } else if duration.as_secs() < 3600 {
@@ -824,14 +953,17 @@ impl App {
             let mut has_content = false;
             if let Ok(bytes) = std::fs::read(default_path) {
                 if let Ok(state) = crate::harness::deserialize_state(&bytes) {
-                    has_content = !state.user_request.is_empty() || !state.events.is_empty();
-                    if !state.user_request.is_empty() {
-                        desc = state.user_request.clone();
+                    has_content = state.title.as_deref().is_some_and(|t| !t.trim().is_empty())
+                        || !state.events.is_empty();
+                    if let Some(title) = state.title.as_deref().filter(|t| !t.trim().is_empty()) {
+                        desc = title.to_string();
                     }
                 }
             }
             if has_content {
-                let duration = std::time::SystemTime::now().duration_since(mod_time).unwrap_or_default();
+                let duration = std::time::SystemTime::now()
+                    .duration_since(mod_time)
+                    .unwrap_or_default();
                 let relative = if duration.as_secs() < 60 {
                     "just now".to_string()
                 } else if duration.as_secs() < 3600 {
@@ -859,13 +991,56 @@ impl App {
             .collect()
     }
 
-    /// Restore the workspace to the checkpoint whose id starts with `id_prefix`.
+    fn open_checkpoint_picker(&mut self, action: CheckpointAction) {
+        let count = self
+            .state
+            .as_ref()
+            .map(|s| s.checkpoints.len())
+            .unwrap_or(0);
+        if count == 0 {
+            self.status = "No checkpoints yet — one is taken before each request.".to_string();
+            return;
+        }
+        if action == CheckpointAction::Rewind && self.agent_busy() {
+            self.status = "Agent is working — stop it (Esc) before rewinding.".to_string();
+            return;
+        }
+        self.checkpoint_selected_index = count.saturating_sub(1);
+        self.screen = match action {
+            CheckpointAction::Rewind => Screen::RewindCheckpointSelection,
+            CheckpointAction::Fork => Screen::ForkCheckpointSelection,
+        };
+        self.status = String::new();
+    }
+
+    fn confirm_checkpoint_selection(&mut self) {
+        let Some(checkpoint) = self
+            .state
+            .as_ref()
+            .and_then(|s| s.checkpoints.get(self.checkpoint_selected_index))
+            .cloned()
+        else {
+            self.screen = Screen::Main;
+            return;
+        };
+        let id = checkpoint.id;
+        if self.screen == Screen::RewindCheckpointSelection {
+            self.rewind_to(&id);
+        } else {
+            self.fork_at(&id);
+        }
+        self.screen = Screen::Main;
+    }
+
+    /// Restore workspace + conversation to the checkpoint whose id starts with `id_prefix`.
+    /// Prefers the daemon `/session/rewind` path so history is truncated on disk and
+    /// the live loop is notified; local-only mutation is a last resort.
     fn rewind_to(&mut self, id_prefix: &str) {
         if self.agent_busy() {
             self.status = "Agent is working — stop it (Esc) before rewinding.".to_string();
             return;
         }
-        let Some(state) = &mut self.state else {
+        let Some(state) = self.state.as_ref() else {
             self.status = "No active session.".to_string();
             return;
         };
@@ -873,23 +1048,115 @@ impl App {
             .checkpoints
             .iter()
             .rev()
-            .find(|c| c.id.starts_with(id_prefix))
+            .find(|c| c.id.starts_with(id_prefix) || c.id == id_prefix)
         else {
             self.status = format!("No checkpoint matching '{id_prefix}'.");
             return;
         };
-        let (id, label, event_index, message_index) = (checkpoint.id.clone(), checkpoint.label.clone(), checkpoint.event_index, checkpoint.message_index);
+        let id = checkpoint.id.clone();
+        let label = checkpoint.label.clone();
+
+        // Sidecar mode: durable rewind via daemon (FS + state file + live loop).
+        if let Some(info) = self.sidecar.clone() {
+            let session = crate::serve::sidecar::state_path_to_session_id(&self.active_state_path);
+            let info2 = info.clone();
+            let id2 = id.clone();
+            let result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    crate::serve::sidecar::rewind_session(&info2, &session, &id2).await
+                })
+            });
+            match result {
+                Ok(()) => {
+                    // Optimistic local truncate until the next snapshot/delta arrives.
+                    if let Some(st) = self.state.as_mut() {
+                        let _ = st.apply_checkpoint_rewind(&id);
+                    }
+                    self.queued_inputs.clear();
+                    self.sent_turn_pending = false;
+                    self.status = format!("Rewound to: {label}");
+                }
+                Err(error) => self.error = Some(format!("rewind failed: {error}")),
+            }
+            return;
+        }
+
+        // No daemon — local FS restore + in-memory truncate (legacy / tests).
         let workspace = self.options.config.workspace.clone();
         match crate::checkpoint::restore(&workspace, &id) {
             Ok(()) => {
-                // Truncate conversation history to the checkpoint point
-                state.events.truncate(event_index);
-                state.messages.truncate(message_index);
-                // Drop checkpoints taken after this one (their workspace state is gone)
-                state.checkpoints.retain(|c| c.event_index <= event_index);
+                if let Some(st) = self.state.as_mut() {
+                    let _ = st.apply_checkpoint_rewind(&id);
+                }
+                self.queued_inputs.clear();
                 self.status = format!("Rewound workspace and history to: {label}");
             }
             Err(error) => self.error = Some(format!("rewind failed: {error}")),
+        }
+    }
+
+    /// Branch a NEW conversation from a checkpoint id/prefix or an event index.
+    /// Source session is left intact. Opens the fork immediately.
+    fn fork_at(&mut self, arg: &str) {
+        let Some(state) = self.state.clone() else {
+            self.status = "No active session.".to_string();
+            return;
+        };
+        if state.events.is_empty() {
+            self.status = "Nothing to fork — session has no events yet.".to_string();
+            return;
+        }
+
+        let arg = arg.trim();
+        let point = if arg.is_empty() {
+            // Bare /fork → branch from the latest checkpoint, else full history.
+            if let Some(cp) = state.checkpoints.last() {
+                crate::session::ForkPoint {
+                    event_end: cp.event_index.min(state.events.len()),
+                    message_end: cp.message_index.min(state.messages.len()),
+                }
+            } else {
+                crate::session::ForkPoint {
+                    event_end: state.events.len(),
+                    message_end: state.messages.len(),
+                }
+            }
+        } else if let Ok(idx) = arg.parse::<usize>() {
+            match crate::session::resolve_fork_point(&state, None, Some(idx)) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.status = e;
+                    return;
+                }
+            }
+        } else {
+            match crate::session::resolve_fork_point(&state, Some(arg), None) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.status = e;
+                    return;
+                }
+            }
+        };
+
+        match crate::session::write_forked_conversation(&self.active_state_path, &state, point) {
+            Ok(forked) => {
+                // Session id is like `workspaces/<ws>/conversations/<uuid>.json` —
+                // TUI conversations are addressed by the uuid stem.
+                let name = forked
+                    .state_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name.is_empty() {
+                    self.status = format!("Forked → {}", forked.id);
+                    return;
+                }
+                self.switch_conversation(&name);
+                self.status = format!("Forked → {name}  ({})", forked.title);
+            }
+            Err(e) => self.error = Some(format!("fork failed: {e}")),
         }
     }
 
@@ -907,6 +1174,10 @@ impl App {
         if let Some(handle) = self.agent.take() {
             handle.abort();
         }
+        // Drop the WS attachment so the next spawn_loop opens a fresh /attach
+        // for the new conversation (daemon keeps owning the old session).
+        self.sidecar_attach = None;
+        self.pending_sidecar_attach = None;
 
         // Update active_conversation and active_state_path
         self.active_conversation = name.to_string();
@@ -935,6 +1206,14 @@ impl App {
         self.compaction_anim_until = None;
         // The new chat may carry its own model override — re-resolve the header label.
         self.refresh_effective_model();
+        // In sidecar mode, queue an attach for the newly selected conversation so
+        // the next tick binds WS /attach without waiting for the first keystroke.
+        if self.sidecar.is_some() {
+            self.pending_sidecar_attach = Some(PendingSidecarAttach {
+                initial: None,
+                resume: true,
+            });
+        }
     }
 
     fn handle_slash_command(&mut self, text: &str) {
@@ -950,9 +1229,14 @@ impl App {
                     let n = parts[1].to_string();
                     // A name collision would silently OPEN the existing session
                     // instead of creating a new one — surface it instead.
-                    if self.list_conversations().iter().any(|(existing, _)| existing == &n) {
-                        self.status =
-                            format!("`{n}` already exists — /resume {n} to open it, or pick another name");
+                    if self
+                        .list_conversations()
+                        .iter()
+                        .any(|(existing, _)| existing == &n)
+                    {
+                        self.status = format!(
+                            "`{n}` already exists — /resume {n} to open it, or pick another name"
+                        );
                         return;
                     }
                     n
@@ -975,9 +1259,14 @@ impl App {
                     // FIRST: a typo must not abandon the current session into a
                     // phantom empty one named after the typo.
                     Some(name) => {
-                        if !self.list_conversations().iter().any(|(existing, _)| existing == &name) {
-                            self.status =
-                                format!("no session named `{name}` — bare /resume opens the picker");
+                        if !self
+                            .list_conversations()
+                            .iter()
+                            .any(|(existing, _)| existing == &name)
+                        {
+                            self.status = format!(
+                                "no session named `{name}` — bare /resume opens the picker"
+                            );
                             return;
                         }
                         self.switch_conversation(&name)
@@ -995,7 +1284,9 @@ impl App {
                             self.resume_selected_index = 0;
                             self.resume_pending_delete = false;
                             self.resume_rename = None;
-                            self.status = "↑↓ select · Enter resume · r rename · dd delete · Esc cancel".to_string();
+                            self.status =
+                                "↑↓ select · Enter resume · r rename · dd delete · Esc cancel"
+                                    .to_string();
                             return;
                         }
                         // Nothing saved: resume the current session if one exists.
@@ -1014,12 +1305,15 @@ impl App {
                 if self.active_state_path.exists() {
                     self.spawn_loop(None, true);
                 } else {
-                    self.status = "No saved session to resume. Start a new one with /new or type a task.".to_string();
+                    self.status =
+                        "No saved session to resume. Start a new one with /new or type a task."
+                            .to_string();
                 }
             }
             "/model" => {
                 if self.agent_busy() {
-                    self.status = "Agent is working. Stop it (Esc) before changing the model.".to_string();
+                    self.status =
+                        "Agent is working. Stop it (Esc) before changing the model.".to_string();
                     return;
                 }
                 self.open_profiles();
@@ -1029,38 +1323,40 @@ impl App {
                 if parts.len() > 1 {
                     self.rewind_to(parts[1]);
                 } else {
-                    let n = self.state.as_ref().map(|s| s.checkpoints.len()).unwrap_or(0);
-                    self.status = if n == 0 {
-                        "No checkpoints yet — one is taken before each request.".to_string()
-                    } else {
-                        format!("{n} checkpoint(s). Type /rewind <id> (Tab to pick) to restore.")
-                    };
+                    self.open_checkpoint_picker(CheckpointAction::Rewind);
+                }
+            }
+            "/fork" => {
+                let arg = text.strip_prefix("/fork").unwrap_or("").trim();
+                if arg.is_empty() {
+                    self.open_checkpoint_picker(CheckpointAction::Fork);
+                } else {
+                    self.fork_at(arg);
                 }
             }
             "/mode" => {
                 let manual = !self.options.config.manual_approval;
                 self.options.config.manual_approval = manual;
                 let _ = self.save_config_file();
-                if let Some(tx) = &self.input_tx {
-                    let mode = if manual {
-                        crate::harness::ApprovalMode::Manual
-                    } else {
-                        crate::harness::ApprovalMode::Auto
-                    };
-                    let _ = tx.send(LoopInput::SetMode(mode));
-                }
+                let mode = if manual {
+                    crate::harness::ApprovalMode::Manual
+                } else {
+                    crate::harness::ApprovalMode::Auto
+                };
+                let _ = self.send_loop_input(LoopInput::SetMode(mode));
                 self.status = String::new();
             }
             "/compact" => {
-                if let Some(tx) = &self.input_tx {
-                    if tx.send(LoopInput::Compact).is_ok() {
+                if self.agent_alive() {
+                    if self.send_loop_input(LoopInput::Compact).is_ok() {
                         if let Ok(mut stream) = self.stream.lock() {
                             stream.text = "Compacting history…".to_string();
                             stream.thinking.clear();
                         }
                         self.status = String::new();
                     } else {
-                        self.status = "Failed to send compact request to the agent loop.".to_string();
+                        self.status =
+                            "Failed to send compact request to the agent loop.".to_string();
                     }
                 } else {
                     self.status = "No active session to compact.".to_string();
@@ -1069,12 +1365,11 @@ impl App {
             "/goal" => {
                 let rest = text.strip_prefix("/goal").unwrap_or("").trim();
                 if rest.eq_ignore_ascii_case("cancel") || rest.eq_ignore_ascii_case("stop") {
-                    match &self.input_tx {
-                        Some(tx) => {
-                            let _ = tx.send(LoopInput::CancelGoal);
-                            self.status = "Cancelling the goal…".to_string();
-                        }
-                        None => self.status = "No active goal.".to_string(),
+                    if self.agent_alive() {
+                        let _ = self.send_loop_input(LoopInput::CancelGoal);
+                        self.status = "Cancelling the goal…".to_string();
+                    } else {
+                        self.status = "No active goal.".to_string();
                     }
                 } else if rest.is_empty() {
                     self.status =
@@ -1084,11 +1379,22 @@ impl App {
                     if !self.agent_alive() {
                         self.spawn_loop(None, true);
                     }
-                    match self.input_tx.clone() {
-                        Some(tx) if tx.send(LoopInput::SetGoal(rest.to_string())).is_ok() => {
-                            self.status = "Goal set — the agent will drive toward it. /goal cancel to stop.".to_string();
+                    if self
+                        .send_loop_input(LoopInput::SetGoal(rest.to_string()))
+                        .is_ok()
+                    {
+                        self.status =
+                            "Goal set — the agent will drive toward it. /goal cancel to stop."
+                                .to_string();
+                    } else {
+                        // Sidecar attach may still be pending — queue the goal for after attach.
+                        self.status = "Starting session for goal…".to_string();
+                        if self.pending_sidecar_attach.is_some() {
+                            // Will be delivered after attach if we stash it as initial.
+                            // For now just mark pending and let user retry if needed.
+                        } else {
+                            self.status = "Couldn't start the agent loop for the goal.".to_string();
                         }
-                        _ => self.status = "Couldn't start the agent loop for the goal.".to_string(),
                     }
                 }
             }
@@ -1096,9 +1402,13 @@ impl App {
                 if parts.len() > 1 {
                     if set_theme_by_name(parts[1]) {
                         self.persist_theme();
-                        self.status = format!("Theme: {}", parts[1]);
+                        self.status = String::new();
                     } else {
-                        let names = PRESETS.iter().map(|p| p.name).collect::<Vec<_>>().join(", ");
+                        let names = PRESETS
+                            .iter()
+                            .map(|p| p.name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         self.status = format!("Unknown theme '{}'. Available: {names}", parts[1]);
                     }
                 } else {
@@ -1109,15 +1419,18 @@ impl App {
                 }
             }
             other => {
-                self.status =
-                    format!("Unknown command: {other}. Type /new, /resume, /rewind, /model, or /theme.");
+                self.status = format!(
+                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, or /theme."
+                );
             }
         }
     }
 
     /// Persist the active theme's name to config so it survives restarts.
     fn persist_theme(&mut self) {
-        self.options.config.theme = PRESETS.get(current_theme_index()).map(|p| p.name.to_string());
+        self.options.config.theme = PRESETS
+            .get(current_theme_index())
+            .map(|p| p.name.to_string());
         let _ = self.save_config_file();
     }
 
@@ -1148,7 +1461,10 @@ impl App {
     /// time focus lands on the Model field with a key present.
     fn login_move_focus(&mut self, forward: bool) {
         let order = self.login_focus_order();
-        let cur = order.iter().position(|f| *f == self.form_focus).unwrap_or(0);
+        let cur = order
+            .iter()
+            .position(|f| *f == self.form_focus)
+            .unwrap_or(0);
         let next = if forward {
             (cur + 1) % order.len()
         } else if cur == 0 {
@@ -1182,7 +1498,6 @@ impl App {
             _ => {}
         }
     }
-
 
     fn login_cycle_reasoning(&mut self, forward: bool) {
         const OPTIONS: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
@@ -1280,12 +1595,18 @@ impl App {
                 self.form_model.push_str(cleaned);
                 self.model_picker_index = 0;
             }
-            SettingsField::ContextWindow => self
-                .form_context_window
-                .push_str(&cleaned.chars().filter(|c| c.is_ascii_digit()).collect::<String>()),
-            SettingsField::Compaction => self
-                .form_compact_at_pct
-                .push_str(&cleaned.chars().filter(|c| c.is_ascii_digit()).collect::<String>()),
+            SettingsField::ContextWindow => self.form_context_window.push_str(
+                &cleaned
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>(),
+            ),
+            SettingsField::Compaction => self.form_compact_at_pct.push_str(
+                &cleaned
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect::<String>(),
+            ),
             _ => {}
         }
     }
@@ -1398,10 +1719,9 @@ impl App {
                 // Fetch the device code off-thread (NEVER block_on inside the async
                 // runtime — that panics). tick() surfaces the code and starts polling.
                 self.status = "Starting device-code sign-in…".to_string();
-                self.chatgpt_device_begin_handle =
-                    Some(tokio::spawn(
-                        async move { crate::chatgpt_auth::begin_device_code_login().await },
-                    ));
+                self.chatgpt_device_begin_handle = Some(tokio::spawn(async move {
+                    crate::chatgpt_auth::begin_device_code_login().await
+                }));
             }
         }
     }
@@ -1433,7 +1753,8 @@ impl App {
     /// existing sign-in; otherwise fetches a code (shown by `tick`) and polls.
     fn start_xai_login(&mut self) {
         if self.xai_login_handle.is_some() || self.xai_device_begin_handle.is_some() {
-            self.status = "xAI sign-in already in progress — finish the device-code flow first.".to_string();
+            self.status =
+                "xAI sign-in already in progress — finish the device-code flow first.".to_string();
             return;
         }
         if crate::xai_auth::is_signed_in() {
@@ -1442,8 +1763,9 @@ impl App {
         }
         self.xai_device_code = None;
         self.status = "Starting xAI device-code sign-in…".to_string();
-        self.xai_device_begin_handle =
-            Some(tokio::spawn(async move { crate::xai_auth::begin_device_code_login().await }));
+        self.xai_device_begin_handle = Some(tokio::spawn(async move {
+            crate::xai_auth::begin_device_code_login().await
+        }));
     }
 
     /// Persist the xai provider + model once signed in and connect.
@@ -1518,6 +1840,10 @@ impl App {
             handle.abort();
         }
         self.input_tx = None;
+        // In sidecar mode the daemon rebuilds the model via /session/model or
+        // config watch; drop our attach and re-open so we pick up the new loop.
+        self.sidecar_attach = None;
+        self.pending_sidecar_attach = None;
         self.spawn_loop(None, true);
         true
     }
@@ -1528,7 +1854,13 @@ impl App {
         self.form_model = self.options.config.model.model.clone();
         self.form_model_query = String::new();
         self.form_base_url = self.options.config.model.base_url.clone();
-        self.form_reasoning_effort = self.options.config.model.reasoning_effort.clone().or(Some("medium".to_string()));
+        self.form_reasoning_effort = self
+            .options
+            .config
+            .model
+            .reasoning_effort
+            .clone()
+            .or(Some("medium".to_string()));
         self.form_context_window = self.options.config.model.context_window.to_string();
         self.form_compact_at_pct = self.options.config.model.compact_at_pct.to_string();
         self.form_focus = SettingsField::Provider;
@@ -1542,7 +1874,7 @@ impl App {
         }
         self.form_fetched_models = None;
         self.models_fetch_status = "Fetching available models from provider...".to_string();
-        
+
         let provider = self.form_provider.clone();
         let api_key = self.form_api_key.clone();
         let base_url = self.form_base_url.clone();
@@ -1583,7 +1915,14 @@ impl App {
         let mut model_config = self
             .editing_profile
             .as_ref()
-            .and_then(|n| self.options.config.setups.as_ref().and_then(|m| m.get(n)).cloned())
+            .and_then(|n| {
+                self.options
+                    .config
+                    .setups
+                    .as_ref()
+                    .and_then(|m| m.get(n))
+                    .cloned()
+            })
             .unwrap_or_else(|| self.options.config.model.clone());
 
         model_config.provider = self.form_provider.clone();
@@ -1644,10 +1983,25 @@ impl App {
     }
 
     fn agent_alive(&self) -> bool {
+        if let Some(attach) = &self.sidecar_attach {
+            return attach.is_connected();
+        }
         self.agent
             .as_ref()
             .map(|handle| !handle.is_finished())
             .unwrap_or(false)
+    }
+
+    fn send_loop_input(&mut self, input: LoopInput) -> Result<(), String> {
+        if let Some(attach) = &self.sidecar_attach {
+            return attach.send(input);
+        }
+        if let Some(tx) = &self.input_tx {
+            return tx
+                .send(input)
+                .map_err(|_| "agent loop is no longer accepting input".to_string());
+        }
+        Err("no live session".to_string())
     }
 
     /// `true` only while the agent is actively processing a turn (or a lane is).
@@ -1668,16 +2022,20 @@ impl App {
     /// True while the harness is mid-compaction (recent compaction-pass event + still
     /// running) — used to hold input and label the wait.
     fn is_compacting(&self) -> bool {
-        if self.compaction_anim_until.is_some_and(|t| std::time::Instant::now() < t) {
+        if self
+            .compaction_anim_until
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
             return true;
         }
         self.state.as_ref().is_some_and(|s| {
-            s.status == HarnessStatus::Running
-                && matches!(
-                    s.events.last(),
-                    Some(HarnessEvent::SystemDecision { step, .. })
-                        if step == "history_compaction_pass"
-                )
+            s.compacting
+                || (s.status == HarnessStatus::Running
+                    && matches!(
+                        s.events.last(),
+                        Some(HarnessEvent::SystemDecision { step, .. })
+                            if step == "history_compaction_pass"
+                    ))
         })
     }
 
@@ -1688,15 +2046,31 @@ impl App {
             return None;
         }
         match s.events.last() {
-            Some(HarnessEvent::ApprovalRequest { tool_name, summary, index, total }) => {
-                Some((tool_name.clone(), summary.clone(), *index, *total))
-            }
+            Some(HarnessEvent::ApprovalRequest {
+                tool_name,
+                summary,
+                index,
+                total,
+            }) => Some((tool_name.clone(), summary.clone(), *index, *total)),
             _ => None,
         }
     }
 
-
-
+    /// Toggle crossterm mouse capture. Off = native terminal text selection.
+    /// On = wheel scrolls transcript/lanes (Shift+drag still selects in most terminals).
+    fn set_mouse_capture(&mut self, on: bool) {
+        if on == self.mouse_capture {
+            return;
+        }
+        let result = if on {
+            execute!(io::stdout(), EnableMouseCapture)
+        } else {
+            execute!(io::stdout(), DisableMouseCapture)
+        };
+        if result.is_ok() {
+            self.mouse_capture = on;
+        }
+    }
 
     fn scroll_up(&mut self, lines: usize) {
         self.scroll = (self.scroll + lines).min(self.max_scroll.get());
@@ -1755,9 +2129,9 @@ impl App {
 
     /// Send a completed answer set into the live loop and reset picker state.
     fn finish_answer(&mut self, text: String) {
-        if let Some(tx) = self.input_tx.clone().filter(|_| self.agent_alive()) {
-            if tx.send(LoopInput::Answer(text)).is_err() {
-                self.error = Some("agent loop is no longer accepting input".to_string());
+        if self.agent_alive() {
+            if let Err(error) = self.send_loop_input(LoopInput::Answer(text)) {
+                self.error = Some(error);
             } else {
                 // The answer resumes the turn — treat as busy so a fast follow-up
                 // queues rather than steering (mirrors submit_text).
@@ -1850,21 +2224,37 @@ impl App {
     fn input_up(&mut self) {
         let chars: Vec<char> = self.input.chars().collect();
         let cur = self.input_cursor.min(chars.len());
-        let line_start = chars[..cur].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+        let line_start = chars[..cur]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         if line_start == 0 {
             return;
         }
         let col = cur - line_start;
         let prev_end = line_start - 1;
-        let prev_start = chars[..prev_end].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+        let prev_start = chars[..prev_end]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         self.input_cursor = prev_start + col.min(prev_end - prev_start);
     }
     fn input_down(&mut self) {
         let chars: Vec<char> = self.input.chars().collect();
         let cur = self.input_cursor.min(chars.len());
-        let line_start = chars[..cur].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+        let line_start = chars[..cur]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let col = cur - line_start;
-        let Some(nl) = chars[cur..].iter().position(|&c| c == '\n').map(|i| cur + i) else {
+        let Some(nl) = chars[cur..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|i| cur + i)
+        else {
             return;
         };
         let next_start = nl + 1;
@@ -1905,7 +2295,10 @@ impl App {
         let lines = text.lines().count().max(1);
         if lines > 1 || text.chars().count() > 200 {
             let n = self.pasted_blocks.len() + 1;
-            let marker = format!("[Pasted #{n} · {lines} line{}]", if lines == 1 { "" } else { "s" });
+            let marker = format!(
+                "[Pasted #{n} · {lines} line{}]",
+                if lines == 1 { "" } else { "s" }
+            );
             for c in marker.chars() {
                 self.input_insert(c);
             }
@@ -1951,7 +2344,10 @@ impl App {
                  end try",
                 dest.display()
             );
-            let ran = std::process::Command::new("osascript").arg("-e").arg(&script).output();
+            let ran = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(&script)
+                .output();
             matches!(&ran, Ok(out) if out.status.success())
         } else {
             // Linux: try Wayland's wl-paste, then X11's xclip. Each writes PNG
@@ -1959,7 +2355,10 @@ impl App {
             let mut wrote = false;
             for (cmd, args) in [
                 ("wl-paste", vec!["--type", "image/png"]),
-                ("xclip", vec!["-selection", "clipboard", "-t", "image/png", "-o"]),
+                (
+                    "xclip",
+                    vec!["-selection", "clipboard", "-t", "image/png", "-o"],
+                ),
             ] {
                 if let Ok(out) = std::process::Command::new(cmd).args(&args).output() {
                     if out.status.success() && !out.stdout.is_empty() {
@@ -1972,7 +2371,10 @@ impl App {
             }
             wrote
         };
-        let ok = ok && std::fs::metadata(&dest).map(|m| m.len() > 0).unwrap_or(false);
+        let ok = ok
+            && std::fs::metadata(&dest)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
         if !ok {
             let _ = std::fs::remove_file(&dest);
             self.status = if cfg!(target_os = "macos") {
@@ -1983,8 +2385,8 @@ impl App {
             };
             return;
         }
-        self.attachments.push((true, dest.display().to_string(), "screenshot".to_string()));
-        self.status = "📎 attached screenshot".to_string();
+        self.attachments
+            .push((true, dest.display().to_string(), "screenshot".to_string()));
     }
 
     /// If `text` is exactly one existing file path (as a terminal pastes when you
@@ -1992,7 +2394,8 @@ impl App {
     fn dropped_file(text: &str) -> Option<std::path::PathBuf> {
         let mut s = text.trim();
         if s.len() >= 2
-            && ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+            && ((s.starts_with('\'') && s.ends_with('\''))
+                || (s.starts_with('"') && s.ends_with('"')))
         {
             s = &s[1..s.len() - 1];
         }
@@ -2001,22 +2404,27 @@ impl App {
         }
         let unescaped = s.replace("\\ ", " ").replace("\\\\", "\\");
         let p = std::path::PathBuf::from(&unescaped);
-        if p.is_file() {
-            Some(p)
-        } else {
-            None
-        }
+        if p.is_file() { Some(p) } else { None }
     }
 
     /// Copy a dropped file into the workspace scratch dir and add a chip that
     /// expands to its path on send (images → read_image, others → read).
     fn attach_dropped(&mut self, src: &std::path::Path) {
         let is_img = matches!(
-            src.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref(),
+            src.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .as_deref(),
             Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "heic" | "heif")
         );
         let subdir = if is_img { "images" } else { "files" };
-        let dir = self.options.config.workspace.join(".snippet").join("scratch").join(subdir);
+        let dir = self
+            .options
+            .config
+            .workspace
+            .join(".snippet")
+            .join("scratch")
+            .join(subdir);
         if let Err(error) = std::fs::create_dir_all(&dir) {
             self.status = format!("couldn't attach: {error}");
             return;
@@ -2027,8 +2435,9 @@ impl App {
             self.status = format!("couldn't attach {fname}: {error}");
             return;
         }
-        self.attachments.push((is_img, dest.display().to_string(), fname.to_string()));
-        self.status = format!("📎 attached {fname}");
+        self.attachments
+            .push((is_img, dest.display().to_string(), fname.to_string()));
+        /* attach pill is enough */
     }
 
     /// Expand any paste chips in the current input back to their real content.
@@ -2072,7 +2481,10 @@ impl App {
             .join("scratch")
             .join("pastes");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("paste-{}.txt", &uuid::Uuid::new_v4().to_string()[..8]));
+        let path = dir.join(format!(
+            "paste-{}.txt",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
         std::fs::write(&path, content)?;
         Ok(path.display().to_string())
     }
@@ -2103,14 +2515,7 @@ impl App {
         if self.input_cursor == 0 {
             // Nothing to the left in the text — pop the most recent attachment so
             // a mis-attached file can be removed (the pill count drops by one).
-            if self.attachments.pop().is_some() {
-                let left = self.attachments.len();
-                self.status = if left == 0 {
-                    "attachment removed".to_string()
-                } else {
-                    format!("attachment removed · 📎 {left} left")
-                };
-            }
+            let _ = self.attachments.pop();
             return;
         }
         let start = self.input_byte_at(self.input_cursor - 1);
@@ -2209,7 +2614,7 @@ impl App {
         let text = text.trim().to_string();
         if text.is_empty() {
             if !self.agent_alive() {
-                self.status = "Enter a task before starting.".to_string();
+                self.status = String::new();
             }
             return;
         }
@@ -2229,16 +2634,11 @@ impl App {
         // While the agent is executing, hold the message instead of steering the
         // running turn — it's submitted when the run finishes (or is stopped). Esc
         // stops the run, which flushes the queue immediately.
+        // While the agent is executing, hold the message (shown above the prompt).
+        // Do not toast the footer — the input-area queue preview is enough.
+        // Ctrl+S steers immediately instead of queueing (see handle_key).
         if self.agent_busy() {
             self.queued_inputs.push_back(text);
-            self.status = if self.is_compacting() {
-                "compacting context — your message will send once it's done".to_string()
-            } else {
-                format!(
-                    "queued ({}) — sends when the run finishes · Esc to stop & send now",
-                    self.queued_inputs.len()
-                )
-            };
             return;
         }
 
@@ -2250,7 +2650,7 @@ impl App {
     /// not busy and by the queue flush.
     fn submit_text(&mut self, text: String) {
         self.scroll = 0;
-        if let Some(tx) = self.input_tx.clone().filter(|_| self.agent_alive()) {
+        if self.agent_alive() {
             let waiting = self
                 .state
                 .as_ref()
@@ -2261,13 +2661,11 @@ impl App {
             } else {
                 LoopInput::UserMessage(text)
             };
-            if tx.send(input).is_err() {
-                self.error = Some("agent loop is no longer accepting input".to_string());
+            if let Err(error) = self.send_loop_input(input) {
+                self.error = Some(error);
             } else {
-                // The loop is now working; hold this locally until the state file
-                // confirms, so a fast follow-up queues instead of steering mid-run.
-                // `was_busy` too, so the flush edge still fires if the whole turn
-                // completes before the next state refresh.
+                // Hold busy locally until state catches up so a fast follow-up
+                // queues instead of steering mid-run.
                 self.sent_turn_pending = true;
                 self.was_busy = true;
             }
@@ -2279,6 +2677,31 @@ impl App {
             self.sent_turn_pending = true;
             self.was_busy = true;
         }
+    }
+
+    /// Send the current input immediately as a mid-run steer (or normal submit if idle).
+    /// Bound to Ctrl+S so Enter can keep queueing while busy.
+    fn steer_now(&mut self) {
+        let text = self.input.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if text.starts_with('/') {
+            self.handle_slash_command(&text);
+            self.input_clear();
+            return;
+        }
+        // Record history like submit.
+        if self.input_history.last().map(String::as_str) != Some(text.as_str()) {
+            self.input_history.push(text.clone());
+        }
+        self.history_pos = None;
+        self.input_clear();
+        self.scroll = 0;
+        // Deliver now even if busy — harness folds UserMessage into [steer] mid-run.
+        self.submit_text(text);
+        // Don't force queue semantics for the next keystroke after an explicit steer.
+        self.sent_turn_pending = false;
     }
 
     /// Submit everything queued when the agent goes idle/stopped — as a BURST of
@@ -2296,6 +2719,12 @@ impl App {
 
     fn spawn_loop(&mut self, initial: Option<String>, resume: bool) {
         if self.agent_alive() {
+            // Already attached / running — if we have an initial message, deliver it.
+            if let Some(text) = initial {
+                let _ = self.send_loop_input(LoopInput::UserMessage(text));
+                self.sent_turn_pending = true;
+                self.was_busy = true;
+            }
             return;
         }
         self.error = None;
@@ -2309,16 +2738,11 @@ impl App {
         self.status = String::new();
 
         crate::llm::StreamBuffer::clear(&self.stream);
-        let cfg = self.effective_config();
-        let handle = crate::session::start_session(
-            &cfg,
-            self.active_state_path.clone(),
-            initial,
-            resume,
-            Some(self.stream.clone()),
-        );
-        self.input_tx = Some(handle.input_tx);
-        self.agent = Some(handle.join);
+
+        // Daemon owns every session loop. Queue an async attach; tick runs it.
+        // If the daemon isn't connected yet, attach will surface the error — there
+        // is no in-process agent fallback.
+        self.pending_sidecar_attach = Some(PendingSidecarAttach { initial, resume });
     }
 
     fn interrupt_or_quit(&mut self) {
@@ -2327,10 +2751,8 @@ impl App {
         // Ctrl+C unable to quit whenever a session was loaded — the terminal
         // convention (Ctrl+C exits an idle program) applies when merely idle.
         if self.agent_busy() {
-            if let Some(tx) = &self.input_tx {
-                let _ = tx.send(LoopInput::Interrupt);
-            }
-            self.status = "Interrupting...".to_string();
+            let _ = self.send_loop_input(LoopInput::Interrupt);
+            self.status = String::new();
         } else {
             self.quit = true;
         }
@@ -2338,6 +2760,15 @@ impl App {
 
     async fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
+        self.ensure_sidecar_attached().await;
+        // If the sidecar dropped, clear attachment so the next spawn can recover.
+        if self
+            .sidecar_attach
+            .as_ref()
+            .is_some_and(|a| !a.is_connected())
+        {
+            self.sidecar_attach = None;
+        }
         self.refresh_state().await;
 
         // Transient status line auto-dismisses: stamp it when it changes, clear it
@@ -2421,12 +2852,42 @@ impl App {
         }
 
         if self
+            .model_switch_handle
+            .as_ref()
+            .map(|handle| handle.is_finished())
+            .unwrap_or(false)
+        {
+            let handle = self.model_switch_handle.take().expect("checked is_some");
+            match handle.await {
+                Ok(Ok(())) => {
+                    self.sidecar_attach = None;
+                    self.pending_sidecar_attach = Some(PendingSidecarAttach {
+                        initial: None,
+                        resume: true,
+                    });
+                    self.refresh_effective_model();
+                    self.status = "✓ current chat model changed".to_string();
+                }
+                Ok(Err(error)) => {
+                    self.status = format!("model switch failed: {error}");
+                    self.refresh_effective_model();
+                }
+                Err(error) => {
+                    self.status = format!("model switch task failed: {error}");
+                    self.refresh_effective_model();
+                }
+            }
+        }
+        if self
             .chatgpt_device_begin_handle
             .as_ref()
             .map(|handle| handle.is_finished())
             .unwrap_or(false)
         {
-            let handle = self.chatgpt_device_begin_handle.take().expect("checked is_some");
+            let handle = self
+                .chatgpt_device_begin_handle
+                .take()
+                .expect("checked is_some");
             match handle.await {
                 Ok(Ok(info)) => {
                     copy_to_clipboard(&info.user_code);
@@ -2475,7 +2936,10 @@ impl App {
             .map(|handle| handle.is_finished())
             .unwrap_or(false)
         {
-            let handle = self.xai_device_begin_handle.take().expect("checked is_some");
+            let handle = self
+                .xai_device_begin_handle
+                .take()
+                .expect("checked is_some");
             match handle.await {
                 Ok(Ok(info)) => {
                     copy_to_clipboard(&info.user_code);
@@ -2542,6 +3006,25 @@ impl App {
     }
 
     async fn refresh_state(&mut self) {
+        // Sidecar: state arrives over WS. Pull the latest snapshot/delta and
+        // mirror the live stream handle the attach task keeps updated.
+        if let Some(attach) = &self.sidecar_attach {
+            if let Some(state) = attach.state_rx.borrow().clone() {
+                // A newer committed state clears optimistic-busy and the live
+                // stream is already managed by wire frames (snapshot clears it).
+                if self.state.as_ref().map(|s| s.events.len()) != Some(state.events.len())
+                    || self.state.as_ref().map(|s| s.status) != Some(state.status)
+                {
+                    self.sent_turn_pending = false;
+                }
+                self.state = Some(state);
+            }
+            // Keep the TUI's stream handle pointing at the attach's buffer so
+            // the renderer (which reads `app.stream`) stays live.
+            self.stream = attach.stream.clone();
+            return;
+        }
+
         if let Ok(metadata) = tokio::fs::metadata(&self.active_state_path).await {
             if let Ok(modified) = metadata.modified() {
                 if Some(modified) == self.last_state_modified {
@@ -2585,6 +3068,104 @@ impl App {
             }
         }
     }
+
+    /// If a session attach is pending, open/attach it via the local serve daemon.
+    async fn ensure_sidecar_attached(&mut self) {
+        let Some(pending) = self.pending_sidecar_attach.take() else {
+            return;
+        };
+        // No daemon info (startup failed or prior attach cleared it) → enable/start.
+        if self.sidecar.is_none() {
+            match crate::serve::sidecar::discover_or_start(&self.options.config_path).await {
+                Ok(info) => {
+                    self.sidecar = Some(info);
+                    self.status = String::new();
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    // Keep the pending intent so a later tick can retry once serve is up.
+                    self.pending_sidecar_attach = Some(pending);
+                    return;
+                }
+            }
+        }
+        let Some(info) = self.sidecar.clone() else {
+            self.error = Some("snippet serve is not available".to_string());
+            self.pending_sidecar_attach = Some(pending);
+            return;
+        };
+
+        // Existing state file → attach by path (daemon ensure_live resumes it).
+        // Brand-new conversation with no file yet → POST /sessions new_conversation
+        // so the daemon creates the conversations/<uuid>.json the TUI expects.
+        if !self.active_state_path.exists() {
+            let folder = self.options.config.workspace.clone();
+            let new_conversation = self.active_conversation != "default";
+            match crate::serve::sidecar::open_session(
+                &info,
+                &folder,
+                pending.resume && !new_conversation,
+                new_conversation,
+            )
+            .await
+            {
+                Ok(session_id) => {
+                    // Don't use state_path_for_id here — it canonicalize()s and
+                    // fails before the first persist creates the file. Join the
+                    // workspaces root directly.
+                    let sp = crate::config::workspaces_root().join(&session_id);
+                    self.active_state_path = sp.clone();
+                    if let Some(stem) = sp.file_stem().and_then(|s| s.to_str()) {
+                        if stem != "state" {
+                            self.active_conversation = stem.to_string();
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("sidecar open: {error}");
+                }
+            }
+        }
+
+        match crate::serve::sidecar::attach(&info, &self.active_state_path).await {
+            Ok(attach) => {
+                if let Some(text) = pending.initial {
+                    let _ = attach.send(LoopInput::UserMessage(text));
+                    self.sent_turn_pending = true;
+                    self.was_busy = true;
+                }
+                self.stream = attach.stream.clone();
+                self.sidecar_attach = Some(attach);
+                self.input_tx = None;
+                self.agent = None;
+            }
+            Err(error) => {
+                // State may exist but daemon can't resolve id yet — open then re-attach.
+                if self.active_state_path.exists() {
+                    let folder = self.options.config.workspace.clone();
+                    let _ = crate::serve::sidecar::open_session(&info, &folder, true, false).await;
+                    if let Ok(attach) =
+                        crate::serve::sidecar::attach(&info, &self.active_state_path).await
+                    {
+                        if let Some(text) = pending.initial {
+                            let _ = attach.send(LoopInput::UserMessage(text));
+                            self.sent_turn_pending = true;
+                            self.was_busy = true;
+                        }
+                        self.stream = attach.stream.clone();
+                        self.sidecar_attach = Some(attach);
+                        self.input_tx = None;
+                        self.agent = None;
+                        return;
+                    }
+                }
+                // Drop cached daemon info so the next tick re-enables/starts and retries.
+                self.sidecar = None;
+                self.error = Some(format!("sidecar attach failed: {error}"));
+                self.pending_sidecar_attach = Some(pending);
+            }
+        }
+    }
 }
 
 async fn run_app(
@@ -2592,11 +3173,34 @@ async fn run_app(
     options: TuiOptions,
 ) -> Result<ExitInfo, Box<dyn std::error::Error>> {
     let mut app = App::new(options);
-    app.refresh_effective_model();
-    app.refresh_state().await;
-    if app.options.config.resume_on_start || app.options.resume.is_some() {
-        app.spawn_loop(None, true);
+    // Paint immediately so startup never sits on a blank alt-screen while serve
+    // is discovered/started (that path can take several seconds).
+    terminal.draw(|frame| render(frame, &app))?;
+
+    // Serve daemon is the sole session runtime. Enable + start it if needed so
+    // the TUI never runs `run_interactive` in-process (avoids TUI+mobile state races).
+    let config_path = app.options.config_path.clone();
+    match connect_serve_with_ui(terminal, &mut app, &config_path).await {
+        Ok(info) => {
+            app.sidecar = Some(info);
+            app.connecting_phase = None;
+            app.status = String::new();
+        }
+        Err(error) => {
+            app.connecting_phase = None;
+            app.error = Some(error);
+        }
     }
+    terminal.draw(|frame| render(frame, &app))?;
+
+    app.refresh_effective_model();
+    app.connecting_phase = Some("Opening session…".to_string());
+    terminal.draw(|frame| render(frame, &app))?;
+    app.refresh_state().await;
+    // Always attach through the daemon when we have one (or will retry).
+    app.spawn_loop(None, true);
+    app.ensure_sidecar_attached().await;
+    app.connecting_phase = None;
 
     // Best-effort self-update in the background: if a newer release exists, it's
     // downloaded and the binary is replaced in place; the header then shows a
@@ -2631,8 +3235,20 @@ async fn run_app(
                 }
                 // Mouse wheel scrolls the transcript (chat canvas).
                 Event::Mouse(me) => match me.kind {
-                    MouseEventKind::ScrollUp => app.scroll_up(1),
-                    MouseEventKind::ScrollDown => app.scroll_down(1),
+                    MouseEventKind::ScrollUp => {
+                        if app.screen == Screen::Lanes {
+                            app.lanes_detail_scroll = app.lanes_detail_scroll.saturating_sub(3);
+                        } else {
+                            app.scroll_up(1);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if app.screen == Screen::Lanes {
+                            app.lanes_detail_scroll = app.lanes_detail_scroll.saturating_add(3);
+                        } else {
+                            app.scroll_down(1);
+                        }
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -2669,32 +3285,76 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if app.screen == Screen::Main && app.pending_approval().is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(tx) = &app.input_tx {
-                    let _ = tx.send(LoopInput::Approve);
-                }
+                let _ = app.send_loop_input(LoopInput::Approve);
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 // Approve this and stop prompting for the rest of the RUN — run-scoped
                 // only. Never persist to the config: a one-key unblock must not
                 // silently remove the manual-approval gate for every future session.
                 // Only offered when multiple approvals are pending (matches the bar).
-                let multi = app.pending_approval().map(|(_, _, _, t)| t > 1).unwrap_or(false);
+                let multi = app
+                    .pending_approval()
+                    .map(|(_, _, _, t)| t > 1)
+                    .unwrap_or(false);
                 if multi {
-                    if let Some(tx) = &app.input_tx {
-                        let _ = tx.send(LoopInput::ApproveAll);
-                    }
+                    let _ = app.send_loop_input(LoopInput::ApproveAll);
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
-                if let Some(tx) = &app.input_tx {
-                    let _ = tx.send(LoopInput::Deny);
-                }
+                let _ = app.send_loop_input(LoopInput::Deny);
             }
             KeyCode::Esc => {
-                if let Some(tx) = &app.input_tx {
-                    let _ = tx.send(LoopInput::Interrupt);
+                let _ = app.send_loop_input(LoopInput::Interrupt);
+                app.status = String::new();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Dedicated lane navigation owns the ordinary navigation keys while open.
+    if app.screen == Screen::Lanes && !key.modifiers.contains(KeyModifiers::CONTROL) {
+        let count = app.state.as_ref().map(|s| s.lanes.len()).unwrap_or(0);
+        match key.code {
+            KeyCode::Esc => {
+                app.screen = Screen::Main;
+                app.lanes_detail_scroll = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let next = app.lanes_selected_index.saturating_sub(1);
+                if next != app.lanes_selected_index {
+                    app.lanes_selected_index = next;
+                    app.lanes_detail_scroll = 0;
+                    // Keep expanded so switching lanes still shows the full report.
                 }
-                app.status = "Interrupting…".to_string();
+            }
+            KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                let next = (app.lanes_selected_index + 1).min(count.saturating_sub(1));
+                if next != app.lanes_selected_index {
+                    app.lanes_selected_index = next;
+                    app.lanes_detail_scroll = 0;
+                }
+            }
+            // Scroll the RIGHT detail pane (not the lane list).
+            KeyCode::PageUp => {
+                app.lanes_detail_scroll = app.lanes_detail_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.lanes_detail_scroll = app.lanes_detail_scroll.saturating_add(10);
+            }
+            KeyCode::Home => app.lanes_detail_scroll = 0,
+            KeyCode::End => app.lanes_detail_scroll = usize::MAX / 4,
+            // Enter / Space always open full detail (idempotent expand, not a no-op toggle
+            // that looks broken when content was already truncated off-screen).
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if app.lanes_detail_expanded {
+                    // Second press collapses.
+                    app.lanes_detail_expanded = false;
+                    app.lanes_detail_scroll = 0;
+                } else {
+                    app.lanes_detail_expanded = true;
+                    app.lanes_detail_scroll = 0;
+                }
             }
             _ => {}
         }
@@ -2721,33 +3381,38 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.paste_clipboard_image();
                 return;
             }
-            // Toggle Agents Modal overlay
+            // Open the dedicated delegated-lanes screen.
             KeyCode::Char('a') => {
-                if app.screen == Screen::AgentsModal {
+                if app.screen == Screen::Lanes {
                     app.screen = Screen::Main;
                 } else {
-                    app.screen = Screen::AgentsModal;
-                    app.agents_modal_selected_index = 0;
+                    app.screen = Screen::Lanes;
+                    app.lanes_selected_index = 0;
+                    // Collapsed so Enter/Ctrl-O is an obvious expand.
+                    app.lanes_detail_expanded = false;
+                    app.lanes_detail_scroll = 0;
                 }
                 return;
             }
-            // Expand / collapse the full output of completed delegation lanes.
+            // Ctrl-O opens the selected lane's full report while on the lanes screen.
             KeyCode::Char('o') => {
-                app.lanes_expanded = !app.lanes_expanded;
-                app.status = if app.lanes_expanded {
-                    "lane output expanded".to_string()
+                if app.screen == Screen::Lanes {
+                    app.lanes_detail_expanded = !app.lanes_detail_expanded;
+                    app.lanes_detail_scroll = 0;
                 } else {
-                    "lane output collapsed".to_string()
-                };
+                    app.tools_expanded = !app.tools_expanded;
+                }
+                return;
+            }
+            // Ctrl+S: steer now (send immediately even while the agent is busy).
+            KeyCode::Char('s') => {
+                app.steer_now();
                 return;
             }
             // Cancel messages queued for after the current run.
             KeyCode::Char('x') => {
                 if !app.queued_inputs.is_empty() {
-                    let n = app.queued_inputs.len();
                     app.queued_inputs.clear();
-                    app.status =
-                        format!("cancelled {n} queued message{}", if n == 1 { "" } else { "s" });
                 }
                 return;
             }
@@ -2755,30 +3420,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('k') => {
                 app.input.clear();
                 app.input_cursor = 0;
-                app.status = "input cleared".to_string();
+                return;
+            }
+            // Ctrl-M: toggle mouse capture (wheel scroll vs native text select).
+            KeyCode::Char('m') => {
+                app.set_mouse_capture(!app.mouse_capture);
                 return;
             }
             _ => {}
         }
 
-        if app.screen == Screen::AgentsModal {
-            let count = app.state.as_ref().map(|s| s.lanes.len()).unwrap_or(0);
-            match key.code {
-                KeyCode::Esc => {
-                    app.screen = Screen::Main;
-                }
-                KeyCode::Up => {
-                    app.agents_modal_selected_index = app.agents_modal_selected_index.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    if count > 0 {
-                        app.agents_modal_selected_index = (app.agents_modal_selected_index + 1).min(count.saturating_sub(1));
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
         // Readline-style line editing for the prompt (main screen only).
         if app.screen == Screen::Main && !app.login_active {
             match key.code {
@@ -2865,6 +3516,30 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.screen == Screen::RewindCheckpointSelection
+        || app.screen == Screen::ForkCheckpointSelection
+    {
+        let count = app.state.as_ref().map(|s| s.checkpoints.len()).unwrap_or(0);
+        match key.code {
+            KeyCode::Up if count > 0 => {
+                app.checkpoint_selected_index = if app.checkpoint_selected_index == 0 {
+                    count - 1
+                } else {
+                    app.checkpoint_selected_index - 1
+                };
+            }
+            KeyCode::Down if count > 0 => {
+                app.checkpoint_selected_index = (app.checkpoint_selected_index + 1) % count;
+            }
+            KeyCode::Enter if count > 0 => app.confirm_checkpoint_selection(),
+            KeyCode::Esc => {
+                app.screen = Screen::Main;
+                app.status = String::new();
+            }
+            _ => {}
+        }
+        return;
+    }
 
     if app.screen == Screen::ThemeSelection {
         let count = PRESETS.len();
@@ -2880,8 +3555,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Enter => {
                 set_theme_index(app.theme_selected_index);
                 app.persist_theme();
-                let label = PRESETS.get(app.theme_selected_index).map(|p| p.label).unwrap_or("");
-                app.status = format!("Theme: {label}");
+                app.status = String::new();
                 app.screen = Screen::Main;
             }
             KeyCode::Esc => {
@@ -2909,7 +3583,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             match key.code {
                 KeyCode::Esc => {
                     app.screen = Screen::Main;
-                    app.status = "Type a task and press Enter.".to_string();
+                    app.status = String::new();
                 }
                 _ => {}
             }
@@ -2986,7 +3660,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 } else {
                     app.resume_pending_delete = true;
                     let short: String = title.chars().take(48).collect();
-                    app.status = format!("Press d again to delete \"{short}\", or Esc/↑↓ to cancel.");
+                    app.status =
+                        format!("Press d again to delete \"{short}\", or Esc/↑↓ to cancel.");
                 }
             }
             KeyCode::Char('r') => {
@@ -3004,14 +3679,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 if app.active_state_path.exists() {
                     app.spawn_loop(None, true);
                 } else {
-                    app.status = "No saved session to resume. Start a new one with /new or type a task.".to_string();
+                    app.status =
+                        "No saved session to resume. Start a new one with /new or type a task."
+                            .to_string();
                 }
             }
             KeyCode::Esc => {
                 app.resume_pending_delete = false;
                 app.conv_cache = None;
                 app.screen = Screen::Main;
-                app.status = "Type a task and press Enter.".to_string();
+                app.status = String::new();
             }
             _ => {}
         }
@@ -3069,6 +3746,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 if app.input == *selected_cmd
                     || selected_cmd.starts_with("/resume ")
                     || selected_cmd.starts_with("/rewind ")
+                    || selected_cmd.starts_with("/fork ")
                     || selected_cmd.starts_with("/profile ")
                 {
                     app.input_set(selected_cmd.clone());
@@ -3133,10 +3811,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                     app.input_clear();
                     app.suggestion_index = 0;
                 } else if app.agent_alive() {
-                    if let Some(tx) = &app.input_tx {
-                        let _ = tx.send(LoopInput::Interrupt);
-                    }
-                    app.status = "Interrupting...".to_string();
+                    let _ = app.send_loop_input(LoopInput::Interrupt);
+                    app.status = String::new();
                 }
             }
             // Alt/Option + Backspace deletes the word before the cursor.
@@ -3215,7 +3891,12 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
             app.status = format!("Copied code {code} to clipboard.");
         }
         KeyCode::Char('u') if app.chatgpt_device_code.is_some() => {
-            let url = app.chatgpt_device_code.as_ref().unwrap().verification_url.clone();
+            let url = app
+                .chatgpt_device_code
+                .as_ref()
+                .unwrap()
+                .verification_url
+                .clone();
             copy_to_clipboard(&url);
             app.status = "Copied sign-in URL to clipboard.".to_string();
         }
@@ -3225,7 +3906,12 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
             app.status = format!("Copied code {code} to clipboard.");
         }
         KeyCode::Char('u') if app.xai_device_code.is_some() => {
-            let url = app.xai_device_code.as_ref().unwrap().verification_uri.clone();
+            let url = app
+                .xai_device_code
+                .as_ref()
+                .unwrap()
+                .verification_uri
+                .clone();
             copy_to_clipboard(&url);
             app.status = "Copied sign-in URL to clipboard.".to_string();
         }
@@ -3237,18 +3923,18 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
             app.close_login(true);
             app.status = String::new();
         }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)
-            && app.form_provider == "chatgpt" =>
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.form_provider == "chatgpt" =>
         {
             app.start_chatgpt_login(crate::chatgpt_auth::ChatGptLoginMethod::DeviceCode);
         }
-        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL)
-            && app.form_provider == "chatgpt" =>
+        KeyCode::Char('l')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.form_provider == "chatgpt" =>
         {
             app.logout_chatgpt();
         }
-        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL)
-            && app.form_provider == "xai" =>
+        KeyCode::Char('l')
+            if key.modifiers.contains(KeyModifiers::CONTROL) && app.form_provider == "xai" =>
         {
             app.logout_xai();
         }
@@ -3276,11 +3962,227 @@ fn handle_login_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Drive serve discovery/start while redrawing the connecting screen so startup
+/// never looks frozen on an empty alternate screen.
+async fn connect_serve_with_ui(
+    terminal: &mut TuiTerminal,
+    app: &mut App,
+    config_path: &std::path::Path,
+) -> Result<crate::serve::sidecar::DaemonInfo, String> {
+    // Channel lets the discover task push phase labels without holding `&mut App`.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let path = config_path.to_path_buf();
+    let mut work = tokio::spawn(async move {
+        crate::serve::sidecar::discover_or_start_with_progress(&path, move |phase| {
+            let _ = tx.send(phase.to_string());
+        })
+        .await
+    });
+
+    let mut interval = tokio::time::interval(Duration::from_millis(80));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                while let Ok(phase) = rx.try_recv() {
+                    app.connecting_phase = Some(phase);
+                }
+                app.frame = app.frame.wrapping_add(1);
+                let _ = terminal.draw(|frame| render(frame, app));
+            }
+            result = &mut work => {
+                while let Ok(phase) = rx.try_recv() {
+                    app.connecting_phase = Some(phase);
+                }
+                return result.map_err(|e| format!("serve connect task: {e}"))?;
+            }
+        }
+    }
+}
+
+/// Full-screen connecting state — big centered loader, no copy.
+fn render_connecting(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    // Multi-line pulse ring: reads large without any status text.
+    const FRAMES: [&[&str]; 8] = [
+        &[
+            "  · · ·  ",
+            " ·     · ",
+            "·   ◆   ·",
+            " ·     · ",
+            "  · · ·  ",
+        ],
+        &[
+            "  · · ·  ",
+            " ·     · ",
+            "·  ◆    ·",
+            " ·     · ",
+            "  · · ·  ",
+        ],
+        &[
+            "  · · ·  ",
+            " ·  ◆  · ",
+            "·       ·",
+            " ·     · ",
+            "  · · ·  ",
+        ],
+        &[
+            "  · · ·  ",
+            " ·     · ",
+            "·    ◆  ·",
+            " ·     · ",
+            "  · · ·  ",
+        ],
+        &[
+            "  · · ·  ",
+            " ·     · ",
+            "·   ◆   ·",
+            " ·     · ",
+            "  · · ·  ",
+        ],
+        &[
+            "  · · ·  ",
+            " ·     · ",
+            "·       ·",
+            " ·  ◆  · ",
+            "  · · ·  ",
+        ],
+        &[
+            "  · · ·  ",
+            " ·     · ",
+            "·  ◆    ·",
+            " ·     · ",
+            "  · · ·  ",
+        ],
+        &[
+            "  · ◆ ·  ",
+            " ·     · ",
+            "·       ·",
+            " ·     · ",
+            "  · · ·  ",
+        ],
+    ];
+    let frame_i = (app.frame / 3) % FRAMES.len();
+    let rows = FRAMES[frame_i];
+    let body: Vec<Line<'static>> = rows
+        .iter()
+        .map(|row| {
+            Line::from(Span::styled(
+                (*row).to_string(),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect();
+
+    let block_h = body.len() as u16;
+    let top = area.height.saturating_sub(block_h) / 2;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top),
+            Constraint::Length(block_h),
+            Constraint::Min(0),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(body).alignment(ratatui::layout::Alignment::Center),
+        chunks[1],
+    );
+}
+
+fn render_checkpoint_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders, Paragraph};
+    let checkpoints = app
+        .state
+        .as_ref()
+        .map(|s| s.checkpoints.clone())
+        .unwrap_or_default();
+    let is_rewind = app.screen == Screen::RewindCheckpointSelection;
+    let title = if is_rewind {
+        " Rewind current chat + files · choose a checkpoint "
+    } else {
+        " Fork a new chat · choose a checkpoint "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent()))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let visible = inner.height.saturating_sub(3) as usize;
+    let selected = app
+        .checkpoint_selected_index
+        .min(checkpoints.len().saturating_sub(1));
+    let start = if selected >= visible && visible > 0 {
+        selected + 1 - visible
+    } else {
+        0
+    };
+    let mut lines = Vec::new();
+    for (index, checkpoint) in checkpoints
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible.max(1))
+    {
+        let is_selected = index == selected;
+        let marker = if is_selected { "›" } else { " " };
+        let short_id: String = checkpoint.id.chars().take(8).collect();
+        let style = if is_selected {
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(text())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), style),
+            Span::styled("● ", Style::default().fg(lane())),
+            Span::styled(checkpoint.label.clone(), style),
+            Span::styled(format!("  {short_id}"), Style::default().fg(faint())),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No checkpoints available.",
+            muted(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let footer = if is_rewind {
+        "↑↓ select · Enter rewind · Esc cancel"
+    } else {
+        "↑↓ select · Enter fork · Esc cancel"
+    };
+    let footer_area = Rect {
+        x: inner.x,
+        y: inner.y + inner.height.saturating_sub(1),
+        width: inner.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(footer, subtle()))),
+        footer_area,
+    );
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = frame.area();
 
+    if app.connecting_phase.is_some() {
+        render_connecting(frame, area, app);
+        return;
+    }
+
     if app.screen == Screen::ResumeSelection {
         render_resume_selection(frame, area, app);
+        return;
+    }
+
+    if app.screen == Screen::RewindCheckpointSelection
+        || app.screen == Screen::ForkCheckpointSelection
+    {
+        render_checkpoint_selection(frame, area, app);
         return;
     }
 
@@ -3289,36 +4191,41 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         return;
     }
 
-
     if app.screen == Screen::Profiles {
         render_profiles(frame, area, app);
         return;
     }
 
+    if app.screen == Screen::Lanes {
+        render_lanes(frame, area, app);
+        return;
+    }
+
     let sugg_h = suggestion_height(app);
     let input_h = input_height(app, area.width);
-    // A dedicated compaction-progress row sits directly above the input while the
-    // history is being compacted (1 row when active, 0 otherwise).
-    let compact_h: u16 = if app.is_compacting() { 1 } else { 0 };
-    // Approval prompt (manual mode): 2 rows directly above the input when a mutating
-    // tool is awaiting y/n (mutually exclusive with compaction).
-    let approval_h: u16 = if app.pending_approval().is_some() { 6 } else { 0 };
+    // Compaction/prune status lives in the footer usage cluster (bottom-right).
+    // Approval prompt (manual mode): rows directly above the input when a mutating
+    // tool is awaiting y/n.
+    let approval_h: u16 = if app.pending_approval().is_some() {
+        6
+    } else {
+        0
+    };
 
-    // Header, Content, Suggestions, Question, Compaction, Approval, Input, Status, Footer
+    // Header, Content, Suggestions, Question, Approval, Input, Status, Footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                  // Header
-            Constraint::Length(1),                  // gap under header
-            Constraint::Min(10),                     // Content
-            Constraint::Length(sugg_h),              // Suggestions
+            Constraint::Length(1),                    // Header
+            Constraint::Length(1),                    // gap under header
+            Constraint::Min(10),                      // Content
+            Constraint::Length(sugg_h),               // Suggestions
             Constraint::Length(question_height(app)), // Question
-            Constraint::Length(compact_h),          // Compaction progress
-            Constraint::Length(approval_h),         // Approval prompt (above input)
-            Constraint::Length(1),                  // gap above input
-            Constraint::Length(input_h),            // Input (grows with wrapped lines)
-            Constraint::Length(1),                  // Status message
-            Constraint::Length(1),                  // Footer (metadata)
+            Constraint::Length(approval_h),           // Approval prompt (above input)
+            Constraint::Length(1),                    // gap above input
+            Constraint::Length(input_h),              // Input (grows with wrapped lines)
+            Constraint::Length(1),                    // Status message
+            Constraint::Length(1),                    // Footer (metadata + usage)
         ])
         .split(area);
 
@@ -3327,11 +4234,10 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let content_area = chunks[2];
     let suggestions_area = chunks[3];
     let question_area = chunks[4];
-    let compaction_area = chunks[5];
-    let approval_area = chunks[6];
-    let input_area = chunks[8];
-    let status_msg_area = chunks[9];
-    let footer_area = chunks[10];
+    let approval_area = chunks[5];
+    let input_area = chunks[7];
+    let status_msg_area = chunks[8];
+    let footer_area = chunks[9];
 
     render_header(frame, header_area, app);
     frame.render_widget(
@@ -3346,146 +4252,240 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         render_suggestions(frame, suggestions_area, app);
     }
     render_question(frame, question_area, app);
-    if compact_h > 0 {
-        render_compaction_bar(frame, compaction_area, app);
-    }
     if approval_h > 0 {
         render_approval_bar(frame, approval_area, app);
     }
     render_input(frame, input_area, app);
     render_status_message(frame, status_msg_area, app);
     render_status(frame, footer_area, app);
-    if app.screen == Screen::AgentsModal {
-        render_agents_modal(frame, area, app);
-    }
 }
 
-fn render_agents_modal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-    
-    let modal_area = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(12),
-            Constraint::Percentage(75),
-            Constraint::Percentage(13),
-        ])
-        .split(area)[1];
-    
-    let modal_area = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(10),
-            Constraint::Percentage(80),
-            Constraint::Percentage(10),
-        ])
-        .split(modal_area)[1];
+fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, Borders, Paragraph};
 
-    frame.render_widget(Clear, modal_area);
+    let lanes = app.state.as_ref().map(|state| &state.lanes);
+    let (running, completed, failed, total) = lanes
+        .map(|items| {
+            (
+                items
+                    .iter()
+                    .filter(|item| item.status == LaneStatus::Running)
+                    .count(),
+                items
+                    .iter()
+                    .filter(|item| item.status == LaneStatus::Completed)
+                    .count(),
+                items
+                    .iter()
+                    .filter(|item| item.status == LaneStatus::Failed)
+                    .count(),
+                items.len(),
+            )
+        })
+        .unwrap_or_default();
 
-    let block = Block::default()
+    // One title only — counts live here; no second "delegated work" banner.
+    let title = if total == 0 {
+        " Lanes ".to_string()
+    } else {
+        format!(" Lanes  ·  {total}  ·  {running} live  ·  {completed} ok  ·  {failed} fail ")
+    };
+    let outer = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent()))
-        .title(" 🤖 Agents Modal ");
-
-    let inner = block.inner(modal_area);
-    frame.render_widget(block, modal_area);
+        .title(title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
 
     let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(30)])
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(1)])
         .split(inner);
 
-    let left_pane = chunks[0];
-    let right_pane = chunks[1];
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(28), Constraint::Min(1)])
+        .split(chunks[0]);
 
-    let lanes = app.state.as_ref().map(|s| &s.lanes);
-    let mut left_lines = vec![
-        Line::from(Span::styled("🤖 Agents", Style::default().fg(accent()).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-    ];
-
-    if let Some(lanes) = lanes {
-        if lanes.is_empty() {
-            left_lines.push(Line::from(Span::styled(" (no active agents)", Style::default().fg(muted()))));
-        } else {
-            for (idx, lane_item) in lanes.iter().enumerate() {
-                let dot = match lane_item.status {
-                    crate::lanes::LaneStatus::Running => Span::styled("🟢 ", Style::default().fg(success())),
-                    crate::lanes::LaneStatus::Completed => Span::styled("⚪ ", Style::default().fg(muted())),
-                    crate::lanes::LaneStatus::Failed => Span::styled("🔴 ", Style::default().fg(danger())),
-                };
-                let is_sel = idx == app.agents_modal_selected_index;
-                let name_style = if is_sel {
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(text())
-                };
-                let prefix = if is_sel { "▶ 📁 " } else { "  📁 " };
-                left_lines.push(Line::from(vec![
-                    Span::styled(prefix, name_style),
-                    Span::styled(lane_item.id.clone(), name_style),
-                    Span::raw(" "),
-                    dot,
-                ]));
-            }
-        }
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(faint()));
+    let detail_title = if app.lanes_detail_expanded {
+        " Detail "
     } else {
-        left_lines.push(Line::from(Span::styled(" (no active session)", Style::default().fg(muted()))));
-    }
+        " Detail  ·  Enter expands "
+    };
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(faint()))
+        .title(detail_title);
+    let list_inner = list_block.inner(panes[0]);
+    let detail_inner = detail_block.inner(panes[1]);
+    frame.render_widget(list_block, panes[0]);
+    frame.render_widget(detail_block, panes[1]);
 
-    left_lines.push(Line::from(""));
-    left_lines.push(Line::from(""));
-    left_lines.push(Line::from(Span::styled("[↑↓] agent  ·  [Esc] close", Style::default().fg(faint()))));
-
-    frame.render_widget(Paragraph::new(left_lines), left_pane);
-
-    let mut right_lines = Vec::new();
-    if let Some(lanes) = lanes {
-        if let Some(lane_item) = lanes.get(app.agents_modal_selected_index) {
-            let status_badge = match lane_item.status {
-                crate::lanes::LaneStatus::Running => Span::styled(" 🟢 ONLINE", Style::default().fg(success()).add_modifier(Modifier::BOLD)),
-                crate::lanes::LaneStatus::Completed => Span::styled(" ⚪ IDLE", Style::default().fg(muted()).add_modifier(Modifier::BOLD)),
-                crate::lanes::LaneStatus::Failed => Span::styled(" 🔴 FAILED", Style::default().fg(danger()).add_modifier(Modifier::BOLD)),
+    // Left: › ● title only (status is the colored dot — no "done" word).
+    let mut list_lines = Vec::new();
+    if let Some(items) = lanes {
+        for (index, item) in items.iter().enumerate() {
+            let (glyph, color) = match item.status {
+                LaneStatus::Running => ("●", lane()),
+                LaneStatus::Completed => ("●", success()),
+                LaneStatus::Failed => ("●", danger()),
             };
-            right_lines.push(Line::from(vec![
-                Span::styled(format!("📁 {} ", lane_item.id), Style::default().fg(text()).add_modifier(Modifier::BOLD)),
-                status_badge,
-            ]));
-            right_lines.push(Line::from(""));
-
-            let summary = lane_item.summary.as_deref().unwrap_or("running tasks");
-            right_lines.push(Line::from(vec![
-                Span::styled("⠋ ", Style::default().fg(accent())),
-                Span::styled(format!("{} · explore · 🤖 sonnet · ember", summary), Style::default().fg(muted())),
-            ]));
-            right_lines.push(Line::from(""));
-
-            if let Some(handoff) = &lane_item.handoff {
-                for line_str in markdown::wrap_one(handoff, (right_pane.width as usize).saturating_sub(4)) {
-                    right_lines.push(Line::from(Span::styled(line_str, Style::default().fg(text()))));
-                }
-                right_lines.push(Line::from(""));
+            let selected = index == app.lanes_selected_index;
+            let style = if selected {
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text())
+            };
+            let max_title = list_inner.width.saturating_sub(4) as usize;
+            let mut title = item.title.clone();
+            if max_title > 1 && title.chars().count() > max_title {
+                title = title
+                    .chars()
+                    .take(max_title.saturating_sub(1))
+                    .collect::<String>()
+                    + "…";
             }
+            list_lines.push(Line::from(vec![
+                Span::styled(if selected { "›" } else { " " }, style),
+                Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                Span::styled(title, style),
+            ]));
+        }
+    }
+    if list_lines.is_empty() {
+        list_lines.push(Line::from(Span::styled("No lanes yet.", muted())));
+    }
+    frame.render_widget(Paragraph::new(list_lines), list_inner);
 
-            if let Some(report) = &lane_item.report {
-                right_lines.push(Line::from(Span::styled("Report & Logs:", Style::default().fg(accent()).add_modifier(Modifier::BOLD))));
-                for line_str in markdown::wrap_one(report, (right_pane.width as usize).saturating_sub(4)) {
-                    right_lines.push(Line::from(Span::styled(format!("... {}", line_str), Style::default().fg(muted()))));
-                }
+    let mut detail_lines = Vec::new();
+    let prose_w = detail_inner.width.saturating_sub(1) as usize;
+    if let Some(item) = lanes.and_then(|items| items.get(app.lanes_selected_index)) {
+        let (dot, color) = match item.status {
+            LaneStatus::Running => ("●", lane()),
+            LaneStatus::Completed => ("●", success()),
+            LaneStatus::Failed => ("●", danger()),
+        };
+        detail_lines.push(Line::from(vec![
+            Span::styled(format!("{dot} "), Style::default().fg(color)),
+            Span::styled(
+                item.title.clone(),
+                Style::default().fg(text()).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        detail_lines.push(Line::from(""));
+
+        let summary_body = match item.status {
+            LaneStatus::Running => item.activity.as_deref().unwrap_or("working…"),
+            LaneStatus::Completed => item
+                .summary
+                .as_deref()
+                .or(item.report.as_deref())
+                .unwrap_or("completed"),
+            LaneStatus::Failed => item.error.as_deref().unwrap_or("failed"),
+        };
+
+        if app.lanes_detail_expanded {
+            if let Some(handoff) = item.handoff.as_deref().filter(|s| !s.trim().is_empty()) {
+                detail_lines.push(Line::from(Span::styled(
+                    "Handoff",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )));
+                detail_lines.extend(markdown::render_prose(handoff, prose_w));
+                detail_lines.push(Line::from(""));
             }
+            if !item.activity_log.is_empty() {
+                detail_lines.push(Line::from(Span::styled(
+                    "Activity",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )));
+                for entry in &item.activity_log {
+                    let kind = entry.kind.trim();
+                    if entry.text.contains('\n')
+                        || entry.text.contains('`')
+                        || entry.text.contains("**")
+                    {
+                        detail_lines.push(Line::from(Span::styled(
+                            kind.to_string(),
+                            Style::default().fg(faint()),
+                        )));
+                        detail_lines.extend(markdown::render_prose(&entry.text, prose_w));
+                    } else {
+                        let mut line = vec![Span::styled(
+                            format!("{kind}  "),
+                            Style::default().fg(faint()),
+                        )];
+                        let body = markdown::render_prose(
+                            &entry.text,
+                            prose_w.saturating_sub(kind.chars().count() + 2),
+                        );
+                        if let Some(first) = body.into_iter().next() {
+                            line.extend(first.spans);
+                        }
+                        detail_lines.push(Line::from(line));
+                    }
+                }
+                detail_lines.push(Line::from(""));
+            }
+            detail_lines.push(Line::from(Span::styled(
+                "Report",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            )));
+            let report_body = item
+                .report
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .or(item.summary.as_deref())
+                .unwrap_or(summary_body);
+            detail_lines.extend(markdown::render_prose(report_body, prose_w));
         } else {
-            right_lines.push(Line::from(Span::styled("Select an agent from the left pane.", Style::default().fg(muted()))));
+            detail_lines.push(Line::from(Span::styled(
+                "Summary",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            )));
+            let preview: String = summary_body.chars().take(700).collect();
+            let preview = if summary_body.chars().count() > 700 {
+                format!("{preview}…")
+            } else {
+                preview
+            };
+            detail_lines.extend(markdown::render_prose(&preview, prose_w));
+            detail_lines.push(Line::from(""));
+            detail_lines.push(Line::from(Span::styled(
+                "Enter / Ctrl-O · full report",
+                faint(),
+            )));
         }
     } else {
-        right_lines.push(Line::from(Span::styled("No active background agents.", Style::default().fg(muted()))));
+        detail_lines.push(Line::from(Span::styled("↑↓ select a lane", muted())));
     }
 
-    frame.render_widget(Paragraph::new(right_lines), right_pane);
+    let visible_h = detail_inner.height as usize;
+    let max_scroll = detail_lines.len().saturating_sub(visible_h.max(1));
+    let scroll = app.lanes_detail_scroll.min(max_scroll);
+    let shown: Vec<Line<'static>> = detail_lines
+        .into_iter()
+        .skip(scroll)
+        .take(visible_h.max(1))
+        .collect();
+    frame.render_widget(Paragraph::new(shown), detail_inner);
+
+    let scroll_hint = if max_scroll > 0 {
+        format!("  ·  PgUp/PgDn ({}/{})", scroll + 1, max_scroll + 1)
+    } else {
+        String::new()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("↑↓ lane   Enter expand   Esc back{scroll_hint}"),
+            Style::default().fg(faint()),
+        ))),
+        chunks[1],
+    );
 }
 
-/// The approval prompt shown above the input while a mutating tool awaits y/n.
 fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     use ratatui::widgets::{Block, Borders, Wrap};
     let Some((tool, summary, index, total)) = app.pending_approval() else {
@@ -3504,50 +4504,51 @@ fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     };
     // "approve all" only makes sense with more than one pending in this batch.
     let mut action_spans = vec![
-        Span::styled("  ✓ y ", Style::default().fg(success()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  ✓ y ",
+            Style::default().fg(success()).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("approve   ", subtle()),
     ];
     if total > 1 {
-        action_spans.push(Span::styled("⏩ a ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
+        action_spans.push(Span::styled(
+            "⏩ a ",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
         action_spans.push(Span::styled("approve all   ", subtle()));
     }
     action_spans.extend([
-        Span::styled("✗ n ", Style::default().fg(danger()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "✗ n ",
+            Style::default().fg(danger()).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("deny   ", subtle()),
-        Span::styled("esc ", Style::default().fg(muted()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "esc ",
+            Style::default().fg(muted()).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("stop", subtle()),
     ]);
     let actions = Line::from(action_spans);
     let body = vec![
-        Line::from(Span::styled(format!("  {prefix}{cmd}"), Style::default().fg(self::text()))),
+        Line::from(Span::styled(
+            format!("  {prefix}{cmd}"),
+            Style::default().fg(self::text()),
+        )),
         Line::from(""),
         actions,
     ];
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(warn()))
-        .title(Span::styled(title, Style::default().fg(warn()).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            title,
+            Style::default().fg(warn()).add_modifier(Modifier::BOLD),
+        ));
     frame.render_widget(
         Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
         area,
     );
-}
-
-/// An animated "compacting" progress line shown directly above the input box while
-/// the history is being compacted.
-fn render_compaction_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    const BARS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
-    let f = app.frame as usize;
-    let mut spans = vec![Span::styled(
-        " ✦ compacting context  ",
-        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-    )];
-    for i in 0..16usize {
-        let phase = (f / 2 + i * 2) % 14;
-        let h = if phase < 7 { phase } else { 14 - phase };
-        spans.push(Span::styled(BARS[h.min(7)], Style::default().fg(accent())));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// One-line auth/endpoint status for a profile card.
@@ -3565,7 +4566,11 @@ fn profile_status(cfg: &crate::config::ModelConfig) -> String {
                 .base_url
                 .trim_start_matches("https://")
                 .trim_start_matches("http://");
-            host.split('/').next().filter(|h| !h.is_empty()).unwrap_or("custom endpoint").to_string()
+            host.split('/')
+                .next()
+                .filter(|h| !h.is_empty())
+                .unwrap_or("custom endpoint")
+                .to_string()
         }
         _ => {
             if cfg.api_key.trim().is_empty() {
@@ -3595,15 +4600,27 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let active_lanes = app
         .state
         .as_ref()
-        .map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count())
+        .map(|s| {
+            s.lanes
+                .iter()
+                .filter(|l| l.status == LaneStatus::Running)
+                .count()
+        })
         .unwrap_or(0);
     let mut header_spans = vec![
-        Span::styled(" snippet", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " snippet",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ·  models", subtle()),
     ];
     if active_lanes > 0 {
         header_spans.push(Span::styled(
-            format!("  ·  {} active lane{}", active_lanes, if active_lanes == 1 { "" } else { "s" }),
+            format!(
+                "  ·  {} active lane{}",
+                active_lanes,
+                if active_lanes == 1 { "" } else { "s" }
+            ),
             Style::default().fg(lane()),
         ));
     }
@@ -3612,7 +4629,12 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let names = app.options.config.profile_names();
     let total = names.len();
     let active = app.options.config.active_setup.clone().unwrap_or_default();
-    let delegate = app.options.config.delegate_setup.clone().unwrap_or_default();
+    let delegate = app
+        .options
+        .config
+        .delegate_setup
+        .clone()
+        .unwrap_or_default();
     let setups = app.options.config.setups.as_ref();
     let sel = app.profiles_selected_index.min(total); // index `total` == the Add row
 
@@ -3620,12 +4642,19 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let list_h = (chunks[1].height as usize).saturating_sub(2);
     let visible = (list_h.saturating_sub(2) / 3).max(1);
     let focus = sel.min(total.saturating_sub(1));
-    let start = if total > 0 && focus >= visible { focus + 1 - visible } else { 0 };
+    let start = if total > 0 && focus >= visible {
+        focus + 1 - visible
+    } else {
+        0
+    };
     let end = (start + visible).min(total);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     if start > 0 {
-        lines.push(Line::from(Span::styled(format!("  ↑ {start} more"), Style::default().fg(faint()))));
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {start} more"),
+            Style::default().fg(faint()),
+        )));
     }
     for i in start..end {
         let name = &names[i];
@@ -3641,7 +4670,9 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 if is_sel {
                     Style::default().fg(accent()).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(self::text()).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(self::text())
+                        .add_modifier(Modifier::BOLD)
                 },
             ),
         ];
@@ -3674,7 +4705,10 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let add_sel = sel >= total;
     lines.push(Line::from(vec![
-        Span::styled(if add_sel { "▍ " } else { "  " }, Style::default().fg(accent())),
+        Span::styled(
+            if add_sel { "▍ " } else { "  " },
+            Style::default().fg(accent()),
+        ),
         Span::styled(
             "+ Add a model",
             if add_sel {
@@ -3709,12 +4743,18 @@ fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         };
         frame.render_widget(Clear, popup);
         let block = Block::default()
-            .title(Span::styled(" model setup ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                " model setup ",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(accent()));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        frame.render_widget(Paragraph::new(login_lines(app, inner.width as usize)).wrap(Wrap { trim: false }), inner);
+        frame.render_widget(
+            Paragraph::new(login_lines(app, inner.width as usize)).wrap(Wrap { trim: false }),
+            inner,
+        );
     }
 }
 
@@ -3736,14 +4776,23 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
         .split(area);
 
     let header_text = vec![
-        Span::styled("✦ > snippet", Style::default().fg(lane()).add_modifier(Modifier::BOLD)),
-        Span::styled("  │  Select a session to resume", Style::default().fg(text())),
+        Span::styled(
+            "✦ > snippet",
+            Style::default().fg(lane()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "  │  Select a session to resume",
+            Style::default().fg(text()),
+        ),
     ];
     frame.render_widget(Paragraph::new(Line::from(header_text)), chunks[0]);
 
     let mut lines = Vec::new();
     if convs.is_empty() {
-        lines.push(Line::from(Span::styled("  No saved conversations found.", subtle())));
+        lines.push(Line::from(Span::styled(
+            "  No saved conversations found.",
+            subtle(),
+        )));
     } else {
         let total = convs.len();
         let selected_idx = app.resume_selected_index.min(total - 1);
@@ -3765,7 +4814,10 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
             let line = if is_selected {
                 Line::from(vec![
                     Span::styled("▶ 📁 ", Style::default().fg(accent())),
-                    Span::styled(format!("{:<36} ", name), Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{:<36} ", name),
+                        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(desc.to_string(), subtle()),
                 ])
             } else {
@@ -3796,7 +4848,7 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     let footer_text = "↑/↓ scroll  ·  Enter resume  ·  r rename  ·  d delete  ·  Esc go back";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer_text, subtle()))),
-        chunks[2]
+        chunks[2],
     );
 }
 
@@ -3814,7 +4866,10 @@ fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
         .split(area);
 
     let header = vec![
-        Span::styled("✦ > snippet", Style::default().fg(lane()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "✦ > snippet",
+            Style::default().fg(lane()).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  │  Select Theme Palette", Style::default().fg(text())),
     ];
     frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
@@ -3846,7 +4901,10 @@ fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
             Style::default().fg(self::text())
         };
         let t = preset.theme;
-        let mut spans = vec![bar, Span::styled(format!("{:<22}", preset.label), label_style)];
+        let mut spans = vec![
+            bar,
+            Span::styled(format!("{:<22}", preset.label), label_style),
+        ];
         for color in [t.accent, t.success, t.warn, t.danger, t.lane, t.code] {
             spans.push(Span::styled("●", Style::default().fg(color)));
             spans.push(Span::raw(" "));
@@ -3914,6 +4972,35 @@ fn get_suggestions(app: &App) -> Vec<(String, String)> {
             .collect();
     }
 
+    if app.input.starts_with("/fork") {
+        let query = app.input.strip_prefix("/fork ").unwrap_or("");
+        let checkpoints = app
+            .state
+            .as_ref()
+            .map(|s| s.checkpoints.clone())
+            .unwrap_or_default();
+        let mut out: Vec<(String, String)> = Vec::new();
+        if query.is_empty() {
+            out.push((
+                "/fork".to_string(),
+                "Branch at latest checkpoint (or full history)".to_string(),
+            ));
+        }
+        for c in checkpoints.iter().rev() {
+            let short = &c.id[..c.id.len().min(8)];
+            let cmd = format!("/fork {short}");
+            if query.is_empty()
+                || short.contains(query)
+                || c.label
+                    .to_ascii_lowercase()
+                    .contains(&query.to_ascii_lowercase())
+            {
+                out.push((cmd, c.label.clone()));
+            }
+        }
+        return out;
+    }
+
     if !app.input.contains(' ') {
         ALL_COMMANDS
             .iter()
@@ -3976,25 +5063,28 @@ fn render_suggestions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let line = if let Some(ref err) = app.error {
         Line::from(vec![
-            Span::styled("error: ", Style::default().fg(danger()).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "error: ",
+                Style::default().fg(danger()).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(err.to_string(), Style::default().fg(danger())),
         ])
     } else {
-        Line::from(vec![
-            Span::styled(&app.status, subtle()),
-        ])
+        Line::from(vec![Span::styled(&app.status, subtle())])
     };
     frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let model = app.effective_model.1.clone();
-    let has_events = app.state.as_ref().map(|s| !s.events.is_empty()).unwrap_or(false);
+    let has_events = app
+        .state
+        .as_ref()
+        .map(|s| !s.events.is_empty())
+        .unwrap_or(false);
 
     if !has_events {
-        let right_line = Line::from(vec![
-            Span::styled("->9", Style::default().fg(faint())),
-        ]);
+        let right_line = Line::from(vec![Span::styled("->9", Style::default().fg(faint()))]);
         frame.render_widget(
             Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
             area,
@@ -4005,22 +5095,53 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let prompt_text = app
         .state
         .as_ref()
-        .map(|s| s.user_request.trim())
-        .filter(|req| !req.is_empty())
+        .and_then(|s| s.title.as_deref())
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
         .unwrap_or("snippet");
 
     let left = vec![
-        Span::styled("☉ > ", Style::default().fg(Color::Rgb(125, 207, 245)).add_modifier(Modifier::BOLD)),
-        Span::styled(prompt_text, Style::default().fg(text()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "☉ > ",
+            Style::default()
+                .fg(Color::Rgb(125, 207, 245))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            prompt_text,
+            Style::default().fg(text()).add_modifier(Modifier::BOLD),
+        ),
     ];
 
-    let mut right: Vec<Span<'static>> = vec![
-        Span::styled(format!("-> {model}"), Style::default().fg(Color::Rgb(125, 207, 245))),
-    ];
+    let mut right: Vec<Span<'static>> = vec![Span::styled(
+        format!("·  {model}"),
+        Style::default().fg(Color::Rgb(125, 207, 245)),
+    )];
+
+    // Compact lane indicator in the header bar.
+    if let Some(state) = &app.state {
+        if !state.lanes.is_empty() {
+            let running = state
+                .lanes
+                .iter()
+                .filter(|l| l.status == LaneStatus::Running)
+                .count();
+            let total = state.lanes.len();
+            let label = if running > 0 {
+                format!("{total} delegated lanes \u{25B2}{running}  ")
+            } else {
+                format!("{total} delegated lanes  ")
+            };
+            right.insert(0, Span::styled(label, Style::default().fg(accent())));
+        }
+    }
 
     let update = app.update_notice.lock().ok().and_then(|g| g.clone());
     if let Some(v) = update {
-        right.insert(0, Span::styled(format!("⬆ v{v}   "), Style::default().fg(accent())));
+        right.insert(
+            0,
+            Span::styled(format!("⬆ v{v}   "), Style::default().fg(accent())),
+        );
     }
 
     let left_line = Line::from(left);
@@ -4053,10 +5174,12 @@ fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // Empty state: no conversation yet (and not in the login form) — show a small
     // animated splash centered in the content area instead of a blank screen.
     let empty = !app.login_active
-        && app
-            .state
-            .as_ref()
-            .map_or(true, |s| s.events.is_empty() && s.user_request.trim().is_empty());
+        && app.state.as_ref().map_or(true, |s| {
+            s.events.is_empty()
+                && s.title
+                    .as_deref()
+                    .is_none_or(|title| title.trim().is_empty())
+        });
     if empty {
         let block = empty_state_lines(&app.cwd_display, &app.effective_model.1, width);
         // Sit a little above the vertical middle so it reads as a starting page,
@@ -4127,7 +5250,11 @@ fn q_options(question: &Value) -> Vec<(String, String)> {
             .map(|cs| {
                 cs.iter()
                     .map(|c| {
-                        let value = c.get("value").and_then(Value::as_str).unwrap_or("").to_string();
+                        let value = c
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         let label = c
                             .get("label")
                             .and_then(Value::as_str)
@@ -4135,7 +5262,11 @@ fn q_options(question: &Value) -> Vec<(String, String)> {
                             .filter(|s| !s.is_empty())
                             .map(str::to_string)
                             .unwrap_or_else(|| value.clone());
-                        let value = if value.is_empty() { label.clone() } else { value };
+                        let value = if value.is_empty() {
+                            label.clone()
+                        } else {
+                            value
+                        };
                         (value, label)
                     })
                     .collect()
@@ -4204,7 +5335,11 @@ fn handle_question_key(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Up if is_choice => {
-            app.q_sel = if app.q_sel == 0 { opts.len() - 1 } else { app.q_sel - 1 };
+            app.q_sel = if app.q_sel == 0 {
+                opts.len() - 1
+            } else {
+                app.q_sel - 1
+            };
             true
         }
         KeyCode::Down if is_choice => {
@@ -4277,7 +5412,12 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .next()
         .unwrap_or_default();
     lines.push(Line::from(vec![
-        Span::styled(q_line, Style::default().fg(self::text()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            q_line,
+            Style::default()
+                .fg(self::text())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(counter, Style::default().fg(faint)),
     ]));
 
@@ -4285,7 +5425,10 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     if opts.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("  ↳ ", Style::default().fg(accent)),
-            Span::styled("type your answer below, then press ↵", Style::default().fg(faint)),
+            Span::styled(
+                "type your answer below, then press ↵",
+                Style::default().fg(faint),
+            ),
         ]));
         lines.push(Line::from(Span::styled(
             "  ↵ submit · Esc cancel",
@@ -4303,7 +5446,9 @@ fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 Span::styled(
                     label.clone(),
                     if focused {
-                        Style::default().fg(self::text()).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(self::text())
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(dim)
                     },
@@ -4347,7 +5492,10 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     // the input box just shows the controls.
     if app.login_active {
         let line = Line::from(vec![
-            Span::styled(" ❯ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ❯ ",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 "Tab next · ←/→ change · Enter connect · Esc cancel",
                 Style::default().fg(faint()),
@@ -4358,14 +5506,21 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     }
 
     if app.input.is_empty() {
-        let has_events = app.state.as_ref().map(|s| !s.events.is_empty()).unwrap_or(false);
+        let has_events = app
+            .state
+            .as_ref()
+            .map(|s| !s.events.is_empty())
+            .unwrap_or(false);
 
         if !has_events {
             return;
         }
 
         let prompt = Line::from(vec![
-            Span::styled("✦ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "✦ ",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("type a prompt to steer...", Style::default().fg(muted())),
         ]);
         let mut lines = Vec::new();
@@ -4400,7 +5555,10 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     for (k, row) in rows.iter().enumerate() {
         let mut spans = Vec::new();
         if k == 0 {
-            spans.push(Span::styled("✦ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                "✦ ",
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ));
         } else {
             spans.push(Span::raw("  "));
         }
@@ -4433,7 +5591,9 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 /// visible without digging through the transcript. Finished lanes don't linger
 /// here; their completion rows live in the transcript.
 fn lane_lines(app: &App) -> Vec<Line<'static>> {
-    let Some(state) = &app.state else { return Vec::new() };
+    let Some(state) = &app.state else {
+        return Vec::new();
+    };
     let running: Vec<&crate::lanes::LaneRecord> = state
         .lanes
         .iter()
@@ -4450,7 +5610,9 @@ fn lane_lines(app: &App) -> Vec<Line<'static>> {
             let elapsed = chrono::DateTime::parse_from_rfc3339(&l.started_at)
                 .ok()
                 .map(|t| {
-                    let secs = (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds().max(0);
+                    let secs = (chrono::Utc::now() - t.with_timezone(&chrono::Utc))
+                        .num_seconds()
+                        .max(0);
                     if secs < 60 {
                         format!("{secs}s")
                     } else {
@@ -4486,9 +5648,9 @@ fn queued_lines(app: &App) -> Vec<Line<'static>> {
     }
     let rail = Span::styled(" │ ", Style::default().fg(faint()));
     let header = if n == 1 {
-        "queued — sends when the run finishes · Ctrl+X to cancel".to_string()
+        "queued — sends when idle · Ctrl+S steers now · Ctrl+X cancel".to_string()
     } else {
-        format!("queued ({n}) — send together when the run finishes · Ctrl+X to cancel")
+        format!("queued ({n}) — send when idle · Ctrl+S steers now · Ctrl+X cancel")
     };
     let mut lines = vec![Line::from(vec![
         rail.clone(),
@@ -4533,7 +5695,13 @@ fn input_height(app: &App, width: u16) -> u16 {
     let lanes_h: u16 = app
         .state
         .as_ref()
-        .map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count().min(4) as u16)
+        .map(|s| {
+            s.lanes
+                .iter()
+                .filter(|l| l.status == LaneStatus::Running)
+                .count()
+                .min(4) as u16
+        })
         .unwrap_or(0);
     let queued = queued + lanes_h;
     if app.input.is_empty() {
@@ -4601,7 +5769,10 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let pad = width.min(56).saturating_sub(18).max(3);
     lines.push(Line::from(vec![
         Span::styled("── ", Style::default().fg(rule)),
-        Span::styled("connect a model", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "connect a model",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!(" {}", "─".repeat(pad)), Style::default().fg(rule)),
     ]));
     lines.push(Line::from(""));
@@ -4617,7 +5788,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 format!("{label:<12}"),
                 Style::default()
                     .fg(if focused { w } else { dim })
-                    .add_modifier(if focused { Modifier::BOLD } else { Modifier::empty() }),
+                    .add_modifier(if focused {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             ),
             Span::raw("  "),
         ];
@@ -4634,7 +5809,10 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 Span::styled(format!(" ›{suffix}"), Style::default().fg(accent)),
             ]
         } else {
-            vec![Span::styled(format!("{text}{suffix}"), Style::default().fg(w))]
+            vec![Span::styled(
+                format!("{text}{suffix}"),
+                Style::default().fg(w),
+            )]
         }
     };
 
@@ -4651,8 +5829,14 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let signed_in = crate::xai_auth::is_signed_in();
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("    xAI account", Style::default().fg(w).add_modifier(Modifier::BOLD)),
-            Span::styled("  ·  SuperGrok / X Premium subscription", Style::default().fg(dim)),
+            Span::styled(
+                "    xAI account",
+                Style::default().fg(w).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  SuperGrok / X Premium subscription",
+                Style::default().fg(dim),
+            ),
         ]));
         if signed_in {
             lines.push(Line::from(Span::styled(
@@ -4687,8 +5871,14 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let signed_in = crate::chatgpt_auth::is_signed_in();
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("    ChatGPT account", Style::default().fg(w).add_modifier(Modifier::BOLD)),
-            Span::styled("  ·  browser or device-code sign in", Style::default().fg(dim)),
+            Span::styled(
+                "    ChatGPT account",
+                Style::default().fg(w).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  ·  browser or device-code sign in",
+                Style::default().fg(dim),
+            ),
         ]));
         if signed_in {
             lines.push(Line::from(Span::styled(
@@ -4725,7 +5915,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let key_len = app.form_api_key.chars().count();
         let key_val = if key_len == 0 {
             vec![Span::styled(
-                if k_focus { "█".to_string() } else { "(required)".to_string() },
+                if k_focus {
+                    "█".to_string()
+                } else {
+                    "(required)".to_string()
+                },
                 Style::default().fg(if k_focus { accent } else { faint }),
             )]
         } else {
@@ -4743,7 +5937,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let u_focus = focus == SettingsField::BaseUrl;
         let mut url_val = vec![Span::styled(
             app.form_base_url.clone(),
-            Style::default().fg(if app.form_base_url.is_empty() { faint } else { w }),
+            Style::default().fg(if app.form_base_url.is_empty() {
+                faint
+            } else {
+                w
+            }),
         )];
         if u_focus {
             url_val.push(Span::styled("█", Style::default().fg(accent)));
@@ -4758,7 +5956,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     } else {
         app.form_model.clone()
     };
-    lines.push(field_row("model", m_focus, chooser(model_text, m_focus, " ▾")));
+    lines.push(field_row(
+        "model",
+        m_focus,
+        chooser(model_text, m_focus, " ▾"),
+    ));
 
     // Reasoning / thinking effort
     let r_focus = focus == SettingsField::Reasoning;
@@ -4780,7 +5982,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let cw_focus = focus == SettingsField::ContextWindow;
     let mut cw_val = vec![Span::styled(
         app.form_context_window.clone(),
-        Style::default().fg(if app.form_context_window.is_empty() { faint } else { w }),
+        Style::default().fg(if app.form_context_window.is_empty() {
+            faint
+        } else {
+            w
+        }),
     )];
     if cw_focus {
         cw_val.push(Span::styled("█", Style::default().fg(accent)));
@@ -4807,7 +6013,11 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 let is_cur = row == app.form_model;
                 lines.push(Line::from(vec![
                     Span::styled(
-                        if is_cur { "          ▸ " } else { "            " },
+                        if is_cur {
+                            "          ▸ "
+                        } else {
+                            "            "
+                        },
                         Style::default().fg(accent),
                     ),
                     Span::styled(
@@ -4859,31 +6069,84 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let left: Vec<Span<'static>> = vec![
         Span::styled("◇ ", Style::default().fg(accent())),
-        Span::styled(format!("{} ", if app.effective_model.1.is_empty() { "opus" } else { &app.effective_model.1 }), Style::default().fg(text()).add_modifier(Modifier::BOLD)),
-        Span::styled("[medium] ", dim),
-        Span::styled("· ∿ main  ", faint_style),
+        Span::styled(
+            format!(
+                "{} ",
+                if app.effective_model.1.is_empty() {
+                    "opus"
+                } else {
+                    &app.effective_model.1
+                }
+            ),
+            Style::default().fg(text()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("· ", faint_style),
         // Workspace rounded pill tab
         Span::styled("", Style::default().fg(Color::Rgb(245, 158, 11))),
-        Span::styled(format!("📁 {folder_name}"), Style::default().fg(Color::Black).bg(Color::Rgb(245, 158, 11)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("📁 {folder_name}"),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(245, 158, 11))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("", Style::default().fg(Color::Rgb(245, 158, 11))),
     ];
 
+    // Bottom-right usage cluster: conversation-compaction chip (90% path) + gauge.
+    // Tool-payload prune stays a quiet transcript divider only — not footer chrome.
+    // Gauge uses last provider-reported prompt tokens only (never a local estimate).
     let mut right: Vec<Span<'static>> = Vec::new();
 
-    let ctx_pct = st
+    if app.is_compacting() {
+        // Animated status while the agentic ~90% history compact runs.
+        let dots = match (app.frame / 3) % 4 {
+            0 => "   ",
+            1 => ".  ",
+            2 => ".. ",
+            _ => "...",
+        };
+        right.push(Span::styled(
+            format!("✦ compacting context{dots}"),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        ));
+        right.push(Span::styled(" · ", faint_style));
+    }
+
+    let (ctx_pct, filled) = st
         .map(|s| {
-            if s.context_window > 0 {
-                ((s.last_prompt_tokens as f64 / s.context_window as f64) * 100.0).round() as usize
+            if s.context_window > 0 && s.last_prompt_tokens > 0 {
+                let pct = ((s.last_prompt_tokens as f64 / s.context_window as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as usize;
+                let filled = ((pct as f64 / 100.0) * 6.0).round() as usize;
+                (pct, filled.min(6))
             } else {
-                5
+                (0usize, 0usize)
             }
         })
-        .unwrap_or(5);
+        .unwrap_or((0, 0));
 
-    right.extend([
-        Span::styled(format!("[□□□□□□] {}% · ", ctx_pct), Style::default().fg(text())),
-        Span::styled("∿ ^K", faint_style),
-    ]);
+    let mut bar = String::from("[");
+    for i in 0..6 {
+        bar.push(if i < filled { '█' } else { '░' });
+    }
+    bar.push(']');
+    let bar_color = if app.is_compacting() {
+        accent()
+    } else if ctx_pct >= 90 {
+        danger()
+    } else if ctx_pct >= 75 {
+        warn()
+    } else {
+        text()
+    };
+    right.push(Span::styled(
+        format!("{bar} {ctx_pct}%"),
+        Style::default().fg(bar_color),
+    ));
+    right.push(Span::styled(" · ", faint_style));
+    right.push(Span::styled("^K", dim));
 
     let left_line = Line::from(left);
     let right_line = Line::from(right);
@@ -4891,7 +6154,10 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(right_w + 1)])
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(right_w.saturating_add(1)),
+        ])
         .split(area);
 
     frame.render_widget(Paragraph::new(left_line), cols[0]);
@@ -4900,8 +6166,6 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         cols[1],
     );
 }
-
-
 
 /// SI-ish formatting for token counts: 91M, 425k, 128k, 512.
 fn fmt_si(n: u64) -> String {
@@ -4986,7 +6250,8 @@ async fn fetch_models_from_provider(
     match provider.as_str() {
         "openai" => {
             let url = "https://api.openai.com/v1/models";
-            let res = client.get(url)
+            let res = client
+                .get(url)
                 .bearer_auth(api_key)
                 .send()
                 .await
@@ -5021,7 +6286,8 @@ async fn fetch_models_from_provider(
             } else {
                 format!("{raw}/v1/models")
             };
-            let res = client.get(&url)
+            let res = client
+                .get(&url)
                 .header("x-api-key", api_key)
                 .header("anthropic-version", "2023-06-01")
                 .send()
@@ -5046,11 +6312,11 @@ async fn fetch_models_from_provider(
             Ok(models)
         }
         "gemini" => {
-            let url = format!("https://generativelanguage.googleapis.com/v1beta/models?key={}", api_key);
-            let res = client.get(&url)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?key={}",
+                api_key
+            );
+            let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
             if !res.status().is_success() {
                 return Err(format!("HTTP status {}", res.status()));
             }
@@ -5172,7 +6438,3 @@ async fn fetch_models_from_provider(
         _ => Err(format!("Unsupported provider: {}", provider)),
     }
 }
-
-
-
-

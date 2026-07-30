@@ -65,7 +65,9 @@ impl AgentModel for AnthropicModel {
         let url = &anthropic_messages_url(&self.config.base_url);
         let url = url.as_str();
         if let Some(sink) = sink {
-            return self.generate_streaming(url, messages, tools, force_tool, &sink).await;
+            return self
+                .generate_streaming(url, messages, tools, force_tool, &sink)
+                .await;
         }
         let body = self.build_anthropic_request(messages, tools, force_tool, false);
         let bytes = self.send_with_retries(url, &body).await?;
@@ -125,13 +127,20 @@ impl AnthropicModel {
         stream: bool,
     ) -> AnthropicRequest {
         let (system_prompt, mut anthropic_messages) = prepare_messages(messages);
-        let system = system_prompt.map(|prompt| vec![AnthropicSystemContent {
-            content_type: "text",
-            text: prompt,
-            cache_control: if self.config.cache_prompt { Some(json!({"type": "ephemeral"})) } else { None },
-        }]);
+        let system = system_prompt.map(|prompt| {
+            vec![AnthropicSystemContent {
+                content_type: "text",
+                text: prompt,
+                cache_control: if self.config.cache_prompt {
+                    Some(json!({"type": "ephemeral"}))
+                } else {
+                    None
+                },
+            }]
+        });
 
-        let mut anthropic_tools: Vec<AnthropicTool> = tools.iter().map(anthropic_tool_from_definition).collect();
+        let mut anthropic_tools: Vec<AnthropicTool> =
+            tools.iter().map(anthropic_tool_from_definition).collect();
         if self.config.cache_prompt {
             if let Some(last_tool) = anthropic_tools.last_mut() {
                 last_tool.cache_control = Some(json!({"type": "ephemeral"}));
@@ -177,8 +186,9 @@ impl AnthropicModel {
                 // Single-message requests (summarizer / reflection workers): the
                 // only block is the target — their long shared prefix still
                 // benefits across those workers' turns.
-                if let Some(block) =
-                    anthropic_messages.last_mut().and_then(|m| m.content.last_mut())
+                if let Some(block) = anthropic_messages
+                    .last_mut()
+                    .and_then(|m| m.content.last_mut())
                 {
                     stamp(block);
                 }
@@ -311,7 +321,11 @@ impl AnthropicModel {
         ))
     }
 
-    async fn send_with_retries(&self, url: &str, body: &AnthropicRequest) -> Result<Vec<u8>, ToolError> {
+    async fn send_with_retries(
+        &self,
+        url: &str,
+        body: &AnthropicRequest,
+    ) -> Result<Vec<u8>, ToolError> {
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
         let mut fatal = false;
@@ -416,7 +430,10 @@ async fn parse_anthropic_sse(
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if let Some(usage) = event.pointer("/message/usage") {
-                    input_tokens = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
                     cache_read = usage
                         .get("cache_read_input_tokens")
                         .and_then(Value::as_u64)
@@ -454,7 +471,8 @@ async fn parse_anthropic_sse(
                 let delta = event.get("delta");
                 match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
                     Some("text_delta") => {
-                        if let Some(chunk) = delta.and_then(|d| d.get("text")).and_then(Value::as_str)
+                        if let Some(chunk) =
+                            delta.and_then(|d| d.get("text")).and_then(Value::as_str)
                         {
                             text.push_str(chunk);
                             StreamBuffer::append(sink, chunk);
@@ -463,8 +481,9 @@ async fn parse_anthropic_sse(
                     // Extended-thinking tokens (present only when thinking is
                     // enabled) — shown dimmed, separate from the answer.
                     Some("thinking_delta") => {
-                        if let Some(chunk) =
-                            delta.and_then(|d| d.get("thinking")).and_then(Value::as_str)
+                        if let Some(chunk) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(Value::as_str)
                         {
                             StreamBuffer::append_thinking(sink, chunk);
                         }
@@ -483,13 +502,13 @@ async fn parse_anthropic_sse(
                 }
             }
             Some("message_delta") => {
-                if let Some(reason) = event
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str)
-                {
+                if let Some(reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     stop_reason = Some(reason.to_string());
                 }
-                if let Some(out) = event.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                if let Some(out) = event
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64)
+                {
                     output_tokens = out;
                 }
                 // Some Anthropic-COMPATIBLE gateways (e.g. OpenCode zen) put the
@@ -500,10 +519,16 @@ async fn parse_anthropic_sse(
                 if let Some(inp) = event.pointer("/usage/input_tokens").and_then(Value::as_u64) {
                     input_tokens = inp;
                 }
-                if let Some(cr) = event.pointer("/usage/cache_read_input_tokens").and_then(Value::as_u64) {
+                if let Some(cr) = event
+                    .pointer("/usage/cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                {
                     cache_read = cr;
                 }
-                if let Some(cc) = event.pointer("/usage/cache_creation_input_tokens").and_then(Value::as_u64) {
+                if let Some(cc) = event
+                    .pointer("/usage/cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
                     cache_creation = cc;
                 }
             }
@@ -720,8 +745,14 @@ struct AnthropicResponse {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicResponseContent {
-    Text { text: String },
-    ToolUse { id: String, name: String, input: Value },
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
     // Extended-thinking blocks (tool-less requests can enable thinking); the
     // buffered path has nowhere to show them, but parsing must not fail on them.
     // Fields intentionally ignored.
@@ -749,13 +780,16 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                 system_prompt = Some(content.clone());
             }
             HarnessMessage::System { content } => {
-                let text = format!("[runtime_signal]\n{content}\n[/runtime_signal]");
+                let text = format!("[steering]\n{content}\n[/steering]");
                 push_block(&mut prepared, "user", text_block(text));
             }
             HarnessMessage::User { content } => {
                 push_block(&mut prepared, "user", text_block(content.clone()));
             }
-            HarnessMessage::Assistant { content, tool_calls } => {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 // Assistant turn: optional text, then a tool_use block per call.
                 if !content.is_empty() {
                     push_block(&mut prepared, "assistant", text_block(content.clone()));
@@ -843,4 +877,3 @@ fn push_block(prepared: &mut Vec<AnthropicMessage>, role: &str, block: Anthropic
         content: vec![block],
     });
 }
-

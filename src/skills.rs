@@ -22,7 +22,9 @@ pub struct Skill {
 
 /// snippet's own skills root (also where skill-management writes would go).
 pub fn skills_root() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     home.join(".snippet").join("skills")
 }
 
@@ -30,7 +32,9 @@ pub fn skills_root() -> PathBuf {
 /// Claude Code's and Codex's global skill folders use the same SKILL.md
 /// standard, so anything installed for them just works here.
 pub fn skills_roots() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     vec![
         skills_root(),
         home.join(".claude").join("skills"),
@@ -74,12 +78,21 @@ pub fn discover_in(root: &Path) -> Vec<Skill> {
         let (mut name, description, disable) = parse_frontmatter(&text);
         if name.is_empty() {
             // default to the folder name, like the open standard
-            name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
         }
         if name.is_empty() || description.is_empty() {
             continue;
         }
-        out.push(Skill { name, description, dir, path, disable_model_invocation: disable });
+        out.push(Skill {
+            name,
+            description,
+            dir,
+            path,
+            disable_model_invocation: disable,
+        });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -148,7 +161,9 @@ fn rank(skills: Vec<Skill>, query: &str) -> Vec<(String, String)> {
             continue;
         }
         let meta = format!("{} {}", sk.name, sk.description).to_lowercase();
-        let body = std::fs::read_to_string(&sk.path).map(|t| t.to_lowercase()).unwrap_or_default();
+        let body = std::fs::read_to_string(&sk.path)
+            .map(|t| t.to_lowercase())
+            .unwrap_or_default();
         let mut score = 0usize;
         for t in &terms {
             if meta.contains(t) {

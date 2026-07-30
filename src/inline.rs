@@ -120,9 +120,7 @@ fn coerce_value(raw: &str) -> Value {
     let trimmed = raw.trim();
     let looks_json = (trimmed.starts_with('[') && trimmed.ends_with(']'))
         || (trimmed.starts_with('{') && trimmed.ends_with('}'));
-    if looks_json
-        && let Ok(value) = serde_json::from_str::<Value>(trimmed)
-    {
+    if looks_json && let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return value;
     }
     Value::String(trimmed.to_string())

@@ -21,6 +21,8 @@ pub struct SessionHandle {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
     pub join: tokio::task::JoinHandle<Result<HarnessState, String>>,
     pub state_path: PathBuf,
+    /// Live token stream shared with attached UIs (TUI / mobile via WS).
+    pub stream: Option<StreamHandle>,
 }
 
 /// Spawn a resident conversation session for `config`, persisting to `state_path`.
@@ -37,7 +39,7 @@ pub fn start_session(
 }
 
 /// Spawn a session with an optional live browser-registry summary provider.
-/// The provider is read synchronously while building each turn's runtime context;
+/// The provider is read synchronously while building each turn's steering block;
 /// it never performs network or tool calls.
 pub fn start_session_with_browser_summary(
     config: &SnippetConfig,
@@ -68,6 +70,7 @@ pub fn start_session_with_browser_summary(
         Arc::new(move || mc.build_model())
     };
     let sp = state_path.clone();
+    let stream_out = stream.clone();
 
     let join = tokio::spawn(async move {
         let mut model = model_config.build_model();
@@ -110,7 +113,12 @@ pub fn start_session_with_browser_summary(
             .map_err(|e| e.to_string())
     });
 
-    SessionHandle { input_tx, join, state_path }
+    SessionHandle {
+        input_tx,
+        join,
+        state_path,
+        stream: stream_out,
+    }
 }
 
 /// One session as seen on disk, for the serve daemon's device-wide list.
@@ -184,7 +192,11 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
             for c in convs.flatten() {
                 let p = c.path();
                 if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                    let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    let name = p
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string();
                     if !name.is_empty() {
                         read_session(&p, &root, &name, &mut out);
                     }
@@ -210,16 +222,17 @@ fn meta_path(state_path: &Path) -> PathBuf {
     state_path.with_extension("meta.json")
 }
 
-/// The label for the session list: the user-set title override if present, else
-/// the first request truncated.
+/// The session-list label. New state stores this in `title`; the initial request
+/// fallback is only for old states while they are being migrated.
 fn effective_title(state: &HarnessState) -> String {
     state
         .title
         .as_deref()
+        .or_else(|| state.initial_request())
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(|t| t.chars().take(120).collect())
-        .unwrap_or_else(|| state.user_request.chars().take(120).collect())
+        .unwrap_or_default()
 }
 
 /// The status string exposed on the session list / events APIs. Uses the enum's
@@ -247,7 +260,11 @@ pub fn set_session_title(state_path: &Path, title: &str) -> Result<(), String> {
     let bytes = std::fs::read(state_path).map_err(|e| e.to_string())?;
     let mut state = deserialize_state(&bytes)?;
     let t = title.trim();
-    state.title = if t.is_empty() { None } else { Some(t.to_string()) };
+    state.title = if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    };
     let out = crate::harness::serialize_state(&state)?;
     // Temp + rename like `persist_state`: a crash mid-write must never leave a
     // truncated state file (an unreadable state is silently started-over on open).
@@ -256,6 +273,267 @@ pub fn set_session_title(state_path: &Path, title: &str) -> Result<(), String> {
     std::fs::rename(&tmp, state_path).map_err(|e| e.to_string())?;
     write_session_meta(state_path, &state);
     Ok(())
+}
+
+/// Where a fork cuts the source conversation. Both ends are exclusive lengths
+/// (`events[..event_end]`, `messages[..message_end]`).
+#[derive(Debug, Clone, Copy)]
+pub struct ForkPoint {
+    pub event_end: usize,
+    pub message_end: usize,
+}
+
+/// Resolve a fork cut from a checkpoint id and/or event index.
+///
+/// - **checkpoint**: same boundary as `/rewind` (state *before* that turn).
+/// - **event_index**: keep through that event (inclusive), then snap back to a
+///   provider-safe boundary (no orphan tool_call / tool_result pairs).
+/// - both: checkpoint wins for the cut; event_index is ignored.
+pub fn resolve_fork_point(
+    state: &HarnessState,
+    checkpoint: Option<&str>,
+    event_index: Option<usize>,
+) -> Result<ForkPoint, String> {
+    if let Some(id) = checkpoint.map(str::trim).filter(|s| !s.is_empty()) {
+        let cp = state
+            .checkpoints
+            .iter()
+            .rev()
+            .find(|c| c.id == id || c.id.starts_with(id))
+            .ok_or_else(|| format!("no checkpoint matching `{id}`"))?;
+        return Ok(ForkPoint {
+            event_end: cp.event_index.min(state.events.len()),
+            message_end: cp.message_index.min(state.messages.len()),
+        });
+    }
+    let Some(idx) = event_index else {
+        return Err("fork requires `checkpoint` or `event_index`".into());
+    };
+    if state.events.is_empty() {
+        return Err("nothing to fork — session has no events".into());
+    }
+    if idx >= state.events.len() {
+        return Err(format!(
+            "event_index {idx} out of range (0..{})",
+            state.events.len().saturating_sub(1)
+        ));
+    }
+    // Keep through idx (inclusive), then walk back to a safe tool-pairing boundary.
+    let mut event_end = idx + 1;
+    event_end = snap_event_end_safe(&state.events, event_end);
+    let message_end = message_end_for_events(state, event_end);
+    Ok(ForkPoint {
+        event_end,
+        message_end,
+    })
+}
+
+/// Walk exclusive `event_end` backward so we don't strand a tool_call without its
+/// result (or a trailing tool_result without its call) — providers 400 on that.
+fn snap_event_end_safe(events: &[crate::harness::HarnessEvent], mut end: usize) -> usize {
+    use crate::harness::HarnessEvent;
+    end = end.min(events.len());
+    while end > 0 {
+        match &events[end - 1] {
+            HarnessEvent::ToolResult { .. } => {
+                // Ensure a ToolCall exists earlier in the kept prefix for pairing
+                // at the tail; if the tail is ToolResult after ToolCall we're fine.
+                break;
+            }
+            HarnessEvent::ToolCall { .. } => {
+                // Orphan call at end — drop it.
+                end -= 1;
+            }
+            HarnessEvent::ApprovalRequest { .. } | HarnessEvent::InvalidToolCall { .. } => {
+                end -= 1;
+            }
+            _ => break,
+        }
+    }
+    end
+}
+
+/// Best-effort message length matching a kept event prefix.
+/// Prefer a checkpoint on the same boundary; otherwise count user/assistant/tool
+/// events and consume messages in order until those counts are met.
+fn message_end_for_events(state: &HarnessState, event_end: usize) -> usize {
+    use crate::harness::HarnessEvent;
+    use crate::llm::HarnessMessage;
+
+    if let Some(cp) = state
+        .checkpoints
+        .iter()
+        .filter(|c| c.event_index == event_end)
+        .last()
+    {
+        return cp.message_index.min(state.messages.len());
+    }
+    // Nearest checkpoint at or before the cut — start counts from there.
+    let (mut base_event, mut base_msg) = state
+        .checkpoints
+        .iter()
+        .filter(|c| c.event_index <= event_end)
+        .max_by_key(|c| c.event_index)
+        .map(|c| (c.event_index, c.message_index))
+        .unwrap_or((0, 0));
+    base_event = base_event.min(event_end);
+    base_msg = base_msg.min(state.messages.len());
+
+    let mut need_user = 0usize;
+    let mut need_assistant = 0usize;
+    let mut need_tool = 0usize;
+    for ev in state
+        .events
+        .get(base_event..event_end)
+        .into_iter()
+        .flatten()
+    {
+        match ev {
+            HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. } => need_user += 1,
+            HarnessEvent::AssistantText { .. } => need_assistant += 1,
+            HarnessEvent::ToolCall { .. } | HarnessEvent::ToolResult { .. } => need_tool += 1,
+            _ => {}
+        }
+    }
+
+    let mut i = base_msg;
+    let mut got_user = 0usize;
+    let mut got_assistant = 0usize;
+    let mut got_tool = 0usize;
+    while i < state.messages.len() {
+        if got_user >= need_user && got_assistant >= need_assistant && got_tool >= need_tool {
+            break;
+        }
+        match &state.messages[i] {
+            HarnessMessage::User { .. } => {
+                if got_user >= need_user {
+                    break;
+                }
+                got_user += 1;
+            }
+            HarnessMessage::Assistant { .. } => {
+                if got_assistant >= need_assistant && got_tool >= need_tool && got_user >= need_user
+                {
+                    // Extra assistant after targets met — stop before it.
+                    break;
+                }
+                got_assistant += 1;
+            }
+            HarnessMessage::ToolResult { .. } => {
+                got_tool += 1;
+            }
+            HarnessMessage::System { .. } | HarnessMessage::Summary { .. } => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Build a forked [`HarnessState`]: history truncated to `point`, idle, no live
+/// lanes/watches/questions. Workspace path is unchanged (shared files on disk).
+pub fn build_forked_state(source: &HarnessState, point: ForkPoint) -> HarnessState {
+    use crate::harness::{ApprovalMode, HarnessStatus};
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let event_end = point.event_end.min(source.events.len());
+    let message_end = point.message_end.min(source.messages.len());
+
+    let mut forked = source.clone();
+    forked.events.truncate(event_end);
+    forked.messages.truncate(message_end);
+    forked
+        .checkpoints
+        .retain(|c| c.event_index <= event_end && c.message_index <= message_end);
+    forked.lanes.clear();
+    forked.watches.clear();
+    forked.pending_question = None;
+    forked.goal = None;
+    forked.compacting = false;
+    forked.final_text = None;
+    forked.status = HarnessStatus::Idle;
+    forked.approval_mode = ApprovalMode::Auto;
+    // Fresh usage accounting for the branch (history is what matters).
+    forked.total_tokens = 0;
+    forked.prompt_tokens = 0;
+    forked.completion_tokens = 0;
+    forked.cache_read_tokens = 0;
+    forked.tool_payloads_pruned = false;
+    // Keep last_prompt_tokens / context_window as hints; model will refresh.
+    forked.created_at = now.clone();
+    forked.updated_at = now;
+    forked.iterations = 0;
+
+    let base_title = source
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("fork");
+    let short: String = base_title.chars().take(60).collect();
+    forked.title = Some(format!("fork · {short}"));
+    forked
+}
+
+/// Result of writing a forked conversation next to the source session.
+#[derive(Debug, Clone)]
+pub struct ForkedConversation {
+    /// Session id relative to the workspaces root (same form as `/sessions`).
+    pub id: String,
+    pub state_path: PathBuf,
+    pub title: String,
+    pub event_end: usize,
+    pub message_end: usize,
+}
+
+/// Fork `source_state_path` at `point` into a new `conversations/<uuid>.json`.
+/// Copies the model-profile sidecar when present. Does **not** start a live loop.
+pub fn write_forked_conversation(
+    source_state_path: &Path,
+    source: &HarnessState,
+    point: ForkPoint,
+) -> Result<ForkedConversation, String> {
+    let forked = build_forked_state(source, point);
+    let title = forked.title.clone().unwrap_or_else(|| "fork".to_string());
+
+    let parent = source_state_path
+        .parent()
+        .ok_or_else(|| "source state path has no parent".to_string())?;
+    // Source may be `state.json` or `conversations/<id>.json` — forks always land
+    // in `conversations/` beside the workspace state root.
+    let conv_dir = if parent.file_name().and_then(|s| s.to_str()) == Some("conversations") {
+        parent.to_path_buf()
+    } else {
+        parent.join("conversations")
+    };
+    std::fs::create_dir_all(&conv_dir).map_err(|e| format!("create conversations dir: {e}"))?;
+
+    let name = uuid::Uuid::new_v4().to_string();
+    let dest = conv_dir.join(format!("{name}.json"));
+    let bytes = crate::harness::serialize_state(&forked)?;
+    let tmp = dest.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write fork: {e}"))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("rename fork: {e}"))?;
+    write_session_meta(&dest, &forked);
+
+    // Carry the per-conversation model override onto the branch.
+    if let Some(profile) = read_session_profile(source_state_path) {
+        write_session_profile(&dest, &profile);
+    }
+
+    let root = workspaces_root();
+    let id = dest
+        .strip_prefix(&root)
+        .unwrap_or(&dest)
+        .display()
+        .to_string();
+
+    Ok(ForkedConversation {
+        id,
+        state_path: dest,
+        title,
+        event_end: point.event_end.min(source.events.len()),
+        message_end: point.message_end.min(source.messages.len()),
+    })
 }
 
 /// Write the metadata sidecar for a state file (best-effort). Called on every
@@ -283,7 +561,11 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let id = path.strip_prefix(root).unwrap_or(path).display().to_string();
+    let id = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string();
 
     // Fast path: read the tiny sidecar, no decompression.
     if let Some(meta) = std::fs::read(meta_path(path))
@@ -317,4 +599,115 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         status: status_str(state.status),
         last_active,
     });
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    use crate::harness::{HarnessEvent, HarnessState, HarnessStatus};
+    use crate::llm::HarnessMessage;
+
+    fn sample_state() -> HarnessState {
+        // Build via JSON so private migration fields stay internal.
+        let mut s: HarnessState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "status": "idle",
+            "created_at": "t0",
+            "updated_at": "t0",
+            "workspace": "/tmp/ws",
+            "title": "original title",
+            "messages": [],
+            "events": [],
+            "iterations": 3,
+            "total_tokens": 100,
+            "prompt_tokens": 80,
+            "completion_tokens": 20,
+            "last_prompt_tokens": 50,
+            "context_window": 128000
+        }))
+        .expect("sample state");
+        s.messages = vec![
+            HarnessMessage::User {
+                content: "hi".into(),
+            },
+            HarnessMessage::Assistant {
+                content: "hello".into(),
+                tool_calls: Vec::new(),
+            },
+            HarnessMessage::User {
+                content: "again".into(),
+            },
+        ];
+        s.events = vec![
+            HarnessEvent::UserInput { text: "hi".into() },
+            HarnessEvent::AssistantText {
+                text: "hello".into(),
+            },
+            HarnessEvent::UserInput {
+                text: "again".into(),
+            },
+        ];
+        s.checkpoints = vec![crate::harness::CheckpointRecord {
+            id: "abc12345deadbeef".into(),
+            label: "hi".into(),
+            created_at: "t0".into(),
+            event_index: 0,
+            message_index: 0,
+        }];
+        s
+    }
+
+    #[test]
+    fn resolve_checkpoint_cut() {
+        let s = sample_state();
+        let p = resolve_fork_point(&s, Some("abc12345"), None).unwrap();
+        assert_eq!(p.event_end, 0);
+        assert_eq!(p.message_end, 0);
+    }
+
+    #[test]
+    fn resolve_event_index_inclusive() {
+        let s = sample_state();
+        let p = resolve_fork_point(&s, None, Some(1)).unwrap();
+        assert_eq!(p.event_end, 2); // keep through index 1
+    }
+
+    #[test]
+    fn build_fork_truncates_and_idles() {
+        let s = sample_state();
+        let p = ForkPoint {
+            event_end: 2,
+            message_end: 2,
+        };
+        let f = build_forked_state(&s, p);
+        assert_eq!(f.events.len(), 2);
+        assert_eq!(f.messages.len(), 2);
+        assert_eq!(f.status, HarnessStatus::Idle);
+        assert!(f.lanes.is_empty());
+        assert!(f.title.as_deref().unwrap_or("").starts_with("fork ·"));
+        assert_eq!(f.total_tokens, 0);
+        assert!(!f.tool_payloads_pruned);
+    }
+
+    #[test]
+    fn snaps_orphan_tool_call_at_end() {
+        let mut s = sample_state();
+        s.events.push(HarnessEvent::ToolCall {
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        });
+        s.messages.push(HarnessMessage::Assistant {
+            content: String::new(),
+            tool_calls: Vec::new(),
+        });
+        let last = s.events.len() - 1;
+        let p = resolve_fork_point(&s, None, Some(last)).unwrap();
+        // Exclusive end must not leave a trailing ToolCall.
+        if p.event_end > 0 {
+            assert!(!matches!(
+                s.events[p.event_end - 1],
+                HarnessEvent::ToolCall { .. }
+            ));
+        }
+    }
 }

@@ -454,7 +454,10 @@ fn save_screenshot_tmp(value: &serde_json::Value) -> Result<String, Box<dyn std:
         return Err("unsupported screenshot data URL".into());
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-    let path = std::env::temp_dir().join(format!("snippet-screenshot-{}.png", uuid::Uuid::new_v4().simple()));
+    let path = std::env::temp_dir().join(format!(
+        "snippet-screenshot-{}.png",
+        uuid::Uuid::new_v4().simple()
+    ));
     std::fs::write(&path, bytes)?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -485,33 +488,36 @@ fn mime_type(path: &std::path::Path) -> &'static str {
 fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let manual = serde_json::json!({
         "workflow": [
-            "Run snippet browser list --json and use the exact device_name.",
-            "Run tabs.query, take the numeric result[].id as TAB_ID.",
-            "For page actions, always pass tabId: TAB_ID.",
-            "Take page.snapshot before using refs; refs expire after navigation or DOM changes.",
-            "Perform one action, inspect its result, then take a new snapshot if needed.",
-            "Never invent browser methods or use Runtime.evaluate directly; use page.eval.",
-            "For network inspection, call netwatch.start with tabId, then getEvents, and stop when finished."
+            "Once per connection: list --json for device_name, then tabs.query for TAB_ID; reuse both until invalidated.",
+            "Keep output small: pipe list/snapshot/manual JSON through jq and return only fields needed for the next action.",
+            "Use the cheapest probe: targeted page.eval for known state; filtered page.snapshot only when refs are needed; screenshot only for visual-only UI.",
+            "One action, then one small state check. Re-snapshot only after navigation/DOM change or a stale-ref error.",
+            "Use page.type for bulk text; page.key for named controls/shortcuts or one printable character. Use refs for DOM, coordinates/mouse for canvas or elements without refs.",
+            "Viewport/element: page.scroll. Nested/virtual/custom scroller: page.mouse.wheel over it. Verify actual movement.",
+            "Never invent methods or use Runtime.evaluate directly. Query one contract with: snippet browser manual --json | jq '.methods[\"METHOD\"]'.",
+            "Network/console: start, reproduce once, get a small limit, stop."
         ],
         "methods": {
             "tabs.query": "{active:true} is optional; returns tab objects. Use result[].id.",
             "tabs.get": "Requires {tabId:number}.",
             "tabs.update": "Requires {tabId:number,url:string}.",
-            "page.snapshot": "Requires {tabId:number}; returns refs such as e42.",
+            "tabs.create": "Creates a tab; usually provide {url:string}.",
+            "tabs.remove": "Requires {tabId:number} or {tabIds:[number]}.",
+            "page.snapshot": "Requires {tabId:number}; returns refs such as e42. Output can be large: pipe through jq and keep only matching ref/text/label/rect fields.",
             "page.click": "Requires {tabId:number,ref:string}; optional mode dom or cdp.",
             "page.type": "Requires {tabId:number,ref:string,text:string}; optional append.",
-            "page.key": "Requires {tabId:number,key:string}; this is the only keyboard method.",
+            "page.key": "Requires {tabId:number,ref:string,key:string}; optional code. Named keys handle Enter/Escape/Tab/arrows/shortcuts; one printable character inserts into editable controls and reports inserted. Prefer page.type for bulk text. Ref must be fresh.",
             "page.drag": "Requires {tabId:number,from:string,to:string}; drags between snapshot refs; optional mode cdp.",
             "page.dragHtml5": "Requires {tabId:number,from:string,to:string}; uses HTML5 drag events between snapshot refs.",
             "page.dragCoordinates": "Requires {tabId:number,x1:number,y1:number,x2:number,y2:number}; viewport CSS pixels, optional steps 2-100.",
-            "page.scroll": "Requires {tabId:number}; use {x:number,y:number} for viewport scrolling or {ref:string} to scroll an element into view.",
+            "page.scroll": "Requires {tabId:number}; finite {x,y} scrolls the viewport, {ref} reveals an element. If scrolled:false, the page may use a nested container: inspect once, then page.mouse.wheel over it. Verify position/content.",
             "page.geometry": "Requires {tabId:number,ref:string}; returns the element center and rect.",
             "page.clickCoordinate": "Requires {tabId:number,x:number,y:number}; uses Chrome CDP pointer input when available.",
             "page.mouse.click": "Requires {tabId:number,x:number,y:number}; Chrome uses Input.dispatchMouseEvent.",
             "page.mouse.move": "Requires {tabId:number,x:number,y:number}; optional steps and fromX/fromY.",
             "page.mouse.down": "Requires {tabId:number,x:number,y:number}; optional button.",
             "page.mouse.up": "Requires {tabId:number,x:number,y:number}; optional button.",
-            "page.mouse.wheel": "Requires {tabId:number,x:number,y:number}; provide deltaX and/or deltaY.",
+            "page.mouse.wheel": "Requires {tabId:number} and non-zero deltaX or deltaY; optional viewport x/y. Best for nested/virtual/wheel-driven UI; Chrome sends a real CDP wheel event. Verify container position/content.",
             "page.listFrames": "Requires {tabId:number}; returns frame ids. Pass frameId to page.snapshot and content-script actions.",
             "page.upload": "Requires {tabId:number,ref:string,files:[{name,type,data}]}; data is base64.",
             "page.getCookies": "Requires {tabId:number}; returns cookies for the tab URL.",
@@ -520,14 +526,14 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "page.handleDialog": "Chrome only; requires {tabId:number,accept:boolean}; enable dialog events first.",
             "page.enableDialogs": "Chrome only; requires {tabId:number}; keeps dialog event capture active until disconnect.",
             "page.startConsole": "Chrome only; requires {tabId:number}; starts bounded console event capture.",
-            "page.getConsole": "Chrome only; optional {limit:number}; returns buffered console events.",
+            "page.getConsole": "Chrome only; optional {limit:number,consume:boolean}; returns buffered console events. consume defaults true.",
             "page.stopConsole": "Chrome only; stops capture and releases its debugger use.",
-            "page.eval": "Requires {tabId:number,expression:string}; do not call Runtime.evaluate.",
+            "page.eval": "Requires {tabId:number,expression:string}; do not call Runtime.evaluate. Return a small scalar/object, not DOM/body dumps.",
             "page.screenshot": "Requires {tabId:number}; Firefox requires the tab to be active.",
             "netwatch.start": "Requires {tabId:number}; starts bounded metadata-only network capture for that tab.",
             "netwatch.pause": "Pauses capture while retaining the watcher and buffered events.",
             "netwatch.resume": "Resumes capture for the active watcher.",
-            "netwatch.getEvents": "Returns and removes buffered request/response/error metadata; optional {limit:number}.",
+            "netwatch.getEvents": "Returns buffered request/response/error metadata; optional {limit:number,consume:boolean}. consume defaults true; false peeks without removing events.",
             "netwatch.stop": "Stops capture and releases the Chrome debugger attachment."
         },
         "errors": {
@@ -541,7 +547,10 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     if json {
         println!("{}", serde_json::to_string_pretty(&manual)?);
     } else {
-        println!("BROWSER MANUAL\n\n{}", serde_json::to_string_pretty(&manual)?);
+        println!(
+            "BROWSER MANUAL\n\n{}",
+            serde_json::to_string_pretty(&manual)?
+        );
     }
     Ok(())
 }

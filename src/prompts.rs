@@ -6,11 +6,7 @@ pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
 
 pub fn coding_system_prompt() -> String {
-    [
-        RUNTIME_SANDBOX_ENVIRONMENT,
-        CODING_AGENT_LAYER,
-    ]
-    .join("\n\n")
+    [RUNTIME_SANDBOX_ENVIRONMENT, CODING_AGENT_LAYER].join("\n\n")
 }
 
 pub fn conversation_system_prompt() -> String {

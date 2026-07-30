@@ -31,7 +31,12 @@ fn asset_name() -> Option<&'static str> {
 /// network / API doesn't cooperate.
 pub async fn latest_version(client: &reqwest::Client) -> Option<String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let resp = client.get(url).header(reqwest::header::USER_AGENT, UA).send().await.ok()?;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, UA)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -141,4 +146,3 @@ fn replace_exe(exe: &Path, new_bytes: &[u8]) -> Result<(), String> {
         format!("replace binary: {e}")
     })
 }
-

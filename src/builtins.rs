@@ -20,7 +20,6 @@ pub fn coding_tools(
     registry.insert(WriteFileTool);
     registry.insert(AppendFileTool);
     registry.insert(EditFileTool);
-    registry.insert(ReplaceFileContentTool);
     registry.insert(ListFilesTool);
     registry.insert(SearchFilesTool);
     registry.insert(SearchContentTool);
@@ -1513,218 +1512,6 @@ impl Tool for ViewOutlineTool {
     }
 }
 
-pub struct ReplaceFileContentTool;
-
-#[derive(Debug, Deserialize)]
-struct ReplaceFileContentArgs {
-    path: String,
-    start_line: usize,
-    end_line: usize,
-    target_content: String,
-    replacement_content: String,
-}
-
-#[async_trait]
-impl Tool for ReplaceFileContentTool {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "replace_file_content".to_string(),
-            description: "Replace a contiguous block of text in a file. Specifies a 1-indexed line range [start_line, end_line] containing precisely the target_content to edit, and replaces it with replacement_content.".to_string(),
-            input_schema: object_schema(
-                json!({
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1},
-                    "target_content": {"type": "string", "description": "The exact string content inside the line range to be replaced."},
-                    "replacement_content": {"type": "string", "description": "The content to replace it with."}
-                }),
-                &["path", "start_line", "end_line", "target_content", "replacement_content"],
-            ),
-        }
-    }
-
-    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: ReplaceFileContentArgs = expect_object("replace_file_content", arguments)?;
-        let path = ctx.resolve_workspace_path(&args.path)?;
-        ctx.check_write(&path)?;
-
-        let content = tokio::fs::read_to_string(&path).await?;
-        let lines: Vec<&str> = content.lines().collect();
-
-        // Line numbers come from a previous read and can be stale after an
-        // insertion/deletion elsewhere in the file. Keep the supplied range as
-        // the fast path, but let the unique target text be the real anchor.
-        let range_valid =
-            args.start_line > 0 && args.start_line <= args.end_line && args.end_line <= lines.len();
-        if range_valid {
-            let actual_target = lines[args.start_line - 1..args.end_line].join("\n");
-            if actual_target == args.target_content {
-                let start = line_start_offset(&content, args.start_line);
-                let end = line_end_offset(&content, args.end_line);
-                return write_replaced_content(ctx, &path, &args, &content, start, end, None).await;
-            }
-        }
-
-        // If the range moved, relocate an exact target only when it occurs once.
-        // This avoids silently editing the wrong copy when a block is duplicated.
-        let exact_matches: Vec<(usize, usize)> = content
-            .match_indices(&args.target_content)
-            .filter_map(|(start, target)| {
-                let end = start + target.len();
-                let at_line_start = start == 0 || content.as_bytes()[start - 1] == b'\n';
-                let at_line_end = end == content.len() || content.as_bytes()[end] == b'\n';
-                (at_line_start && at_line_end).then_some((start, end))
-            })
-            .collect();
-        if exact_matches.len() == 1 {
-            let (start, end) = exact_matches[0];
-            return write_replaced_content(
-                ctx,
-                &path,
-                &args,
-                &content,
-                start,
-                end,
-                Some(format!(
-                    "matched target content after the supplied line range [{}-{}] moved",
-                    args.start_line, args.end_line
-                )),
-            )
-            .await;
-        }
-        if exact_matches.len() > 1 {
-            return Err(ToolError::msg(format!(
-                "Target content was not at line range [{}-{}], and matches {} places in `{}`. Re-read the file and include a unique surrounding line.",
-                args.start_line,
-                args.end_line,
-                exact_matches.len(),
-                args.path
-            )));
-        }
-
-        // read_file presents CRLF blocks as LF-separated lines. Match that form
-        // too, then replace by line offsets so the file's existing line endings
-        // remain intact.
-        let target_lines: Vec<&str> = args.target_content.lines().collect();
-        let normalized_target = target_lines.join("\n");
-        let mut normalized_matches = Vec::new();
-        if !target_lines.is_empty() && target_lines.len() <= lines.len() {
-            for start_line in 0..=lines.len() - target_lines.len() {
-                let candidate = lines[start_line..start_line + target_lines.len()].join("\n");
-                if candidate == normalized_target {
-                    normalized_matches.push((start_line + 1, start_line + target_lines.len()));
-                }
-            }
-        }
-        match normalized_matches.as_slice() {
-            [(start_line, end_line)] => {
-                let start = line_start_offset(&content, *start_line);
-                let end = line_end_offset(&content, *end_line);
-                write_replaced_content(
-                    ctx,
-                    &path,
-                    &args,
-                    &content,
-                    start,
-                    end,
-                    Some(format!(
-                        "matched target content after the supplied line range [{}-{}] moved",
-                        args.start_line, args.end_line
-                    )),
-                )
-                .await
-            }
-            [] => Err(ToolError::msg(replace_content_diagnostic(&content, &args))),
-            matches => Err(ToolError::msg(format!(
-                "Target content was not at line range [{}-{}], and matches {} places in `{}` after normalizing line endings. Re-read the file and include a unique surrounding line.",
-                args.start_line,
-                args.end_line,
-                matches.len(),
-                args.path
-            ))),
-        }
-    }
-}
-
-fn line_start_offset(content: &str, line: usize) -> usize {
-    if line <= 1 {
-        return 0;
-    }
-    content
-        .match_indices('\n')
-        .nth(line - 2)
-        .map(|(offset, _)| offset + 1)
-        .unwrap_or(content.len())
-}
-
-fn line_end_offset(content: &str, line: usize) -> usize {
-    let start = line_start_offset(content, line);
-    let end = content[start..]
-        .find('\n')
-        .map(|offset| start + offset)
-        .unwrap_or(content.len());
-    // Keep CRLF's carriage return with the following line ending.
-    if end > start && content.as_bytes().get(end - 1) == Some(&b'\r') {
-        end - 1
-    } else {
-        end
-    }
-}
-
-async fn write_replaced_content(
-    ctx: &ToolContext,
-    path: &std::path::Path,
-    args: &ReplaceFileContentArgs,
-    content: &str,
-    start: usize,
-    end: usize,
-    note: Option<String>,
-) -> Result<ToolResult, ToolError> {
-    let replacement = if content[end..].starts_with("\r\n") {
-        args.replacement_content
-            .strip_suffix("\r\n")
-            .unwrap_or(&args.replacement_content)
-    } else if content[end..].starts_with('\n') {
-        args.replacement_content
-            .strip_suffix('\n')
-            .unwrap_or(&args.replacement_content)
-    } else {
-        &args.replacement_content
-    };
-    let mut updated = String::with_capacity(content.len() - (end - start) + replacement.len());
-    updated.push_str(&content[..start]);
-    updated.push_str(replacement);
-    updated.push_str(&content[end..]);
-    tokio::fs::write(path, updated).await?;
-    ctx.record_change(path);
-
-    let mut result = json!({"path": args.path, "replaced": true});
-    if let Some(note) = note {
-        result["note"] = json!(note);
-    }
-    Ok(ToolResult::success(result))
-}
-
-fn replace_content_diagnostic(content: &str, args: &ReplaceFileContentArgs) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let start = args.start_line.saturating_sub(2).min(lines.len());
-    let end = (args.end_line + 2).min(lines.len());
-    let region = if start < end {
-        lines[start..end]
-            .iter()
-            .enumerate()
-            .map(|(index, line)| format!("{:>4}| {line}", start + index + 1))
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        "(requested range is outside the current file)".to_string()
-    };
-    format!(
-        "Target content was not found in `{}`. The supplied line range [{}-{}] is stale or the target differs in whitespace/escaping. Re-read the current lines and send a unique target_content.\n\nCurrent text near that range:\n{}",
-        args.path, args.start_line, args.end_line, region
-    )
-}
-
 pub struct WebSearchTool {
     pub api_key: String,
 }
@@ -2030,6 +1817,7 @@ impl Tool for MemoryWriteTool {
         memory_store(ctx)
             .write_entry(&args.id, &args.content, self.entry_budget, self.max_entries)
             .map_err(ToolError::msg)?;
+        ctx.note_memory_write(&args.id);
         Ok(ToolResult::success(json!({ "id": args.id, "saved": true })))
     }
 }
@@ -2308,7 +2096,6 @@ impl Tool for SkillTool {
     }
 }
 
-
 #[cfg(test)]
 mod edit_matching_tests {
     use super::{Flex, flexible_replace};
@@ -2330,7 +2117,10 @@ mod edit_matching_tests {
         let source = "const value = build(first, second);\n";
         let old = "const value = build(first, changed);";
 
-        assert!(matches!(flexible_replace(source, old, "replacement"), Flex::NoMatch));
+        assert!(matches!(
+            flexible_replace(source, old, "replacement"),
+            Flex::NoMatch
+        ));
     }
 
     #[test]

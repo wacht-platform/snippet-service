@@ -31,7 +31,9 @@ pub(crate) fn humanize_http_error(status: reqwest::StatusCode, body: &str) -> St
     let code = status.as_u16();
     let headline = match code {
         429 => "Rate limited — the provider is throttling requests. Wait a moment and try again.",
-        401 | 403 => "Authentication failed — check the API key (or sign in again) for this provider.",
+        401 | 403 => {
+            "Authentication failed — check the API key (or sign in again) for this provider."
+        }
         402 => "Payment required — the provider reports you're out of credits or quota.",
         400 | 422 => "The provider rejected the request as invalid.",
         404 => "Not found — the model name or endpoint may be wrong.",
@@ -180,12 +182,19 @@ impl StreamBuffer {
     pub fn snapshot(handle: &StreamHandle) -> String {
         handle
             .lock()
-            .map(|buf| buf.text_visible.then(|| buf.text.clone()).unwrap_or_default())
+            .map(|buf| {
+                buf.text_visible
+                    .then(|| buf.text.clone())
+                    .unwrap_or_default()
+            })
             .unwrap_or_default()
     }
 
     pub fn snapshot_thinking(handle: &StreamHandle) -> String {
-        handle.lock().map(|buf| buf.thinking.clone()).unwrap_or_default()
+        handle
+            .lock()
+            .map(|buf| buf.thinking.clone())
+            .unwrap_or_default()
     }
 }
 

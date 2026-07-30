@@ -10,13 +10,42 @@ use std::time::Duration;
 
 use axum::extract::ws::Message;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::tools::BrowserSummaryProvider;
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_DEVICE_NAME_CHARS: usize = 64;
+
+fn command_timeout(method: &str) -> Duration {
+    match method {
+        "tabs.query" | "tabs.get" | "tabs.create" | "tabs.update" | "tabs.remove"
+        | "page.scroll" | "page.geometry" | "page.click" | "page.type" | "page.key" => {
+            Duration::from_secs(15)
+        }
+        "page.snapshot" | "page.screenshot" | "page.eval" | "page.upload" | "page.getCookies"
+        | "page.setCookie" | "page.removeCookies" => Duration::from_secs(30),
+        "page.dragHtml5"
+        | "page.dragCoordinates"
+        | "page.mouse.move"
+        | "page.mouse.down"
+        | "page.mouse.up"
+        | "page.mouse.click"
+        | "page.mouse.wheel"
+        | "page.handleDialog"
+        | "page.enableDialogs"
+        | "page.startConsole"
+        | "page.stopConsole"
+        | "page.getConsole"
+        | "netwatch.start"
+        | "netwatch.pause"
+        | "netwatch.resume"
+        | "netwatch.getEvents"
+        | "netwatch.stop"
+        | "debugger.sendCommand" => Duration::from_secs(45),
+        _ => Duration::from_secs(30),
+    }
+}
 
 pub fn validate_device_name(raw: &str) -> Result<String, String> {
     let name = raw.trim();
@@ -215,16 +244,26 @@ impl BrowserManager {
         args: Value,
     ) -> CommandResult {
         let device_name = validate_device_name(raw_device_name)?;
-        let browser_id = {
+        let connection = {
             let connections = self.connections.lock().await;
             connections
                 .values()
                 .find(|connection| connection.info.device_name == device_name)
-                .map(|connection| connection.info.browser_id.clone())
+                .map(|connection| {
+                    (
+                        connection.info.browser_id.clone(),
+                        connection.info.capabilities.clone(),
+                    )
+                })
         };
-        let Some(browser_id) = browser_id else {
+        let Some((browser_id, capabilities)) = connection else {
             return Err(format!("no connected browser named `{device_name}`"));
         };
+        if !capabilities.iter().any(|capability| capability == method) {
+            return Err(format!(
+                "browser `{device_name}` does not advertise capability `{method}`"
+            ));
+        }
         self.send_command_internal(&browser_id, &device_name, method, args)
             .await
     }
@@ -265,7 +304,7 @@ impl BrowserManager {
             self.pending.lock().await.remove(&request_id);
             return Err(format!("browser `{display_name}` disconnected"));
         }
-        match tokio::time::timeout(COMMAND_TIMEOUT, receiver).await {
+        match tokio::time::timeout(command_timeout(method), receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(format!("browser `{display_name}` command waiter dropped")),
             Err(_) => {
@@ -297,6 +336,17 @@ impl BrowserManager {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn command_timeouts_match_operation_cost() {
+        assert_eq!(command_timeout("page.scroll"), Duration::from_secs(15));
+        assert_eq!(command_timeout("page.screenshot"), Duration::from_secs(30));
+        assert_eq!(command_timeout("page.dragHtml5"), Duration::from_secs(45));
+        assert_eq!(
+            command_timeout("unknown.future.method"),
+            Duration::from_secs(30)
+        );
+    }
 
     #[test]
     fn validates_device_names_at_registration_boundary() {
@@ -351,7 +401,7 @@ mod tests {
                 RegisterMessage {
                     browser: "firefox".to_string(),
                     device_name: "named device".to_string(),
-                    capabilities: Vec::new(),
+                    capabilities: vec!["tabs.query".to_string()],
                 },
                 outbound,
             )
@@ -374,6 +424,28 @@ mod tests {
             .await;
         assert_eq!(command.await.unwrap().unwrap(), json!([]));
     }
+    #[tokio::test]
+    async fn rejects_unadvertised_capabilities() {
+        let manager = BrowserManager::default();
+        let (outbound, _) = mpsc::unbounded_channel();
+        manager
+            .register(
+                RegisterMessage {
+                    browser: "firefox".to_string(),
+                    device_name: "limited device".to_string(),
+                    capabilities: vec!["tabs.query".to_string()],
+                },
+                outbound,
+            )
+            .await
+            .expect("registration");
+        let error = manager
+            .send_command_for_device_name("limited device", "page.screenshot", json!({}))
+            .await
+            .expect_err("unsupported capability must be rejected");
+        assert!(error.contains("does not advertise capability"));
+    }
+
     #[test]
     fn live_summary_limits_entries_and_reports_remaining_count() {
         let browsers: Vec<BrowserInfo> = (0..7)

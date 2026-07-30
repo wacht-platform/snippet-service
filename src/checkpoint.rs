@@ -23,7 +23,9 @@ pub fn shadow_dir(workspace: &Path) -> PathBuf {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     canon.hash(&mut h);
     let id = format!("{:016x}", h.finish());
-    std::env::temp_dir().join("snippet-shadows").join(format!("{id}.git"))
+    std::env::temp_dir()
+        .join("snippet-shadows")
+        .join(format!("{id}.git"))
 }
 
 /// Run a git command against the shadow repo (its own git-dir, work-tree = the
@@ -70,6 +72,22 @@ pub fn git_available() -> bool {
 /// Create the shadow repo on first use and exclude snippet's own dirs.
 fn ensure_init(workspace: &Path) -> Result<(), String> {
     let shadow = shadow_dir(workspace);
+    let valid_repo = shadow.exists()
+        && Command::new("git")
+            .arg("--git-dir")
+            .arg(&shadow)
+            .arg("rev-parse")
+            .arg("--git-dir")
+            .current_dir(workspace)
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+    if shadow.exists() && !valid_repo {
+        // This is private checkpoint state, never the user's repository. Remove a
+        // stale/partial shadow so checkpointing can self-heal after corruption.
+        std::fs::remove_dir_all(&shadow)
+            .map_err(|error| format!("remove invalid shadow repository: {error}"))?;
+    }
     if !shadow.exists() {
         if let Some(parent) = shadow.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -97,23 +115,51 @@ fn ensure_init(workspace: &Path) -> Result<(), String> {
 /// Snapshot the whole work-tree to a hidden commit and return its id. Best-effort:
 /// returns `None` (never errors the turn) if git is missing or the snapshot fails.
 pub fn snapshot(workspace: &Path, label: &str) -> Option<String> {
+    snapshot_diagnostic(workspace, label).ok()
+}
+
+/// Snapshot with a diagnostic error so callers can record why checkpoint creation
+/// was skipped. Keep `snapshot` as the quiet compatibility wrapper for restores.
+pub fn snapshot_diagnostic(workspace: &Path, label: &str) -> Result<String, String> {
     if !git_available() {
-        return None;
+        return Err("git is not available".to_string());
     }
-    ensure_init(workspace).ok()?;
-    git(workspace, &["add", "-A"]).ok()?;
-    let tree = git(workspace, &["write-tree"]).ok()?;
+    ensure_init(workspace).map_err(|e| format!("initialize shadow repo: {e}"))?;
+    git(workspace, &["add", "-A"]).map_err(|e| format!("git add: {e}"))?;
+    let tree = match git(workspace, &["write-tree"]) {
+        Ok(tree) => tree,
+        Err(first_error) => {
+            // The shadow index can outlive workspace rewrites and retain an object
+            // that was garbage-collected or replaced. Rebuild only this private
+            // index; never touch the user's real `.git/index`.
+            let index_path = shadow_dir(workspace).join("index");
+            let recovery = std::fs::remove_file(&index_path)
+                .map_err(|e| format!("remove corrupt shadow index: {e}"))
+                .and_then(|_| git(workspace, &["add", "-A"]))
+                .and_then(|_| git(workspace, &["write-tree"]));
+            match recovery {
+                Ok(tree) => tree,
+                Err(recovery_error) => {
+                    return Err(format!(
+                        "git write-tree: {first_error}; shadow-index recovery failed: {recovery_error}"
+                    ));
+                }
+            }
+        }
+    };
     // Standalone commit (no parent chain) so a dropped snapshot becomes
     // unreachable and is freed by gc. Each snapshot is kept alive only by its own
     // `refs/snapshots/<id>` ref until `prune` removes it.
-    let commit = git(workspace, &["commit-tree", &tree, "-m", label]).ok()?;
+    let commit = git(workspace, &["commit-tree", &tree, "-m", label])
+        .map_err(|e| format!("git commit-tree: {e}"))?;
     let refname = format!("refs/snapshots/{commit}");
-    git(workspace, &["update-ref", &refname, &commit]).ok()?;
+    git(workspace, &["update-ref", &refname, &commit])
+        .map_err(|e| format!("git update-ref: {e}"))?;
     // Stable handle to the most recent checkpoint so the agent can review its own
     // changes since the turn began: `git --git-dir=$SNIPPET_SHADOW_GIT
     // --work-tree=. diff checkpoint`. Kept across prunes (it points into `keep`).
     let _ = git(workspace, &["update-ref", "refs/heads/checkpoint", &commit]);
-    Some(commit)
+    Ok(commit)
 }
 
 /// Drop the snapshots in `dropped` and garbage-collect the shadow repo so disk

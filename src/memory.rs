@@ -31,9 +31,9 @@ pub fn patterns_budget() -> usize {
 /// small (not user-tunable) — they're directives, not a knowledge store.
 const RULES_BUDGET_CHARS: usize = 2_000;
 
-const BLOCK_HEADER: &str = "[workspace_memory]\nDurable memory built across sessions. STANDING RULES are always in force — follow them in every reply. REUSABLE PATTERNS are cross-project techniques — apply the fitting one instead of re-deriving. The REFERENCE INDEX points to fuller entries you load on demand with memory_read(id). Maintain rules with memory_rule, patterns with memory_pattern, entries with memory_write, the index with memory_index. Verify a load-bearing detail against the live code before relying on it.";
+const BLOCK_HEADER: &str = "[workspace_memory]\nDurable across sessions. Obey STANDING RULES always. Apply matching REUSABLE PATTERNS. Load index entries with memory_read(id). Maintain via memory_rule / memory_pattern / memory_write+memory_index. Verify load-bearing details against live code.";
 
-const EMPTY_BLOCK: &str = "[workspace_memory]\n(empty) — no durable memory yet. As you learn how this project is built, its conventions and gotchas, or how to do recurring tasks here, save them with memory_write(id, content) plus a pointer line via memory_index. For an always-followed directive (e.g. a user preference like 'in emails, don't use dashes'), use memory_rule(scope, content): scope='global' applies in every workspace, 'workspace' only here. Entries load on demand via memory_read(id).";
+const EMPTY_BLOCK: &str = "[workspace_memory]\n(empty) — save durable project facts/playbooks with memory_write+memory_index; always-on prefs with memory_rule(scope=global|workspace); cross-project techniques with memory_pattern.";
 
 /// The hard cap on a standing-rules file (global or per-workspace).
 pub fn rules_budget() -> usize {
@@ -118,7 +118,9 @@ impl MemoryStore {
             return Err("pattern is empty".to_string());
         }
         if line.lines().count() > 1 {
-            return Err("add one pattern per call (a single line: situation → approach → why)".to_string());
+            return Err(
+                "add one pattern per call (a single line: situation → approach → why)".to_string(),
+            );
         }
         let current = self.read_patterns();
         if current.lines().any(|l| l.trim() == line) {
@@ -140,8 +142,13 @@ impl MemoryStore {
             .append(true)
             .open(self.patterns_path())
             .map_err(|e| e.to_string())?;
-        let sep = if current.is_empty() || current.ends_with('\n') { "" } else { "\n" };
-        f.write_all(format!("{sep}{line}\n").as_bytes()).map_err(|e| e.to_string())?;
+        let sep = if current.is_empty() || current.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        f.write_all(format!("{sep}{line}\n").as_bytes())
+            .map_err(|e| e.to_string())?;
         Ok(true)
     }
 
@@ -208,7 +215,8 @@ impl MemoryStore {
 
     pub fn read_entry(&self, id: &str) -> Result<String, String> {
         let path = self.entry_path(id)?;
-        fs::read_to_string(&path).map_err(|_| format!("no memory entry `{}`", sanitize_id(id).unwrap_or_default()))
+        fs::read_to_string(&path)
+            .map_err(|_| format!("no memory entry `{}`", sanitize_id(id).unwrap_or_default()))
     }
 
     pub fn write_entry(
@@ -259,9 +267,10 @@ impl MemoryStore {
         let path = self.entry_path(id)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(format!("no memory entry `{}`", sanitize_id(id).unwrap_or_default()))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                "no memory entry `{}`",
+                sanitize_id(id).unwrap_or_default()
+            )),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -283,7 +292,10 @@ impl MemoryStore {
         let manifest = if entries.is_empty() {
             String::new()
         } else {
-            format!("\n\nentries (load with memory_read): {}", entries.join(", "))
+            format!(
+                "\n\nentries (load with memory_read): {}",
+                entries.join(", ")
+            )
         };
         Some(format!("{body}{manifest}"))
     }
@@ -293,7 +305,7 @@ impl MemoryStore {
     pub fn render_for_prompt(&self, index_budget: usize) -> Option<String> {
         match self.index_body(index_budget) {
             Some(body) => Some(format!(
-                "{BLOCK_HEADER}\n\nREFERENCE INDEX — load an entry with memory_read(id):\n{body}"
+                "{BLOCK_HEADER}\n\nREFERENCE INDEX (memory_read id):\n{body}"
             )),
             None => Some(EMPTY_BLOCK.to_string()),
         }
@@ -333,15 +345,15 @@ pub fn render_session_memory(workspace_root: &Path, index_budget: usize) -> Opti
     }
     let mut out = String::from(BLOCK_HEADER);
     if let Some(r) = rules {
-        out.push_str("\n\nSTANDING RULES — always follow these, in every reply (global + this folder):\n");
+        out.push_str("\n\nSTANDING RULES (always):\n");
         out.push_str(&r);
     }
     if let Some(p) = patterns {
-        out.push_str("\n\nREUSABLE PATTERNS — techniques learned across projects; apply the fitting one instead of re-deriving, adapt as needed:\n");
+        out.push_str("\n\nREUSABLE PATTERNS (apply when they fit):\n");
         out.push_str(&p);
     }
     if let Some(i) = index {
-        out.push_str("\n\nREFERENCE INDEX — load an entry with memory_read(id):\n");
+        out.push_str("\n\nREFERENCE INDEX (memory_read id):\n");
         out.push_str(&i);
     }
     Some(out)
@@ -377,11 +389,12 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     let mut tmp = path.to_path_buf();
     let name = format!(
         "{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("memory")
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("memory")
     );
     tmp.set_file_name(name);
     fs::write(&tmp, content).map_err(|e| e.to_string())?;
     fs::rename(&tmp, path).map_err(|e| e.to_string())?;
     Ok(())
 }
-

@@ -20,7 +20,10 @@ fn bundled_language(ext: &str) -> Option<(&'static str, tree_sitter::Language)> 
         "rs" => ("rust", tree_sitter_rust::LANGUAGE.into()),
         "py" | "pyi" => ("python", tree_sitter_python::LANGUAGE.into()),
         "js" | "jsx" | "mjs" | "cjs" => ("javascript", tree_sitter_javascript::LANGUAGE.into()),
-        "ts" | "mts" | "cts" => ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "ts" | "mts" | "cts" => (
+            "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ),
         "tsx" => ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         "go" => ("go", tree_sitter_go::LANGUAGE.into()),
         "java" => ("java", tree_sitter_java::LANGUAGE.into()),

@@ -143,7 +143,10 @@ async fn fetch_openai_compatible(cfg: &ModelConfig) -> Result<Vec<CatalogModel>,
     if !cfg.api_key.trim().is_empty() {
         req = req.bearer_auth(cfg.api_key.trim());
     }
-    let response = req.send().await.map_err(|e| format!("model list request failed: {e}"))?;
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("model list request failed: {e}"))?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -160,9 +163,8 @@ async fn fetch_openai_compatible(cfg: &ModelConfig) -> Result<Vec<CatalogModel>,
             let (reasoning, context_window) = if is_openrouter {
                 let params = m["supported_parameters"].as_array();
                 let reasoning = params.map(|p| {
-                    p.iter().any(|x| {
-                        matches!(x.as_str(), Some("reasoning") | Some("reasoning_effort"))
-                    })
+                    p.iter()
+                        .any(|x| matches!(x.as_str(), Some("reasoning") | Some("reasoning_effort")))
                 });
                 (reasoning, m["context_length"].as_u64())
             } else {
@@ -201,11 +203,17 @@ async fn fetch_gemini(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String> {
         .iter()
         .filter_map(|m| {
             // "models/gemini-3.5-flash" → "gemini-3.5-flash"
-            let id = m["name"].as_str()?.trim_start_matches("models/").to_string();
+            let id = m["name"]
+                .as_str()?
+                .trim_start_matches("models/")
+                .to_string();
             // Only generateContent-capable models are usable as a chat model.
             let methods = m["supportedGenerationMethods"].as_array();
             if let Some(methods) = methods {
-                if !methods.iter().any(|x| x.as_str() == Some("generateContent")) {
+                if !methods
+                    .iter()
+                    .any(|x| x.as_str() == Some("generateContent"))
+                {
                     return None;
                 }
             }
@@ -220,4 +228,3 @@ async fn fetch_gemini(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String> {
         })
         .collect())
 }
-

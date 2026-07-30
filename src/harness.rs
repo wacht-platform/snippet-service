@@ -47,13 +47,7 @@ const DEDUP_TOOLS: [&str; 4] = [
 
 /// Tools that change the workspace; running one invalidates the dedup set so
 /// re-discovery afterward is allowed.
-const MUTATING_TOOLS: [&str; 5] = [
-    "write_file",
-    "edit_file",
-    "append_file",
-    "replace_file_content",
-    "bash",
-];
+const MUTATING_TOOLS: [&str; 4] = ["write_file", "edit_file", "append_file", "bash"];
 
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {
@@ -75,9 +69,13 @@ pub struct HarnessConfig {
     pub exa_api_key: Option<String>,
     /// Configured model context window for this run; used by compaction gates.
     pub context_window_tokens: u64,
-    /// Start compaction when the largest observed prompt reaches this percentage
-    /// of `context_window_tokens`.
+    /// Full history rewrite (agentic table) when prompt usage hits this % of window.
     pub compact_at_pct: u8,
+    /// Cheap tool-body prune starts at this % of the window (no model call).
+    pub tool_prune_at_pct: u8,
+    /// When prune fires, stub tools only in the oldest prefix whose estimated
+    /// size is this % of the context window (default first 40%).
+    pub tool_prune_prefix_pct: u8,
     /// Start fresh runs in manual approval mode (bash + file edits wait for y/n).
     pub manual_approval: bool,
     /// Per-workspace memory: inject the `[workspace_memory]` index into the system
@@ -107,6 +105,8 @@ impl Default for HarnessConfig {
             exa_api_key: None,
             context_window_tokens: 128_000,
             compact_at_pct: 90,
+            tool_prune_at_pct: 75,
+            tool_prune_prefix_pct: 40,
             manual_approval: false,
             memory_enabled: true,
             memory_index_budget_chars: 5_000,
@@ -357,11 +357,14 @@ pub struct HarnessState {
     /// device-wide session list). Empty on states from before this field existed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub workspace: String,
-    pub user_request: String,
-    /// User-set title override for the session list; when set it wins over the
-    /// `user_request`-derived label. Renaming (TUI/app) sets this.
-    #[serde(default)]
+    /// The session title. For a new session this is seeded from its first request;
+    /// renaming replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Legacy migration input only. Old state files stored the first request under
+    /// this key; it is accepted when reading and never written back.
+    #[serde(rename = "user_request", default, skip_serializing)]
+    legacy_request: String,
     /// An active `/goal` the agent is autonomously working toward (None = normal
     /// interactive mode). See [`Goal`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,7 +374,12 @@ pub struct HarnessState {
     /// "Running" — compaction can take a while and otherwise looks like a normal turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compacting: bool,
+    /// Omitted on the attach wire (clients render from `events` + live stream).
+    /// Default so snapshot/delta frames that strip LLM history still deserialize.
+    #[serde(default)]
     pub messages: Vec<HarnessMessage>,
+    /// Present on full snapshots; deltas send `new_events` instead and omit this.
+    #[serde(default)]
     pub events: Vec<HarnessEvent>,
     pub iterations: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -412,6 +420,80 @@ pub struct HarnessState {
     /// The model's context window in tokens, for the usage gauge (0 = unknown).
     #[serde(default)]
     pub context_window: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_payloads_pruned: bool,
+}
+
+impl HarnessState {
+    /// Truncate events/messages/checkpoints to a checkpoint boundary.
+    /// Returns the checkpoint label on success.
+    pub fn apply_checkpoint_rewind(&mut self, checkpoint_id: &str) -> Result<String, String> {
+        let cp = self
+            .checkpoints
+            .iter()
+            .find(|c| c.id == checkpoint_id || c.id.starts_with(checkpoint_id))
+            .cloned()
+            .ok_or_else(|| format!("checkpoint not found: {checkpoint_id}"))?;
+        let event_index = cp.event_index.min(self.events.len());
+        let message_index = cp.message_index.min(self.messages.len());
+        self.events.truncate(event_index);
+        self.messages.truncate(message_index);
+        self.checkpoints.retain(|c| c.event_index <= event_index);
+        self.final_text = None;
+        self.pending_question = None;
+        self.compacting = false;
+        self.tool_payloads_pruned = false;
+        self.status = HarnessStatus::Idle;
+        Ok(cp.label)
+    }
+
+    /// Return the original request for model-context features without making it
+    /// part of the session metadata or public wire model.
+    pub fn initial_request(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .find_map(|message| match message {
+                HarnessMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .or_else(|| {
+                (!self.legacy_request.trim().is_empty()).then_some(self.legacy_request.as_str())
+            })
+    }
+}
+
+fn normalize_state_title(state: &mut HarnessState) {
+    let legacy_request = state.legacy_request.trim().to_string();
+    // Very old states carried the first prompt only in `user_request`. Preserve
+    // that conversational context before dropping the metadata field. Current
+    // states already have the prompt in `messages`, so this is a no-op for them.
+    if !legacy_request.is_empty()
+        && !state
+            .messages
+            .iter()
+            .any(|message| matches!(message, HarnessMessage::User { .. }))
+    {
+        state.messages.push(HarnessMessage::User {
+            content: legacy_request.clone(),
+        });
+    }
+    let title_is_empty = state
+        .title
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    if title_is_empty {
+        if let Some(request) = state
+            .initial_request()
+            .filter(|text| !text.trim().is_empty())
+        {
+            state.title = Some(request.to_string());
+        }
+    }
+    // The legacy field is an input-only migration bridge. Once its value has
+    // seeded the title/context, drop it so every subsequent persist emits the
+    // clean schema.
+    state.legacy_request.clear();
 }
 
 /// A working-tree snapshot the user can rewind to (a commit in the shadow repo).
@@ -588,10 +670,10 @@ impl CodingHarness {
     pub async fn run(
         &self,
         model: &mut dyn AgentModel,
-        user_request: impl Into<String>,
+        initial_request: impl Into<String>,
     ) -> Result<HarnessOutcome, ToolError> {
         let mut state = self
-            .load_or_initialize_state(Some(user_request.into()))
+            .load_or_initialize_state(Some(initial_request.into()))
             .await?;
         self.compact_history_if_needed(model, &mut state).await?;
         if state.status == HarnessStatus::Completed {
@@ -912,6 +994,10 @@ impl CodingHarness {
                 match result {
                     StepResult::Continue => {
                         consecutive_errors = 0;
+                        // Step already persists after model text / each tool;
+                        // flush again so end-of-step bookkeeping is on disk
+                        // before the next model call.
+                        self.persist(&mut state, &lanes).await?;
                     }
                     StepResult::TurnEnded { kind, final_text } => {
                         consecutive_errors = 0;
@@ -1040,14 +1126,11 @@ impl CodingHarness {
                             self.persist(&mut state, &lanes).await?;
                         }
                         Some(LoopInput::Rewind { checkpoint }) => {
-                            // Find the checkpoint and truncate state to that point
-                            if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint) {
-                                let event_index = cp.event_index;
-                                let message_index = cp.message_index;
-                                state.events.truncate(event_index);
-                                state.messages.truncate(message_index);
-                                state.checkpoints.retain(|c| c.event_index <= event_index);
-                                self.persist(&mut state, &lanes).await?;
+                            match state.apply_checkpoint_rewind(&checkpoint) {
+                                Ok(_) => self.persist(&mut state, &lanes).await?,
+                                Err(_) => {
+                                    // Unknown checkpoint id — leave state unchanged.
+                                }
                             }
                         }
                         // No tool call is pending while idle — nothing to approve.
@@ -1113,9 +1196,14 @@ impl CodingHarness {
         // continues a turn already checkpointed.
         if !answering {
             // First real request seeds the session title (app sessions open
-            // empty, so user_request starts blank).
-            if state.user_request.trim().is_empty() {
-                state.user_request = text.clone();
+            // empty, so title starts blank).
+            if state
+                .title
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                state.title = Some(text.clone());
             }
             self.checkpoint(state, &text).await;
             // Fresh request: re-discovery is legitimate again, and prior-turn
@@ -1305,15 +1393,33 @@ impl CodingHarness {
     async fn checkpoint(&self, state: &mut HarnessState, prompt: &str) {
         let label: String = prompt.chars().take(80).collect();
         let workspace = self.context.workspace_root().to_path_buf();
+        let workspace_for_log = workspace.clone();
         let snap_label = label.clone();
         // `git add -A` + commit-tree can take a while on a large workspace — run it
         // off the async runtime so it never stalls streaming or other lanes.
-        let id = tokio::task::spawn_blocking(move || {
-            crate::checkpoint::snapshot(&workspace, &snap_label)
+        let result = tokio::task::spawn_blocking(move || {
+            crate::checkpoint::snapshot_diagnostic(&workspace, &snap_label)
         })
-        .await
-        .ok()
-        .flatten();
+        .await;
+        let id = match result {
+            Ok(Ok(id)) => Some(id),
+            Ok(Err(error)) => {
+                self.debug_log(&format!(
+                    "checkpoint skipped: workspace={} label={:?} error={error}",
+                    workspace_for_log.display(),
+                    label
+                ));
+                None
+            }
+            Err(error) => {
+                self.debug_log(&format!(
+                    "checkpoint skipped: workspace={} label={:?} snapshot task failed: {error}",
+                    workspace_for_log.display(),
+                    label
+                ));
+                None
+            }
+        };
         if let Some(id) = id {
             state.checkpoints.push(CheckpointRecord {
                 id,
@@ -1453,14 +1559,7 @@ impl CodingHarness {
                 false
             }
             LoopInput::Rewind { checkpoint } => {
-                // Find the checkpoint and truncate state to that point
-                if let Some(cp) = state.checkpoints.iter().find(|c| c.id == checkpoint) {
-                    let event_index = cp.event_index;
-                    let message_index = cp.message_index;
-                    state.events.truncate(event_index);
-                    state.messages.truncate(message_index);
-                    state.checkpoints.retain(|c| c.event_index <= event_index);
-                }
+                let _ = state.apply_checkpoint_rewind(&checkpoint);
                 false
             }
             LoopInput::Interrupt => true,
@@ -1677,7 +1776,7 @@ impl CodingHarness {
         let mut request_messages = state.messages.clone();
         self.inline_images(&mut request_messages, model.supports_images());
         // Delivered as System, not User: adapters wrap a mid-history System turn
-        // in a `[runtime_signal]` envelope, so the model reads it as out-of-band
+        // in a `[steering]` envelope, so the model reads it as out-of-band
         // runtime state rather than the user speaking — which stopped it from (a)
         // replying with "you should do X" advice and (b) narrating its completion
         // status back to "the user". (On the wire this still lands in the user
@@ -1690,6 +1789,7 @@ impl CodingHarness {
                 conversation_mode,
                 self.context.workspace_root(),
                 self.context.browser_summary(),
+                &self.context.memory_writes_snapshot(),
             ),
         });
 
@@ -1870,9 +1970,13 @@ impl CodingHarness {
                         tool_calls: Vec::new(),
                     });
                     state.events.push(HarnessEvent::AssistantText { text });
+                    // Committed into events — drop the live buffer so clients don't
+                    // keep showing the same fragment (and thinking) beside it.
                     if let Some(sink) = sink {
-                        StreamBuffer::set_text_visible(sink, true);
+                        StreamBuffer::clear(sink);
                     }
+                    // Durably land model output before the next step/restart.
+                    let _ = self.persist(state, lanes).await;
                 }
                 return StepResult::Continue;
             }
@@ -1884,10 +1988,15 @@ impl CodingHarness {
                     tool_calls: Vec::new(),
                 });
                 state.events.push(HarnessEvent::AssistantText { text });
-                if let Some(sink) = sink {
-                    StreamBuffer::set_text_visible(sink, true);
-                }
             }
+            // Always clear after a terminal plain-text step — even with no prose —
+            // so sticky thinking can't linger on idle clients between turns.
+            if let Some(sink) = sink {
+                StreamBuffer::clear(sink);
+            }
+            // Flush model output before ending / re-prompting so a restart can't
+            // drop the just-committed reply.
+            let _ = self.persist(state, lanes).await;
             // Conversation agent: don't end with NO visible reply when the agent
             // hasn't actually answered since the last user message (e.g. it only
             // left a note and then returned an empty turn). Re-prompt for a real
@@ -1975,7 +2084,18 @@ impl CodingHarness {
         // (Clone: the delegation-only early end below reuses it as final_text.)
         if let Some(text) = progress_text.clone() {
             state.events.push(HarnessEvent::AssistantText { text });
+            // Progress prose is durable now — clear live text/thinking so the
+            // UI doesn't double-render against AssistantText + stream frames.
+            if let Some(sink) = sink {
+                StreamBuffer::clear(sink);
+            }
+        } else if let Some(sink) = sink {
+            // Tool-only step: drop any reasoning that arrived with the call.
+            StreamBuffer::clear(sink);
         }
+        // Persist the assistant turn (text and/or tool_calls) before executing
+        // tools so a crash mid-batch still leaves the model output on disk.
+        let _ = self.persist(state, lanes).await;
 
         // Per-turn productivity tracking, drives note-loop / unproductive /
         // backpressure / shell-discipline signals after the batch runs.
@@ -2054,15 +2174,17 @@ impl CodingHarness {
                             text: s.to_string(),
                         });
                         if let Some(sink) = sink {
-                            StreamBuffer::set_text_visible(sink, true);
+                            StreamBuffer::clear(sink);
                         }
                     }
+                    let _ = self.persist(state, lanes).await;
                     return StepResult::TurnEnded {
                         kind: TurnEndKind::Complete,
                         final_text: Some(s.to_string()),
                     };
                 }
                 // Missing summary: the error result nudges a retry next turn.
+                let _ = self.persist(state, lanes).await;
                 continue;
             }
 
@@ -2090,6 +2212,8 @@ impl CodingHarness {
                     tool_name,
                     content: result,
                 });
+                // Flush each meta tool (note/delegate/ask_user/…) as it lands.
+                let _ = self.persist(state, lanes).await;
                 // ask_user pauses the run here; nothing else ends a turn now.
                 if let MetaControl::EndTurn { kind, final_text } = control {
                     return StepResult::TurnEnded { kind, final_text };
@@ -2122,6 +2246,7 @@ impl CodingHarness {
                     tool_name,
                     content: result,
                 });
+                let _ = self.persist(state, lanes).await;
                 continue;
             }
 
@@ -2153,6 +2278,7 @@ impl CodingHarness {
                     tool_name: tool_name.clone(),
                     content: result,
                 });
+                let _ = self.persist(state, lanes).await;
                 continue;
             }
 
@@ -2214,6 +2340,7 @@ impl CodingHarness {
                     tool_name: tool_name.clone(),
                     content: result,
                 });
+                let _ = self.persist(state, lanes).await;
                 continue;
             }
             let force_vault_approval = !vault_secrets_used.is_empty();
@@ -2280,14 +2407,14 @@ impl CodingHarness {
                         tool_name: tool_name.clone(),
                         content: result,
                     });
+                    let _ = self.persist(state, lanes).await;
                     continue;
                 }
             }
 
             // Surface the in-flight call before running it so a slow tool (bash,
             // web fetch) isn't a black box — the TUI shows this ToolCall with a
-            // "running" indicator until its result lands. Best-effort; the
-            // end-of-step persist in the run loop is authoritative.
+            // "running" indicator until its result lands.
             let _ = self.persist(state, lanes).await;
 
             let mut result = match self
@@ -2334,6 +2461,9 @@ impl CodingHarness {
                 tool_name,
                 content: result,
             });
+            // Flush after every tool result so a mid-batch kill still keeps
+            // completed calls on disk.
+            let _ = self.persist(state, lanes).await;
         }
 
         // A turn with no shell nudge breaks the escalation streak.
@@ -2789,7 +2919,7 @@ impl CodingHarness {
 
     async fn load_or_initialize_state(
         &self,
-        user_request: Option<String>,
+        initial_request: Option<String>,
     ) -> Result<HarnessState, ToolError> {
         // Build the per-workspace memory block once and fold it into the system
         // prefix, so it rides in the cached prompt and refreshes every session
@@ -2819,6 +2949,9 @@ impl CodingHarness {
             // the run — fall through and start a fresh session, overwriting it.
             match deserialize_state(&bytes) {
                 Ok(mut state) => {
+                    // Migrate old metadata in memory; the next persist omits the
+                    // legacy `user_request` field and keeps the title as identity.
+                    normalize_state_title(&mut state);
                     // Reflect the current run's folder (backfills pre-field states).
                     state.workspace = self.context.workspace_root().display().to_string();
                     state.context_window = self.config.context_window_tokens;
@@ -2832,7 +2965,7 @@ impl CodingHarness {
                     // (Anthropic, DeepSeek) 400 on that history forever after.
                     // Repair on load so a resumed session is always well-formed.
                     repair_unanswered_tool_calls(&mut state.messages);
-                    if let Some(request) = user_request
+                    if let Some(request) = initial_request
                         .map(|r| r.trim().to_string())
                         .filter(|r| !r.is_empty())
                     {
@@ -2861,22 +2994,22 @@ impl CodingHarness {
         }
 
         let now = Utc::now().to_rfc3339();
-        let request = user_request
+        let request = initial_request
             .map(|r| r.trim().to_string())
             .filter(|r| !r.is_empty());
         let mut messages = vec![HarnessMessage::System {
             content: seeded_system,
         }];
         let mut events = Vec::new();
-        let (status, user_request) = match request {
+        let (status, title) = match request.as_ref() {
             Some(text) => {
                 messages.push(HarnessMessage::User {
                     content: text.clone(),
                 });
                 events.push(HarnessEvent::UserInput { text: text.clone() });
-                (HarnessStatus::Running, text)
+                (HarnessStatus::Running, Some(text.clone()))
             }
-            None => (HarnessStatus::Idle, String::new()),
+            None => (HarnessStatus::Idle, None),
         };
         let state = HarnessState {
             version: 1,
@@ -2884,8 +3017,8 @@ impl CodingHarness {
             created_at: now.clone(),
             updated_at: now,
             workspace: self.context.workspace_root().display().to_string(),
-            user_request,
-            title: None,
+            title,
+            legacy_request: String::new(),
             goal: None,
             compacting: false,
             watches: Vec::new(),
@@ -2908,6 +3041,7 @@ impl CodingHarness {
             checkpoints: Vec::new(),
             rate_limit: None,
             context_window: self.config.context_window_tokens,
+            tool_payloads_pruned: false,
         };
         self.persist_state(&state).await?;
         Ok(state)
@@ -2927,7 +3061,81 @@ impl CodingHarness {
         model: &mut dyn AgentModel,
         state: &mut HarnessState,
     ) -> Result<(), ToolError> {
+        // Tier 0: strip old tool bodies (no model call) once usage is high.
+        // Only then fall through to the expensive agentic table rewrite.
+        if self.prune_old_tool_payloads(state) {
+            let _ = self.persist_state(state).await;
+        }
         self.compact_history_agentic(model, state, false).await
+    }
+
+    fn prune_old_tool_payloads(&self, state: &mut HarnessState) -> bool {
+        const MIN_SAVINGS_TOKENS: u64 = 256;
+
+        let window = self.config.context_window_tokens.max(1);
+        let start_at =
+            window.saturating_mul(self.config.tool_prune_at_pct.clamp(1, 100) as u64) / 100;
+        let prefix_budget =
+            window.saturating_mul(self.config.tool_prune_prefix_pct.clamp(1, 100) as u64) / 100;
+        if state.tool_payloads_pruned
+            || start_at == 0
+            || prefix_budget == 0
+            || state.last_prompt_tokens < start_at
+            || state.messages.is_empty()
+        {
+            return false;
+        }
+
+        let mut cumulative = 0u64;
+        let mut cut = 0usize;
+        for (i, msg) in state.messages.iter().enumerate() {
+            let tokens = estimate_message_tokens(msg);
+            if cumulative.saturating_add(tokens) > prefix_budget {
+                break;
+            }
+            cumulative = cumulative.saturating_add(tokens);
+            cut = i + 1;
+        }
+        if cut == 0 {
+            return false;
+        }
+
+        let before = estimate_prompt_tokens(&state.messages);
+        let mut messages = state.messages.clone();
+        let mut pruned_n = 0u32;
+        for message in &mut messages[..cut] {
+            match message {
+                HarnessMessage::Assistant { tool_calls, .. } => {
+                    for call in tool_calls {
+                        if !tool_args_are_stub(&call.arguments) {
+                            call.arguments = json!({"_":"pruned"});
+                            pruned_n += 1;
+                        }
+                    }
+                }
+                HarnessMessage::ToolResult {
+                    tool_name, content, ..
+                } if !tool_result_is_stub(content) => {
+                    *content = pruned_tool_result_stub(tool_name);
+                    pruned_n += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let after = estimate_prompt_tokens(&messages);
+        let saved = before.saturating_sub(after);
+        if pruned_n == 0 || saved < MIN_SAVINGS_TOKENS {
+            return false;
+        }
+
+        state.messages = messages;
+        state.tool_payloads_pruned = true;
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "tool_payloads_pruned".to_string(),
+            reasoning: "Pruned older tool data.".to_string(),
+        });
+        true
     }
 
     async fn compact_history(
@@ -2977,7 +3185,7 @@ impl CodingHarness {
         };
 
         let summarize_window = |messages: &[HarnessMessage],
-                                user_request: &str|
+                                original_request: &str|
          -> (String, String, usize) {
             let mut objective = Vec::new();
             let mut actions = Vec::new();
@@ -3084,10 +3292,10 @@ impl CodingHarness {
                 }
             }
 
-            if objective.is_empty() && !user_request.trim().is_empty() {
+            if objective.is_empty() && !original_request.trim().is_empty() {
                 objective.push(format!(
                     "- Original request: {}",
-                    preview_text(user_request, 320)
+                    preview_text(original_request, 320)
                 ));
             }
 
@@ -3198,7 +3406,8 @@ impl CodingHarness {
                 break;
             }
 
-            let (summary, recent, recent_len) = summarize_window(&older, &state.user_request);
+            let original_request = state.initial_request().unwrap_or("");
+            let (summary, recent, recent_len) = summarize_window(&older, original_request);
             preserved_recent_count = recent_len;
 
             let mut next = vec![
@@ -3252,7 +3461,8 @@ impl CodingHarness {
                 preserved_recent_count
             ),
         });
-        // Prune events to this compaction boundary (see compact_history_agentic).
+        // Prune events to this compaction boundary. Tool rows are
+        // reconstructible noise — they'd only bloat every persist.
         if let Some(i) = state.events.iter().rposition(
             |e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"),
         ) {
@@ -3262,6 +3472,7 @@ impl CodingHarness {
         // (prompt/completion/total) reflect everything sent and are unaffected by
         // compaction. The gauge repopulates from the next response's usage.
         state.last_prompt_tokens = 0;
+        state.tool_payloads_pruned = false;
         Ok(())
     }
 
@@ -3341,7 +3552,8 @@ impl CodingHarness {
         // thinking). Restore the session's effort before returning either way.
         let prev_effort = model.swap_reasoning_effort(Some("off".to_string()));
 
-        let window_text = render_window(&prior_table, &older, &state.user_request, RECENT_FOCUS);
+        let original_request = state.initial_request().unwrap_or("");
+        let window_text = render_window(&prior_table, &older, original_request, RECENT_FOCUS);
         let table = match self.run_agentic_summary(model, &window_text).await {
             Ok(table) => table,
             // Model unavailable / failed — fall back to the heuristic compaction.
@@ -3389,9 +3601,8 @@ impl CodingHarness {
                 state.last_prompt_tokens, window, self.config.compact_at_pct
             ),
         });
-        // Drop events before this boundary — they're hidden from the UI and absent
-        // from model history (which lives in `messages`), so they'd only bloat every
-        // persist. This is what keeps a long session from growing unbounded.
+        // Prune events to this compaction boundary. Tool rows are
+        // reconstructible noise — they'd only bloat every persist.
         if let Some(i) = state.events.iter().rposition(
             |e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"),
         ) {
@@ -3419,6 +3630,7 @@ impl CodingHarness {
         // Restore the session's reasoning effort for the next real model call.
         model.swap_reasoning_effort(prev_effort);
         state.last_prompt_tokens = 0;
+        state.tool_payloads_pruned = false;
         Ok(())
     }
 
@@ -3723,6 +3935,40 @@ impl CodingHarness {
     }
 }
 
+/// Tiny marker left in place of pruned tool-call arguments.
+fn tool_args_are_stub(args: &Value) -> bool {
+    match args {
+        Value::Object(map) => {
+            map.len() <= 1
+                && map
+                    .get("_")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s == "pruned")
+        }
+        _ => false,
+    }
+}
+
+/// True when a tool result was already replaced by our prune stub.
+fn tool_result_is_stub(content: &Value) -> bool {
+    content
+        .get("pruned")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || content
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s == "pruned")
+}
+
+/// Minimal tool-result body kept after prune — just enough for pairing + audit.
+fn pruned_tool_result_stub(tool_name: &str) -> Value {
+    json!({
+        "pruned": true,
+        "tool": tool_name,
+    })
+}
+
 /// Insert synthetic error results for assistant tool calls that never received
 /// one. Every unanswered `tool_call_id` gets a stub result appended right after
 /// the contiguous result run that follows its assistant message, preserving the
@@ -3815,14 +4061,15 @@ fn build_live_context(
     conversation_mode: bool,
     workspace: &std::path::Path,
     browser_summary: Option<String>,
+    memory_writes: &[String],
 ) -> String {
     let signals = std::mem::take(&mut vars.pending_signals);
-    let mut block = String::from("<runtime_context>\n");
+    let mut block = String::new();
     // Terse on purpose: re-sent uncached every turn, so it carries only volatile
     // STATE (facts the model reads), never standing rules or imperatives. The
     // governing rules — that this block is not the user, and not to narrate turn
     // status — live once in the cached system prompt (conversation_agent_layer.md
-    // [runtime_context]), not repeated here every turn where they read like a user
+    // [steering]), not repeated here every turn where they read like a user
     // instruction and cost uncached tokens. One-line reminder only:
     block.push_str("# INTERNAL STATE — not user content; read silently and act.\n");
 
@@ -3905,7 +4152,7 @@ fn build_live_context(
     }
 
     if !signals.is_empty() {
-        block.push_str("\n[runtime_signals]  # one-shot state about last turn; act now, won't repeat. never quote it.\n");
+        block.push_str("\n[steering_signals]  # one-shot state about last turn; act now, won't repeat. never quote it.\n");
         for signal in &signals {
             block.push_str(&format!("{}\n", signal.render()));
         }
@@ -3924,9 +4171,24 @@ fn build_live_context(
         }
     }
 
-    // Skills are NOT preloaded into context — the agent finds them on demand with
-    // `search_skills` (keeps context lean however many skills exist), then loads the
-    // chosen one with `skill`.
+    // Skills: count-only (not the catalog) — search on demand keeps context lean.
+    let skill_n = crate::skills::discover().len();
+    if skill_n > 0 {
+        block.push_str("\n[skills_available]\n");
+        block.push_str(&format!(
+            "count = {skill_n}  # search_skills then skill(name) before improvising procedures\n"
+        ));
+    }
+
+    // Mid-session memory writes (system index is cache-fixed until resume).
+    if !memory_writes.is_empty() {
+        let ids: Vec<&str> = memory_writes.iter().map(String::as_str).collect();
+        block.push_str("\n[memory_updated]\n");
+        block.push_str(&format!(
+            "ids = \"{}\"  # written this session — memory_read to use now; system index refreshes on resume\n",
+            ids.join(", ")
+        ));
+    }
 
     // Background processes the agent started (dev servers, watchers) — so it knows
     // what's already running instead of re-launching, and can tail logs / kill them.
@@ -3986,7 +4248,6 @@ fn build_live_context(
         ));
     }
 
-    block.push_str("</runtime_context>\n");
     block
 }
 
@@ -4210,12 +4471,15 @@ pub fn deserialize_state(bytes: &[u8]) -> Result<HarnessState, String> {
     let mut decompressed_bytes = Vec::new();
     if decoder.read_to_end(&mut decompressed_bytes).is_ok() {
         if let Ok(state) = rmp_serde::from_slice::<HarnessState>(&decompressed_bytes) {
+            let mut state = state;
+            normalize_state_title(&mut state);
             return Ok(state);
         }
     }
 
     // Fallback: try parsing as legacy JSON
-    if let Ok(state) = serde_json::from_slice::<HarnessState>(bytes) {
+    if let Ok(mut state) = serde_json::from_slice::<HarnessState>(bytes) {
+        normalize_state_title(&mut state);
         return Ok(state);
     }
 
@@ -4281,7 +4545,7 @@ evidence = "exact paths, commands, and IDs verbatim; no speculation, no padding"
 
 [finalize]
 write_once = "write each entry ONCE. Do NOT re-save or 'polish' an entry you already wrote in this pass — it changes little and just burns turns. Aim for 1–2 writes total (an entry, then the index), then finalize."
-bias_to_capture = "if the session did REAL work (edits, debugging, a build, a multi-step task), it almost always demonstrated a reusable procedure or surfaced a durable fact — write at least one entry before finalizing. Finalizing with nothing written is only correct when the session was genuinely trivial."
+bias_to_capture = "if the session did REAL work (edits, debugging, a build, multi-step task), write at least one entry before finalizing — prefer UPDATING an existing id that matches the table over a new near-duplicate. Finalizing empty is only correct when the session was genuinely trivial. User lasting prefs → note them in a playbook line if memory_rule is unavailable here."
 when = "finalize as soon as the index and entries reflect the durable procedures/facts from this session — usually within 1–2 writes"
 how = "call finalize (one tool call per turn)""#;
 
@@ -4456,37 +4720,38 @@ fn tools_token_overhead(defs: &[NativeToolDefinition]) -> u64 {
 /// counting base64 as text (~chars/4) which overstates by ~10–50×.
 const ESTIMATED_VISION_TOKENS_PER_IMAGE: u64 = 1_200;
 
-fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
-    let mut chars: usize = 0;
+fn estimate_message_tokens(m: &HarnessMessage) -> u64 {
+    let mut chars: usize = 8; // role/framing overhead
     let mut images: u64 = 0;
-    for m in messages {
-        chars += 8; // role/framing overhead per message
-        match m {
-            HarnessMessage::User { content }
-            | HarnessMessage::System { content }
-            | HarnessMessage::Summary { content, .. } => chars += content.len(),
-            HarnessMessage::Assistant {
-                content,
-                tool_calls,
-            } => {
-                chars += content.len();
-                for c in tool_calls {
-                    chars += c.name.len() + c.arguments.to_string().len() + 8;
-                }
+    match m {
+        HarnessMessage::User { content }
+        | HarnessMessage::System { content }
+        | HarnessMessage::Summary { content, .. } => chars += content.len(),
+        HarnessMessage::Assistant {
+            content,
+            tool_calls,
+        } => {
+            chars += content.len();
+            for c in tool_calls {
+                chars += c.name.len() + c.arguments.to_string().len() + 8;
             }
-            HarnessMessage::ToolResult {
-                tool_name, content, ..
-            } => {
-                chars += tool_name.len();
-                let (cleaned, image) = crate::llm::split_inlined_image(content);
-                chars += cleaned.to_string().len();
-                if image.is_some() {
-                    images += 1;
-                }
+        }
+        HarnessMessage::ToolResult {
+            tool_name, content, ..
+        } => {
+            chars += tool_name.len();
+            let (cleaned, image) = crate::llm::split_inlined_image(content);
+            chars += cleaned.to_string().len();
+            if image.is_some() {
+                images += 1;
             }
         }
     }
     (chars / 4) as u64 + images.saturating_mul(ESTIMATED_VISION_TOKENS_PER_IMAGE)
+}
+
+fn estimate_prompt_tokens(messages: &[HarnessMessage]) -> u64 {
+    messages.iter().map(estimate_message_tokens).sum()
 }
 
 fn compact_path(path: &Path) -> String {
@@ -4531,7 +4796,7 @@ fn approval_summary(tool_name: &str, args: &Value) -> String {
 fn render_window(
     prior_table: &str,
     older: &[HarnessMessage],
-    user_request: &str,
+    original_request: &str,
     recent_focus: usize,
 ) -> String {
     let mut out = String::new();
@@ -4539,10 +4804,10 @@ fn render_window(
         out.push_str("PRIOR TABLE (update this in place):\n");
         out.push_str(prior_table.trim());
         out.push_str("\n\n");
-    } else if !user_request.trim().is_empty() {
+    } else if !original_request.trim().is_empty() {
         out.push_str(&format!(
             "ORIGINAL REQUEST: {}\n\n",
-            clip(user_request, 600)
+            clip(original_request, 600)
         ));
     }
     out.push_str("CONVERSATION TO SUMMARIZE:\n");
@@ -4620,4 +4885,342 @@ fn render_window(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod state_migration_tests {
+    use super::*;
+
+    fn legacy_state(title: Option<&str>) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "status": "idle",
+            "created_at": "now",
+            "updated_at": "now",
+            "workspace": "/tmp/workspace",
+            "user_request": "Restore the old session title",
+            "title": title,
+            "messages": [],
+            "events": [],
+            "iterations": 0
+        }))
+        .expect("legacy state JSON")
+    }
+
+    #[test]
+    fn legacy_request_migrates_to_title_and_is_not_reserialized() {
+        let state = deserialize_state(&legacy_state(None)).expect("legacy state should load");
+        assert_eq!(
+            state.title.as_deref(),
+            Some("Restore the old session title")
+        );
+        assert_eq!(
+            state.initial_request(),
+            Some("Restore the old session title")
+        );
+
+        let encoded = serialize_state(&state).expect("migrated state should serialize");
+        let mut decoder = flate2::read::GzDecoder::new(encoded.as_slice());
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut raw).expect("decompress state");
+        let value: serde_json::Value =
+            rmp_serde::from_slice(&raw).expect("decode serialized state map");
+        assert_eq!(
+            value.get("title").and_then(|v| v.as_str()),
+            Some("Restore the old session title")
+        );
+        assert_eq!(state.tool_payloads_pruned, false);
+        assert!(value.get("user_request").is_none());
+    }
+
+    #[test]
+    fn explicit_title_wins_over_legacy_request() {
+        let state =
+            deserialize_state(&legacy_state(Some("Saved title"))).expect("state should load");
+        assert_eq!(state.title.as_deref(), Some("Saved title"));
+        assert_eq!(
+            state.initial_request(),
+            Some("Restore the old session title")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_prune_tests {
+    use super::*;
+    use crate::llm::ToolCallRecord;
+
+    fn bulky_messages(n_tools: usize) -> Vec<HarnessMessage> {
+        let mut msgs = vec![HarnessMessage::System {
+            content: "sys".into(),
+        }];
+        for i in 0..n_tools {
+            let id = format!("c{i}");
+            let blob = "x".repeat(4_000);
+            msgs.push(HarnessMessage::Assistant {
+                content: String::new(),
+                tool_calls: vec![ToolCallRecord {
+                    id: id.clone(),
+                    name: "bash".into(),
+                    arguments: json!({"command": blob.clone()}),
+                    signature: None,
+                    origin_model: None,
+                }],
+            });
+            msgs.push(HarnessMessage::ToolResult {
+                tool_call_id: id,
+                tool_name: "bash".into(),
+                content: json!({"stdout": blob, "status": "ok"}),
+            });
+        }
+        // Live tail the pruner must leave alone.
+        msgs.push(HarnessMessage::User {
+            content: "keep me".into(),
+        });
+        msgs.push(HarnessMessage::Assistant {
+            content: "recent".into(),
+            tool_calls: vec![ToolCallRecord {
+                id: "live".into(),
+                name: "bash".into(),
+                arguments: json!({"command": "echo live-tail-must-stay"}),
+                signature: None,
+                origin_model: None,
+            }],
+        });
+        msgs.push(HarnessMessage::ToolResult {
+            tool_call_id: "live".into(),
+            tool_name: "bash".into(),
+            content: json!({"stdout": "live-tail-must-stay", "status": "ok"}),
+        });
+        msgs
+    }
+
+    fn test_state(messages: Vec<HarnessMessage>, last_prompt_tokens: u64) -> HarnessState {
+        HarnessState {
+            version: 1,
+            status: HarnessStatus::Idle,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            workspace: "/tmp".into(),
+            title: None,
+            legacy_request: String::new(),
+            goal: None,
+            compacting: false,
+            watches: Vec::new(),
+            messages,
+            events: Vec::new(),
+            iterations: 0,
+            final_text: None,
+            lanes: Vec::new(),
+            pending_question: None,
+            approval_mode: ApprovalMode::Auto,
+            total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            last_prompt_tokens,
+            cache_read_tokens: 0,
+            checkpoints: Vec::new(),
+            rate_limit: None,
+            context_window: 10_000,
+            tool_payloads_pruned: false,
+        }
+    }
+
+    #[test]
+    fn prunes_old_tool_bodies_keeps_recent_and_pairing() {
+        // window 10k, fire at 50% (5k), prefix = first 40% (4k) of window.
+        // Each bulky tool pair is ~2k est tokens, so several early pairs fall
+        // inside the prefix and must be stubbed; the live tail must not.
+        let harness = CodingHarness::new(
+            HarnessConfig {
+                context_window_tokens: 10_000,
+                tool_prune_at_pct: 50,
+                tool_prune_prefix_pct: 40,
+                ..HarnessConfig::default()
+            },
+            ToolRegistry::new(),
+            ToolContext::new(std::env::temp_dir()).expect("ctx"),
+        );
+        let mut state = test_state(bulky_messages(12), 8_000); // above 50% of 10k
+        let prefix_budget = 10_000u64 * 40 / 100;
+        let mut cum = 0u64;
+        let mut cut = 0usize;
+        for (i, msg) in state.messages.iter().enumerate() {
+            let t = estimate_message_tokens(msg);
+            if cum + t > prefix_budget {
+                break;
+            }
+            cum += t;
+            cut = i + 1;
+        }
+        assert!(
+            cut > 1,
+            "prefix cut should cover more than system alone, cut={cut}"
+        );
+
+        let before = estimate_prompt_tokens(&state.messages);
+        assert!(harness.prune_old_tool_payloads(&mut state));
+        assert!(state.tool_payloads_pruned);
+        let after = estimate_prompt_tokens(&state.messages);
+        assert!(
+            after < before,
+            "expected prune to shrink tokens {before} → {after}"
+        );
+
+        // Everything in the prefix with tools is stubbed.
+        for i in 0..cut {
+            match &state.messages[i] {
+                HarnessMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                    assert!(
+                        tool_args_are_stub(&tool_calls[0].arguments),
+                        "prefix msg {i} tool args should be stubbed"
+                    );
+                    assert!(!tool_calls[0].id.is_empty());
+                    assert_eq!(tool_calls[0].name, "bash");
+                }
+                HarnessMessage::ToolResult { content, .. } => {
+                    assert!(
+                        tool_result_is_stub(content),
+                        "prefix msg {i} tool result should be stubbed"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Past the prefix: tool payloads stay intact (including live tail).
+        for i in cut..state.messages.len() {
+            match &state.messages[i] {
+                HarnessMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => {
+                    assert!(
+                        !tool_args_are_stub(&tool_calls[0].arguments),
+                        "post-prefix msg {i} tool args must stay"
+                    );
+                }
+                HarnessMessage::ToolResult { content, .. } => {
+                    assert!(
+                        !tool_result_is_stub(content),
+                        "post-prefix msg {i} tool result must stay"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let last = state.messages.last().expect("tail");
+        match last {
+            HarnessMessage::ToolResult {
+                tool_call_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "live");
+                assert!(!tool_result_is_stub(content));
+                assert_eq!(
+                    content.get("stdout").and_then(Value::as_str),
+                    Some("live-tail-must-stay")
+                );
+            }
+            other => panic!("expected live tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pruning_is_once_per_history_epoch() {
+        let harness = CodingHarness::new(
+            HarnessConfig {
+                context_window_tokens: 10_000,
+                tool_prune_at_pct: 50,
+                tool_prune_prefix_pct: 40,
+                ..HarnessConfig::default()
+            },
+            ToolRegistry::new(),
+            ToolContext::new(std::env::temp_dir()).expect("ctx"),
+        );
+        let mut state = test_state(bulky_messages(12), 8_000);
+        assert!(harness.prune_old_tool_payloads(&mut state));
+
+        state.messages.insert(
+            1,
+            HarnessMessage::ToolResult {
+                tool_call_id: "new-old".into(),
+                tool_name: "bash".into(),
+                content: json!({"stdout": "z".repeat(4_000)}),
+            },
+        );
+        let messages = state.messages.clone();
+        assert!(!harness.prune_old_tool_payloads(&mut state));
+        assert_eq!(state.messages, messages);
+    }
+
+    #[test]
+    fn insignificant_savings_do_not_mutate_or_mark_epoch() {
+        let harness = CodingHarness::new(
+            HarnessConfig {
+                context_window_tokens: 1_000,
+                tool_prune_at_pct: 50,
+                tool_prune_prefix_pct: 100,
+                ..HarnessConfig::default()
+            },
+            ToolRegistry::new(),
+            ToolContext::new(std::env::temp_dir()).expect("ctx"),
+        );
+        let messages = vec![
+            HarnessMessage::System {
+                content: "sys".into(),
+            },
+            HarnessMessage::ToolResult {
+                tool_call_id: "small".into(),
+                tool_name: "bash".into(),
+                content: json!({"stdout": "tiny"}),
+            },
+        ];
+        let mut state = test_state(messages.clone(), 900);
+        assert!(!harness.prune_old_tool_payloads(&mut state));
+        assert_eq!(state.messages, messages);
+        assert!(!state.tool_payloads_pruned);
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_starts_a_new_prune_epoch() {
+        let harness = CodingHarness::new(
+            HarnessConfig::default(),
+            ToolRegistry::new(),
+            ToolContext::new(std::env::temp_dir()).expect("ctx"),
+        );
+        let mut state = test_state(bulky_messages(12), 100_000);
+        state.tool_payloads_pruned = true;
+
+        harness
+            .compact_history(&mut state, true)
+            .await
+            .expect("compaction");
+
+        assert!(!state.tool_payloads_pruned);
+        assert_eq!(state.last_prompt_tokens, 0);
+        assert!(state.events.iter().any(
+            |event| matches!(event, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted")
+        ));
+    }
+
+    #[test]
+    fn skips_prune_below_threshold() {
+        let harness = CodingHarness::new(
+            HarnessConfig {
+                context_window_tokens: 10_000,
+                tool_prune_at_pct: 75,
+                ..HarnessConfig::default()
+            },
+            ToolRegistry::new(),
+            ToolContext::new(std::env::temp_dir()).expect("ctx"),
+        );
+        let mut state = test_state(bulky_messages(12), 1_000); // well under 75%
+        assert!(!harness.prune_old_tool_payloads(&mut state));
+        match &state.messages[1] {
+            HarnessMessage::Assistant { tool_calls, .. } => {
+                assert!(!tool_args_are_stub(&tool_calls[0].arguments));
+            }
+            _ => panic!("expected assistant"),
+        }
+    }
 }

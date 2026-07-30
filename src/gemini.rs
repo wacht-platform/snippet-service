@@ -168,7 +168,11 @@ impl AgentModel for GeminiModel {
                     e @ ("low" | "medium" | "high" | "xhigh" | "max") if is_g3 => {
                         // Gemini 3 exposes discrete levels; `high` is the ceiling, so
                         // `xhigh`/`max` map onto it too.
-                        let level = if matches!(e, "high" | "xhigh" | "max") { "high" } else { "low" };
+                        let level = if matches!(e, "high" | "xhigh" | "max") {
+                            "high"
+                        } else {
+                            "low"
+                        };
                         thinking.insert("thinkingLevel".to_string(), json!(level));
                     }
                     "low" => {
@@ -308,10 +312,8 @@ impl GeminiModel {
                 let delta_contents = cacheable[prior.cached_content_count..].to_vec();
                 let delta_tokens = estimate_tokens(&Value::Array(delta_contents.clone()));
                 let m = (prior.reuse_turns as usize).saturating_add(1);
-                let near_expiry =
-                    prior.expire_at <= Utc::now() + chrono::Duration::seconds(120);
-                should_refresh =
-                    delta_tokens.saturating_mul(m) >= prefix_tokens || near_expiry;
+                let near_expiry = prior.expire_at <= Utc::now() + chrono::Duration::seconds(120);
+                should_refresh = delta_tokens.saturating_mul(m) >= prefix_tokens || near_expiry;
 
                 let mut delta = delta_contents;
                 delta.extend(tail);
@@ -460,8 +462,10 @@ impl GeminiModel {
                         fatal = !is_retryable_status(status);
                         break;
                     }
-                    let parsed: GeminiResponse = serde_json::from_slice(&bytes)
-                        .map_err(|error| ToolError::msg(format!("invalid gemini response: {error}")))?;
+                    let parsed: GeminiResponse =
+                        serde_json::from_slice(&bytes).map_err(|error| {
+                            ToolError::msg(format!("invalid gemini response: {error}"))
+                        })?;
                     // Gemini flash sometimes returns an empty turn (no parts) even
                     // with tools available — transient. Retry a few times before
                     // handing the empty response back.
@@ -591,12 +595,15 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
             HarnessMessage::System { content } => push_content(
                 &mut contents,
                 "user",
-                vec![json!({ "text": format!("[runtime_signal]\n{content}\n[/runtime_signal]") })],
+                vec![json!({ "text": format!("[steering]\n{content}\n[/steering]") })],
             ),
             HarnessMessage::User { content } => {
                 push_content(&mut contents, "user", vec![json!({ "text": content })])
             }
-            HarnessMessage::Assistant { content, tool_calls } => {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 let mut parts: Vec<Value> = Vec::new();
                 if !content.is_empty() {
                     parts.push(json!({ "text": content }));
@@ -612,10 +619,9 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
                     // model (signatures are model-specific). Otherwise Gemini 3+
                     // rejects a replayed functionCall without one, so attach the
                     // skip sentinel; Gemini 2.5 needs neither.
-                    let own_signature = call
-                        .signature
-                        .as_deref()
-                        .filter(|sig| !sig.is_empty() && call.origin_model.as_deref() == Some(model));
+                    let own_signature = call.signature.as_deref().filter(|sig| {
+                        !sig.is_empty() && call.origin_model.as_deref() == Some(model)
+                    });
                     if let Some(signature) = own_signature {
                         part["thoughtSignature"] = json!(signature);
                     } else if !is_gemini_2_5(model) {
@@ -627,7 +633,9 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
                     push_content(&mut contents, "model", parts);
                 }
             }
-            HarnessMessage::ToolResult { tool_name, content, .. } => {
+            HarnessMessage::ToolResult {
+                tool_name, content, ..
+            } => {
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
                 let response = if cleaned.is_object() {
                     cleaned
@@ -642,13 +650,11 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
                 }
                 push_content(&mut contents, "user", parts);
             }
-            HarnessMessage::Summary { kind, content } => {
-                push_content(
-                    &mut contents,
-                    "user",
-                    vec![json!({ "text": format!("[summary:{kind}]\n{content}\n[/summary]") })],
-                )
-            }
+            HarnessMessage::Summary { kind, content } => push_content(
+                &mut contents,
+                "user",
+                vec![json!({ "text": format!("[summary:{kind}]\n{content}\n[/summary]") })],
+            ),
         }
     }
     (system, contents)
@@ -718,10 +724,7 @@ fn map_response(response: GeminiResponse, model: &str) -> (ModelOutput, Option<S
         rate_limit: None,
     };
     let thought = thought_text.trim();
-    (
-        output,
-        (!thought.is_empty()).then(|| thought.to_string()),
-    )
+    (output, (!thought.is_empty()).then(|| thought.to_string()))
 }
 
 /// Consume a Gemini `streamGenerateContent?alt=sse` stream: push text and thought
@@ -816,7 +819,11 @@ fn response_empty(response: &GeminiResponse) -> bool {
         // retry logic gives the model another shot at a real turn.
         .any(|part| {
             !part.thought.unwrap_or(false)
-                && part.text.as_deref().map(|t| !t.trim().is_empty()).unwrap_or(false)
+                && part
+                    .text
+                    .as_deref()
+                    .map(|t| !t.trim().is_empty())
+                    .unwrap_or(false)
         });
     !has_call && !has_text
 }

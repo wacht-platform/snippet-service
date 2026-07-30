@@ -157,7 +157,7 @@ assemblyai_api_key = "..."
 - **One engine, two front-ends.** The harness loop is UI-agnostic; the TUI and `serve` are thin shells over it, so a session started in either is the same on-disk session under `~/.snippet/workspaces/`.
 - **Durable + resumable.** Every session persists loop state, history, and checkpoints — resume, rewind, or attach from another device.
 - **Layered prompts.** `prompts/{operating_style,sandbox_environment,artifact_discipline,coding_agent_layer,conversation_agent_layer}.md` are composed into the system prompt; per-turn steering is injected fresh each turn (kept out of the cached prefix for token efficiency).
-- **Tools:** `read_file`, `read_image`, `write_file`, `append_file`, `edit_file`, `replace_file_content`, `list_files`, `search_files`, `search_content` (regex), `view_outline`, `code_map`, `bash` (+ `background`), `search_skills`/`skill`, and `delegate_task` for parallel lanes.
+- **Tools:** `read_file`, `read_image`, `write_file`, `append_file`, `edit_file`, `list_files`, `search_files`, `search_content` (regex), `view_outline`, `code_map`, `bash` (+ `background`), `search_skills`/`skill`, and `delegate_task` for parallel lanes.
 
 ## Security
 

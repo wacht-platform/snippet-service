@@ -250,7 +250,7 @@ pub(super) async fn download_fs_file(
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (StatusCode::NOT_FOUND, "not found").into_response()
+            return (StatusCode::NOT_FOUND, "not found").into_response();
         }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -404,7 +404,7 @@ pub(super) async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuer
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
                 }
             };
             let truncated = bytes.len() > MAX_FS_FILE_BYTES;

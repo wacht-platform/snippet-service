@@ -69,7 +69,13 @@ pub struct WatchManager {
 
 impl WatchManager {
     pub fn new(workspace: PathBuf, tx: mpsc::UnboundedSender<WatchEvent>) -> Self {
-        Self { records: Vec::new(), tasks: Vec::new(), tx, counter: 0, workspace }
+        Self {
+            records: Vec::new(),
+            tasks: Vec::new(),
+            tx,
+            counter: 0,
+            workspace,
+        }
     }
 
     pub fn records(&self) -> &[WatchRecord] {
@@ -84,7 +90,10 @@ impl WatchManager {
                 continue;
             }
             // Keep the counter ahead of restored ids ("watch-3" → counter ≥ 3).
-            if let Some(n) = r.id.strip_prefix("watch-").and_then(|s| s.parse::<usize>().ok()) {
+            if let Some(n) =
+                r.id.strip_prefix("watch-")
+                    .and_then(|s| s.parse::<usize>().ok())
+            {
                 self.counter = self.counter.max(n);
             }
             self.records.push(r.clone());
@@ -108,7 +117,11 @@ impl WatchManager {
         if let Some(f) = filter {
             regex::Regex::new(f).map_err(|e| format!("filter is not a valid regex: {e}"))?;
         }
-        if self.records.iter().any(|r| r.path == resolved.display().to_string()) {
+        if self
+            .records
+            .iter()
+            .any(|r| r.path == resolved.display().to_string())
+        {
             return Err(format!(
                 "`{path}` is already being watched — remove it first to change the filter."
             ));
@@ -208,7 +221,10 @@ impl WatchManager {
                 let started = tokio::time::Instant::now();
                 loop {
                     sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-                    let now = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(size);
+                    let now = tokio::fs::metadata(&path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(size);
                     if now == size || started.elapsed() >= Duration::from_millis(DEBOUNCE_MAX_MS) {
                         size = now.max(size);
                         break;
@@ -273,4 +289,3 @@ fn cap_tail(delta: &str, max: usize) -> (String, u64) {
     }
     ((&delta[start..]).to_string(), start as u64)
 }
-

@@ -137,8 +137,16 @@ async fn post_form(url: &str, fields: &[(&str, &str)]) -> Result<(bool, Value), 
 
 fn failure(action: &str, body: &Value) -> String {
     let err = body.get("error").and_then(Value::as_str).unwrap_or("");
-    let desc = body.get("error_description").and_then(Value::as_str).unwrap_or("");
-    let detail = [err, desc].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(": ");
+    let desc = body
+        .get("error_description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let detail = [err, desc]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(": ");
     if detail.is_empty() {
         format!("xAI OAuth {action} failed")
     } else {
@@ -150,7 +158,11 @@ fn failure(action: &str, body: &Value) -> String {
 pub async fn begin_device_code_login() -> Result<DeviceCodeInfo, String> {
     let (ok, body) = post_form(
         DEVICE_CODE_URL,
-        &[("client_id", CLIENT_ID), ("scope", SCOPE), ("referrer", "snippet")],
+        &[
+            ("client_id", CLIENT_ID),
+            ("scope", SCOPE),
+            ("referrer", "snippet"),
+        ],
     )
     .await?;
     if !ok {
@@ -163,8 +175,15 @@ pub async fn begin_device_code_login() -> Result<DeviceCodeInfo, String> {
             .or_else(|| s("verification_uri"))
             .ok_or("no verification_uri")?,
         device_code: s("device_code").ok_or("no device_code")?,
-        interval_s: body.get("interval").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(5),
-        expires_in_s: body.get("expires_in").and_then(Value::as_i64).unwrap_or(600),
+        interval_s: body
+            .get("interval")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .unwrap_or(5),
+        expires_in_s: body
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .unwrap_or(600),
     })
 }
 

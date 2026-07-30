@@ -65,7 +65,9 @@ async fn audio_duration_seconds(path: &Path) -> Result<f64, String> {
 pub(super) async fn prepare_message(d: &Daemon, text: String) -> Result<String, String> {
     let markers: Vec<PathBuf> = text.lines().filter_map(attachment_path).collect();
     if markers.len() > MAX_ATTACHMENTS {
-        return Err(format!("a message can contain at most {MAX_ATTACHMENTS} attachments"));
+        return Err(format!(
+            "a message can contain at most {MAX_ATTACHMENTS} attachments"
+        ));
     }
     let audio_paths: Vec<PathBuf> = markers
         .iter()
@@ -151,7 +153,9 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
     if !submit_response.status().is_success() {
         let status = submit_response.status();
         let body = submit_response.text().await.unwrap_or_default();
-        return Err(format!("AssemblyAI transcript submission failed ({status}): {body}"));
+        return Err(format!(
+            "AssemblyAI transcript submission failed ({status}): {body}"
+        ));
     }
     let submitted: serde_json::Value = submit_response
         .json()

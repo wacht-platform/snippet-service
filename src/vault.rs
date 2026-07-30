@@ -166,8 +166,13 @@ impl Vault {
     /// Valid secret name = valid env var name, uppercase convention.
     pub fn valid_name(name: &str) -> bool {
         !name.is_empty()
-            && name.chars().next().is_some_and(|c| c.is_ascii_uppercase() || c == '_')
-            && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            && name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     }
 
     pub fn set(&mut self, name: &str, value: &str) -> Result<(), String> {
@@ -179,7 +184,8 @@ impl Vault {
         if value.trim().len() < MIN_SECRET_LEN {
             return Err(format!("value too short (min {MIN_SECRET_LEN} chars)"));
         }
-        self.secrets.insert(name.to_string(), value.trim().to_string());
+        self.secrets
+            .insert(name.to_string(), value.trim().to_string());
         self.save()
     }
 

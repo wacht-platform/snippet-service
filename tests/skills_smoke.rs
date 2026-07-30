@@ -16,12 +16,16 @@ fn discovers_and_loads_skill() {
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].name, "changelog");
 
-    let (sk, body, files): (_, String, Vec<String>) = snippet::skills::load_in(&root, "changelog").unwrap();
+    let (sk, body, files): (_, String, Vec<String>) =
+        snippet::skills::load_in(&root, "changelog").unwrap();
     assert_eq!(sk.name, "changelog");
     assert!(!body.starts_with("---"), "frontmatter should be stripped");
     assert!(body.contains("# Changelog"));
     assert!(files.iter().any(|f| f.contains("collect.sh")));
-    assert!(files[0].starts_with('/'), "bundled paths should be absolute");
+    assert!(
+        files[0].starts_with('/'),
+        "bundled paths should be absolute"
+    );
 
     // search: a matching query surfaces the skill; a blank query lists all.
     let hits = snippet::skills::search_in(&root, "changelog release notes");

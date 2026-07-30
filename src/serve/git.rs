@@ -516,7 +516,7 @@ pub(super) async fn git_stash(
                 StatusCode::BAD_REQUEST,
                 format!("unknown stash op `{other}`"),
             )
-                .into_response()
+                .into_response();
         }
     };
     let _lock = d.git_write.lock().await;

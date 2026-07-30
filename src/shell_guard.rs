@@ -204,8 +204,7 @@ const NUDGE_WRITE_MSG: &str = "you wrote file content through the shell. Prefer 
 `append_file` (add lines), or `edit_file` (change a substring) — they honor read-before-edit and the trailing-newline \
 guarantee that shell `>`/`>>`/`tee` skip. Shell stays great for inspection (grep, pipes, find).";
 
-const NUDGE_SED_MSG: &str =
-    "`sed -i` edits a file in place. Prefer `read_file` then `edit_file` (anchor `old_string` \
+const NUDGE_SED_MSG: &str = "`sed -i` edits a file in place. Prefer `read_file` then `edit_file` (anchor `old_string` \
 on the exact bytes you read) — keeps read-discipline intact. Shell stays great for inspection.";
 
 const NUDGE_CAT_MSG: &str = "you used `cat` to read a whole file. Prefer `read_file`: it returns total_lines/total_chars and the \
