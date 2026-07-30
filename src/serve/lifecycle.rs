@@ -26,43 +26,35 @@ pub fn acquire_shared_lock() -> Option<std::fs::File> {
     }
 }
 
-/// Compare the running binary's hash against the stored hash in the lock file.
-/// If they differ, the binary was updated externally — restart is needed.
-pub fn binary_hash_changed() -> bool {
-    let Some(current_hash) = compute_binary_hash() else {
-        return false;
+/// Write the current binary's hash into the lock file. A process that has just
+/// launched is already running the selected binary, so any older hash is stale.
+pub fn stamp_binary_hash() {
+    let Some(hash) = compute_binary_hash() else {
+        return;
     };
-    let stored = std::fs::read_to_string(lock_path()).unwrap_or_default();
-    let stored = stored.trim();
-    // Empty or missing stored hash → first run, don't restart.
-    if stored.is_empty() {
-        return false;
-    }
-    current_hash != stored
+    let _ = write_binary_hash(&lock_path(), &hash);
 }
 
-/// Write the current binary's hash into the lock file (under an exclusive lock).
-/// Called by the installer after copying the new binary.
-pub fn stamp_binary_hash() {
+fn write_binary_hash(path: &std::path::Path, hash: &str) -> std::io::Result<()> {
+    use std::io::Write;
     use std::os::unix::io::AsRawFd;
-    let dir = snippet_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let file = match std::fs::OpenOptions::new()
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        .open(lock_path())
-    {
-        Ok(f) => f,
-        Err(_) => return,
-    };
+        .truncate(false)
+        .open(path)?;
     unsafe {
         libc::flock(file.as_raw_fd(), libc::LOCK_EX);
     }
-    if let Some(hash) = compute_binary_hash() {
-        let _ = std::fs::write(lock_path(), hash);
-    }
-    // Lock released when file drops.
+    file.set_len(0)?;
+    file.write_all(hash.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn compute_binary_hash() -> Option<String> {
@@ -977,5 +969,24 @@ pub fn ensure_service(config_path: &std::path::Path) -> Result<(), String> {
         start_installed_service()
     } else {
         install_service_quiet(config_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_binary_hash;
+
+    #[test]
+    fn startup_stamp_replaces_stale_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("serve.lock");
+        std::fs::write(&path, "old-binary-hash\n").expect("seed stale hash");
+
+        write_binary_hash(&path, "new-binary-hash").expect("stamp current hash");
+
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read stamped hash"),
+            "new-binary-hash"
+        );
     }
 }

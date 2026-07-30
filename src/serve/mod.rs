@@ -444,13 +444,7 @@ pub async fn run_serve(
     tunnel: Tunnel,
     supervised: bool,
 ) -> Result<(), String> {
-    // If the binary was replaced externally (mv/cp) and the hash in the lock
-    // file doesn't match, exit so systemd/launchd restarts with the new binary.
-    // The hash is stamped after a successful startup.
-    if crate::serve::lifecycle::binary_hash_changed() {
-        eprintln!("binary updated — exiting for service restart");
-        std::process::exit(1);
-    }
+    crate::serve::lifecycle::stamp_binary_hash();
     let token_for_print = token.clone();
     let mut config = config;
     config.ensure_setups();
