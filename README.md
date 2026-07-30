@@ -31,10 +31,11 @@ No cloud middleman, no lock-in, no subscription of ours. Your keys, your machine
 - **Drive it from your phone or Mac** — run `snippet serve` on your dev box and control it from the [mobile/desktop app](https://github.com/wacht-platform/snippet-mobile) over an authenticated [cloudflared](https://github.com/cloudflare/cloudflared) tunnel: chat, browse & edit files, view git diffs, run commands, manage checkpoints.
 - **Any model** — `anthropic`, `openai`, `gemini`, `openrouter`, `openai-compatible` (local models included), or a **ChatGPT subscription** (OAuth, no API key). Configure several providers as **profiles** and switch the active one — even **per conversation**.
 - **Real tool surface** — read/write/edit, shell, recursive regex search, structural code mapping, image reading, and web search (with an Exa key).
-- **Parallel sub-agents** — the agent orchestrates scoped work across background **lanes** that share the workspace and report back with exact `file:line` references, keeping its own context lean.
+- **Parallel sub-agents** — the agent orchestrates scoped work across durable background **lanes**, shows their live activity in a dedicated TUI screen, and can recover their state after a restart.
+- **Browser control** — connect the companion Chrome/Firefox extension and let the agent inspect tabs, operate DOM or canvas interfaces, scroll nested views, drag and drop, inspect console/network metadata, and verify each action through the `snippet browser` CLI.
 - **Agent Skills** — drop a `SKILL.md` folder in `~/.snippet/skills/`; the agent discovers and loads it on demand (the open [Agent Skills](https://agentskills.io) standard).
 - **Background processes** — start dev servers / watchers detached; the agent tracks, tails, and kills them.
-- **Runs indefinitely** — long histories **auto-compact** at a configurable threshold, and a persistent **memory** carries key facts across compactions, so a single session never hits a wall.
+- **Runs indefinitely** — long histories **auto-compact**, old tool payloads are pruned once per history epoch to protect prompt-cache reuse, and persistent **memory** carries key facts across compactions.
 - **Self-updating** — the TUI checks for a newer release on launch; the daemon updates itself in place and restarts cleanly without dropping work.
 - **Prompts as files** — every system-prompt layer lives in `prompts/` and is embedded at compile time. Tune the agent by editing Markdown, not Rust.
 
@@ -83,6 +84,7 @@ Describe a task in plain language and the agent plans, edits, runs, and verifies
 | `/compact`         | Compact the conversation history now                          |
 | `/rewind`          | Rewind to an earlier checkpoint                               |
 | `/new`             | Start a fresh conversation                                    |
+| `Ctrl-A`           | Open the dedicated delegated-lanes activity screen            |
 | `/theme`           | Switch the color theme                                        |
 
 The status bar shows the active model and a live context-usage gauge; sessions auto-compact before they fill.
