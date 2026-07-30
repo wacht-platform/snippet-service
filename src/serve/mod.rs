@@ -2288,7 +2288,7 @@ async fn handle_ws(
             {
                 use std::hash::{Hash, Hasher};
                 let snap = crate::llm::StreamBuffer::snapshot(&stream);
-                let think = crate::llm::StreamBuffer::snapshot_thinking(&stream);
+                let think = crate::llm::StreamBuffer::snapshot_thinking_tail(&stream, 12_000);
                 let visible = stream.try_lock().map(|b| b.text_visible).unwrap_or(false);
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 snap.hash(&mut h);
