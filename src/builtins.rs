@@ -138,8 +138,6 @@ impl Tool for ReadFileTool {
                 "the vault file is off-limits — secret VALUES are never readable. Use a secret as $NAME in bash; its value is injected into the process and redacted from output.",
             ));
         }
-        // Image path (or binary that sniffs as one): same envelope as read_image so
-        // the harness inlines vision bytes. Models often call read_file on screenshots.
         let head = {
             use tokio::io::AsyncReadExt;
             let mut f = tokio::fs::File::open(&path).await?;
@@ -176,8 +174,6 @@ impl Tool for ReadFileTool {
         let (selected, mut range_meta) = if args.start_char.is_some() || args.end_char.is_some() {
             let chars: Vec<char> = content.chars().collect();
             let start = args.start_char.unwrap_or(1).max(1);
-            // `clamp(start, total)` panics if start > total (e.g. an empty file), so
-            // bound `end` independently and only slice when the window is in range.
             let end = args
                 .end_char
                 .unwrap_or(total_chars)
@@ -207,9 +203,6 @@ impl Tool for ReadFileTool {
         };
 
         let hash = slice_hash(&selected);
-        // The model controls read size via the windows, so read_file pages itself
-        // rather than spilling: an over-large slice is previewed with a hint to
-        // narrow the window (the central spill in `tools.rs` exempts read_file).
         let truncated = selected.chars().count() > MAX_INLINE_CHARS;
         let content_field: String = if truncated {
             selected.chars().take(6000).collect()
@@ -349,12 +342,8 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/gif")
     } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         Some("image/webp")
-    } else if bytes.starts_with(b"BM") {
-        Some("image/bmp")
     } else {
-        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
-        let head = head.trim_start();
-        (head.starts_with("<?xml") || head.starts_with("<svg")).then_some("image/svg+xml")
+        None
     }
 }
 
