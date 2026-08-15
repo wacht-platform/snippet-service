@@ -278,9 +278,8 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Lane lifecycle and reports belong to the dedicated lanes screen. Do not
-        // duplicate them in the conversation canvas; the compact aggregate below
-        // remains the only inline affordance.
+        // Lane lifecycle and reports live in the dedicated lanes screen; keep the
+        // conversation canvas free of duplicate lane status and report previews.
         if matches!(
             event,
             HarnessEvent::LaneSpawned { .. } | HarnessEvent::LaneCompleted { .. }

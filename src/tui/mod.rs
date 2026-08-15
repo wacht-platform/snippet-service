@@ -4432,17 +4432,21 @@ fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 }
                 detail_lines.push(Line::from(""));
             }
-            detail_lines.push(Line::from(Span::styled(
-                "Report",
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-            )));
-            let report_body = item
-                .report
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .or(item.summary.as_deref())
-                .unwrap_or(summary_body);
-            detail_lines.extend(markdown::render_prose(report_body, prose_w));
+            if let Some(summary) = item.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+                detail_lines.push(Line::from(Span::styled(
+                    "Summary",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )));
+                detail_lines.extend(markdown::render_prose(summary, prose_w));
+                detail_lines.push(Line::from(""));
+            }
+            if let Some(report) = item.report.as_deref().filter(|s| !s.trim().is_empty()) {
+                detail_lines.push(Line::from(Span::styled(
+                    "Report",
+                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                )));
+                detail_lines.extend(markdown::render_prose(report, prose_w));
+            }
         } else {
             detail_lines.push(Line::from(Span::styled(
                 "Summary",
