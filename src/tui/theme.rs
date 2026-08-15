@@ -203,7 +203,97 @@ pub(super) const EVERFOREST: Theme = Theme {
     code: Color::Rgb(214, 153, 182),    // purple
 };
 
+// Kanagawa Wave — ink-black indigo with Hokusai-inspired muted jewel tones.
+pub(super) const KANAGAWA: Theme = Theme {
+    accent: Color::Rgb(126, 156, 216),
+    text: Color::Rgb(220, 215, 186),
+    muted: Color::Rgb(166, 166, 156),
+    faint: Color::Rgb(114, 113, 105),
+    success: Color::Rgb(152, 187, 108),
+    danger: Color::Rgb(195, 64, 67),
+    warn: Color::Rgb(230, 195, 132),
+    lane: Color::Rgb(126, 156, 216),
+    code: Color::Rgb(149, 127, 184),
+};
+
+// Ayu Mirage — warm charcoal, amber focus, and restrained blue-green status.
+pub(super) const AYU_MIRAGE: Theme = Theme {
+    accent: Color::Rgb(255, 204, 102),
+    text: Color::Rgb(204, 202, 194),
+    muted: Color::Rgb(171, 176, 182),
+    faint: Color::Rgb(92, 103, 115),
+    success: Color::Rgb(186, 230, 126),
+    danger: Color::Rgb(240, 113, 120),
+    warn: Color::Rgb(255, 204, 102),
+    lane: Color::Rgb(149, 230, 203),
+    code: Color::Rgb(255, 173, 102),
+};
+
+// Night Owl — crisp slate navy designed for long, low-light coding sessions.
+pub(super) const NIGHT_OWL: Theme = Theme {
+    accent: Color::Rgb(130, 170, 255),
+    text: Color::Rgb(214, 222, 235),
+    muted: Color::Rgb(157, 177, 197),
+    faint: Color::Rgb(99, 119, 119),
+    success: Color::Rgb(173, 219, 103),
+    danger: Color::Rgb(239, 83, 80),
+    warn: Color::Rgb(255, 203, 107),
+    lane: Color::Rgb(199, 146, 234),
+    code: Color::Rgb(199, 146, 234),
+};
+
+// Monokai Pro — high-clarity charcoal with lively, carefully balanced accents.
+pub(super) const MONOKAI_PRO: Theme = Theme {
+    accent: Color::Rgb(252, 152, 103),
+    text: Color::Rgb(252, 252, 250),
+    muted: Color::Rgb(193, 192, 192),
+    faint: Color::Rgb(114, 112, 114),
+    success: Color::Rgb(169, 220, 118),
+    danger: Color::Rgb(255, 97, 136),
+    warn: Color::Rgb(255, 216, 102),
+    lane: Color::Rgb(120, 220, 232),
+    code: Color::Rgb(171, 157, 242),
+};
+
+// Oxocarbon — IBM Carbon's deep graphite base and cool blue focus color.
+pub(super) const OXOCARBON: Theme = Theme {
+    accent: Color::Rgb(120, 169, 255),
+    text: Color::Rgb(242, 244, 248),
+    muted: Color::Rgb(187, 195, 207),
+    faint: Color::Rgb(105, 112, 119),
+    success: Color::Rgb(66, 190, 101),
+    danger: Color::Rgb(255, 126, 182),
+    warn: Color::Rgb(241, 194, 27),
+    lane: Color::Rgb(51, 177, 255),
+    code: Color::Rgb(190, 157, 255),
+};
+
 pub(super) const PRESETS: &[ThemePreset] = &[
+    ThemePreset {
+        name: "kanagawa",
+        label: "Kanagawa Wave",
+        theme: KANAGAWA,
+    },
+    ThemePreset {
+        name: "ayu-mirage",
+        label: "Ayu Mirage",
+        theme: AYU_MIRAGE,
+    },
+    ThemePreset {
+        name: "night-owl",
+        label: "Night Owl",
+        theme: NIGHT_OWL,
+    },
+    ThemePreset {
+        name: "monokai-pro",
+        label: "Monokai Pro",
+        theme: MONOKAI_PRO,
+    },
+    ThemePreset {
+        name: "oxocarbon",
+        label: "Oxocarbon",
+        theme: OXOCARBON,
+    },
     ThemePreset {
         name: "terminal-ink",
         label: "Terminal Ink (blue)",
