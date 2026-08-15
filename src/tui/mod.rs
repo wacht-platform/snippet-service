@@ -2682,7 +2682,9 @@ impl App {
     /// Send the current input immediately as a mid-run steer (or normal submit if idle).
     /// Bound to Ctrl+S so Enter can keep queueing while busy.
     fn steer_now(&mut self) {
-        let text = self.input.trim().to_string();
+        // Use the same expansion as a normal submission so steering never drops
+        // pasted blocks or attachments that live outside `self.input`.
+        let text = self.message_for_send().trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -2699,9 +2701,10 @@ impl App {
         self.input_clear();
         self.scroll = 0;
         // Deliver now even if busy — harness folds UserMessage into [steer] mid-run.
+        // `submit_text` retains its local busy marker until persisted state catches
+        // up, so a fast Enter after this steer queues instead of becoming a second,
+        // timing-dependent steer.
         self.submit_text(text);
-        // Don't force queue semantics for the next keystroke after an explicit steer.
-        self.sent_turn_pending = false;
     }
 
     /// Submit everything queued when the agent goes idle/stopped — as a BURST of
