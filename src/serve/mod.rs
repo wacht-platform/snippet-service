@@ -32,7 +32,7 @@ mod browser;
 mod fs;
 mod git;
 mod lifecycle;
-use crate::term::SessionTerm;
+use crate::term::SessionTerms;
 pub mod sidecar;
 mod transcribe;
 mod tunnel;
@@ -56,8 +56,8 @@ struct LiveSession {
     /// harness so /attach can push partial answer/thinking without waiting for
     /// the next state.json write.
     stream: crate::llm::StreamHandle,
-    /// Interactive human PTY for this session (not used by the agent bash tool).
-    term: Arc<SessionTerm>,
+    /// Interactive human PTYs for this session (not used by the agent bash tool).
+    terms: Arc<SessionTerms>,
 }
 
 fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<String>) -> LiveSession {
@@ -91,7 +91,7 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
         stream: handle.stream.unwrap_or_else(|| {
             std::sync::Arc::new(std::sync::Mutex::new(crate::llm::StreamBuffer::default()))
         }),
-        term: SessionTerm::new(cwd),
+        terms: SessionTerms::new(cwd),
     }
 }
 
@@ -2212,14 +2212,14 @@ async fn attach_ws(
     }
     match d.ensure_live(&q.session).await {
         Some((_, state_path, stream)) => {
-            let term = {
+            let terms = {
                 let sessions = d.sessions.lock().await;
-                sessions.get(&q.session).map(|s| s.term.clone())
+                sessions.get(&q.session).map(|s| s.terms.clone())
             };
             let daemon = d.clone();
             let session = q.session.clone();
             ws.on_upgrade(move |socket| {
-                handle_ws(socket, daemon, session, state_path, stream, term)
+                handle_ws(socket, daemon, session, state_path, stream, terms)
             })
         }
         None => (StatusCode::NOT_FOUND, "no such session").into_response(),
@@ -2232,7 +2232,7 @@ async fn handle_ws(
     session: String,
     state_path: PathBuf,
     stream: crate::llm::StreamHandle,
-    term: Option<std::sync::Arc<crate::term::SessionTerm>>,
+    terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -2241,13 +2241,13 @@ async fn handle_ws(
     let push_session = session.clone();
     let push_state_path = state_path.clone();
     let push_stream = stream.clone();
-    let push_term = term.clone();
+    let push_terms = terms.clone();
     let push = tokio::spawn(async move {
         let daemon = push_daemon;
         let session = push_session;
         let state_path = push_state_path;
         let stream = push_stream;
-        let term = push_term;
+        let terms = push_terms;
         let mut last_mtime = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_stream_fp: u64 = 0;
@@ -2347,34 +2347,38 @@ async fn handle_ws(
                     }
                 }
             }
-            if let Some(t) = term.as_ref() {
+            if let Some(terms) = terms.as_ref() {
                 use base64::Engine;
                 if !sent_term_snap {
                     sent_term_snap = true;
-                    term_seq = term_seq.wrapping_add(1);
-                    let (bytes, cols, rows, alive) = t.snapshot();
-                    let frame = serde_json::json!({
-                        "wire": "term",
-                        "op": "snapshot",
-                        "seq": term_seq,
-                        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        "cols": cols,
-                        "rows": rows,
-                        "alive": alive,
-                    });
-                    if let Ok(json) = serde_json::to_string(&frame) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
-                            break;
+                    for (id, bytes, cols, rows, alive) in terms.snapshot_all() {
+                        term_seq = term_seq.wrapping_add(1);
+                        let frame = serde_json::json!({
+                            "wire": "term",
+                            "op": "snapshot",
+                            "id": id,
+                            "seq": term_seq,
+                            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            "cols": cols,
+                            "rows": rows,
+                            "alive": alive,
+                        });
+                        if let Ok(json) = serde_json::to_string(&frame) {
+                            if sender.send(Message::Text(json.into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
-                let chunk = t.poll_out();
-                if !chunk.is_empty() {
+                for (id, chunk, cols, rows, alive) in terms.poll_all() {
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     term_seq = term_seq.wrapping_add(1);
-                    let (_, cols, rows, alive) = t.snapshot();
                     let frame = serde_json::json!({
                         "wire": "term",
                         "op": "out",
+                        "id": id,
                         "seq": term_seq,
                         "data": base64::engine::general_purpose::STANDARD.encode(&chunk),
                         "cols": cols,
@@ -2403,8 +2407,8 @@ async fn handle_ws(
                 let dominated = serde_json::from_str::<serde_json::Value>(t.as_str());
                 if let Ok(val) = dominated {
                     if val.get("wire").and_then(|w| w.as_str()) == Some("term") {
-                        if let Some(t) = term.as_ref() {
-                            apply_term_client(t, &val);
+                        if let Some(terms) = terms.as_ref() {
+                            apply_term_client(terms, &val);
                         }
                         continue;
                     }
@@ -2434,27 +2438,44 @@ async fn handle_ws(
     push.abort();
 }
 
-fn apply_term_client(term: &crate::term::SessionTerm, val: &serde_json::Value) {
+fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value) {
     use base64::Engine;
     let op = val.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let cols = val.get("cols").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
     let rows = val.get("rows").and_then(|v| v.as_u64()).unwrap_or(24) as u16;
+    let id = val
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .to_string();
     match op {
-        "open" | "resize" => {
-            let _ = term.ensure(cols, rows);
-            if op == "resize" {
+        "open" | "new" => {
+            let id = if op == "new" {
+                terms.alloc_id()
+            } else {
+                id
+            };
+            if let Some(term) = terms.get_or_create(&id) {
+                let _ = term.ensure(cols, rows);
+            }
+        }
+        "resize" => {
+            if let Some(term) = terms.get_or_create(&id) {
+                let _ = term.ensure(cols, rows);
                 term.resize(cols, rows);
             }
         }
         "in" => {
-            let _ = term.ensure(cols, rows);
-            if let Some(data) = val.get("data").and_then(|v| v.as_str()) {
-                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
-                    term.write(&bytes);
+            if let Some(term) = terms.get_or_create(&id) {
+                let _ = term.ensure(cols, rows);
+                if let Some(data) = val.get("data").and_then(|v| v.as_str()) {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                        term.write(&bytes);
+                    }
                 }
             }
         }
-        "close" => term.kill(),
+        "close" => terms.close(&id),
         _ => {}
     }
 }

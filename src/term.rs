@@ -13,6 +13,82 @@ use std::thread;
 use std::time::Duration;
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
+const MAX_TERMS: usize = 8;
+
+/// Several human PTYs for one session. Frames carry `id` (default `"0"`).
+pub struct SessionTerms {
+    cwd: PathBuf,
+    next_id: Mutex<u32>,
+    terms: Mutex<std::collections::HashMap<String, Arc<SessionTerm>>>,
+}
+
+impl SessionTerms {
+    pub fn new(cwd: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            cwd,
+            next_id: Mutex::new(1),
+            terms: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    pub fn get_or_create(&self, id: &str) -> Option<Arc<SessionTerm>> {
+        let mut g = self.terms.lock().ok()?;
+        if let Some(t) = g.get(id) {
+            return Some(t.clone());
+        }
+        if g.len() >= MAX_TERMS {
+            return None;
+        }
+        let t = SessionTerm::new(self.cwd.clone());
+        g.insert(id.to_string(), t.clone());
+        Some(t)
+    }
+
+    pub fn alloc_id(&self) -> String {
+        let mut n = match self.next_id.lock() {
+            Ok(g) => g,
+            Err(_) => return "0".into(),
+        };
+        let id = n.to_string();
+        *n += 1;
+        id
+    }
+
+    pub fn close(&self, id: &str) {
+        if let Ok(mut g) = self.terms.lock() {
+            if let Some(t) = g.remove(id) {
+                t.kill();
+            }
+        }
+    }
+
+    pub fn poll_all(&self) -> Vec<(String, Vec<u8>, u16, u16, bool)> {
+        let g = match self.terms.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        g.iter()
+            .map(|(id, t)| {
+                let chunk = t.poll_out();
+                let (_, cols, rows, alive) = t.snapshot();
+                (id.clone(), chunk, cols, rows, alive)
+            })
+            .collect()
+    }
+
+    pub fn snapshot_all(&self) -> Vec<(String, Vec<u8>, u16, u16, bool)> {
+        let g = match self.terms.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        g.iter()
+            .map(|(id, t)| {
+                let (bytes, cols, rows, alive) = t.snapshot();
+                (id.clone(), bytes, cols, rows, alive)
+            })
+            .collect()
+    }
+}
 
 pub struct SessionTerm {
     inner: Mutex<Inner>,

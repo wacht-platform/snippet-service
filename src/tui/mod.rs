@@ -487,15 +487,21 @@ struct App {
     sidecar_attach: Option<crate::serve::sidecar::SidecarAttach>,
     /// Set by `spawn_loop` in sidecar mode; consumed by `ensure_sidecar_attached`.
     pending_sidecar_attach: Option<PendingSidecarAttach>,
-    /// Interactive session PTY (daemon-owned). Rendered when `screen == Term`.
-    term_vt: crate::term::VtScreen,
-    term_alive: bool,
-    term_cols: u16,
-    term_rows: u16,
-    term_seq: u64,
+    /// Interactive session PTYs (daemon-owned). Rendered when `screen == Term`.
+    term_panes: Vec<TermPane>,
+    term_focus: usize,
     /// When set, the main canvas shows a connecting screen instead of the empty
     /// transcript — used while discovering/starting the local serve daemon.
     connecting_phase: Option<String>,
+}
+
+struct TermPane {
+    id: String,
+    vt: crate::term::VtScreen,
+    alive: bool,
+    cols: u16,
+    rows: u16,
+    seq: u64,
 }
 
 impl App {
@@ -592,11 +598,8 @@ impl App {
             sidecar: None,
             sidecar_attach: None,
             pending_sidecar_attach: None,
-            term_vt: crate::term::VtScreen::new(80, 24),
-            term_alive: false,
-            term_cols: 80,
-            term_rows: 24,
-            term_seq: 0,
+            term_panes: Vec::new(),
+            term_focus: 0,
             connecting_phase: Some("Looking for local serve…".to_string()),
         };
         app.init_settings_form();
@@ -1446,31 +1449,98 @@ impl App {
     }
 
     fn open_term(&mut self) {
+        if self.term_panes.is_empty() {
+            self.term_panes.push(TermPane {
+                id: "0".into(),
+                vt: crate::term::VtScreen::new(80, 24),
+                alive: false,
+                cols: 80,
+                rows: 24,
+                seq: 0,
+            });
+            self.term_focus = 0;
+        }
         self.screen = Screen::Term;
-        self.status = "Session shell · Esc leaves · Ctrl-T toggles".to_string();
-        self.send_term_open();
+        self.status = "Session shell · Esc leaves · Ctrl-T next · Ctrl-N new".to_string();
+        self.send_term_open(false);
     }
 
-    fn send_term_open(&self) {
+    fn new_term(&mut self) {
+        if self.term_panes.len() >= 8 {
+            self.status = "At most 8 shells per session".to_string();
+            return;
+        }
+        let id = self
+            .term_panes
+            .iter()
+            .filter_map(|p| p.id.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .to_string();
+        self.term_panes.push(TermPane {
+            id,
+            vt: crate::term::VtScreen::new(80, 24),
+            alive: false,
+            cols: 80,
+            rows: 24,
+            seq: 0,
+        });
+        self.term_focus = self.term_panes.len() - 1;
+        self.screen = Screen::Term;
+        self.send_term_open(true);
+    }
+
+    fn close_focused_term(&mut self) {
+        if self.term_panes.is_empty() {
+            self.screen = Screen::Main;
+            return;
+        }
+        let id = self.term_panes[self.term_focus].id.clone();
         if let Some(a) = self.sidecar_attach.as_ref() {
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
-                "op": "open",
-                "cols": self.term_cols,
-                "rows": self.term_rows,
+                "op": "close",
+                "id": id,
+            }));
+        }
+        self.term_panes.remove(self.term_focus);
+        if self.term_panes.is_empty() {
+            self.term_focus = 0;
+            self.screen = Screen::Main;
+            return;
+        }
+        self.term_focus = self.term_focus.min(self.term_panes.len() - 1);
+    }
+
+    fn send_term_open(&self, fresh: bool) {
+        let Some(pane) = self.term_panes.get(self.term_focus) else {
+            return;
+        };
+        if let Some(a) = self.sidecar_attach.as_ref() {
+            let _ = a.send_term(serde_json::json!({
+                "wire": "term",
+                "op": if fresh { "new" } else { "open" },
+                "id": pane.id,
+                "cols": pane.cols,
+                "rows": pane.rows,
             }));
         }
     }
 
     fn send_term_bytes(&self, bytes: &[u8]) {
         use base64::Engine;
+        let Some(pane) = self.term_panes.get(self.term_focus) else {
+            return;
+        };
         if let Some(a) = self.sidecar_attach.as_ref() {
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
                 "op": "in",
+                "id": pane.id,
                 "data": base64::engine::general_purpose::STANDARD.encode(bytes),
-                "cols": self.term_cols,
-                "rows": self.term_rows,
+                "cols": pane.cols,
+                "rows": pane.rows,
             }));
         }
     }
@@ -1480,21 +1550,42 @@ impl App {
         let Some(attach) = self.sidecar_attach.as_mut() else {
             return;
         };
-        // watch keeps the last frame forever — only apply when it actually changed.
         if !attach.term_rx.has_changed().unwrap_or(false) {
             return;
         }
         let Some(v) = attach.term_rx.borrow_and_update().clone() else {
             return;
         };
+        let id = v
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("0")
+            .to_string();
         let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-        if seq != 0 && seq == self.term_seq {
+        let idx = if let Some(i) = self.term_panes.iter().position(|p| p.id == id) {
+            i
+        } else {
+            self.term_panes.push(TermPane {
+                id: id.clone(),
+                vt: crate::term::VtScreen::new(80, 24),
+                alive: false,
+                cols: 80,
+                rows: 24,
+                seq: 0,
+            });
+            self.term_panes.len() - 1
+        };
+        let pane = &mut self.term_panes[idx];
+        if seq != 0 && seq == pane.seq {
             return;
         }
         if seq != 0 {
-            self.term_seq = seq;
+            pane.seq = seq;
         }
-        self.term_alive = v.get("alive").and_then(|a| a.as_bool()).unwrap_or(self.term_alive);
+        pane.alive = v
+            .get("alive")
+            .and_then(|a| a.as_bool())
+            .unwrap_or(pane.alive);
         let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
         let data = v
             .get("data")
@@ -1502,10 +1593,10 @@ impl App {
             .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
             .unwrap_or_default();
         if op == "snapshot" {
-            self.term_vt = crate::term::VtScreen::new(self.term_cols as usize, self.term_rows as usize);
+            pane.vt = crate::term::VtScreen::new(pane.cols as usize, pane.rows as usize);
         }
         if !data.is_empty() {
-            self.term_vt.feed(&data);
+            pane.vt.feed(&data);
         }
     }
 
@@ -2792,7 +2883,7 @@ impl App {
     }
 
     /// Send the current input immediately as a mid-run steer (or normal submit if idle).
-    /// Bound to Ctrl+S so Enter can keep queueing while busy.
+    /// Bound to Ctrl+G (and Ctrl+S when the host tty delivers it).
     fn steer_now(&mut self) {
         // Use the same expansion as a normal submission so steering never drops
         // pasted blocks or attachments that live outside `self.input`.
@@ -3394,7 +3485,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
         if app.screen == Screen::Term {
-            app.screen = Screen::Main;
+            if app.term_panes.len() > 1 {
+                app.term_focus = (app.term_focus + 1) % app.term_panes.len();
+            } else {
+                app.screen = Screen::Main;
+            }
         } else {
             app.open_term();
         }
@@ -3406,11 +3501,22 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.screen = Screen::Main;
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('d'))
-        {
-            app.quit = true;
-            return;
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('q') => {
+                    app.quit = true;
+                    return;
+                }
+                KeyCode::Char('n') => {
+                    app.new_term();
+                    return;
+                }
+                KeyCode::Char('w') => {
+                    app.close_focused_term();
+                    return;
+                }
+                _ => {}
+            }
         }
         if let Some(bytes) = App::encode_term_key(key) {
             app.send_term_bytes(&bytes);
@@ -3546,8 +3652,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 }
                 return;
             }
-            // Ctrl+S: steer now (send immediately even while the agent is busy).
-            KeyCode::Char('s') => {
+            // Ctrl+G / Ctrl+S: steer now. Ctrl+S is often swallowed by XOFF
+            // (software flow control) in the host terminal, so Ctrl+G is the
+            // reliable chord. Ctrl+S still works when the tty actually delivers it.
+            KeyCode::Char('s') | KeyCode::Char('g') => {
                 app.steer_now();
                 return;
             }
@@ -5249,28 +5357,63 @@ fn ansi_color(idx: u8) -> Color {
 }
 
 fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let body = area;
+    if app.term_panes.is_empty() {
+        app.open_term();
+    }
+    let n = app.term_panes.len().max(1);
+    app.term_focus = app.term_focus.min(n - 1);
+    let tab_h: u16 = if n > 1 { 1 } else { 0 };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(tab_h), Constraint::Min(2)])
+        .split(area);
+    if tab_h > 0 {
+        let mut spans = Vec::new();
+        for (i, pane) in app.term_panes.iter().enumerate() {
+            let label = format!(" {} ", i + 1);
+            let style = if i == app.term_focus {
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+            } else {
+                subtle()
+            };
+            spans.push(Span::styled(label, style));
+            let _ = pane;
+        }
+        spans.push(Span::styled("  Ctrl-T next · Ctrl-N new · Ctrl-W close", subtle()));
+        frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
+    }
+    let body = chunks[1];
     let cols = body.width.max(2) as usize;
     let rows = body.height.max(2) as usize;
-    if cols as u16 != app.term_cols || rows as u16 != app.term_rows {
-        app.term_cols = cols as u16;
-        app.term_rows = rows as u16;
-        app.term_vt.resize(cols, rows);
+    let focus = app.term_focus;
+    let (need_resize, id) = {
+        let pane = &mut app.term_panes[focus];
+        let need = cols as u16 != pane.cols || rows as u16 != pane.rows;
+        if need {
+            pane.cols = cols as u16;
+            pane.rows = rows as u16;
+            pane.vt.resize(cols, rows);
+        }
+        (need, pane.id.clone())
+    };
+    if need_resize {
         if let Some(a) = app.sidecar_attach.as_ref() {
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
                 "op": "resize",
-                "cols": app.term_cols,
-                "rows": app.term_rows,
+                "id": id,
+                "cols": cols,
+                "rows": rows,
             }));
         }
     }
+    let pane = &app.term_panes[focus];
     let mut lines: Vec<Line> = Vec::with_capacity(rows);
-    let (cx, cy) = app.term_vt.cursor();
-    for y in 0..rows.min(app.term_vt.rows) {
+    let (cx, cy) = pane.vt.cursor();
+    for y in 0..rows.min(pane.vt.rows) {
         let mut spans = Vec::new();
-        for x in 0..cols.min(app.term_vt.cols) {
-            let cell = app.term_vt.cell(x, y);
+        for x in 0..cols.min(pane.vt.cols) {
+            let cell = pane.vt.cell(x, y);
             let mut fg = if cell.inverse {
                 ansi_color(cell.bg)
             } else {
@@ -5875,9 +6018,9 @@ fn queued_lines(app: &App) -> Vec<Line<'static>> {
     }
     let rail = Span::styled(" │ ", Style::default().fg(faint()));
     let header = if n == 1 {
-        "queued — sends when idle · Ctrl+S steers now · Ctrl+X cancel".to_string()
+                            "queued — sends when idle · Ctrl+G steers now · Ctrl+X cancel".to_string()
     } else {
-        format!("queued ({n}) — send when idle · Ctrl+S steers now · Ctrl+X cancel")
+                            format!("queued ({n}) — send when idle · Ctrl+G steers now · Ctrl+X cancel")
     };
     let mut lines = vec![Line::from(vec![
         rail.clone(),
