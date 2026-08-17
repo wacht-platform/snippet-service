@@ -461,6 +461,17 @@ pub(super) async fn upload_fs_file(
     if bytes.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty upload").into_response();
     }
+    const MAX_UPLOAD_FILE_BYTES: usize = 1024 * 1024 * 1024;
+    if bytes.len() > MAX_UPLOAD_FILE_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "upload exceeds {} MB limit",
+                MAX_UPLOAD_FILE_BYTES / (1024 * 1024)
+            ),
+        )
+            .into_response();
+    }
     // Targeted upload into a directory under the original filename, or (default)
     // a temp dir with a generated name (for chat attachments).
     let path = if let Some(dir) = req.dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {

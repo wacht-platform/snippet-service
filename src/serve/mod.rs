@@ -480,10 +480,10 @@ pub async fn run_serve(
         tokio::spawn(async move { config_watch_loop(d).await });
     }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
-    // inflates it by ~4/3. Size the request-body limit so a ~50 MB file still fits
-    // once encoded (≈67 MB) plus headroom for the JSON envelope. Every other route
+    // inflates it by ~4/3. Size the request-body limit so a ~1 GB file still fits
+    // once encoded (≈1.33 GB) plus headroom for the JSON envelope. Every other route
     // keeps axum's small default body limit.
-    const MAX_UPLOAD_FILE_BYTES: usize = 50 * 1024 * 1024;
+    const MAX_UPLOAD_FILE_BYTES: usize = 1024 * 1024 * 1024;
     const UPLOAD_BODY_LIMIT: usize = MAX_UPLOAD_FILE_BYTES / 3 * 4 + 64 * 1024;
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
