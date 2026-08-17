@@ -238,48 +238,59 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
     } else {
         PathBuf::from(".")
     };
+    // Do not attach the slave in the parent. Command's Stdio::from(dup)
+    // leaves fds that are not the session controlling TTY, so fish's
+    // tcgetpgrp/setpgid fail ("No TTY for interactive shell").
+    // login_tty: parent keeps only the master; the child opens the slave
+    // after setsid and makes it the controlling terminal.
+    let slave_path = slave_pts_path(&slave)?;
+    drop(slave);
     let mut cmd = Command::new(&shell);
-    // Interactive login-style session. Fish/zsh job control needs a real
-    // controlling TTY on fds 0/1/2 — dup'd slave clones without login_tty
-    // leave tcgetpgrp/setpgid failing and some shells spin until the host OOMs.
     cmd.arg("-i")
         .current_dir(&cwd)
-        .stdin(Stdio::from(dup_file(&slave)?))
-        .stdout(Stdio::from(dup_file(&slave)?))
-        .stderr(Stdio::from(dup_file(&slave)?))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .env("TERM", "xterm-256color")
         .env("COLORTERM", "truecolor")
         .env("SHELL", &shell);
-    let slave_fd = slave.as_raw_fd();
     unsafe {
         cmd.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Make this the session's controlling terminal, then put stdin/
-            // stdout/stderr on the slave and close extras so job control works.
-            if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EPERM) {
-                    return Err(err);
-                }
-            }
-            if libc::dup2(slave_fd, 0) < 0
-                || libc::dup2(slave_fd, 1) < 0
-                || libc::dup2(slave_fd, 2) < 0
-            {
+            let cpath = std::ffi::CString::new(slave_path.to_string_lossy().as_bytes())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pts path"))?;
+            let fd = libc::open(cpath.as_ptr(), libc::O_RDWR);
+            if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if slave_fd > 2 {
-                libc::close(slave_fd);
+            // Best-effort: drop inherited controlling tty, then claim this one.
+            let _ = libc::ioctl(fd, libc::TIOCNOTTY, 0);
+            if libc::ioctl(fd, libc::TIOCSCTTY, 1) < 0
+                && libc::ioctl(fd, libc::TIOCSCTTY, 0) < 0
+            {
+                let err = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(err);
+            }
+            if libc::dup2(fd, 0) < 0 || libc::dup2(fd, 1) < 0 || libc::dup2(fd, 2) < 0 {
+                let err = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(err);
+            }
+            if fd > 2 {
+                libc::close(fd);
             }
             let pgid = libc::getpid();
-            let _ = libc::setpgid(0, pgid);
+            if libc::setpgid(0, pgid) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let _ = libc::tcsetpgrp(0, pgid);
             Ok(())
         });
     }
     let child = cmd.spawn().map_err(|e| format!("spawn shell: {e}"))?;
-    drop(slave);
     g.child = Some(child);
     g.master = Some(master);
     g.alive = true;
@@ -319,8 +330,15 @@ fn open_pty() -> Result<(std::fs::File, std::fs::File), String> {
     }
 }
 
-fn dup_file(f: &std::fs::File) -> Result<std::fs::File, String> {
-    f.try_clone().map_err(|e| e.to_string())
+fn slave_pts_path(slave: &std::fs::File) -> Result<PathBuf, String> {
+    unsafe {
+        let mut name = [0i8; 128];
+        if libc::ptsname_r(slave.as_raw_fd(), name.as_mut_ptr(), name.len()) != 0 {
+            return Err(format!("ptsname_r: {}", std::io::Error::last_os_error()));
+        }
+        let cname = std::ffi::CStr::from_ptr(name.as_ptr());
+        Ok(PathBuf::from(cname.to_str().map_err(|e| e.to_string())?))
+    }
 }
 
 fn set_nonblocking(fd: i32) {
