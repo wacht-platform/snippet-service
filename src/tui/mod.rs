@@ -405,6 +405,10 @@ struct App {
     /// Inputs typed while the agent is executing — held and submitted when the run
     /// finishes (or is stopped), instead of steering mid-run.
     queued_inputs: std::collections::VecDeque<String>,
+    /// Steers already sent to the loop but not yet in `state.events`. The
+    /// composer is cleared on send; without this the words vanish until the
+    /// harness writes `HarnessEvent::Steer`.
+    pending_steers: Vec<String>,
     /// Was the agent busy on the previous tick? Drives the queue flush on the
     /// busy → not-busy edge.
     was_busy: bool,
@@ -555,6 +559,7 @@ impl App {
             seen_compactions: usize::MAX, // uninitialized; first tick seeds it, no flash
 
             queued_inputs: std::collections::VecDeque::new(),
+            pending_steers: Vec::new(),
             sent_turn_pending: false,
             effective_model: (String::new(), String::new()),
             conv_cache: None,
@@ -1208,6 +1213,7 @@ impl App {
         // never fire into the newly-switched session, stale busy flags must not
         // trigger a phantom flush, and a lingering error must not mask status.
         self.queued_inputs.clear();
+        self.pending_steers.clear();
         self.was_busy = false;
         self.sent_turn_pending = false;
         self.error = None;
@@ -2892,11 +2898,34 @@ impl App {
         self.history_pos = None;
         self.input_clear();
         self.scroll = 0;
+        // Keep the words on screen until the harness writes Steer / UserInput.
+        self.pending_steers.push(text.clone());
         // Deliver now even if busy — harness folds UserMessage into [steer] mid-run.
         // `submit_text` retains its local busy marker until persisted state catches
         // up, so a fast Enter after this steer queues instead of becoming a second,
         // timing-dependent steer.
         self.submit_text(text);
+    }
+
+    fn prune_pending_steers(&mut self) {
+        if self.pending_steers.is_empty() {
+            return;
+        }
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let mut remaining = Vec::new();
+        for pending in self.pending_steers.drain(..) {
+            let still_waiting = !state.events.iter().rev().any(|e| match e {
+                crate::harness::HarnessEvent::Steer { text }
+                | crate::harness::HarnessEvent::UserInput { text } => text == &pending,
+                _ => false,
+            });
+            if still_waiting {
+                remaining.push(pending);
+            }
+        }
+        self.pending_steers = remaining;
     }
 
     /// Submit everything queued when the agent goes idle/stopped — as a BURST of
@@ -3204,8 +3233,14 @@ impl App {
     async fn refresh_state(&mut self) {
         // Sidecar: state arrives over WS. Pull the latest snapshot/delta and
         // mirror the live stream handle the attach task keeps updated.
-        if let Some(attach) = &self.sidecar_attach {
-            if let Some(state) = attach.state_rx.borrow().clone() {
+        let sidecar_update = self.sidecar_attach.as_ref().map(|attach| {
+            (
+                attach.stream.clone(),
+                attach.state_rx.borrow().clone(),
+            )
+        });
+        if let Some((stream, maybe_state)) = sidecar_update {
+            if let Some(state) = maybe_state {
                 // A newer committed state clears optimistic-busy and the live
                 // stream is already managed by wire frames (snapshot clears it).
                 if self.state.as_ref().map(|s| s.events.len()) != Some(state.events.len())
@@ -3214,10 +3249,11 @@ impl App {
                     self.sent_turn_pending = false;
                 }
                 self.state = Some(state);
+                self.prune_pending_steers();
             }
             // Keep the TUI's stream handle pointing at the attach's buffer so
             // the renderer (which reads `app.stream`) stays live.
-            self.stream = attach.stream.clone();
+            self.stream = stream;
             return;
         }
 
@@ -3243,7 +3279,10 @@ impl App {
 
         match tokio::fs::read(&self.active_state_path).await {
             Ok(bytes) => match crate::harness::deserialize_state(&bytes) {
-                Ok(state) => self.state = Some(state),
+                Ok(state) => {
+                    self.state = Some(state);
+                    self.prune_pending_steers();
+                }
                 // An unreadable file (e.g. saved by an older build) shouldn't pin a
                 // red error in the footer. Show the session empty; starting a new
                 // run overwrites it cleanly.

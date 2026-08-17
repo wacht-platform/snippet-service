@@ -306,6 +306,28 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         push_tagged(&mut lines, rendered, !is_user, &mut tag_pending);
         prev_tool_row = false;
     }
+    for pending in &app.pending_steers {
+        if pending.trim().is_empty() {
+            continue;
+        }
+        set_speaker(&mut lines, &mut speaker, &mut tag_pending, false);
+        if prev_tool_row && !lines.is_empty() && lines.last().map_or(true, |l| !l.spans.is_empty())
+        {
+            lines.push(Line::from(""));
+        }
+        push_tagged(
+            &mut lines,
+            event_lines(
+                &HarnessEvent::Steer {
+                    text: pending.clone(),
+                },
+                content_w,
+            ),
+            false,
+            &mut tag_pending,
+        );
+        prev_tool_row = false;
+    }
     let _ = prev_tool_row;
 
     // Live "working…" feedback at the tail while the agent is processing (or a lane is).
