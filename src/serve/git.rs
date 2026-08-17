@@ -264,7 +264,7 @@ pub(super) async fn git_log(
     }
 }
 
-// POST /git/branches {session} — local branches + which is current.
+// POST /git/branches {session} — local + remote-tracking branches + current.
 pub(super) async fn git_branches(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -277,21 +277,43 @@ pub(super) async fn git_branches(
         Ok(d) => d,
         Err(r) => return r,
     };
-    match run_git(&dir, ["branch", "--format=%(HEAD)\x1f%(refname:short)"]).await {
+    match run_git(
+        &dir,
+        [
+            "branch",
+            "-a",
+            "--format=%(HEAD)\x1f%(refname:short)\x1f%(upstream:short)",
+        ],
+    )
+    .await
+    {
         Ok((0, stdout, _, _)) => {
             let mut current = String::new();
-            let branches: Vec<String> = stdout
-                .lines()
-                .filter_map(|l| l.split_once('\x1f'))
-                .map(|(head, name)| {
-                    if head == "*" {
-                        current = name.to_string();
-                    }
-                    name.to_string()
-                })
-                .collect();
-            Json(serde_json::json!({"ok": true, "current": current, "branches": branches}))
-                .into_response()
+            let mut local = Vec::new();
+            let mut remotes = Vec::new();
+            for line in stdout.lines() {
+                let mut parts = line.split('\x1f');
+                let head = parts.next().unwrap_or("");
+                let name = parts.next().unwrap_or("").trim();
+                if name.is_empty() || name.ends_with("/HEAD") {
+                    continue;
+                }
+                if head == "*" {
+                    current = name.to_string();
+                }
+                if name.starts_with("remotes/") {
+                    remotes.push(name.trim_start_matches("remotes/").to_string());
+                } else {
+                    local.push(name.to_string());
+                }
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "current": current,
+                "branches": local,
+                "remotes": remotes,
+            }))
+            .into_response()
         }
         Ok((_, _, stderr, _)) => {
             Json(serde_json::json!({"ok": false, "error": stderr.trim()})).into_response()
