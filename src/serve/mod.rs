@@ -2460,13 +2460,13 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
             }
         }
         "resize" => {
-            if let Some(term) = terms.get_or_create(&id) {
+            if let Some(term) = terms.get(&id) {
                 let _ = term.ensure(cols, rows);
                 term.resize(cols, rows);
             }
         }
         "in" => {
-            if let Some(term) = terms.get_or_create(&id) {
+            if let Some(term) = terms.get(&id) {
                 let _ = term.ensure(cols, rows);
                 if let Some(data) = val.get("data").and_then(|v| v.as_str()) {
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {

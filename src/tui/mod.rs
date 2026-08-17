@@ -5333,7 +5333,14 @@ fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     }
     let pane = &app.term_panes[focus];
     let mut lines: Vec<Line> = Vec::with_capacity(rows);
-    let (cx, cy) = pane.vt.cursor();
+    let (raw_cx, raw_cy) = pane.vt.cursor();
+    // Pending wrap: emulator cx == cols (past last cell). Paint the block
+    // on the next row so the cursor never vanishes mid-line.
+    let (cx, cy) = if raw_cx >= pane.vt.cols {
+        (0usize, (raw_cy + 1).min(pane.vt.rows.saturating_sub(1)))
+    } else {
+        (raw_cx, raw_cy)
+    };
     for y in 0..rows.min(pane.vt.rows) {
         let mut spans = Vec::new();
         for x in 0..cols.min(pane.vt.cols) {

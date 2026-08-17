@@ -9,8 +9,6 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
 const MAX_TERMS: usize = 8;
@@ -44,6 +42,10 @@ impl SessionTerms {
         Some(t)
     }
 
+    pub fn get(&self, id: &str) -> Option<Arc<SessionTerm>> {
+        self.terms.lock().ok()?.get(id).cloned()
+    }
+
     pub fn alloc_id(&self) -> String {
         let mut n = match self.next_id.lock() {
             Ok(g) => g,
@@ -63,15 +65,19 @@ impl SessionTerms {
     }
 
     pub fn poll_all(&self) -> Vec<(String, Vec<u8>, u16, u16, bool)> {
-        let g = match self.terms.lock() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
+        let panes: Vec<(String, Arc<SessionTerm>)> = {
+            let g = match self.terms.lock() {
+                Ok(g) => g,
+                Err(_) => return Vec::new(),
+            };
+            g.iter().map(|(id, t)| (id.clone(), t.clone())).collect()
         };
-        g.iter()
+        panes
+            .into_iter()
             .map(|(id, t)| {
                 let chunk = t.poll_out();
                 let (_, cols, rows, alive) = t.snapshot();
-                (id.clone(), chunk, cols, rows, alive)
+                (id, chunk, cols, rows, alive)
             })
             .collect()
     }
@@ -174,7 +180,9 @@ impl SessionTerm {
         };
         let mut buf = [0u8; 8192];
         let mut out = Vec::new();
-        loop {
+        // Bound one poll so a noisy fish (or a broken TTY loop) cannot
+        // pin this lock and starve the rest of the daemon.
+        for _ in 0..32 {
             match master.read(&mut buf) {
                 Ok(0) => {
                     g.alive = false;
@@ -294,8 +302,6 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
     g.child = Some(child);
     g.master = Some(master);
     g.alive = true;
-    // Give the shell a tick to emit its first prompt.
-    thread::sleep(Duration::from_millis(20));
     Ok(())
 }
 
