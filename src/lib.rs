@@ -1,3 +1,8 @@
+// forkpty lives in libutil on glibc.
+#[cfg(unix)]
+#[link(name = "util")]
+unsafe extern "C" {}
+
 pub mod anthropic;
 pub mod bg;
 pub mod builtins;

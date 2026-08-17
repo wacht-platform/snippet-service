@@ -4,10 +4,8 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
@@ -101,7 +99,7 @@ pub struct SessionTerm {
 }
 
 struct Inner {
-    child: Option<Child>,
+    child_pid: Option<libc::pid_t>,
     master: Option<std::fs::File>,
     cols: u16,
     rows: u16,
@@ -114,7 +112,7 @@ impl SessionTerm {
     pub fn new(cwd: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {
-                child: None,
+                child_pid: None,
                 master: None,
                 cols: 80,
                 rows: 24,
@@ -131,8 +129,8 @@ impl SessionTerm {
 
     pub fn ensure(&self, cols: u16, rows: u16) -> Result<(), String> {
         let mut g = self.inner.lock().map_err(|e| e.to_string())?;
-        if let Some(child) = g.child.as_mut() {
-            if let Ok(None) = child.try_wait() {
+        if let Some(pid) = g.child_pid {
+            if !reap_if_exited(pid) {
                 if cols != g.cols || rows != g.rows {
                     g.cols = cols.max(2);
                     g.rows = rows.max(2);
@@ -142,6 +140,9 @@ impl SessionTerm {
                 }
                 return Ok(());
             }
+            g.child_pid = None;
+            g.master = None;
+            g.alive = false;
         }
         spawn_locked(&mut g, cols, rows)
     }
@@ -197,9 +198,10 @@ impl SessionTerm {
                 }
             }
         }
-        if let Some(child) = g.child.as_mut() {
-            if let Ok(Some(_)) = child.try_wait() {
+        if let Some(pid) = g.child_pid {
+            if reap_if_exited(pid) {
                 g.alive = false;
+                g.child_pid = None;
             }
         }
         if !out.is_empty() {
@@ -223,9 +225,13 @@ impl SessionTerm {
 
     pub fn kill(&self) {
         if let Ok(mut g) = self.inner.lock() {
-            if let Some(mut c) = g.child.take() {
-                let _ = c.kill();
-                let _ = c.wait();
+            if let Some(pid) = g.child_pid.take() {
+                unsafe {
+                    libc::kill(pid, libc::SIGHUP);
+                    libc::kill(pid, libc::SIGTERM);
+                    let mut status = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                }
             }
             g.master = None;
             g.alive = false;
@@ -233,104 +239,58 @@ impl SessionTerm {
     }
 }
 
+fn reap_if_exited(pid: libc::pid_t) -> bool {
+    unsafe {
+        let mut status = 0;
+        let r = libc::waitpid(pid, &mut status, libc::WNOHANG);
+        r == pid || r < 0
+    }
+}
+
 fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
     g.cols = cols.max(2);
     g.rows = rows.max(2);
-    let (master, slave) = open_pty()?;
-    set_winsize(master.as_raw_fd(), g.cols, g.rows);
-    set_nonblocking(master.as_raw_fd());
-
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let cwd = if g.cwd.is_dir() {
         g.cwd.clone()
     } else {
         PathBuf::from(".")
     };
-    // Parent keeps the slave open so the pts stays allocated. The child
-    // re-opens it after setsid and claims it as the controlling TTY.
-    // Never abort spawn on TIOCSCTTY/setpgid — that left a black pane.
-    let slave_path = slave_pts_path(&slave)?;
-    let mut cmd = Command::new(&shell);
-    cmd.arg("-i")
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env("TERM", "xterm-256color")
-        .env("COLORTERM", "truecolor")
-        .env("SHELL", &shell);
-    unsafe {
-        cmd.pre_exec(move || {
-            let _ = libc::setsid();
-            let cpath = std::ffi::CString::new(slave_path.to_string_lossy().as_bytes())
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pts path"))?;
-            let fd = libc::open(cpath.as_ptr(), libc::O_RDWR);
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            let _ = libc::ioctl(fd, libc::TIOCSCTTY, 0);
-            if libc::dup2(fd, 0) < 0 || libc::dup2(fd, 1) < 0 || libc::dup2(fd, 2) < 0 {
-                let err = std::io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
-            if fd > 2 {
-                libc::close(fd);
-            }
-            let pgid = libc::getpid();
-            let _ = libc::setpgid(0, pgid);
-            let _ = libc::tcsetpgrp(0, pgid);
-            Ok(())
-        });
+    let ws = libc::winsize {
+        ws_row: g.rows,
+        ws_col: g.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let mut master_fd = -1;
+    let pid = unsafe { libc::forkpty(&mut master_fd, std::ptr::null_mut(), std::ptr::null(), &ws) };
+    if pid < 0 {
+        return Err(format!("forkpty: {}", std::io::Error::last_os_error()));
     }
-    let child = cmd.spawn().map_err(|e| format!("spawn shell: {e}"))?;
-    drop(slave);
-    g.child = Some(child);
+    if pid == 0 {
+        // Child: forkpty already made the slave our controlling TTY on 0/1/2.
+        let _ = std::env::set_current_dir(&cwd);
+        unsafe {
+            libc::setenv(
+                c"TERM".as_ptr(),
+                c"xterm-256color".as_ptr(),
+                1,
+            );
+            libc::setenv(c"COLORTERM".as_ptr(), c"truecolor".as_ptr(), 1);
+            let cshell = std::ffi::CString::new(shell.as_bytes()).unwrap_or_else(|_| c"/bin/bash".into());
+            libc::setenv(c"SHELL".as_ptr(), cshell.as_ptr(), 1);
+            let argv = [cshell.as_ptr(), c"-i".as_ptr(), std::ptr::null()];
+            libc::execvp(cshell.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    // Parent
+    set_nonblocking(master_fd);
+    let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    g.child_pid = Some(pid);
     g.master = Some(master);
     g.alive = true;
     Ok(())
-}
-
-fn open_pty() -> Result<(std::fs::File, std::fs::File), String> {
-    unsafe {
-        let master_fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-        if master_fd < 0 {
-            return Err(format!("posix_openpt: {}", std::io::Error::last_os_error()));
-        }
-        if libc::grantpt(master_fd) != 0 {
-            libc::close(master_fd);
-            return Err(format!("grantpt: {}", std::io::Error::last_os_error()));
-        }
-        if libc::unlockpt(master_fd) != 0 {
-            libc::close(master_fd);
-            return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
-        }
-        let mut name = [0i8; 128];
-        if libc::ptsname_r(master_fd, name.as_mut_ptr(), name.len()) != 0 {
-            libc::close(master_fd);
-            return Err(format!("ptsname_r: {}", std::io::Error::last_os_error()));
-        }
-        let cname = std::ffi::CStr::from_ptr(name.as_ptr());
-        let slave_path = Path::new(cname.to_str().map_err(|e| e.to_string())?);
-        let slave = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(slave_path)
-            .map_err(|e| format!("open slave: {e}"))?;
-        let master = std::os::fd::FromRawFd::from_raw_fd(master_fd);
-        Ok((master, slave))
-    }
-}
-
-fn slave_pts_path(slave: &std::fs::File) -> Result<PathBuf, String> {
-    unsafe {
-        let mut name = [0i8; 128];
-        if libc::ptsname_r(slave.as_raw_fd(), name.as_mut_ptr(), name.len()) != 0 {
-            return Err(format!("ptsname_r: {}", std::io::Error::last_os_error()));
-        }
-        let cname = std::ffi::CStr::from_ptr(name.as_ptr());
-        Ok(PathBuf::from(cname.to_str().map_err(|e| e.to_string())?))
-    }
 }
 
 fn set_nonblocking(fd: i32) {
@@ -1003,5 +963,28 @@ mod tests {
         assert_eq!(s.cell(0, 0).ch, 'X');
         assert_eq!(s.cell(1, 0).ch, 'a');
         assert_eq!(s.cell(2, 0).ch, 'b');
+    }
+
+    #[test]
+    fn forkpty_shell_echoes() {
+        let term = SessionTerm::new(std::env::temp_dir());
+        term.ensure(40, 12).expect("spawn");
+        // Force bash so this is not fish-config dependent.
+        // The spawned SHELL may still be fish; send a command that any POSIX
+        // shell prints.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        term.write(b"printf SNIPPET_PTY_OK\\n\n");
+        let mut got = String::new();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let chunk = term.poll_out();
+            got.push_str(&String::from_utf8_lossy(&chunk));
+            if got.contains("SNIPPET_PTY_OK") {
+                term.kill();
+                return;
+            }
+        }
+        term.kill();
+        panic!("no echo from PTY, got: {got:?}");
     }
 }
