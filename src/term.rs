@@ -16,6 +16,10 @@ pub struct SessionTerms {
     cwd: PathBuf,
     next_id: Mutex<u32>,
     terms: Mutex<std::collections::HashMap<String, Arc<SessionTerm>>>,
+    /// Pane ids that must send a full snapshot on the next attach poll
+    /// (open / resize). Incremental `out` frames are diffs; a client that
+    /// missed them (or rebuilt its screen) needs the whole scrollback.
+    snap_ids: Mutex<std::collections::HashSet<String>>,
 }
 
 impl SessionTerms {
@@ -24,6 +28,7 @@ impl SessionTerms {
             cwd,
             next_id: Mutex::new(1),
             terms: Mutex::new(std::collections::HashMap::new()),
+            snap_ids: Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -42,6 +47,26 @@ impl SessionTerms {
 
     pub fn get(&self, id: &str) -> Option<Arc<SessionTerm>> {
         self.terms.lock().ok()?.get(id).cloned()
+    }
+
+    pub fn request_snapshot(&self, id: &str) {
+        if let Ok(mut g) = self.snap_ids.lock() {
+            g.insert(id.to_string());
+        }
+    }
+
+    pub fn take_snapshots(&self) -> Vec<(String, Vec<u8>, u16, u16, bool)> {
+        let ids: Vec<String> = match self.snap_ids.lock() {
+            Ok(mut g) => g.drain().collect(),
+            Err(_) => return Vec::new(),
+        };
+        ids.into_iter()
+            .filter_map(|id| {
+                let t = self.get(&id)?;
+                let (bytes, cols, rows, alive) = t.snapshot();
+                Some((id, bytes, cols, rows, alive))
+            })
+            .collect()
     }
 
     pub fn alloc_id(&self) -> String {

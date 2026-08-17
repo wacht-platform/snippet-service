@@ -1519,11 +1519,19 @@ impl App {
         }
     }
 
-    fn send_term_bytes(&self, bytes: &[u8]) {
+    fn send_term_bytes(&mut self, bytes: &[u8]) {
         use base64::Engine;
-        let Some(pane) = self.term_panes.get(self.term_focus) else {
+        let Some(pane) = self.term_panes.get_mut(self.term_focus) else {
             return;
         };
+        // Paint immediately. Live `out` frames can arrive a tick later (or
+        // never, if another attach already drained the PTY). Printable keys
+        // and CR/BS still need to show up this frame.
+        if bytes.iter().any(|b| *b == 0x1b) {
+            // Leave CSI / arrows to the real PTY echo so we don't double-draw.
+        } else {
+            pane.vt.feed(bytes);
+        }
         if let Some(a) = self.sidecar_attach.as_ref() {
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
@@ -3458,9 +3466,10 @@ async fn run_app(
     }
 
     while !app.quit {
+        app.tick().await;
         terminal.draw(|frame| render(frame, &mut app))?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(40))? {
             match event::read()? {
                 // With the kitty protocol a key can arrive as Press/Repeat/Release;
                 // act on Press/Repeat only so a key isn't handled twice.
@@ -3495,7 +3504,6 @@ async fn run_app(
                 _ => {}
             }
         }
-        app.tick().await;
     }
 
     // Freshest token totals for the closing summary.

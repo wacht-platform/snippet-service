@@ -2349,9 +2349,15 @@ async fn handle_ws(
             }
             if let Some(terms) = terms.as_ref() {
                 use base64::Engine;
-                if !sent_term_snap {
+                let extra_snaps = terms.take_snapshots();
+                if !sent_term_snap || !extra_snaps.is_empty() {
                     sent_term_snap = true;
-                    for (id, bytes, cols, rows, alive) in terms.snapshot_all() {
+                    let snaps = if extra_snaps.is_empty() {
+                        terms.snapshot_all()
+                    } else {
+                        extra_snaps
+                    };
+                    for (id, bytes, cols, rows, alive) in snaps {
                         term_seq = term_seq.wrapping_add(1);
                         let frame = serde_json::json!({
                             "wire": "term",
@@ -2459,12 +2465,15 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
             };
             if let Some(term) = terms.get_or_create(&id) {
                 let _ = term.ensure(cols, rows);
+                term.resize(cols, rows);
+                terms.request_snapshot(&id);
             }
         }
         "resize" => {
             if let Some(term) = terms.get(&id) {
                 let _ = term.ensure(cols, rows);
                 term.resize(cols, rows);
+                terms.request_snapshot(&id);
             }
         }
         "in" => {
