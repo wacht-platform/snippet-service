@@ -503,6 +503,11 @@ struct TermPane {
     /// True after the first incremental `out`. Later `snapshot` frames are
     /// stale full-scrollback copies and must not wipe the live screen.
     live: bool,
+    /// Daemon PTY is not opened until the first real pane size is known.
+    /// Opening at 80×24 then resizing is what scrambled fish's prompt.
+    opened: bool,
+    /// `true` = this pane should be created with `op: new`.
+    fresh: bool,
 }
 
 impl App {
@@ -1447,12 +1452,13 @@ impl App {
                 rows: 24,
                 seq: 0,
                 live: false,
+                opened: false,
+                fresh: false,
             });
             self.term_focus = 0;
         }
         self.screen = Screen::Term;
         self.status = "Session shell · Esc leaves · Ctrl-T next · Ctrl-N new".to_string();
-        self.send_term_open(false);
     }
 
     fn new_term(&mut self) {
@@ -1481,10 +1487,11 @@ impl App {
             rows,
             seq: 0,
             live: false,
+            opened: false,
+            fresh: true,
         });
         self.term_focus = self.term_panes.len() - 1;
         self.screen = Screen::Term;
-        self.send_term_open(true);
     }
 
     fn close_focused_term(&mut self) {
@@ -1509,10 +1516,15 @@ impl App {
         self.term_focus = self.term_focus.min(self.term_panes.len() - 1);
     }
 
-    fn send_term_open(&self, fresh: bool) {
-        let Some(pane) = self.term_panes.get(self.term_focus) else {
+    fn send_term_open(&mut self) {
+        let Some(pane) = self.term_panes.get_mut(self.term_focus) else {
             return;
         };
+        if pane.opened {
+            return;
+        }
+        pane.opened = true;
+        let fresh = pane.fresh;
         if let Some(a) = self.sidecar_attach.as_ref() {
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
@@ -1565,6 +1577,8 @@ impl App {
                     rows: 24,
                     seq: 0,
                     live: false,
+                    opened: true,
+                    fresh: false,
                 });
                 self.term_panes.len() - 1
             };
@@ -5305,6 +5319,8 @@ fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             rows: 24,
             seq: 0,
             live: false,
+            opened: false,
+            fresh: false,
         });
         app.term_focus = 0;
     }
@@ -5334,7 +5350,7 @@ fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     let cols = body.width.max(2) as usize;
     let rows = body.height.max(2) as usize;
     let focus = app.term_focus;
-    let (need_resize, id) = {
+    let (need_resize, need_open, id) = {
         let pane = &mut app.term_panes[focus];
         let need = cols as u16 != pane.cols || rows as u16 != pane.rows;
         if need {
@@ -5342,9 +5358,12 @@ fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             pane.rows = rows as u16;
             pane.vt.resize(cols, rows);
         }
-        (need, pane.id.clone())
+        (need, !pane.opened, pane.id.clone())
     };
-    if need_resize {
+    if need_open {
+        // Spawn at the measured pane size — never 80×24 then resize.
+        app.send_term_open();
+    } else if need_resize {
         if let Some(a) = app.sidecar_attach.as_ref() {
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",

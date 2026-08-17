@@ -606,4 +606,78 @@ mod tests {
         term.kill();
         panic!("no echo from PTY, got: {got:?}");
     }
+
+    fn screen_text(s: &VtScreen) -> String {
+        let mut out = String::new();
+        for y in 0..s.rows {
+            let mut line = String::new();
+            for x in 0..s.cols {
+                line.push(s.cell(x, y).ch);
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+        out
+    }
+
+    fn pump(term: &SessionTerm, vt: &mut VtScreen, ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        loop {
+            let chunk = term.poll_out();
+            if !chunk.is_empty() {
+                vt.feed(&chunk);
+                let replies = vt.take_replies();
+                if !replies.is_empty() {
+                    term.write(&replies);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn fish_ls_paints_command_and_listing() {
+        if !std::path::Path::new("/usr/bin/fish").exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("AAA.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("BBB.txt"), b"y").unwrap();
+        // SAFETY: test-only, single-threaded here.
+        unsafe {
+            std::env::set_var("SHELL", "/usr/bin/fish");
+        }
+        let term = SessionTerm::new(dir.path().to_path_buf());
+        term.ensure(80, 24).expect("spawn");
+        let mut vt = VtScreen::new(80, 24);
+        pump(&term, &mut vt, 400);
+        term.write(b"ls\r");
+        pump(&term, &mut vt, 600);
+        term.write(b"ls\r");
+        pump(&term, &mut vt, 600);
+        unsafe {
+            std::env::remove_var("SHELL");
+        }
+        let painted = screen_text(&vt);
+        term.kill();
+        assert!(
+            painted.matches("ls").count() >= 2,
+            "expected two visible ls commands, got:\n{painted}"
+        );
+        assert!(
+            painted.contains("AAA.txt") && painted.contains("BBB.txt"),
+            "expected listing, got:\n{painted}"
+        );
+        // Prompt should still be on its own line, not glued into the listing.
+        let glued = painted
+            .lines()
+            .any(|l| l.contains("ls") && l.contains("AAA.txt") && !l.contains("> ls"));
+        assert!(
+            !glued,
+            "ls listing glued onto the command line:\n{painted}"
+        );
+    }
 }
