@@ -7,47 +7,109 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// TEMP: one file for TUI + daemon + PTY so we can pin the live delay.
-/// Remove after the session-shell attach path is solid.
-pub fn debug_log(src: &str, msg: &str) {
-    let path = std::env::temp_dir().join("snippet-term-debug.log");
-    let ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{ms} pid={} {src} {msg}", std::process::id());
-    }
-}
-
-pub fn preview_bytes(bytes: &[u8]) -> String {
-    let n = bytes.len().min(48);
-    let mut s = String::new();
-    for &b in &bytes[..n] {
-        match b {
-            b'\r' => s.push_str("\\r"),
-            b'\n' => s.push_str("\\n"),
-            b'\t' => s.push_str("\\t"),
-            0x1b => s.push_str("\\e"),
-            0x7f => s.push_str("\\x7f"),
-            c if (0x20..0x7f).contains(&c) => s.push(c as char),
-            c => s.push_str(&format!("\\x{c:02x}")),
-        }
-    }
-    if bytes.len() > n {
-        s.push_str("…");
-    }
-    format!("{}b {s}", bytes.len())
-}
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
 const MAX_TERMS: usize = 8;
+const NOTIFY_PAYLOAD_CAP: usize = 512;
+
+/// A PTY-originated desktop notification (BEL, OSC 9, OSC 777).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermNotify {
+    pub pane: String,
+    pub message: String,
+}
+
+/// Detect BEL / OSC 9 / OSC 777 in the raw stream so the daemon can
+/// push them over `/events` even when no client is painting the pane.
+#[derive(Default)]
+struct NotifyScan {
+    /// 0 ground, 1 saw ESC, 2 collecting OSC payload.
+    esc: u8,
+    payload: Vec<u8>,
+}
+
+impl NotifyScan {
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<String>) {
+        for &b in bytes {
+            match self.esc {
+                0 if b == 0x07 => out.push(String::new()),
+                0 if b == 0x1b => self.esc = 1,
+                1 if b == b']' => {
+                    self.esc = 2;
+                    self.payload.clear();
+                }
+                1 => self.esc = 0,
+                2 if b == 0x07 => {
+                    if let Some(msg) = parse_osc_notify(&self.payload) {
+                        out.push(msg);
+                    }
+                    self.payload.clear();
+                    self.esc = 0;
+                }
+                2 if b == 0x1b => self.esc = 3,
+                2 => {
+                    if self.payload.len() < NOTIFY_PAYLOAD_CAP {
+                        self.payload.push(b);
+                    }
+                }
+                // OSC terminated by ST (`ESC \`).
+                3 if b == b'\\' => {
+                    if let Some(msg) = parse_osc_notify(&self.payload) {
+                        out.push(msg);
+                    }
+                    self.payload.clear();
+                    self.esc = 0;
+                }
+                3 => {
+                    // Not ST — treat the ESC as starting a new sequence.
+                    self.payload.clear();
+                    self.esc = if b == b']' {
+                        2
+                    } else if b == 0x1b {
+                        1
+                    } else {
+                        0
+                    };
+                }
+                _ => self.esc = 0,
+            }
+        }
+    }
+}
+
+fn parse_osc_notify(payload: &[u8]) -> Option<String> {
+    // OSC 9 ; message
+    if let Some(rest) = payload.strip_prefix(b"9;") {
+        return Some(osc_message(rest));
+    }
+    // OSC 777 ; notify ; title ; body   (urxvt / notify-send)
+    if let Some(rest) = payload.strip_prefix(b"777;") {
+        let text = std::str::from_utf8(rest).unwrap_or("");
+        let mut parts = text.splitn(3, ';');
+        let kind = parts.next().unwrap_or("");
+        if !kind.eq_ignore_ascii_case("notify") {
+            return None;
+        }
+        let title = parts.next().unwrap_or("").trim();
+        let body = parts.next().unwrap_or("").trim();
+        return Some(match (title.is_empty(), body.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => title.to_string(),
+            (true, false) => body.to_string(),
+            (false, false) => format!("{title}: {body}"),
+        });
+    }
+    None
+}
+
+fn osc_message(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect()
+}
 
 /// Detect CSI 6n / CSI 5n in the raw stream and answer them. `vt100` 0.15
 /// swallows DSR and never replies, which is why fish left the cursor dead.
@@ -134,6 +196,12 @@ pub struct SessionTerms {
     /// missed them (or rebuilt its screen) needs the whole scrollback.
     snap_ids: Mutex<std::collections::HashSet<String>>,
     fanout: Mutex<Fanout>,
+    /// BEL / OSC 9 / OSC 777 seen since the last `/events` drain.
+    notifies: Mutex<Vec<TermNotify>>,
+    /// Incremental frames drained while no /attach client was subscribed.
+    /// The next `subscribe` takes these so a harvest for notifications
+    /// cannot steal bytes from a later attach.
+    pending: Mutex<Vec<(String, Vec<u8>, u16, u16, bool)>>,
 }
 
 /// Token for one /attach subscriber. Drop unregisters the mailbox.
@@ -158,15 +226,55 @@ impl SessionTerms {
             terms: Mutex::new(HashMap::new()),
             snap_ids: Mutex::new(std::collections::HashSet::new()),
             fanout: Mutex::new(Fanout::new()),
+            notifies: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Drain the PTY (so idle shells still fire BEL / OSC) and take
+    /// any notifications queued since the last harvest.
+    pub fn harvest(&self) -> Vec<TermNotify> {
+        self.pump();
+        self.take_notifies()
+    }
+
+    /// Drain PTY-originated notifications (BEL / OSC 9 / OSC 777).
+    pub fn take_notifies(&self) -> Vec<TermNotify> {
+        match self.notifies.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn push_notifies(&self, pane: &str, messages: Vec<String>) {
+        if messages.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.notifies.lock() {
+            for message in messages {
+                g.push(TermNotify {
+                    pane: pane.to_string(),
+                    message,
+                });
+            }
+            // Bound the mailbox so a looping `echo -e '\a'` cannot grow forever
+            // if no /events client is attached.
+            if g.len() > 32 {
+                let drop = g.len() - 32;
+                g.drain(..drop);
+            }
+        }
     }
 
     pub fn subscribe(self: &Arc<Self>) -> TermClient {
         let mut g = self.fanout.lock().expect("fanout");
         let id = g.next_client;
         g.next_client = g.next_client.wrapping_add(1).max(1);
-        g.clients.insert(id, Vec::new());
-        debug_log("pty", &format!("subscribe client={id} n={}", g.clients.len()));
+        let mailbox = match self.pending.lock() {
+            Ok(mut p) => std::mem::take(&mut *p),
+            Err(_) => Vec::new(),
+        };
+        g.clients.insert(id, mailbox);
         TermClient {
             id,
             terms: Arc::clone(self),
@@ -240,7 +348,8 @@ impl SessionTerms {
         let mut frames = Vec::new();
         for (id, t) in panes {
             let was_alive = t.is_alive();
-            let chunk = t.poll_out();
+            let (chunk, notes) = t.poll_out();
+            self.push_notifies(&id, notes);
             let (_, cols, rows, alive) = t.snapshot();
             if chunk.is_empty() && alive {
                 continue;
@@ -255,28 +364,30 @@ impl SessionTerms {
             return;
         }
         if let Ok(mut g) = self.fanout.lock() {
-            let n = g.clients.len();
-            for mailbox in g.clients.values_mut() {
-                mailbox.extend(frames.iter().cloned());
+            if g.clients.is_empty() {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.extend(frames);
+                    if pending.len() > 64 {
+                        let drop = pending.len() - 64;
+                        pending.drain(..drop);
+                    }
+                }
+            } else {
+                for mailbox in g.clients.values_mut() {
+                    mailbox.extend(frames.iter().cloned());
+                }
             }
-            debug_log(
-                "pty",
-                &format!(
-                    "fanout n={n} frames={}",
-                    frames
-                        .iter()
-                        .map(|(id, c, _, _, _)| format!("{id}:{}", preview_bytes(c)))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ),
-            );
         }
     }
 
     pub fn poll_client(&self, client: &TermClient) -> Vec<(String, Vec<u8>, u16, u16, bool)> {
         self.pump();
         match self.fanout.lock() {
-            Ok(mut g) => g.clients.get_mut(&client.id).map(std::mem::take).unwrap_or_default(),
+            Ok(mut g) => g
+                .clients
+                .get_mut(&client.id)
+                .map(std::mem::take)
+                .unwrap_or_default(),
             Err(_) => Vec::new(),
         }
     }
@@ -293,7 +404,8 @@ impl SessionTerms {
         panes
             .into_iter()
             .map(|(id, t)| {
-                let chunk = t.poll_out();
+                let (chunk, notes) = t.poll_out();
+                self.push_notifies(&id, notes);
                 let (_, cols, rows, alive) = t.snapshot();
                 (id, chunk, cols, rows, alive)
             })
@@ -327,6 +439,7 @@ struct Inner {
     scrollback: VecDeque<u8>,
     alive: bool,
     dsr: DsrScan,
+    notify: NotifyScan,
 }
 
 impl SessionTerm {
@@ -341,6 +454,7 @@ impl SessionTerm {
                 scrollback: VecDeque::with_capacity(4096),
                 alive: false,
                 dsr: DsrScan::default(),
+                notify: NotifyScan::default(),
             }),
         })
     }
@@ -367,16 +481,6 @@ impl SessionTerm {
             g.alive = false;
         }
         let r = spawn_locked(&mut g, cols, rows);
-        debug_log(
-            "pty",
-            &format!(
-                "ensure spawn {}x{} ok={} alive={}",
-                cols,
-                rows,
-                r.is_ok(),
-                g.alive
-            ),
-        );
         r
     }
 
@@ -386,18 +490,8 @@ impl SessionTerm {
             Err(_) => return,
         };
         if let Some(m) = g.master.as_mut() {
-            let wrote = m.write_all(bytes);
+            let _ = m.write_all(bytes);
             let _ = m.flush();
-            debug_log(
-                "pty",
-                &format!(
-                    "write {} wrote_ok={}",
-                    preview_bytes(bytes),
-                    wrote.is_ok()
-                ),
-            );
-        } else {
-            debug_log("pty", &format!("write-drop no-master {}", preview_bytes(bytes)));
         }
     }
 
@@ -413,14 +507,15 @@ impl SessionTerm {
         }
     }
 
-    /// Drain newly available PTY output into scrollback and return it.
-    pub fn poll_out(&self) -> Vec<u8> {
+    /// Drain newly available PTY output into scrollback and return it
+    /// plus any BEL / OSC 9 / OSC 777 messages found in this chunk.
+    pub fn poll_out(&self) -> (Vec<u8>, Vec<String>) {
         let mut g = match self.inner.lock() {
             Ok(g) => g,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), Vec::new()),
         };
         let Some(master) = g.master.as_mut() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let mut buf = [0u8; 8192];
         let mut out = Vec::new();
@@ -465,17 +560,11 @@ impl SessionTerm {
                     let _ = m.write_all(&replies);
                     let _ = m.flush();
                 }
-                debug_log(
-                    "pty",
-                    &format!("dsr-reply {}", preview_bytes(&replies)),
-                );
             }
-            debug_log(
-                "pty",
-                &format!("poll_out {} alive={}", preview_bytes(&out), g.alive),
-            );
         }
-        out
+        let mut notes = Vec::new();
+        g.notify.feed(&out, &mut notes);
+        (out, notes)
     }
 
     pub fn snapshot(&self) -> (Vec<u8>, u16, u16, bool) {
@@ -483,7 +572,12 @@ impl SessionTerm {
             Ok(g) => g,
             Err(_) => return (Vec::new(), 80, 24, false),
         };
-        (g.scrollback.iter().copied().collect(), g.cols, g.rows, g.alive)
+        (
+            g.scrollback.iter().copied().collect(),
+            g.cols,
+            g.rows,
+            g.alive,
+        )
     }
 
     pub fn kill(&self) {
@@ -534,13 +628,10 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
         // Child: forkpty already made the slave our controlling TTY on 0/1/2.
         let _ = std::env::set_current_dir(&cwd);
         unsafe {
-            libc::setenv(
-                c"TERM".as_ptr(),
-                c"xterm-256color".as_ptr(),
-                1,
-            );
+            libc::setenv(c"TERM".as_ptr(), c"xterm-256color".as_ptr(), 1);
             libc::setenv(c"COLORTERM".as_ptr(), c"truecolor".as_ptr(), 1);
-            let cshell = std::ffi::CString::new(shell.as_bytes()).unwrap_or_else(|_| c"/bin/bash".into());
+            let cshell =
+                std::ffi::CString::new(shell.as_bytes()).unwrap_or_else(|_| c"/bin/bash".into());
             libc::setenv(c"SHELL".as_ptr(), cshell.as_ptr(), 1);
             let argv = [cshell.as_ptr(), c"-i".as_ptr(), std::ptr::null()];
             libc::execvp(cshell.as_ptr(), argv.as_ptr());
@@ -679,7 +770,12 @@ impl VtScreen {
         // Answer DSR against the *current* cursor, then apply the bytes so
         // the report matches what the shell just asked about.
         let (row, col) = self.parser.screen().cursor_position();
-        self.dsr.feed(bytes, &mut self.replies, row.saturating_add(1), col.saturating_add(1));
+        self.dsr.feed(
+            bytes,
+            &mut self.replies,
+            row.saturating_add(1),
+            col.saturating_add(1),
+        );
         self.parser.process(bytes);
         self.history.extend_from_slice(bytes);
         const HISTORY_CAP: usize = 256 * 1024;
@@ -756,6 +852,17 @@ mod tests {
     }
 
     #[test]
+    fn notify_scan_bell_and_osc() {
+        let mut s = NotifyScan::default();
+        let mut out = Vec::new();
+        s.feed(b"ok\x07", &mut out);
+        s.feed(b"\x1b]9;build done\x07", &mut out);
+        s.feed(b"\x1b]777;notify;cargo;finished\x1b\\", &mut out);
+        s.feed(b"\x1b]0;window title\x07", &mut out);
+        assert_eq!(out, vec!["", "build done", "cargo: finished"]);
+    }
+
+    #[test]
     fn resize_keeps_visible_cells() {
         let mut s = VtScreen::new(20, 4);
         s.feed(b"hello");
@@ -776,7 +883,7 @@ mod tests {
         let mut got = String::new();
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let chunk = term.poll_out();
+            let (chunk, _) = term.poll_out();
             got.push_str(&String::from_utf8_lossy(&chunk));
             if got.contains("SNIPPET_PTY_OK") {
                 term.kill();
@@ -803,7 +910,7 @@ mod tests {
     fn pump(term: &SessionTerm, vt: &mut VtScreen, ms: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
         loop {
-            let chunk = term.poll_out();
+            let (chunk, _) = term.poll_out();
             if !chunk.is_empty() {
                 vt.feed(&chunk);
                 let replies = vt.take_replies();
@@ -893,7 +1000,7 @@ mod tests {
         fn pump_one(t: &SessionTerm, vt: &mut VtScreen, ms: u64) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
             loop {
-                let chunk = t.poll_out();
+                let (chunk, _) = t.poll_out();
                 if !chunk.is_empty() {
                     vt.feed(&chunk);
                     let replies = vt.take_replies();

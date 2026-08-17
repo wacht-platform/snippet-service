@@ -374,6 +374,13 @@ pub struct HarnessState {
     /// "Running" — compaction can take a while and otherwise looks like a normal turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compacting: bool,
+    /// When the current running turn began (RFC3339). Cleared when not running
+    /// so attached UIs can tick elapsed from the event, not from widget mount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at: Option<String>,
+    /// When the current compaction pass began (RFC3339). Cleared when idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacting_started_at: Option<String>,
     /// Omitted on the attach wire (clients render from `events` + live stream).
     /// Default so snapshot/delta frames that strip LLM history still deserialize.
     #[serde(default)]
@@ -442,6 +449,8 @@ impl HarnessState {
         self.final_text = None;
         self.pending_question = None;
         self.compacting = false;
+        self.compacting_started_at = None;
+        self.turn_started_at = None;
         self.tool_payloads_pruned = false;
         self.status = HarnessStatus::Idle;
         Ok(cp.label)
@@ -2976,7 +2985,7 @@ impl CodingHarness {
                             content: request.clone(),
                         });
                         state.events.push(HarnessEvent::UserInput { text: request });
-                        self.persist_state(&state).await?;
+                        self.persist_state(&mut state).await?;
                     }
                     return Ok(state);
                 }
@@ -3011,16 +3020,22 @@ impl CodingHarness {
             }
             None => (HarnessStatus::Idle, None),
         };
-        let state = HarnessState {
+        let mut state = HarnessState {
             version: 1,
             status,
             created_at: now.clone(),
-            updated_at: now,
+            updated_at: now.clone(),
             workspace: self.context.workspace_root().display().to_string(),
             title,
             legacy_request: String::new(),
             goal: None,
             compacting: false,
+            turn_started_at: if matches!(status, HarnessStatus::Running) {
+                Some(now.clone())
+            } else {
+                None
+            },
+            compacting_started_at: None,
             watches: Vec::new(),
             messages,
             events,
@@ -3043,7 +3058,7 @@ impl CodingHarness {
             context_window: self.config.context_window_tokens,
             tool_payloads_pruned: false,
         };
-        self.persist_state(&state).await?;
+        self.persist_state(&mut state).await?;
         Ok(state)
     }
 
@@ -3921,11 +3936,11 @@ impl CodingHarness {
         }
     }
 
-    async fn persist_state(&self, state: &HarnessState) -> Result<(), ToolError> {
+    async fn persist_state(&self, state: &mut HarnessState) -> Result<(), ToolError> {
+        stamp_activity_times(state);
         let Some(path) = &self.config.state_path else {
             return Ok(());
         };
-        let mut state = state.clone();
         state.updated_at = Utc::now().to_rfc3339();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -3938,6 +3953,27 @@ impl CodingHarness {
         // every conversation when enumerating (scales to thousands of sessions).
         crate::session::write_session_meta(path, &state);
         Ok(())
+    }
+}
+
+/// Keep compacting/thinking clocks anchored to when the activity actually
+/// started, not when a client widget mounted. Called on every persist so
+/// attached UIs can tick from a durable RFC3339 stamp.
+fn stamp_activity_times(state: &mut HarnessState) {
+    let now = Utc::now().to_rfc3339();
+    if state.compacting {
+        if state.compacting_started_at.is_none() {
+            state.compacting_started_at = Some(now.clone());
+        }
+    } else {
+        state.compacting_started_at = None;
+    }
+    if state.status == HarnessStatus::Running && !state.compacting {
+        if state.turn_started_at.is_none() {
+            state.turn_started_at = Some(now);
+        }
+    } else if state.status != HarnessStatus::Running {
+        state.turn_started_at = None;
     }
 }
 
@@ -5012,6 +5048,8 @@ mod tool_prune_tests {
             legacy_request: String::new(),
             goal: None,
             compacting: false,
+            turn_started_at: None,
+            compacting_started_at: None,
             watches: Vec::new(),
             messages,
             events: Vec::new(),

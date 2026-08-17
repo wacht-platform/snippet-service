@@ -449,6 +449,8 @@ fn apply_wire_frame(
                     acc.lanes = partial.lanes;
                     acc.watches = partial.watches;
                     acc.compacting = partial.compacting;
+                    acc.turn_started_at = partial.turn_started_at;
+                    acc.compacting_started_at = partial.compacting_started_at;
                     if let Some(t) = partial.title {
                         acc.title = Some(t);
                     }

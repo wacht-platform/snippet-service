@@ -553,7 +553,7 @@ impl App {
             resume_selected_index: 0,
             resume_pending_delete: false,
             resume_rename: None,
-            
+
             model_picker_index: 0,
             profiles_selected_index: 0,
             lanes_selected_index: 0,
@@ -1551,10 +1551,6 @@ impl App {
             .map(|(i, _)| i)
             .collect();
         for idx in dead.into_iter().rev() {
-            crate::term::debug_log(
-                "tui",
-                &format!("reap-dead id={}", self.term_panes[idx].id),
-            );
             self.close_term_at(idx);
         }
     }
@@ -1580,13 +1576,6 @@ impl App {
         }))
         .is_ok()
         {
-            crate::term::debug_log(
-                "tui",
-                &format!(
-                    "open id={} fresh={fresh} {}x{}",
-                    pane.id, pane.cols, pane.rows
-                ),
-            );
             pane.opened = true;
         }
     }
@@ -1594,20 +1583,9 @@ impl App {
     fn send_term_bytes(&self, bytes: &[u8]) {
         use base64::Engine;
         let Some(pane) = self.term_panes.get(self.term_focus) else {
-            crate::term::debug_log("tui", "in-drop no-pane");
             return;
         };
         if let Some(a) = self.sidecar_attach.as_ref() {
-            crate::term::debug_log(
-                "tui",
-                &format!(
-                    "in id={} {}x{} {}",
-                    pane.id,
-                    pane.cols,
-                    pane.rows,
-                    crate::term::preview_bytes(bytes)
-                ),
-            );
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
                 "op": "in",
@@ -1616,11 +1594,6 @@ impl App {
                 "cols": pane.cols,
                 "rows": pane.rows,
             }));
-        } else {
-            crate::term::debug_log(
-                "tui",
-                &format!("in-drop no-attach id={}", pane.id),
-            );
         }
     }
 
@@ -1672,24 +1645,12 @@ impl App {
             if op == "snapshot" {
                 // Raw PTY history replayed into a sized screen is what
                 // glued `ls` onto the prompt. Incremental `out` is truth.
-                crate::term::debug_log(
-                    "tui",
-                    &format!("skip-snapshot id={id} seq={seq} {}", crate::term::preview_bytes(&data)),
-                );
                 continue;
             }
             if op == "out" {
                 pane.live = true;
             }
             if !data.is_empty() {
-                crate::term::debug_log(
-                    "tui",
-                    &format!(
-                        "paint id={id} op={op} seq={seq} live={} {}",
-                        pane.live,
-                        crate::term::preview_bytes(&data)
-                    ),
-                );
                 pane.vt.feed(&data);
             }
             // DSR/DA is answered on the daemon. Two clients writing
@@ -3346,12 +3307,10 @@ impl App {
     async fn refresh_state(&mut self) {
         // Sidecar: state arrives over WS. Pull the latest snapshot/delta and
         // mirror the live stream handle the attach task keeps updated.
-        let sidecar_update = self.sidecar_attach.as_ref().map(|attach| {
-            (
-                attach.stream.clone(),
-                attach.state_rx.borrow().clone(),
-            )
-        });
+        let sidecar_update = self
+            .sidecar_attach
+            .as_ref()
+            .map(|attach| (attach.stream.clone(), attach.state_rx.borrow().clone()));
         if let Some((stream, maybe_state)) = sidecar_update {
             if let Some(state) = maybe_state {
                 // A newer committed state clears optimistic-busy and the live
@@ -5423,7 +5382,10 @@ fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             spans.push(Span::styled(label, style));
             let _ = pane;
         }
-        spans.push(Span::styled("  Ctrl-T next · Ctrl-N new · Ctrl-W close", subtle()));
+        spans.push(Span::styled(
+            "  Ctrl-T next · Ctrl-N new · Ctrl-W close",
+            subtle(),
+        ));
         frame.render_widget(Paragraph::new(Line::from(spans)), chunks[0]);
     }
     let body = chunks[1];
@@ -6072,9 +6034,9 @@ fn queued_lines(app: &App) -> Vec<Line<'static>> {
     }
     let rail = Span::styled(" │ ", Style::default().fg(faint()));
     let header = if n == 1 {
-                            "queued — sends when idle · Ctrl+G steers now · Ctrl+X cancel".to_string()
+        "queued — sends when idle · Ctrl+G steers now · Ctrl+X cancel".to_string()
     } else {
-                            format!("queued ({n}) — send when idle · Ctrl+G steers now · Ctrl+X cancel")
+        format!("queued ({n}) — send when idle · Ctrl+G steers now · Ctrl+X cancel")
     };
     let mut lines = vec![Line::from(vec![
         rail.clone(),

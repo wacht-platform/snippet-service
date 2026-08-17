@@ -70,9 +70,7 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
                 .map(|s| PathBuf::from(s.workspace))
         })
         .filter(|p| p.is_dir())
-        .or_else(|| {
-            std::env::current_dir().ok()
-        })
+        .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     // Prefer workspace from the live state file on the handle itself.
     let cwd = {
@@ -2363,15 +2361,6 @@ async fn handle_ws(
                         continue;
                     }
                     term_seq = term_seq.wrapping_add(1);
-                    crate::term::debug_log(
-                        "serve",
-                        &format!(
-                            "ws-out id={id} seq={term_seq} {}x{} alive={alive} {}",
-                            cols,
-                            rows,
-                            crate::term::preview_bytes(&chunk)
-                        ),
-                    );
                     let frame = serde_json::json!({
                         "wire": "term",
                         "op": "out",
@@ -2445,10 +2434,6 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
         .and_then(|v| v.as_str())
         .unwrap_or("0")
         .to_string();
-    crate::term::debug_log(
-        "serve",
-        &format!("ws-in op={op} id={id} {cols}x{rows}"),
-    );
     match op {
         "open" | "new" => {
             // Honor the client's pane id. Allocating a different one left the
@@ -2500,10 +2485,10 @@ async fn events_ws(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    ws.on_upgrade(handle_events_ws)
+    ws.on_upgrade(move |socket| handle_events_ws(socket, d))
 }
 
-async fn handle_events_ws(socket: WebSocket) {
+async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
     use std::collections::{HashMap, HashSet};
     let (mut sender, mut receiver) = socket.split();
     let push = tokio::spawn(async move {
@@ -2542,6 +2527,33 @@ async fn handle_events_ws(socket: WebSocket) {
             }
             last.retain(|k, _| seen.contains(k));
             first = false;
+            // BEL / OSC 9 / OSC 777. Harvest also drains idle PTYs so a
+            // notification still fires when nobody is attached. Bytes drained
+            // with no subscriber are stashed for the next /attach.
+            {
+                let live = daemon.sessions.lock().await;
+                for (id, sess) in live.iter() {
+                    let notes = sess.terms.harvest();
+                    if notes.is_empty() {
+                        continue;
+                    }
+                    let meta = sessions.iter().find(|s| s.id == *id);
+                    let title = meta.map(|s| s.title.as_str()).unwrap_or("");
+                    let folder = meta.map(|s| s.folder.as_str()).unwrap_or("");
+                    let status = meta.map(|s| s.status.as_str()).unwrap_or("");
+                    for n in notes {
+                        out.push(serde_json::json!({
+                            "session": id,
+                            "title": title,
+                            "workspace": folder,
+                            "kind": "term",
+                            "status": status,
+                            "message": n.message,
+                            "pane": n.pane,
+                        }));
+                    }
+                }
+            }
             for e in out {
                 if sender
                     .send(Message::Text(e.to_string().into()))
