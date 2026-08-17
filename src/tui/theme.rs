@@ -30,8 +30,6 @@ pub(super) fn theme() -> Theme {
     AMOLED
 }
 
-pub(super) fn set_theme_index(_i: usize) {}
-
 /// Persisted config names still load; every name is AMOLED.
 pub(super) fn set_theme_by_name(_name: &str) -> bool {
     true

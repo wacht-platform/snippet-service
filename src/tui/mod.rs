@@ -1,7 +1,6 @@
 use std::cell::Cell;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{
