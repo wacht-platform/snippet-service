@@ -500,6 +500,9 @@ struct TermPane {
     cols: u16,
     rows: u16,
     seq: u64,
+    /// True after the first incremental `out`. Later `snapshot` frames are
+    /// stale full-scrollback copies and must not wipe the live screen.
+    live: bool,
 }
 
 impl App {
@@ -1443,6 +1446,7 @@ impl App {
                 cols: 80,
                 rows: 24,
                 seq: 0,
+                live: false,
             });
             self.term_focus = 0;
         }
@@ -1476,6 +1480,7 @@ impl App {
             cols,
             rows,
             seq: 0,
+            live: false,
         });
         self.term_focus = self.term_panes.len() - 1;
         self.screen = Screen::Term;
@@ -1559,6 +1564,7 @@ impl App {
                     cols: 80,
                     rows: 24,
                     seq: 0,
+                    live: false,
                 });
                 self.term_panes.len() - 1
             };
@@ -1580,7 +1586,15 @@ impl App {
                 .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
                 .unwrap_or_default();
             if op == "snapshot" {
+                if pane.live {
+                    // Incremental out already painted. A later full-scrollback
+                    // snapshot is stale and would wipe typed keys / the prompt.
+                    continue;
+                }
                 pane.vt = crate::term::VtScreen::new(pane.cols as usize, pane.rows as usize);
+            }
+            if op == "out" {
+                pane.live = true;
             }
             if !data.is_empty() {
                 pane.vt.feed(&data);
@@ -5290,6 +5304,7 @@ fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
             cols: 80,
             rows: 24,
             seq: 0,
+            live: false,
         });
         app.term_focus = 0;
     }

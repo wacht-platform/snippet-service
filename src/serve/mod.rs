@@ -2473,7 +2473,6 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
             if let Some(term) = terms.get(&id) {
                 let _ = term.ensure(cols, rows);
                 term.resize(cols, rows);
-                terms.request_snapshot(&id);
             }
         }
         "in" => {
