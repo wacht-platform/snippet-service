@@ -314,32 +314,14 @@ fn set_winsize(fd: i32, cols: u16, rows: u16) {
     }
 }
 
-/// Tiny VT parser used by the TUI to paint the session PTY into a ratatui pane.
-/// Enough for bash/vim/htop/less: SGR, CUP, ED/EL, cursor save/restore, alt
-/// screen, CUU/CUD/CUF/CUB, CHA, VPA, DECSTBM, IND/RI, CR/LF/BS/TAB, OSC strip.
-#[derive(Clone)]
+/// Screen buffer for the TUI pane. Parsing is `vt100` (vte-based), not our
+/// homemade CSI machine — fish/zsh prompts need a real emulator.
 pub struct VtScreen {
     pub cols: usize,
     pub rows: usize,
-    cells: Vec<VtCell>,
-    cx: usize,
-    cy: usize,
-    saved: (usize, usize),
-    fg: u8,
-    bg: u8,
-    bold: bool,
-    inverse: bool,
-    origin: bool,
-    scroll_top: usize,
-    scroll_bot: usize,
-    alt: bool,
-    main: Vec<VtCell>,
-    main_cx: usize,
-    main_cy: usize,
-    utf8: Vec<u8>,
-    esc: Esc,
-    insert: bool,
+    parser: vt100::Parser,
     replies: Vec<u8>,
+    dsr: DsrScan,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -363,13 +345,55 @@ impl Default for VtCell {
     }
 }
 
-#[derive(Clone)]
-enum Esc {
-    Ground,
-    Esc,
-    Csi(String),
-    Osc(String),
-    Charset,
+/// Detect CSI 6n / CSI 5n in the raw stream and answer them. `vt100` 0.15
+/// swallows DSR and never replies, which is why fish left the cursor dead.
+#[derive(Default)]
+struct DsrScan {
+    esc: u8, // 0 ground, 1 saw ESC, 2 saw CSI
+    params: Vec<u8>,
+}
+
+impl DsrScan {
+    fn feed(&mut self, bytes: &[u8], replies: &mut Vec<u8>, row: u16, col: u16) {
+        for &b in bytes {
+            match self.esc {
+                0 if b == 0x1b => self.esc = 1,
+                1 if b == b'[' => {
+                    self.esc = 2;
+                    self.params.clear();
+                }
+                1 => self.esc = 0,
+                2 if b.is_ascii_digit() || b == b';' => {
+                    if self.params.len() < 16 {
+                        self.params.push(b);
+                    }
+                }
+                2 if b == b'n' => {
+                    let p = std::str::from_utf8(&self.params).unwrap_or("");
+                    if p.is_empty() || p == "6" {
+                        replies.extend_from_slice(format!("\x1b[{};{}R", row, col).as_bytes());
+                    } else if p == "5" {
+                        replies.extend_from_slice(b"\x1b[0n");
+                    }
+                    self.esc = 0;
+                    self.params.clear();
+                }
+                2 => {
+                    self.esc = 0;
+                    self.params.clear();
+                }
+                _ => self.esc = 0,
+            }
+        }
+    }
+}
+
+fn map_color(c: vt100::Color, default: u8) -> u8 {
+    match c {
+        vt100::Color::Default => default,
+        vt100::Color::Idx(i) => i,
+        vt100::Color::Rgb(r, g, b) => rgb_to_256(r, g, b),
+    }
 }
 
 impl VtScreen {
@@ -379,25 +403,9 @@ impl VtScreen {
         Self {
             cols,
             rows,
-            cells: vec![VtCell::default(); cols * rows],
-            cx: 0,
-            cy: 0,
-            saved: (0, 0),
-            fg: 7,
-            bg: 0,
-            bold: false,
-            inverse: false,
-            origin: false,
-            scroll_top: 0,
-            scroll_bot: rows.saturating_sub(1),
-            alt: false,
-            main: Vec::new(),
-            main_cx: 0,
-            main_cy: 0,
-            utf8: Vec::new(),
-            esc: Esc::Ground,
-            insert: false,
+            parser: vt100::Parser::new(rows as u16, cols as u16, 0),
             replies: Vec::new(),
+            dsr: DsrScan::default(),
         }
     }
 
@@ -412,490 +420,38 @@ impl VtScreen {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        let mut next = vec![VtCell::default(); cols * rows];
-        let copy_c = self.cols.min(cols);
-        let copy_r = self.rows.min(rows);
-        for y in 0..copy_r {
-            for x in 0..copy_c {
-                next[y * cols + x] = self.cells[y * self.cols + x];
-            }
-        }
-        self.cells = next;
         self.cols = cols;
         self.rows = rows;
-        self.scroll_bot = rows.saturating_sub(1);
-        self.scroll_top = self.scroll_top.min(self.scroll_bot);
-        // Allow cx == cols (pending wrap). Never pin at last column.
-        if self.cx > cols {
-            self.cx = cols;
-        }
-        self.cy = self.cy.min(rows.saturating_sub(1));
+        self.parser.set_size(rows as u16, cols as u16);
     }
 
     pub fn cell(&self, x: usize, y: usize) -> VtCell {
-        self.cells.get(y * self.cols + x).copied().unwrap_or_default()
+        let Some(c) = self.parser.screen().cell(y as u16, x as u16) else {
+            return VtCell::default();
+        };
+        let text = c.contents();
+        let ch = text.chars().next().unwrap_or(' ');
+        let inverse = c.inverse();
+        VtCell {
+            ch: if text.is_empty() { ' ' } else { ch },
+            fg: map_color(c.fgcolor(), 7),
+            bg: map_color(c.bgcolor(), 0),
+            bold: c.bold(),
+            inverse,
+        }
     }
 
     pub fn cursor(&self) -> (usize, usize) {
-        (self.cx, self.cy)
+        let (row, col) = self.parser.screen().cursor_position();
+        (col as usize, row as usize)
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.byte(b);
-        }
-    }
-
-    fn byte(&mut self, b: u8) {
-        match &mut self.esc {
-            Esc::Osc(buf) => {
-                if b == 0x07 || (b == b'\\' && buf.ends_with('\u{1b}')) {
-                    self.esc = Esc::Ground;
-                } else {
-                    buf.push(b as char);
-                    if buf.len() > 1024 {
-                        self.esc = Esc::Ground;
-                    }
-                }
-                return;
-            }
-            Esc::Csi(buf) => {
-                if (0x40..=0x7e).contains(&b) {
-                    let params = std::mem::take(buf);
-                    self.esc = Esc::Ground;
-                    self.csi(&params, b as char);
-                } else {
-                    buf.push(b as char);
-                    if buf.len() > 64 {
-                        self.esc = Esc::Ground;
-                    }
-                }
-                return;
-            }
-            Esc::Esc => {
-                self.esc = Esc::Ground;
-                match b {
-                    b'[' => {
-                        self.esc = Esc::Csi(String::new());
-                        return;
-                    }
-                    b']' => {
-                        self.esc = Esc::Osc(String::new());
-                        return;
-                    }
-                    b'(' | b')' | b'*' | b'+' => {
-                        self.esc = Esc::Charset;
-                        return;
-                    }
-                    b'7' => self.saved = (self.cx, self.cy),
-                    b'8' => {
-                        self.cx = self.saved.0.min(self.cols.saturating_sub(1));
-                        self.cy = self.saved.1.min(self.rows.saturating_sub(1));
-                    }
-                    b'M' => self.ri(),
-                    b'D' => self.index(),
-                    b'E' => {
-                        self.cx = 0;
-                        self.index();
-                    }
-                    b'c' => {
-                        let cols = self.cols;
-                        let rows = self.rows;
-                        *self = Self::new(cols, rows);
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            Esc::Charset => {
-                self.esc = Esc::Ground;
-                return;
-            }
-            Esc::Ground => {}
-        }
-
-        match b {
-            0x1b => {
-                self.esc = Esc::Esc;
-                return;
-            }
-            0x08 => {
-                self.cx = self.cx.saturating_sub(1);
-                return;
-            }
-            0x09 => {
-                self.cx = ((self.cx / 8) + 1) * 8;
-                if self.cx >= self.cols {
-                    self.cx = 0;
-                    self.index();
-                }
-                return;
-            }
-            0x0a | 0x0b | 0x0c => {
-                self.index();
-                return;
-            }
-            0x0d => {
-                self.cx = 0;
-                return;
-            }
-            0x07 => return,
-            b if b < 0x20 => return,
-            _ => {}
-        }
-
-        self.utf8.push(b);
-        match std::str::from_utf8(&self.utf8) {
-            Ok(s) => {
-                if let Some(ch) = s.chars().next() {
-                    self.put(ch);
-                }
-                self.utf8.clear();
-            }
-            Err(e) if e.error_len().is_some() => {
-                self.put('�');
-                self.utf8.clear();
-            }
-            Err(_) => {
-                if self.utf8.len() > 4 {
-                    self.utf8.clear();
-                }
-            }
-        }
-    }
-
-    fn put(&mut self, ch: char) {
-        // Wrap only when writing past the last column. Clamping on resize used
-        // to pin cx at cols-1, so the next glyph overwrote that cell then
-        // jumped to 0,0 — typed `ls` stacked on the prompt.
-        if self.cx >= self.cols {
-            self.cx = 0;
-            self.index();
-        }
-        if self.insert {
-            self.insert_blanks(1);
-        }
-        let i = self.cy * self.cols + self.cx;
-        if i < self.cells.len() {
-            self.cells[i] = VtCell {
-                ch,
-                fg: self.fg,
-                bg: self.bg,
-                bold: self.bold,
-                inverse: self.inverse,
-            };
-        }
-        self.cx = self.cx.saturating_add(1);
-    }
-
-    fn insert_blanks(&mut self, n: usize) {
-        let n = n.max(1).min(self.cols);
-        let row = self.cy * self.cols;
-        let start = row + self.cx.min(self.cols);
-        let end = row + self.cols;
-        if start >= end {
-            return;
-        }
-        for i in (start..end).rev() {
-            let src = i.saturating_sub(n);
-            if src >= start && i < self.cells.len() {
-                self.cells[i] = self.cells[src];
-            } else if i < self.cells.len() {
-                self.cells[i] = VtCell::default();
-            }
-        }
-    }
-
-    fn delete_chars(&mut self, n: usize) {
-        let n = n.max(1);
-        let row = self.cy * self.cols;
-        let start = row + self.cx.min(self.cols);
-        let end = row + self.cols;
-        if start >= end {
-            return;
-        }
-        for i in start..end {
-            let src = i + n;
-            if src < end && src < self.cells.len() {
-                self.cells[i] = self.cells[src];
-            } else if i < self.cells.len() {
-                self.cells[i] = VtCell::default();
-            }
-        }
-    }
-
-    fn erase_chars(&mut self, n: usize) {
-        let n = n.max(1);
-        let row = self.cy * self.cols;
-        for x in self.cx..(self.cx + n).min(self.cols) {
-            let i = row + x;
-            if i < self.cells.len() {
-                self.cells[i] = VtCell::default();
-            }
-        }
-    }
-
-    fn index(&mut self) {
-        if self.cy == self.scroll_bot {
-            self.scroll_up();
-        } else if self.cy + 1 < self.rows {
-            self.cy += 1;
-        }
-    }
-
-    fn ri(&mut self) {
-        if self.cy == self.scroll_top {
-            self.scroll_down();
-        } else if self.cy > 0 {
-            self.cy -= 1;
-        }
-    }
-
-    fn scroll_up(&mut self) {
-        let cols = self.cols;
-        let top = self.scroll_top;
-        let bot = self.scroll_bot;
-        if bot <= top {
-            return;
-        }
-        for y in top..bot {
-            for x in 0..cols {
-                self.cells[y * cols + x] = self.cells[(y + 1) * cols + x];
-            }
-        }
-        for x in 0..cols {
-            self.cells[bot * cols + x] = VtCell::default();
-        }
-    }
-
-    fn scroll_down(&mut self) {
-        let cols = self.cols;
-        let top = self.scroll_top;
-        let bot = self.scroll_bot;
-        if bot <= top {
-            return;
-        }
-        for y in (top + 1..=bot).rev() {
-            for x in 0..cols {
-                self.cells[y * cols + x] = self.cells[(y - 1) * cols + x];
-            }
-        }
-        for x in 0..cols {
-            self.cells[top * cols + x] = VtCell::default();
-        }
-    }
-
-    fn csi(&mut self, params: &str, cmd: char) {
-        let priv_p = params.starts_with('?');
-        let body = params.trim_start_matches(['?', '>', '=']);
-        let nums: Vec<i32> = if body.is_empty() {
-            Vec::new()
-        } else {
-            body.split(';')
-                .map(|p| p.parse().unwrap_or(0))
-                .collect()
-        };
-        let n = |i: usize, d: i32| nums.get(i).copied().filter(|v| *v > 0).unwrap_or(d) as usize;
-        match (priv_p, cmd) {
-            (_, 'n') => {
-                // DSR. Fish/zsh ask CSI 6n for cursor; silence = broken prompt.
-                let what = nums.first().copied().unwrap_or(0);
-                if what == 6 {
-                    let row = self.cy.saturating_add(1);
-                    let col = self.cx.min(self.cols.saturating_sub(1)).saturating_add(1);
-                    let reply = format!("\x1b[{row};{col}R");
-                    self.replies.extend_from_slice(reply.as_bytes());
-                } else if what == 5 {
-                    self.replies.extend_from_slice(b"\x1b[0n");
-                }
-            }
-            (false, 'h' | 'l') => {
-                let on = cmd == 'h';
-                for p in &nums {
-                    if *p == 4 {
-                        self.insert = on;
-                    }
-                }
-            }
-            (true, 'h' | 'l') => {
-                let on = cmd == 'h';
-                for p in &nums {
-                    if *p == 1049 || *p == 47 || *p == 1047 {
-                        self.set_alt(on);
-                    }
-                }
-            }
-            (false, 'A') => self.cy = self.cy.saturating_sub(n(0, 1)),
-            (false, 'B') => self.cy = (self.cy + n(0, 1)).min(self.rows.saturating_sub(1)),
-            (false, 'C') => self.cx = (self.cx + n(0, 1)).min(self.cols.saturating_sub(1)),
-            (false, 'D') => self.cx = self.cx.saturating_sub(n(0, 1)),
-            (false, 'G') => self.cx = n(0, 1).saturating_sub(1).min(self.cols.saturating_sub(1)),
-            (false, 'd') => self.cy = n(0, 1).saturating_sub(1).min(self.rows.saturating_sub(1)),
-            (false, 'H' | 'f') => {
-                let y = n(0, 1).saturating_sub(1);
-                let x = n(1, 1).saturating_sub(1);
-                self.cy = y.min(self.rows.saturating_sub(1));
-                self.cx = x.min(self.cols.saturating_sub(1));
-            }
-            (false, 'J') => self.ed(nums.first().copied().unwrap_or(0)),
-            (false, 'K') => self.el(nums.first().copied().unwrap_or(0)),
-            (false, 'm') => self.sgr(&nums),
-            (false, 'r') => {
-                let top = n(0, 1).saturating_sub(1);
-                let bot = if nums.len() > 1 {
-                    n(1, 1).saturating_sub(1)
-                } else {
-                    self.rows.saturating_sub(1)
-                };
-                self.scroll_top = top.min(self.rows.saturating_sub(1));
-                self.scroll_bot = bot.max(self.scroll_top).min(self.rows.saturating_sub(1));
-            }
-            (false, 's') => self.saved = (self.cx, self.cy),
-            (false, 'u') => {
-                self.cx = self.saved.0.min(self.cols.saturating_sub(1));
-                self.cy = self.saved.1.min(self.rows.saturating_sub(1));
-            }
-            (false, 'L') => {
-                for _ in 0..n(0, 1) {
-                    self.scroll_down();
-                }
-            }
-            (false, 'M') => {
-                for _ in 0..n(0, 1) {
-                    self.scroll_up();
-                }
-            }
-            (false, '@') => self.insert_blanks(n(0, 1)),
-            (false, 'P') => self.delete_chars(n(0, 1)),
-            (false, 'X') => self.erase_chars(n(0, 1)),
-            _ => {}
-        }
-        let _ = self.origin;
-    }
-
-    fn set_alt(&mut self, on: bool) {
-        if on == self.alt {
-            return;
-        }
-        if on {
-            self.main = self.cells.clone();
-            self.main_cx = self.cx;
-            self.main_cy = self.cy;
-            self.cells = vec![VtCell::default(); self.cols * self.rows];
-            self.cx = 0;
-            self.cy = 0;
-            self.alt = true;
-        } else {
-            if self.main.len() == self.cells.len() {
-                self.cells = std::mem::take(&mut self.main);
-            } else {
-                self.cells = vec![VtCell::default(); self.cols * self.rows];
-            }
-            self.cx = self.main_cx.min(self.cols.saturating_sub(1));
-            self.cy = self.main_cy.min(self.rows.saturating_sub(1));
-            self.alt = false;
-        }
-    }
-
-    fn ed(&mut self, mode: i32) {
-        match mode {
-            1 => {
-                for i in 0..=(self.cy * self.cols + self.cx).min(self.cells.len().saturating_sub(1)) {
-                    self.cells[i] = VtCell::default();
-                }
-            }
-            2 | 3 => {
-                self.cells.fill(VtCell::default());
-                if mode == 2 {
-                    self.cx = 0;
-                    self.cy = 0;
-                }
-            }
-            _ => {
-                let start = self.cy * self.cols + self.cx;
-                for i in start..self.cells.len() {
-                    self.cells[i] = VtCell::default();
-                }
-            }
-        }
-    }
-
-    fn el(&mut self, mode: i32) {
-        let row = self.cy * self.cols;
-        match mode {
-            1 => {
-                for x in 0..=self.cx.min(self.cols.saturating_sub(1)) {
-                    self.cells[row + x] = VtCell::default();
-                }
-            }
-            2 => {
-                for x in 0..self.cols {
-                    self.cells[row + x] = VtCell::default();
-                }
-            }
-            _ => {
-                for x in self.cx..self.cols {
-                    self.cells[row + x] = VtCell::default();
-                }
-            }
-        }
-    }
-
-    fn sgr(&mut self, nums: &[i32]) {
-        if nums.is_empty() {
-            self.fg = 7;
-            self.bg = 0;
-            self.bold = false;
-            self.inverse = false;
-            return;
-        }
-        let mut i = 0;
-        while i < nums.len() {
-            match nums[i] {
-                0 => {
-                    self.fg = 7;
-                    self.bg = 0;
-                    self.bold = false;
-                    self.inverse = false;
-                }
-                1 => self.bold = true,
-                22 => self.bold = false,
-                7 => self.inverse = true,
-                27 => self.inverse = false,
-                n @ 30..=37 => self.fg = (n - 30) as u8,
-                39 => self.fg = 7,
-                n @ 40..=47 => self.bg = (n - 40) as u8,
-                49 => self.bg = 0,
-                n @ 90..=97 => self.fg = (n - 90 + 8) as u8,
-                n @ 100..=107 => self.bg = (n - 100 + 8) as u8,
-                38 | 48 => {
-                    let is_fg = nums[i] == 38;
-                    if i + 2 < nums.len() && nums[i + 1] == 5 {
-                        let idx = nums[i + 2].clamp(0, 255) as u8;
-                        if is_fg {
-                            self.fg = idx;
-                        } else {
-                            self.bg = idx;
-                        }
-                        i += 2;
-                    } else if i + 4 < nums.len() && nums[i + 1] == 2 {
-                        // Approximate 24-bit as 256-color cube.
-                        let r = nums[i + 2].clamp(0, 255) as u8;
-                        let g = nums[i + 3].clamp(0, 255) as u8;
-                        let b = nums[i + 4].clamp(0, 255) as u8;
-                        let idx = rgb_to_256(r, g, b);
-                        if is_fg {
-                            self.fg = idx;
-                        } else {
-                            self.bg = idx;
-                        }
-                        i += 4;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
+        // Answer DSR against the *current* cursor, then apply the bytes so
+        // the report matches what the shell just asked about.
+        let (row, col) = self.parser.screen().cursor_position();
+        self.dsr.feed(bytes, &mut self.replies, row.saturating_add(1), col.saturating_add(1));
+        self.parser.process(bytes);
     }
 }
 
@@ -953,16 +509,6 @@ mod tests {
         s.feed(b"hi");
         s.feed(b"\x1b[6n");
         assert_eq!(s.take_replies(), b"\x1b[1;3R");
-    }
-
-    #[test]
-    fn insert_mode_shifts_right() {
-        let mut s = VtScreen::new(10, 2);
-        s.feed(b"abc");
-        s.feed(b"\x1b[1;1H\x1b[4hX");
-        assert_eq!(s.cell(0, 0).ch, 'X');
-        assert_eq!(s.cell(1, 0).ch, 'a');
-        assert_eq!(s.cell(2, 0).ch, 'b');
     }
 
     #[test]
