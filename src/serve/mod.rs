@@ -2450,7 +2450,9 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
         .to_string();
     match op {
         "open" | "new" => {
-            let id = if op == "new" {
+            // Honor the client's pane id. Allocating a different one left the
+            // TUI painting an empty pane while output landed on an unseen id.
+            let id = if op == "new" && id.is_empty() {
                 terms.alloc_id()
             } else {
                 id

@@ -246,13 +246,10 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
     } else {
         PathBuf::from(".")
     };
-    // Do not attach the slave in the parent. Command's Stdio::from(dup)
-    // leaves fds that are not the session controlling TTY, so fish's
-    // tcgetpgrp/setpgid fail ("No TTY for interactive shell").
-    // login_tty: parent keeps only the master; the child opens the slave
-    // after setsid and makes it the controlling terminal.
+    // Parent keeps the slave open so the pts stays allocated. The child
+    // re-opens it after setsid and claims it as the controlling TTY.
+    // Never abort spawn on TIOCSCTTY/setpgid — that left a black pane.
     let slave_path = slave_pts_path(&slave)?;
-    drop(slave);
     let mut cmd = Command::new(&shell);
     cmd.arg("-i")
         .current_dir(&cwd)
@@ -264,24 +261,14 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
         .env("SHELL", &shell);
     unsafe {
         cmd.pre_exec(move || {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            let _ = libc::setsid();
             let cpath = std::ffi::CString::new(slave_path.to_string_lossy().as_bytes())
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pts path"))?;
             let fd = libc::open(cpath.as_ptr(), libc::O_RDWR);
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Best-effort: drop inherited controlling tty, then claim this one.
-            let _ = libc::ioctl(fd, libc::TIOCNOTTY, 0);
-            if libc::ioctl(fd, libc::TIOCSCTTY, 1) < 0
-                && libc::ioctl(fd, libc::TIOCSCTTY, 0) < 0
-            {
-                let err = std::io::Error::last_os_error();
-                libc::close(fd);
-                return Err(err);
-            }
+            let _ = libc::ioctl(fd, libc::TIOCSCTTY, 0);
             if libc::dup2(fd, 0) < 0 || libc::dup2(fd, 1) < 0 || libc::dup2(fd, 2) < 0 {
                 let err = std::io::Error::last_os_error();
                 libc::close(fd);
@@ -291,14 +278,13 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
                 libc::close(fd);
             }
             let pgid = libc::getpid();
-            if libc::setpgid(0, pgid) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            let _ = libc::setpgid(0, pgid);
             let _ = libc::tcsetpgrp(0, pgid);
             Ok(())
         });
     }
     let child = cmd.spawn().map_err(|e| format!("spawn shell: {e}"))?;
+    drop(slave);
     g.child = Some(child);
     g.master = Some(master);
     g.alive = true;
