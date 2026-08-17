@@ -2358,6 +2358,15 @@ async fn handle_ws(
                         continue;
                     }
                     term_seq = term_seq.wrapping_add(1);
+                    crate::term::debug_log(
+                        "serve",
+                        &format!(
+                            "ws-out id={id} seq={term_seq} {}x{} alive={alive} {}",
+                            cols,
+                            rows,
+                            crate::term::preview_bytes(&chunk)
+                        ),
+                    );
                     let frame = serde_json::json!({
                         "wire": "term",
                         "op": "out",
@@ -2431,6 +2440,10 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
         .and_then(|v| v.as_str())
         .unwrap_or("0")
         .to_string();
+    crate::term::debug_log(
+        "serve",
+        &format!("ws-in op={op} id={id} {cols}x{rows}"),
+    );
     match op {
         "open" | "new" => {
             // Honor the client's pane id. Allocating a different one left the

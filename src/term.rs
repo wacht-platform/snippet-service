@@ -7,6 +7,44 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// TEMP: one file for TUI + daemon + PTY so we can pin the live delay.
+/// Remove after the session-shell attach path is solid.
+pub fn debug_log(src: &str, msg: &str) {
+    let path = std::env::temp_dir().join("snippet-term-debug.log");
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{ms} pid={} {src} {msg}", std::process::id());
+    }
+}
+
+pub fn preview_bytes(bytes: &[u8]) -> String {
+    let n = bytes.len().min(48);
+    let mut s = String::new();
+    for &b in &bytes[..n] {
+        match b {
+            b'\r' => s.push_str("\\r"),
+            b'\n' => s.push_str("\\n"),
+            b'\t' => s.push_str("\\t"),
+            0x1b => s.push_str("\\e"),
+            0x7f => s.push_str("\\x7f"),
+            c if (0x20..0x7f).contains(&c) => s.push(c as char),
+            c => s.push_str(&format!("\\x{c:02x}")),
+        }
+    }
+    if bytes.len() > n {
+        s.push_str("…");
+    }
+    format!("{}b {s}", bytes.len())
+}
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
 const MAX_TERMS: usize = 8;
@@ -169,7 +207,18 @@ impl SessionTerm {
             g.master = None;
             g.alive = false;
         }
-        spawn_locked(&mut g, cols, rows)
+        let r = spawn_locked(&mut g, cols, rows);
+        debug_log(
+            "pty",
+            &format!(
+                "ensure spawn {}x{} ok={} alive={}",
+                cols,
+                rows,
+                r.is_ok(),
+                g.alive
+            ),
+        );
+        r
     }
 
     pub fn write(&self, bytes: &[u8]) {
@@ -178,8 +227,18 @@ impl SessionTerm {
             Err(_) => return,
         };
         if let Some(m) = g.master.as_mut() {
-            let _ = m.write_all(bytes);
+            let wrote = m.write_all(bytes);
             let _ = m.flush();
+            debug_log(
+                "pty",
+                &format!(
+                    "write {} wrote_ok={}",
+                    preview_bytes(bytes),
+                    wrote.is_ok()
+                ),
+            );
+        } else {
+            debug_log("pty", &format!("write-drop no-master {}", preview_bytes(bytes)));
         }
     }
 
@@ -236,6 +295,10 @@ impl SessionTerm {
                 }
                 g.scrollback.push_back(*b);
             }
+            debug_log(
+                "pty",
+                &format!("poll_out {} alive={}", preview_bytes(&out), g.alive),
+            );
         }
         out
     }

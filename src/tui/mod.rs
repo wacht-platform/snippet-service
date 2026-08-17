@@ -1537,6 +1537,13 @@ impl App {
         }))
         .is_ok()
         {
+            crate::term::debug_log(
+                "tui",
+                &format!(
+                    "open id={} fresh={fresh} {}x{}",
+                    pane.id, pane.cols, pane.rows
+                ),
+            );
             pane.opened = true;
         }
     }
@@ -1544,9 +1551,20 @@ impl App {
     fn send_term_bytes(&self, bytes: &[u8]) {
         use base64::Engine;
         let Some(pane) = self.term_panes.get(self.term_focus) else {
+            crate::term::debug_log("tui", "in-drop no-pane");
             return;
         };
         if let Some(a) = self.sidecar_attach.as_ref() {
+            crate::term::debug_log(
+                "tui",
+                &format!(
+                    "in id={} {}x{} {}",
+                    pane.id,
+                    pane.cols,
+                    pane.rows,
+                    crate::term::preview_bytes(bytes)
+                ),
+            );
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
                 "op": "in",
@@ -1555,6 +1573,11 @@ impl App {
                 "cols": pane.cols,
                 "rows": pane.rows,
             }));
+        } else {
+            crate::term::debug_log(
+                "tui",
+                &format!("in-drop no-attach id={}", pane.id),
+            );
         }
     }
 
@@ -1607,16 +1630,36 @@ impl App {
             if op == "snapshot" {
                 // Raw PTY history replayed into a sized screen is what
                 // glued `ls` onto the prompt. Incremental `out` is truth.
+                crate::term::debug_log(
+                    "tui",
+                    &format!("skip-snapshot id={id} seq={seq} {}", crate::term::preview_bytes(&data)),
+                );
                 continue;
             }
             if op == "out" {
                 pane.live = true;
             }
             if !data.is_empty() {
+                crate::term::debug_log(
+                    "tui",
+                    &format!(
+                        "paint id={id} op={op} seq={seq} live={} {}",
+                        pane.live,
+                        crate::term::preview_bytes(&data)
+                    ),
+                );
                 pane.vt.feed(&data);
             }
             let replies = pane.vt.take_replies();
             if !replies.is_empty() {
+                crate::term::debug_log(
+                    "tui",
+                    &format!(
+                        "dsr-reply id={} {}",
+                        pane.id,
+                        crate::term::preview_bytes(&replies)
+                    ),
+                );
                 replies_out.push((pane.id.clone(), replies));
             }
         }
