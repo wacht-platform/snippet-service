@@ -1516,6 +1516,49 @@ impl App {
         self.term_focus = self.term_focus.min(self.term_panes.len() - 1);
     }
 
+    fn close_term_at(&mut self, idx: usize) {
+        if idx >= self.term_panes.len() {
+            return;
+        }
+        let id = self.term_panes[idx].id.clone();
+        if let Some(a) = self.sidecar_attach.as_ref() {
+            let _ = a.send_term(serde_json::json!({
+                "wire": "term",
+                "op": "close",
+                "id": id,
+            }));
+        }
+        self.term_panes.remove(idx);
+        if self.term_panes.is_empty() {
+            self.term_focus = 0;
+            self.screen = Screen::Main;
+            return;
+        }
+        if self.term_focus > idx {
+            self.term_focus -= 1;
+        }
+        self.term_focus = self.term_focus.min(self.term_panes.len() - 1);
+    }
+
+    /// Ctrl-D sent EOF; when the child exits, drop the tab instead of
+    /// leaving a dead pane that still needs Ctrl-W.
+    fn reap_dead_terms(&mut self) {
+        let dead: Vec<usize> = self
+            .term_panes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.opened && p.live && !p.alive)
+            .map(|(i, _)| i)
+            .collect();
+        for idx in dead.into_iter().rev() {
+            crate::term::debug_log(
+                "tui",
+                &format!("reap-dead id={}", self.term_panes[idx].id),
+            );
+            self.close_term_at(idx);
+        }
+    }
+
     fn send_term_open(&mut self) {
         let Some(pane) = self.term_panes.get_mut(self.term_focus) else {
             return;
@@ -3053,6 +3096,7 @@ impl App {
         }
         self.refresh_state().await;
         self.drain_term_frames();
+        self.reap_dead_terms();
         // Open may have been skipped while /attach was still coming up.
         if self.sidecar_attach.is_some() && self.screen == Screen::Term {
             let saved = self.term_focus;

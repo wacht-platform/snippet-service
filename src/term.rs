@@ -239,11 +239,16 @@ impl SessionTerms {
         };
         let mut frames = Vec::new();
         for (id, t) in panes {
+            let was_alive = t.is_alive();
             let chunk = t.poll_out();
-            if chunk.is_empty() {
+            let (_, cols, rows, alive) = t.snapshot();
+            if chunk.is_empty() && alive {
                 continue;
             }
-            let (_, cols, rows, alive) = t.snapshot();
+            if chunk.is_empty() && !was_alive {
+                // Already reported dead.
+                continue;
+            }
             frames.push((id, chunk, cols, rows, alive));
         }
         if frames.is_empty() {

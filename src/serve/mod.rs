@@ -2359,7 +2359,7 @@ async fn handle_ws(
                     None => terms.poll_all(),
                 };
                 for (id, chunk, cols, rows, alive) in frames {
-                    if chunk.is_empty() {
+                    if chunk.is_empty() && alive {
                         continue;
                     }
                     term_seq = term_seq.wrapping_add(1);
