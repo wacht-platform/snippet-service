@@ -3159,6 +3159,7 @@ impl CodingHarness {
             Some(HarnessMessage::System { content }) => content.clone(),
             _ => return Ok(()),
         };
+        state.compacting = true;
 
         let last_summary_index = state
             .messages
@@ -3473,6 +3474,7 @@ impl CodingHarness {
         // compaction. The gauge repopulates from the next response's usage.
         state.last_prompt_tokens = 0;
         state.tool_payloads_pruned = false;
+        state.compacting = false;
         Ok(())
     }
 
@@ -3533,6 +3535,8 @@ impl CodingHarness {
         }
 
         // Surface the compaction animation while the summarizer works.
+        // `compacting` is what attached UIs poll — set it for auto *and* manual.
+        state.compacting = true;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compaction_pass".to_string(),
             reasoning: format!(
@@ -3563,6 +3567,7 @@ impl CodingHarness {
                 self.debug_log(&format!(
                     "agentic summary failed → heuristic compaction (memory reflection skipped): {e}"
                 ));
+                // compact_history clears `compacting` when it finishes.
                 return self.compact_history(state, force).await;
             }
         };
@@ -3631,6 +3636,7 @@ impl CodingHarness {
         model.swap_reasoning_effort(prev_effort);
         state.last_prompt_tokens = 0;
         state.tool_payloads_pruned = false;
+        state.compacting = false;
         Ok(())
     }
 
