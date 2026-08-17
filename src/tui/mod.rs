@@ -1480,19 +1480,19 @@ impl App {
         let Some(attach) = self.sidecar_attach.as_mut() else {
             return;
         };
-        let Some(v) = attach.term_rx.borrow().clone() else {
+        // watch keeps the last frame forever — only apply when it actually changed.
+        if !attach.term_rx.has_changed().unwrap_or(false) {
+            return;
+        }
+        let Some(v) = attach.term_rx.borrow_and_update().clone() else {
             return;
         };
         let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
         if seq != 0 && seq == self.term_seq {
             return;
         }
-        self.term_seq = seq;
-        if let Some(c) = v.get("cols").and_then(|x| x.as_u64()) {
-            self.term_cols = c as u16;
-        }
-        if let Some(r) = v.get("rows").and_then(|x| x.as_u64()) {
-            self.term_rows = r as u16;
+        if seq != 0 {
+            self.term_seq = seq;
         }
         self.term_alive = v.get("alive").and_then(|a| a.as_bool()).unwrap_or(self.term_alive);
         let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
@@ -1505,8 +1505,6 @@ impl App {
             self.term_vt = crate::term::VtScreen::new(self.term_cols as usize, self.term_rows as usize);
         }
         if !data.is_empty() {
-            self.term_vt
-                .resize(self.term_cols as usize, self.term_rows as usize);
             self.term_vt.feed(&data);
         }
     }
@@ -5251,23 +5249,7 @@ fn ansi_color(idx: u8) -> Color {
 }
 
 fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(4), Constraint::Length(1)])
-        .split(area);
-    let title = if app.term_alive {
-        " session shell "
-    } else {
-        " session shell (starting…) "
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(title, Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-            Span::styled("  Esc leave · Ctrl-T toggle", subtle()),
-        ])),
-        chunks[0],
-    );
-    let body = chunks[1];
+    let body = area;
     let cols = body.width.max(2) as usize;
     let rows = body.height.max(2) as usize;
     if cols as u16 != app.term_cols || rows as u16 != app.term_rows {
@@ -5318,13 +5300,6 @@ fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), body);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{}×{} · keys go to the shell", app.term_cols, app.term_rows),
-            subtle(),
-        ))),
-        chunks[2],
-    );
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {

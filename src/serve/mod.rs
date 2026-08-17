@@ -2252,6 +2252,7 @@ async fn handle_ws(
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_stream_fp: u64 = 0;
         let mut sent_term_snap = false;
+        let mut term_seq: u64 = 0;
         loop {
             if let Ok(meta) = tokio::fs::metadata(&state_path).await {
                 if let Ok(mtime) = meta.modified() {
@@ -2350,10 +2351,12 @@ async fn handle_ws(
                 use base64::Engine;
                 if !sent_term_snap {
                     sent_term_snap = true;
+                    term_seq = term_seq.wrapping_add(1);
                     let (bytes, cols, rows, alive) = t.snapshot();
                     let frame = serde_json::json!({
                         "wire": "term",
                         "op": "snapshot",
+                        "seq": term_seq,
                         "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
                         "cols": cols,
                         "rows": rows,
@@ -2367,10 +2370,12 @@ async fn handle_ws(
                 }
                 let chunk = t.poll_out();
                 if !chunk.is_empty() {
+                    term_seq = term_seq.wrapping_add(1);
                     let (_, cols, rows, alive) = t.snapshot();
                     let frame = serde_json::json!({
                         "wire": "term",
                         "op": "out",
+                        "seq": term_seq,
                         "data": base64::engine::general_purpose::STANDARD.encode(&chunk),
                         "cols": cols,
                         "rows": rows,
