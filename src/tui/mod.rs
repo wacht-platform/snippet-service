@@ -69,6 +69,10 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
         "Toggle manual approval (bash & file edits ask y/n)",
     ),
     ("/theme", "Switch the color theme"),
+    (
+        "/term",
+        "Open this session's interactive shell (Ctrl-T; Esc leaves)",
+    ),
 ];
 
 struct PendingSidecarAttach {
@@ -209,6 +213,7 @@ enum Screen {
     ThemeSelection,
     Profiles,
     Lanes,
+    Term,
     RewindCheckpointSelection,
     ForkCheckpointSelection,
 }
@@ -482,6 +487,12 @@ struct App {
     sidecar_attach: Option<crate::serve::sidecar::SidecarAttach>,
     /// Set by `spawn_loop` in sidecar mode; consumed by `ensure_sidecar_attached`.
     pending_sidecar_attach: Option<PendingSidecarAttach>,
+    /// Interactive session PTY (daemon-owned). Rendered when `screen == Term`.
+    term_vt: crate::term::VtScreen,
+    term_alive: bool,
+    term_cols: u16,
+    term_rows: u16,
+    term_seq: u64,
     /// When set, the main canvas shows a connecting screen instead of the empty
     /// transcript — used while discovering/starting the local serve daemon.
     connecting_phase: Option<String>,
@@ -581,6 +592,11 @@ impl App {
             sidecar: None,
             sidecar_attach: None,
             pending_sidecar_attach: None,
+            term_vt: crate::term::VtScreen::new(80, 24),
+            term_alive: false,
+            term_cols: 80,
+            term_rows: 24,
+            term_seq: 0,
             connecting_phase: Some("Looking for local serve…".to_string()),
         };
         app.init_settings_form();
@@ -1398,6 +1414,9 @@ impl App {
                     }
                 }
             }
+            "/term" => {
+                self.open_term();
+            }
             "/theme" => {
                 if parts.len() > 1 {
                     if set_theme_by_name(parts[1]) {
@@ -1420,9 +1439,104 @@ impl App {
             }
             other => {
                 self.status = format!(
-                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, or /theme."
+                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, /term, or /theme."
                 );
             }
+        }
+    }
+
+    fn open_term(&mut self) {
+        self.screen = Screen::Term;
+        self.status = "Session shell · Esc leaves · Ctrl-T toggles".to_string();
+        self.send_term_open();
+    }
+
+    fn send_term_open(&self) {
+        if let Some(a) = self.sidecar_attach.as_ref() {
+            let _ = a.send_term(serde_json::json!({
+                "wire": "term",
+                "op": "open",
+                "cols": self.term_cols,
+                "rows": self.term_rows,
+            }));
+        }
+    }
+
+    fn send_term_bytes(&self, bytes: &[u8]) {
+        use base64::Engine;
+        if let Some(a) = self.sidecar_attach.as_ref() {
+            let _ = a.send_term(serde_json::json!({
+                "wire": "term",
+                "op": "in",
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes),
+                "cols": self.term_cols,
+                "rows": self.term_rows,
+            }));
+        }
+    }
+
+    fn drain_term_frames(&mut self) {
+        use base64::Engine;
+        let Some(attach) = self.sidecar_attach.as_mut() else {
+            return;
+        };
+        let Some(v) = attach.term_rx.borrow().clone() else {
+            return;
+        };
+        let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+        if seq != 0 && seq == self.term_seq {
+            return;
+        }
+        self.term_seq = seq;
+        if let Some(c) = v.get("cols").and_then(|x| x.as_u64()) {
+            self.term_cols = c as u16;
+        }
+        if let Some(r) = v.get("rows").and_then(|x| x.as_u64()) {
+            self.term_rows = r as u16;
+        }
+        self.term_alive = v.get("alive").and_then(|a| a.as_bool()).unwrap_or(self.term_alive);
+        let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
+        let data = v
+            .get("data")
+            .and_then(|d| d.as_str())
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .unwrap_or_default();
+        if op == "snapshot" {
+            self.term_vt = crate::term::VtScreen::new(self.term_cols as usize, self.term_rows as usize);
+        }
+        if !data.is_empty() {
+            self.term_vt
+                .resize(self.term_cols as usize, self.term_rows as usize);
+            self.term_vt.feed(&data);
+        }
+    }
+
+    fn encode_term_key(key: KeyEvent) -> Option<Vec<u8>> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char(c) if ctrl => {
+                let b = c.to_ascii_lowercase() as u8;
+                if (b'a'..=b'z').contains(&b) {
+                    Some(vec![b - b'a' + 1])
+                } else {
+                    Some(c.to_string().into_bytes())
+                }
+            }
+            KeyCode::Char(c) => Some(c.to_string().into_bytes()),
+            KeyCode::Enter => Some(vec![b'\r']),
+            KeyCode::Tab => Some(vec![b'\t']),
+            KeyCode::Backspace => Some(vec![0x7f]),
+            KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+            KeyCode::Up => Some(b"\x1b[A".to_vec()),
+            KeyCode::Down => Some(b"\x1b[B".to_vec()),
+            KeyCode::Right => Some(b"\x1b[C".to_vec()),
+            KeyCode::Left => Some(b"\x1b[D".to_vec()),
+            KeyCode::Home => Some(b"\x1b[H".to_vec()),
+            KeyCode::End => Some(b"\x1b[F".to_vec()),
+            KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+            KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+            KeyCode::Esc => None,
+            _ => None,
         }
     }
 
@@ -2773,6 +2887,7 @@ impl App {
             self.sidecar_attach = None;
         }
         self.refresh_state().await;
+        self.drain_term_frames();
 
         // Transient status line auto-dismisses: stamp it when it changes, clear it
         // a few seconds later so confirmations ("✓ … resumed") don't linger.
@@ -3178,7 +3293,7 @@ async fn run_app(
     let mut app = App::new(options);
     // Paint immediately so startup never sits on a blank alt-screen while serve
     // is discovered/started (that path can take several seconds).
-    terminal.draw(|frame| render(frame, &app))?;
+    terminal.draw(|frame| render(frame, &mut app))?;
 
     // Serve daemon is the sole session runtime. Enable + start it if needed so
     // the TUI never runs `run_interactive` in-process (avoids TUI+mobile state races).
@@ -3194,11 +3309,11 @@ async fn run_app(
             app.error = Some(error);
         }
     }
-    terminal.draw(|frame| render(frame, &app))?;
+    terminal.draw(|frame| render(frame, &mut app))?;
 
     app.refresh_effective_model();
     app.connecting_phase = Some("Opening session…".to_string());
-    terminal.draw(|frame| render(frame, &app))?;
+    terminal.draw(|frame| render(frame, &mut app))?;
     app.refresh_state().await;
     // Always attach through the daemon when we have one (or will retry).
     app.spawn_loop(None, true);
@@ -3221,7 +3336,7 @@ async fn run_app(
     }
 
     while !app.quit {
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| render(frame, &mut app))?;
 
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
@@ -3278,6 +3393,32 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     // been seen. Without this, `error` (cleared only on spawn) permanently masks
     // every later status line ("queued (1)…", "Session deleted", …).
     app.error = None;
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
+        if app.screen == Screen::Term {
+            app.screen = Screen::Main;
+        } else {
+            app.open_term();
+        }
+        return;
+    }
+
+    if app.screen == Screen::Term {
+        if key.code == KeyCode::Esc {
+            app.screen = Screen::Main;
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('d'))
+        {
+            app.quit = true;
+            return;
+        }
+        if let Some(bytes) = App::encode_term_key(key) {
+            app.send_term_bytes(&bytes);
+        }
+        return;
+    }
 
     if app.login_active {
         handle_login_key(app, key);
@@ -4169,7 +4310,7 @@ fn render_checkpoint_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
     );
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
+fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let area = frame.area();
 
     if app.connecting_phase.is_some() {
@@ -4201,6 +4342,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     if app.screen == Screen::Lanes {
         render_lanes(frame, area, app);
+        return;
+    }
+
+    if app.screen == Screen::Term {
+        render_term(frame, area, app);
         return;
     }
 
@@ -5080,6 +5226,105 @@ fn render_status_message(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) 
         Line::from(vec![Span::styled(&app.status, subtle())])
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn ansi_color(idx: u8) -> Color {
+    match idx {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::White,
+        8 => Color::DarkGray,
+        9 => Color::LightRed,
+        10 => Color::LightGreen,
+        11 => Color::LightYellow,
+        12 => Color::LightBlue,
+        13 => Color::LightMagenta,
+        14 => Color::LightCyan,
+        15 => Color::Gray,
+        n => Color::Indexed(n),
+    }
+}
+
+fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(4), Constraint::Length(1)])
+        .split(area);
+    let title = if app.term_alive {
+        " session shell "
+    } else {
+        " session shell (starting…) "
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(title, Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled("  Esc leave · Ctrl-T toggle", subtle()),
+        ])),
+        chunks[0],
+    );
+    let body = chunks[1];
+    let cols = body.width.max(2) as usize;
+    let rows = body.height.max(2) as usize;
+    if cols as u16 != app.term_cols || rows as u16 != app.term_rows {
+        app.term_cols = cols as u16;
+        app.term_rows = rows as u16;
+        app.term_vt.resize(cols, rows);
+        if let Some(a) = app.sidecar_attach.as_ref() {
+            let _ = a.send_term(serde_json::json!({
+                "wire": "term",
+                "op": "resize",
+                "cols": app.term_cols,
+                "rows": app.term_rows,
+            }));
+        }
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+    let (cx, cy) = app.term_vt.cursor();
+    for y in 0..rows.min(app.term_vt.rows) {
+        let mut spans = Vec::new();
+        for x in 0..cols.min(app.term_vt.cols) {
+            let cell = app.term_vt.cell(x, y);
+            let mut fg = if cell.inverse {
+                ansi_color(cell.bg)
+            } else {
+                ansi_color(cell.fg)
+            };
+            let bg = if cell.inverse {
+                ansi_color(cell.fg)
+            } else if cell.bg == 0 {
+                Color::Reset
+            } else {
+                ansi_color(cell.bg)
+            };
+            if x == cx && y == cy {
+                fg = Color::Black;
+            }
+            let mut style = Style::default().fg(fg);
+            if x == cx && y == cy {
+                style = style.bg(Color::White);
+            } else if bg != Color::Reset {
+                style = style.bg(bg);
+            }
+            if cell.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(cell.ch.to_string(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{}×{} · keys go to the shell", app.term_cols, app.term_rows),
+            subtle(),
+        ))),
+        chunks[2],
+    );
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {

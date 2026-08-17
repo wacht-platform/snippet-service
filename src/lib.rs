@@ -25,6 +25,7 @@ pub mod shell_guard;
 pub mod signals;
 pub mod skills;
 pub mod sse;
+pub mod term;
 pub mod tools;
 pub mod tui;
 pub mod update;

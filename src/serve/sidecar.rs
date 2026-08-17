@@ -156,6 +156,9 @@ pub struct SidecarAttach {
     pub state_rx: watch::Receiver<Option<HarnessState>>,
     /// Send `LoopInput` to the daemon (same shape mobile uses).
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
+    /// Raw JSON frames for the session PTY (`wire: term`).
+    pub term_tx: mpsc::UnboundedSender<String>,
+    pub term_rx: watch::Receiver<Option<serde_json::Value>>,
     /// Live token stream — written by stream frames, read by the TUI renderer.
     pub stream: StreamHandle,
     /// True while the WS tasks are still running.
@@ -173,6 +176,12 @@ impl SidecarAttach {
             .send(input)
             .map_err(|_| "sidecar session disconnected".to_string())
     }
+
+    pub fn send_term(&self, frame: serde_json::Value) -> Result<(), String> {
+        self.term_tx
+            .send(frame.to_string())
+            .map_err(|_| "sidecar session disconnected".to_string())
+    }
 }
 
 /// Attach to a live daemon session (starts/resumes it via `/attach` if needed).
@@ -187,25 +196,36 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
 
     let (state_tx, state_rx) = watch::channel::<Option<HarnessState>>(None);
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<LoopInput>();
+    let (term_out_tx, mut term_out_rx) = mpsc::unbounded_channel::<String>();
+    let (term_in_tx, term_in_rx) = watch::channel::<Option<serde_json::Value>>(None);
     let stream: StreamHandle = Arc::new(Mutex::new(StreamBuffer::default()));
     let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut tasks = Vec::new();
 
-    // Outbound: LoopInput → WS text frames.
+    // Outbound: LoopInput or term JSON → WS text frames.
     let connected_out = connected.clone();
     tasks.push(tokio::spawn(async move {
-        while let Some(input) = input_rx.recv().await {
-            let Ok(json) = serde_json::to_string(&input) else {
-                continue;
-            };
-            if sink.send(WsMessage::Text(json.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                input = input_rx.recv() => {
+                    let Some(input) = input else { break; };
+                    let Ok(json) = serde_json::to_string(&input) else { continue; };
+                    if sink.send(WsMessage::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+                frame = term_out_rx.recv() => {
+                    let Some(json) = frame else { break; };
+                    if sink.send(WsMessage::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         connected_out.store(false, std::sync::atomic::Ordering::Relaxed);
     }));
 
-    // Inbound: WS → state watch + stream buffer.
+    // Inbound: WS → state watch + stream buffer + term frames.
     let stream_in = stream.clone();
     let connected_in = connected.clone();
     tasks.push(tokio::spawn(async move {
@@ -217,6 +237,12 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
                 }
                 continue;
             };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if v.get("wire").and_then(|w| w.as_str()) == Some("term") {
+                    let _ = term_in_tx.send(Some(v));
+                    continue;
+                }
+            }
             apply_wire_frame(&text, &mut accumulated, &state_tx, &stream_in);
         }
         connected_in.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -225,6 +251,8 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
     Ok(SidecarAttach {
         state_rx,
         input_tx,
+        term_tx: term_out_tx,
+        term_rx: term_in_rx,
         stream,
         connected,
         _tasks: tasks,
