@@ -466,10 +466,9 @@ impl VtScreen {
         }
         self.cols = cols;
         self.rows = rows;
-        self.parser = vt100::Parser::new(rows as u16, cols as u16, 0);
-        self.dsr = DsrScan::default();
-        self.replies.clear();
-        self.parser.process(&self.history);
+        // Keep the live grid. Replaying history here stacked a second
+        // prompt/listing on top of the PTY's own redraw.
+        self.parser.set_size(rows as u16, cols as u16);
     }
 
     pub fn cell(&self, x: usize, y: usize) -> VtCell {
@@ -577,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn resize_replays_history() {
+    fn resize_keeps_visible_cells() {
         let mut s = VtScreen::new(20, 4);
         s.feed(b"hello");
         s.resize(40, 8);
