@@ -88,7 +88,7 @@ pub struct SnippetConfig {
     /// config.toml; it is never returned by the remote config endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assemblyai_api_key: Option<String>,
-    /// TUI color theme name (e.g. "midnight", "light", "high-contrast", "ember").
+    /// TUI color theme. Ignored — AMOLED is the only palette.
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,

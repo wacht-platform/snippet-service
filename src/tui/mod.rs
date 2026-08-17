@@ -68,7 +68,6 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
         "/mode",
         "Toggle manual approval (bash & file edits ask y/n)",
     ),
-    ("/theme", "Switch the color theme"),
     (
         "/term",
         "Open this session's interactive shell (Ctrl-T; Esc leaves)",
@@ -210,7 +209,6 @@ fn restore_terminal(terminal: &mut TuiTerminal) -> Result<(), Box<dyn std::error
 enum Screen {
     Main,
     ResumeSelection,
-    ThemeSelection,
     Profiles,
     Lanes,
     Term,
@@ -385,9 +383,6 @@ struct App {
     /// While renaming a saved session in the resume picker: the in-progress title
     /// buffer (None = not renaming).
     resume_rename: Option<String>,
-    /// Theme picker cursor + the index to restore if the picker is cancelled.
-    theme_selected_index: usize,
-    theme_original_index: usize,
     /// Inline model suggestion cursor in the login form.
     model_picker_index: usize,
     /// Profiles screen cursor; which profile (if any) the editor is editing; and
@@ -547,8 +542,7 @@ impl App {
             resume_selected_index: 0,
             resume_pending_delete: false,
             resume_rename: None,
-            theme_selected_index: 0,
-            theme_original_index: 0,
+            
             model_picker_index: 0,
             profiles_selected_index: 0,
             lanes_selected_index: 0,
@@ -1421,28 +1415,11 @@ impl App {
                 self.open_term();
             }
             "/theme" => {
-                if parts.len() > 1 {
-                    if set_theme_by_name(parts[1]) {
-                        self.persist_theme();
-                        self.status = String::new();
-                    } else {
-                        let names = PRESETS
-                            .iter()
-                            .map(|p| p.name)
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        self.status = format!("Unknown theme '{}'. Available: {names}", parts[1]);
-                    }
-                } else {
-                    self.theme_original_index = current_theme_index();
-                    self.theme_selected_index = current_theme_index();
-                    self.screen = Screen::ThemeSelection;
-                    self.status = String::new();
-                }
+                self.status = "AMOLED is the only theme.".to_string();
             }
             other => {
                 self.status = format!(
-                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, /term, or /theme."
+                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, or /term."
                 );
             }
         }
@@ -1627,14 +1604,6 @@ impl App {
             KeyCode::Esc => None,
             _ => None,
         }
-    }
-
-    /// Persist the active theme's name to config so it survives restarts.
-    fn persist_theme(&mut self) {
-        self.options.config.theme = PRESETS
-            .get(current_theme_index())
-            .map(|p| p.name.to_string());
-        let _ = self.save_config_file();
     }
 
     /// Tab order of the login form fields (Base URL only for openai-compatible).
@@ -3791,33 +3760,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if app.screen == Screen::ThemeSelection {
-        let count = PRESETS.len();
-        match key.code {
-            KeyCode::Up => {
-                app.theme_selected_index = (app.theme_selected_index + count - 1) % count;
-                set_theme_index(app.theme_selected_index); // live preview
-            }
-            KeyCode::Down => {
-                app.theme_selected_index = (app.theme_selected_index + 1) % count;
-                set_theme_index(app.theme_selected_index);
-            }
-            KeyCode::Enter => {
-                set_theme_index(app.theme_selected_index);
-                app.persist_theme();
-                app.status = String::new();
-                app.screen = Screen::Main;
-            }
-            KeyCode::Esc => {
-                set_theme_index(app.theme_original_index); // revert live preview
-                app.screen = Screen::Main;
-                app.status = String::new();
-            }
-            _ => {}
-        }
-        return;
-    }
-
     if app.screen == Screen::ResumeSelection {
         // Use the snapshot taken when the picker opened (see conv_cache) —
         // re-scanning every session file per keypress made the picker laggy.
@@ -4433,11 +4375,6 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         || app.screen == Screen::ForkCheckpointSelection
     {
         render_checkpoint_selection(frame, area, app);
-        return;
-    }
-
-    if app.screen == Screen::ThemeSelection {
-        render_theme_selection(frame, area, app);
         return;
     }
 
@@ -5107,85 +5044,6 @@ fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     let footer_text = "↑/↓ scroll  ·  Enter resume  ·  r rename  ·  d delete  ·  Esc go back";
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(footer_text, subtle()))),
-        chunks[2],
-    );
-}
-
-/// The `/theme` picker: presets with a live color swatch; arrowing previews the
-/// whole UI in that theme (set in the key handler), Enter applies + persists.
-fn render_theme_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, BorderType, Borders};
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(10),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    let header = vec![
-        Span::styled(
-            "✦ > snippet",
-            Style::default().fg(lane()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  │  Select Theme Palette", Style::default().fg(text())),
-    ];
-    frame.render_widget(Paragraph::new(Line::from(header)), chunks[0]);
-
-    let total = PRESETS.len();
-    let sel = app.theme_selected_index.min(total.saturating_sub(1));
-    let visible = (chunks[1].height as usize).saturating_sub(4).max(1);
-    let start = if sel >= visible { sel + 1 - visible } else { 0 };
-    let end = (start + visible).min(total);
-    let mut lines = Vec::new();
-    if start > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("  ↑ {} more", start),
-            Style::default().fg(faint()),
-        )));
-    } else {
-        lines.push(Line::from(""));
-    }
-    for (idx, preset) in PRESETS.iter().enumerate().take(end).skip(start) {
-        let selected = idx == sel;
-        let bar = if selected {
-            Span::styled("▶ ", Style::default().fg(accent()))
-        } else {
-            Span::raw("  ")
-        };
-        let label_style = if selected {
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(self::text())
-        };
-        let t = preset.theme;
-        let mut spans = vec![
-            bar,
-            Span::styled(format!("{:<22}", preset.label), label_style),
-        ];
-        for color in [t.accent, t.success, t.warn, t.danger, t.lane, t.code] {
-            spans.push(Span::styled("●", Style::default().fg(color)));
-            spans.push(Span::raw(" "));
-        }
-        lines.push(Line::from(spans));
-    }
-    if end < total {
-        lines.push(Line::from(Span::styled(
-            format!("  ↓ {} more", total - end),
-            Style::default().fg(faint()),
-        )));
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(faint()));
-    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
-
-    let footer = "[↑/↓] preview  ·  [Enter] apply  ·  [Esc] cancel";
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer, subtle()))),
         chunks[2],
     );
 }
