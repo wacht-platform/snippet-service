@@ -6174,9 +6174,11 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     );
 }
 
-/// SI-ish formatting for token counts: 91M, 425k, 128k, 512.
+/// SI-ish formatting for token counts: 1.2B, 91M, 425k, 512.
 fn fmt_si(n: u64) -> String {
-    if n >= 1_000_000 {
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
         format!("{:.0}M", n as f64 / 1_000_000.0)
     } else if n >= 1000 {
         format!("{:.0}k", n as f64 / 1000.0)
