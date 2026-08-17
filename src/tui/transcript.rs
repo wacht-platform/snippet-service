@@ -319,7 +319,10 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         // can't stick under the committed answer after the buffer clears late.
         let thinking = crate::llm::StreamBuffer::snapshot_thinking(&app.stream);
         let thinking = thinking.trim_end();
-        if !thinking.is_empty() {
+        // Hide reasoning once this turn has taken a tool/action — the action
+        // is the UI, leftover thought is noise.
+        let hide_thought = turn_has_visible_action(&state.events);
+        if !thinking.is_empty() && !hide_thought {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
@@ -380,6 +383,26 @@ fn indent_block(lines: Vec<Line<'static>>, cols: usize) -> Vec<Line<'static>> {
             l
         })
         .collect()
+}
+
+fn turn_has_visible_action(events: &[HarnessEvent]) -> bool {
+    for event in events.iter().rev() {
+        match event {
+            HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. } => return false,
+            HarnessEvent::ToolCall { .. }
+            | HarnessEvent::ToolResult { .. }
+            | HarnessEvent::InvalidToolCall { .. }
+            | HarnessEvent::Note { .. }
+            | HarnessEvent::FilePresented { .. }
+            | HarnessEvent::UserQuestion { .. }
+            | HarnessEvent::ApprovalRequest { .. }
+            | HarnessEvent::LaneSpawned { .. }
+            | HarnessEvent::LaneCompleted { .. }
+            | HarnessEvent::AssistantText { .. } => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Render model thinking with the same Markdown-lite treatment as assistant
