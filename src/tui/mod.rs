@@ -2853,11 +2853,17 @@ impl App {
     /// Send the current input immediately as a mid-run steer (or normal submit if idle).
     /// Bound to Ctrl+G (and Ctrl+S when the host tty delivers it).
     fn steer_now(&mut self) {
-        // Use the same expansion as a normal submission so steering never drops
-        // pasted blocks or attachments that live outside `self.input`.
-        let text = self.message_for_send().trim().to_string();
+        // Composer first. If it's empty but a message is already queued, that
+        // queued text IS the steer — Ctrl+G must not no-op.
+        let mut text = self.message_for_send().trim().to_string();
         if text.is_empty() {
-            return;
+            if let Some(queued) = self.queued_inputs.pop_front() {
+                text = queued;
+            } else {
+                return;
+            }
+        } else {
+            self.queued_inputs.clear();
         }
         if text.starts_with('/') {
             self.handle_slash_command(&text);

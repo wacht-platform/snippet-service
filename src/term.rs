@@ -427,7 +427,10 @@ impl VtScreen {
         self.rows = rows;
         self.scroll_bot = rows.saturating_sub(1);
         self.scroll_top = self.scroll_top.min(self.scroll_bot);
-        self.cx = self.cx.min(cols.saturating_sub(1));
+        // Allow cx == cols (pending wrap). Never pin at last column.
+        if self.cx > cols {
+            self.cx = cols;
+        }
         self.cy = self.cy.min(rows.saturating_sub(1));
     }
 
@@ -564,6 +567,9 @@ impl VtScreen {
     }
 
     fn put(&mut self, ch: char) {
+        // Wrap only when writing past the last column. Clamping on resize used
+        // to pin cx at cols-1, so the next glyph overwrote that cell then
+        // jumped to 0,0 — typed `ls` stacked on the prompt.
         if self.cx >= self.cols {
             self.cx = 0;
             self.index();
@@ -578,7 +584,7 @@ impl VtScreen {
                 inverse: self.inverse,
             };
         }
-        self.cx += 1;
+        self.cx = self.cx.saturating_add(1);
     }
 
     fn index(&mut self) {
@@ -858,5 +864,15 @@ mod tests {
         s.feed(b"abc\x1b[1;1H\x1b[2Jxyz");
         assert_eq!(s.cell(0, 0).ch, 'x');
         assert_eq!(s.cell(1, 0).ch, 'y');
+    }
+
+    #[test]
+    fn wrap_does_not_overwrite_last_col() {
+        let mut s = VtScreen::new(4, 2);
+        s.feed(b"abcdX");
+        assert_eq!(s.cell(0, 0).ch, 'a');
+        assert_eq!(s.cell(3, 0).ch, 'd');
+        assert_eq!(s.cell(0, 1).ch, 'X');
+        assert_eq!(s.cursor(), (1, 1));
     }
 }
