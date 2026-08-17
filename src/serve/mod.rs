@@ -2448,13 +2448,16 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
             }
         }
         "resize" => {
-            if let Some(term) = terms.get(&id) {
+            if let Some(term) = terms.get_or_create(&id) {
                 let _ = term.ensure(cols, rows);
                 term.resize(cols, rows);
             }
         }
         "in" => {
-            if let Some(term) = terms.get(&id) {
+            // Typing must spawn the pane if `open`/`new` never landed
+            // (blank Ctrl-N tab). Dropping `in` on a missing id is why
+            // keys look captured but never paint.
+            if let Some(term) = terms.get_or_create(&id) {
                 let _ = term.ensure(cols, rows);
                 if let Some(data) = val.get("data").and_then(|v| v.as_str()) {
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {

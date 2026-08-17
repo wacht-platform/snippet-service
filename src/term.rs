@@ -698,4 +698,60 @@ mod tests {
             shell_ls_paints(zsh);
         }
     }
+
+    #[test]
+    fn two_panes_spawn_and_echo_independently() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        std::fs::write(dir.path().join("AAA.txt"), b"x").unwrap();
+        let terms = SessionTerms::new(dir.path().to_path_buf());
+        let a = terms.get_or_create("0").expect("pane 0");
+        let b = terms.get_or_create("4").expect("pane 4");
+        a.ensure(80, 24).expect("spawn 0");
+        b.ensure(80, 24).expect("spawn 4");
+        let mut vt0 = VtScreen::new(80, 24);
+        let mut vt4 = VtScreen::new(80, 24);
+        fn pump_one(t: &SessionTerm, vt: &mut VtScreen, ms: u64) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            loop {
+                let chunk = t.poll_out();
+                if !chunk.is_empty() {
+                    vt.feed(&chunk);
+                    let replies = vt.take_replies();
+                    if !replies.is_empty() {
+                        t.write(&replies);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        pump_one(&a, &mut vt0, 600);
+        pump_one(&b, &mut vt4, 600);
+        a.write(b"echo PANE0\r");
+        b.write(b"echo PANE4\r");
+        pump_one(&a, &mut vt0, 800);
+        pump_one(&b, &mut vt4, 800);
+        let t0 = screen_text(&vt0);
+        let t4 = screen_text(&vt4);
+        a.kill();
+        b.kill();
+        assert!(
+            t0.contains("PANE0"),
+            "pane 0 should echo its own command:\n{t0}"
+        );
+        assert!(
+            t4.contains("PANE4"),
+            "pane 4 should echo its own command:\n{t4}"
+        );
+        assert!(
+            !t0.contains("PANE4"),
+            "pane 0 must not show pane 4 output:\n{t0}"
+        );
+        assert!(
+            !t4.contains("PANE0"),
+            "pane 4 must not show pane 0 output:\n{t4}"
+        );
+    }
 }
