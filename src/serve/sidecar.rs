@@ -158,7 +158,7 @@ pub struct SidecarAttach {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
     /// Raw JSON frames for the session PTY (`wire: term`).
     pub term_tx: mpsc::UnboundedSender<String>,
-    pub term_rx: watch::Receiver<Option<serde_json::Value>>,
+    pub term_rx: mpsc::UnboundedReceiver<serde_json::Value>,
     /// Live token stream — written by stream frames, read by the TUI renderer.
     pub stream: StreamHandle,
     /// True while the WS tasks are still running.
@@ -197,7 +197,7 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
     let (state_tx, state_rx) = watch::channel::<Option<HarnessState>>(None);
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<LoopInput>();
     let (term_out_tx, mut term_out_rx) = mpsc::unbounded_channel::<String>();
-    let (term_in_tx, term_in_rx) = watch::channel::<Option<serde_json::Value>>(None);
+    let (term_in_tx, term_in_rx) = mpsc::unbounded_channel::<serde_json::Value>();
     let stream: StreamHandle = Arc::new(Mutex::new(StreamBuffer::default()));
     let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut tasks = Vec::new();
@@ -239,7 +239,7 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
             };
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 if v.get("wire").and_then(|w| w.as_str()) == Some("term") {
-                    let _ = term_in_tx.send(Some(v));
+                    let _ = term_in_tx.send(v);
                     continue;
                 }
             }

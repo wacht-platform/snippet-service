@@ -1411,7 +1411,11 @@ impl App {
                 }
             }
             "/term" => {
-                self.open_term();
+                if parts.get(1).is_some_and(|p| *p == "new") {
+                    self.new_term();
+                } else {
+                    self.open_term();
+                }
             }
             "/theme" => {
                 self.status = "AMOLED is the only theme.".to_string();
@@ -1526,53 +1530,49 @@ impl App {
         let Some(attach) = self.sidecar_attach.as_mut() else {
             return;
         };
-        if !attach.term_rx.has_changed().unwrap_or(false) {
-            return;
-        }
-        let Some(v) = attach.term_rx.borrow_and_update().clone() else {
-            return;
-        };
-        let id = v
-            .get("id")
-            .and_then(|s| s.as_str())
-            .unwrap_or("0")
-            .to_string();
-        let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-        let idx = if let Some(i) = self.term_panes.iter().position(|p| p.id == id) {
-            i
-        } else {
-            self.term_panes.push(TermPane {
-                id: id.clone(),
-                vt: crate::term::VtScreen::new(80, 24),
-                alive: false,
-                cols: 80,
-                rows: 24,
-                seq: 0,
-            });
-            self.term_panes.len() - 1
-        };
-        let pane = &mut self.term_panes[idx];
-        if seq != 0 && seq == pane.seq {
-            return;
-        }
-        if seq != 0 {
-            pane.seq = seq;
-        }
-        pane.alive = v
-            .get("alive")
-            .and_then(|a| a.as_bool())
-            .unwrap_or(pane.alive);
-        let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
-        let data = v
-            .get("data")
-            .and_then(|d| d.as_str())
-            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-            .unwrap_or_default();
-        if op == "snapshot" {
-            pane.vt = crate::term::VtScreen::new(pane.cols as usize, pane.rows as usize);
-        }
-        if !data.is_empty() {
-            pane.vt.feed(&data);
+        while let Ok(v) = attach.term_rx.try_recv() {
+            let id = v
+                .get("id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("0")
+                .to_string();
+            let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+            let idx = if let Some(i) = self.term_panes.iter().position(|p| p.id == id) {
+                i
+            } else {
+                self.term_panes.push(TermPane {
+                    id: id.clone(),
+                    vt: crate::term::VtScreen::new(80, 24),
+                    alive: false,
+                    cols: 80,
+                    rows: 24,
+                    seq: 0,
+                });
+                self.term_panes.len() - 1
+            };
+            let pane = &mut self.term_panes[idx];
+            if seq != 0 && seq == pane.seq {
+                continue;
+            }
+            if seq != 0 {
+                pane.seq = seq;
+            }
+            pane.alive = v
+                .get("alive")
+                .and_then(|a| a.as_bool())
+                .unwrap_or(pane.alive);
+            let op = v.get("op").and_then(|o| o.as_str()).unwrap_or("");
+            let data = v
+                .get("data")
+                .and_then(|d| d.as_str())
+                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                .unwrap_or_default();
+            if op == "snapshot" {
+                pane.vt = crate::term::VtScreen::new(pane.cols as usize, pane.rows as usize);
+            }
+            if !data.is_empty() {
+                pane.vt.feed(&data);
+            }
         }
     }
 
@@ -3401,8 +3401,9 @@ async fn run_app(
                 // act on Press/Repeat only so a key isn't handled twice.
                 Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(&mut app, key),
                 Event::Paste(text) => {
-                    // Route paste to the login form when it's open, else the prompt.
-                    if app.login_active {
+                    if app.screen == Screen::Term {
+                        app.send_term_bytes(text.as_bytes());
+                    } else if app.login_active {
                         app.login_paste(&text);
                     } else {
                         app.input_paste(&text);
