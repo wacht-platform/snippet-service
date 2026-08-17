@@ -2,7 +2,7 @@
 //! `/attach` with `wire: "term"` frames. The agent `bash` tool stays
 //! non-interactive and never shares this PTY.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
@@ -49,15 +49,105 @@ pub fn preview_bytes(bytes: &[u8]) -> String {
 const SCROLLBACK_CAP: usize = 256 * 1024;
 const MAX_TERMS: usize = 8;
 
+/// Detect CSI 6n / CSI 5n in the raw stream and answer them. `vt100` 0.15
+/// swallows DSR and never replies, which is why fish left the cursor dead.
+#[derive(Default)]
+struct DsrScan {
+    esc: u8, // 0 ground, 1 saw ESC, 2 saw CSI
+    params: Vec<u8>,
+}
+
+impl DsrScan {
+    fn feed(&mut self, bytes: &[u8], replies: &mut Vec<u8>, row: u16, col: u16) {
+        for &b in bytes {
+            match self.esc {
+                0 if b == 0x1b => self.esc = 1,
+                1 if b == b'[' => {
+                    self.esc = 2;
+                    self.params.clear();
+                }
+                1 if b == b'Z' => {
+                    replies.extend_from_slice(b"\x1b[?1;2c");
+                    self.esc = 0;
+                }
+                1 => self.esc = 0,
+                2 if b.is_ascii_digit() || b == b';' || b == b'>' || b == b'?' => {
+                    if self.params.len() < 16 {
+                        self.params.push(b);
+                    }
+                }
+                2 if b == b'n' => {
+                    let p = std::str::from_utf8(&self.params).unwrap_or("");
+                    if p.is_empty() || p == "6" {
+                        replies.extend_from_slice(format!("\x1b[{};{}R", row, col).as_bytes());
+                    } else if p == "5" {
+                        replies.extend_from_slice(b"\x1b[0n");
+                    }
+                    self.esc = 0;
+                    self.params.clear();
+                }
+                // DA / secondary DA — fish waits on these after a command.
+                2 if b == b'c' => {
+                    let p = std::str::from_utf8(&self.params).unwrap_or("");
+                    if p == ">" || p == ">0" {
+                        replies.extend_from_slice(b"\x1b[>0;276;0c");
+                    } else {
+                        replies.extend_from_slice(b"\x1b[?1;2c");
+                    }
+                    self.esc = 0;
+                    self.params.clear();
+                }
+                2 => {
+                    self.esc = 0;
+                    self.params.clear();
+                }
+                _ => self.esc = 0,
+            }
+        }
+    }
+}
+
+/// Per-client mailbox. Each /attach owns one; pollers never drain the PTY
+/// themselves. Two attach loops calling `poll_out` stole the fish prompt
+/// and left the TUI painting leftovers at column 46.
+struct Fanout {
+    next_client: u64,
+    clients: HashMap<u64, Vec<(String, Vec<u8>, u16, u16, bool)>>,
+}
+
+impl Fanout {
+    fn new() -> Self {
+        Self {
+            next_client: 1,
+            clients: HashMap::new(),
+        }
+    }
+}
+
 /// Several human PTYs for one session. Frames carry `id` (default `"0"`).
 pub struct SessionTerms {
     cwd: PathBuf,
     next_id: Mutex<u32>,
-    terms: Mutex<std::collections::HashMap<String, Arc<SessionTerm>>>,
+    terms: Mutex<HashMap<String, Arc<SessionTerm>>>,
     /// Pane ids that must send a full snapshot on the next attach poll
     /// (open / resize). Incremental `out` frames are diffs; a client that
     /// missed them (or rebuilt its screen) needs the whole scrollback.
     snap_ids: Mutex<std::collections::HashSet<String>>,
+    fanout: Mutex<Fanout>,
+}
+
+/// Token for one /attach subscriber. Drop unregisters the mailbox.
+pub struct TermClient {
+    id: u64,
+    terms: Arc<SessionTerms>,
+}
+
+impl Drop for TermClient {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.terms.fanout.lock() {
+            g.clients.remove(&self.id);
+        }
+    }
 }
 
 impl SessionTerms {
@@ -65,9 +155,22 @@ impl SessionTerms {
         Arc::new(Self {
             cwd,
             next_id: Mutex::new(1),
-            terms: Mutex::new(std::collections::HashMap::new()),
+            terms: Mutex::new(HashMap::new()),
             snap_ids: Mutex::new(std::collections::HashSet::new()),
+            fanout: Mutex::new(Fanout::new()),
         })
+    }
+
+    pub fn subscribe(self: &Arc<Self>) -> TermClient {
+        let mut g = self.fanout.lock().expect("fanout");
+        let id = g.next_client;
+        g.next_client = g.next_client.wrapping_add(1).max(1);
+        g.clients.insert(id, Vec::new());
+        debug_log("pty", &format!("subscribe client={id} n={}", g.clients.len()));
+        TermClient {
+            id,
+            terms: Arc::clone(self),
+        }
     }
 
     pub fn get_or_create(&self, id: &str) -> Option<Arc<SessionTerm>> {
@@ -125,6 +228,55 @@ impl SessionTerms {
         }
     }
 
+    /// Drain the PTY once and copy the same bytes to every subscriber.
+    fn pump(&self) {
+        let panes: Vec<(String, Arc<SessionTerm>)> = {
+            let g = match self.terms.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            g.iter().map(|(id, t)| (id.clone(), t.clone())).collect()
+        };
+        let mut frames = Vec::new();
+        for (id, t) in panes {
+            let chunk = t.poll_out();
+            if chunk.is_empty() {
+                continue;
+            }
+            let (_, cols, rows, alive) = t.snapshot();
+            frames.push((id, chunk, cols, rows, alive));
+        }
+        if frames.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.fanout.lock() {
+            let n = g.clients.len();
+            for mailbox in g.clients.values_mut() {
+                mailbox.extend(frames.iter().cloned());
+            }
+            debug_log(
+                "pty",
+                &format!(
+                    "fanout n={n} frames={}",
+                    frames
+                        .iter()
+                        .map(|(id, c, _, _, _)| format!("{id}:{}", preview_bytes(c)))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            );
+        }
+    }
+
+    pub fn poll_client(&self, client: &TermClient) -> Vec<(String, Vec<u8>, u16, u16, bool)> {
+        self.pump();
+        match self.fanout.lock() {
+            Ok(mut g) => g.clients.get_mut(&client.id).map(std::mem::take).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Tests / single-consumer path. Prefer `subscribe` + `poll_client`.
     pub fn poll_all(&self) -> Vec<(String, Vec<u8>, u16, u16, bool)> {
         let panes: Vec<(String, Arc<SessionTerm>)> = {
             let g = match self.terms.lock() {
@@ -169,6 +321,7 @@ struct Inner {
     cwd: PathBuf,
     scrollback: VecDeque<u8>,
     alive: bool,
+    dsr: DsrScan,
 }
 
 impl SessionTerm {
@@ -182,6 +335,7 @@ impl SessionTerm {
                 cwd,
                 scrollback: VecDeque::with_capacity(4096),
                 alive: false,
+                dsr: DsrScan::default(),
             }),
         })
     }
@@ -294,6 +448,22 @@ impl SessionTerm {
                     g.scrollback.pop_front();
                 }
                 g.scrollback.push_back(*b);
+            }
+            // Answer DSR/DA here so fish gets a reply even if a client
+            // never paints (or two clients would double-answer).
+            let row = g.rows.max(1);
+            let col = 1u16;
+            let mut replies = Vec::new();
+            g.dsr.feed(&out, &mut replies, row, col);
+            if !replies.is_empty() {
+                if let Some(m) = g.master.as_mut() {
+                    let _ = m.write_all(&replies);
+                    let _ = m.flush();
+                }
+                debug_log(
+                    "pty",
+                    &format!("dsr-reply {}", preview_bytes(&replies)),
+                );
             }
             debug_log(
                 "pty",
@@ -432,64 +602,6 @@ impl Default for VtCell {
             bg: 0,
             bold: false,
             inverse: false,
-        }
-    }
-}
-
-/// Detect CSI 6n / CSI 5n in the raw stream and answer them. `vt100` 0.15
-/// swallows DSR and never replies, which is why fish left the cursor dead.
-#[derive(Default)]
-struct DsrScan {
-    esc: u8, // 0 ground, 1 saw ESC, 2 saw CSI
-    params: Vec<u8>,
-}
-
-impl DsrScan {
-    fn feed(&mut self, bytes: &[u8], replies: &mut Vec<u8>, row: u16, col: u16) {
-        for &b in bytes {
-            match self.esc {
-                0 if b == 0x1b => self.esc = 1,
-                1 if b == b'[' => {
-                    self.esc = 2;
-                    self.params.clear();
-                }
-                1 if b == b'Z' => {
-                    replies.extend_from_slice(b"\x1b[?1;2c");
-                    self.esc = 0;
-                }
-                1 => self.esc = 0,
-                2 if b.is_ascii_digit() || b == b';' || b == b'>' || b == b'?' => {
-                    if self.params.len() < 16 {
-                        self.params.push(b);
-                    }
-                }
-                2 if b == b'n' => {
-                    let p = std::str::from_utf8(&self.params).unwrap_or("");
-                    if p.is_empty() || p == "6" {
-                        replies.extend_from_slice(format!("\x1b[{};{}R", row, col).as_bytes());
-                    } else if p == "5" {
-                        replies.extend_from_slice(b"\x1b[0n");
-                    }
-                    self.esc = 0;
-                    self.params.clear();
-                }
-                // DA / secondary DA — fish waits on these after a command.
-                2 if b == b'c' => {
-                    let p = std::str::from_utf8(&self.params).unwrap_or("");
-                    if p == ">" || p == ">0" {
-                        replies.extend_from_slice(b"\x1b[>0;276;0c");
-                    } else {
-                        replies.extend_from_slice(b"\x1b[?1;2c");
-                    }
-                    self.esc = 0;
-                    self.params.clear();
-                }
-                2 => {
-                    self.esc = 0;
-                    self.params.clear();
-                }
-                _ => self.esc = 0,
-            }
         }
     }
 }
@@ -815,6 +927,38 @@ mod tests {
         assert!(
             !t4.contains("PANE0"),
             "pane 4 must not show pane 0 output:\n{t4}"
+        );
+    }
+
+    #[test]
+    fn two_clients_both_see_the_same_bytes() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let terms = SessionTerms::new(dir.path().to_path_buf());
+        let a = terms.subscribe();
+        let b = terms.subscribe();
+        let pane = terms.get_or_create("0").expect("pane");
+        pane.ensure(80, 24).expect("spawn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut fa = Vec::new();
+        let mut fb = Vec::new();
+        while std::time::Instant::now() < deadline {
+            for (_, chunk, _, _, _) in terms.poll_client(&a) {
+                fa.extend(chunk);
+            }
+            for (_, chunk, _, _, _) in terms.poll_client(&b) {
+                fb.extend(chunk);
+            }
+            if !fa.is_empty() && !fb.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pane.kill();
+        let sa = String::from_utf8_lossy(&fa);
+        let sb = String::from_utf8_lossy(&fb);
+        assert!(
+            !fa.is_empty() && fa == fb,
+            "both attach clients must get the same PTY bytes\na={sa:?}\nb={sb:?}"
         );
     }
 }

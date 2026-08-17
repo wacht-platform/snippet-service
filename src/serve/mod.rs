@@ -2248,6 +2248,7 @@ async fn handle_ws(
         let state_path = push_state_path;
         let stream = push_stream;
         let terms = push_terms;
+        let term_client = terms.as_ref().map(|t| t.subscribe());
         let mut last_mtime = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_stream_fp: u64 = 0;
@@ -2353,7 +2354,11 @@ async fn handle_ws(
                 // clients get live bytes or a cell snapshot, never CSI history)
                 // is what glued `ls` onto the fish prompt.
                 let _ = terms.take_snapshots();
-                for (id, chunk, cols, rows, alive) in terms.poll_all() {
+                let frames = match term_client.as_ref() {
+                    Some(c) => terms.poll_client(c),
+                    None => terms.poll_all(),
+                };
+                for (id, chunk, cols, rows, alive) in frames {
                     if chunk.is_empty() {
                         continue;
                     }

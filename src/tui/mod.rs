@@ -1583,7 +1583,6 @@ impl App {
 
     fn drain_term_frames(&mut self) {
         use base64::Engine;
-        let mut replies_out: Vec<(String, Vec<u8>)> = Vec::new();
         let Some(attach) = self.sidecar_attach.as_mut() else {
             return;
         };
@@ -1650,28 +1649,9 @@ impl App {
                 );
                 pane.vt.feed(&data);
             }
-            let replies = pane.vt.take_replies();
-            if !replies.is_empty() {
-                crate::term::debug_log(
-                    "tui",
-                    &format!(
-                        "dsr-reply id={} {}",
-                        pane.id,
-                        crate::term::preview_bytes(&replies)
-                    ),
-                );
-                replies_out.push((pane.id.clone(), replies));
-            }
-        }
-        if let Some(a) = self.sidecar_attach.as_ref() {
-            for (id, replies) in replies_out {
-                let _ = a.send_term(serde_json::json!({
-                    "wire": "term",
-                    "op": "in",
-                    "id": id,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&replies),
-                }));
-            }
+            // DSR/DA is answered on the daemon. Two clients writing
+            // CSI 6n replies stacked fish's prompt.
+            let _ = pane.vt.take_replies();
         }
     }
 
