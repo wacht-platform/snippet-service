@@ -2251,7 +2251,6 @@ async fn handle_ws(
         let mut last_mtime = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_stream_fp: u64 = 0;
-        let mut sent_term_snap = false;
         let mut term_seq: u64 = 0;
         loop {
             if let Ok(meta) = tokio::fs::metadata(&state_path).await {
@@ -2349,33 +2348,11 @@ async fn handle_ws(
             }
             if let Some(terms) = terms.as_ref() {
                 use base64::Engine;
-                let extra_snaps = terms.take_snapshots();
-                if !sent_term_snap || !extra_snaps.is_empty() {
-                    sent_term_snap = true;
-                    let snaps = if extra_snaps.is_empty() {
-                        terms.snapshot_all()
-                    } else {
-                        extra_snaps
-                    };
-                    for (id, bytes, cols, rows, alive) in snaps {
-                        term_seq = term_seq.wrapping_add(1);
-                        let frame = serde_json::json!({
-                            "wire": "term",
-                            "op": "snapshot",
-                            "id": id,
-                            "seq": term_seq,
-                            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
-                            "cols": cols,
-                            "rows": rows,
-                            "alive": alive,
-                        });
-                        if let Ok(json) = serde_json::to_string(&frame) {
-                            if sender.send(Message::Text(json.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
+                // Incremental PTY bytes only. Replaying raw scrollback into a
+                // sized vt100 (tmux/ghostty-style: emulator owns the grid;
+                // clients get live bytes or a cell snapshot, never CSI history)
+                // is what glued `ls` onto the fish prompt.
+                let _ = terms.take_snapshots();
                 for (id, chunk, cols, rows, alive) in terms.poll_all() {
                     if chunk.is_empty() {
                         continue;
@@ -2466,7 +2443,8 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
             if let Some(term) = terms.get_or_create(&id) {
                 let _ = term.ensure(cols, rows);
                 term.resize(cols, rows);
-                terms.request_snapshot(&id);
+                // Do not snapshot raw scrollback — replaying it into vt100
+                // at the current size scrambles fish/zsh/bash prompts.
             }
         }
         "resize" => {

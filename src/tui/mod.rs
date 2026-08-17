@@ -1523,16 +1523,21 @@ impl App {
         if pane.opened {
             return;
         }
-        pane.opened = true;
+        let Some(a) = self.sidecar_attach.as_ref() else {
+            // Do not latch opened — tick will retry once /attach is up.
+            return;
+        };
         let fresh = pane.fresh;
-        if let Some(a) = self.sidecar_attach.as_ref() {
-            let _ = a.send_term(serde_json::json!({
-                "wire": "term",
-                "op": if fresh { "new" } else { "open" },
-                "id": pane.id,
-                "cols": pane.cols,
-                "rows": pane.rows,
-            }));
+        if a.send_term(serde_json::json!({
+            "wire": "term",
+            "op": if fresh { "new" } else { "open" },
+            "id": pane.id,
+            "cols": pane.cols,
+            "rows": pane.rows,
+        }))
+        .is_ok()
+        {
+            pane.opened = true;
         }
     }
 
@@ -1600,12 +1605,9 @@ impl App {
                 .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
                 .unwrap_or_default();
             if op == "snapshot" {
-                if pane.live {
-                    // Incremental out already painted. A later full-scrollback
-                    // snapshot is stale and would wipe typed keys / the prompt.
-                    continue;
-                }
-                pane.vt = crate::term::VtScreen::new(pane.cols as usize, pane.rows as usize);
+                // Raw PTY history replayed into a sized screen is what
+                // glued `ls` onto the prompt. Incremental `out` is truth.
+                continue;
             }
             if op == "out" {
                 pane.live = true;
@@ -3028,6 +3030,17 @@ impl App {
         }
         self.refresh_state().await;
         self.drain_term_frames();
+        // Open may have been skipped while /attach was still coming up.
+        if self.sidecar_attach.is_some() && self.screen == Screen::Term {
+            let saved = self.term_focus;
+            for i in 0..self.term_panes.len() {
+                if !self.term_panes[i].opened {
+                    self.term_focus = i;
+                    self.send_term_open();
+                }
+            }
+            self.term_focus = saved.min(self.term_panes.len().saturating_sub(1));
+        }
 
         // Transient status line auto-dismisses: stamp it when it changes, clear it
         // a few seconds later so confirmations ("✓ … resumed") don't linger.
