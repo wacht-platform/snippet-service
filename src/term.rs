@@ -362,8 +362,12 @@ impl DsrScan {
                     self.esc = 2;
                     self.params.clear();
                 }
+                1 if b == b'Z' => {
+                    replies.extend_from_slice(b"\x1b[?1;2c");
+                    self.esc = 0;
+                }
                 1 => self.esc = 0,
-                2 if b.is_ascii_digit() || b == b';' => {
+                2 if b.is_ascii_digit() || b == b';' || b == b'>' || b == b'?' => {
                     if self.params.len() < 16 {
                         self.params.push(b);
                     }
@@ -374,6 +378,17 @@ impl DsrScan {
                         replies.extend_from_slice(format!("\x1b[{};{}R", row, col).as_bytes());
                     } else if p == "5" {
                         replies.extend_from_slice(b"\x1b[0n");
+                    }
+                    self.esc = 0;
+                    self.params.clear();
+                }
+                // DA / secondary DA — fish waits on these after a command.
+                2 if b == b'c' => {
+                    let p = std::str::from_utf8(&self.params).unwrap_or("");
+                    if p == ">" || p == ">0" {
+                        replies.extend_from_slice(b"\x1b[>0;276;0c");
+                    } else {
+                        replies.extend_from_slice(b"\x1b[?1;2c");
                     }
                     self.esc = 0;
                     self.params.clear();
@@ -509,6 +524,15 @@ mod tests {
         s.feed(b"hi");
         s.feed(b"\x1b[6n");
         assert_eq!(s.take_replies(), b"\x1b[1;3R");
+    }
+
+    #[test]
+    fn da_and_secondary_da_reply() {
+        let mut s = VtScreen::new(20, 4);
+        s.feed(b"\x1b[c");
+        assert_eq!(s.take_replies(), b"\x1b[?1;2c");
+        s.feed(b"\x1b[>c");
+        assert_eq!(s.take_replies(), b"\x1b[>0;276;0c");
     }
 
     #[test]

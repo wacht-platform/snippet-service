@@ -3514,7 +3514,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
         if app.screen == Screen::Term {
-            app.new_term();
+            if app.term_panes.len() > 1 {
+                app.term_focus = (app.term_focus + 1) % app.term_panes.len();
+            } else {
+                app.screen = Screen::Main;
+            }
         } else {
             app.open_term();
         }
