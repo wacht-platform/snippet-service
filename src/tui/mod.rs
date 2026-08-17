@@ -1527,6 +1527,7 @@ impl App {
 
     fn drain_term_frames(&mut self) {
         use base64::Engine;
+        let mut replies_out: Vec<(String, Vec<u8>)> = Vec::new();
         let Some(attach) = self.sidecar_attach.as_mut() else {
             return;
         };
@@ -1572,6 +1573,20 @@ impl App {
             }
             if !data.is_empty() {
                 pane.vt.feed(&data);
+            }
+            let replies = pane.vt.take_replies();
+            if !replies.is_empty() {
+                replies_out.push((pane.id.clone(), replies));
+            }
+        }
+        if let Some(a) = self.sidecar_attach.as_ref() {
+            for (id, replies) in replies_out {
+                let _ = a.send_term(serde_json::json!({
+                    "wire": "term",
+                    "op": "in",
+                    "id": id,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&replies),
+                }));
             }
         }
     }
@@ -3460,11 +3475,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
         if app.screen == Screen::Term {
-            if app.term_panes.len() > 1 {
-                app.term_focus = (app.term_focus + 1) % app.term_panes.len();
-            } else {
-                app.screen = Screen::Main;
-            }
+            app.new_term();
         } else {
             app.open_term();
         }
@@ -5221,8 +5232,18 @@ fn ansi_color(idx: u8) -> Color {
 }
 
 fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+    // Never call open_term() here — it sends on the sidecar and panics
+    // ratatui if the pane list is empty or the socket is mid-draw.
     if app.term_panes.is_empty() {
-        app.open_term();
+        app.term_panes.push(TermPane {
+            id: "0".into(),
+            vt: crate::term::VtScreen::new(80, 24),
+            alive: false,
+            cols: 80,
+            rows: 24,
+            seq: 0,
+        });
+        app.term_focus = 0;
     }
     let n = app.term_panes.len().max(1);
     app.term_focus = app.term_focus.min(n - 1);

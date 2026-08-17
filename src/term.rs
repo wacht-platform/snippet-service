@@ -368,6 +368,8 @@ pub struct VtScreen {
     main_cy: usize,
     utf8: Vec<u8>,
     esc: Esc,
+    insert: bool,
+    replies: Vec<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -424,7 +426,14 @@ impl VtScreen {
             main_cy: 0,
             utf8: Vec::new(),
             esc: Esc::Ground,
+            insert: false,
+            replies: Vec::new(),
         }
+    }
+
+    /// Bytes the emulator must write back to the PTY (DSR / cursor report).
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.replies)
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -593,6 +602,9 @@ impl VtScreen {
             self.cx = 0;
             self.index();
         }
+        if self.insert {
+            self.insert_blanks(1);
+        }
         let i = self.cy * self.cols + self.cx;
         if i < self.cells.len() {
             self.cells[i] = VtCell {
@@ -604,6 +616,53 @@ impl VtScreen {
             };
         }
         self.cx = self.cx.saturating_add(1);
+    }
+
+    fn insert_blanks(&mut self, n: usize) {
+        let n = n.max(1).min(self.cols);
+        let row = self.cy * self.cols;
+        let start = row + self.cx.min(self.cols);
+        let end = row + self.cols;
+        if start >= end {
+            return;
+        }
+        for i in (start..end).rev() {
+            let src = i.saturating_sub(n);
+            if src >= start && i < self.cells.len() {
+                self.cells[i] = self.cells[src];
+            } else if i < self.cells.len() {
+                self.cells[i] = VtCell::default();
+            }
+        }
+    }
+
+    fn delete_chars(&mut self, n: usize) {
+        let n = n.max(1);
+        let row = self.cy * self.cols;
+        let start = row + self.cx.min(self.cols);
+        let end = row + self.cols;
+        if start >= end {
+            return;
+        }
+        for i in start..end {
+            let src = i + n;
+            if src < end && src < self.cells.len() {
+                self.cells[i] = self.cells[src];
+            } else if i < self.cells.len() {
+                self.cells[i] = VtCell::default();
+            }
+        }
+    }
+
+    fn erase_chars(&mut self, n: usize) {
+        let n = n.max(1);
+        let row = self.cy * self.cols;
+        for x in self.cx..(self.cx + n).min(self.cols) {
+            let i = row + x;
+            if i < self.cells.len() {
+                self.cells[i] = VtCell::default();
+            }
+        }
     }
 
     fn index(&mut self) {
@@ -668,6 +727,26 @@ impl VtScreen {
         };
         let n = |i: usize, d: i32| nums.get(i).copied().filter(|v| *v > 0).unwrap_or(d) as usize;
         match (priv_p, cmd) {
+            (_, 'n') => {
+                // DSR. Fish/zsh ask CSI 6n for cursor; silence = broken prompt.
+                let what = nums.first().copied().unwrap_or(0);
+                if what == 6 {
+                    let row = self.cy.saturating_add(1);
+                    let col = self.cx.min(self.cols.saturating_sub(1)).saturating_add(1);
+                    let reply = format!("\x1b[{row};{col}R");
+                    self.replies.extend_from_slice(reply.as_bytes());
+                } else if what == 5 {
+                    self.replies.extend_from_slice(b"\x1b[0n");
+                }
+            }
+            (false, 'h' | 'l') => {
+                let on = cmd == 'h';
+                for p in &nums {
+                    if *p == 4 {
+                        self.insert = on;
+                    }
+                }
+            }
             (true, 'h' | 'l') => {
                 let on = cmd == 'h';
                 for p in &nums {
@@ -716,6 +795,9 @@ impl VtScreen {
                     self.scroll_up();
                 }
             }
+            (false, '@') => self.insert_blanks(n(0, 1)),
+            (false, 'P') => self.delete_chars(n(0, 1)),
+            (false, 'X') => self.erase_chars(n(0, 1)),
             _ => {}
         }
         let _ = self.origin;
@@ -893,5 +975,23 @@ mod tests {
         assert_eq!(s.cell(3, 0).ch, 'd');
         assert_eq!(s.cell(0, 1).ch, 'X');
         assert_eq!(s.cursor(), (1, 1));
+    }
+
+    #[test]
+    fn dsr_reports_cursor() {
+        let mut s = VtScreen::new(20, 4);
+        s.feed(b"hi");
+        s.feed(b"\x1b[6n");
+        assert_eq!(s.take_replies(), b"\x1b[1;3R");
+    }
+
+    #[test]
+    fn insert_mode_shifts_right() {
+        let mut s = VtScreen::new(10, 2);
+        s.feed(b"abc");
+        s.feed(b"\x1b[1;1H\x1b[4hX");
+        assert_eq!(s.cell(0, 0).ch, 'X');
+        assert_eq!(s.cell(1, 0).ch, 'a');
+        assert_eq!(s.cell(2, 0).ch, 'b');
     }
 }
