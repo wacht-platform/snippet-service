@@ -239,23 +239,42 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
         PathBuf::from(".")
     };
     let mut cmd = Command::new(&shell);
+    // Interactive login-style session. Fish/zsh job control needs a real
+    // controlling TTY on fds 0/1/2 — dup'd slave clones without login_tty
+    // leave tcgetpgrp/setpgid failing and some shells spin until the host OOMs.
     cmd.arg("-i")
         .current_dir(&cwd)
         .stdin(Stdio::from(dup_file(&slave)?))
         .stdout(Stdio::from(dup_file(&slave)?))
         .stderr(Stdio::from(dup_file(&slave)?))
         .env("TERM", "xterm-256color")
-        .env("COLORTERM", "truecolor");
+        .env("COLORTERM", "truecolor")
+        .env("SHELL", &shell);
     let slave_fd = slave.as_raw_fd();
     unsafe {
         cmd.pre_exec(move || {
-            // Become a session leader so job control works in the PTY.
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // Make this the session's controlling terminal, then put stdin/
+            // stdout/stderr on the slave and close extras so job control works.
             if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) < 0 {
-                // Non-fatal on some kernels if already controlling.
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EPERM) {
+                    return Err(err);
+                }
             }
+            if libc::dup2(slave_fd, 0) < 0
+                || libc::dup2(slave_fd, 1) < 0
+                || libc::dup2(slave_fd, 2) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+            let pgid = libc::getpid();
+            let _ = libc::setpgid(0, pgid);
             Ok(())
         });
     }
