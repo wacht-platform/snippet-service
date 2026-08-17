@@ -1464,12 +1464,17 @@ impl App {
             .unwrap_or(0)
             .saturating_add(1)
             .to_string();
+        let (cols, rows) = self
+            .term_panes
+            .get(self.term_focus)
+            .map(|p| (p.cols.max(2), p.rows.max(2)))
+            .unwrap_or((80, 24));
         self.term_panes.push(TermPane {
             id,
-            vt: crate::term::VtScreen::new(80, 24),
+            vt: crate::term::VtScreen::new(cols as usize, rows as usize),
             alive: false,
-            cols: 80,
-            rows: 24,
+            cols,
+            rows,
             seq: 0,
         });
         self.term_focus = self.term_panes.len() - 1;

@@ -322,6 +322,9 @@ pub struct VtScreen {
     parser: vt100::Parser,
     replies: Vec<u8>,
     dsr: DsrScan,
+    /// Full PTY stream so a resize can rebuild the screen instead of
+    /// leaving an empty grid that later `out` diffs never refill.
+    history: Vec<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -421,6 +424,7 @@ impl VtScreen {
             parser: vt100::Parser::new(rows as u16, cols as u16, 0),
             replies: Vec::new(),
             dsr: DsrScan::default(),
+            history: Vec::new(),
         }
     }
 
@@ -437,7 +441,10 @@ impl VtScreen {
         }
         self.cols = cols;
         self.rows = rows;
-        self.parser.set_size(rows as u16, cols as u16);
+        self.parser = vt100::Parser::new(rows as u16, cols as u16, 0);
+        self.dsr = DsrScan::default();
+        self.replies.clear();
+        self.parser.process(&self.history);
     }
 
     pub fn cell(&self, x: usize, y: usize) -> VtCell {
@@ -462,11 +469,20 @@ impl VtScreen {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         // Answer DSR against the *current* cursor, then apply the bytes so
         // the report matches what the shell just asked about.
         let (row, col) = self.parser.screen().cursor_position();
         self.dsr.feed(bytes, &mut self.replies, row.saturating_add(1), col.saturating_add(1));
         self.parser.process(bytes);
+        self.history.extend_from_slice(bytes);
+        const HISTORY_CAP: usize = 256 * 1024;
+        if self.history.len() > HISTORY_CAP {
+            let drop = self.history.len() - HISTORY_CAP;
+            self.history.drain(..drop);
+        }
     }
 }
 
@@ -533,6 +549,15 @@ mod tests {
         assert_eq!(s.take_replies(), b"\x1b[?1;2c");
         s.feed(b"\x1b[>c");
         assert_eq!(s.take_replies(), b"\x1b[>0;276;0c");
+    }
+
+    #[test]
+    fn resize_replays_history() {
+        let mut s = VtScreen::new(20, 4);
+        s.feed(b"hello");
+        s.resize(40, 8);
+        assert_eq!(s.cell(0, 0).ch, 'h');
+        assert_eq!(s.cell(4, 0).ch, 'o');
     }
 
     #[test]
