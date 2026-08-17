@@ -638,26 +638,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fish_ls_paints_command_and_listing() {
-        if !std::path::Path::new("/usr/bin/fish").exists() {
+    fn shell_ls_paints(shell: &str) {
+        if !std::path::Path::new(shell).exists() {
             return;
         }
         let dir = tempfile::tempdir().expect("tmpdir");
         std::fs::write(dir.path().join("AAA.txt"), b"x").unwrap();
         std::fs::write(dir.path().join("BBB.txt"), b"y").unwrap();
-        // SAFETY: test-only, single-threaded here.
+        // SAFETY: test-only, sequential --test-threads=1.
         unsafe {
-            std::env::set_var("SHELL", "/usr/bin/fish");
+            std::env::set_var("SHELL", shell);
         }
         let term = SessionTerm::new(dir.path().to_path_buf());
         term.ensure(80, 24).expect("spawn");
         let mut vt = VtScreen::new(80, 24);
-        pump(&term, &mut vt, 400);
+        pump(&term, &mut vt, 800);
         term.write(b"ls\r");
-        pump(&term, &mut vt, 600);
+        pump(&term, &mut vt, 800);
         term.write(b"ls\r");
-        pump(&term, &mut vt, 600);
+        pump(&term, &mut vt, 800);
         unsafe {
             std::env::remove_var("SHELL");
         }
@@ -665,19 +664,38 @@ mod tests {
         term.kill();
         assert!(
             painted.matches("ls").count() >= 2,
-            "expected two visible ls commands, got:\n{painted}"
+            "{shell}: expected two visible ls commands, got:\n{painted}"
         );
         assert!(
             painted.contains("AAA.txt") && painted.contains("BBB.txt"),
-            "expected listing, got:\n{painted}"
+            "{shell}: expected listing, got:\n{painted}"
         );
-        // Prompt should still be on its own line, not glued into the listing.
         let glued = painted
             .lines()
             .any(|l| l.contains("ls") && l.contains("AAA.txt") && !l.contains("> ls"));
         assert!(
             !glued,
-            "ls listing glued onto the command line:\n{painted}"
+            "{shell}: ls listing glued onto the command line:\n{painted}"
         );
+    }
+
+    #[test]
+    fn fish_ls_paints_command_and_listing() {
+        shell_ls_paints("/usr/bin/fish");
+    }
+
+    #[test]
+    fn bash_ls_paints_command_and_listing() {
+        shell_ls_paints("/bin/bash");
+    }
+
+    #[test]
+    fn zsh_ls_paints_command_and_listing() {
+        let zsh = ["/usr/bin/zsh", "/bin/zsh"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        if let Some(zsh) = zsh {
+            shell_ls_paints(zsh);
+        }
     }
 }
