@@ -651,8 +651,6 @@ struct AnthropicRequest {
     stream: Option<bool>,
 }
 
-/// Map a unified reasoning-effort level to an Anthropic extended-thinking budget
-/// (tokens). `off`/unset/unknown → no extended thinking.
 /// Build the Messages endpoint from a configured base URL, tolerating whatever
 /// shape the user pasted (compatible gateways present the base URL inconsistently):
 ///   ""                              → https://api.anthropic.com/v1/messages

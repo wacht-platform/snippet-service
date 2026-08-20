@@ -38,7 +38,6 @@ pub(super) async fn start_cloudflared_quick(
     Err("timed out waiting for the cloudflared URL".to_string())
 }
 
-/// Pull the first `https://*.trycloudflare.com` URL out of cloudflared's log output.
 fn extract_trycloudflare_url(s: &str) -> Option<String> {
     for line in s.lines() {
         if let Some(i) = line.find("https://") {
@@ -106,7 +105,6 @@ pub fn ensure_cloudflared_foreground() -> Result<(), String> {
     Ok(())
 }
 
-/// Redraw the single-line download progress bar in place (driven by chunk arrival).
 fn draw_download_progress(spinner: char, done: u64, total: Option<u64>) {
     use std::io::Write;
     let mb = |b: u64| b as f64 / 1_000_000.0;
@@ -131,7 +129,6 @@ fn draw_download_progress(spinner: char, done: u64, total: Option<u64>) {
     let _ = std::io::stdout().flush();
 }
 
-/// Fetch the official cloudflared static binary into `dest` (one-time, ~35 MB).
 async fn download_cloudflared(dest: &std::path::Path) -> Result<(), String> {
     use futures_util::StreamExt;
 

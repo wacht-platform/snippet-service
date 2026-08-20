@@ -72,8 +72,6 @@ pub(super) fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-// --- background daemon lifecycle ---
-
 pub(super) fn snippet_dir() -> PathBuf {
     home_dir().join(".snippet")
 }

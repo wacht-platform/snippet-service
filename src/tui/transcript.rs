@@ -300,7 +300,6 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
         set_speaker(&mut lines, &mut speaker, &mut tag_pending, !is_user);
 
-        // Add vertical spacing between tool runs and prose text
         if prev_tool_row && !lines.is_empty() && lines.last().map_or(true, |l| !l.spans.is_empty())
         {
             lines.push(Line::from(""));
@@ -382,7 +381,6 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ]));
         }
     }
-    // Append inline login Q&A if active
     lines.extend(login_lines(app, width));
     lines
 }
@@ -654,8 +652,6 @@ fn audio_block_lines(name: &str, body: &str, width: usize) -> Vec<Line<'static>>
 pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     let cleaned = strip_attachment_markers(text);
     let (prose, audio) = split_audio_sections(&cleaned);
-    // Your messages are the brightest, boldest text — the conversation's spine, so
-    // your questions stand out from the agent's replies at a glance.
     let body = Style::default()
         .fg(self::text())
         .add_modifier(Modifier::BOLD);
@@ -741,7 +737,6 @@ fn present_file_lines(path: &str, caption: Option<&str>, width: usize) -> Vec<Li
             Span::styled(seg, style),
         ]));
     }
-    // Full path when it differs from the basename (muted second line).
     if name != path {
         push_wrapped(&mut lines, path, width, Style::default().fg(faint()));
     }

@@ -1,10 +1,6 @@
-//! Background sub-agent lanes — snippet's infra-free analog of wacht's task
-//! delegation.
+//! Background sub-agent lanes.
 //!
-//! wacht delegates by creating a board item + assignment + task subscription and
-//! letting a separate DB-persisted executor thread (own sandbox, own S3 mounts)
-//! pick it up over NATS. snippet has none of that substrate, so a "lane" here is
-//! just a child [`CodingHarness`] run on a `tokio` task: it shares the parent
+//! A "lane" here is a child [`CodingHarness`] run on a `tokio` task: it shares the parent
 //! workspace (so produced files are visible to the conversation agent), runs the
 //! plain coding-agent prompt to `complete`, and reports a [`LaneResult`] back over
 //! a channel. Multiple lanes run in parallel.

@@ -4,10 +4,6 @@
 //! the harness loop *before* the generic [`crate::tools::ToolRegistry`], because
 //! they steer the loop itself (end a turn, pause for input, spawn a lane) rather
 //! than just producing a value. Delegated lanes never see them.
-//!
-//! Ported in shape from wacht's `executor/agent_loop/meta_tools` — the
-//! platform-coupled bits (DB writes, NATS, board items) are dropped; the
-//! infra-free validation discipline is kept.
 
 use serde_json::{Value, json};
 
@@ -344,7 +340,7 @@ fn delegate_task_tool() -> NativeToolDefinition {
     }
 }
 
-// --- Validation (infra-free port of wacht's delegation / ask_user gates) ---
+// --- Validation ---
 
 const MIN_DELEGATE_DESCRIPTION_CHARS: usize = 40;
 
@@ -357,9 +353,9 @@ pub struct DelegateBrief {
     pub read_only: bool,
 }
 
-/// Validate a `delegate_task` payload. Mirrors wacht's `validate_delegate_description`:
-/// the brief must state both a scope boundary and an expected deliverable, so the
-/// lane can't drift. Returns a user-correctable message on failure (fed back to the
+/// Validate a `delegate_task` payload: the brief must state both a scope
+/// boundary and an expected deliverable, so the lane can't drift.
+/// Returns a user-correctable message on failure (fed back to the
 /// model as a tool error so it self-corrects next turn).
 pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> {
     let lane_id = arguments

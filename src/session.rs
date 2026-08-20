@@ -62,8 +62,8 @@ pub fn start_session_with_browser_summary(
     let memory_entry_budget_chars = config.memory_entry_budget_chars;
     let memory_max_entries = config.memory_max_entries;
     let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
-    // Delegated lanes may run on a different profile than the active session
-    // model (see `delegate_setup`) — a cheaper model for parallel grunt work or
+    // Delegated lanes may run on a different model than the active session
+    // (see `delegate_model_config`) — a cheaper model for parallel grunt work or
     // a stronger one for hard sub-tasks. Falls back to the active model.
     let factory: ModelFactory = {
         let mc = config.delegate_model_config();
@@ -236,8 +236,7 @@ fn effective_title(state: &HarnessState) -> String {
 }
 
 /// The status string exposed on the session list / events APIs. Uses the enum's
-/// serde (snake_case) name — `Debug`-lowercasing produced `waitingforinput`,
-/// which consumers matching the documented `waiting_for_input` never saw.
+/// serde (snake_case) name.
 pub fn status_str(status: crate::harness::HarnessStatus) -> String {
     serde_json::to_value(status)
         .ok()

@@ -300,8 +300,7 @@ impl MemoryStore {
         Some(format!("{body}{manifest}"))
     }
 
-    /// This workspace's index block alone (no rules), or the empty hint. Retained
-    /// for direct/standalone use and tests; sessions use `render_session_memory`.
+    /// This workspace's index block alone (no rules), or the empty hint.
     pub fn render_for_prompt(&self, index_budget: usize) -> Option<String> {
         match self.index_body(index_budget) {
             Some(body) => Some(format!(
@@ -381,7 +380,7 @@ fn sanitize_id(id: &str) -> Result<String, String> {
 }
 
 /// Write `content` to `path` atomically (temp file in the same dir + rename),
-/// creating parent dirs. Mirrors the persist_state pattern in harness.rs.
+/// creating parent dirs.
 fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;

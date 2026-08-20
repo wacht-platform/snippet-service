@@ -21,18 +21,15 @@ use crate::tools::{ToolContext, ToolError, ToolRegistry};
 use crate::watches::{WatchEvent, WatchManager, WatchRecord};
 
 /// Consecutive tool-call turns with no real work before the run is wrapped up.
-/// Ported from wacht's `MAX_UNPRODUCTIVE_TURNS`.
 const MAX_UNPRODUCTIVE_TURNS: usize = 4;
 
 /// Consecutive note-only turns before raising a `NoteLoop` nudge.
 const NOTE_LOOP_AT: usize = 3;
 
-/// A single-turn tool batch this large raises `BatchBackpressure`. Ported from
-/// wacht's `LARGE_TOOL_BATCH`.
+/// A single-turn tool batch this large raises `BatchBackpressure`.
 const LARGE_TOOL_BATCH: usize = 10;
 
 /// The second consecutive shell-discipline nudge escalates to reflect-and-switch.
-/// Ported from wacht's `SHELL_NUDGE_ESCALATE_AT`.
 const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
 /// Read-only discovery tools whose exact-duplicate re-call within a request is
@@ -59,8 +56,7 @@ pub struct HarnessConfig {
     pub state_path: Option<PathBuf>,
     pub resume: bool,
     /// Consecutive model-call failures tolerated before giving up. `0` fails on
-    /// the first error (used by one-shot tests). Ported from
-    /// `MAX_CONSECUTIVE_RECOVERY_ATTEMPTS`.
+    /// the first error (used by one-shot tests).
     pub max_consecutive_recovery: usize,
     pub recovery_base_ms: u64,
     pub recovery_max_ms: u64,
@@ -560,7 +556,7 @@ pub enum LoopInput {
     },
 }
 
-// --- Runtime corrections (ported from executor/runtime/step_control.rs) ---
+// --- Runtime corrections ---
 
 #[derive(Debug, Clone, Copy)]
 enum RuntimeCorrectionKind {
@@ -1766,7 +1762,7 @@ impl CodingHarness {
 
         // Unproductive backstop: too many tool-call turns in a row that did no
         // real work (notes / unknown tools). Wrap the run up cleanly rather than
-        // spinning. Ported from wacht's `MAX_UNPRODUCTIVE_TURNS` gate.
+        // spinning.
         if vars.unproductive_turns >= MAX_UNPRODUCTIVE_TURNS {
             vars.unproductive_turns = 0;
             return StepResult::TurnEnded {
@@ -1885,8 +1881,7 @@ impl CodingHarness {
         }
         // Prefer provider-reported prompt tokens when present. The manual estimate is
         // only a fallback for gateways that omit/zero usage — never a floor over
-        // real API numbers (it used to max() with a base64-inflated estimate and
-        // push the context gauge to 100% after a few images).
+        // real API numbers.
         let estimated_prompt =
             estimate_prompt_tokens(&request_messages) + tools_token_overhead(&definitions);
         let anchor_tokens = if let Some(usage) = output.usage {
@@ -1929,7 +1924,7 @@ impl CodingHarness {
             if looks_like_inline_tool_submission(text) {
                 let inline = extract_inline_tool_submissions(text);
                 let residual = inline.residual_text.clone().unwrap_or_default();
-                // Salvage gating (wacht): only adopt recovered calls when the
+                // Salvage gating: only adopt recovered calls when the
                 // markup dominated the message (short residual prose). If the
                 // residual is long, the text is a real reply that happens to
                 // mention markup — keep it as prose, ignore the salvage.
@@ -4241,7 +4236,7 @@ fn build_live_context(
 
     // Surface heuristics about the latest user message (prompt-injection,
     // exfiltration, secrets, destructive intent) so the model weighs them rather
-    // than blindly complying. Ported from wacht's `derive_input_safety_signals`.
+    // than blindly complying.
     if let Some(latest) = latest_user_input(state) {
         let safety = derive_input_safety_signals(&latest);
         if !safety.is_empty() {
@@ -4334,8 +4329,7 @@ fn build_live_context(
 }
 
 /// Flag the latest user message for prompt-injection / exfiltration / secret /
-/// destructive phrasing (capped at 6). Ported from wacht's
-/// `derive_input_safety_signals`.
+/// destructive phrasing (capped at 6).
 fn derive_input_safety_signals(input: &str) -> Vec<String> {
     let input_lower = input.to_lowercase();
     let mut seen = std::collections::HashSet::new();

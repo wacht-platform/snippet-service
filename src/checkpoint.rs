@@ -29,7 +29,7 @@ pub fn shadow_dir(workspace: &Path) -> PathBuf {
 }
 
 /// Run a git command against the shadow repo (its own git-dir, work-tree = the
-/// workspace). Identity is supplied via env so no repo config is required.
+/// workspace).
 fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("--git-dir")

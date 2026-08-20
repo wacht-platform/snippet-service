@@ -48,7 +48,6 @@ pub(super) async fn browse_fs(State(d): State<Shared>, Query(q): Query<FsQuery>)
             });
         }
     }
-    // Directories first, then alphabetical.
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
@@ -387,7 +386,6 @@ fn parse_byte_range(raw: &str, total: u64) -> Option<(u64, u64)> {
     (start <= end && start < total).then_some((start, end))
 }
 
-/// Cap a single file read for the mobile viewer.
 const MAX_FS_FILE_BYTES: usize = 512 * 1024;
 
 // GET /fs/file?path= — read one text file's contents (for the in-app file viewer).
@@ -409,7 +407,6 @@ pub(super) async fn read_fs_file(State(d): State<Shared>, Query(q): Query<FsQuer
             };
             let truncated = bytes.len() > MAX_FS_FILE_BYTES;
             let slice = &bytes[..bytes.len().min(MAX_FS_FILE_BYTES)];
-            // Binary if it has a NUL or isn't valid UTF-8 up to the cut.
             let binary = slice.contains(&0) || std::str::from_utf8(slice).is_err();
             let content = if binary {
                 String::new()

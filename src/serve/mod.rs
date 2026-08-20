@@ -72,7 +72,6 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
         .filter(|p| p.is_dir())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    // Prefer workspace from the live state file on the handle itself.
     let cwd = {
         let from_state = std::fs::read(&handle.state_path)
             .ok()
@@ -257,7 +256,6 @@ impl Daemon {
         if state.workspace.is_empty() || !folder.is_dir() {
             return None;
         }
-        // Re-apply any persisted per-conversation model override; else the default.
         let profile = read_session_profile(&sp);
         self.reload_config().await; // pick up profiles added from the TUI
         let cfg = {
@@ -335,7 +333,6 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        // Abort the old loop and respawn with the fresh model config (state resumes).
         if let Some(old) = sessions.remove(id) {
             old.join.abort();
         }
@@ -571,7 +568,6 @@ pub async fn run_serve(
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
 
-    // Serve in the background so we can bring up the tunnel and print the QR.
     let mut server = tokio::spawn(async move { axum::serve(listener, app).await });
 
     // Serve is remote-only: a tunnel is required (on-device, use the TUI). A tunnel
@@ -606,7 +602,6 @@ pub async fn run_serve(
         "serve up at {public_url} (token elided — `snippet serve --status` shows the connection)"
     );
     write_serve_state(&public_url, &token_for_print, host, port);
-    // Record the binary hash so the next startup can detect external updates.
     crate::serve::lifecycle::stamp_binary_hash();
 
     // Run until the listener dies or we get SIGTERM/SIGINT (`serve --stop`); either
@@ -641,19 +636,16 @@ async fn config_watch_loop(daemon: Shared) {
         .await
         .ok()
         .and_then(|m| m.modified().ok());
-    // Sessions whose model must be rebuilt but are currently busy — retried until idle.
     let mut pending: HashSet<String> = HashSet::new();
 
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Detect a config change (mtime).
         if let Ok(meta) = tokio::fs::metadata(&path).await {
             if let Ok(mtime) = meta.modified() {
                 if Some(mtime) != last_mtime {
                     last_mtime = Some(mtime);
                     daemon.reload_config().await;
-                    // Every live session may now have a different model — queue them all.
                     let ids: Vec<String> = daemon.sessions.lock().await.keys().cloned().collect();
                     eprintln!(
                         "config.toml changed — reloaded; rebuilding {} live session model(s)",
@@ -667,7 +659,6 @@ async fn config_watch_loop(daemon: Shared) {
         if pending.is_empty() {
             continue;
         }
-        // Apply to sessions that are safe to restart right now (not mid-turn).
         let mut done = Vec::new();
         for id in pending.iter() {
             match daemon.rebuild_session_model(id).await {
@@ -719,7 +710,6 @@ async fn self_update_loop(daemon: Shared, supervised: bool) {
         {
             staged = Some(latest);
         }
-        // Binary replaced on disk. Wait for idle, then restart.
         wait_for_idle(&daemon).await;
         if supervised {
             trigger_restart();
@@ -733,8 +723,6 @@ async fn self_update_loop(daemon: Shared, supervised: bool) {
 /// Resolve the real filesystem path of the running binary, bypassing
 /// `/proc/self/exe` which keeps the old inode after `mv`.
 fn resolve_exe_path() -> Option<std::path::PathBuf> {
-    // Try reading /proc/self/maps to find our own binary path, which
-    // always reflects the current on-disk path.
     #[cfg(target_os = "linux")]
     {
         if let Ok(exe) = std::env::current_exe() {
@@ -746,7 +734,6 @@ fn resolve_exe_path() -> Option<std::path::PathBuf> {
                 return Some(exe);
             }
         }
-        // Fallback: parse /proc/self/exe symlink target to get the path string.
         let link = std::fs::read_link("/proc/self/exe").ok()?;
         return Some(link);
     }
@@ -766,7 +753,6 @@ async fn binary_watch_loop(daemon: Shared, supervised: bool) {
         Some(p) => p,
         None => return,
     };
-    // Snapshot the inode + mtime at startup.
     let initial_meta = match std::fs::metadata(&exe) {
         Ok(m) => Some((inode_from_meta(&m), mtime_from_meta(&m))),
         Err(_) => None,
@@ -784,7 +770,6 @@ async fn binary_watch_loop(daemon: Shared, supervised: bool) {
         let cur_inode = inode_from_meta(&meta);
         let cur_mtime = mtime_from_meta(&meta);
         if cur_inode != initial_inode || cur_mtime != initial_mtime {
-            // Binary replaced externally. Wait for idle sessions, then restart.
             wait_for_idle(&daemon).await;
             if supervised {
                 trigger_restart();
@@ -1117,8 +1102,7 @@ async fn handle_browser_ws(socket: WebSocket, daemon: Shared) {
 }
 
 // GET /sessions[?folder=] — device sessions (optionally scoped to one folder),
-// each with a `running` flag. Metadata comes from per-session sidecars, so this
-// no longer decompresses every conversation.
+// each with a `running` flag.
 async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> Response {
     if !d.authed(&q.token) {
         return unauthorized();
@@ -1136,7 +1120,6 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
         .map(|s| {
             let live_s = live.get(&s.id);
             let running = s.status == "running";
-            // Live override if running, else the persisted sidecar (or none → default).
             let profile = live_s
                 .and_then(|l| l.profile.clone())
                 .or_else(|| state_path_for_id(&s.id).and_then(|p| read_session_profile(&p)));
@@ -1197,7 +1180,6 @@ async fn open_session(
     if !folder.is_dir() {
         return (StatusCode::BAD_REQUEST, "not a directory").into_response();
     }
-    // Resolve the state path first (needs the workspace's base config).
     let base_state = {
         let c = d.config.lock().unwrap();
         c.for_workspace(folder.clone()).state_path
@@ -1255,8 +1237,6 @@ async fn open_session(
     }
     Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
 }
-
-// ---- model configuration (mirrors the TUI's profiles, shared config.toml) ----
 
 #[derive(Serialize)]
 struct ProfileView {
@@ -1908,10 +1888,6 @@ async fn exec_in_session(
     .into_response()
 }
 
-/// Resolve a session id to its on-disk workspace folder, or an error response.
-/// Resolve the directory git should run in. The value is either a session id
-/// (→ that session's workspace) or, for git on a plain folder with no session
-/// (e.g. the file explorer), a direct directory path.
 #[derive(Deserialize)]
 struct BgReq {
     session: String,
@@ -2234,7 +2210,6 @@ async fn handle_ws(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    // Push HarnessState on disk mtime change + live stream frames between persists.
     let push_daemon = daemon.clone();
     let push_session = session.clone();
     let push_state_path = state_path.clone();
@@ -2277,9 +2252,6 @@ async fn handle_ws(
                                         }
                                     }
                                     let count = state.events.len();
-                                    // Compare typed events directly. The previous implementation
-                                    // serialized the entire prefix to JSON on every update, even
-                                    // though the state was already deserialized.
                                     let snapshot = if last_events.is_empty() {
                                         true
                                     } else {
@@ -2319,7 +2291,6 @@ async fn handle_ws(
                     }
                 }
             }
-            // Live token stream (partial answer/thinking) — independent of state.json.
             {
                 use std::hash::{Hash, Hasher};
                 let snap = crate::llm::StreamBuffer::snapshot(&stream);
@@ -2382,7 +2353,6 @@ async fn handle_ws(
         }
     });
 
-    // Inbound: JSON LoopInput → the session's channel.
     // Each idempotent client input may carry a nonce. On reconnect the mobile
     // client resends with the same nonce so the server drops duplicates.
     while let Some(Ok(msg)) = receiver.next().await {
@@ -2412,7 +2382,6 @@ async fn handle_ws(
                         }
                     }
                 }
-                // Normal path: deserialize into LoopInput and deliver.
                 if let Ok(input) = serde_json::from_str::<LoopInput>(t.as_str()) {
                     daemon.deliver(&session, input).await;
                 }

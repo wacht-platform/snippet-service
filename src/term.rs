@@ -169,9 +169,7 @@ impl DsrScan {
     }
 }
 
-/// Per-client mailbox. Each /attach owns one; pollers never drain the PTY
-/// themselves. Two attach loops calling `poll_out` stole the fish prompt
-/// and left the TUI painting leftovers at column 46.
+/// Per-client mailbox. Each /attach owns one; pollers never drain the PTY.
 struct Fanout {
     next_client: u64,
     clients: HashMap<u64, Vec<(String, Vec<u8>, u16, u16, bool)>>,
@@ -669,7 +667,7 @@ fn set_winsize(fd: i32, cols: u16, rows: u16) {
 }
 
 /// Screen buffer for the TUI pane. Parsing is `vt100` (vte-based), not our
-/// homemade CSI machine — fish/zsh prompts need a real emulator.
+/// custom CSI parser — fish/zsh prompts need a real emulator.
 pub struct VtScreen {
     pub cols: usize,
     pub rows: usize,
@@ -737,8 +735,6 @@ impl VtScreen {
         }
         self.cols = cols;
         self.rows = rows;
-        // Keep the live grid. Replaying history here stacked a second
-        // prompt/listing on top of the PTY's own redraw.
         self.parser.set_size(rows as u16, cols as u16);
     }
 

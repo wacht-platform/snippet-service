@@ -1,8 +1,6 @@
 use super::theme::*;
 use super::*;
 
-// --- Markdown-lite prose rendering (assistant text) ---
-
 pub(super) fn render_prose(text: &str, width: usize) -> Vec<Line<'static>> {
     let base = Style::default().fg(self::text());
     let code_block = Style::default().fg(code());
@@ -253,7 +251,6 @@ pub(super) fn render_md_table(
 
     let mut out = Vec::new();
 
-    // Top border line: ┌──────┬──────┐
     let mut top_border = vec![Span::styled("┌─", faint)];
     for c in 0..ncols {
         if c > 0 {
@@ -264,10 +261,8 @@ pub(super) fn render_md_table(
     top_border.push(Span::styled("─┐", faint));
     out.push(Line::from(top_border));
 
-    // Header row
     out.extend(render_row(header, true));
 
-    // Separator line: ├──────┼──────┤
     let mut mid_border = vec![Span::styled("├─", faint)];
     for c in 0..ncols {
         if c > 0 {
@@ -278,12 +273,10 @@ pub(super) fn render_md_table(
     mid_border.push(Span::styled("─┤", faint));
     out.push(Line::from(mid_border));
 
-    // Body rows
     for row in body {
         out.extend(render_row(row, false));
     }
 
-    // Bottom border line: └──────┴──────┘
     let mut bot_border = vec![Span::styled("└─", faint)];
     for c in 0..ncols {
         if c > 0 {

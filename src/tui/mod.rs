@@ -5595,8 +5595,6 @@ fn render_history(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(window), inner);
 }
 
-// --- Question panel (interactive ask_user picker) ---
-
 /// The questions array of the active ask_user prompt, or empty when not waiting.
 fn questions_of(app: &App) -> Vec<Value> {
     app.state
@@ -5772,7 +5770,6 @@ fn question_height(app: &App) -> u16 {
         return 0;
     };
     let opts = q_options(q);
-    // blank + question(+counter) + body + controls
     let body = if opts.is_empty() { 2 } else { opts.len() + 1 };
     ((2 + body).min(16)) as u16
 }
@@ -6156,7 +6153,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.push(Line::from(""));
 
-    // Title rule
     let pad = width.min(56).saturating_sub(18).max(3);
     lines.push(Line::from(vec![
         Span::styled("── ", Style::default().fg(rule)),
@@ -6168,7 +6164,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ]));
     lines.push(Line::from(""));
 
-    // One labelled field row, focused or not, with caller-supplied value spans.
     let field_row = |label: &str, focused: bool, value: Vec<Span<'static>>| -> Line<'static> {
         let mut spans = vec![
             Span::styled(
@@ -6191,7 +6186,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         Line::from(spans)
     };
 
-    // Adjustable (provider/model) value, wrapped in ‹ › when focused.
     let chooser = |text: String, focused: bool, suffix: &str| -> Vec<Span<'static>> {
         if focused {
             vec![
@@ -6207,7 +6201,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
     };
 
-    // Provider
     let p_focus = focus == SettingsField::Provider;
     lines.push(field_row(
         "provider",
@@ -6301,7 +6294,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(""));
     } else {
-        // API key (masked)
         let k_focus = focus == SettingsField::ApiKey;
         let key_len = app.form_api_key.chars().count();
         let key_val = if key_len == 0 {
@@ -6323,7 +6315,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(field_row("api key", k_focus, key_val));
     }
 
-    // Base URL (openai-compatible only)
     if provider_needs_base_url(&app.form_provider) {
         let u_focus = focus == SettingsField::BaseUrl;
         let mut url_val = vec![Span::styled(
@@ -6340,7 +6331,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(field_row("base url", u_focus, url_val));
     }
 
-    // Model
     let m_focus = focus == SettingsField::Model;
     let model_text = if app.form_model.is_empty() {
         "(pick one)".to_string()
@@ -6353,7 +6343,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         chooser(model_text, m_focus, " ▾"),
     ));
 
-    // Reasoning / thinking effort
     let r_focus = focus == SettingsField::Reasoning;
     let reasoning = app
         .form_reasoning_effort
@@ -6391,7 +6380,6 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         chooser(format!("{}%", app.form_compact_at_pct.trim()), cp_focus, ""),
     ));
 
-    // Model dropdown — shown while the Model field is focused.
     if m_focus {
         let rows = login_model_rows(app);
         if rows.is_empty() {

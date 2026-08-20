@@ -30,8 +30,6 @@ use crate::config::workspaces_root;
 use crate::harness::{HarnessEvent, HarnessState, LoopInput};
 use crate::llm::{StreamBuffer, StreamHandle};
 
-// ── discovery ──────────────────────────────────────────────────────────
-
 /// Parsed from `~/.snippet/serve.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DaemonInfo {
@@ -135,8 +133,6 @@ pub async fn discover_or_start_with_progress(
     )
 }
 
-// ── session id ─────────────────────────────────────────────────────────
-
 /// Map a state file path to the daemon session id
 /// (`path` relative to `workspaces_root()`).
 pub fn state_path_to_session_id(state_path: &Path) -> String {
@@ -147,8 +143,6 @@ pub fn state_path_to_session_id(state_path: &Path) -> String {
         .display()
         .to_string()
 }
-
-// ── attached session ───────────────────────────────────────────────────
 
 /// One TUI↔daemon session attachment.
 pub struct SidecarAttach {
@@ -202,7 +196,6 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
     let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut tasks = Vec::new();
 
-    // Outbound: LoopInput or term JSON → WS text frames.
     let connected_out = connected.clone();
     tasks.push(tokio::spawn(async move {
         loop {
@@ -225,7 +218,6 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
         connected_out.store(false, std::sync::atomic::Ordering::Relaxed);
     }));
 
-    // Inbound: WS → state watch + stream buffer + term frames.
     let stream_in = stream.clone();
     let connected_in = connected.clone();
     tasks.push(tokio::spawn(async move {
@@ -258,8 +250,6 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
         _tasks: tasks,
     })
 }
-
-// ── HTTP helpers ───────────────────────────────────────────────────────
 
 /// Ensure the daemon has a live session for this workspace folder.
 /// Returns the daemon session id.
@@ -357,8 +347,6 @@ pub async fn rewind_session(
     }
     Ok(())
 }
-
-// ── internals ──────────────────────────────────────────────────────────
 
 fn ws_attach_url(info: &DaemonInfo, session_id: &str) -> Result<String, String> {
     let base = info.api_url.trim_end_matches('/');

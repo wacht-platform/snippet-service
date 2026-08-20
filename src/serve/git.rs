@@ -36,7 +36,6 @@ where
     }
 }
 
-/// Standard JSON for a write op: ok flag + raw streams so the app can show errors.
 fn git_result(code: i32, stdout: String, stderr: String, truncated: bool) -> Response {
     Json(serde_json::json!({
         "ok": code == 0,

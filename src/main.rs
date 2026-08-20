@@ -6,7 +6,7 @@ use snippet::serve::{self};
 use snippet::tui::{TuiOptions, run_tui};
 
 #[derive(Debug, Parser)]
-#[command(name = "snippet")]
+#[command(name = "snippet", version)]
 #[command(about = "A Rust coding-agent harness with a durable TUI runtime.")]
 struct Cli {
     #[arg(long)]
@@ -20,6 +20,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the installed Snippet version.
+    Version,
     /// Run headless in the background and serve the agent for remote control (mobile
     /// app). Additive — the TUI is unchanged; both use the same on-disk sessions.
     Serve {
@@ -220,7 +222,6 @@ fn vault_cli(action: VaultAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         VaultAction::Set { name } => {
             let value = if std::io::stdin().is_terminal() {
-                // No-echo prompt on a TTY so the value isn't visible on screen.
                 print!("value for {name} (input hidden): ");
                 std::io::stdout().flush()?;
                 let value = rpassword_read()?;
@@ -748,6 +749,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_path(&cli);
 
     match cli.command {
+        Some(Command::Version) => {
+            println!("{}", snippet::update::CURRENT_VERSION);
+            Ok(())
+        }
         Some(Command::Vault { action }) => return vault_cli(action),
         Some(Command::Browser { action }) => return runtime()?.block_on(browser_cli(action)),
         Some(Command::Serve {
@@ -763,7 +768,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             disable,
             supervised: _,
         }) => {
-            // Lifecycle commands are synchronous and need no config/runtime.
             if stop {
                 return serve::stop().map_err(Into::into);
             }
@@ -799,7 +803,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let public_url = public_url.or(s.public_url);
             let tunnel = serve::resolve_tunnel(no_tunnel, public_url.clone());
             serve::write_own_pidfile();
-            // Fetch cloudflared if using the default quick tunnel.
             let needs_cf = !no_tunnel && public_url.is_none();
             if needs_cf {
                 serve::ensure_cloudflared_foreground()?;

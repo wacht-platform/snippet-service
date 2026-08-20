@@ -1,14 +1,11 @@
-//! Live-context runtime signals — snippet's port of wacht's `RuntimeSignal`
-//! (executor/core.rs).
+//! Live-context runtime signals.
 //!
 //! When the model does something off (text with no tool call, an empty turn, the
 //! same call repeated, a tool that doesn't exist), the loop raises a typed signal.
 //! Signals are *transient*: they are drained into the next turn's freshly-rendered
 //! `[live_context]` block as a crisp imperative line, then discarded. They are
 //! never written into the durable message history, so they re-ground the model
-//! every turn without piling up as stale nudges — which is exactly why wacht steers
-//! a flaky model into a clean tool call where snippet's old accumulating nudge let
-//! it loop.
+//! every turn without piling up as stale nudges.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeSignal {

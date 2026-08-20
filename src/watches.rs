@@ -2,10 +2,7 @@
 //! its turn, and is woken with the text APPENDED to that file (optionally only
 //! when it matches a filter regex) — the file-output twin of a lane report.
 //!
-//! Detection is a cheap async poll of (size, mtime) rather than inotify: the
-//! debounce window below dominates end-to-end latency anyway, polling behaves
-//! identically on every filesystem (NFS, bind mounts, containers), and it needs
-//! no extra dependency or thread-bridging. Each watch is one tokio task tailing
+//! Each watch is one tokio task tailing
 //! a byte offset; appends are debounced until the file goes quiet, capped, then
 //! delivered to the resident loop through the same kind of channel lanes use.
 
