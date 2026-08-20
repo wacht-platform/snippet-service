@@ -53,3 +53,11 @@ orient = "memory/skills match first when index fits; else skim shape (list_files
 fan_out = "Fan out only when independent areas genuinely need separate investigation. Do not delegate merely because more than one file is involved."
 go_deep = "For localized work, read the relevant implementation and direct call sites. Reserve end-to-end multi-file exploration for cross-cutting behavior."
 validate_and_synthesize = "confirm each load-bearing finding — yours or a lane's — against the actual file; wait until every lane reports; then fold everything into one grounded answer (carry useful file:line refs) and flag what you couldn't verify"
+
+[worker_envelope]
+# When operating as a delegated worker (not orchestrating), follow this task envelope.
+acknowledge = "on task receipt, confirm scope — what you will do and what files/areas you own"
+execute = "do the work using standard coding discipline — explore, change, verify; stay within the stated scope"
+report = "When a [mission_control_task] envelope is active, call report_mission_task when the work is done, blocked, or failed. Include a concise summary, verification, artifacts, cautions, and the specific blocker if any."
+blocker = "if you cannot proceed (missing info, ambiguous scope, env issue), report the specific blocker immediately — do not guess or stall"
+no_session_orchestration = "as a worker you do not spawn lanes, manage sessions, or orchestrate device/browser state — your job is code-level execution and reporting"

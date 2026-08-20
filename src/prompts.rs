@@ -4,6 +4,7 @@
 pub const RUNTIME_SANDBOX_ENVIRONMENT: &str = include_str!("../prompts/sandbox_environment.md");
 pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer.md");
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
+pub const MISSION_CONTROL_LAYER: &str = include_str!("../prompts/mission_control_layer.md");
 
 pub fn coding_system_prompt() -> String {
     [RUNTIME_SANDBOX_ENVIRONMENT, CODING_AGENT_LAYER].join("\n\n")
@@ -14,6 +15,15 @@ pub fn conversation_system_prompt() -> String {
         RUNTIME_SANDBOX_ENVIRONMENT,
         CODING_AGENT_LAYER,
         CONVERSATION_AGENT_LAYER,
+    ]
+    .join("\n\n")
+}
+
+pub fn mission_control_system_prompt() -> String {
+    [
+        RUNTIME_SANDBOX_ENVIRONMENT,
+        CODING_AGENT_LAYER,
+        MISSION_CONTROL_LAYER,
     ]
     .join("\n\n")
 }
