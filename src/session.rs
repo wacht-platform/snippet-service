@@ -110,11 +110,30 @@ fn start_session_with_role(
 
     let join = tokio::spawn(async move {
         let mut model = model_config.build_model();
-        let context = match browser_summary {
-            Some(provider) => ToolContext::with_browser_summary(workspace, provider),
-            None => ToolContext::new(workspace),
+        let context = if mission_control {
+            ToolContext::mission_control(workspace)
+        } else {
+            match browser_summary {
+                Some(provider) => ToolContext::with_browser_summary(workspace, provider),
+                None => ToolContext::new(workspace),
+            }
         }
         .map_err(|e| e.to_string())?;
+        let mut tools = coding_tools(
+            exa_api_key.clone(),
+            crate::memory::MemoryLimits {
+                enabled: memory_enabled,
+                writable: true,
+                index_budget_chars: memory_index_budget_chars,
+                entry_budget_chars: memory_entry_budget_chars,
+                max_entries: memory_max_entries,
+            },
+        );
+        if mission_control {
+            crate::mission_tools::add_mission_control_tools(&mut tools);
+        } else {
+            crate::mission_tools::add_worker_report_tool(&mut tools);
+        }
         let harness = CodingHarness::new(
             HarnessConfig {
                 system_prompt: if mission_control {
@@ -136,16 +155,7 @@ fn start_session_with_role(
                 allow_lane_control: !mission_control,
                 ..HarnessConfig::default()
             },
-            coding_tools(
-                exa_api_key,
-                crate::memory::MemoryLimits {
-                    enabled: memory_enabled,
-                    writable: true,
-                    index_budget_chars: memory_index_budget_chars,
-                    entry_budget_chars: memory_entry_budget_chars,
-                    max_entries: memory_max_entries,
-                },
-            ),
+            tools,
             context,
         );
         harness

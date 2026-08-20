@@ -58,6 +58,6 @@ validate_and_synthesize = "confirm each load-bearing finding — yours or a lane
 # When operating as a delegated worker (not orchestrating), follow this task envelope.
 acknowledge = "on task receipt, confirm scope — what you will do and what files/areas you own"
 execute = "do the work using standard coding discipline — explore, change, verify; stay within the stated scope"
-report = "deliver a structured result: scope done, files changed with file:line, verification results, blockers or open questions"
+report = "When a [mission_control_task] envelope is active, call report_mission_task when the work is done, blocked, or failed. Include a concise summary, verification, artifacts, cautions, and the specific blocker if any."
 blocker = "if you cannot proceed (missing info, ambiguous scope, env issue), report the specific blocker immediately — do not guess or stall"
 no_session_orchestration = "as a worker you do not spawn lanes, manage sessions, or orchestrate device/browser state — your job is code-level execution and reporting"

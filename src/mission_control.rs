@@ -978,3 +978,58 @@ mod tests {
         assert_eq!(t2.dependencies[0].task_id, "t1");
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlSettings {
+    #[serde(default)]
+    pub mission_control_session_id: Option<String>,
+    #[serde(default = "default_notification_policy")]
+    pub notification_policy: String,
+}
+
+fn default_notification_policy() -> String {
+    "mission_control_only".to_string()
+}
+
+impl Default for ControlSettings {
+    fn default() -> Self {
+        Self {
+            mission_control_session_id: None,
+            notification_policy: default_notification_policy(),
+        }
+    }
+}
+
+fn settings_path(root: &Path) -> PathBuf {
+    root.join("settings.json")
+}
+
+pub fn load_settings(root: &Path) -> ControlSettings {
+    read_json(&settings_path(root)).unwrap_or_default()
+}
+
+pub fn save_settings(root: &Path, settings: &ControlSettings) -> Result<(), String> {
+    write_json(&settings_path(root), settings)
+}
+
+pub fn set_mission_control_session(
+    root: &Path,
+    session_id: &str,
+) -> Result<ControlSettings, String> {
+    let mut settings = load_settings(root);
+    settings.mission_control_session_id = Some(session_id.to_string());
+    save_settings(root, &settings)?;
+    Ok(settings)
+}
+
+pub fn set_notification_policy(root: &Path, policy: &str) -> Result<ControlSettings, String> {
+    if !matches!(policy, "mission_control_only" | "all_sessions" | "none") {
+        return Err(
+            "notification policy must be mission_control_only, all_sessions, or none".to_string(),
+        );
+    }
+    let mut settings = load_settings(root);
+    settings.notification_policy = policy.to_string();
+    save_settings(root, &settings)?;
+    Ok(settings)
+}

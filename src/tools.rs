@@ -80,11 +80,18 @@ pub struct ToolContext {
     /// context as [memory_updated] so the agent can memory_read them now — the
     /// system-prefix index is cache-fixed until resume.
     memory_writes: Arc<Mutex<Vec<String>>>,
+    mission_control: bool,
 }
 
 impl ToolContext {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self, ToolError> {
         Self::with_owner(workspace_root, "main")
+    }
+
+    pub fn mission_control(workspace_root: impl Into<PathBuf>) -> Result<Self, ToolError> {
+        let mut context = Self::with_owner(workspace_root, "mission_control")?;
+        context.mission_control = true;
+        Ok(context)
     }
 
     pub fn with_browser_summary(
@@ -121,6 +128,7 @@ impl ToolContext {
             browser_summary,
             seen: Arc::new(Mutex::new(HashMap::new())),
             memory_writes: Arc::new(Mutex::new(Vec::new())),
+            mission_control: false,
         })
     }
 
@@ -130,6 +138,15 @@ impl ToolContext {
 
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    pub fn is_mission_control(&self) -> bool {
+        self.mission_control
+    }
+
+    pub fn mission_control_root(&self) -> Option<PathBuf> {
+        self.mission_control
+            .then(|| crate::mission_control::MissionControlStore::default_root(None))
     }
 
     /// Record a successful memory_write id for live-context [memory_updated].

@@ -518,6 +518,10 @@ pub async fn run_serve(
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
         .route("/mission-control/overview", get(mission_control_overview))
+        .route(
+            "/mission-control/settings",
+            get(mission_control_settings).put(mission_control_update_settings),
+        )
         .route("/mission-control/open", post(mission_control_open))
         .route(
             "/mission-control/tasks",
@@ -2495,6 +2499,10 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
     let (mut sender, mut receiver) = socket.split();
     let push = tokio::spawn(async move {
         let mut last: HashMap<String, String> = HashMap::new();
+        let settings = mission_control::load_settings(&daemon.mission_control_root);
+        let mission_id = settings.mission_control_session_id;
+        let suppress_workers = settings.notification_policy == "mission_control_only";
+        let suppress_all = settings.notification_policy == "none";
         let mut first = true;
         loop {
             let sessions = list_device_sessions();
@@ -2519,6 +2527,11 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
                     "idle" if prevs == "running" => "idle", // a turn just finished
                     _ => continue, // running / interrupted / newly-seen idle
                 };
+                if suppress_all
+                    || (suppress_workers && mission_id.as_deref() != Some(s.id.as_str()))
+                {
+                    continue;
+                }
                 out.push(serde_json::json!({
                     "session": s.id,
                     "title": s.title,
@@ -3139,6 +3152,7 @@ async fn mission_control_open(
         );
         sessions.insert(id.clone(), live_from_handle(handle, profile));
     }
+    let _ = mission_control::set_mission_control_session(&d.mission_control_root, &id);
     Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
 }
 
@@ -3154,5 +3168,34 @@ async fn mission_control_dispatch_loop(daemon: Shared) {
             let _ = dispatch_mission_task(&daemon, &task.id).await;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[derive(Deserialize)]
+struct MissionSettingsReq {
+    notification_policy: String,
+}
+
+async fn mission_control_settings(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(mission_control::load_settings(&d.mission_control_root)).into_response()
+}
+
+async fn mission_control_update_settings(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<MissionSettingsReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match mission_control::set_notification_policy(
+        &d.mission_control_root,
+        &req.notification_policy,
+    ) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => mission_error(error),
     }
 }
