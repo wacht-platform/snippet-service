@@ -14,7 +14,7 @@ use crate::config::{SnippetConfig, workspaces_root};
 use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, deserialize_state};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
-use crate::prompts::conversation_system_prompt;
+use crate::prompts::{conversation_system_prompt, mission_control_system_prompt};
 use crate::tools::{BrowserSummaryProvider, ToolContext};
 
 pub struct SessionHandle {
@@ -35,12 +35,28 @@ pub fn start_session(
     resume: bool,
     stream: Option<StreamHandle>,
 ) -> SessionHandle {
-    start_session_with_browser_summary(config, state_path, initial, resume, stream, None)
+    start_session_with_role(config, state_path, initial, resume, stream, None, false)
 }
 
-/// Spawn a session with an optional live browser-registry summary provider.
-/// The provider is read synchronously while building each turn's steering block;
-/// it never performs network or tool calls.
+pub fn start_mission_control_session(
+    config: &SnippetConfig,
+    state_path: PathBuf,
+    initial: Option<String>,
+    resume: bool,
+    stream: Option<StreamHandle>,
+    browser_summary: Option<BrowserSummaryProvider>,
+) -> SessionHandle {
+    start_session_with_role(
+        config,
+        state_path,
+        initial,
+        resume,
+        stream,
+        browser_summary,
+        true,
+    )
+}
+
 pub fn start_session_with_browser_summary(
     config: &SnippetConfig,
     state_path: PathBuf,
@@ -48,6 +64,26 @@ pub fn start_session_with_browser_summary(
     resume: bool,
     stream: Option<StreamHandle>,
     browser_summary: Option<BrowserSummaryProvider>,
+) -> SessionHandle {
+    start_session_with_role(
+        config,
+        state_path,
+        initial,
+        resume,
+        stream,
+        browser_summary,
+        false,
+    )
+}
+
+fn start_session_with_role(
+    config: &SnippetConfig,
+    state_path: PathBuf,
+    initial: Option<String>,
+    resume: bool,
+    stream: Option<StreamHandle>,
+    browser_summary: Option<BrowserSummaryProvider>,
+    mission_control: bool,
 ) -> SessionHandle {
     let (input_tx, rx) = mpsc::unbounded_channel();
 
@@ -81,7 +117,11 @@ pub fn start_session_with_browser_summary(
         .map_err(|e| e.to_string())?;
         let harness = CodingHarness::new(
             HarnessConfig {
-                system_prompt: conversation_system_prompt(),
+                system_prompt: if mission_control {
+                    mission_control_system_prompt()
+                } else {
+                    conversation_system_prompt()
+                },
                 state_path: Some(sp),
                 resume,
                 exa_api_key: exa_api_key.clone(),
@@ -93,6 +133,7 @@ pub fn start_session_with_browser_summary(
                 memory_entry_budget_chars,
                 memory_max_entries,
                 memory_reflect_on_compaction,
+                allow_lane_control: !mission_control,
                 ..HarnessConfig::default()
             },
             coding_tools(

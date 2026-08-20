@@ -30,15 +30,24 @@ pub fn is_meta_tool(name: &str) -> bool {
 /// turn by replying with no tool calls. `complete_goal` is the one exception, and
 /// it's only offered while an autonomous `/goal` is active (so it can end it).
 pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinition> {
+    conversation_meta_definitions_for(goal_active, true)
+}
+
+pub fn conversation_meta_definitions_for(
+    goal_active: bool,
+    allow_lane_control: bool,
+) -> Vec<NativeToolDefinition> {
     let mut tools = vec![
         note_tool(),
         ask_user_tool(),
-        delegate_task_tool(),
-        cancel_delegated_task_tool(),
         monitor_tool(),
         present_file_tool(),
         set_session_title_tool(),
     ];
+    if allow_lane_control {
+        tools.push(delegate_task_tool());
+        tools.push(cancel_delegated_task_tool());
+    }
     if goal_active {
         tools.push(complete_goal_tool());
     }

@@ -19,6 +19,7 @@ pub mod lanes;
 pub mod llm;
 pub mod memory;
 pub mod meta;
+pub mod mission_control;
 pub mod openai;
 pub mod outline;
 pub mod prompts;

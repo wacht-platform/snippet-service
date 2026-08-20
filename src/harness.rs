@@ -86,6 +86,8 @@ pub struct HarnessConfig {
     /// status only (tool names/paths, never prompts) and is not user-addressable.
     pub progress_tx: Option<mpsc::UnboundedSender<crate::lanes::LaneProgress>>,
     pub progress_id: Option<String>,
+    /// Mission Control coordinates durable sessions rather than spawning lanes.
+    pub allow_lane_control: bool,
 }
 
 impl Default for HarnessConfig {
@@ -111,6 +113,7 @@ impl Default for HarnessConfig {
             memory_reflect_on_compaction: true,
             progress_tx: None,
             progress_id: None,
+            allow_lane_control: true,
         }
     }
 }
@@ -2192,7 +2195,13 @@ impl CodingHarness {
                 continue;
             }
 
-            let is_meta = conversation_mode && meta::is_meta_tool(&tool_name);
+            let is_meta = conversation_mode
+                && meta::is_meta_tool(&tool_name)
+                && (self.config.allow_lane_control
+                    || !matches!(
+                        tool_name.as_str(),
+                        "delegate_task" | "cancel_delegated_task"
+                    ));
 
             if is_meta {
                 if tool_name == "note" {
@@ -2920,7 +2929,10 @@ impl CodingHarness {
         if conversation_mode {
             // User-facing: meta tools (note/ask_user/delegate); no terminate tool —
             // a plain reply ends the turn. `complete_goal` is added only while a goal runs.
-            definitions.extend(meta::conversation_meta_definitions(goal_active));
+            definitions.extend(meta::conversation_meta_definitions_for(
+                goal_active,
+                self.config.allow_lane_control,
+            ));
         } else {
             // Headless (lanes / one-shot run): an explicit terminate_loop carries a
             // structured summary back to the caller.
