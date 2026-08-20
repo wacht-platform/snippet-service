@@ -188,8 +188,14 @@ fn tasks_dir(root: &Path) -> PathBuf {
     root.join("tasks")
 }
 
+fn safe_id(id: &str) -> String {
+    id.replace('%', "%25")
+        .replace('/', "%2F")
+        .replace('\\', "%5C")
+}
+
 fn session_path(root: &Path, id: &str) -> PathBuf {
-    sessions_dir(root).join(format!("{id}.json"))
+    sessions_dir(root).join(format!("{}.json", safe_id(id)))
 }
 
 fn task_path(root: &Path, id: &str) -> PathBuf {
@@ -216,6 +222,12 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     serde_json::from_str(&raw).map_err(|e| format!("deserialise {}: {e}", path.display()))
 }
 
+fn unsafe_id(id: &str) -> String {
+    id.replace("%2F", "/")
+        .replace("%5C", "\\")
+        .replace("%25", "%")
+}
+
 fn list_ids_in_dir(dir: &Path) -> Vec<String> {
     let mut ids = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -223,7 +235,7 @@ fn list_ids_in_dir(dir: &Path) -> Vec<String> {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    ids.push(stem.to_string());
+                    ids.push(unsafe_id(stem));
                 }
             }
         }
@@ -642,6 +654,16 @@ mod tests {
         create_session(root.path(), "s1", "X", Path::new("/")).unwrap();
         let s = archive_session(root.path(), "s1").unwrap();
         assert_eq!(s.status, SessionStatus::Archived);
+    }
+
+    #[test]
+    fn session_ids_with_slashes_roundtrip() {
+        let root = tmp();
+        let id = "workspace-a/conversations/example.json";
+        create_session(root.path(), id, "Nested", Path::new("/workspace")).unwrap();
+        let loaded = get_session(root.path(), id).unwrap();
+        assert_eq!(loaded.id, id);
+        assert_eq!(list_sessions(root.path(), false).unwrap()[0].id, id);
     }
 
     // -- Task tests -------------------------------------------------------
