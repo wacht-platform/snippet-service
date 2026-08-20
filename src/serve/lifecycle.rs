@@ -536,11 +536,14 @@ pub fn uninstall_service() -> Result<(), String> {
     Ok(())
 }
 
-/// Run a command to completion, returning whether it exited 0 (errors → false).
+/// Run a lifecycle command quietly, returning whether it exited 0 (errors → false).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(cmd: &str, args: &[&str]) -> bool {
     std::process::Command::new(cmd)
         .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
