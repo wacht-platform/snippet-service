@@ -282,7 +282,9 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         // conversation canvas free of duplicate lane status and report previews.
         if matches!(
             event,
-            HarnessEvent::LaneSpawned { .. } | HarnessEvent::LaneCompleted { .. }
+            HarnessEvent::LaneSpawned { .. }
+                | HarnessEvent::LaneCancelled { .. }
+                | HarnessEvent::LaneCompleted { .. }
         ) {
             continue;
         }
@@ -419,6 +421,7 @@ fn turn_has_visible_action(events: &[HarnessEvent]) -> bool {
             | HarnessEvent::UserQuestion { .. }
             | HarnessEvent::ApprovalRequest { .. }
             | HarnessEvent::LaneSpawned { .. }
+            | HarnessEvent::LaneCancelled { .. }
             | HarnessEvent::LaneCompleted { .. }
             | HarnessEvent::AssistantText { .. } => return true,
             _ => {}
@@ -500,6 +503,12 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
         HarnessEvent::LaneSpawned { id: _, title } => {
             marker_block("→", lane(), &format!("delegated: {title}"), width)
         }
+        HarnessEvent::LaneCancelled { title, reason, .. } => marker_block(
+            "×",
+            muted(),
+            &format!("cancelled: {title} — {reason}"),
+            width,
+        ),
         HarnessEvent::LaneCompleted {
             id,
             title,
@@ -878,6 +887,7 @@ pub(super) fn lane_completed_lines(
     let (tag, color) = match status {
         LaneStatus::Completed => ("done", success()),
         LaneStatus::Failed => ("failed", danger()),
+        LaneStatus::Cancelled => ("cancelled", muted()),
         LaneStatus::Running => ("running", lane()),
     };
     // Subject only — the id is internal plumbing (kept in the signature for

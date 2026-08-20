@@ -14,10 +14,11 @@ use serde_json::{Value, json};
 use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
-pub const META_TOOL_NAMES: [&str; 7] = [
+pub const META_TOOL_NAMES: [&str; 8] = [
     "note",
     "ask_user",
     "delegate_task",
+    "cancel_delegated_task",
     "complete_goal",
     "monitor",
     "present_file",
@@ -37,6 +38,7 @@ pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinit
         note_tool(),
         ask_user_tool(),
         delegate_task_tool(),
+        cancel_delegated_task_tool(),
         monitor_tool(),
         present_file_tool(),
         set_session_title_tool(),
@@ -47,6 +49,21 @@ pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinit
     tools
 }
 
+fn cancel_delegated_task_tool() -> NativeToolDefinition {
+    NativeToolDefinition {
+        name: "cancel_delegated_task".to_string(),
+        description: "Stop one RUNNING delegated task and reclaim its scope before doing that work yourself. Use only when the user redirects, the work is now unnecessary, or you must deliberately take over. Give the lane_id and a concise reason. The lane's partial workspace changes are preserved; validate them before relying on them.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "lane_id": {"type": "string", "description": "ID of the running delegated task to stop."},
+                "reason": {"type": "string", "description": "Why the parent is reclaiming this delegated scope."}
+            },
+            "required": ["lane_id", "reason"],
+            "additionalProperties": false,
+        }),
+    }
+}
 fn set_session_title_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "set_session_title".to_string(),

@@ -39,12 +39,13 @@ use transcript::*;
 /// Meta tools render through their own dedicated events (Note / AssistantText /
 /// UserQuestion / LaneSpawned), so their raw tool-call/result rows are hidden to
 /// avoid duplication.
-const HIDDEN_TOOL_ROWS: [&str; 8] = [
+const HIDDEN_TOOL_ROWS: [&str; 9] = [
     "terminate_loop",
     "note",
     "notify_user",
     "ask_user",
     "delegate_task",
+    "cancel_delegated_task",
     "complete_goal",
     "monitor",
     "present_file",
@@ -4656,6 +4657,7 @@ fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 LaneStatus::Running => ("●", lane()),
                 LaneStatus::Completed => ("●", success()),
                 LaneStatus::Failed => ("●", danger()),
+                LaneStatus::Cancelled => ("●", muted()),
             };
             let selected = index == app.lanes_selected_index;
             let style = if selected {
@@ -4691,6 +4693,7 @@ fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             LaneStatus::Running => ("●", lane()),
             LaneStatus::Completed => ("●", success()),
             LaneStatus::Failed => ("●", danger()),
+            LaneStatus::Cancelled => ("●", muted()),
         };
         detail_lines.push(Line::from(vec![
             Span::styled(format!("{dot} "), Style::default().fg(color)),
@@ -4708,7 +4711,9 @@ fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 .as_deref()
                 .or(item.report.as_deref())
                 .unwrap_or("completed"),
-            LaneStatus::Failed => item.error.as_deref().unwrap_or("failed"),
+            LaneStatus::Failed | LaneStatus::Cancelled => {
+                item.error.as_deref().unwrap_or("cancelled")
+            }
         };
 
         if app.lanes_detail_expanded {

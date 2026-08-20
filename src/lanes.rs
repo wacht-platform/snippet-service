@@ -32,6 +32,7 @@ pub type ModelFactory = Arc<dyn Fn() -> Box<dyn AgentModel> + Send + Sync>;
 #[serde(rename_all = "snake_case")]
 pub enum LaneStatus {
     Running,
+    Cancelled,
     Completed,
     Failed,
 }
@@ -124,14 +125,14 @@ pub struct LaneManager {
     records: Vec<LaneRecord>,
     counter: usize,
     exa_api_key: Option<String>,
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    handles: Vec<(String, tokio::task::JoinHandle<()>)>,
 }
 
 impl Drop for LaneManager {
     fn drop(&mut self) {
         // Interrupt/teardown: don't leave detached lanes burning tokens.
-        for h in &self.handles {
-            h.abort();
+        for (_, handle) in &self.handles {
+            handle.abort();
         }
     }
 }
@@ -271,6 +272,44 @@ impl LaneManager {
         Ok(title)
     }
 
+    pub fn cancel(&mut self, lane_id: &str, reason: &str) -> Result<String, String> {
+        let Some(record) = self.records.iter_mut().find(|r| r.id == lane_id) else {
+            return Err(format!(
+                "no delegated task `{lane_id}` is known in this conversation."
+            ));
+        };
+        if record.status != LaneStatus::Running {
+            return Err(format!(
+                "delegated task `{lane_id}` is not running (status: {:?}).",
+                record.status
+            ));
+        }
+        for (id, handle) in &self.handles {
+            if id == lane_id {
+                handle.abort();
+                break;
+            }
+        }
+        record.status = LaneStatus::Cancelled;
+        record.error = Some(format!("cancelled by parent: {reason}"));
+        record.finished_at = Some(Utc::now().to_rfc3339());
+        let activity = LaneActivity {
+            at: Utc::now().to_rfc3339(),
+            kind: "cancelled".to_string(),
+            text: reason.to_string(),
+        };
+        record.activity = Some(activity.text.clone());
+        record.activity_kind = Some(activity.kind.clone());
+        record.activity_at = Some(activity.at.clone());
+        record.activity_log.push(activity);
+        const MAX_ACTIVITY: usize = 24;
+        if record.activity_log.len() > MAX_ACTIVITY {
+            let drop_count = record.activity_log.len() - MAX_ACTIVITY;
+            record.activity_log.drain(..drop_count);
+        }
+        Ok(record.title.clone())
+    }
+
     /// Shared spawn: run the lane on a tokio task and report back over the channel.
     fn launch(&mut self, id: &str, title: &str, brief: &str, resume: bool, read_only: bool) {
         let factory = self.factory.clone().expect("checked by callers");
@@ -330,7 +369,7 @@ impl LaneManager {
             };
             let _ = result_tx.send(lane_result);
         });
-        self.handles.push(handle);
+        self.handles.push((id.to_string(), handle));
     }
 
     pub fn record_progress(&mut self, progress: &LaneProgress) {
@@ -379,8 +418,14 @@ impl LaneManager {
         }
     }
 
-    /// Fold a completed lane's terminal report into its record.
-    pub fn record_result(&mut self, result: &LaneResult) {
+    pub fn record_result(&mut self, result: &LaneResult) -> bool {
+        if self
+            .records
+            .iter()
+            .any(|record| record.id == result.id && record.status == LaneStatus::Cancelled)
+        {
+            return false;
+        }
         if let Some(record) = self
             .records
             .iter_mut()
@@ -394,6 +439,7 @@ impl LaneManager {
             let text = match result.status {
                 LaneStatus::Completed => "completed",
                 LaneStatus::Failed => "failed",
+                LaneStatus::Cancelled => "cancelled",
                 LaneStatus::Running => "running",
             };
             let activity = LaneActivity {
@@ -417,6 +463,7 @@ impl LaneManager {
             // Bound finished-lane growth (TTL + count) and sweep orphan disk state.
             let _ = self.housekeep();
         }
+        true
     }
 
     /// Drop finished lanes past TTL / over the finished-count cap, delete their
@@ -1010,6 +1057,32 @@ mod tests {
         );
         assert!(!dir.join("lane-99.json").exists(), "orphan must be swept");
         assert!(!dir.join("lane-99.meta.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_lane_ignores_late_terminal_result() {
+        let dir = std::env::temp_dir().join(format!("snippet-lane-cancel-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut manager = empty_manager(dir.clone()).with_records(vec![test_record()]);
+        assert_eq!(
+            manager.cancel("lane-1", "parent taking over").unwrap(),
+            "audit"
+        );
+        assert!(!manager.record_result(&LaneResult {
+            id: "lane-1".to_string(),
+            title: "audit".to_string(),
+            status: LaneStatus::Completed,
+            summary: Some("late result".to_string()),
+            report: None,
+            error: None,
+        }));
+        let record = &manager.records()[0];
+        assert_eq!(record.status, LaneStatus::Cancelled);
+        assert_eq!(
+            record.error.as_deref(),
+            Some("cancelled by parent: parent taking over")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

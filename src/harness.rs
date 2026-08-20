@@ -166,6 +166,11 @@ pub enum HarnessEvent {
         id: String,
         title: String,
     },
+    LaneCancelled {
+        id: String,
+        title: String,
+        reason: String,
+    },
     /// A delegated lane reported back.
     LaneCompleted {
         id: String,
@@ -1685,7 +1690,9 @@ impl CodingHarness {
         lanes: &mut LaneManager,
         result: &LaneResult,
     ) {
-        lanes.record_result(result);
+        if !lanes.record_result(result) {
+            return;
+        }
         let body = match result.status {
             // Prefer the full report (actions + findings + summary); fall back to
             // the concise summary so the parent agent sees what the lane actually did.
@@ -1707,6 +1714,7 @@ impl CodingHarness {
                     .unwrap_or_else(|| "unknown error".to_string()),
                 result.id,
             ),
+            LaneStatus::Cancelled => "cancelled".to_string(),
             LaneStatus::Running => "still running".to_string(),
         };
         // Orchestration cue: tell the agent whether it's still waiting on others
@@ -2088,18 +2096,10 @@ impl CodingHarness {
             content: progress_text.clone().unwrap_or_default(),
             tool_calls,
         });
-        // Progress text on a tool turn is rendered immediately, in order — never
-        // buffered or re-delivered (that was the old duplicate-answer source).
-        // (Clone: the delegation-only early end below reuses it as final_text.)
         if let Some(text) = progress_text.clone() {
             state.events.push(HarnessEvent::AssistantText { text });
-            // Progress prose is durable now — clear live text/thinking so the
-            // UI doesn't double-render against AssistantText + stream frames.
-            if let Some(sink) = sink {
-                StreamBuffer::clear(sink);
-            }
-        } else if let Some(sink) = sink {
-            // Tool-only step: drop any reasoning that arrived with the call.
+        }
+        if let Some(sink) = sink {
             StreamBuffer::clear(sink);
         }
         // Persist the assistant turn (text and/or tool_calls) before executing
@@ -2554,6 +2554,45 @@ impl CodingHarness {
         arguments: &Value,
     ) -> (Value, MetaControl) {
         match tool_name {
+            "cancel_delegated_task" => {
+                let lane_id = arguments
+                    .get("lane_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty());
+                let reason = arguments
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty());
+                match (lane_id, reason) {
+                    (Some(lane_id), Some(reason)) => match lanes.cancel(lane_id, reason) {
+                        Ok(title) => {
+                            state.events.push(HarnessEvent::LaneCancelled {
+                                id: lane_id.to_string(),
+                                title: title.clone(),
+                                reason: reason.to_string(),
+                            });
+                            (
+                                json!({"schema_version": 1, "status": "success", "data": {
+                                    "cancelled": true,
+                                    "lane_id": lane_id,
+                                    "title": title,
+                                    "note": "The delegated scope is now yours. Partial workspace changes were preserved; inspect and validate them before continuing."
+                                }}),
+                                MetaControl::Continue,
+                            )
+                        }
+                        Err(error) => (tool_error(error), MetaControl::Continue),
+                    },
+                    _ => (
+                        tool_error(
+                            "cancel_delegated_task requires non-empty `lane_id` and `reason`.",
+                        ),
+                        MetaControl::Continue,
+                    ),
+                }
+            }
             "note" => {
                 let entry = arguments
                     .get("entry")
@@ -4275,6 +4314,7 @@ fn build_live_context(
             let status = match l.status {
                 LaneStatus::Completed => "completed",
                 LaneStatus::Failed => "FAILED",
+                LaneStatus::Cancelled => "cancelled",
                 LaneStatus::Running => unreachable!("filtered above"),
             };
             block.push_str(&format!(
