@@ -428,7 +428,9 @@ pub fn archive_session(root: &Path, id: &str) -> Result<ManagedSession, String> 
 // TaskRecord CRUD
 // ---------------------------------------------------------------------------
 
-/// Create a new task record and persist it.
+/// Create a new task record and persist it. `handoff_mode` is stored in the
+/// same write so a dispatcher can never claim the task before its delivery
+/// semantics are persisted.
 pub fn create_task(
     root: &Path,
     id: &str,
@@ -436,6 +438,28 @@ pub fn create_task(
     title: &str,
     description: &str,
     owned_paths: Vec<PathBuf>,
+) -> Result<TaskRecord, String> {
+    create_task_with_mode(
+        root,
+        id,
+        session_id,
+        title,
+        description,
+        owned_paths,
+        HandoffMode::default(),
+    )
+}
+
+/// Like [`create_task`] with an explicit handoff delivery mode.
+#[allow(clippy::too_many_arguments)]
+pub fn create_task_with_mode(
+    root: &Path,
+    id: &str,
+    session_id: &str,
+    title: &str,
+    description: &str,
+    owned_paths: Vec<PathBuf>,
+    handoff_mode: HandoffMode,
 ) -> Result<TaskRecord, String> {
     let _guard = store_lock();
     let now = epoch_secs();
@@ -447,7 +471,7 @@ pub fn create_task(
         status: TaskStatus::Pending,
         dependencies: Vec::new(),
         handoff: None,
-        handoff_mode: HandoffMode::default(),
+        handoff_mode,
         reporting_session: None,
         dispatch_failures: 0,
         result: None,
@@ -531,7 +555,8 @@ pub fn find_tasks(
 
 /// Move a task to a terminal status and set its result. Returns an error
 /// instead of panicking when handed a non-terminal status, and refuses to
-/// overwrite an already-terminal task.
+/// overwrite an already-terminal task (a second completion must not flip a
+/// `Done` task to `Failed` or replace its result).
 pub fn complete_task(
     root: &Path,
     id: &str,
@@ -542,6 +567,16 @@ pub fn complete_task(
         return Err(format!(
             "complete_task requires a terminal status, got {status:?}"
         ));
+    }
+    {
+        let _guard = store_lock();
+        let existing: TaskRecord = read_json(&task_path(root, id))?;
+        if existing.status.is_terminal() {
+            return Err(format!(
+                "task {id} is already terminal ({:?}); refusing to overwrite its result",
+                existing.status
+            ));
+        }
     }
     update_task(root, id, |t| {
         t.status = status;
@@ -617,8 +652,9 @@ pub fn mark_notification_delivered(
 ///
 /// Deliberately does NOT hold `store_lock()` for the whole pass: it calls
 /// locking helpers (`archive_session` → `update_session`) and a non-reentrant
-/// guard would self-deadlock. Each inner mutation is individually serialized,
-/// which is sufficient — the loop only reads via those same helpers.
+/// guard would self-deadlock. Task transitions go through `update_task` so each
+/// read-modify-write cycle is individually serialized — a concurrent
+/// notification or report can never be discarded by the archive write.
 pub fn archive_all(root: &Path) -> Result<u32, String> {
     let sessions = list_sessions(root, true)?;
     let mut count = 0u32;
@@ -626,12 +662,13 @@ pub fn archive_all(root: &Path) -> Result<u32, String> {
         archive_session(root, &s.id)?;
         // Also terminalise all non-terminal tasks for this session.
         let tasks = list_tasks(root, Some(&s.id), None)?;
-        for mut t in tasks {
+        for t in tasks {
             if !t.status.is_terminal() {
-                t.status = TaskStatus::Cancelled;
-                t.updated_at = epoch_secs();
-                t.owned_paths.clear();
-                write_json(&task_path(root, &t.id), &t)?;
+                update_task(root, &t.id, |task| {
+                    task.status = TaskStatus::Cancelled;
+                    task.owned_paths.clear();
+                    task.reporting_session = None;
+                })?;
             }
         }
         count += 1;
@@ -642,25 +679,41 @@ pub fn archive_all(root: &Path) -> Result<u32, String> {
 /// Return every Blocked task whose dependencies are all Done back to Pending
 /// so the dispatch loop can pick them up. Called after any task completes;
 /// cheap no-op when nothing is eligible. Returns the ids re-queued.
+///
+/// Tasks blocked by the dispatch retry ceiling (`dispatch_failures`) are NOT
+/// re-queued here — a dependency-less blocked task is retry-exhausted, and the
+/// user must explicitly reset it (e.g. via REST `status: "pending"`).
 pub fn unblock_ready_tasks(root: &Path) -> Result<Vec<String>, String> {
-    let _guard = store_lock();
     let mut unblocked = Vec::new();
-    for id in list_ids_in_dir(&tasks_dir(root)) {
-        let Ok(mut task) = read_json::<TaskRecord>(&task_path(root, &id)) else {
-            continue;
-        };
-        if task.status != TaskStatus::Blocked {
-            continue;
-        }
+    let ids = {
+        let _guard = store_lock();
+        list_ids_in_dir(&tasks_dir(root))
+            .into_iter()
+            .filter_map(|id| {
+                read_json::<TaskRecord>(&task_path(root, &id))
+                    .ok()
+                    .map(|t| (id, t))
+            })
+            .filter(|(_, t)| t.status == TaskStatus::Blocked && t.dispatch_failures == 0)
+            .collect::<Vec<_>>()
+    };
+    for (id, task) in ids {
         let ready = task.dependencies.iter().all(|dep| {
             read_json::<TaskRecord>(&task_path(root, &dep.task_id))
                 .map(|other| other.status == TaskStatus::Done)
                 .unwrap_or(false)
         });
-        if ready {
-            task.status = TaskStatus::Pending;
-            task.updated_at = epoch_secs();
-            if write_json(&task_path(root, &id), &task).is_ok() {
+        if !ready {
+            continue;
+        }
+        // Transition through update_task so the requeue is serialized against
+        // any concurrent mutation of the same record.
+        if let Ok(updated) = update_task(root, &id, |t| {
+            if t.status == TaskStatus::Blocked {
+                t.status = TaskStatus::Pending;
+            }
+        }) {
+            if updated.status == TaskStatus::Pending {
                 unblocked.push(id);
             }
         }

@@ -160,24 +160,20 @@ impl Tool for CreateMissionTask {
                 )));
             }
         };
-        let owned_paths = if args.owned_paths.is_empty() {
-            vec![PathBuf::from(&state.workspace)]
-        } else {
-            args.owned_paths.iter().map(PathBuf::from).collect()
-        };
-        let task = mission_control::update_task(
+        // Owned paths must stay inside the target session's workspace — same
+        // rule as the REST path; an unconstrained claim (e.g. "/") would stall
+        // the whole board through conflict detection.
+        let workspace = std::path::PathBuf::from(&state.workspace);
+        let owned_paths = crate::serve::validated_owned_paths(&args.owned_paths, &workspace)
+            .map_err(ToolError::msg)?;
+        let task = mission_control::create_task_with_mode(
             &root,
-            &mission_control::create_task(
-                &root,
-                &id,
-                &args.session_id,
-                args.title.trim(),
-                args.description.trim(),
-                owned_paths,
-            )
-            .map_err(ToolError::msg)?
-            .id,
-            |t| t.handoff_mode = handoff_mode,
+            &id,
+            &args.session_id,
+            args.title.trim(),
+            args.description.trim(),
+            owned_paths,
+            handoff_mode,
         )
         .map_err(ToolError::msg)?;
         Ok(ToolResult::success(

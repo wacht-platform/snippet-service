@@ -2666,29 +2666,56 @@ struct MissionTaskReq {
 
 /// Validate caller-supplied owned paths against a managed workspace: each must
 /// resolve inside it. Returns the canonicalised list, defaulting to the whole
-/// workspace when nothing valid is supplied.
-fn validated_owned_paths(
+/// workspace when nothing valid is supplied. A claimed path may not exist yet
+/// (the task will create it), so non-existent paths are resolved against their
+/// nearest existing ancestor; the workspace is canonicalised once so symlinked
+/// workspaces compare correctly.
+pub fn validated_owned_paths(
     raw_paths: &[String],
     workspace: &std::path::Path,
 ) -> Result<Vec<std::path::PathBuf>, String> {
+    let root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     let mut out = Vec::new();
     for raw in raw_paths {
-        let path = PathBuf::from(raw);
-        match path
-            .canonicalize()
-            .ok()
-            .filter(|resolved| resolved.starts_with(workspace))
-        {
-            Some(resolved) => out.push(resolved),
-            None => {
-                return Err(format!(
-                    "owned path '{raw}' is outside the target session's workspace"
-                ));
+        let path = std::path::PathBuf::from(raw);
+        // Walk up to the nearest ancestor that exists, canonicalise that, and
+        // re-append the non-existent remainder.
+        let mut prefix = path.clone();
+        let mut suffix = Vec::new();
+        let resolved = loop {
+            match prefix.canonicalize() {
+                Ok(canonical) => {
+                    let mut resolved = canonical;
+                    for part in suffix.iter().rev() {
+                        resolved.push(part);
+                    }
+                    break resolved;
+                }
+                Err(_) => match prefix.parent() {
+                    Some(parent) => {
+                        if let Some(name) = prefix.file_name() {
+                            suffix.push(name.to_os_string());
+                        }
+                        prefix = parent.to_path_buf();
+                    }
+                    // Reached the filesystem root without finding anything
+                    // that exists — treat as outside the workspace.
+                    None => break path.clone(),
+                },
             }
+        };
+        if resolved.starts_with(&root) {
+            out.push(resolved);
+        } else {
+            return Err(format!(
+                "owned path '{raw}' is outside the target session's workspace"
+            ));
         }
     }
     if out.is_empty() {
-        out.push(workspace.to_path_buf());
+        out.push(root);
     }
     Ok(out)
 }
@@ -2852,10 +2879,18 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
         return Err("task has no target session".to_string());
     }
     for dependency in &task.dependencies {
-        let other = mission_control::get_task(root, &dependency.task_id)?;
+        // A missing/unreadable dependency record must roll the claim back like
+        // every other failure path — otherwise the task strands InProgress.
+        let other = match mission_control::get_task(root, &dependency.task_id) {
+            Ok(other) => other,
+            Err(error) => {
+                release_failed_claim(root, &task, &error)?;
+                return Err(error);
+            }
+        };
         if other.status != TaskStatus::Done {
             let reason = format!("waiting on dependency {}", dependency.task_id);
-            mission_control::update_task(root, task_id, |task| {
+            let blocked = mission_control::update_task(root, task_id, |task| {
                 task.status = TaskStatus::Blocked;
                 task.reporting_session = None;
                 task.notifications
@@ -2866,7 +2901,8 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
                         delivered: false,
                     });
             })?;
-            return Ok(task);
+            // Report the stored (blocked) state, not the pre-update claim.
+            return Ok(blocked);
         }
     }
     let managed = match mission_control::get_session(root, &task.session_id) {
@@ -2921,6 +2957,9 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
         task.id,
     );
     d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
+    // Delivery succeeded — clear the retry counter so the ceiling stays
+    // "consecutive failures" as documented.
+    mission_control::update_task(root, task_id, |t| t.dispatch_failures = 0)?;
     mission_control::get_task(root, task_id)
 }
 
@@ -3021,23 +3060,44 @@ async fn mission_control_update_task(
     }
     let root = &d.mission_control_root;
     // Resolve the existing task up-front so owned-path updates can be
-    // validated against the target session's workspace.
+    // validated against the *effective* target session's workspace: the
+    // session named in the request when retargeting, else the current one.
     let existing = match mission_control::get_task(root, &id) {
         Ok(task) => task,
         Err(error) => return mission_error(error),
     };
-    let workspace_for_paths: std::path::PathBuf = {
-        match mission_control::get_session(root, &existing.session_id) {
-            Ok(session) => session.workspace,
-            Err(_) => PathBuf::new(),
-        }
+    let effective_session_id = if req.session_id.trim().is_empty() {
+        existing.session_id.clone()
+    } else {
+        req.session_id.trim().to_string()
     };
-    if !req.owned_paths.is_empty() && !workspace_for_paths.as_os_str().is_empty() {
-        if let Err(error) = validated_owned_paths(&req.owned_paths, &workspace_for_paths) {
-            return mission_error(error);
-        }
-    }
+    let workspace_for_paths: std::path::PathBuf =
+        match mission_control::get_session(root, &effective_session_id) {
+            Ok(session) => session.workspace,
+            Err(error) => return mission_error(error),
+        };
+    let validated_paths = if req.owned_paths.is_empty() {
+        None
+    } else {
+        Some(
+            match validated_owned_paths(&req.owned_paths, &workspace_for_paths) {
+                Ok(paths) => paths,
+                Err(error) => return mission_error(error),
+            },
+        )
+    };
     let status = req.status.as_deref().and_then(task_status);
+    let handoff_mode = match req.handoff_mode.as_deref() {
+        None => None,
+        Some(mode_raw) => match mission_control::HandoffMode::parse(mode_raw) {
+            Some(mode) => Some(mode),
+            None => {
+                return mission_error(format!(
+                    "handoff_mode must be 'resume' or 'fresh', got '{mode_raw}'"
+                ));
+            }
+        },
+    };
     let updated = mission_control::update_task(root, &id, |task| {
         if !req.title.trim().is_empty() {
             task.title = req.title.trim().to_string();
@@ -3045,19 +3105,15 @@ async fn mission_control_update_task(
         if !req.description.trim().is_empty() {
             task.description = req.description.trim().to_string();
         }
-        if !req.session_id.trim().is_empty() {
+        if !req.session_id.trim().is_empty() && req.session_id.trim() != existing.session_id {
             task.session_id = req.session_id.trim().to_string();
             task.reporting_session = None; // re-bind on retarget
         }
-        if !req.owned_paths.is_empty() {
-            task.owned_paths = validated_owned_paths(&req.owned_paths, &workspace_for_paths)
-                .unwrap_or_else(|_| task.owned_paths.clone());
+        if let Some(paths) = &validated_paths {
+            task.owned_paths = paths.clone();
         }
-        if let Some(mode_raw) = req.handoff_mode.as_deref() {
-            match mission_control::HandoffMode::parse(mode_raw) {
-                Some(mode) => task.handoff_mode = mode,
-                None => {}
-            }
+        if let Some(mode) = handoff_mode {
+            task.handoff_mode = mode;
         }
         if let Some(status) = status {
             task.status = status;
