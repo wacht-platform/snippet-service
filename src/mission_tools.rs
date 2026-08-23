@@ -115,6 +115,10 @@ struct CreateTaskArgs {
     title: String,
     description: String,
     session_id: String,
+    /// `resume` (default): target session already has the context. `fresh`:
+    /// the description is a self-contained briefing for a session that lacks it.
+    #[serde(default)]
+    handoff_mode: Option<String>,
     #[serde(default)]
     owned_paths: Vec<String>,
 }
@@ -122,7 +126,7 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist and queue a structured handoff to an existing durable session. The daemon dispatches it safely; do not use this for trivial work.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "owned_paths":{"type":"array","items":{"type":"string"}}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist and queue a structured handoff to an existing durable session. The daemon dispatches it safely; do not use this for trivial work. handoff_mode: 'resume' when the target session already has the context, 'fresh' when the description must be a self-contained briefing.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -147,18 +151,33 @@ impl Tool for CreateMissionTask {
             .map_err(ToolError::msg)?;
         }
         let id = uuid::Uuid::new_v4().to_string();
+        let handoff_mode = match args.handoff_mode.as_deref() {
+            None | Some("resume") => mission_control::HandoffMode::Resume,
+            Some("fresh") => mission_control::HandoffMode::Fresh,
+            Some(other) => {
+                return Err(ToolError::msg(format!(
+                    "handoff_mode must be 'resume' or 'fresh', got '{other}'"
+                )));
+            }
+        };
         let owned_paths = if args.owned_paths.is_empty() {
             vec![PathBuf::from(&state.workspace)]
         } else {
             args.owned_paths.iter().map(PathBuf::from).collect()
         };
-        let task = mission_control::create_task(
+        let task = mission_control::update_task(
             &root,
-            &id,
-            &args.session_id,
-            args.title.trim(),
-            args.description.trim(),
-            owned_paths,
+            &mission_control::create_task(
+                &root,
+                &id,
+                &args.session_id,
+                args.title.trim(),
+                args.description.trim(),
+                owned_paths,
+            )
+            .map_err(ToolError::msg)?
+            .id,
+            |t| t.handoff_mode = handoff_mode,
         )
         .map_err(ToolError::msg)?;
         Ok(ToolResult::success(
@@ -202,13 +221,21 @@ pub struct ReportMissionTask;
 #[async_trait]
 impl Tool for ReportMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "report_mission_task".into(), description: "Report a Mission Control task's completion, failure, or blocker. Use only after receiving a [mission_control_task] envelope.".into(), input_schema: schema(json!({"task_id":{"type":"string"}, "status":{"type":"string","enum":["done","blocked","failed"]}, "summary":{"type":"string"}, "artifacts":{"type":"array","items":{"type":"string"}}}), &["task_id","status","summary"]) }
+        NativeToolDefinition { name: "report_mission_task".into(), description: "Report a Mission Control task's completion, failure, or blocker. Use only for the [mission_control_task] envelope delivered to this session.".into(), input_schema: schema(json!({"task_id":{"type":"string"}, "status":{"type":"string","enum":["done","blocked","failed"]}, "summary":{"type":"string"}, "artifacts":{"type":"array","items":{"type":"string"}}}), &["task_id","status","summary"]) }
     }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ReportArgs =
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "report_mission_task".into(),
             })?;
+        // Authority binding: the caller must be the durable session this task
+        // was dispatched to. Tasks are bound at dispatch time via
+        // `claim_task_for_dispatch`; anything else is rejected.
+        let Some(caller) = ctx.durable_session_id() else {
+            return Err(ToolError::msg(
+                "this session is not bound to a Mission Control task; report_mission_task is only available to dispatched task sessions",
+            ));
+        };
         let root = mission_control::MissionControlStore::default_root(None);
         let status = match args.status.as_str() {
             "done" => TaskStatus::Done,
@@ -216,6 +243,13 @@ impl Tool for ReportMissionTask {
             "failed" => TaskStatus::Failed,
             _ => return Err(ToolError::msg("status must be done, blocked, or failed")),
         };
+        {
+            let bound = mission_control::get_task(&root, &args.task_id)
+                .map_err(|_| ToolError::msg("unknown task"))?;
+            if bound.reporting_session.as_deref() != Some(caller) {
+                return Err(ToolError::msg("task was not dispatched to this session"));
+            }
+        }
         let task = if status.is_terminal() {
             mission_control::complete_task(
                 &root,
@@ -231,6 +265,7 @@ impl Tool for ReportMissionTask {
         } else {
             mission_control::update_task(&root, &args.task_id, |task| {
                 task.status = status;
+                task.owned_paths.clear(); // release ownership while blocked
                 task.notifications
                     .push(mission_control::NotificationMarker {
                         target: "mission_control".into(),

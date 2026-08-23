@@ -110,7 +110,13 @@ fn start_session_with_role(
 
     let join = tokio::spawn(async move {
         let mut model = model_config.build_model();
-        let context = if mission_control {
+        // Durable identity = state path relative to the workspaces root — the
+        // same id the daemon uses for managed sessions and task envelopes.
+        let durable_id = sp
+            .strip_prefix(crate::config::workspaces_root())
+            .ok()
+            .map(|p| p.display().to_string());
+        let base_context = if mission_control {
             ToolContext::mission_control(workspace)
         } else {
             match browser_summary {
@@ -119,6 +125,10 @@ fn start_session_with_role(
             }
         }
         .map_err(|e| e.to_string())?;
+        let context = match durable_id {
+            Some(id) => base_context.with_durable_session_id(id),
+            None => base_context,
+        };
         let mut tools = coding_tools(
             exa_api_key.clone(),
             crate::memory::MemoryLimits {

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -108,6 +109,29 @@ pub struct Handoff {
     pub context: BTreeMap<String, String>,
 }
 
+/// How a dispatched task should be delivered to its target session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffMode {
+    /// The target session already holds the relevant context; deliver the task
+    /// envelope as-is.
+    #[default]
+    Resume,
+    /// The target session lacks the context; the full handoff description is
+    /// the worker's briefing and must be self-contained.
+    Fresh,
+}
+
+impl HandoffMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "resume" => Some(Self::Resume),
+            "fresh" => Some(Self::Fresh),
+            _ => None,
+        }
+    }
+}
+
 /// Result produced when a task completes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskResult {
@@ -149,6 +173,17 @@ pub struct TaskRecord {
     pub dependencies: Vec<Dependency>,
     /// Handoff information (populated when work is delegated).
     pub handoff: Option<Handoff>,
+    /// How the handoff should be delivered (resume context vs fresh briefing).
+    #[serde(default)]
+    pub handoff_mode: HandoffMode,
+    /// Session id allowed to report this task's outcome. Set at dispatch time;
+    /// `report_mission_task` is only honoured for tasks bound to the caller.
+    #[serde(default)]
+    pub reporting_session: Option<String>,
+    /// Consecutive failed dispatch attempts; reset on successful delivery.
+    /// At the retry ceiling the task is parked as Blocked with a notification.
+    #[serde(default)]
+    pub dispatch_failures: u32,
     /// Result (populated when terminal).
     pub result: Option<TaskResult>,
     /// Pending / undelivered notification markers.
@@ -199,21 +234,43 @@ fn session_path(root: &Path, id: &str) -> PathBuf {
 }
 
 fn task_path(root: &Path, id: &str) -> PathBuf {
-    tasks_dir(root).join(format!("{id}.json"))
+    tasks_dir(root).join(format!("{}.json", safe_id(id)))
 }
 
 // ---------------------------------------------------------------------------
 // Atomic I/O helpers
 // ---------------------------------------------------------------------------
 
+/// Process-wide serialisation for store mutations. All read-modify-write
+/// helpers (`update_task`, `update_session`, settings updates, dispatch
+/// claims) hold this lock across the whole cycle so concurrent callers — the
+/// dispatch loop, REST handlers, worker tool calls — cannot lose updates.
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn store_lock() -> MutexGuard<'static, ()> {
+    STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Monotonic counter making atomic-write temp files unique per write.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     let content = serde_json::to_string_pretty(value).map_err(|e| format!("serialise: {e}"))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("record");
+    let tmp = path.with_file_name(format!(".{file}.{pid}.{n}.tmp"));
     fs::write(&tmp, &content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("rename {}: {e}", path.display()));
+    }
     Ok(())
 }
 
@@ -317,12 +374,15 @@ pub fn get_session(root: &Path, id: &str) -> Result<ManagedSession, String> {
 }
 
 /// Update a managed session in-place.  The caller provides a closure that
-/// mutates the session; the updated version is persisted atomically.
+/// mutates the session; the updated version is persisted atomically. Holds the
+/// store lock across the read-modify-write cycle so concurrent callers cannot
+/// lose updates.
 pub fn update_session(
     root: &Path,
     id: &str,
     f: impl FnOnce(&mut ManagedSession),
 ) -> Result<ManagedSession, String> {
+    let _guard = store_lock();
     let mut session: ManagedSession = read_json(&session_path(root, id))?;
     f(&mut session);
     session.updated_at = epoch_secs();
@@ -377,6 +437,7 @@ pub fn create_task(
     description: &str,
     owned_paths: Vec<PathBuf>,
 ) -> Result<TaskRecord, String> {
+    let _guard = store_lock();
     let now = epoch_secs();
     let task = TaskRecord {
         id: id.to_string(),
@@ -386,6 +447,9 @@ pub fn create_task(
         status: TaskStatus::Pending,
         dependencies: Vec::new(),
         handoff: None,
+        handoff_mode: HandoffMode::default(),
+        reporting_session: None,
+        dispatch_failures: 0,
         result: None,
         notifications: Vec::new(),
         owned_paths,
@@ -401,12 +465,15 @@ pub fn get_task(root: &Path, id: &str) -> Result<TaskRecord, String> {
     read_json(&task_path(root, id))
 }
 
-/// Update a task record in-place (closure mutates, then persists).
+/// Update a task record in-place (closure mutates, then persists). Holds the
+/// store lock across the read-modify-write cycle so concurrent callers — the
+/// dispatch loop, REST handlers, worker tool calls — cannot lose updates.
 pub fn update_task(
     root: &Path,
     id: &str,
     f: impl FnOnce(&mut TaskRecord),
 ) -> Result<TaskRecord, String> {
+    let _guard = store_lock();
     let mut task: TaskRecord = read_json(&task_path(root, id))?;
     f(&mut task);
     task.updated_at = epoch_secs();
@@ -462,22 +529,42 @@ pub fn find_tasks(
     Ok(out)
 }
 
-/// Move a task to a terminal status and set its result.
+/// Move a task to a terminal status and set its result. Returns an error
+/// instead of panicking when handed a non-terminal status, and refuses to
+/// overwrite an already-terminal task.
 pub fn complete_task(
     root: &Path,
     id: &str,
     status: TaskStatus,
     result: TaskResult,
 ) -> Result<TaskRecord, String> {
-    assert!(
-        status.is_terminal(),
-        "complete_task requires a terminal status"
-    );
+    if !status.is_terminal() {
+        return Err(format!(
+            "complete_task requires a terminal status, got {status:?}"
+        ));
+    }
     update_task(root, id, |t| {
         t.status = status;
         t.result = Some(result);
         t.owned_paths.clear(); // release ownership
+        t.reporting_session = None;
     })
+}
+
+/// Atomically claim a Pending task for dispatch: flips `Pending → InProgress`
+/// exactly once. Concurrent dispatchers (loop + REST paths) race through this
+/// compare-and-swap; only one caller wins and delivers the envelope.
+pub fn claim_task_for_dispatch(root: &Path, id: &str) -> Result<TaskRecord, String> {
+    let _guard = store_lock();
+    let mut task: TaskRecord = read_json(&task_path(root, id))?;
+    if task.status != TaskStatus::Pending {
+        return Ok(task);
+    }
+    task.status = TaskStatus::InProgress;
+    task.reporting_session = Some(task.session_id.clone());
+    task.updated_at = epoch_secs();
+    write_json(&task_path(root, id), &task)?;
+    Ok(task)
 }
 
 /// Add a dependency edge to a task.
@@ -527,6 +614,11 @@ pub fn mark_notification_delivered(
 }
 
 /// Archive all active sessions and their tasks in one pass.
+///
+/// Deliberately does NOT hold `store_lock()` for the whole pass: it calls
+/// locking helpers (`archive_session` → `update_session`) and a non-reentrant
+/// guard would self-deadlock. Each inner mutation is individually serialized,
+/// which is sufficient — the loop only reads via those same helpers.
 pub fn archive_all(root: &Path) -> Result<u32, String> {
     let sessions = list_sessions(root, true)?;
     let mut count = 0u32;
@@ -547,33 +639,53 @@ pub fn archive_all(root: &Path) -> Result<u32, String> {
     Ok(count)
 }
 
+/// Return every Blocked task whose dependencies are all Done back to Pending
+/// so the dispatch loop can pick them up. Called after any task completes;
+/// cheap no-op when nothing is eligible. Returns the ids re-queued.
+pub fn unblock_ready_tasks(root: &Path) -> Result<Vec<String>, String> {
+    let _guard = store_lock();
+    let mut unblocked = Vec::new();
+    for id in list_ids_in_dir(&tasks_dir(root)) {
+        let Ok(mut task) = read_json::<TaskRecord>(&task_path(root, &id)) else {
+            continue;
+        };
+        if task.status != TaskStatus::Blocked {
+            continue;
+        }
+        let ready = task.dependencies.iter().all(|dep| {
+            read_json::<TaskRecord>(&task_path(root, &dep.task_id))
+                .map(|other| other.status == TaskStatus::Done)
+                .unwrap_or(false)
+        });
+        if ready {
+            task.status = TaskStatus::Pending;
+            task.updated_at = epoch_secs();
+            if write_json(&task_path(root, &id), &task).is_ok() {
+                unblocked.push(id);
+            }
+        }
+    }
+    Ok(unblocked)
+}
+
 // ---------------------------------------------------------------------------
-// Concurrency guard (optional — for callers that want safe concurrent access)
+// Store handle (thin; mutations serialise on the process-wide lock)
 // ---------------------------------------------------------------------------
 
 /// A thin wrapper providing interior-mutability-safe access to a store rooted
 /// at a specific path.  Only serialises writes; reads are plain filesystem ops.
+#[derive(Debug, Clone)]
 pub struct MissionControlStore {
     root: PathBuf,
-    _lock: Mutex<()>,
 }
 
 impl MissionControlStore {
     pub fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            _lock: Mutex::new(()),
-        }
+        Self { root }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    /// Acquire the write lock.  Hold the returned guard for a batch of
-    /// mutations to avoid interleaving.
-    pub fn lock(&self) -> MutexGuard<'_, ()> {
-        self._lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Convenience: data-root from env with optional override.
@@ -899,6 +1011,9 @@ mod tests {
                     m
                 },
             }),
+            handoff_mode: HandoffMode::Resume,
+            reporting_session: Some("s1".into()),
+            dispatch_failures: 0,
             result: None,
             notifications: vec![NotificationMarker {
                 target: "lane-1".into(),
@@ -934,7 +1049,7 @@ mod tests {
         let store = MissionControlStore::new(root.path().to_path_buf());
 
         {
-            let _guard = store.lock();
+            let _guard = store_lock();
             create_session(store.root(), "s1", "Locked", Path::new("/")).unwrap();
         }
 
@@ -976,6 +1091,91 @@ mod tests {
         let t2 = read_json::<TaskRecord>(&task_path(root.path(), "t2")).unwrap();
         assert_eq!(t2.dependencies.len(), 1);
         assert_eq!(t2.dependencies[0].task_id, "t1");
+    }
+
+    #[test]
+    fn task_paths_reject_traversal_ids() {
+        let root = tmp();
+        for evil in ["../../etc/passwd", "..\\..\\x", "a/../settings"] {
+            let p = task_path(root.path(), evil);
+            assert!(
+                p.starts_with(tasks_dir(root.path())),
+                "{evil} escaped the store"
+            );
+        }
+        // Session ids keep their existing escaping (slash ids roundtrip).
+        create_session(root.path(), "ws/a", "Nested", Path::new("/w")).unwrap();
+        assert!(get_session(root.path(), "ws/a").is_ok());
+    }
+
+    #[test]
+    fn claim_is_one_shot_and_binds_reporter() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "t1", "s1", "T", "D", vec![]).unwrap();
+
+        let claimed = claim_task_for_dispatch(root.path(), "t1").unwrap();
+        assert_eq!(claimed.status, TaskStatus::InProgress);
+        assert_eq!(claimed.reporting_session.as_deref(), Some("s1"));
+
+        // A second dispatcher must not re-claim or reset the binding.
+        let again = claim_task_for_dispatch(root.path(), "t1").unwrap();
+        assert_eq!(again.status, TaskStatus::InProgress);
+        assert_eq!(again.reporting_session.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn blocked_tasks_resume_when_dependencies_complete() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "dep", "s1", "Dep", "D", vec![]).unwrap();
+        create_task(root.path(), "waiter", "s1", "W", "D", vec![]).unwrap();
+        add_dependency(root.path(), "waiter", "dep", None).unwrap();
+        update_task(root.path(), "waiter", |t| t.status = TaskStatus::Blocked).unwrap();
+
+        // Dependency not done yet → stays blocked.
+        assert!(unblock_ready_tasks(root.path()).unwrap().is_empty());
+        assert_eq!(
+            get_task(root.path(), "waiter").unwrap().status,
+            TaskStatus::Blocked
+        );
+
+        complete_task(root.path(), "dep", TaskStatus::Done, TaskResult::default()).unwrap();
+        let unblocked = unblock_ready_tasks(root.path()).unwrap();
+        assert_eq!(unblocked, vec!["waiter".to_string()]);
+        assert_eq!(
+            get_task(root.path(), "waiter").unwrap().status,
+            TaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn complete_task_rejects_non_terminal_status() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "t1", "s1", "T", "D", vec![PathBuf::from("/w")]).unwrap();
+        let err = complete_task(
+            root.path(),
+            "t1",
+            TaskStatus::InProgress,
+            TaskResult::default(),
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn handoff_modes_roundtrip() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "t1", "s1", "T", "D", vec![]).unwrap();
+        update_task(root.path(), "t1", |t| {
+            t.handoff_mode = HandoffMode::Fresh;
+        })
+        .unwrap();
+        assert_eq!(
+            get_task(root.path(), "t1").unwrap().handoff_mode,
+            HandoffMode::Fresh
+        );
     }
 }
 

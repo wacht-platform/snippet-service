@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{LoopInput, deserialize_state, serialize_state};
-use crate::mission_control::{self, ManagedSession, TaskRecord, TaskStatus};
+use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
 use crate::session::{
     list_device_sessions, read_session_profile, start_mission_control_session,
     start_session_with_browser_summary, state_path_for_id, write_session_profile,
@@ -266,16 +266,32 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        let handle = start_session_with_browser_summary(
-            &cfg,
-            sp.clone(),
-            None,
-            true,
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                crate::llm::StreamBuffer::default(),
-            ))),
-            Some(self.browser.summary_provider()),
-        );
+        // Role-aware resume: a session opened as Mission Control must come back
+        // with the MC prompt/tools/lane restrictions after a daemon restart,
+        // not silently downgrade to an ordinary conversation session.
+        let role = read_session_role(&sp);
+        let handle = match role.as_deref() {
+            Some("mission_control") => crate::session::start_mission_control_session(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+            _ => start_session_with_browser_summary(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+        };
         let tx = handle.input_tx.clone();
         let live = live_from_handle(handle, profile);
         let stream = live.stream.clone();
@@ -2499,12 +2515,14 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
     let (mut sender, mut receiver) = socket.split();
     let push = tokio::spawn(async move {
         let mut last: HashMap<String, String> = HashMap::new();
-        let settings = mission_control::load_settings(&daemon.mission_control_root);
-        let mission_id = settings.mission_control_session_id;
-        let suppress_workers = settings.notification_policy == "mission_control_only";
-        let suppress_all = settings.notification_policy == "none";
         let mut first = true;
         loop {
+            // Re-read the notification policy every tick so setting changes and
+            // MC-session re-opens apply to already-connected clients.
+            let settings = mission_control::load_settings(&daemon.mission_control_root);
+            let mission_id = settings.mission_control_session_id;
+            let suppress_workers = settings.notification_policy == "mission_control_only";
+            let suppress_all = settings.notification_policy == "none";
             let sessions = list_device_sessions();
             let mut seen = HashSet::new();
             let mut out = Vec::new();
@@ -2637,10 +2655,42 @@ struct MissionTaskReq {
     description: String,
     #[serde(default)]
     session_id: String,
+    /// `resume` (default) or `fresh` — how the handoff should be delivered.
+    #[serde(default)]
+    handoff_mode: Option<String>,
     #[serde(default)]
     owned_paths: Vec<String>,
     #[serde(default)]
     status: Option<String>,
+}
+
+/// Validate caller-supplied owned paths against a managed workspace: each must
+/// resolve inside it. Returns the canonicalised list, defaulting to the whole
+/// workspace when nothing valid is supplied.
+fn validated_owned_paths(
+    raw_paths: &[String],
+    workspace: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut out = Vec::new();
+    for raw in raw_paths {
+        let path = PathBuf::from(raw);
+        match path
+            .canonicalize()
+            .ok()
+            .filter(|resolved| resolved.starts_with(workspace))
+        {
+            Some(resolved) => out.push(resolved),
+            None => {
+                return Err(format!(
+                    "owned path '{raw}' is outside the target session's workspace"
+                ));
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(workspace.to_path_buf());
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -2790,55 +2840,116 @@ async fn mission_control_tasks(
 
 async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, String> {
     let root = &d.mission_control_root;
-    let task = mission_control::get_task(root, task_id)?;
-    if task.status != TaskStatus::Pending {
+    // Atomic claim: Pending → InProgress exactly once. Concurrent dispatchers
+    // (loop + REST paths) lose the race here and return without delivering.
+    let task = mission_control::claim_task_for_dispatch(root, task_id)?;
+    if task.status != TaskStatus::InProgress || task.reporting_session.is_none() {
+        // Not claimed by us (already in progress/terminal) — nothing to do.
         return Ok(task);
     }
     if task.session_id.trim().is_empty() {
+        release_failed_claim(root, &task, "task has no target session")?;
         return Err("task has no target session".to_string());
     }
     for dependency in &task.dependencies {
         let other = mission_control::get_task(root, &dependency.task_id)?;
         if other.status != TaskStatus::Done {
-            return mission_control::update_task(root, task_id, |task| {
+            let reason = format!("waiting on dependency {}", dependency.task_id);
+            mission_control::update_task(root, task_id, |task| {
                 task.status = TaskStatus::Blocked;
-            });
+                task.reporting_session = None;
+                task.notifications
+                    .push(mission_control::NotificationMarker {
+                        target: "mission_control".to_string(),
+                        kind: "blocked".to_string(),
+                        message: reason.clone(),
+                        delivered: false,
+                    });
+            })?;
+            return Ok(task);
         }
     }
-    let managed = mission_control::get_session(root, &task.session_id)?;
+    let managed = match mission_control::get_session(root, &task.session_id) {
+        Ok(managed) => managed,
+        Err(error) => {
+            release_failed_claim(root, &task, &error)?;
+            return Err(error);
+        }
+    };
     if managed.status != mission_control::SessionStatus::Active {
-        return Err("target session is archived".to_string());
+        let error = "target session is archived".to_string();
+        release_failed_claim(root, &task, &error)?;
+        return Err(error);
     }
     let conflicts = mission_control::detect_conflicts(root, task_id, &task.owned_paths)?;
     if !conflicts.is_empty() {
-        return Err(format!(
+        let error = format!(
             "workspace paths are owned by active task(s): {}",
             conflicts
                 .iter()
                 .map(|conflict| conflict.existing_task_id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        ));
+        );
+        release_failed_claim(root, &task, &error)?;
+        return Err(error);
     }
     let handoff = task
         .handoff
         .as_ref()
         .map(|handoff| handoff.description.as_str())
         .unwrap_or("");
+    // Fresh-mode handoffs must be self-contained briefings; resume-mode ones
+    // assume the session already holds the context.
+    let mode_line = match task.handoff_mode {
+        mission_control::HandoffMode::Fresh => {
+            "handoff_mode: fresh (self-contained briefing; the session has no prior context)\n"
+        }
+        mission_control::HandoffMode::Resume => "",
+    };
     let text = format!(
-        "[mission_control_task]\ntask_id: {}\ntitle: {}\nscope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\n[/mission_control_task]",
+        "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nreporting: when done/blocked/failed, call report_mission_task for task_id {} — it is bound to this session\n[/mission_control_task]",
         task.id,
         task.title,
+        mode_line,
         if handoff.is_empty() {
             task.description.as_str()
         } else {
             handoff
         },
         managed.workspace.display(),
+        task.id,
     );
-    mission_control::update_task(root, task_id, |task| task.status = TaskStatus::InProgress)?;
     d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
     mission_control::get_task(root, task_id)
+}
+
+/// Roll a claimed-but-undeliverable task back to Pending and record why, so
+/// the loop can retry later instead of silently spinning with a stale claim.
+/// After `MAX_DISPATCH_FAILURES` consecutive failures the task is parked as
+/// Blocked so it stops consuming the loop.
+fn release_failed_claim(
+    root: &std::path::Path,
+    task: &TaskRecord,
+    error: &str,
+) -> Result<(), String> {
+    const MAX_DISPATCH_FAILURES: u32 = 5;
+    mission_control::update_task(root, &task.id, |t| {
+        t.dispatch_failures += 1;
+        t.reporting_session = None;
+        if t.dispatch_failures >= MAX_DISPATCH_FAILURES {
+            t.status = TaskStatus::Blocked;
+            t.notifications.push(NotificationMarker {
+                target: "mission_control".to_string(),
+                kind: "blocked".to_string(),
+                message: format!("dispatch failed {} times: {error}", t.dispatch_failures),
+                delivered: false,
+            });
+        } else {
+            t.status = TaskStatus::Pending;
+        }
+    })
+    .map(|_| ())
 }
 
 async fn mission_control_create_task(
@@ -2857,10 +2968,11 @@ async fn mission_control_create_task(
         Ok(session) => session,
         Err(error) => return mission_error(error),
     };
-    let owned_paths = if req.owned_paths.is_empty() {
-        vec![managed.workspace.clone()]
-    } else {
-        req.owned_paths.iter().map(PathBuf::from).collect()
+    // Every owned path must stay inside the session's workspace; otherwise a
+    // caller could claim "/" or another project's tree and block all tasks.
+    let owned_paths = match validated_owned_paths(&req.owned_paths, &managed.workspace) {
+        Ok(paths) => paths,
+        Err(error) => return mission_error(error),
     };
     let id = uuid::Uuid::new_v4().to_string();
     let task = match mission_control::create_task(
@@ -2881,6 +2993,7 @@ async fn mission_control_create_task(
             Ok(task) => task,
             Err(error) => match mission_control::update_task(root, &task.id, |task| {
                 task.status = TaskStatus::Blocked;
+                task.reporting_session = None;
                 task.notifications
                     .push(mission_control::NotificationMarker {
                         target: "mission_control".to_string(),
@@ -2907,6 +3020,23 @@ async fn mission_control_update_task(
         return unauthorized();
     }
     let root = &d.mission_control_root;
+    // Resolve the existing task up-front so owned-path updates can be
+    // validated against the target session's workspace.
+    let existing = match mission_control::get_task(root, &id) {
+        Ok(task) => task,
+        Err(error) => return mission_error(error),
+    };
+    let workspace_for_paths: std::path::PathBuf = {
+        match mission_control::get_session(root, &existing.session_id) {
+            Ok(session) => session.workspace,
+            Err(_) => PathBuf::new(),
+        }
+    };
+    if !req.owned_paths.is_empty() && !workspace_for_paths.as_os_str().is_empty() {
+        if let Err(error) = validated_owned_paths(&req.owned_paths, &workspace_for_paths) {
+            return mission_error(error);
+        }
+    }
     let status = req.status.as_deref().and_then(task_status);
     let updated = mission_control::update_task(root, &id, |task| {
         if !req.title.trim().is_empty() {
@@ -2917,12 +3047,23 @@ async fn mission_control_update_task(
         }
         if !req.session_id.trim().is_empty() {
             task.session_id = req.session_id.trim().to_string();
+            task.reporting_session = None; // re-bind on retarget
         }
         if !req.owned_paths.is_empty() {
-            task.owned_paths = req.owned_paths.iter().map(PathBuf::from).collect();
+            task.owned_paths = validated_owned_paths(&req.owned_paths, &workspace_for_paths)
+                .unwrap_or_else(|_| task.owned_paths.clone());
+        }
+        if let Some(mode_raw) = req.handoff_mode.as_deref() {
+            match mission_control::HandoffMode::parse(mode_raw) {
+                Some(mode) => task.handoff_mode = mode,
+                None => {}
+            }
         }
         if let Some(status) = status {
             task.status = status;
+            if status.is_terminal() || status == TaskStatus::Blocked {
+                task.reporting_session = None;
+            }
         }
     });
     match updated {
@@ -3132,6 +3273,7 @@ async fn mission_control_open(
         .profile
         .clone()
         .or_else(|| read_session_profile(&state_path));
+    write_session_role(&state_path, "mission_control");
     let cfg = {
         let config = d.config.lock().unwrap();
         let mut workspace = config.for_workspace(folder.clone());
@@ -3152,23 +3294,56 @@ async fn mission_control_open(
         );
         sessions.insert(id.clone(), live_from_handle(handle, profile));
     }
-    let _ = mission_control::set_mission_control_session(&d.mission_control_root, &id);
+    if let Err(error) = mission_control::set_mission_control_session(&d.mission_control_root, &id) {
+        eprintln!("[mission-control] failed to persist active MC session: {error}");
+    }
     Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
 }
 
+/// Persist the MC session id next to the session's state file so a daemon
+/// restart can resume it with the Mission Control role (prompt + tools +
+/// lane restrictions) instead of silently downgrading it to an ordinary
+/// conversation session.
+const MC_ROLE_SIDECAR_SUFFIX: &str = ".role";
+
+fn write_session_role(state_path: &std::path::Path, role: &str) {
+    let sidecar = PathBuf::from(format!("{}{MC_ROLE_SIDECAR_SUFFIX}", state_path.display()));
+    if let Some(parent) = sidecar.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(sidecar, role);
+}
+
+pub fn read_session_role(state_path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(PathBuf::from(format!(
+        "{}{MC_ROLE_SIDECAR_SUFFIX}",
+        state_path.display()
+    )))
+    .ok()?;
+    let role = raw.trim().to_string();
+    (!role.is_empty()).then_some(role)
+}
+
+/// Dispatch loop: claims and delivers every Pending task, then re-queues any
+/// Blocked tasks whose dependencies have completed. Failures roll the claim
+/// back with a retry counter; at the ceiling the task parks as Blocked.
 async fn mission_control_dispatch_loop(daemon: Shared) {
     loop {
-        let tasks = mission_control::list_tasks(
-            &daemon.mission_control_root,
-            None,
-            Some(TaskStatus::Pending),
-        )
-        .unwrap_or_default();
+        let root = &daemon.mission_control_root;
+        let _ = mission_control::unblock_ready_tasks(root);
+        let tasks =
+            mission_control::list_tasks(root, None, Some(TaskStatus::Pending)).unwrap_or_default();
         for task in tasks {
-            let _ = dispatch_mission_task(&daemon, &task.id).await;
+            if let Err(error) = dispatch_mission_task(&daemon, &task.id).await {
+                tracing_log_dispatch_failure(&task.id, &error);
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+fn tracing_log_dispatch_failure(task_id: &str, error: &str) {
+    eprintln!("[mission-control] dispatch {task_id} failed: {error}");
 }
 
 #[derive(Deserialize)]

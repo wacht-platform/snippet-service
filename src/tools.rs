@@ -81,6 +81,10 @@ pub struct ToolContext {
     /// system-prefix index is cache-fixed until resume.
     memory_writes: Arc<Mutex<Vec<String>>>,
     mission_control: bool,
+    /// Durable session identity (state path relative to the workspaces root).
+    /// Set for daemon-managed sessions; lets `report_mission_task` verify the
+    /// caller actually owns the task it is reporting on.
+    durable_session_id: Option<String>,
 }
 
 impl ToolContext {
@@ -129,6 +133,7 @@ impl ToolContext {
             seen: Arc::new(Mutex::new(HashMap::new())),
             memory_writes: Arc::new(Mutex::new(Vec::new())),
             mission_control: false,
+            durable_session_id: None,
         })
     }
 
@@ -142,6 +147,17 @@ impl ToolContext {
 
     pub fn is_mission_control(&self) -> bool {
         self.mission_control
+    }
+
+    /// Bind this context to a durable daemon-managed session id. Called by the
+    /// serve layer when starting/resuming managed sessions.
+    pub fn with_durable_session_id(mut self, id: impl Into<String>) -> Self {
+        self.durable_session_id = Some(id.into());
+        self
+    }
+
+    pub fn durable_session_id(&self) -> Option<&str> {
+        self.durable_session_id.as_deref()
     }
 
     pub fn mission_control_root(&self) -> Option<PathBuf> {

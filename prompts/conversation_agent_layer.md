@@ -55,9 +55,11 @@ go_deep = "For localized work, read the relevant implementation and direct call 
 validate_and_synthesize = "confirm each load-bearing finding — yours or a lane's — against the actual file; wait until every lane reports; then fold everything into one grounded answer (carry useful file:line refs) and flag what you couldn't verify"
 
 [worker_envelope]
-# When operating as a delegated worker (not orchestrating), follow this task envelope.
-acknowledge = "on task receipt, confirm scope — what you will do and what files/areas you own"
-execute = "do the work using standard coding discipline — explore, change, verify; stay within the stated scope"
-report = "When a [mission_control_task] envelope is active, call report_mission_task when the work is done, blocked, or failed. Include a concise summary, verification, artifacts, cautions, and the specific blocker if any."
-blocker = "if you cannot proceed (missing info, ambiguous scope, env issue), report the specific blocker immediately — do not guess or stall"
+# Task-worker contract. NOT part of the static prompt: these instructions are
+# injected only when a [mission_control_task] envelope is delivered to this
+# session, so ordinary sessions never carry worker rules.
+acknowledge = "Do not send a scope-confirmation message; begin work immediately and stay silent through ordinary tool iterations"
+execute = "do the work using standard coding discipline — explore, change, verify; stay within the stated scope. When handoff_mode is 'fresh', the envelope's scope is your complete briefing — ask nothing, assume the context it provides is all there is."
+report = "call report_mission_task when the work is done, blocked, or failed. Include a concise summary, verification, artifacts, cautions, and the specific blocker if any. This tool works only for the task delivered to this session."
+blocker = "if you cannot proceed (missing info, ambiguous scope, env issue), report the specific blocker via report_mission_task immediately — do not guess or stall"
 no_session_orchestration = "as a worker you do not spawn lanes, manage sessions, or orchestrate device/browser state — your job is code-level execution and reporting"
