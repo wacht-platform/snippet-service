@@ -2830,6 +2830,7 @@ async fn mission_control_overview(
             mission_session_view(session, count)
         })
         .collect::<Vec<_>>();
+    let mc_session_id = Some(mission_control::SESSION_ID);
     Json(serde_json::json!({
         "active_tasks": active_tasks,
         "completed_tasks": done_tasks,
@@ -2838,6 +2839,7 @@ async fn mission_control_overview(
         "total_sessions": sessions.len(),
         "recent_tasks": recent_tasks,
         "recent_sessions": recent_sessions,
+        "mc_session_id": mc_session_id,
     }))
     .into_response()
 }
@@ -2944,7 +2946,7 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
         mission_control::HandoffMode::Resume => "",
     };
     let text = format!(
-        "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nreporting: when done/blocked/failed, call report_mission_task for task_id {} — it is bound to this session\n[/mission_control_task]",
+        "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nrules: do not confirm scope; begin immediately. If handoff_mode is fresh, this envelope is the complete briefing — do not ask for missing history. Stay in scope; do not spawn lanes or manage other sessions. When done/blocked/failed, call report_mission_task for task_id {} — it is bound to this session. If you cannot proceed, report the blocker instead of guessing.\n[/mission_control_task]",
         task.id,
         task.title,
         mode_line,
@@ -3299,7 +3301,6 @@ async fn mission_control_archive_session(
 
 #[derive(Deserialize)]
 struct MissionOpenReq {
-    folder: String,
     #[serde(default)]
     profile: Option<String>,
 }
@@ -3312,19 +3313,13 @@ async fn mission_control_open(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let folder = PathBuf::from(&req.folder);
-    if !folder.is_dir() {
-        return mission_error("folder is not a directory".to_string());
-    }
-    let state_path = {
-        let config = d.config.lock().unwrap();
-        config.for_workspace(folder.clone()).state_path
+    let home = match mission_control::ensure_home() {
+        Ok(path) => path,
+        Err(error) => return mission_error(error),
     };
-    let id = state_path
-        .strip_prefix(workspaces_root())
-        .unwrap_or(&state_path)
-        .display()
-        .to_string();
+    let state_path = mission_control::session_state_path();
+    let id = mission_control::SESSION_ID.to_string();
+    let resume = state_path.exists();
     let profile = req
         .profile
         .clone()
@@ -3332,7 +3327,7 @@ async fn mission_control_open(
     write_session_role(&state_path, "mission_control");
     let cfg = {
         let config = d.config.lock().unwrap();
-        let mut workspace = config.for_workspace(folder.clone());
+        let mut workspace = config.for_workspace(home.clone());
         apply_profile(&mut workspace, &profile);
         workspace
     };
@@ -3342,18 +3337,25 @@ async fn mission_control_open(
             &cfg,
             state_path,
             None,
-            true,
+            resume,
             Some(Arc::new(std::sync::Mutex::new(
                 crate::llm::StreamBuffer::default(),
             ))),
             Some(d.browser.summary_provider()),
         );
         sessions.insert(id.clone(), live_from_handle(handle, profile));
+        if !resume {
+            if let Some(live) = sessions.get(&id) {
+                let _ = live
+                    .input_tx
+                    .send(LoopInput::SetTitle("Mission Control".into()));
+            }
+        }
     }
     if let Err(error) = mission_control::set_mission_control_session(&d.mission_control_root, &id) {
         eprintln!("[mission-control] failed to persist active MC session: {error}");
     }
-    Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
+    Json(serde_json::json!({ "id": id, "folder": home })).into_response()
 }
 
 /// Persist the MC session id next to the session's state file so a daemon
@@ -3394,7 +3396,38 @@ async fn mission_control_dispatch_loop(daemon: Shared) {
                 tracing_log_dispatch_failure(&task.id, &error);
             }
         }
+        deliver_mission_control_reports(&daemon).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Worker `report_mission_task` only writes the JSON store. Push undelivered
+/// markers into the Mission Control conversation so the user sees the result.
+async fn deliver_mission_control_reports(daemon: &Daemon) {
+    let root = &daemon.mission_control_root;
+    let Ok(tasks) = mission_control::list_tasks(root, None, None) else {
+        return;
+    };
+    for task in tasks {
+        for (index, marker) in task.notifications.iter().enumerate() {
+            if marker.delivered || marker.target != "mission_control" {
+                continue;
+            }
+            let text = format!(
+                "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]",
+                task.id,
+                task.title,
+                marker.kind,
+                marker.message
+            );
+            daemon
+                .deliver(
+                    mission_control::SESSION_ID,
+                    LoopInput::UserMessage(text),
+                )
+                .await;
+            let _ = mission_control::mark_notification_delivered(root, &task.id, index);
+        }
     }
 }
 

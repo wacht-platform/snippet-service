@@ -112,10 +112,13 @@ fn start_session_with_role(
         let mut model = model_config.build_model();
         // Durable identity = state path relative to the workspaces root — the
         // same id the daemon uses for managed sessions and task envelopes.
-        let durable_id = sp
-            .strip_prefix(crate::config::workspaces_root())
-            .ok()
-            .map(|p| p.display().to_string());
+        let durable_id = if mission_control {
+            Some(crate::mission_control::SESSION_ID.to_string())
+        } else {
+            sp.strip_prefix(crate::config::workspaces_root())
+                .ok()
+                .map(|p| p.display().to_string())
+        };
         let base_context = if mission_control {
             ToolContext::mission_control(workspace)
         } else {
@@ -202,6 +205,10 @@ pub struct SessionInfo {
 /// Resolve a session id (relative path under the workspaces root) to its state
 /// file, rejecting any path that escapes the root.
 pub fn state_path_for_id(id: &str) -> Option<PathBuf> {
+    if crate::mission_control::is_session_id(id) {
+        let path = crate::mission_control::session_state_path();
+        return path.exists().then_some(path);
+    }
     let root = workspaces_root();
     let path = root.join(id);
     // Reject traversal: the resolved path must stay under the root.
@@ -266,7 +273,49 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
         }
     }
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+    if let Some(mc) = mission_control_list_row() {
+        out.insert(0, mc);
+    }
     out
+}
+
+fn mission_control_list_row() -> Option<SessionInfo> {
+    let path = crate::mission_control::session_state_path();
+    if !path.exists() {
+        return None;
+    }
+    let last_active = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (folder, title, status) = if let Some(meta) = std::fs::read(meta_path(&path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
+    {
+        (meta.folder, meta.title, meta.status)
+    } else {
+        (
+            crate::mission_control::workspace_path()
+                .display()
+                .to_string(),
+            "Mission Control".to_string(),
+            "idle".to_string(),
+        )
+    };
+    Some(SessionInfo {
+        id: crate::mission_control::SESSION_ID.to_string(),
+        folder,
+        conversation: "default".to_string(),
+        title: if title.trim().is_empty() {
+            "Mission Control".to_string()
+        } else {
+            title
+        },
+        status,
+        last_active,
+    })
 }
 
 /// Lightweight session metadata, written next to each state file so listing can
@@ -628,6 +677,15 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         .unwrap_or(path)
         .display()
         .to_string();
+    if crate::mission_control::is_session_id(&id) {
+        return;
+    }
+    let role = std::fs::read_to_string(PathBuf::from(format!("{}.role", path.display())))
+        .ok()
+        .map(|s| s.trim().to_string());
+    if role.as_deref() == Some("mission_control") {
+        return;
+    }
 
     // Fast path: read the tiny sidecar, no decompression.
     if let Some(meta) = std::fs::read(meta_path(path))

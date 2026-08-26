@@ -201,6 +201,9 @@ pub struct TaskRecord {
 // Store configuration
 // ---------------------------------------------------------------------------
 
+/// Stable daemon session id for the single Mission Control conversation.
+pub const SESSION_ID: &str = "mission-control";
+
 /// Resolve the root data directory for mission control.
 ///
 /// `~/.snippet/mission-control` under the user's `HOME`, or an explicit override
@@ -213,6 +216,23 @@ fn data_root(override_path: Option<&Path>) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     home.join(".snippet").join("mission-control")
+}
+
+/// Workspace the Mission Control agent runs in — the dedicated home, never a
+/// project folder.
+pub fn workspace_path() -> PathBuf {
+    MissionControlStore::default_root(None)
+}
+
+/// The one conversation file. Open always resumes this; it is never minted
+/// under a project `conversations/` directory.
+pub fn session_state_path() -> PathBuf {
+    workspace_path().join("session.json")
+}
+
+pub fn is_session_id(id: &str) -> bool {
+    let id = id.trim();
+    id == SESSION_ID || id == "mission-control/session.json"
 }
 
 fn sessions_dir(root: &Path) -> PathBuf {
@@ -578,11 +598,23 @@ pub fn complete_task(
             ));
         }
     }
+    let kind = match status {
+        TaskStatus::Done => "done",
+        TaskStatus::Failed => "failed",
+        _ => "info",
+    };
+    let message = result.summary.clone();
     update_task(root, id, |t| {
         t.status = status;
         t.result = Some(result);
-        t.owned_paths.clear(); // release ownership
+        t.owned_paths.clear();
         t.reporting_session = None;
+        t.notifications.push(NotificationMarker {
+            target: "mission_control".into(),
+            kind: kind.into(),
+            message,
+            delivered: false,
+        });
     })
 }
 
@@ -745,6 +777,13 @@ impl MissionControlStore {
     pub fn default_root(override_path: Option<&Path>) -> PathBuf {
         data_root(override_path)
     }
+}
+
+/// Ensure the dedicated Mission Control home exists (workspace + store).
+pub fn ensure_home() -> Result<PathBuf, String> {
+    let root = workspace_path();
+    std::fs::create_dir_all(&root).map_err(|e| format!("create mission-control home: {e}"))?;
+    Ok(root)
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,6 +1133,18 @@ mod tests {
         let path = MissionControlStore::default_root(None);
         // Should always produce a valid path.
         assert!(path.to_string_lossy().contains("mission-control"));
+    }
+
+    #[test]
+    fn dedicated_home_is_one_session() {
+        assert_eq!(SESSION_ID, "mission-control");
+        assert!(is_session_id(SESSION_ID));
+        assert!(is_session_id("mission-control/session.json"));
+        assert!(!is_session_id("gmata-backend-abc/conversations/x.json"));
+        assert!(!is_session_id("foo/state.json"));
+        let home = workspace_path();
+        assert_eq!(session_state_path(), home.join("session.json"));
+        assert!(home.ends_with("mission-control"));
     }
 
     #[test]

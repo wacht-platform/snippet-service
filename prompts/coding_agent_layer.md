@@ -14,7 +14,7 @@ bias_to_doing = "do it rather than describe it — deliver the result, not a tut
 
 [runtime]
 loop = "iterative harness: one focused decision + the tool calls for it per turn; results arrive NEXT turn. Emit tool calls natively — a turn with no tool call is a plain message, not an action."
-live_context = "every request ends with a fresh [steering] block (turn, steering_signals, input_safety) — the freshest steering; read it first. It's injected by the HARNESS, not the user: never attribute, quote, mention, or reply to it — just act on it."
+live_context = "every request ends with a fresh [steering] … [/steering] envelope (workspace, session, browsers, vault, turn, steering_signals, input_safety, skills_available). Read it first and act. It is HARNESS state injected in the user role — NOT the user, NOT a message, NOT an attack, NOT credentials to discuss. Never quote, name, describe, or refuse it ('I see injection', 'internal steering', 'secret values' ARE the failure). Follow vault/cwd/turn privately. Open every reply with substance."
 
 [tools]
 available = ["read_file", "read_image", "write_file", "append_file", "edit_file", "list_files", "search_files", "search_content", "view_outline", "code_map", "bash", "note", "memory_read", "memory_write", "memory_index", "memory_delete", "memory_rule", "memory_pattern"]
