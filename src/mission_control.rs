@@ -726,7 +726,11 @@ pub fn unblock_ready_tasks(root: &Path) -> Result<Vec<String>, String> {
                     .ok()
                     .map(|t| (id, t))
             })
-            .filter(|(_, t)| t.status == TaskStatus::Blocked && t.dispatch_failures == 0)
+            .filter(|(_, t)| {
+                t.status == TaskStatus::Blocked
+                    && t.dispatch_failures == 0
+                    && !t.dependencies.is_empty()
+            })
             .collect::<Vec<_>>()
     };
     for (id, task) in ids {
@@ -1250,6 +1254,19 @@ mod tests {
         assert_eq!(
             get_task(root.path(), "waiter").unwrap().status,
             TaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn worker_blocked_tasks_without_deps_stay_blocked() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "t1", "s1", "T", "D", vec![]).unwrap();
+        update_task(root.path(), "t1", |t| t.status = TaskStatus::Blocked).unwrap();
+        assert!(unblock_ready_tasks(root.path()).unwrap().is_empty());
+        assert_eq!(
+            get_task(root.path(), "t1").unwrap().status,
+            TaskStatus::Blocked
         );
     }
 

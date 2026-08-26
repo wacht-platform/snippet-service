@@ -2946,7 +2946,7 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
         mission_control::HandoffMode::Resume => "",
     };
     let text = format!(
-        "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nrules: do not confirm scope; begin immediately. If handoff_mode is fresh, this envelope is the complete briefing — do not ask for missing history. Stay in scope; do not spawn lanes or manage other sessions. When done/blocked/failed, call report_mission_task for task_id {} — it is bound to this session. If you cannot proceed, report the blocker instead of guessing.\n[/mission_control_task]",
+        "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nrules: do not confirm scope; begin immediately. If handoff_mode is fresh, this envelope is the complete briefing — do not ask for missing history. Stay in this session — it already has the context; do not spawn lanes unless the work is independently parallel. Stay in scope; do not manage other sessions. If a prior read-only report is gone, redo the evaluation from current sources and deliver it. When done/blocked/failed, call report_mission_task for task_id {} — it is bound to this session. Block only for a missing unique artifact or user decision, not compacted history.\n[/mission_control_task]",
         task.id,
         task.title,
         mode_line,

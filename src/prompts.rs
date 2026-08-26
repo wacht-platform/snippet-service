@@ -41,6 +41,10 @@ mod tests {
         assert!(mc.contains("~/.snippet/mission-control"));
         assert!(mc.contains("last_active"));
         assert!(mc.contains("Do not ask other sessions what they are doing"));
+        assert!(mc.contains("Do not do the review yourself because it looks small"));
+        assert!(mc.contains(
+            "do a status/review/diff yourself when a matching session already owns that repo"
+        ));
         assert!(mc.contains("inspect_session output is another chat's history"));
         assert!(mc.contains("[steering] … [/steering]"));
         let coding = coding_system_prompt();
@@ -55,9 +59,12 @@ mod tests {
         assert!(!mc.contains("$SNIPPET_SHADOW_GIT"));
         let coding = coding_system_prompt();
         assert!(coding.contains("snippet_execution_agent"));
+        assert!(coding.contains("Do the work in THIS session"));
+        assert!(coding.contains("redo the evaluation from current sources"));
         assert!(!coding.contains("You are Mission Control"));
         let conversation = conversation_system_prompt();
         assert!(conversation.contains("snippet_conversation_agent"));
+        assert!(conversation.contains("a new lane will miss it"));
         assert!(!conversation.contains("[worker_envelope]"));
         assert!(!conversation.contains("You are Mission Control"));
     }
