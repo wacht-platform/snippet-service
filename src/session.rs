@@ -666,6 +666,75 @@ pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
     }
 }
 
+/// Persist a brand-new idle conversation in `folder` so Mission Control can
+/// dispatch to it. `new_conversation=false` uses the folder's default
+/// `state.json` (refuses if one already exists). `true` always writes a
+/// fresh `conversations/<uuid>.json`.
+pub fn create_blank_session(
+    folder: &Path,
+    title: &str,
+    new_conversation: bool,
+) -> Result<SessionInfo, String> {
+    let folder = folder
+        .canonicalize()
+        .map_err(|e| format!("folder is not a directory: {e}"))?;
+    if !folder.is_dir() {
+        return Err("folder is not a directory".into());
+    }
+    let base = crate::config::state_path_for_workspace(&folder);
+    let dest = if new_conversation {
+        let parent = base
+            .parent()
+            .ok_or_else(|| "workspace state path has no parent".to_string())?;
+        let conv_dir = parent.join("conversations");
+        std::fs::create_dir_all(&conv_dir).map_err(|e| format!("create conversations dir: {e}"))?;
+        conv_dir.join(format!("{}.json", uuid::Uuid::new_v4()))
+    } else {
+        if base.exists() {
+            return Err(
+                "this folder already has a default session — pass new_conversation=true or route to the existing id".into(),
+            );
+        }
+        if let Some(parent) = base.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create workspace dir: {e}"))?;
+        }
+        base
+    };
+
+    let label = title.trim();
+    let state = HarnessState::blank(
+        folder.display().to_string(),
+        (!label.is_empty()).then(|| label.to_string()),
+    );
+    let bytes = crate::harness::serialize_state(&state)?;
+    let tmp = dest.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write session: {e}"))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("rename session: {e}"))?;
+    write_session_meta(&dest, &state);
+
+    let root = workspaces_root();
+    let id = dest
+        .strip_prefix(&root)
+        .unwrap_or(&dest)
+        .display()
+        .to_string();
+    Ok(SessionInfo {
+        id,
+        folder: folder.display().to_string(),
+        conversation: if new_conversation {
+            dest.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("new")
+                .to_string()
+        } else {
+            "default".into()
+        },
+        title: effective_title(&state),
+        status: status_str(state.status),
+        last_active: 0,
+    })
+}
+
 /// Remove a session's state file and its sidecars (metadata + model override —
 /// a leftover `.profile` would silently re-apply the deleted session's model to
 /// the next session opened on this state path).
@@ -839,6 +908,40 @@ mod fork_tests {
                 s.events[p.event_end - 1],
                 HarnessEvent::ToolCall { .. }
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod create_blank_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn create_blank_session_writes_idle_state() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!("snippet-mc-blank-{stamp}"));
+        fs::create_dir_all(&folder).unwrap();
+        let info = create_blank_session(&folder, "Odd request", true).unwrap();
+        assert_eq!(info.title, "Odd request");
+        assert_eq!(info.status, "idle");
+        assert_eq!(info.folder, folder.canonicalize().unwrap().display().to_string());
+        let path = state_path_for_id(&info.id).expect("created session is resolvable");
+        assert!(path.exists());
+        let state = deserialize_state(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(state.status, crate::harness::HarnessStatus::Idle);
+        assert_eq!(state.title.as_deref(), Some("Odd request"));
+        let _ = fs::remove_dir_all(&folder);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(parent.join(format!(
+                "{}.meta.json",
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
+            )));
         }
     }
 }

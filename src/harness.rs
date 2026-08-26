@@ -198,10 +198,11 @@ pub struct HarnessOutcome {
     pub iterations: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessStatus {
     /// No active turn; awaiting the next user input or lane report.
+    #[default]
     Idle,
     Running,
     /// Paused on an `ask_user` question; awaiting the user's answer.
@@ -351,7 +352,7 @@ fn earliest_reset(snap: &crate::llm::RateLimitSnapshot) -> Option<i64> {
         .min()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct HarnessState {
     pub version: u32,
     pub status: HarnessStatus,
@@ -436,6 +437,21 @@ pub struct HarnessState {
 }
 
 impl HarnessState {
+    /// Idle persisted conversation with no turns — used when Mission Control
+    /// opens a new chat so it can dispatch into it.
+    pub fn blank(workspace: impl Into<String>, title: Option<String>) -> Self {
+        let now = Utc::now().to_rfc3339();
+        Self {
+            version: 1,
+            status: HarnessStatus::Idle,
+            created_at: now.clone(),
+            updated_at: now,
+            workspace: workspace.into(),
+            title,
+            ..Self::default()
+        }
+    }
+
     /// Truncate events/messages/checkpoints to a checkpoint boundary.
     /// Returns the checkpoint label on success.
     pub fn apply_checkpoint_rewind(&mut self, checkpoint_id: &str) -> Result<String, String> {

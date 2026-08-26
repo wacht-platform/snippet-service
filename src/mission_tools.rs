@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::llm::NativeToolDefinition;
 use crate::mission_control::{self, TaskResult, TaskStatus};
-use crate::session::{list_device_sessions, state_path_for_id};
+use crate::session::{create_blank_session, list_device_sessions, state_path_for_id};
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 fn schema(properties: Value, required: &[&str]) -> Value {
@@ -38,6 +38,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ListSessions);
     registry.insert(InspectSession);
     registry.insert(ListMissionTasks);
+    registry.insert(CreateMissionSession);
     registry.insert(CreateMissionTask);
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
@@ -226,6 +227,53 @@ impl Tool for ListMissionTasks {
         Ok(ToolResult::success(
             json!({"tasks": tasks.iter().map(task_view).collect::<Vec<_>>() }),
         ))
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateSessionArgs {
+    folder: String,
+    #[serde(default)]
+    title: String,
+    /// When true, always open a new conversation even if the folder already
+    /// has a default session. When false (default), reuse is refused — route
+    /// to the existing id instead.
+    #[serde(default)]
+    new_conversation: bool,
+}
+pub struct CreateMissionSession;
+#[async_trait]
+impl Tool for CreateMissionSession {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "create_mission_session".into(),
+            description: "Open a new durable chat in an existing folder so you can dispatch to it. Use when list_sessions has no matching row but the user named a real directory. folder must already exist. Prefer routing to an existing session; only create when none fits. Then create_mission_task on the returned id with handoff_mode=fresh.".into(),
+            input_schema: schema(
+                json!({
+                    "folder": {"type": "string"},
+                    "title": {"type": "string"},
+                    "new_conversation": {"type": "boolean"}
+                }),
+                &["folder"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let _ = root(ctx)?;
+        let args: CreateSessionArgs =
+            serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
+                tool: "create_mission_session".into(),
+            })?;
+        let folder = std::path::PathBuf::from(args.folder.trim());
+        if args.folder.trim().is_empty() {
+            return Err(ToolError::msg("folder must be a non-empty path"));
+        }
+        let session = create_blank_session(&folder, &args.title, args.new_conversation)
+            .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({
+            "session": session,
+            "note": "Created idle. Dispatch with create_mission_task(session_id, handoff_mode=fresh). Do not implement here.",
+        })))
     }
 }
 

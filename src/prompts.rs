@@ -36,7 +36,10 @@ mod tests {
         assert!(mc.contains("Mission Control"));
         assert!(mc.contains("list_sessions"));
         assert!(mc.contains("inspect_session"));
+        assert!(mc.contains("create_mission_session"));
         assert!(mc.contains("create_mission_task"));
+        assert!(mc.contains("Expect messy, informal"));
+        assert!(mc.contains("ask ONE question after intel"));
         assert!(mc.contains("retry_mission_task"));
         assert!(mc.contains("cancel_mission_task"));
         assert!(mc.contains("read_image"));
