@@ -15,7 +15,7 @@ use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, dese
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
 use crate::prompts::{conversation_system_prompt, mission_control_system_prompt};
-use crate::tools::{BrowserSummaryProvider, ToolContext};
+use crate::tools::{BrowserSummaryProvider, ToolContext, ToolRegistry};
 
 pub struct SessionHandle {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
@@ -101,9 +101,12 @@ fn start_session_with_role(
     // Delegated lanes may run on a different model than the active session
     // (see `delegate_model_config`) — a cheaper model for parallel grunt work or
     // a stronger one for hard sub-tasks. Falls back to the active model.
-    let factory: ModelFactory = {
+    // Mission Control never gets a factory: it routes, it does not spawn lanes.
+    let factory: Option<ModelFactory> = if mission_control {
+        None
+    } else {
         let mc = config.delegate_model_config();
-        Arc::new(move || mc.build_model())
+        Some(Arc::new(move || mc.build_model()))
     };
     let sp = state_path.clone();
     let stream_out = stream.clone();
@@ -132,21 +135,26 @@ fn start_session_with_role(
             Some(id) => base_context.with_durable_session_id(id),
             None => base_context,
         };
-        let mut tools = coding_tools(
-            exa_api_key.clone(),
-            crate::memory::MemoryLimits {
-                enabled: memory_enabled,
-                writable: true,
-                index_budget_chars: memory_index_budget_chars,
-                entry_budget_chars: memory_entry_budget_chars,
-                max_entries: memory_max_entries,
-            },
-        );
-        if mission_control {
+        // MC is a router. Giving it coding_tools (bash/read/edit) plus a
+        // factory lets it ignore the orchestrator prompt and implement itself.
+        let tools = if mission_control {
+            let mut tools = ToolRegistry::new();
             crate::mission_tools::add_mission_control_tools(&mut tools);
+            tools
         } else {
+            let mut tools = coding_tools(
+                exa_api_key.clone(),
+                crate::memory::MemoryLimits {
+                    enabled: memory_enabled,
+                    writable: true,
+                    index_budget_chars: memory_index_budget_chars,
+                    entry_budget_chars: memory_entry_budget_chars,
+                    max_entries: memory_max_entries,
+                },
+            );
             crate::mission_tools::add_worker_report_tool(&mut tools);
-        }
+            tools
+        };
         let harness = CodingHarness::new(
             HarnessConfig {
                 system_prompt: if mission_control {
@@ -172,7 +180,7 @@ fn start_session_with_role(
             context,
         );
         harness
-            .run_interactive(&mut model, initial, rx, Some(factory), stream)
+            .run_interactive(&mut model, initial, rx, factory, stream)
             .await
             .map_err(|e| e.to_string())
     });

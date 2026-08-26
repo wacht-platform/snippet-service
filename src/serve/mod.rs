@@ -354,16 +354,29 @@ impl Daemon {
         if let Some(old) = sessions.remove(id) {
             old.join.abort();
         }
-        let handle = start_session_with_browser_summary(
-            &cfg,
-            sp.clone(),
-            None,
-            true,
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                crate::llm::StreamBuffer::default(),
-            ))),
-            Some(self.browser.summary_provider()),
-        );
+        let role = read_session_role(&sp);
+        let handle = match role.as_deref() {
+            Some("mission_control") => start_mission_control_session(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+            _ => start_session_with_browser_summary(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+        };
         sessions.insert(id.to_string(), live_from_handle(handle, profile));
         RebuildOutcome::Rebuilt
     }
