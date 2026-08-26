@@ -2934,16 +2934,41 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
     }
     let conflicts = mission_control::detect_conflicts(root, task_id, &task.owned_paths)?;
     if !conflicts.is_empty() {
-        let error = format!(
-            "workspace paths are owned by active task(s): {}",
-            conflicts
-                .iter()
-                .map(|conflict| conflict.existing_task_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+        // Queue behind the current owner. This is waiting, not a dispatch
+        // failure — do not burn the retry ceiling.
+        let mut owners = Vec::new();
+        for conflict in &conflicts {
+            if !owners.contains(&conflict.existing_task_id) {
+                owners.push(conflict.existing_task_id.clone());
+            }
+        }
+        let reason = format!(
+            "waiting on workspace owner(s): {}",
+            owners.join(", ")
         );
-        release_failed_claim(root, &task, &error)?;
-        return Err(error);
+        let blocked = mission_control::update_task(root, task_id, |task| {
+            task.status = TaskStatus::Blocked;
+            task.reporting_session = None;
+            task.dispatch_failures = 0;
+            for owner in &owners {
+                if !task.dependencies.iter().any(|d| d.task_id == *owner) {
+                    task.dependencies.push(mission_control::Dependency {
+                        task_id: owner.clone(),
+                        reason: Some("workspace path already in use".into()),
+                    });
+                }
+            }
+            if !task.notifications.iter().any(|n| n.message == reason) {
+                task.notifications
+                    .push(mission_control::NotificationMarker {
+                        target: "mission_control".to_string(),
+                        kind: "blocked".to_string(),
+                        message: reason.clone(),
+                        delivered: false,
+                    });
+            }
+        })?;
+        return Ok(blocked);
     }
     let handoff = task
         .handoff

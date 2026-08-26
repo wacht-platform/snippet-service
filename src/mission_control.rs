@@ -332,10 +332,12 @@ pub struct OwnershipConflict {
     pub path: PathBuf,
 }
 
-/// Scan all *active* (non-terminal) tasks for overlapping `owned_paths`.
+/// Scan *in-progress* tasks for overlapping `owned_paths`.
 ///
-/// Returns a conflict for each path in `candidate_paths` that is already
-/// claimed by a different, still-active task.
+/// Only a delivered (InProgress) task holds the lock. Pending and Blocked
+/// tasks may list the same intended paths — they are queued, not owners.
+/// Treating them as owners made two same-workspace tasks deadlock and burn
+/// the dispatch retry ceiling against each other.
 pub fn detect_conflicts(
     root: &Path,
     candidate_task_id: &str,
@@ -348,7 +350,7 @@ pub fn detect_conflicts(
             continue;
         }
         let t: TaskRecord = read_json(&task_path(root, id))?;
-        if t.status.is_terminal() {
+        if t.status != TaskStatus::InProgress {
             continue;
         }
         for cp in candidate_paths {
@@ -768,7 +770,7 @@ pub fn unblock_ready_tasks(root: &Path) -> Result<Vec<String>, String> {
     for (id, task) in ids {
         let ready = task.dependencies.iter().all(|dep| {
             read_json::<TaskRecord>(&task_path(root, &dep.task_id))
-                .map(|other| other.status == TaskStatus::Done)
+                .map(|other| other.status.is_terminal())
                 .unwrap_or(false)
         });
         if !ready {
@@ -1048,8 +1050,10 @@ mod tests {
             vec![PathBuf::from("/src/c.rs")],
         )
         .unwrap();
+        claim_task_for_dispatch(root.path(), "t1").unwrap();
+        claim_task_for_dispatch(root.path(), "t2").unwrap();
 
-        // Request overlap on a.rs — should conflict with t1.
+        // Request overlap on a.rs — should conflict with in-progress t1.
         let conflicts =
             detect_conflicts(root.path(), "t_new", &[PathBuf::from("/src/a.rs")]).unwrap();
         assert_eq!(conflicts.len(), 1);
@@ -1060,6 +1064,36 @@ mod tests {
         let conflicts2 =
             detect_conflicts(root.path(), "t2", &[PathBuf::from("/src/c.rs")]).unwrap();
         assert!(conflicts2.is_empty());
+    }
+
+    #[test]
+    fn detect_conflicts_ignores_pending_and_blocked() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/")).unwrap();
+        create_task(
+            root.path(),
+            "queued",
+            "s1",
+            "A",
+            "D",
+            vec![PathBuf::from("/src/a.rs")],
+        )
+        .unwrap();
+        create_task(
+            root.path(),
+            "parked",
+            "s1",
+            "B",
+            "D",
+            vec![PathBuf::from("/src/a.rs")],
+        )
+        .unwrap();
+        update_task(root.path(), "parked", |t| t.status = TaskStatus::Blocked).unwrap();
+
+        // Two queued claims of the same path must not deadlock each other.
+        let conflicts =
+            detect_conflicts(root.path(), "t_new", &[PathBuf::from("/src/a.rs")]).unwrap();
+        assert!(conflicts.is_empty());
     }
 
     #[test]
@@ -1281,6 +1315,30 @@ mod tests {
         );
 
         complete_task(root.path(), "dep", TaskStatus::Done, TaskResult::default()).unwrap();
+        let unblocked = unblock_ready_tasks(root.path()).unwrap();
+        assert_eq!(unblocked, vec!["waiter".to_string()]);
+        assert_eq!(
+            get_task(root.path(), "waiter").unwrap().status,
+            TaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn waiter_resumes_when_owner_is_cancelled() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "owner", "s1", "Owner", "D", vec![]).unwrap();
+        create_task(root.path(), "waiter", "s1", "W", "D", vec![]).unwrap();
+        add_dependency(root.path(), "waiter", "owner", Some("workspace")).unwrap();
+        update_task(root.path(), "waiter", |t| t.status = TaskStatus::Blocked).unwrap();
+
+        complete_task(
+            root.path(),
+            "owner",
+            TaskStatus::Cancelled,
+            TaskResult::default(),
+        )
+        .unwrap();
         let unblocked = unblock_ready_tasks(root.path()).unwrap();
         assert_eq!(unblocked, vec!["waiter".to_string()]);
         assert_eq!(

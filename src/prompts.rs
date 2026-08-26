@@ -38,6 +38,8 @@ mod tests {
         assert!(mc.contains("inspect_session"));
         assert!(mc.contains("create_mission_task"));
         assert!(mc.contains("retry_mission_task"));
+        assert!(mc.contains("cancel_mission_task"));
+        assert!(mc.contains("read_image"));
         assert!(mc.contains("bash is for inspection only"));
         assert!(mc.contains("never excessively"));
         assert!(mc.contains("Going idle IS waiting"));

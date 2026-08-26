@@ -40,6 +40,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ListMissionTasks);
     registry.insert(CreateMissionTask);
     registry.insert(RetryMissionTask);
+    registry.insert(CancelMissionTask);
     registry.insert(ArchiveMissionSession);
 }
 
@@ -327,6 +328,46 @@ impl Tool for RetryMissionTask {
         Ok(ToolResult::success(json!({
             "task": task_view(&task),
             "note": "Re-queued as pending. The daemon will dispatch it again."
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct CancelTaskArgs {
+    task_id: String,
+}
+pub struct CancelMissionTask;
+#[async_trait]
+impl Tool for CancelMissionTask {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "cancel_mission_task".into(),
+            description: "Cancel a queued, blocked, failed, or in-progress Mission Control task. Use when the user drops the work or two tasks are deadlocked. Does not delete history. Refuses already-done work.".into(),
+            input_schema: schema(json!({"task_id":{"type":"string"}}), &["task_id"]),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: CancelTaskArgs =
+            serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
+                tool: "cancel_mission_task".into(),
+            })?;
+        if args.task_id.trim().is_empty() {
+            return Err(ToolError::msg("task_id must be non-empty"));
+        }
+        let task = mission_control::complete_task(
+            &root(ctx)?,
+            args.task_id.trim(),
+            TaskStatus::Cancelled,
+            TaskResult {
+                summary: "Cancelled by Mission Control.".into(),
+                authoritative: true,
+                ..Default::default()
+            },
+        )
+        .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({
+            "task": task_view(&task),
+            "note": "Cancelled. Waiters on this task can now dispatch."
         })))
     }
 }

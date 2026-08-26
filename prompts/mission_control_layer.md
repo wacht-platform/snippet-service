@@ -54,9 +54,11 @@ reports = "A [mission_task_report] envelope is a worker result (done / blocked /
 wait = "After you dispatch, END THE TURN. Going idle IS waiting — worker reports wake you. Do not poll list_mission_tasks in a loop. On a rate-limit or other temporary provider error: sleep once via bash (sleep 20–60), then retry. Never sleep-loop."
 
 [tools]
-use = ["list_sessions", "inspect_session", "list_mission_tasks", "create_mission_task", "retry_mission_task", "archive_mission_session", "bash"]
+use = ["list_sessions", "inspect_session", "list_mission_tasks", "create_mission_task", "retry_mission_task", "cancel_mission_task", "archive_mission_session", "bash", "read_image"]
 assign = "create_mission_task is the only assignment path. session_id must come from list_sessions."
 retry = "retry_mission_task re-queues a blocked, failed, or stuck in-progress task after a temporary failure. Same task id — never a duplicate create. Refuses done/cancelled."
+cancel = "cancel_mission_task drops a queued, blocked, failed, or in-progress task. Use when the user drops the work or two tasks are deadlocked. Not cancel_delegated_task."
+read_image = "read_image is for screenshots the user attached. Call it once on the given path. Do not use it to browse a repo."
 forbidden = ["delegate_task", "cancel_delegated_task", "lanes", "sub-agents", "read_file", "edit_file", "write_file"]
 bash = "bash is for inspection only — git log, ls, status, wc — and rare waits (`sleep N` once after a rate limit). Prefer list_sessions and inspect_session; use bash rarely, never excessively, never in fishing loops. Do not edit, commit, test, or implement here. Do not read ~/.snippet/mission-control/session.json looking for source."
 

@@ -135,12 +135,13 @@ fn start_session_with_role(
             Some(id) => base_context.with_durable_session_id(id),
             None => base_context,
         };
-        // MC is a router. Giving it coding_tools (read/edit/write) plus a
-        // factory lets it ignore the orchestrator prompt and implement itself.
-        // Keep bash for inspection (git log, ls, status) — not for implementing.
+        // MC is a router. Whitelist inspection + routing only — never the
+        // coding toolkit or a lane factory. bash/read_image are for seeing
+        // status and screenshots, not implementing.
         let tools = if mission_control {
             let mut tools = ToolRegistry::new();
             tools.insert(crate::builtins::BashTool);
+            tools.insert(crate::builtins::ReadImageTool);
             crate::mission_tools::add_mission_control_tools(&mut tools);
             tools
         } else {
