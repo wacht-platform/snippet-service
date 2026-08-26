@@ -708,13 +708,45 @@ pub fn archive_all(root: &Path) -> Result<u32, String> {
     Ok(count)
 }
 
+/// Re-queue a non-terminal or failed task so dispatch can deliver it again.
+/// Use after a temporary failure (rate limit, dispatch ceiling, worker
+/// `blocked`). Refuses Done/Cancelled — those are finished, not paused.
+pub fn retry_task(root: &Path, id: &str) -> Result<TaskRecord, String> {
+    update_task(root, id, |t| {
+        if matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled) {
+            return;
+        }
+        t.status = TaskStatus::Pending;
+        t.dispatch_failures = 0;
+        t.reporting_session = None;
+        t.owned_paths.clear();
+        t.notifications.push(NotificationMarker {
+            target: "mission_control".into(),
+            kind: "info".into(),
+            message: "re-queued after temporary failure".into(),
+            delivered: true,
+        });
+    })
+    .and_then(|t| {
+        if matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled) {
+            Err(format!(
+                "task {id} is {:?}; only blocked, failed, or in-progress work can be retried",
+                t.status
+            ))
+        } else {
+            Ok(t)
+        }
+    })
+}
+
 /// Return every Blocked task whose dependencies are all Done back to Pending
 /// so the dispatch loop can pick them up. Called after any task completes;
 /// cheap no-op when nothing is eligible. Returns the ids re-queued.
 ///
 /// Tasks blocked by the dispatch retry ceiling (`dispatch_failures`) are NOT
 /// re-queued here — a dependency-less blocked task is retry-exhausted, and the
-/// user must explicitly reset it (e.g. via REST `status: "pending"`).
+/// user must explicitly reset it (e.g. via REST `status: "pending"` or
+/// `retry_mission_task`).
 pub fn unblock_ready_tasks(root: &Path) -> Result<Vec<String>, String> {
     let mut unblocked = Vec::new();
     let ids = {
@@ -1268,6 +1300,38 @@ mod tests {
             get_task(root.path(), "t1").unwrap().status,
             TaskStatus::Blocked
         );
+    }
+
+    #[test]
+    fn retry_task_requeues_blocked_and_failed() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "t1", "s1", "T", "D", vec![]).unwrap();
+        update_task(root.path(), "t1", |t| {
+            t.status = TaskStatus::Blocked;
+            t.dispatch_failures = 5;
+            t.reporting_session = Some("s1".into());
+        })
+        .unwrap();
+        let retried = retry_task(root.path(), "t1").unwrap();
+        assert_eq!(retried.status, TaskStatus::Pending);
+        assert_eq!(retried.dispatch_failures, 0);
+        assert!(retried.reporting_session.is_none());
+
+        update_task(root.path(), "t1", |t| t.status = TaskStatus::Failed).unwrap();
+        assert_eq!(
+            retry_task(root.path(), "t1").unwrap().status,
+            TaskStatus::Pending
+        );
+
+        complete_task(
+            root.path(),
+            "t1",
+            TaskStatus::Done,
+            TaskResult::default(),
+        )
+        .unwrap();
+        assert!(retry_task(root.path(), "t1").is_err());
     }
 
     #[test]

@@ -30,6 +30,7 @@ fn task_view(task: &mission_control::TaskRecord) -> Value {
         "dependencies": task.dependencies, "handoff": task.handoff,
         "result": task.result, "owned_paths": task.owned_paths,
         "notifications": task.notifications, "updated_at": task.updated_at,
+        "dispatch_failures": task.dispatch_failures,
     })
 }
 
@@ -38,6 +39,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(InspectSession);
     registry.insert(ListMissionTasks);
     registry.insert(CreateMissionTask);
+    registry.insert(RetryMissionTask);
     registry.insert(ArchiveMissionSession);
 }
 
@@ -215,7 +217,7 @@ pub struct ListMissionTasks;
 #[async_trait]
 impl Tool for ListMissionTasks {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "list_mission_tasks".into(), description: "List Mission Control's durable task board, including queued, active, blocked, and completed work.".into(), input_schema: schema(json!({}), &[]) }
+        NativeToolDefinition { name: "list_mission_tasks".into(), description: "List Mission Control's durable task board, including queued, active, blocked, failed, and completed work. Read status, result, notifications, and dispatch_failures — those are how you see errors and temporary failures to resume.".into(), input_schema: schema(json!({}), &[]) }
     }
     async fn execute(&self, ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
         let root = root(ctx)?;
@@ -295,6 +297,37 @@ impl Tool for CreateMissionTask {
         Ok(ToolResult::success(
             json!({"task": task_view(&task), "note":"Persisted as pending. The daemon will dispatch it when its workspace is available."}),
         ))
+    }
+}
+
+#[derive(Deserialize)]
+struct RetryTaskArgs {
+    task_id: String,
+}
+pub struct RetryMissionTask;
+#[async_trait]
+impl Tool for RetryMissionTask {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "retry_mission_task".into(),
+            description: "Re-queue a blocked, failed, or stuck in-progress Mission Control task after a temporary failure (rate limit, dispatch error). Does not create a new task. Refuses done/cancelled work.".into(),
+            input_schema: schema(json!({"task_id":{"type":"string"}}), &["task_id"]),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: RetryTaskArgs =
+            serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
+                tool: "retry_mission_task".into(),
+            })?;
+        if args.task_id.trim().is_empty() {
+            return Err(ToolError::msg("task_id must be non-empty"));
+        }
+        let task = mission_control::retry_task(&root(ctx)?, args.task_id.trim())
+            .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({
+            "task": task_view(&task),
+            "note": "Re-queued as pending. The daemon will dispatch it again."
+        })))
     }
 }
 

@@ -37,6 +37,11 @@ mod tests {
         assert!(mc.contains("list_sessions"));
         assert!(mc.contains("inspect_session"));
         assert!(mc.contains("create_mission_task"));
+        assert!(mc.contains("retry_mission_task"));
+        assert!(mc.contains("bash is for inspection only"));
+        assert!(mc.contains("never excessively"));
+        assert!(mc.contains("Going idle IS waiting"));
+        assert!(mc.contains("[mission_task_report]"));
         assert!(mc.contains("Gather first. Confirm second. Route third."));
         assert!(mc.contains("~/.snippet/mission-control"));
         assert!(mc.contains("last_active"));
@@ -60,6 +65,7 @@ mod tests {
         let coding = coding_system_prompt();
         assert!(coding.contains("snippet_execution_agent"));
         assert!(coding.contains("Do the work in THIS session"));
+        assert!(coding.contains("you MUST call report_mission_task"));
         assert!(coding.contains("redo the evaluation from current sources"));
         assert!(!coding.contains("You are Mission Control"));
         let conversation = conversation_system_prompt();
