@@ -85,6 +85,9 @@ pub struct ToolContext {
     /// Set for daemon-managed sessions; lets `report_mission_task` verify the
     /// caller actually owns the task it is reporting on.
     durable_session_id: Option<String>,
+    /// Same store the daemon dispatcher uses. Set for Mission Control so tools
+    /// do not recompute the root from HOME independently.
+    mission_control_root: Option<PathBuf>,
 }
 
 impl ToolContext {
@@ -93,8 +96,10 @@ impl ToolContext {
     }
 
     pub fn mission_control(workspace_root: impl Into<PathBuf>) -> Result<Self, ToolError> {
-        let mut context = Self::with_owner(workspace_root, "mission_control")?;
+        let root = workspace_root.into();
+        let mut context = Self::with_owner(root.clone(), "mission_control")?;
         context.mission_control = true;
+        context.mission_control_root = Some(root);
         Ok(context)
     }
 
@@ -134,6 +139,7 @@ impl ToolContext {
             memory_writes: Arc::new(Mutex::new(Vec::new())),
             mission_control: false,
             durable_session_id: None,
+            mission_control_root: None,
         })
     }
 
@@ -161,8 +167,7 @@ impl ToolContext {
     }
 
     pub fn mission_control_root(&self) -> Option<PathBuf> {
-        self.mission_control
-            .then(|| crate::mission_control::MissionControlStore::default_root(None))
+        self.mission_control_root.clone()
     }
 
     /// Record a successful memory_write id for live-context [memory_updated].

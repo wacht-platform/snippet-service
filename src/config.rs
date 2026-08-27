@@ -30,7 +30,7 @@ pub fn worktrees_root() -> PathBuf {
     snippet_home().join("worktrees")
 }
 
-fn snippet_home() -> PathBuf {
+pub fn snippet_home() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));

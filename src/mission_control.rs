@@ -212,10 +212,7 @@ fn data_root(override_path: Option<&Path>) -> PathBuf {
     if let Some(p) = override_path {
         return p.to_path_buf();
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".snippet").join("mission-control")
+    crate::config::snippet_home().join("mission-control")
 }
 
 /// Workspace the Mission Control agent runs in — the dedicated home, never a
@@ -710,12 +707,16 @@ pub fn archive_all(root: &Path) -> Result<u32, String> {
     Ok(count)
 }
 
-/// Re-queue a non-terminal or failed task so dispatch can deliver it again.
+/// Re-queue a blocked or failed task so dispatch can deliver it again.
 /// Use after a temporary failure (rate limit, dispatch ceiling, worker
-/// `blocked`). Refuses Done/Cancelled — those are finished, not paused.
+/// `blocked`). Refuses Done/Cancelled (finished) and InProgress (still
+/// delivered to a worker).
 pub fn retry_task(root: &Path, id: &str) -> Result<TaskRecord, String> {
     update_task(root, id, |t| {
-        if matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        if matches!(
+            t.status,
+            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::InProgress
+        ) {
             return;
         }
         t.status = TaskStatus::Pending;
@@ -730,9 +731,12 @@ pub fn retry_task(root: &Path, id: &str) -> Result<TaskRecord, String> {
         });
     })
     .and_then(|t| {
-        if matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        if matches!(
+            t.status,
+            TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::InProgress
+        ) {
             Err(format!(
-                "task {id} is {:?}; only blocked, failed, or in-progress work can be retried",
+                "task {id} is {:?}; only blocked or failed work can be retried",
                 t.status
             ))
         } else {
@@ -1198,11 +1202,11 @@ mod tests {
     // -- MissionControlStore ----------------------------------------------
 
     #[test]
-    fn store_default_root_falls_back_to_tmp() {
-        // When HOME is unset or unusual the fallback is /tmp.
+    fn store_default_root_is_under_snippet_home() {
         let path = MissionControlStore::default_root(None);
-        // Should always produce a valid path.
         assert!(path.to_string_lossy().contains("mission-control"));
+        assert_eq!(path, crate::config::snippet_home().join("mission-control"));
+        assert!(!path.starts_with("/tmp/.snippet"));
     }
 
     #[test]
@@ -1390,6 +1394,14 @@ mod tests {
         )
         .unwrap();
         assert!(retry_task(root.path(), "t1").is_err());
+
+        create_task(root.path(), "t2", "s1", "T2", "D", vec![]).unwrap();
+        update_task(root.path(), "t2", |t| t.status = TaskStatus::InProgress).unwrap();
+        assert!(retry_task(root.path(), "t2").is_err());
+        assert_eq!(
+            get_task(root.path(), "t2").unwrap().status,
+            TaskStatus::InProgress
+        );
     }
 
     #[test]
