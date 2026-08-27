@@ -47,8 +47,10 @@ mod tests {
         assert!(mc.contains("openable card"));
         assert!(mc.contains("bash is for inspection"));
         assert!(mc.contains("mkdir -p --"));
+        assert!(mc.contains("npx create-next-app"));
+        assert!(mc.contains("npm create vite"));
         assert!(mc.contains("Wait for yes"));
-        assert!(mc.contains("Do not mkdir without that yes"));
+        assert!(mc.contains("Do not init without that yes"));
         assert!(mc.contains("never excessively"));
         assert!(mc.contains("Going idle IS waiting"));
         assert!(mc.contains("[mission_task_report]"));
