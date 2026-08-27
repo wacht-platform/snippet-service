@@ -4,6 +4,7 @@
 //! (and, optionally, a live `StreamHandle`). Shared by the TUI and headless `serve`.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -666,20 +667,105 @@ pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
     }
 }
 
+/// If `folder` is a git work tree, add a detached worktree under
+/// `~/.snippet/worktrees/{repo}/{id}` and return that path (preserving a
+/// subfolder relative to the repo root). Non-git folders, nested worktrees
+/// already under that root, and any git failure fall back to `folder`.
+pub fn prepare_new_session_workspace(folder: &Path) -> PathBuf {
+    try_session_worktree(folder).unwrap_or_else(|| folder.to_path_buf())
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn sanitize_repo_name(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "repo".into()
+    } else {
+        s
+    }
+}
+
+fn try_session_worktree(folder: &Path) -> Option<PathBuf> {
+    let inside = git_stdout(folder, &["rev-parse", "--is-inside-work-tree"])?;
+    if inside != "true" {
+        return None;
+    }
+    let toplevel = PathBuf::from(git_stdout(folder, &["rev-parse", "--show-toplevel"])?);
+    let root = crate::config::worktrees_root();
+    if folder.starts_with(&root) || toplevel.starts_with(&root) {
+        return None;
+    }
+    let repo = sanitize_repo_name(toplevel.file_name()?.to_str()?);
+    let id = uuid::Uuid::new_v4().to_string();
+    let dest = root.join(repo).join(&id[..8]);
+    std::fs::create_dir_all(dest.parent()?).ok()?;
+    if dest.exists() {
+        return None;
+    }
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&toplevel)
+        .args(["worktree", "add", "--detach"])
+        .arg(&dest)
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dest);
+        return None;
+    }
+    let workspace = match folder.strip_prefix(&toplevel) {
+        Ok(rel) if !rel.as_os_str().is_empty() => dest.join(rel),
+        _ => dest,
+    };
+    Some(workspace)
+}
+
 /// Persist a brand-new idle conversation in `folder` so Mission Control can
 /// dispatch to it. `new_conversation=false` uses the folder's default
 /// `state.json` (refuses if one already exists). `true` always writes a
-/// fresh `conversations/<uuid>.json`.
+/// fresh `conversations/<uuid>.json`. Git repos get an isolated worktree.
 pub fn create_blank_session(
     folder: &Path,
     title: &str,
     new_conversation: bool,
 ) -> Result<SessionInfo, String> {
-    let folder = folder
+    let mut folder = folder
         .canonicalize()
         .map_err(|e| format!("folder is not a directory: {e}"))?;
     if !folder.is_dir() {
         return Err("folder is not a directory".into());
+    }
+    if new_conversation {
+        folder = prepare_new_session_workspace(&folder);
+        if let Ok(canonical) = folder.canonicalize() {
+            folder = canonical;
+        }
     }
     let base = crate::config::state_path_for_workspace(&folder);
     let dest = if new_conversation {
@@ -943,5 +1029,68 @@ mod create_blank_tests {
                 path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
             )));
         }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    #[test]
+    fn new_session_in_git_repo_uses_isolated_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = std::env::temp_dir().join(format!("snippet-wt-repo-{stamp}"));
+        let trees = std::env::temp_dir().join(format!("snippet-wt-root-{stamp}"));
+        fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q"]);
+        git_ok(&repo, &["config", "user.email", "snippet@test"]);
+        git_ok(&repo, &["config", "user.name", "snippet"]);
+        fs::write(repo.join("README"), "hi\n").unwrap();
+        git_ok(&repo, &["add", "README"]);
+        git_ok(&repo, &["commit", "-qm", "init"]);
+        let repo = repo.canonicalize().unwrap();
+        let prev = std::env::var_os("SNIPPET_WORKTREES");
+        // Test-only isolation of the worktree root; restored immediately after.
+        unsafe { std::env::set_var("SNIPPET_WORKTREES", &trees) };
+        let workspace = prepare_new_session_workspace(&repo);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("SNIPPET_WORKTREES", v),
+                None => std::env::remove_var("SNIPPET_WORKTREES"),
+            }
+        }
+        assert_ne!(workspace, repo);
+        assert!(workspace.starts_with(&trees));
+        assert!(workspace.join(".git").exists());
+        assert!(workspace.join("README").exists());
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&workspace)
+            .status();
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&trees);
+    }
+
+    #[test]
+    fn non_git_folder_stays_put() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!("snippet-wt-plain-{stamp}"));
+        fs::create_dir_all(&folder).unwrap();
+        let got = prepare_new_session_workspace(&folder);
+        assert_eq!(got, folder);
+        let _ = fs::remove_dir_all(&folder);
     }
 }

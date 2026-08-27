@@ -25,8 +25,9 @@ use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{LoopInput, deserialize_state, serialize_state};
 use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
 use crate::session::{
-    list_device_sessions, read_session_profile, start_mission_control_session,
-    start_session_with_browser_summary, state_path_for_id, write_session_profile,
+    list_device_sessions, prepare_new_session_workspace, read_session_profile,
+    start_mission_control_session, start_session_with_browser_summary, state_path_for_id,
+    write_session_profile,
 };
 
 mod browser;
@@ -1242,9 +1243,15 @@ async fn open_session(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let folder = PathBuf::from(&req.folder);
+    let mut folder = PathBuf::from(&req.folder);
     if !folder.is_dir() {
         return (StatusCode::BAD_REQUEST, "not a directory").into_response();
+    }
+    // New conversations in a git repo get an isolated worktree under
+    // ~/.snippet/worktrees/{repo}/{id}. Resume / default stay in the original
+    // folder so existing chats are untouched.
+    if req.new_conversation {
+        folder = prepare_new_session_workspace(&folder);
     }
     let base_state = {
         let c = d.config.lock().unwrap();
@@ -1277,7 +1284,7 @@ async fn open_session(
     let profile = persisted.clone().or_else(|| req.profile.clone());
     let cfg = {
         let c = d.config.lock().unwrap();
-        let mut w = c.for_workspace(folder);
+        let mut w = c.for_workspace(folder.clone());
         apply_profile(&mut w, &profile);
         w
     };
@@ -1301,7 +1308,7 @@ async fn open_session(
         }
         sessions.insert(id.clone(), live_from_handle(handle, profile));
     }
-    Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
+    Json(serde_json::json!({ "id": id, "folder": folder.display().to_string() })).into_response()
 }
 
 #[derive(Serialize)]
