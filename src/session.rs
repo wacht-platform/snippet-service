@@ -291,6 +291,15 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
     out
 }
 
+/// Same catalog as [`list_device_sessions`], without Mission Control itself —
+/// the routing agent must not treat its own home as a dispatch target.
+pub fn list_routable_sessions() -> Vec<SessionInfo> {
+    list_device_sessions()
+        .into_iter()
+        .filter(|s| !crate::mission_control::is_session_id(&s.id))
+        .collect()
+}
+
 fn mission_control_list_row() -> Option<SessionInfo> {
     let path = crate::mission_control::session_state_path();
     if !path.exists() {
@@ -711,6 +720,17 @@ fn sanitize_repo_name(name: &str) -> String {
     }
 }
 
+fn unique_worktree_path(parent: &Path) -> Option<PathBuf> {
+    for _ in 0..8 {
+        let id = uuid::Uuid::new_v4().to_string();
+        let dest = parent.join(&id[..8]);
+        if !dest.exists() {
+            return Some(dest);
+        }
+    }
+    Some(parent.join(uuid::Uuid::new_v4().to_string()))
+}
+
 fn try_session_worktree(folder: &Path) -> Option<PathBuf> {
     let inside = git_stdout(folder, &["rev-parse", "--is-inside-work-tree"])?;
     if inside != "true" {
@@ -722,12 +742,10 @@ fn try_session_worktree(folder: &Path) -> Option<PathBuf> {
         return None;
     }
     let repo = sanitize_repo_name(toplevel.file_name()?.to_str()?);
-    let id = uuid::Uuid::new_v4().to_string();
-    let dest = root.join(repo).join(&id[..8]);
-    std::fs::create_dir_all(dest.parent()?).ok()?;
-    if dest.exists() {
-        return None;
-    }
+    let parent = root.join(&repo);
+    std::fs::create_dir_all(&parent).ok()?;
+    // Unique per session so one repo can host many parallel worktrees.
+    let dest = unique_worktree_path(&parent)?;
     let status = Command::new("git")
         .arg("-C")
         .arg(&toplevel)
@@ -823,12 +841,81 @@ pub fn create_blank_session(
 
 /// Remove a session's state file and its sidecars (metadata + model override —
 /// a leftover `.profile` would silently re-apply the deleted session's model to
-/// the next session opened on this state path).
+/// the next session opened on this state path). Isolated git worktrees created
+/// for this session are removed too.
 pub fn remove_session_files(state_path: &Path) {
+    if let Some(folder) = workspace_from_state_file(state_path) {
+        drop_session_worktree(&folder);
+    }
     let _ = std::fs::remove_file(state_path);
     let _ = std::fs::remove_file(meta_path(state_path));
     let _ = std::fs::remove_file(state_path.with_extension("nonces.json"));
     let _ = std::fs::remove_file(profile_sidecar(state_path));
+}
+
+fn workspace_from_state_file(state_path: &Path) -> Option<PathBuf> {
+    if let Some(meta) = std::fs::read(meta_path(state_path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
+    {
+        if !meta.folder.trim().is_empty() {
+            return Some(PathBuf::from(meta.folder));
+        }
+    }
+    let bytes = std::fs::read(state_path).ok()?;
+    let state = deserialize_state(&bytes).ok()?;
+    if state.workspace.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(state.workspace))
+    }
+}
+
+/// Best-effort: drop a linked git worktree created for this session.
+/// A linked worktree has a `.git` *file* (not a directory). Never touches
+/// the original clone.
+fn drop_session_worktree(folder: &Path) {
+    let folder = folder.canonicalize().unwrap_or_else(|_| folder.to_path_buf());
+    let Some(worktree) = linked_worktree_root(&folder) else {
+        return;
+    };
+    if let Some(common) = git_stdout(&worktree, &["rev-parse", "--git-common-dir"]) {
+        let common_path = PathBuf::from(&common);
+        let common_path = if common_path.is_absolute() {
+            common_path
+        } else {
+            worktree.join(common_path)
+        };
+        if let Some(main) = common_path.parent() {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(main)
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree)
+                .status();
+        }
+    }
+    if worktree.exists() {
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+}
+
+/// Walk up from `folder` until we find a `.git` file — the linked-worktree
+/// marker. A `.git` directory is the original clone and is left alone.
+fn linked_worktree_root(folder: &Path) -> Option<PathBuf> {
+    let mut cur = folder.to_path_buf();
+    loop {
+        let git = cur.join(".git");
+        if git.is_file() {
+            return Some(cur);
+        }
+        if git.is_dir() {
+            return None;
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
 }
 
 fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<SessionInfo>) {
@@ -1041,14 +1128,8 @@ mod create_blank_tests {
         assert!(status.success(), "git {args:?} failed in {}", dir.display());
     }
 
-    #[test]
-    fn new_session_in_git_repo_uses_isolated_worktree() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let repo = std::env::temp_dir().join(format!("snippet-wt-repo-{stamp}"));
-        let trees = std::env::temp_dir().join(format!("snippet-wt-root-{stamp}"));
+    fn init_repo(stamp: u128, suffix: &str) -> PathBuf {
+        let repo = std::env::temp_dir().join(format!("snippet-wt-{suffix}-{stamp}"));
         fs::create_dir_all(&repo).unwrap();
         git_ok(&repo, &["init", "-q"]);
         git_ok(&repo, &["config", "user.email", "snippet@test"]);
@@ -1056,29 +1137,36 @@ mod create_blank_tests {
         fs::write(repo.join("README"), "hi\n").unwrap();
         git_ok(&repo, &["add", "README"]);
         git_ok(&repo, &["commit", "-qm", "init"]);
-        let repo = repo.canonicalize().unwrap();
-        let prev = std::env::var_os("SNIPPET_WORKTREES");
-        // Test-only isolation of the worktree root; restored immediately after.
-        unsafe { std::env::set_var("SNIPPET_WORKTREES", &trees) };
-        let workspace = prepare_new_session_workspace(&repo);
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("SNIPPET_WORKTREES", v),
-                None => std::env::remove_var("SNIPPET_WORKTREES"),
-            }
-        }
-        assert_ne!(workspace, repo);
-        assert!(workspace.starts_with(&trees));
-        assert!(workspace.join(".git").exists());
-        assert!(workspace.join("README").exists());
+        repo.canonicalize().unwrap()
+    }
+
+    fn drop_worktree(repo: &Path, workspace: &Path) {
         let _ = Command::new("git")
             .arg("-C")
-            .arg(&repo)
+            .arg(repo)
             .args(["worktree", "remove", "--force"])
-            .arg(&workspace)
+            .arg(workspace)
             .status();
+        if workspace.exists() {
+            let _ = fs::remove_dir_all(workspace);
+        }
+    }
+
+    #[test]
+    fn new_session_in_git_repo_uses_isolated_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "repo");
+        let workspace = prepare_new_session_workspace(&repo);
+        let root = crate::config::worktrees_root();
+        assert_ne!(workspace, repo);
+        assert!(workspace.starts_with(&root));
+        assert!(workspace.join(".git").is_file());
+        assert!(workspace.join("README").exists());
+        drop_worktree(&repo, &workspace);
         let _ = fs::remove_dir_all(&repo);
-        let _ = fs::remove_dir_all(&trees);
     }
 
     #[test]
@@ -1092,5 +1180,40 @@ mod create_blank_tests {
         let got = prepare_new_session_workspace(&folder);
         assert_eq!(got, folder);
         let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn parallel_sessions_get_unique_worktrees() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "parallel");
+        let a = prepare_new_session_workspace(&repo);
+        let b = prepare_new_session_workspace(&repo);
+        let root = crate::config::worktrees_root();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&root) && b.starts_with(&root));
+        assert!(a.join("README").exists() && b.join("README").exists());
+        drop_worktree(&repo, &a);
+        drop_worktree(&repo, &b);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn deleting_a_session_drops_its_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "drop");
+        let workspace = prepare_new_session_workspace(&repo);
+        assert!(workspace.exists());
+        let info = create_blank_session(&workspace, "wt-drop", false).unwrap();
+        let path = state_path_for_id(&info.id).expect("created session is resolvable");
+        remove_session_files(&path);
+        assert!(!workspace.exists(), "isolated worktree should be gone");
+        assert!(repo.exists(), "original clone must stay");
+        let _ = fs::remove_dir_all(&repo);
     }
 }

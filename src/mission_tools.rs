@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use crate::llm::NativeToolDefinition;
 use crate::mission_control::{self, TaskResult, TaskStatus};
-use crate::session::{create_blank_session, list_device_sessions, state_path_for_id};
+use crate::session::{create_blank_session, list_routable_sessions, state_path_for_id};
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 fn schema(properties: Value, required: &[&str]) -> Value {
@@ -55,7 +55,7 @@ impl Tool for ListSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_sessions".into(),
-            description: "Catalog of every durable chat on this device, newest last_active first. Each row: id (pass to inspect_session / create_mission_task), title (tab name), folder (workspace/repo), status (idle/running/waiting_for_input), last_active (unix seconds). This IS what other sessions are doing — do not ask them. Call before routing.".into(),
+            description: "Catalog of every durable chat on this device except Mission Control itself, newest last_active first. Each row: id (pass to inspect_session / create_mission_task), title (tab name), folder (workspace/repo), status (idle/running/waiting_for_input), last_active (unix seconds). This IS what other sessions are doing — do not ask them. Call before routing.".into(),
             input_schema: schema(json!({}), &[]),
         }
     }
@@ -64,7 +64,7 @@ impl Tool for ListSessions {
         _ctx: &ToolContext,
         _arguments: Value,
     ) -> Result<ToolResult, ToolError> {
-        let sessions = list_device_sessions();
+        let sessions = list_routable_sessions();
         Ok(ToolResult::success(json!({"sessions": sessions})))
     }
 }

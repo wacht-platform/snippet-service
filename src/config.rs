@@ -27,9 +27,6 @@ pub fn workspaces_root() -> PathBuf {
 
 /// Isolated git worktrees for new sessions: `~/.snippet/worktrees/{repo}/{id}`.
 pub fn worktrees_root() -> PathBuf {
-    if let Some(p) = std::env::var_os("SNIPPET_WORKTREES") {
-        return PathBuf::from(p);
-    }
     snippet_home().join("worktrees")
 }
 
