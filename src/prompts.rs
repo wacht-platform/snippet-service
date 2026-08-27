@@ -45,7 +45,10 @@ mod tests {
         assert!(mc.contains("read_image"));
         assert!(mc.contains("present_file"));
         assert!(mc.contains("openable card"));
-        assert!(mc.contains("bash is for inspection only"));
+        assert!(mc.contains("bash is for inspection"));
+        assert!(mc.contains("mkdir -p --"));
+        assert!(mc.contains("Wait for yes"));
+        assert!(mc.contains("Do not mkdir without that yes"));
         assert!(mc.contains("never excessively"));
         assert!(mc.contains("Going idle IS waiting"));
         assert!(mc.contains("[mission_task_report]"));
