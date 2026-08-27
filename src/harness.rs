@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -86,6 +86,8 @@ pub struct HarnessConfig {
     /// status only (tool names/paths, never prompts) and is not user-addressable.
     pub progress_tx: Option<mpsc::UnboundedSender<crate::lanes::LaneProgress>>,
     pub progress_id: Option<String>,
+    /// Mission Control coordinates durable sessions rather than spawning lanes.
+    pub allow_lane_control: bool,
 }
 
 impl Default for HarnessConfig {
@@ -111,6 +113,7 @@ impl Default for HarnessConfig {
             memory_reflect_on_compaction: true,
             progress_tx: None,
             progress_id: None,
+            allow_lane_control: true,
         }
     }
 }
@@ -195,10 +198,11 @@ pub struct HarnessOutcome {
     pub iterations: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessStatus {
     /// No active turn; awaiting the next user input or lane report.
+    #[default]
     Idle,
     Running,
     /// Paused on an `ask_user` question; awaiting the user's answer.
@@ -348,7 +352,7 @@ fn earliest_reset(snap: &crate::llm::RateLimitSnapshot) -> Option<i64> {
         .min()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct HarnessState {
     pub version: u32,
     pub status: HarnessStatus,
@@ -433,6 +437,21 @@ pub struct HarnessState {
 }
 
 impl HarnessState {
+    /// Idle persisted conversation with no turns — used when Mission Control
+    /// opens a new chat so it can dispatch into it.
+    pub fn blank(workspace: impl Into<String>, title: Option<String>) -> Self {
+        let now = Utc::now().to_rfc3339();
+        Self {
+            version: 1,
+            status: HarnessStatus::Idle,
+            created_at: now.clone(),
+            updated_at: now,
+            workspace: workspace.into(),
+            title,
+            ..Self::default()
+        }
+    }
+
     /// Truncate events/messages/checkpoints to a checkpoint boundary.
     /// Returns the checkpoint label on success.
     pub fn apply_checkpoint_rewind(&mut self, checkpoint_id: &str) -> Result<String, String> {
@@ -1977,11 +1996,7 @@ impl CodingHarness {
             // `handle_terminal_text` move toward completion.
             if truncated {
                 if let Some(text) = progress_text {
-                    state.messages.push(HarnessMessage::Assistant {
-                        content: text.clone(),
-                        tool_calls: Vec::new(),
-                    });
-                    state.events.push(HarnessEvent::AssistantText { text });
+                    record_assistant_text(state, text, None);
                     // Committed into events — drop the live buffer so clients don't
                     // keep showing the same fragment (and thinking) beside it.
                     if let Some(sink) = sink {
@@ -1995,11 +2010,7 @@ impl CodingHarness {
             // No tool calls: the turn is over and this text is the final answer
             // ("no tool calls = done"). Render it once, in order, and end the run.
             if let Some(text) = progress_text.clone() {
-                state.messages.push(HarnessMessage::Assistant {
-                    content: text.clone(),
-                    tool_calls: Vec::new(),
-                });
-                state.events.push(HarnessEvent::AssistantText { text });
+                record_assistant_text(state, text, None);
             }
             // Always clear after a terminal plain-text step — even with no prose —
             // so sticky thinking can't linger on idle clients between turns.
@@ -2087,12 +2098,13 @@ impl CodingHarness {
                 origin_model: call.origin_model.clone(),
             })
             .collect();
-        state.messages.push(HarnessMessage::Assistant {
-            content: progress_text.clone().unwrap_or_default(),
-            tool_calls,
-        });
         if let Some(text) = progress_text.clone() {
-            state.events.push(HarnessEvent::AssistantText { text });
+            record_assistant_text(state, text, Some(tool_calls));
+        } else {
+            state.messages.push(HarnessMessage::Assistant {
+                content: String::new(),
+                tool_calls,
+            });
         }
         if let Some(sink) = sink {
             StreamBuffer::clear(sink);
@@ -2170,13 +2182,7 @@ impl CodingHarness {
                     // render it as one, or the turn ends silently and the user
                     // never sees the reply.
                     if conversation_mode && !replied_since_last_user(&state.events) {
-                        state.messages.push(HarnessMessage::Assistant {
-                            content: s.to_string(),
-                            tool_calls: Vec::new(),
-                        });
-                        state.events.push(HarnessEvent::AssistantText {
-                            text: s.to_string(),
-                        });
+                        record_assistant_text(state, s.to_string(), None);
                         if let Some(sink) = sink {
                             StreamBuffer::clear(sink);
                         }
@@ -2192,7 +2198,13 @@ impl CodingHarness {
                 continue;
             }
 
-            let is_meta = conversation_mode && meta::is_meta_tool(&tool_name);
+            let is_meta = conversation_mode
+                && meta::is_meta_tool(&tool_name)
+                && (self.config.allow_lane_control
+                    || !matches!(
+                        tool_name.as_str(),
+                        "delegate_task" | "cancel_delegated_task"
+                    ));
 
             if is_meta {
                 if tool_name == "note" {
@@ -2920,7 +2932,10 @@ impl CodingHarness {
         if conversation_mode {
             // User-facing: meta tools (note/ask_user/delegate); no terminate tool —
             // a plain reply ends the turn. `complete_goal` is added only while a goal runs.
-            definitions.extend(meta::conversation_meta_definitions(goal_active));
+            definitions.extend(meta::conversation_meta_definitions_for(
+                goal_active,
+                self.config.allow_lane_control,
+            ));
         } else {
             // Headless (lanes / one-shot run): an explicit terminate_loop carries a
             // structured summary back to the caller.
@@ -4448,6 +4463,93 @@ fn replied_since_last_user(events: &[HarnessEvent]) -> bool {
     false
 }
 
+/// Record an assistant turn. Near-duplicate status prose is dropped before it
+/// enters `events` or `messages` so clients and the on-disk session never see
+/// it. Tool-call turns still persist (empty content) so pairing stays valid.
+fn record_assistant_text(
+    state: &mut HarnessState,
+    text: String,
+    tool_calls: Option<Vec<crate::llm::ToolCallRecord>>,
+) {
+    let redundant = assistant_text_is_redundant(&text, &state.events);
+    let content = if redundant || text.trim().is_empty() {
+        String::new()
+    } else {
+        text.clone()
+    };
+    let calls = tool_calls.unwrap_or_default();
+    if !content.is_empty() || !calls.is_empty() {
+        state.messages.push(HarnessMessage::Assistant {
+            content,
+            tool_calls: calls,
+        });
+    }
+    if !redundant && !text.trim().is_empty() {
+        state.events.push(HarnessEvent::AssistantText { text });
+    }
+}
+
+fn normalize_assistant_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn assistant_text_is_redundant(text: &str, events: &[HarnessEvent]) -> bool {
+    let next = normalize_assistant_text(text);
+    if next.is_empty() {
+        return false;
+    }
+    let recent: Vec<&str> = events
+        .iter()
+        .rev()
+        .filter_map(|e| match e {
+            HarnessEvent::AssistantText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .take(3)
+        .collect();
+    for prior in recent {
+        let prev = normalize_assistant_text(prior);
+        if prev.is_empty() {
+            continue;
+        }
+        if next == prev {
+            return true;
+        }
+        if next.chars().count() >= 24 && prev.contains(&next) {
+            return true;
+        }
+        if prev.chars().count() >= 24 && next.contains(&prev) {
+            return true;
+        }
+        if token_overlap(&next, &prev) >= 0.80 {
+            return true;
+        }
+    }
+    false
+}
+
+fn token_overlap(a: &str, b: &str) -> f64 {
+    let as_set: HashSet<&str> = a.split(' ').filter(|w| w.len() > 2).collect();
+    let bs_set: HashSet<&str> = b.split(' ').filter(|w| w.len() > 2).collect();
+    if as_set.is_empty() || bs_set.is_empty() {
+        return 0.0;
+    }
+    let shared = as_set.intersection(&bs_set).count();
+    let denom = as_set.len().min(bs_set.len());
+    shared as f64 / denom as f64
+}
+
 /// On a fresh session in a git work tree, make sure snippet's `.snippet/` scratch
 /// (bg-process registry, lane state) is gitignored so it never lands in the user's
 /// history. Best-effort and idempotent: creates `.gitignore` if it's missing,
@@ -5018,6 +5120,117 @@ mod state_migration_tests {
             state.initial_request(),
             Some("Restore the old session title")
         );
+    }
+}
+
+#[cfg(test)]
+mod assistant_dedup_tests {
+    use super::*;
+    use crate::llm::ToolCallRecord;
+
+    fn empty_state() -> HarnessState {
+        HarnessState {
+            version: 1,
+            status: HarnessStatus::Idle,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+            workspace: "/tmp".into(),
+            title: None,
+            legacy_request: String::new(),
+            goal: None,
+            compacting: false,
+            turn_started_at: None,
+            compacting_started_at: None,
+            watches: Vec::new(),
+            messages: Vec::new(),
+            events: Vec::new(),
+            iterations: 0,
+            final_text: None,
+            lanes: Vec::new(),
+            pending_question: None,
+            approval_mode: ApprovalMode::Auto,
+            total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            last_prompt_tokens: 0,
+            cache_read_tokens: 0,
+            checkpoints: Vec::new(),
+            rate_limit: None,
+            context_window: 10_000,
+            tool_payloads_pruned: false,
+        }
+    }
+
+    fn assistant_texts(state: &HarnessState) -> Vec<&str> {
+        state
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                HarnessEvent::AssistantText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn restated_status_is_not_stored() {
+        let mut state = empty_state();
+        let first = "I'll inspect the hydrate path, keep loading until the first snapshot, then format worker reports.";
+        record_assistant_text(&mut state, first.into(), None);
+        record_assistant_text(
+            &mut state,
+            "I'll inspect the hydrate path, keep loading until the first snapshot.".into(),
+            None,
+        );
+        record_assistant_text(
+            &mut state,
+            "I'll keep going on the MC chat: hide the terminal, make the list row distinct, add a dispatched-task list.".into(),
+            None,
+        );
+        record_assistant_text(
+            &mut state,
+            "I'll keep going on the MC chat: distinct list row, hide terminal, dispatched-task list, and tool/handoff rows that only expand when they have something to show.".into(),
+            None,
+        );
+        record_assistant_text(&mut state, "Fresh direction now.".into(), None);
+        assert_eq!(
+            assistant_texts(&state),
+            vec![
+                first,
+                "I'll keep going on the MC chat: hide the terminal, make the list row distinct, add a dispatched-task list.",
+                "Fresh direction now.",
+            ]
+        );
+        assert_eq!(state.messages.len(), 3);
+    }
+
+    #[test]
+    fn redundant_prose_still_stores_tool_calls() {
+        let mut state = empty_state();
+        record_assistant_text(&mut state, "Checking the hydrate path now.".into(), None);
+        record_assistant_text(
+            &mut state,
+            "Checking the hydrate path now.".into(),
+            Some(vec![ToolCallRecord {
+                id: "c1".into(),
+                name: "list_sessions".into(),
+                arguments: json!({}),
+                signature: None,
+                origin_model: None,
+            }]),
+        );
+        assert_eq!(assistant_texts(&state), vec!["Checking the hydrate path now."]);
+        match &state.messages[1] {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                assert!(content.is_empty());
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].name, "list_sessions");
+            }
+            other => panic!("expected assistant tool turn, got {other:?}"),
+        }
     }
 }
 

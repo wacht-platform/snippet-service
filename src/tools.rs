@@ -80,11 +80,27 @@ pub struct ToolContext {
     /// context as [memory_updated] so the agent can memory_read them now — the
     /// system-prefix index is cache-fixed until resume.
     memory_writes: Arc<Mutex<Vec<String>>>,
+    mission_control: bool,
+    /// Durable session identity (state path relative to the workspaces root).
+    /// Set for daemon-managed sessions; lets `report_mission_task` verify the
+    /// caller actually owns the task it is reporting on.
+    durable_session_id: Option<String>,
+    /// Same store the daemon dispatcher uses. Set for Mission Control so tools
+    /// do not recompute the root from HOME independently.
+    mission_control_root: Option<PathBuf>,
 }
 
 impl ToolContext {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self, ToolError> {
         Self::with_owner(workspace_root, "main")
+    }
+
+    pub fn mission_control(workspace_root: impl Into<PathBuf>) -> Result<Self, ToolError> {
+        let root = workspace_root.into();
+        let mut context = Self::with_owner(root.clone(), "mission_control")?;
+        context.mission_control = true;
+        context.mission_control_root = Some(root);
+        Ok(context)
     }
 
     pub fn with_browser_summary(
@@ -121,6 +137,9 @@ impl ToolContext {
             browser_summary,
             seen: Arc::new(Mutex::new(HashMap::new())),
             memory_writes: Arc::new(Mutex::new(Vec::new())),
+            mission_control: false,
+            durable_session_id: None,
+            mission_control_root: None,
         })
     }
 
@@ -130,6 +149,25 @@ impl ToolContext {
 
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    pub fn is_mission_control(&self) -> bool {
+        self.mission_control
+    }
+
+    /// Bind this context to a durable daemon-managed session id. Called by the
+    /// serve layer when starting/resuming managed sessions.
+    pub fn with_durable_session_id(mut self, id: impl Into<String>) -> Self {
+        self.durable_session_id = Some(id.into());
+        self
+    }
+
+    pub fn durable_session_id(&self) -> Option<&str> {
+        self.durable_session_id.as_deref()
+    }
+
+    pub fn mission_control_root(&self) -> Option<PathBuf> {
+        self.mission_control_root.clone()
     }
 
     /// Record a successful memory_write id for live-context [memory_updated].

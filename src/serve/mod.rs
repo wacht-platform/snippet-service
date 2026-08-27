@@ -23,9 +23,11 @@ use tokio::task::JoinHandle;
 
 use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{LoopInput, deserialize_state, serialize_state};
+use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
 use crate::session::{
-    list_device_sessions, read_session_profile, start_session_with_browser_summary,
-    state_path_for_id, write_session_profile,
+    list_device_sessions, prepare_new_session_workspace, read_session_profile,
+    start_mission_control_session, start_session_with_browser_summary, state_path_for_id,
+    write_session_profile,
 };
 
 mod browser;
@@ -137,6 +139,7 @@ struct Daemon {
     /// first-seen time. Prevents duplicate user messages and decision retries when
     /// the mobile client resends after a reconnect.
     seen_nonces: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    mission_control_root: PathBuf,
 }
 
 /// The machine's hostname, used as the app's default instance name.
@@ -264,16 +267,32 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        let handle = start_session_with_browser_summary(
-            &cfg,
-            sp.clone(),
-            None,
-            true,
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                crate::llm::StreamBuffer::default(),
-            ))),
-            Some(self.browser.summary_provider()),
-        );
+        // Role-aware resume: a session opened as Mission Control must come back
+        // with the MC prompt/tools/lane restrictions after a daemon restart,
+        // not silently downgrade to an ordinary conversation session.
+        let role = read_session_role(&sp);
+        let handle = match role.as_deref() {
+            Some("mission_control") => crate::session::start_mission_control_session(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+            _ => start_session_with_browser_summary(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+        };
         let tx = handle.input_tx.clone();
         let live = live_from_handle(handle, profile);
         let stream = live.stream.clone();
@@ -336,16 +355,29 @@ impl Daemon {
         if let Some(old) = sessions.remove(id) {
             old.join.abort();
         }
-        let handle = start_session_with_browser_summary(
-            &cfg,
-            sp.clone(),
-            None,
-            true,
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                crate::llm::StreamBuffer::default(),
-            ))),
-            Some(self.browser.summary_provider()),
-        );
+        let role = read_session_role(&sp);
+        let handle = match role.as_deref() {
+            Some("mission_control") => start_mission_control_session(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+            _ => start_session_with_browser_summary(
+                &cfg,
+                sp.clone(),
+                None,
+                true,
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::llm::StreamBuffer::default(),
+                ))),
+                Some(self.browser.summary_provider()),
+            ),
+        };
         sessions.insert(id.to_string(), live_from_handle(handle, profile));
         RebuildOutcome::Rebuilt
     }
@@ -478,6 +510,7 @@ pub async fn run_serve(
         git_write: Mutex::new(()),
         browser: BrowserManager::default(),
         seen_nonces: std::sync::Mutex::new(HashMap::new()),
+        mission_control_root: mission_control::MissionControlStore::default_root(None),
     });
 
     // Background self-update: periodically check for a newer release, replace the
@@ -500,6 +533,10 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { config_watch_loop(d).await });
     }
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { mission_control_dispatch_loop(d).await });
+    }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
     // inflates it by ~4/3. Size the request-body limit so a ~1 GB file still fits
     // once encoded (≈1.33 GB) plus headroom for the JSON envelope. Every other route
@@ -510,6 +547,36 @@ pub async fn run_serve(
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
+        .route("/mission-control/overview", get(mission_control_overview))
+        .route(
+            "/mission-control/settings",
+            get(mission_control_settings).put(mission_control_update_settings),
+        )
+        .route("/mission-control/open", post(mission_control_open))
+        .route(
+            "/mission-control/tasks",
+            get(mission_control_tasks).post(mission_control_create_task),
+        )
+        .route(
+            "/mission-control/tasks/{id}",
+            put(mission_control_update_task),
+        )
+        .route(
+            "/mission-control/tasks/{id}/archive",
+            post(mission_control_archive_task),
+        )
+        .route(
+            "/mission-control/sessions",
+            get(mission_control_sessions).post(mission_control_create_session),
+        )
+        .route(
+            "/mission-control/sessions/{id}",
+            put(mission_control_update_session),
+        )
+        .route(
+            "/mission-control/sessions/{id}/archive",
+            post(mission_control_archive_session),
+        )
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
         .route(
@@ -1176,9 +1243,15 @@ async fn open_session(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let folder = PathBuf::from(&req.folder);
+    let mut folder = PathBuf::from(&req.folder);
     if !folder.is_dir() {
         return (StatusCode::BAD_REQUEST, "not a directory").into_response();
+    }
+    // New conversations in a git repo get an isolated worktree under
+    // ~/.snippet/worktrees/{repo}/{id}. Resume / default stay in the original
+    // folder so existing chats are untouched.
+    if req.new_conversation {
+        folder = prepare_new_session_workspace(&folder);
     }
     let base_state = {
         let c = d.config.lock().unwrap();
@@ -1211,7 +1284,7 @@ async fn open_session(
     let profile = persisted.clone().or_else(|| req.profile.clone());
     let cfg = {
         let c = d.config.lock().unwrap();
-        let mut w = c.for_workspace(folder);
+        let mut w = c.for_workspace(folder.clone());
         apply_profile(&mut w, &profile);
         w
     };
@@ -1235,7 +1308,7 @@ async fn open_session(
         }
         sessions.insert(id.clone(), live_from_handle(handle, profile));
     }
-    Json(serde_json::json!({ "id": id, "folder": req.folder })).into_response()
+    Json(serde_json::json!({ "id": id, "folder": folder.display().to_string() })).into_response()
 }
 
 #[derive(Serialize)]
@@ -2464,6 +2537,12 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
         let mut last: HashMap<String, String> = HashMap::new();
         let mut first = true;
         loop {
+            // Re-read the notification policy every tick so setting changes and
+            // MC-session re-opens apply to already-connected clients.
+            let settings = mission_control::load_settings(&daemon.mission_control_root);
+            let mission_id = settings.mission_control_session_id;
+            let suppress_workers = settings.notification_policy == "mission_control_only";
+            let suppress_all = settings.notification_policy == "none";
             let sessions = list_device_sessions();
             let mut seen = HashSet::new();
             let mut out = Vec::new();
@@ -2486,6 +2565,11 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
                     "idle" if prevs == "running" => "idle", // a turn just finished
                     _ => continue, // running / interrupted / newly-seen idle
                 };
+                if suppress_all
+                    || (suppress_workers && mission_id.as_deref() != Some(s.id.as_str()))
+                {
+                    continue;
+                }
                 out.push(serde_json::json!({
                     "session": s.id,
                     "title": s.title,
@@ -2558,6 +2642,7 @@ mod tests {
             git_write: Mutex::new(()),
             browser: BrowserManager::default(),
             seen_nonces: std::sync::Mutex::new(HashMap::new()),
+            mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
     }
 
@@ -2573,5 +2658,853 @@ mod tests {
         let restarted = test_daemon();
         assert!(!restarted.accept_nonce("session", "nonce-1", &state_path));
         assert!(restarted.accept_nonce("session", "nonce-2", &state_path));
+    }
+}
+
+#[derive(Deserialize)]
+struct MissionListQuery {
+    token: Option<String>,
+    archived: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct MissionTaskReq {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    session_id: String,
+    /// `resume` (default) or `fresh` — how the handoff should be delivered.
+    #[serde(default)]
+    handoff_mode: Option<String>,
+    #[serde(default)]
+    owned_paths: Vec<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Validate caller-supplied owned paths against a managed workspace: each must
+/// resolve inside it. Returns the canonicalised list, defaulting to the whole
+/// workspace when nothing valid is supplied. A claimed path may not exist yet
+/// (the task will create it), so non-existent paths are resolved against their
+/// nearest existing ancestor; the workspace is canonicalised once so symlinked
+/// workspaces compare correctly.
+pub fn validated_owned_paths(
+    raw_paths: &[String],
+    workspace: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let mut out = Vec::new();
+    for raw in raw_paths {
+        let path = std::path::PathBuf::from(raw);
+        // Walk up to the nearest ancestor that exists, canonicalise that, and
+        // re-append the non-existent remainder.
+        let mut prefix = path.clone();
+        let mut suffix = Vec::new();
+        let resolved = loop {
+            match prefix.canonicalize() {
+                Ok(canonical) => {
+                    let mut resolved = canonical;
+                    for part in suffix.iter().rev() {
+                        resolved.push(part);
+                    }
+                    break resolved;
+                }
+                Err(_) => match prefix.parent() {
+                    Some(parent) => {
+                        if let Some(name) = prefix.file_name() {
+                            suffix.push(name.to_os_string());
+                        }
+                        prefix = parent.to_path_buf();
+                    }
+                    // Reached the filesystem root without finding anything
+                    // that exists — treat as outside the workspace.
+                    None => break path.clone(),
+                },
+            }
+        };
+        if resolved.starts_with(&root) {
+            out.push(resolved);
+        } else {
+            return Err(format!(
+                "owned path '{raw}' is outside the target session's workspace"
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push(root);
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+struct MissionSessionReq {
+    #[serde(default)]
+    session_id: String,
+    folder: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MissionSessionUpdate {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+fn task_status(raw: &str) -> Option<TaskStatus> {
+    match raw {
+        "pending" => Some(TaskStatus::Pending),
+        "in_progress" => Some(TaskStatus::InProgress),
+        "blocked" => Some(TaskStatus::Blocked),
+        "done" | "completed" => Some(TaskStatus::Done),
+        "failed" => Some(TaskStatus::Failed),
+        "cancelled" => Some(TaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn mission_task_view(task: &TaskRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": task.id,
+        "title": task.title,
+        "description": task.description,
+        "status": task.status,
+        "session_id": task.session_id,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+        "archived": task.status.is_terminal(),
+        "owned_paths": task.owned_paths,
+        "dependencies": task.dependencies,
+        "handoff": task.handoff,
+        "result": task.result,
+        "notifications": task.notifications,
+    })
+}
+
+fn mission_session_view(session: &ManagedSession, task_count: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": session.id,
+        "session_id": session.id,
+        "folder": session.workspace,
+        "title": session.label,
+        "status": session.status,
+        "created_at": session.created_at,
+        "last_active_at": session.updated_at,
+        "task_count": task_count,
+        "archived": matches!(session.status, mission_control::SessionStatus::Archived),
+        "metadata": session.tags,
+    })
+}
+
+fn mission_error(error: String) -> Response {
+    (StatusCode::BAD_REQUEST, error).into_response()
+}
+
+async fn mission_control_overview(
+    State(d): State<Shared>,
+    Query(q): Query<MissionListQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let root = &d.mission_control_root;
+    let Ok(tasks) = mission_control::list_tasks(root, None, None) else {
+        return mission_error("could not read Mission Control tasks".to_string());
+    };
+    let Ok(sessions) = mission_control::list_sessions(root, false) else {
+        return mission_error("could not read Mission Control sessions".to_string());
+    };
+    let active_tasks = tasks
+        .iter()
+        .filter(|task| !task.status.is_terminal())
+        .count();
+    let done_tasks = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Done)
+        .count();
+    let active_sessions = sessions
+        .iter()
+        .filter(|session| session.status == mission_control::SessionStatus::Active)
+        .count();
+    let recent_tasks = tasks
+        .iter()
+        .rev()
+        .take(12)
+        .map(mission_task_view)
+        .collect::<Vec<_>>();
+    let recent_sessions = sessions
+        .iter()
+        .rev()
+        .take(12)
+        .map(|session| {
+            let count = tasks
+                .iter()
+                .filter(|task| task.session_id == session.id)
+                .count();
+            mission_session_view(session, count)
+        })
+        .collect::<Vec<_>>();
+    let mc_session_id = Some(mission_control::SESSION_ID);
+    Json(serde_json::json!({
+        "active_tasks": active_tasks,
+        "completed_tasks": done_tasks,
+        "total_tasks": tasks.len(),
+        "active_sessions": active_sessions,
+        "total_sessions": sessions.len(),
+        "recent_tasks": recent_tasks,
+        "recent_sessions": recent_sessions,
+        "mc_session_id": mc_session_id,
+    }))
+    .into_response()
+}
+
+async fn mission_control_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<MissionListQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match mission_control::list_tasks(&d.mission_control_root, None, None) {
+        Ok(tasks) => Json(
+            tasks
+                .iter()
+                .filter(|task| {
+                    q.archived
+                        .is_none_or(|archived| archived == task.status.is_terminal())
+                })
+                .map(mission_task_view)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, String> {
+    let root = &d.mission_control_root;
+    // Atomic claim: Pending → InProgress exactly once. Concurrent dispatchers
+    // (loop + REST paths) lose the race here and return without delivering.
+    let task = mission_control::claim_task_for_dispatch(root, task_id)?;
+    if task.status != TaskStatus::InProgress || task.reporting_session.is_none() {
+        // Not claimed by us (already in progress/terminal) — nothing to do.
+        return Ok(task);
+    }
+    if task.session_id.trim().is_empty() {
+        release_failed_claim(root, &task, "task has no target session")?;
+        return Err("task has no target session".to_string());
+    }
+    for dependency in &task.dependencies {
+        // A missing/unreadable dependency record must roll the claim back like
+        // every other failure path — otherwise the task strands InProgress.
+        let other = match mission_control::get_task(root, &dependency.task_id) {
+            Ok(other) => other,
+            Err(error) => {
+                release_failed_claim(root, &task, &error)?;
+                return Err(error);
+            }
+        };
+        if other.status != TaskStatus::Done {
+            let reason = format!("waiting on dependency {}", dependency.task_id);
+            let blocked = mission_control::update_task(root, task_id, |task| {
+                task.status = TaskStatus::Blocked;
+                task.reporting_session = None;
+                task.notifications
+                    .push(mission_control::NotificationMarker {
+                        target: "mission_control".to_string(),
+                        kind: "blocked".to_string(),
+                        message: reason.clone(),
+                        delivered: false,
+                    });
+            })?;
+            // Report the stored (blocked) state, not the pre-update claim.
+            return Ok(blocked);
+        }
+    }
+    let managed = match mission_control::get_session(root, &task.session_id) {
+        Ok(managed) => managed,
+        Err(error) => {
+            release_failed_claim(root, &task, &error)?;
+            return Err(error);
+        }
+    };
+    if managed.status != mission_control::SessionStatus::Active {
+        let error = "target session is archived".to_string();
+        release_failed_claim(root, &task, &error)?;
+        return Err(error);
+    }
+    let conflicts = mission_control::detect_conflicts(root, task_id, &task.owned_paths)?;
+    if !conflicts.is_empty() {
+        // Queue behind the current owner. This is waiting, not a dispatch
+        // failure — do not burn the retry ceiling.
+        let mut owners = Vec::new();
+        for conflict in &conflicts {
+            if !owners.contains(&conflict.existing_task_id) {
+                owners.push(conflict.existing_task_id.clone());
+            }
+        }
+        let reason = format!(
+            "waiting on workspace owner(s): {}",
+            owners.join(", ")
+        );
+        let blocked = mission_control::update_task(root, task_id, |task| {
+            task.status = TaskStatus::Blocked;
+            task.reporting_session = None;
+            task.dispatch_failures = 0;
+            for owner in &owners {
+                if !task.dependencies.iter().any(|d| d.task_id == *owner) {
+                    task.dependencies.push(mission_control::Dependency {
+                        task_id: owner.clone(),
+                        reason: Some("workspace path already in use".into()),
+                    });
+                }
+            }
+            if !task.notifications.iter().any(|n| n.message == reason) {
+                task.notifications
+                    .push(mission_control::NotificationMarker {
+                        target: "mission_control".to_string(),
+                        kind: "blocked".to_string(),
+                        message: reason.clone(),
+                        delivered: false,
+                    });
+            }
+        })?;
+        return Ok(blocked);
+    }
+    let handoff = task
+        .handoff
+        .as_ref()
+        .map(|handoff| handoff.description.as_str())
+        .unwrap_or("");
+    // Fresh-mode handoffs must be self-contained briefings; resume-mode ones
+    // assume the session already holds the context.
+    let mode_line = match task.handoff_mode {
+        mission_control::HandoffMode::Fresh => {
+            "handoff_mode: fresh (self-contained briefing; the session has no prior context)\n"
+        }
+        mission_control::HandoffMode::Resume => "",
+    };
+    let text = format!(
+        "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nrules: do not confirm scope; begin immediately. If handoff_mode is fresh, this envelope is the complete briefing — do not ask for missing history. Stay in this session — it already has the context; do not spawn lanes unless the work is independently parallel. Stay in scope; do not manage other sessions. If a prior read-only report is gone, redo the evaluation from current sources and deliver it. You MUST call report_mission_task for task_id {} before you stop — even on a clean success with no errors. Status done if finished; blocked if you need a unique artifact or user decision; failed only for a hard stop. A silent finish leaves Mission Control unable to resume. Block only for a missing unique artifact or user decision, not compacted history.\n[/mission_control_task]",
+        task.id,
+        task.title,
+        mode_line,
+        if handoff.is_empty() {
+            task.description.as_str()
+        } else {
+            handoff
+        },
+        managed.workspace.display(),
+        task.id,
+    );
+    d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
+    // Delivery succeeded — clear the retry counter so the ceiling stays
+    // "consecutive failures" as documented.
+    mission_control::update_task(root, task_id, |t| t.dispatch_failures = 0)?;
+    mission_control::get_task(root, task_id)
+}
+
+/// Roll a claimed-but-undeliverable task back to Pending and record why, so
+/// the loop can retry later instead of silently spinning with a stale claim.
+/// After `MAX_DISPATCH_FAILURES` consecutive failures the task is parked as
+/// Blocked so it stops consuming the loop.
+fn release_failed_claim(
+    root: &std::path::Path,
+    task: &TaskRecord,
+    error: &str,
+) -> Result<(), String> {
+    const MAX_DISPATCH_FAILURES: u32 = 5;
+    mission_control::update_task(root, &task.id, |t| {
+        t.dispatch_failures += 1;
+        t.reporting_session = None;
+        if t.dispatch_failures >= MAX_DISPATCH_FAILURES {
+            t.status = TaskStatus::Blocked;
+            t.notifications.push(NotificationMarker {
+                target: "mission_control".to_string(),
+                kind: "blocked".to_string(),
+                message: format!("dispatch failed {} times: {error}", t.dispatch_failures),
+                delivered: false,
+            });
+        } else {
+            t.status = TaskStatus::Pending;
+        }
+    })
+    .map(|_| ())
+}
+
+async fn mission_control_create_task(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<MissionTaskReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.title.trim().is_empty() || req.session_id.trim().is_empty() {
+        return mission_error("title and session_id are required".to_string());
+    }
+    let root = &d.mission_control_root;
+    let managed = match mission_control::get_session(root, &req.session_id) {
+        Ok(session) => session,
+        Err(error) => return mission_error(error),
+    };
+    // Every owned path must stay inside the session's workspace; otherwise a
+    // caller could claim "/" or another project's tree and block all tasks.
+    let owned_paths = match validated_owned_paths(&req.owned_paths, &managed.workspace) {
+        Ok(paths) => paths,
+        Err(error) => return mission_error(error),
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let task = match mission_control::create_task(
+        root,
+        &id,
+        &req.session_id,
+        req.title.trim(),
+        req.description.trim(),
+        owned_paths,
+    ) {
+        Ok(task) => task,
+        Err(error) => return mission_error(error),
+    };
+    let task = if req.status.as_deref() == Some("pending") {
+        task
+    } else {
+        match dispatch_mission_task(&d, &task.id).await {
+            Ok(task) => task,
+            Err(error) => match mission_control::update_task(root, &task.id, |task| {
+                task.status = TaskStatus::Blocked;
+                task.reporting_session = None;
+                task.notifications
+                    .push(mission_control::NotificationMarker {
+                        target: "mission_control".to_string(),
+                        kind: "blocked".to_string(),
+                        message: error,
+                        delivered: false,
+                    });
+            }) {
+                Ok(task) => task,
+                Err(error) => return mission_error(error),
+            },
+        }
+    };
+    Json(mission_task_view(&task)).into_response()
+}
+
+async fn mission_control_update_task(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<MissionTaskReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let root = &d.mission_control_root;
+    // Resolve the existing task up-front so owned-path updates can be
+    // validated against the *effective* target session's workspace: the
+    // session named in the request when retargeting, else the current one.
+    let existing = match mission_control::get_task(root, &id) {
+        Ok(task) => task,
+        Err(error) => return mission_error(error),
+    };
+    let effective_session_id = if req.session_id.trim().is_empty() {
+        existing.session_id.clone()
+    } else {
+        req.session_id.trim().to_string()
+    };
+    let workspace_for_paths: std::path::PathBuf =
+        match mission_control::get_session(root, &effective_session_id) {
+            Ok(session) => session.workspace,
+            Err(error) => return mission_error(error),
+        };
+    let validated_paths = if req.owned_paths.is_empty() {
+        None
+    } else {
+        Some(
+            match validated_owned_paths(&req.owned_paths, &workspace_for_paths) {
+                Ok(paths) => paths,
+                Err(error) => return mission_error(error),
+            },
+        )
+    };
+    let status = req.status.as_deref().and_then(task_status);
+    let handoff_mode = match req.handoff_mode.as_deref() {
+        None => None,
+        Some(mode_raw) => match mission_control::HandoffMode::parse(mode_raw) {
+            Some(mode) => Some(mode),
+            None => {
+                return mission_error(format!(
+                    "handoff_mode must be 'resume' or 'fresh', got '{mode_raw}'"
+                ));
+            }
+        },
+    };
+    let updated = mission_control::update_task(root, &id, |task| {
+        if !req.title.trim().is_empty() {
+            task.title = req.title.trim().to_string();
+        }
+        if !req.description.trim().is_empty() {
+            task.description = req.description.trim().to_string();
+        }
+        if !req.session_id.trim().is_empty() && req.session_id.trim() != existing.session_id {
+            task.session_id = req.session_id.trim().to_string();
+            task.reporting_session = None; // re-bind on retarget
+        }
+        if let Some(paths) = &validated_paths {
+            task.owned_paths = paths.clone();
+        }
+        if let Some(mode) = handoff_mode {
+            task.handoff_mode = mode;
+        }
+        if let Some(status) = status {
+            task.status = status;
+            if status.is_terminal() || status == TaskStatus::Blocked {
+                task.reporting_session = None;
+            }
+        }
+    });
+    match updated {
+        Ok(task) if task.status == TaskStatus::Pending => {
+            match dispatch_mission_task(&d, &id).await {
+                Ok(task) => Json(mission_task_view(&task)).into_response(),
+                Err(error) => mission_error(error),
+            }
+        }
+        Ok(task) => Json(mission_task_view(&task)).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+async fn mission_control_archive_task(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match mission_control::complete_task(
+        &d.mission_control_root,
+        &id,
+        TaskStatus::Cancelled,
+        mission_control::TaskResult {
+            summary: "Archived by Mission Control.".to_string(),
+            ..Default::default()
+        },
+    ) {
+        Ok(task) => Json(mission_task_view(&task)).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+async fn mission_control_sessions(
+    State(d): State<Shared>,
+    Query(q): Query<MissionListQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let root = &d.mission_control_root;
+    let tasks = mission_control::list_tasks(root, None, None).unwrap_or_default();
+    match mission_control::list_sessions(root, false) {
+        Ok(sessions) => Json(
+            sessions
+                .iter()
+                .filter(|session| {
+                    q.archived.is_none_or(|archived| {
+                        archived
+                            == matches!(session.status, mission_control::SessionStatus::Archived)
+                    })
+                })
+                .map(|session| {
+                    mission_session_view(
+                        session,
+                        tasks
+                            .iter()
+                            .filter(|task| task.session_id == session.id)
+                            .count(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+async fn mission_control_create_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<MissionSessionReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let folder = PathBuf::from(&req.folder);
+    if !folder.is_dir() {
+        return mission_error("folder is not a directory".to_string());
+    }
+    let session_id = if req.session_id.trim().is_empty() {
+        let base_state = {
+            d.config
+                .lock()
+                .unwrap()
+                .for_workspace(folder.clone())
+                .state_path
+        };
+        let path = base_state
+            .parent()
+            .map(|parent| {
+                parent
+                    .join("conversations")
+                    .join(format!("{}.json", uuid::Uuid::new_v4()))
+            })
+            .unwrap_or(base_state);
+        let id = path
+            .strip_prefix(workspaces_root())
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        let cfg = {
+            let config = d.config.lock().unwrap();
+            let mut workspace = config.for_workspace(folder.clone());
+            apply_profile(&mut workspace, &req.profile);
+            workspace
+        };
+        let handle = start_session_with_browser_summary(
+            &cfg,
+            path,
+            None,
+            false,
+            Some(Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            ))),
+            Some(d.browser.summary_provider()),
+        );
+        let mut live = d.sessions.lock().await;
+        live.insert(id.clone(), live_from_handle(handle, req.profile.clone()));
+        id
+    } else {
+        req.session_id.trim().to_string()
+    };
+    let label = if req.title.trim().is_empty() {
+        "Managed session"
+    } else {
+        req.title.trim()
+    };
+    let root = &d.mission_control_root;
+    let session = match mission_control::create_session(root, &session_id, label, &folder) {
+        Ok(session) => session,
+        Err(error) => return mission_error(error),
+    };
+    Json(mission_session_view(&session, 0)).into_response()
+}
+
+async fn mission_control_update_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<MissionSessionUpdate>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match mission_control::update_session(&d.mission_control_root, &id, |session| {
+        if let Some(title) = req
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            session.label = title.to_string();
+        }
+    }) {
+        Ok(session) => Json(mission_session_view(&session, 0)).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+async fn mission_control_archive_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match mission_control::archive_session(&d.mission_control_root, &id) {
+        Ok(session) => Json(mission_session_view(&session, 0)).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct MissionOpenReq {
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+async fn mission_control_open(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<MissionOpenReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let home = match mission_control::ensure_home() {
+        Ok(path) => path,
+        Err(error) => return mission_error(error),
+    };
+    let state_path = mission_control::session_state_path();
+    let id = mission_control::SESSION_ID.to_string();
+    let resume = state_path.exists();
+    let profile = req
+        .profile
+        .clone()
+        .or_else(|| read_session_profile(&state_path));
+    write_session_role(&state_path, "mission_control");
+    let cfg = {
+        let config = d.config.lock().unwrap();
+        let mut workspace = config.for_workspace(home.clone());
+        apply_profile(&mut workspace, &profile);
+        workspace
+    };
+    let mut sessions = d.sessions.lock().await;
+    if !sessions.contains_key(&id) {
+        let handle = start_mission_control_session(
+            &cfg,
+            state_path,
+            None,
+            resume,
+            Some(Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            ))),
+            Some(d.browser.summary_provider()),
+        );
+        sessions.insert(id.clone(), live_from_handle(handle, profile));
+        if !resume {
+            if let Some(live) = sessions.get(&id) {
+                let _ = live
+                    .input_tx
+                    .send(LoopInput::SetTitle("Mission Control".into()));
+            }
+        }
+    }
+    if let Err(error) = mission_control::set_mission_control_session(&d.mission_control_root, &id) {
+        eprintln!("[mission-control] failed to persist active MC session: {error}");
+    }
+    Json(serde_json::json!({ "id": id, "folder": home })).into_response()
+}
+
+/// Persist the MC session id next to the session's state file so a daemon
+/// restart can resume it with the Mission Control role (prompt + tools +
+/// lane restrictions) instead of silently downgrading it to an ordinary
+/// conversation session.
+const MC_ROLE_SIDECAR_SUFFIX: &str = ".role";
+
+fn write_session_role(state_path: &std::path::Path, role: &str) {
+    let sidecar = PathBuf::from(format!("{}{MC_ROLE_SIDECAR_SUFFIX}", state_path.display()));
+    if let Some(parent) = sidecar.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(sidecar, role);
+}
+
+pub fn read_session_role(state_path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(PathBuf::from(format!(
+        "{}{MC_ROLE_SIDECAR_SUFFIX}",
+        state_path.display()
+    )))
+    .ok()?;
+    let role = raw.trim().to_string();
+    (!role.is_empty()).then_some(role)
+}
+
+/// Dispatch loop: claims and delivers every Pending task, then re-queues any
+/// Blocked tasks whose dependencies have completed. Failures roll the claim
+/// back with a retry counter; at the ceiling the task parks as Blocked.
+async fn mission_control_dispatch_loop(daemon: Shared) {
+    loop {
+        let root = &daemon.mission_control_root;
+        let _ = mission_control::unblock_ready_tasks(root);
+        let tasks =
+            mission_control::list_tasks(root, None, Some(TaskStatus::Pending)).unwrap_or_default();
+        for task in tasks {
+            if let Err(error) = dispatch_mission_task(&daemon, &task.id).await {
+                tracing_log_dispatch_failure(&task.id, &error);
+            }
+        }
+        deliver_mission_control_reports(&daemon).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Worker `report_mission_task` only writes the JSON store. Push undelivered
+/// markers into the Mission Control conversation so the user sees the result.
+async fn deliver_mission_control_reports(daemon: &Daemon) {
+    let root = &daemon.mission_control_root;
+    let Ok(tasks) = mission_control::list_tasks(root, None, None) else {
+        return;
+    };
+    for task in tasks {
+        for (index, marker) in task.notifications.iter().enumerate() {
+            if marker.delivered || marker.target != "mission_control" {
+                continue;
+            }
+            let text = format!(
+                "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]",
+                task.id,
+                task.title,
+                marker.kind,
+                marker.message
+            );
+            daemon
+                .deliver(
+                    mission_control::SESSION_ID,
+                    LoopInput::UserMessage(text),
+                )
+                .await;
+            let _ = mission_control::mark_notification_delivered(root, &task.id, index);
+        }
+    }
+}
+
+fn tracing_log_dispatch_failure(task_id: &str, error: &str) {
+    eprintln!("[mission-control] dispatch {task_id} failed: {error}");
+}
+
+#[derive(Deserialize)]
+struct MissionSettingsReq {
+    notification_policy: String,
+}
+
+async fn mission_control_settings(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(mission_control::load_settings(&d.mission_control_root)).into_response()
+}
+
+async fn mission_control_update_settings(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<MissionSettingsReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match mission_control::set_notification_policy(
+        &d.mission_control_root,
+        &req.notification_policy,
+    ) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(error) => mission_error(error),
     }
 }
