@@ -43,6 +43,8 @@ mod tests {
         assert!(mc.contains("retry_mission_task"));
         assert!(mc.contains("cancel_mission_task"));
         assert!(mc.contains("read_image"));
+        assert!(mc.contains("present_file"));
+        assert!(mc.contains("openable card"));
         assert!(mc.contains("bash is for inspection only"));
         assert!(mc.contains("never excessively"));
         assert!(mc.contains("Going idle IS waiting"));
