@@ -261,7 +261,7 @@ pub async fn open_session(
 ) -> Result<String, String> {
     let url = format!("{}/sessions", info.api_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
     let resp = client

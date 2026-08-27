@@ -22,10 +22,19 @@ pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
 
 /// Root holding every workspace's session state.
 pub fn workspaces_root() -> PathBuf {
+    snippet_home().join("workspaces")
+}
+
+/// Isolated git worktrees for new sessions: `~/.snippet/worktrees/{repo}/{id}`.
+pub fn worktrees_root() -> PathBuf {
+    snippet_home().join("worktrees")
+}
+
+pub fn snippet_home() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".snippet").join("workspaces")
+    home.join(".snippet")
 }
 
 /// Restrict a file to owner-only (0600) on Unix; no-op elsewhere.

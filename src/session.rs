@@ -4,6 +4,7 @@
 //! (and, optionally, a live `StreamHandle`). Shared by the TUI and headless `serve`.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -14,8 +15,8 @@ use crate::config::{SnippetConfig, workspaces_root};
 use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, deserialize_state};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
-use crate::prompts::conversation_system_prompt;
-use crate::tools::{BrowserSummaryProvider, ToolContext};
+use crate::prompts::{conversation_system_prompt, mission_control_system_prompt};
+use crate::tools::{BrowserSummaryProvider, ToolContext, ToolRegistry};
 
 pub struct SessionHandle {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
@@ -35,12 +36,28 @@ pub fn start_session(
     resume: bool,
     stream: Option<StreamHandle>,
 ) -> SessionHandle {
-    start_session_with_browser_summary(config, state_path, initial, resume, stream, None)
+    start_session_with_role(config, state_path, initial, resume, stream, None, false)
 }
 
-/// Spawn a session with an optional live browser-registry summary provider.
-/// The provider is read synchronously while building each turn's steering block;
-/// it never performs network or tool calls.
+pub fn start_mission_control_session(
+    config: &SnippetConfig,
+    state_path: PathBuf,
+    initial: Option<String>,
+    resume: bool,
+    stream: Option<StreamHandle>,
+    browser_summary: Option<BrowserSummaryProvider>,
+) -> SessionHandle {
+    start_session_with_role(
+        config,
+        state_path,
+        initial,
+        resume,
+        stream,
+        browser_summary,
+        true,
+    )
+}
+
 pub fn start_session_with_browser_summary(
     config: &SnippetConfig,
     state_path: PathBuf,
@@ -48,6 +65,26 @@ pub fn start_session_with_browser_summary(
     resume: bool,
     stream: Option<StreamHandle>,
     browser_summary: Option<BrowserSummaryProvider>,
+) -> SessionHandle {
+    start_session_with_role(
+        config,
+        state_path,
+        initial,
+        resume,
+        stream,
+        browser_summary,
+        false,
+    )
+}
+
+fn start_session_with_role(
+    config: &SnippetConfig,
+    state_path: PathBuf,
+    initial: Option<String>,
+    resume: bool,
+    stream: Option<StreamHandle>,
+    browser_summary: Option<BrowserSummaryProvider>,
+    mission_control: bool,
 ) -> SessionHandle {
     let (input_tx, rx) = mpsc::unbounded_channel();
 
@@ -65,23 +102,70 @@ pub fn start_session_with_browser_summary(
     // Delegated lanes may run on a different model than the active session
     // (see `delegate_model_config`) — a cheaper model for parallel grunt work or
     // a stronger one for hard sub-tasks. Falls back to the active model.
-    let factory: ModelFactory = {
+    // Mission Control never gets a factory: it routes, it does not spawn lanes.
+    let factory: Option<ModelFactory> = if mission_control {
+        None
+    } else {
         let mc = config.delegate_model_config();
-        Arc::new(move || mc.build_model())
+        Some(Arc::new(move || mc.build_model()))
     };
     let sp = state_path.clone();
     let stream_out = stream.clone();
 
     let join = tokio::spawn(async move {
         let mut model = model_config.build_model();
-        let context = match browser_summary {
-            Some(provider) => ToolContext::with_browser_summary(workspace, provider),
-            None => ToolContext::new(workspace),
+        // Durable identity = state path relative to the workspaces root — the
+        // same id the daemon uses for managed sessions and task envelopes.
+        let durable_id = if mission_control {
+            Some(crate::mission_control::SESSION_ID.to_string())
+        } else {
+            sp.strip_prefix(crate::config::workspaces_root())
+                .ok()
+                .map(|p| p.display().to_string())
+        };
+        let base_context = if mission_control {
+            ToolContext::mission_control(workspace)
+        } else {
+            match browser_summary {
+                Some(provider) => ToolContext::with_browser_summary(workspace, provider),
+                None => ToolContext::new(workspace),
+            }
         }
         .map_err(|e| e.to_string())?;
+        let context = match durable_id {
+            Some(id) => base_context.with_durable_session_id(id),
+            None => base_context,
+        };
+        // MC is a router. Whitelist inspection + routing only — never the
+        // coding toolkit or a lane factory. bash/read_image are for seeing
+        // status and screenshots, not implementing.
+        let tools = if mission_control {
+            let mut tools = ToolRegistry::new();
+            tools.insert(crate::builtins::BashTool);
+            tools.insert(crate::builtins::ReadImageTool);
+            crate::mission_tools::add_mission_control_tools(&mut tools);
+            tools
+        } else {
+            let mut tools = coding_tools(
+                exa_api_key.clone(),
+                crate::memory::MemoryLimits {
+                    enabled: memory_enabled,
+                    writable: true,
+                    index_budget_chars: memory_index_budget_chars,
+                    entry_budget_chars: memory_entry_budget_chars,
+                    max_entries: memory_max_entries,
+                },
+            );
+            crate::mission_tools::add_worker_report_tool(&mut tools);
+            tools
+        };
         let harness = CodingHarness::new(
             HarnessConfig {
-                system_prompt: conversation_system_prompt(),
+                system_prompt: if mission_control {
+                    mission_control_system_prompt()
+                } else {
+                    conversation_system_prompt()
+                },
                 state_path: Some(sp),
                 resume,
                 exa_api_key: exa_api_key.clone(),
@@ -93,22 +177,14 @@ pub fn start_session_with_browser_summary(
                 memory_entry_budget_chars,
                 memory_max_entries,
                 memory_reflect_on_compaction,
+                allow_lane_control: !mission_control,
                 ..HarnessConfig::default()
             },
-            coding_tools(
-                exa_api_key,
-                crate::memory::MemoryLimits {
-                    enabled: memory_enabled,
-                    writable: true,
-                    index_budget_chars: memory_index_budget_chars,
-                    entry_budget_chars: memory_entry_budget_chars,
-                    max_entries: memory_max_entries,
-                },
-            ),
+            tools,
             context,
         );
         harness
-            .run_interactive(&mut model, initial, rx, Some(factory), stream)
+            .run_interactive(&mut model, initial, rx, factory, stream)
             .await
             .map_err(|e| e.to_string())
     });
@@ -141,6 +217,10 @@ pub struct SessionInfo {
 /// Resolve a session id (relative path under the workspaces root) to its state
 /// file, rejecting any path that escapes the root.
 pub fn state_path_for_id(id: &str) -> Option<PathBuf> {
+    if crate::mission_control::is_session_id(id) {
+        let path = crate::mission_control::session_state_path();
+        return path.exists().then_some(path);
+    }
     let root = workspaces_root();
     let path = root.join(id);
     // Reject traversal: the resolved path must stay under the root.
@@ -205,7 +285,58 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
         }
     }
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+    if let Some(mc) = mission_control_list_row() {
+        out.insert(0, mc);
+    }
     out
+}
+
+/// Same catalog as [`list_device_sessions`], without Mission Control itself —
+/// the routing agent must not treat its own home as a dispatch target.
+pub fn list_routable_sessions() -> Vec<SessionInfo> {
+    list_device_sessions()
+        .into_iter()
+        .filter(|s| !crate::mission_control::is_session_id(&s.id))
+        .collect()
+}
+
+fn mission_control_list_row() -> Option<SessionInfo> {
+    let path = crate::mission_control::session_state_path();
+    if !path.exists() {
+        return None;
+    }
+    let last_active = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (folder, title, status) = if let Some(meta) = std::fs::read(meta_path(&path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
+    {
+        (meta.folder, meta.title, meta.status)
+    } else {
+        (
+            crate::mission_control::workspace_path()
+                .display()
+                .to_string(),
+            "Mission Control".to_string(),
+            "idle".to_string(),
+        )
+    };
+    Some(SessionInfo {
+        id: crate::mission_control::SESSION_ID.to_string(),
+        folder,
+        conversation: "default".to_string(),
+        title: if title.trim().is_empty() {
+            "Mission Control".to_string()
+        } else {
+            title
+        },
+        status,
+        last_active,
+    })
 }
 
 /// Lightweight session metadata, written next to each state file so listing can
@@ -545,14 +676,246 @@ pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
     }
 }
 
+/// If `folder` is a git work tree, add a detached worktree under
+/// `~/.snippet/worktrees/{repo}/{id}` and return that path (preserving a
+/// subfolder relative to the repo root). Non-git folders, nested worktrees
+/// already under that root, and any git failure fall back to `folder`.
+pub fn prepare_new_session_workspace(folder: &Path) -> PathBuf {
+    try_session_worktree(folder).unwrap_or_else(|| folder.to_path_buf())
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn sanitize_repo_name(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "repo".into()
+    } else {
+        s
+    }
+}
+
+fn unique_worktree_path(parent: &Path) -> Option<PathBuf> {
+    for _ in 0..8 {
+        let id = uuid::Uuid::new_v4().to_string();
+        let dest = parent.join(&id[..8]);
+        if !dest.exists() {
+            return Some(dest);
+        }
+    }
+    Some(parent.join(uuid::Uuid::new_v4().to_string()))
+}
+
+fn try_session_worktree(folder: &Path) -> Option<PathBuf> {
+    let inside = git_stdout(folder, &["rev-parse", "--is-inside-work-tree"])?;
+    if inside != "true" {
+        return None;
+    }
+    let toplevel = PathBuf::from(git_stdout(folder, &["rev-parse", "--show-toplevel"])?);
+    let root = crate::config::worktrees_root();
+    if folder.starts_with(&root) || toplevel.starts_with(&root) {
+        return None;
+    }
+    let repo = sanitize_repo_name(toplevel.file_name()?.to_str()?);
+    let parent = root.join(&repo);
+    std::fs::create_dir_all(&parent).ok()?;
+    // Unique per session so one repo can host many parallel worktrees.
+    let dest = unique_worktree_path(&parent)?;
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&toplevel)
+        .args(["worktree", "add", "--detach"])
+        .arg(&dest)
+        .status()
+        .ok()?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dest);
+        return None;
+    }
+    let workspace = match folder.strip_prefix(&toplevel) {
+        Ok(rel) if !rel.as_os_str().is_empty() => dest.join(rel),
+        _ => dest,
+    };
+    Some(workspace)
+}
+
+/// Persist a brand-new idle conversation in `folder` so Mission Control can
+/// dispatch to it. `new_conversation=false` uses the folder's default
+/// `state.json` (refuses if one already exists). `true` always writes a
+/// fresh `conversations/<uuid>.json`. Git repos get an isolated worktree.
+pub fn create_blank_session(
+    folder: &Path,
+    title: &str,
+    new_conversation: bool,
+) -> Result<SessionInfo, String> {
+    let mut folder = folder
+        .canonicalize()
+        .map_err(|e| format!("folder is not a directory: {e}"))?;
+    if !folder.is_dir() {
+        return Err("folder is not a directory".into());
+    }
+    if new_conversation {
+        folder = prepare_new_session_workspace(&folder);
+        if let Ok(canonical) = folder.canonicalize() {
+            folder = canonical;
+        }
+    }
+    let base = crate::config::state_path_for_workspace(&folder);
+    let dest = if new_conversation {
+        let parent = base
+            .parent()
+            .ok_or_else(|| "workspace state path has no parent".to_string())?;
+        let conv_dir = parent.join("conversations");
+        std::fs::create_dir_all(&conv_dir).map_err(|e| format!("create conversations dir: {e}"))?;
+        conv_dir.join(format!("{}.json", uuid::Uuid::new_v4()))
+    } else {
+        if base.exists() {
+            return Err(
+                "this folder already has a default session — pass new_conversation=true or route to the existing id".into(),
+            );
+        }
+        if let Some(parent) = base.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create workspace dir: {e}"))?;
+        }
+        base
+    };
+
+    let label = title.trim();
+    let state = HarnessState::blank(
+        folder.display().to_string(),
+        (!label.is_empty()).then(|| label.to_string()),
+    );
+    let bytes = crate::harness::serialize_state(&state)?;
+    let tmp = dest.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| format!("write session: {e}"))?;
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("rename session: {e}"))?;
+    write_session_meta(&dest, &state);
+
+    let root = workspaces_root();
+    let id = dest
+        .strip_prefix(&root)
+        .unwrap_or(&dest)
+        .display()
+        .to_string();
+    Ok(SessionInfo {
+        id,
+        folder: folder.display().to_string(),
+        conversation: if new_conversation {
+            dest.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("new")
+                .to_string()
+        } else {
+            "default".into()
+        },
+        title: effective_title(&state),
+        status: status_str(state.status),
+        last_active: 0,
+    })
+}
+
 /// Remove a session's state file and its sidecars (metadata + model override —
 /// a leftover `.profile` would silently re-apply the deleted session's model to
-/// the next session opened on this state path).
+/// the next session opened on this state path). Isolated git worktrees created
+/// for this session are removed too.
 pub fn remove_session_files(state_path: &Path) {
+    if let Some(folder) = workspace_from_state_file(state_path) {
+        drop_session_worktree(&folder);
+    }
     let _ = std::fs::remove_file(state_path);
     let _ = std::fs::remove_file(meta_path(state_path));
     let _ = std::fs::remove_file(state_path.with_extension("nonces.json"));
     let _ = std::fs::remove_file(profile_sidecar(state_path));
+}
+
+fn workspace_from_state_file(state_path: &Path) -> Option<PathBuf> {
+    if let Some(meta) = std::fs::read(meta_path(state_path))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
+    {
+        if !meta.folder.trim().is_empty() {
+            return Some(PathBuf::from(meta.folder));
+        }
+    }
+    let bytes = std::fs::read(state_path).ok()?;
+    let state = deserialize_state(&bytes).ok()?;
+    if state.workspace.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(state.workspace))
+    }
+}
+
+/// Best-effort: drop a linked git worktree created for this session.
+/// A linked worktree has a `.git` *file* (not a directory). Never touches
+/// the original clone.
+fn drop_session_worktree(folder: &Path) {
+    let folder = folder.canonicalize().unwrap_or_else(|_| folder.to_path_buf());
+    let Some(worktree) = linked_worktree_root(&folder) else {
+        return;
+    };
+    if let Some(common) = git_stdout(&worktree, &["rev-parse", "--git-common-dir"]) {
+        let common_path = PathBuf::from(&common);
+        let common_path = if common_path.is_absolute() {
+            common_path
+        } else {
+            worktree.join(common_path)
+        };
+        if let Some(main) = common_path.parent() {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(main)
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree)
+                .status();
+        }
+    }
+    if worktree.exists() {
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+}
+
+/// Walk up from `folder` until we find a `.git` file — the linked-worktree
+/// marker. A `.git` directory is the original clone and is left alone.
+fn linked_worktree_root(folder: &Path) -> Option<PathBuf> {
+    let mut cur = folder.to_path_buf();
+    loop {
+        let git = cur.join(".git");
+        if git.is_file() {
+            return Some(cur);
+        }
+        if git.is_dir() {
+            return None;
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
 }
 
 fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<SessionInfo>) {
@@ -567,6 +930,15 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         .unwrap_or(path)
         .display()
         .to_string();
+    if crate::mission_control::is_session_id(&id) {
+        return;
+    }
+    let role = std::fs::read_to_string(PathBuf::from(format!("{}.role", path.display())))
+        .ok()
+        .map(|s| s.trim().to_string());
+    if role.as_deref() == Some("mission_control") {
+        return;
+    }
 
     // Fast path: read the tiny sidecar, no decompression.
     if let Some(meta) = std::fs::read(meta_path(path))
@@ -710,5 +1082,138 @@ mod fork_tests {
                 HarnessEvent::ToolCall { .. }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod create_blank_tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn create_blank_session_writes_idle_state() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!("snippet-mc-blank-{stamp}"));
+        fs::create_dir_all(&folder).unwrap();
+        let info = create_blank_session(&folder, "Odd request", true).unwrap();
+        assert_eq!(info.title, "Odd request");
+        assert_eq!(info.status, "idle");
+        assert_eq!(info.folder, folder.canonicalize().unwrap().display().to_string());
+        let path = state_path_for_id(&info.id).expect("created session is resolvable");
+        assert!(path.exists());
+        let state = deserialize_state(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(state.status, crate::harness::HarnessStatus::Idle);
+        assert_eq!(state.title.as_deref(), Some("Odd request"));
+        let _ = fs::remove_dir_all(&folder);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(parent.join(format!(
+                "{}.meta.json",
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or("")
+            )));
+        }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    fn init_repo(stamp: u128, suffix: &str) -> PathBuf {
+        let repo = std::env::temp_dir().join(format!("snippet-wt-{suffix}-{stamp}"));
+        fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-q"]);
+        git_ok(&repo, &["config", "user.email", "snippet@test"]);
+        git_ok(&repo, &["config", "user.name", "snippet"]);
+        fs::write(repo.join("README"), "hi\n").unwrap();
+        git_ok(&repo, &["add", "README"]);
+        git_ok(&repo, &["commit", "-qm", "init"]);
+        repo.canonicalize().unwrap()
+    }
+
+    fn drop_worktree(repo: &Path, workspace: &Path) {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(workspace)
+            .status();
+        if workspace.exists() {
+            let _ = fs::remove_dir_all(workspace);
+        }
+    }
+
+    #[test]
+    fn new_session_in_git_repo_uses_isolated_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "repo");
+        let workspace = prepare_new_session_workspace(&repo);
+        let root = crate::config::worktrees_root();
+        assert_ne!(workspace, repo);
+        assert!(workspace.starts_with(&root));
+        assert!(workspace.join(".git").is_file());
+        assert!(workspace.join("README").exists());
+        drop_worktree(&repo, &workspace);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn non_git_folder_stays_put() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let folder = std::env::temp_dir().join(format!("snippet-wt-plain-{stamp}"));
+        fs::create_dir_all(&folder).unwrap();
+        let got = prepare_new_session_workspace(&folder);
+        assert_eq!(got, folder);
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn parallel_sessions_get_unique_worktrees() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "parallel");
+        let a = prepare_new_session_workspace(&repo);
+        let b = prepare_new_session_workspace(&repo);
+        let root = crate::config::worktrees_root();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&root) && b.starts_with(&root));
+        assert!(a.join("README").exists() && b.join("README").exists());
+        drop_worktree(&repo, &a);
+        drop_worktree(&repo, &b);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn deleting_a_session_drops_its_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "drop");
+        let workspace = prepare_new_session_workspace(&repo);
+        assert!(workspace.exists());
+        let info = create_blank_session(&workspace, "wt-drop", false).unwrap();
+        let path = state_path_for_id(&info.id).expect("created session is resolvable");
+        remove_session_files(&path);
+        assert!(!workspace.exists(), "isolated worktree should be gone");
+        assert!(repo.exists(), "original clone must stay");
+        let _ = fs::remove_dir_all(&repo);
     }
 }
