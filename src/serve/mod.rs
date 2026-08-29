@@ -24,8 +24,9 @@ use tokio::task::JoinHandle;
 use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{LoopInput, deserialize_state, serialize_state};
 use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
+use crate::recurring::{self, Schedule};
 use crate::session::{
-    list_device_sessions, prepare_new_session_workspace, read_session_profile,
+    list_device_sessions, prepare_new_session_workspace, read_session_profile, status_str,
     start_mission_control_session, start_session_with_browser_summary, state_path_for_id,
     write_session_profile,
 };
@@ -140,6 +141,7 @@ struct Daemon {
     /// the mobile client resends after a reconnect.
     seen_nonces: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     mission_control_root: PathBuf,
+    recurring_root: PathBuf,
 }
 
 /// The machine's hostname, used as the app's default instance name.
@@ -511,6 +513,7 @@ pub async fn run_serve(
         browser: BrowserManager::default(),
         seen_nonces: std::sync::Mutex::new(HashMap::new()),
         mission_control_root: mission_control::MissionControlStore::default_root(None),
+        recurring_root: recurring::default_root(),
     });
 
     // Background self-update: periodically check for a newer release, replace the
@@ -537,6 +540,10 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { mission_control_dispatch_loop(d).await });
     }
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { recurring_tick_loop(d).await });
+    }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
     // inflates it by ~4/3. Size the request-body limit so a ~1 GB file still fits
     // once encoded (≈1.33 GB) plus headroom for the JSON envelope. Every other route
@@ -547,6 +554,11 @@ pub async fn run_serve(
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
+        .route("/recurring", get(list_recurring).post(create_recurring))
+        .route(
+            "/recurring/{id}",
+            put(update_recurring).delete(delete_recurring),
+        )
         .route("/mission-control/overview", get(mission_control_overview))
         .route(
             "/mission-control/settings",
@@ -2643,6 +2655,7 @@ mod tests {
             browser: BrowserManager::default(),
             seen_nonces: std::sync::Mutex::new(HashMap::new()),
             mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
+            recurring_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
     }
 
@@ -3505,6 +3518,182 @@ async fn mission_control_update_settings(
         &req.notification_policy,
     ) {
         Ok(settings) => Json(settings).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+fn session_busy_for_recurring(id: &str) -> bool {
+    let Some(sp) = state_path_for_id(id) else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(&sp) else {
+        return false;
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return false;
+    };
+    recurring::session_is_busy(&status_str(state.status))
+        || state
+            .lanes
+            .iter()
+            .any(|l| matches!(l.status, crate::lanes::LaneStatus::Running))
+}
+
+async fn recurring_tick_loop(daemon: Shared) {
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let due = recurring::due_jobs(&daemon.recurring_root, now).unwrap_or_default();
+        for job in due {
+            if session_busy_for_recurring(&job.session_id) {
+                let _ = recurring::mark_queued(&daemon.recurring_root, &job.id);
+                continue;
+            }
+            daemon
+                .deliver(&job.session_id, LoopInput::UserMessage(job.envelope()))
+                .await;
+            let _ = recurring::mark_fired(&daemon.recurring_root, &job.id, now);
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+async fn list_recurring(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match recurring::list_jobs(&d.recurring_root) {
+        Ok(jobs) => Json(jobs).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct RecurringCreateReq {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    schedule: String,
+}
+
+#[derive(Deserialize)]
+struct RecurringUpdateReq {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    schedule: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+async fn create_recurring(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<RecurringCreateReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let schedule = match Schedule::parse(&req.schedule) {
+        Ok(s) => s,
+        Err(error) => return mission_error(error),
+    };
+    match recurring::create_job(
+        &d.recurring_root,
+        &req.title,
+        &req.session_id,
+        &req.prompt,
+        schedule,
+    ) {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+async fn update_recurring(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<RecurringUpdateReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let schedule = match req.schedule.as_deref() {
+        Some(raw) if !raw.trim().is_empty() => match Schedule::parse(raw) {
+            Ok(s) => Some(s),
+            Err(error) => return mission_error(error),
+        },
+        _ => None,
+    };
+    match recurring::update_job(&d.recurring_root, &id, |job| {
+        if let Some(title) = req.title.as_deref() {
+            let title = title.trim();
+            if !title.is_empty() {
+                job.title = title.to_string();
+            }
+        }
+        if let Some(session_id) = req.session_id.as_deref() {
+            let session_id = session_id.trim();
+            if !session_id.is_empty() {
+                job.session_id = session_id.to_string();
+            }
+        }
+        if let Some(prompt) = req.prompt.as_deref() {
+            let prompt = prompt.trim();
+            if !prompt.is_empty() {
+                job.prompt = prompt.to_string();
+            }
+        }
+        if let Some(schedule) = schedule.clone() {
+            job.schedule = schedule;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            job.next_run_at = job.schedule.next_after(now);
+            job.queued = false;
+        }
+        if let Some(enabled) = req.enabled {
+            job.enabled = enabled;
+            if !enabled {
+                job.queued = false;
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if job.next_run_at < now {
+                    job.next_run_at = job.schedule.next_after(now);
+                }
+            }
+        }
+    }) {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+async fn delete_recurring(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match recurring::delete_job(&d.recurring_root, &id) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(error) => mission_error(error),
     }
 }
