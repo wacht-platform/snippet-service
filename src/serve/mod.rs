@@ -3551,10 +3551,22 @@ async fn recurring_tick_loop(daemon: Shared) {
                 let _ = recurring::mark_queued(&daemon.recurring_root, &job.id);
                 continue;
             }
-            daemon
-                .deliver(&job.session_id, LoopInput::UserMessage(job.envelope()))
-                .await;
-            let _ = recurring::mark_fired(&daemon.recurring_root, &job.id, now);
+            let workspace = state_path_for_id(&job.session_id)
+                .and_then(|sp| std::fs::read(&sp).ok())
+                .and_then(|bytes| deserialize_state(&bytes).ok())
+                .map(|s| PathBuf::from(s.workspace))
+                .filter(|p| p.is_dir());
+            match job.render_message(workspace.as_deref()) {
+                Ok(text) => {
+                    daemon
+                        .deliver(&job.session_id, LoopInput::UserMessage(text))
+                        .await;
+                    let _ = recurring::mark_fired(&daemon.recurring_root, &job.id, now);
+                }
+                Err(error) => {
+                    let _ = recurring::mark_error(&daemon.recurring_root, &job.id, &error);
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
@@ -3579,6 +3591,8 @@ struct RecurringCreateReq {
     #[serde(default)]
     prompt: String,
     #[serde(default)]
+    plan_path: Option<String>,
+    #[serde(default)]
     schedule: String,
 }
 
@@ -3590,6 +3604,8 @@ struct RecurringUpdateReq {
     session_id: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    plan_path: Option<String>,
     #[serde(default)]
     schedule: Option<String>,
     #[serde(default)]
@@ -3614,6 +3630,7 @@ async fn create_recurring(
         &req.session_id,
         &req.prompt,
         schedule,
+        req.plan_path.as_deref(),
     ) {
         Ok(job) => Json(job).into_response(),
         Err(error) => mission_error(error),
@@ -3650,10 +3667,15 @@ async fn update_recurring(
             }
         }
         if let Some(prompt) = req.prompt.as_deref() {
-            let prompt = prompt.trim();
-            if !prompt.is_empty() {
-                job.prompt = prompt.to_string();
-            }
+            job.prompt = prompt.trim().to_string();
+        }
+        if let Some(plan_path) = req.plan_path.as_deref() {
+            let trimmed = plan_path.trim();
+            job.plan_path = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
         }
         if let Some(schedule) = schedule.clone() {
             job.schedule = schedule;
