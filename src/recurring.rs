@@ -1,9 +1,10 @@
 //! Durable recurring jobs that poke Mission Control or any conversation session.
 //!
 //! Jobs live as JSON files under `~/.snippet/recurring/<id>.json`. The serve
-//! daemon's tick loop claims due jobs and delivers a `[recurring_job]` user
-//! message through `Daemon::deliver`. If the target session is mid-turn, the
-//! fire is queued (one deep) and retried on the next idle tick — missed
+//! daemon's tick loop claims due jobs and delivers a formatted scheduled
+//! user message through `Daemon::deliver`. Optional `plan_path` is read from
+//! disk at fire time (markdown/plan file). If the target session is mid-turn,
+//! the fire is queued (one deep) and retried on the next idle tick — missed
 //! intervals are not backfilled.
 
 use std::fs;
@@ -62,25 +63,28 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
     serde_json::from_str(&raw).map_err(|e| format!("deserialise {}: {e}", path.display()))
 }
 
+/// Shortest repeating interval (5 minutes).
+pub const MIN_INTERVAL_SECS: u64 = 300;
+
 /// How often a job fires.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Schedule {
-    /// Fire every `every_secs` seconds (minimum 60).
+    /// Fire every `every_secs` seconds (minimum [`MIN_INTERVAL_SECS`]).
     Interval { every_secs: u64 },
     /// Fire once a day at `hour`:`minute` in local time (0–23, 0–59).
     Daily { hour: u8, minute: u8 },
 }
 
 impl Schedule {
-    /// Parse `every 15m|1h|1d` or `daily HH:MM`.
+    /// Parse `every 5m|15m|1h|1d|300s` or `daily HH:MM`.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
         let lower = raw.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("every ") {
             let every_secs = parse_duration(rest.trim())?;
-            if every_secs < 60 {
-                return Err("interval must be at least 60 seconds".into());
+            if every_secs < MIN_INTERVAL_SECS {
+                return Err("interval must be at least 5 minutes".into());
             }
             return Ok(Self::Interval { every_secs });
         }
@@ -88,7 +92,7 @@ impl Schedule {
             let (hour, minute) = parse_hhmm(rest.trim())?;
             return Ok(Self::Daily { hour, minute });
         }
-        Err("schedule must be `every 15m|1h|1d` or `daily HH:MM`".into())
+        Err("schedule must be `every 5m|1h|1d` or `daily HH:MM`".into())
     }
 
     pub fn display(&self) -> String {
@@ -202,6 +206,10 @@ pub struct RecurringJob {
     /// Target conversation: `mission-control` or any session id.
     pub session_id: String,
     pub prompt: String,
+    /// Optional markdown/plan file, read at fire time (relative to the session
+    /// workspace, or absolute). Empty/None = prompt only.
+    #[serde(default)]
+    pub plan_path: Option<String>,
     pub schedule: Schedule,
     pub enabled: bool,
     pub next_run_at: u64,
@@ -219,15 +227,67 @@ pub struct RecurringJob {
 }
 
 impl RecurringJob {
-    pub fn envelope(&self) -> String {
-        format!(
-            "[recurring_job]\nid: {}\ntitle: {}\nschedule: {}\n\n{}\n[/recurring_job]",
-            self.id,
-            self.title,
-            self.schedule.display(),
-            self.prompt.trim()
-        )
+    /// Chat-shaped user message for this fire. Reads `plan_path` now so the
+    /// markdown/plan file can change between runs.
+    pub fn render_message(&self, workspace: Option<&Path>) -> Result<String, String> {
+        let mut body = format!("**Scheduled · {}**", self.schedule.display());
+        if !self.title.trim().is_empty() {
+            body.push_str(" — ");
+            body.push_str(self.title.trim());
+        }
+        body.push_str("\n\n");
+        let prompt = self.prompt.trim();
+        if !prompt.is_empty() {
+            body.push_str(prompt);
+            body.push('\n');
+        }
+        if let Some(path) = self.plan_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            let contents = read_plan(path, workspace)?;
+            if !prompt.is_empty() {
+                body.push('\n');
+            }
+            body.push_str("From `");
+            body.push_str(path);
+            body.push_str("`:\n\n");
+            body.push_str(&contents);
+            if !contents.ends_with('\n') {
+                body.push('\n');
+            }
+        }
+        Ok(body.trim_end().to_string())
     }
+}
+
+const PLAN_MAX_BYTES: usize = 64 * 1024;
+
+fn read_plan(path: &str, workspace: Option<&Path>) -> Result<String, String> {
+    let given = PathBuf::from(path);
+    let resolved = if given.is_absolute() {
+        given
+    } else {
+        let ws = workspace.ok_or_else(|| {
+            "plan path is relative but this session has no workspace".to_string()
+        })?;
+        let joined = ws.join(&given);
+        let canon_ws = ws.canonicalize().unwrap_or_else(|_| ws.to_path_buf());
+        match joined.canonicalize() {
+            Ok(canon) => {
+                if !canon.starts_with(&canon_ws) {
+                    return Err("plan path must stay inside the session workspace".into());
+                }
+                canon
+            }
+            Err(_) => {
+                return Err(format!("plan file not found: {}", joined.display()));
+            }
+        }
+    };
+    let bytes = fs::read(&resolved)
+        .map_err(|e| format!("read plan {}: {e}", resolved.display()))?;
+    if bytes.len() > PLAN_MAX_BYTES {
+        return Err("plan file is larger than 64 KiB".into());
+    }
+    String::from_utf8(bytes).map_err(|_| "plan file is not UTF-8".into())
 }
 
 fn list_ids(root: &Path) -> Vec<String> {
@@ -266,24 +326,35 @@ pub fn get_job(root: &Path, id: &str) -> Result<RecurringJob, String> {
     read_json(&job_path(root, id))
 }
 
+fn normalize_plan_path(raw: Option<&str>) -> Option<String> {
+    let p = raw?.trim();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p.to_string())
+    }
+}
+
 pub fn create_job(
     root: &Path,
     title: &str,
     session_id: &str,
     prompt: &str,
     schedule: Schedule,
+    plan_path: Option<&str>,
 ) -> Result<RecurringJob, String> {
     let title = title.trim();
     let session_id = session_id.trim();
     let prompt = prompt.trim();
+    let plan_path = normalize_plan_path(plan_path);
     if title.is_empty() {
         return Err("title is required".into());
     }
     if session_id.is_empty() {
         return Err("session_id is required".into());
     }
-    if prompt.is_empty() {
-        return Err("prompt is required".into());
+    if prompt.is_empty() && plan_path.is_none() {
+        return Err("prompt or plan_path is required".into());
     }
     let now = epoch_secs();
     let job = RecurringJob {
@@ -291,6 +362,7 @@ pub fn create_job(
         title: title.to_string(),
         session_id: session_id.to_string(),
         prompt: prompt.to_string(),
+        plan_path,
         next_run_at: schedule.next_after(now),
         schedule,
         enabled: true,
@@ -414,14 +486,23 @@ mod tests {
             }
         );
         assert!(Schedule::parse("every 30s").is_err());
+        assert!(Schedule::parse("every 4m").is_err());
+        assert_eq!(
+            Schedule::parse("every 5m").unwrap(),
+            Schedule::Interval { every_secs: 300 }
+        );
+        assert_eq!(
+            Schedule::parse("every 300s").unwrap(),
+            Schedule::Interval { every_secs: 300 }
+        );
         assert!(Schedule::parse("cron * * *").is_err());
         assert!(Schedule::parse("daily 25:00").is_err());
     }
 
     #[test]
     fn interval_next_after_adds() {
-        let s = Schedule::Interval { every_secs: 60 };
-        assert_eq!(s.next_after(1000), 1060);
+        let s = Schedule::Interval { every_secs: 300 };
+        assert_eq!(s.next_after(1000), 1300);
     }
 
     #[test]
@@ -433,6 +514,7 @@ mod tests {
             "mission-control",
             "summarize CI",
             Schedule::parse("every 1h").unwrap(),
+            None,
         )
         .unwrap();
         assert!(job.enabled);
@@ -460,6 +542,7 @@ mod tests {
             "s1",
             "do it",
             Schedule::Interval { every_secs: 3600 },
+            None,
         )
         .unwrap();
         mark_queued(root.path(), &job.id).unwrap();
@@ -476,7 +559,8 @@ mod tests {
             "T",
             "s1",
             "do it",
-            Schedule::Interval { every_secs: 60 },
+            Schedule::Interval { every_secs: 300 },
+            None,
         )
         .unwrap();
         // Pretend it was due an hour ago and queued.
@@ -489,17 +573,18 @@ mod tests {
         let fired = mark_fired(root.path(), &job.id, now).unwrap();
         assert!(!fired.queued);
         assert_eq!(fired.last_run_at, Some(now));
-        assert_eq!(fired.next_run_at, now + 60);
+        assert_eq!(fired.next_run_at, now + 300);
     }
 
     #[test]
-    fn envelope_wraps_prompt() {
+    fn render_message_is_chat_shaped() {
         let job = RecurringJob {
             id: "abc".into(),
             title: "Ping".into(),
             session_id: "mission-control".into(),
             prompt: "say hello".into(),
-            schedule: Schedule::Interval { every_secs: 60 },
+            plan_path: None,
+            schedule: Schedule::Interval { every_secs: 300 },
             enabled: true,
             next_run_at: 0,
             last_run_at: None,
@@ -508,10 +593,52 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let env = job.envelope();
-        assert!(env.contains("[recurring_job]"));
-        assert!(env.contains("say hello"));
-        assert!(env.contains("every 1m"));
+        let msg = job.render_message(None).unwrap();
+        assert!(msg.starts_with("**Scheduled · every 5m** — Ping"));
+        assert!(msg.contains("say hello"));
+        assert!(!msg.contains("[recurring_job]"));
+    }
+
+    #[test]
+    fn render_message_includes_plan_file() {
+        let dir = tmp();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "# Do the thing\n\n- step 1\n").unwrap();
+        let job = RecurringJob {
+            id: "abc".into(),
+            title: "Nightly".into(),
+            session_id: "s1".into(),
+            prompt: "follow the plan".into(),
+            plan_path: Some(plan.display().to_string()),
+            schedule: Schedule::Interval { every_secs: 300 },
+            enabled: true,
+            next_run_at: 0,
+            last_run_at: None,
+            last_error: None,
+            queued: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let msg = job.render_message(None).unwrap();
+        assert!(msg.contains("follow the plan"));
+        assert!(msg.contains("# Do the thing"));
+        assert!(msg.contains("From `"));
+    }
+
+    #[test]
+    fn create_accepts_plan_without_prompt() {
+        let root = tmp();
+        let job = create_job(
+            root.path(),
+            "From file",
+            "s1",
+            "",
+            Schedule::Interval { every_secs: 300 },
+            Some("notes/plan.md"),
+        )
+        .unwrap();
+        assert_eq!(job.plan_path.as_deref(), Some("notes/plan.md"));
+        assert!(job.prompt.is_empty());
     }
 
     #[test]

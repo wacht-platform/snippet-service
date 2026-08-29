@@ -74,7 +74,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/recur",
-        "Schedule a recurring poke: /recur list · add every 1h <prompt> · pause|on|rm <id>",
+        "Schedule a recurring poke: /recur list · add every 5m <prompt> · add … @plan.md · pause|on|rm <id>",
     ),
 ];
 
@@ -1466,7 +1466,7 @@ impl App {
             match crate::recurring::list_jobs(&root) {
                 Ok(jobs) if jobs.is_empty() => {
                     self.status =
-                        "No recurring jobs. /recur add every 1h <prompt>  ·  /recur add daily 09:00 <prompt>"
+                        "No recurring jobs. /recur add every 5m <prompt>  ·  /recur add daily 09:00 @plan.md"
                             .into();
                 }
                 Ok(jobs) => {
@@ -1504,45 +1504,52 @@ impl App {
         let tail = parts.next().unwrap_or("").trim();
         match verb.as_str() {
             "add" => {
-                // /recur add [mc] every 1h <prompt>
-                // /recur add [mc] daily 09:00 <prompt>
+                // /recur add [mc] every 5m <prompt>
+                // /recur add [mc] daily 09:00 @notes/plan.md
                 let mut tokens = tail.split_whitespace();
                 let first = tokens.next().unwrap_or("");
-                let (session_id, schedule_raw, prompt) = if first.eq_ignore_ascii_case("mc")
+                let (session_id, schedule_raw, rest) = if first.eq_ignore_ascii_case("mc")
                     || first.eq_ignore_ascii_case("mission-control")
                 {
                     let kind = tokens.next().unwrap_or("");
                     let spec = tokens.next().unwrap_or("");
-                    let prompt: String = tokens.collect::<Vec<_>>().join(" ");
+                    let rest: String = tokens.collect::<Vec<_>>().join(" ");
                     (
                         crate::mission_control::SESSION_ID.to_string(),
                         format!("{kind} {spec}"),
-                        prompt,
+                        rest,
                     )
                 } else {
                     let spec = tokens.next().unwrap_or("");
-                    let prompt: String = tokens.collect::<Vec<_>>().join(" ");
+                    let rest: String = tokens.collect::<Vec<_>>().join(" ");
                     (
                         self.current_session_id(),
                         format!("{first} {spec}"),
-                        prompt,
+                        rest,
                     )
                 };
-                if prompt.is_empty() {
+                let (prompt, plan_path) = split_recur_prompt_and_plan(&rest);
+                if prompt.is_empty() && plan_path.is_none() {
                     self.status =
-                        "Usage: /recur add [mc] every 1h <prompt>   ·   /recur add [mc] daily 09:00 <prompt>"
+                        "Usage: /recur add [mc] every 5m <prompt>   ·   /recur add [mc] daily 09:00 @plan.md"
                             .into();
                     return;
                 }
                 match crate::recurring::Schedule::parse(&schedule_raw) {
                     Ok(schedule) => {
-                        let title: String = prompt.chars().take(48).collect();
+                        let title_src = if !prompt.is_empty() {
+                            prompt.as_str()
+                        } else {
+                            plan_path.as_deref().unwrap_or("scheduled")
+                        };
+                        let title: String = title_src.chars().take(48).collect();
                         match crate::recurring::create_job(
                             &root,
                             &title,
                             &session_id,
                             &prompt,
                             schedule,
+                            plan_path.as_deref(),
                         ) {
                             Ok(job) => {
                                 self.status = format!(
@@ -1585,7 +1592,7 @@ impl App {
             },
             _ => {
                 self.status =
-                    "Usage: /recur list · add [mc] every 1h|daily 09:00 <prompt> · pause|on|rm <id>"
+                    "Usage: /recur list · add [mc] every 5m|daily 09:00 <prompt> · add … @plan.md · pause|on|rm <id>"
                         .into();
             }
         }
@@ -6990,4 +6997,25 @@ fn resolve_recur_id(root: &std::path::Path, prefix: &str) -> Result<String, Stri
             many.len()
         )),
     }
+}
+
+/// Split trailing `@path` (or `file:path`) off a `/recur add` rest string.
+fn split_recur_prompt_and_plan(rest: &str) -> (String, Option<String>) {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return (String::new(), None);
+    }
+    if let Some(path) = rest.strip_prefix('@').or_else(|| rest.strip_prefix("file:")) {
+        let path = path.trim();
+        if !path.is_empty() {
+            return (String::new(), Some(path.to_string()));
+        }
+    }
+    if let Some((prompt, path)) = rest.rsplit_once(" @") {
+        let path = path.trim();
+        if !path.is_empty() && !path.contains(char::is_whitespace) {
+            return (prompt.trim().to_string(), Some(path.to_string()));
+        }
+    }
+    (rest.to_string(), None)
 }
