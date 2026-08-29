@@ -72,6 +72,10 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
         "/term",
         "Open this session's interactive shell (Ctrl-T; Esc leaves)",
     ),
+    (
+        "/recur",
+        "Schedule a recurring poke: /recur list · add every 1h <prompt> · pause|on|rm <id>",
+    ),
 ];
 
 struct PendingSidecarAttach {
@@ -1435,10 +1439,154 @@ impl App {
             "/theme" => {
                 self.status = "AMOLED is the only theme.".to_string();
             }
+            "/recur" => self.handle_recur_command(text),
             other => {
                 self.status = format!(
-                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, or /term."
+                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, /term, or /recur."
                 );
+            }
+        }
+    }
+
+    fn current_session_id(&self) -> String {
+        if self.active_state_path == crate::mission_control::session_state_path()
+            || crate::mission_control::is_session_id(
+                &crate::serve::sidecar::state_path_to_session_id(&self.active_state_path),
+            )
+        {
+            return crate::mission_control::SESSION_ID.to_string();
+        }
+        crate::serve::sidecar::state_path_to_session_id(&self.active_state_path)
+    }
+
+    fn handle_recur_command(&mut self, text: &str) {
+        let rest = text.strip_prefix("/recur").unwrap_or("").trim();
+        let root = crate::recurring::default_root();
+        if rest.is_empty() || rest.eq_ignore_ascii_case("list") {
+            match crate::recurring::list_jobs(&root) {
+                Ok(jobs) if jobs.is_empty() => {
+                    self.status =
+                        "No recurring jobs. /recur add every 1h <prompt>  ·  /recur add daily 09:00 <prompt>"
+                            .into();
+                }
+                Ok(jobs) => {
+                    let lines: Vec<String> = jobs
+                        .iter()
+                        .map(|j| {
+                            let flag = if !j.enabled {
+                                "paused"
+                            } else if j.queued {
+                                "queued"
+                            } else {
+                                "on"
+                            };
+                            let short = if j.id.len() >= 8 { &j.id[..8] } else { &j.id };
+                            format!(
+                                "{short}  {flag}  {}  → {}  {}",
+                                j.schedule.display(),
+                                j.session_id,
+                                j.title
+                            )
+                        })
+                        .collect();
+                    self.status = format!(
+                        "{} job(s):\n{}",
+                        jobs.len(),
+                        lines.join("\n")
+                    );
+                }
+                Err(e) => self.status = format!("recur list failed: {e}"),
+            }
+            return;
+        }
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let verb = parts.next().unwrap_or("").to_ascii_lowercase();
+        let tail = parts.next().unwrap_or("").trim();
+        match verb.as_str() {
+            "add" => {
+                // /recur add [mc] every 1h <prompt>
+                // /recur add [mc] daily 09:00 <prompt>
+                let mut tokens = tail.split_whitespace();
+                let first = tokens.next().unwrap_or("");
+                let (session_id, schedule_raw, prompt) = if first.eq_ignore_ascii_case("mc")
+                    || first.eq_ignore_ascii_case("mission-control")
+                {
+                    let kind = tokens.next().unwrap_or("");
+                    let spec = tokens.next().unwrap_or("");
+                    let prompt: String = tokens.collect::<Vec<_>>().join(" ");
+                    (
+                        crate::mission_control::SESSION_ID.to_string(),
+                        format!("{kind} {spec}"),
+                        prompt,
+                    )
+                } else {
+                    let spec = tokens.next().unwrap_or("");
+                    let prompt: String = tokens.collect::<Vec<_>>().join(" ");
+                    (
+                        self.current_session_id(),
+                        format!("{first} {spec}"),
+                        prompt,
+                    )
+                };
+                if prompt.is_empty() {
+                    self.status =
+                        "Usage: /recur add [mc] every 1h <prompt>   ·   /recur add [mc] daily 09:00 <prompt>"
+                            .into();
+                    return;
+                }
+                match crate::recurring::Schedule::parse(&schedule_raw) {
+                    Ok(schedule) => {
+                        let title: String = prompt.chars().take(48).collect();
+                        match crate::recurring::create_job(
+                            &root,
+                            &title,
+                            &session_id,
+                            &prompt,
+                            schedule,
+                        ) {
+                            Ok(job) => {
+                                self.status = format!(
+                                    "Recurring {} → {} ({})",
+                                    job.schedule.display(),
+                                    job.session_id,
+                                    &job.id[..8.min(job.id.len())]
+                                );
+                            }
+                            Err(e) => self.status = format!("recur add failed: {e}"),
+                        }
+                    }
+                    Err(e) => self.status = format!("{e}"),
+                }
+            }
+            "pause" | "off" => match resolve_recur_id(&root, tail) {
+                Ok(id) => match crate::recurring::set_enabled(&root, &id, false) {
+                    Ok(job) => {
+                        self.status = format!("Paused {}", short_id(&job.id));
+                    }
+                    Err(e) => self.status = format!("recur pause failed: {e}"),
+                },
+                Err(e) => self.status = e,
+            },
+            "on" | "resume" | "unpause" => match resolve_recur_id(&root, tail) {
+                Ok(id) => match crate::recurring::set_enabled(&root, &id, true) {
+                    Ok(job) => {
+                        self.status = format!("Enabled {}", short_id(&job.id));
+                    }
+                    Err(e) => self.status = format!("recur on failed: {e}"),
+                },
+                Err(e) => self.status = e,
+            },
+            "rm" | "remove" | "delete" => match resolve_recur_id(&root, tail) {
+                Ok(id) => match crate::recurring::delete_job(&root, &id) {
+                    Ok(()) => self.status = format!("Removed {}", short_id(&id)),
+                    Err(e) => self.status = format!("recur rm failed: {e}"),
+                },
+                Err(e) => self.status = e,
+            },
+            _ => {
+                self.status =
+                    "Usage: /recur list · add [mc] every 1h|daily 09:00 <prompt> · pause|on|rm <id>"
+                        .into();
             }
         }
     }
@@ -6817,5 +6965,29 @@ async fn fetch_models_from_provider(
             Ok(models)
         }
         _ => Err(format!("Unsupported provider: {}", provider)),
+    }
+}
+
+fn short_id(id: &str) -> &str {
+    if id.len() >= 8 { &id[..8] } else { id }
+}
+
+fn resolve_recur_id(root: &std::path::Path, prefix: &str) -> Result<String, String> {
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return Err("Usage: /recur pause|on|rm <id>".into());
+    }
+    let jobs = crate::recurring::list_jobs(root).map_err(|e| format!("recur: {e}"))?;
+    let matches: Vec<_> = jobs
+        .into_iter()
+        .filter(|j| j.id == prefix || j.id.starts_with(prefix))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok(one.id.clone()),
+        [] => Err(format!("no recurring job matching `{prefix}`")),
+        many => Err(format!(
+            "ambiguous id `{prefix}` ({} matches) — use more of the id",
+            many.len()
+        )),
     }
 }
