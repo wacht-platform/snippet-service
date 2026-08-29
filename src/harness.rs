@@ -32,14 +32,16 @@ const LARGE_TOOL_BATCH: usize = 10;
 /// The second consecutive shell-discipline nudge escalates to reflect-and-switch.
 const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
-/// Read-only discovery tools whose exact-duplicate re-call within a request is
-/// wasteful spinning (the result is already in history). `read_file` is excluded
-/// — re-reading after an edit is legitimate.
-const DEDUP_TOOLS: [&str; 4] = [
+/// Read-only tools whose exact-duplicate re-call within a request is wasteful
+/// spinning (the result is already in history). `read_file` is excluded —
+/// re-reading after an edit is legitimate. `memory_read` is included: recalling
+/// the same id again this turn cannot change the entry.
+const DEDUP_TOOLS: [&str; 5] = [
     "list_files",
     "search_content",
     "search_files",
     "view_outline",
+    "memory_read",
 ];
 
 /// Tools that change the workspace; running one invalidates the dedup set so
@@ -2280,10 +2282,15 @@ impl CodingHarness {
                 // ("insufficient tool messages"), and the broken turn poisons every
                 // later request until compaction.
                 dedup_hits += 1;
+                let skipped = if tool_name == "memory_read" {
+                    "Identical memory_read already ran this turn — reuse that result. Don't recall the same id again."
+                } else {
+                    "Identical discovery call already ran this turn — reuse the earlier result instead of repeating it."
+                };
                 let result = json!({
                     "schema_version": 1,
                     "status": "ok",
-                    "data": {"skipped": "Identical discovery call already ran this turn — reuse the earlier result instead of repeating it."},
+                    "data": {"skipped": skipped},
                 });
                 state.events.push(HarnessEvent::ToolResult {
                     tool_name: tool_name.clone(),
@@ -2464,7 +2471,13 @@ impl CodingHarness {
             // are stale — re-discovery is legitimate again; clear the dedup set.
             // Otherwise remember this discovery call so an exact repeat is caught.
             if MUTATING_TOOLS.contains(&tool_name.as_str()) {
-                vars.executed_calls.clear();
+                // File/shell mutations stale workspace discovery, not memory.
+                vars.executed_calls.retain(|s| s.starts_with("memory_read:"));
+            } else if matches!(
+                tool_name.as_str(),
+                "memory_write" | "memory_delete" | "memory_index"
+            ) {
+                vars.executed_calls.retain(|s| !s.starts_with("memory_read:"));
             } else if DEDUP_TOOLS.contains(&tool_name.as_str()) {
                 vars.executed_calls.insert(signature);
             }
