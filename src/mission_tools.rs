@@ -40,6 +40,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ListMissionTasks);
     registry.insert(CreateMissionSession);
     registry.insert(CreateMissionTask);
+    registry.insert(CreateRecurringJob);
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
     registry.insert(ArchiveMissionSession);
@@ -511,5 +512,79 @@ impl Tool for ReportMissionTask {
             .map_err(ToolError::msg)?
         };
         Ok(ToolResult::success(json!({"task": task_view(&task)})))
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateRecurringArgs {
+    title: String,
+    session_id: String,
+    schedule: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    plan_path: Option<String>,
+}
+
+/// Writes `~/.snippet/recurring/<id>.json`. The serve tick is the only reader —
+/// creating the file *is* scheduling. The target session picks it up as SetGoal.
+pub struct CreateRecurringJob;
+#[async_trait]
+impl Tool for CreateRecurringJob {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "create_recurring_job".into(),
+            description: "Schedule a recurring autonomous GOAL on an existing chat. Writes ~/.snippet/recurring/<id>.json; the daemon detects that file and delivers SetGoal to session_id. session_id must come from list_sessions (or mission-control). schedule is `every 5m|15m|1h|1d` (min 5 minutes) or `daily HH:MM`. prompt and/or plan_path required — plan_path is a markdown/plan file the target session rereads each fire. If that session is already on a goal, this fire queues and starts the moment the current goal completes.".into(),
+            input_schema: schema(
+                json!({
+                    "title": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "schedule": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "plan_path": {"type": "string"}
+                }),
+                &["title", "session_id", "schedule"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let _ = root(ctx)?;
+        let args: CreateRecurringArgs =
+            serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
+                tool: "create_recurring_job".into(),
+            })?;
+        let session_id = args.session_id.trim();
+        if session_id.is_empty() {
+            return Err(ToolError::msg("session_id is required"));
+        }
+        if !crate::mission_control::is_session_id(session_id)
+            && state_path_for_id(session_id).is_none()
+        {
+            return Err(ToolError::msg(
+                "unknown target session — pass an id from list_sessions",
+            ));
+        }
+        let schedule = crate::recurring::Schedule::parse(&args.schedule).map_err(ToolError::msg)?;
+        let job = crate::recurring::create_job(
+            &crate::recurring::default_root(),
+            args.title.trim(),
+            session_id,
+            args.prompt.trim(),
+            schedule,
+            args.plan_path.as_deref(),
+        )
+        .map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({
+            "job": {
+                "id": job.id,
+                "title": job.title,
+                "session_id": job.session_id,
+                "schedule": job.schedule.display(),
+                "plan_path": job.plan_path,
+                "next_run_at": job.next_run_at,
+                "path": format!("~/.snippet/recurring/{}.json", job.id),
+            },
+            "note": "Job file written. The daemon tick will SetGoal on that session when due; if it is already on a goal, this fire queues and starts immediately after complete_goal.",
+        })))
     }
 }

@@ -74,7 +74,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/recur",
-        "Schedule a recurring poke: /recur list · add every 5m <prompt> · add … @plan.md · pause|on|rm <id>",
+        "Schedule a recurring goal: /recur list · add every 5m <prompt> · add <session> every 5m … · add … @plan.md · pause|on|rm <id>",
     ),
 ];
 
@@ -1466,7 +1466,7 @@ impl App {
             match crate::recurring::list_jobs(&root) {
                 Ok(jobs) if jobs.is_empty() => {
                     self.status =
-                        "No recurring jobs. /recur add every 5m <prompt>  ·  /recur add daily 09:00 @plan.md"
+                        "No recurring jobs. /recur add every 5m <prompt>  ·  /recur add <session> every 1h @plan.md"
                             .into();
                 }
                 Ok(jobs) => {
@@ -1504,11 +1504,22 @@ impl App {
         let tail = parts.next().unwrap_or("").trim();
         match verb.as_str() {
             "add" => {
-                // /recur add [mc] every 5m <prompt>
-                // /recur add [mc] daily 09:00 @notes/plan.md
+                // /recur add every 5m <prompt>            → this chat
+                // /recur add daily 09:00 @notes/plan.md
+                // /recur add <session-id> every 5m …      → that chat (from MC or any)
                 let mut tokens = tail.split_whitespace();
                 let first = tokens.next().unwrap_or("");
-                let (session_id, schedule_raw, rest) = if first.eq_ignore_ascii_case("mc")
+                let looks_like_schedule = first.eq_ignore_ascii_case("every")
+                    || first.eq_ignore_ascii_case("daily");
+                let (session_id, schedule_raw, rest) = if looks_like_schedule {
+                    let spec = tokens.next().unwrap_or("");
+                    let rest: String = tokens.collect::<Vec<_>>().join(" ");
+                    (
+                        self.current_session_id(),
+                        format!("{first} {spec}"),
+                        rest,
+                    )
+                } else if first.eq_ignore_ascii_case("mc")
                     || first.eq_ignore_ascii_case("mission-control")
                 {
                     let kind = tokens.next().unwrap_or("");
@@ -1520,18 +1531,16 @@ impl App {
                         rest,
                     )
                 } else {
+                    // first token is a target session id
+                    let kind = tokens.next().unwrap_or("");
                     let spec = tokens.next().unwrap_or("");
                     let rest: String = tokens.collect::<Vec<_>>().join(" ");
-                    (
-                        self.current_session_id(),
-                        format!("{first} {spec}"),
-                        rest,
-                    )
+                    (first.to_string(), format!("{kind} {spec}"), rest)
                 };
                 let (prompt, plan_path) = split_recur_prompt_and_plan(&rest);
                 if prompt.is_empty() && plan_path.is_none() {
                     self.status =
-                        "Usage: /recur add [mc] every 5m <prompt>   ·   /recur add [mc] daily 09:00 @plan.md"
+                        "Usage: /recur add every 5m <prompt>   ·   /recur add <session> every 5m @plan.md   ·   /recur add daily 09:00 @plan.md"
                             .into();
                     return;
                 }
@@ -1592,7 +1601,7 @@ impl App {
             },
             _ => {
                 self.status =
-                    "Usage: /recur list · add [mc] every 5m|daily 09:00 <prompt> · add … @plan.md · pause|on|rm <id>"
+                    "Usage: /recur list · add every 5m|daily 09:00 <prompt> · add <session> every 5m … @plan.md · pause|on|rm <id>"
                         .into();
             }
         }

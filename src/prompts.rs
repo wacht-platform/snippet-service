@@ -38,6 +38,8 @@ mod tests {
         assert!(mc.contains("inspect_session"));
         assert!(mc.contains("create_mission_session"));
         assert!(mc.contains("create_mission_task"));
+        assert!(mc.contains("create_recurring_job"));
+        assert!(mc.contains("~/.snippet/recurring"));
         assert!(mc.contains("Expect messy, informal"));
         assert!(mc.contains("ask ONE question after intel"));
         assert!(mc.contains("retry_mission_task"));
