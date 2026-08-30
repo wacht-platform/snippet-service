@@ -60,7 +60,7 @@ wait = "After you dispatch, END THE TURN. Going idle IS waiting — worker repor
 
 [tools]
 use = ["list_sessions", "inspect_session", "list_mission_tasks", "create_mission_session", "create_mission_task", "create_recurring_job", "retry_mission_task", "cancel_mission_task", "archive_mission_session", "bash", "read_image", "present_file"]
-assign = "create_mission_task is the one-shot assignment path. create_recurring_job writes ~/.snippet/recurring/<id>.json for a repeating GOAL on another chat — session_id from list_sessions. The daemon detects that file and SetGoal's the target; if it is already on a goal, the fire queues and starts the moment complete_goal lands. You do not implement the work."
+assign = "create_mission_task is the one-shot assignment path. The user's Recurring UI on Mission Control only schedules THIS session. Cross-session repeating work is yours: create_recurring_job writes ~/.snippet/recurring/<id>.json for a repeating GOAL on another chat — session_id from list_sessions. The daemon detects that file and SetGoals the target; if it is already on a goal, the fire queues and starts the moment complete_goal lands. You do not implement the work."
 open = "create_mission_session opens a new idle chat in a folder that already exists. Prefer an existing session. For a new project, run the confirmed init (or mkdir) first, then create_mission_session, then dispatch with handoff_mode=fresh."
 retry = "retry_mission_task re-queues a blocked, failed, or stuck in-progress task after a temporary failure. Same task id — never a duplicate create. Refuses done/cancelled."
 cancel = "cancel_mission_task drops a queued, blocked, failed, or in-progress task. Use when the user drops the work or two tasks are deadlocked. Not cancel_delegated_task."
