@@ -22,7 +22,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
-use crate::harness::{LoopInput, deserialize_state, serialize_state};
+use crate::harness::{GoalStatus, LoopInput, deserialize_state, serialize_state};
 use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
 use crate::recurring::{self, Schedule};
 use crate::session::{
@@ -3537,6 +3537,10 @@ fn session_busy_for_recurring(id: &str) -> bool {
             .lanes
             .iter()
             .any(|l| matches!(l.status, crate::lanes::LaneStatus::Running))
+        || matches!(
+            state.goal.as_ref().map(|g| g.status),
+            Some(GoalStatus::Active | GoalStatus::Paused)
+        )
 }
 
 async fn recurring_tick_loop(daemon: Shared) {
@@ -3556,10 +3560,10 @@ async fn recurring_tick_loop(daemon: Shared) {
                 .and_then(|bytes| deserialize_state(&bytes).ok())
                 .map(|s| PathBuf::from(s.workspace))
                 .filter(|p| p.is_dir());
-            match job.render_message(workspace.as_deref()) {
+            match job.render_goal(workspace.as_deref()) {
                 Ok(text) => {
                     daemon
-                        .deliver(&job.session_id, LoopInput::UserMessage(text))
+                        .deliver(&job.session_id, LoopInput::SetGoal(text))
                         .await;
                     let _ = recurring::mark_fired(&daemon.recurring_root, &job.id, now);
                 }
@@ -3568,7 +3572,14 @@ async fn recurring_tick_loop(daemon: Shared) {
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        // Queued fires wait on an in-flight goal. Poll fast so the next goal
+        // starts as soon as `complete_goal` persists Idle — not on the 15s tick.
+        let wait = if recurring::has_queued(&daemon.recurring_root) {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(15)
+        };
+        tokio::time::sleep(wait).await;
     }
 }
 

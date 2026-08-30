@@ -42,8 +42,8 @@ pub mod watches;
 pub mod xai_auth;
 
 pub use harness::{
-    CodingHarness, HarnessConfig, HarnessEvent, HarnessOutcome, HarnessState, HarnessStatus,
-    LoopInput,
+    CodingHarness, GoalStatus, HarnessConfig, HarnessEvent, HarnessOutcome, HarnessState,
+    HarnessStatus, LoopInput,
 };
 pub use lanes::{LaneManager, LaneRecord, LaneResult, LaneStatus, ModelFactory};
 pub use llm::{AgentModel, GeneratedToolCall, ModelOutput, NativeToolDefinition};

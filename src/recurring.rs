@@ -1,11 +1,13 @@
 //! Durable recurring jobs that poke Mission Control or any conversation session.
 //!
-//! Jobs live as JSON files under `~/.snippet/recurring/<id>.json`. The serve
-//! daemon's tick loop claims due jobs and delivers a formatted scheduled
-//! user message through `Daemon::deliver`. Optional `plan_path` is read from
-//! disk at fire time (markdown/plan file). If the target session is mid-turn,
-//! the fire is queued (one deep) and retried on the next idle tick — missed
-//! intervals are not backfilled.
+//! **Detection:** jobs are JSON files under `~/.snippet/recurring/<id>.json`.
+//! Creating/updating a file there *is* scheduling — the serve tick loop is the
+//! only reader. It claims due jobs and delivers `LoopInput::SetGoal` so the
+//! target session drives that piece of work to `complete_goal`. Optional
+//! `plan_path` is read from disk at fire time. If the target is mid-turn, has a
+//! running lane, or already has an active/paused goal, the fire is queued (one
+//! deep). Queued jobs are retried as soon as that goal completes (fast poll
+//! while anything is queued) — missed intervals are not backfilled.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -227,15 +229,15 @@ pub struct RecurringJob {
 }
 
 impl RecurringJob {
-    /// Chat-shaped user message for this fire. Reads `plan_path` now so the
-    /// markdown/plan file can change between runs.
-    pub fn render_message(&self, workspace: Option<&Path>) -> Result<String, String> {
-        let mut body = format!("**Scheduled · {}**", self.schedule.display());
-        if !self.title.trim().is_empty() {
-            body.push_str(" — ");
-            body.push_str(self.title.trim());
+    /// Goal text for this fire. Reads `plan_path` now so the markdown/plan file
+    /// can change between runs. The agent drives this to `complete_goal`.
+    pub fn render_goal(&self, workspace: Option<&Path>) -> Result<String, String> {
+        let mut body = String::new();
+        let title = self.title.trim();
+        if !title.is_empty() {
+            body.push_str(title);
+            body.push_str("\n\n");
         }
-        body.push_str("\n\n");
         let prompt = self.prompt.trim();
         if !prompt.is_empty() {
             body.push_str(prompt);
@@ -243,7 +245,7 @@ impl RecurringJob {
         }
         if let Some(path) = self.plan_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
             let contents = read_plan(path, workspace)?;
-            if !prompt.is_empty() {
+            if !prompt.is_empty() || !title.is_empty() {
                 body.push('\n');
             }
             body.push_str("From `");
@@ -254,7 +256,11 @@ impl RecurringJob {
                 body.push('\n');
             }
         }
-        Ok(body.trim_end().to_string())
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return Err("goal text is empty".into());
+        }
+        Ok(body)
     }
 }
 
@@ -421,6 +427,13 @@ pub fn due_jobs(root: &Path, now: u64) -> Result<Vec<RecurringJob>, String> {
         .collect())
 }
 
+/// True when any enabled job is waiting on a busy session (goal already running).
+pub fn has_queued(root: &Path) -> bool {
+    list_jobs(root)
+        .map(|jobs| jobs.iter().any(|j| j.enabled && j.queued))
+        .unwrap_or(false)
+}
+
 /// After a successful delivery: clear queue, stamp last_run, advance schedule
 /// from `now` (skip missed intervals).
 pub fn mark_fired(root: &Path, id: &str, now: u64) -> Result<RecurringJob, String> {
@@ -577,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn render_message_is_chat_shaped() {
+    fn render_goal_is_work_to_complete() {
         let job = RecurringJob {
             id: "abc".into(),
             title: "Ping".into(),
@@ -593,14 +606,15 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let msg = job.render_message(None).unwrap();
-        assert!(msg.starts_with("**Scheduled · every 5m** — Ping"));
+        let msg = job.render_goal(None).unwrap();
+        assert!(msg.starts_with("Ping"));
         assert!(msg.contains("say hello"));
         assert!(!msg.contains("[recurring_job]"));
+        assert!(!msg.contains("**Scheduled"));
     }
 
     #[test]
-    fn render_message_includes_plan_file() {
+    fn render_goal_includes_plan_file() {
         let dir = tmp();
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# Do the thing\n\n- step 1\n").unwrap();
@@ -619,7 +633,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        let msg = job.render_message(None).unwrap();
+        let msg = job.render_goal(None).unwrap();
         assert!(msg.contains("follow the plan"));
         assert!(msg.contains("# Do the thing"));
         assert!(msg.contains("From `"));
