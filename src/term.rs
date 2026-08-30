@@ -611,14 +611,23 @@ fn spawn_locked(g: &mut Inner, cols: u16, rows: u16) -> Result<(), String> {
     } else {
         PathBuf::from(".")
     };
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_row: g.rows,
         ws_col: g.cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
     let mut master_fd = -1;
-    let pid = unsafe { libc::forkpty(&mut master_fd, std::ptr::null_mut(), std::ptr::null(), &ws) };
+    // Linux libc wants *const termios/winsize; Apple wants *mut. *mut coerces
+    // to *const on Linux, so null_mut + &mut ws compiles on both.
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut ws,
+        )
+    };
     if pid < 0 {
         return Err(format!("forkpty: {}", std::io::Error::last_os_error()));
     }
