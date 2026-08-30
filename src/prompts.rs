@@ -40,6 +40,9 @@ mod tests {
         assert!(mc.contains("create_mission_task"));
         assert!(mc.contains("create_recurring_job"));
         assert!(mc.contains("~/.snippet/recurring"));
+        assert!(mc.contains("create an agent"));
+        assert!(mc.contains("set up a folder/workspace"));
+        assert!(mc.contains("not a lane"));
         assert!(mc.contains("Expect messy, informal"));
         assert!(mc.contains("ask ONE question after intel"));
         assert!(mc.contains("retry_mission_task"));
