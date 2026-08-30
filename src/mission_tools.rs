@@ -534,7 +534,7 @@ impl Tool for CreateRecurringJob {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_recurring_job".into(),
-            description: "Schedule a recurring autonomous GOAL on an existing chat. Writes ~/.snippet/recurring/<id>.json; the daemon detects that file and delivers SetGoal to session_id. session_id must come from list_sessions (or mission-control). schedule is `every 5m|15m|1h|1d` (min 5 minutes) or `daily HH:MM`. prompt and/or plan_path required — plan_path is a markdown/plan file the target session rereads each fire. If that session is already on a goal, this fire queues and starts the moment the current goal completes.".into(),
+            description: "Schedule a recurring autonomous GOAL on ANY existing chat by writing ~/.snippet/recurring/<id>.json. The user's Recurring screen on Mission Control only creates jobs for Mission Control itself — this tool is how you target other sessions. The daemon detects that file and delivers SetGoal to session_id. session_id must come from list_sessions (or mission-control). schedule is `every 5m|15m|1h|1d` (min 5 minutes) or `daily HH:MM`. prompt and/or plan_path required — plan_path is a markdown/plan file the target session rereads each fire. If that session is already on a goal, this fire queues and starts the moment the current goal completes.".into(),
             input_schema: schema(
                 json!({
                     "title": {"type": "string"},
