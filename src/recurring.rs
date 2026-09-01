@@ -76,10 +76,14 @@ pub enum Schedule {
     Interval { every_secs: u64 },
     /// Fire once a day at `hour`:`minute` in local time (0–23, 0–59).
     Daily { hour: u8, minute: u8 },
+    /// One-off fire at unix second `at`. After it fires the job is disabled
+    /// (kept so the UI can show it as done).
+    Once { at: u64 },
 }
 
 impl Schedule {
-    /// Parse `every 5m|15m|1h|1d|300s` or `daily HH:MM`.
+    /// Parse `every 5m|15m|1h|1d|300s`, `daily HH:MM`, `at HH:MM` (next
+    /// occurrence), or `in <duration>` (e.g. `in 30m`).
     pub fn parse(raw: &str) -> Result<Self, String> {
         let raw = raw.trim();
         let lower = raw.to_ascii_lowercase();
@@ -94,7 +98,20 @@ impl Schedule {
             let (hour, minute) = parse_hhmm(rest.trim())?;
             return Ok(Self::Daily { hour, minute });
         }
-        Err("schedule must be `every 5m|1h|1d` or `daily HH:MM`".into())
+        if let Some(rest) = lower.strip_prefix("at ") {
+            let (hour, minute) = parse_hhmm(rest.trim())?;
+            let now = epoch_secs();
+            return Ok(Self::Once {
+                at: next_daily_after(now, hour, minute),
+            });
+        }
+        if let Some(rest) = lower.strip_prefix("in ") {
+            let secs = parse_duration(rest.trim())?;
+            return Ok(Self::Once {
+                at: epoch_secs().saturating_add(secs),
+            });
+        }
+        Err("schedule must be `every 5m|1h|1d`, `daily HH:MM`, `at HH:MM`, or `in 30m`".into())
     }
 
     pub fn display(&self) -> String {
@@ -111,15 +128,30 @@ impl Schedule {
                 }
             }
             Self::Daily { hour, minute } => format!("daily {hour:02}:{minute:02}"),
+            Self::Once { at } => format!("once {}", fmt_hhmm(*at)),
         }
     }
 
-    /// Next fire time after `from` (unix seconds).
+    /// Next fire time after `from` (unix seconds). `Once` never re-arms: after
+    /// its moment passes it stays due-until-fired (the tick disables it right
+    /// after delivering), so return `at` unchanged.
     pub fn next_after(&self, from: u64) -> u64 {
         match self {
             Self::Interval { every_secs } => from.saturating_add(*every_secs),
             Self::Daily { hour, minute } => next_daily_after(from, *hour, *minute),
+            Self::Once { at } => *at,
         }
+    }
+}
+
+/// Local HH:MM for a unix timestamp (used in the `once` display).
+fn fmt_hhmm(at: u64) -> String {
+    use chrono::{Local, TimeZone, Timelike};
+    let at_i = i64::try_from(at).unwrap_or(i64::MAX);
+    let dt = Local.timestamp_opt(at_i, 0).single();
+    match dt {
+        Some(dt) => format!("{:02}:{:02}", dt.hour(), dt.minute()),
+        None => "??".into(),
     }
 }
 
@@ -213,6 +245,10 @@ pub struct RecurringJob {
     #[serde(default)]
     pub plan_path: Option<String>,
     pub schedule: Schedule,
+    /// How the fire lands in the session: an autonomous [`Delivery::Goal`]
+    /// (default) or a plain [`Delivery::Message`] chat turn.
+    #[serde(default)]
+    pub delivery: Delivery,
     pub enabled: bool,
     pub next_run_at: u64,
     #[serde(default)]
@@ -228,10 +264,21 @@ pub struct RecurringJob {
     pub updated_at: u64,
 }
 
+/// How a fire reaches the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    /// Set an autonomous goal the agent drives to `complete_goal`.
+    #[default]
+    Goal,
+    /// Send a plain user message (scheduled one-off messages).
+    Message,
+}
+
 impl RecurringJob {
-    /// Goal text for this fire. Reads `plan_path` now so the markdown/plan file
-    /// can change between runs. The agent drives this to `complete_goal`.
-    pub fn render_goal(&self, workspace: Option<&Path>) -> Result<String, String> {
+    /// Body text shared by both deliveries: title, prompt, and the plan file
+    /// read now so the markdown/plan can change between runs.
+    fn render_body(&self, workspace: Option<&Path>) -> Result<String, String> {
         let mut body = String::new();
         let title = self.title.trim();
         if !title.is_empty() {
@@ -261,6 +308,16 @@ impl RecurringJob {
             return Err("goal text is empty".into());
         }
         Ok(body)
+    }
+
+    /// Goal text for this fire. The agent drives it to `complete_goal`.
+    pub fn render_goal(&self, workspace: Option<&Path>) -> Result<String, String> {
+        self.render_body(workspace)
+    }
+
+    /// Plain message text for a scheduled-message fire.
+    pub fn render_message(&self, workspace: Option<&Path>) -> Result<String, String> {
+        self.render_body(workspace)
     }
 }
 
@@ -349,6 +406,21 @@ pub fn create_job(
     schedule: Schedule,
     plan_path: Option<&str>,
 ) -> Result<RecurringJob, String> {
+    create_job_with(root, title, session_id, prompt, schedule, plan_path, Delivery::Goal)
+}
+
+/// Same as [`create_job`] with an explicit delivery and immediate first run:
+/// `next_run_at` starts at `now` so the tick fires it on its next pass (the
+/// "first run immediately" behaviour for both goals and scheduled messages).
+pub fn create_job_with(
+    root: &Path,
+    title: &str,
+    session_id: &str,
+    prompt: &str,
+    schedule: Schedule,
+    plan_path: Option<&str>,
+    delivery: Delivery,
+) -> Result<RecurringJob, String> {
     let title = title.trim();
     let session_id = session_id.trim();
     let prompt = prompt.trim();
@@ -369,7 +441,10 @@ pub fn create_job(
         session_id: session_id.to_string(),
         prompt: prompt.to_string(),
         plan_path,
-        next_run_at: schedule.next_after(now),
+        delivery,
+        // First run fires on the next tick (≤15s away) instead of waiting a
+        // full interval / until tomorrow.
+        next_run_at: now,
         schedule,
         enabled: true,
         last_run_at: None,
@@ -435,13 +510,18 @@ pub fn has_queued(root: &Path) -> bool {
 }
 
 /// After a successful delivery: clear queue, stamp last_run, advance schedule
-/// from `now` (skip missed intervals).
+/// from `now` (skip missed intervals). A `Once` schedule is disabled instead —
+/// it has fired its one shot and stays visible in the UI as done.
 pub fn mark_fired(root: &Path, id: &str, now: u64) -> Result<RecurringJob, String> {
     update_job(root, id, |job| {
         job.queued = false;
         job.last_run_at = Some(now);
         job.last_error = None;
-        job.next_run_at = job.schedule.next_after(now);
+        if matches!(job.schedule, Schedule::Once { .. }) {
+            job.enabled = false;
+        } else {
+            job.next_run_at = job.schedule.next_after(now);
+        }
     })
 }
 
@@ -519,6 +599,99 @@ mod tests {
     }
 
     #[test]
+    fn once_schedule_parses_and_never_rearms() {
+        let now = epoch_secs();
+        match Schedule::parse("in 30m").unwrap() {
+            Schedule::Once { at } => {
+                assert!(at >= now + 1800 && at <= now + 1800 + 2);
+            }
+            other => panic!("expected Once, got {other:?}"),
+        }
+        match Schedule::parse("at 09:00").unwrap() {
+            Schedule::Once { at } => {
+                // Next occurrence of 09:00 — today or tomorrow, but in the future.
+                assert!(at > now);
+            }
+            other => panic!("expected Once, got {other:?}"),
+        }
+        assert!(Schedule::parse("at 25:00").is_err());
+        assert!(Schedule::parse("in 0s").is_err());
+        // Once never re-arms.
+        let s = Schedule::Once { at: 5000 };
+        assert_eq!(s.next_after(9999), 5000);
+    }
+
+    #[test]
+    fn create_job_first_run_is_immediate() {
+        let root = tempfile::tempdir().unwrap();
+        let before = epoch_secs();
+        let job = create_job(
+            root.path(),
+            "Nightly review",
+            "mission-control",
+            "Review the inbox",
+            Schedule::Interval { every_secs: 3600 },
+            None,
+        )
+        .unwrap();
+        // Due on the next tick, not a full interval out.
+        assert!(job.next_run_at <= before + 2);
+        // And the schedule still advances from fire time afterwards.
+        let fired = mark_fired(root.path(), &job.id, epoch_secs()).unwrap();
+        assert!(fired.next_run_at >= before + 3600);
+    }
+
+    #[test]
+    fn once_job_disables_after_firing() {
+        let root = tempfile::tempdir().unwrap();
+        let job = create_job(
+            root.path(),
+            "One-off",
+            "mission-control",
+            "Say hi at noon",
+            Schedule::Once { at: epoch_secs() },
+            None,
+        )
+        .unwrap();
+        assert!(job.enabled);
+        let fired = mark_fired(root.path(), &job.id, epoch_secs()).unwrap();
+        assert!(!fired.enabled, "Once should disable after firing");
+        // Due-filter ignores it now.
+        assert!(due_jobs(root.path(), epoch_secs())
+            .unwrap()
+            .iter()
+            .all(|j| j.id != job.id));
+    }
+
+    #[test]
+    fn message_delivery_defaults_to_goal() {
+        let raw = serde_json::to_string(&RecurringJob {
+            id: "x".into(),
+            title: "t".into(),
+            session_id: "mission-control".into(),
+            prompt: "p".into(),
+            plan_path: None,
+            schedule: Schedule::Interval { every_secs: 3600 },
+            delivery: Delivery::Goal,
+            enabled: true,
+            next_run_at: 0,
+            last_run_at: None,
+            last_error: None,
+            queued: false,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .unwrap();
+        // Old on-disk jobs (no delivery field) must parse as Goal.
+        let without_delivery = raw.replace(
+            r#","delivery":"goal""#,
+            "",
+        );
+        let job: RecurringJob = serde_json::from_str(&without_delivery).unwrap();
+        assert_eq!(job.delivery, Delivery::Goal);
+    }
+
+    #[test]
     fn create_list_update_delete() {
         let root = tmp();
         let job = create_job(
@@ -533,7 +706,8 @@ mod tests {
         assert!(job.enabled);
         assert_eq!(job.session_id, "mission-control");
         assert!(!job.queued);
-        assert!(job.next_run_at > job.created_at);
+        // First run is immediate: due on the next tick, not a full interval out.
+        assert!(job.next_run_at <= job.created_at);
 
         let listed = list_jobs(root.path()).unwrap();
         assert_eq!(listed.len(), 1);
@@ -598,6 +772,7 @@ mod tests {
             prompt: "say hello".into(),
             plan_path: None,
             schedule: Schedule::Interval { every_secs: 300 },
+            delivery: Delivery::Goal,
             enabled: true,
             next_run_at: 0,
             last_run_at: None,
@@ -625,6 +800,7 @@ mod tests {
             prompt: "follow the plan".into(),
             plan_path: Some(plan.display().to_string()),
             schedule: Schedule::Interval { every_secs: 300 },
+            delivery: Delivery::Goal,
             enabled: true,
             next_run_at: 0,
             last_run_at: None,

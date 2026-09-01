@@ -524,6 +524,10 @@ struct CreateRecurringArgs {
     prompt: String,
     #[serde(default)]
     plan_path: Option<String>,
+    /// `goal` (default): the fire sets an autonomous goal the target session
+    /// drives to complete_goal. `message`: a plain scheduled chat turn.
+    #[serde(default)]
+    delivery: Option<String>,
 }
 
 /// Writes `~/.snippet/recurring/<id>.json`. The serve tick is the only reader —
@@ -534,14 +538,15 @@ impl Tool for CreateRecurringJob {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_recurring_job".into(),
-            description: "Schedule a recurring autonomous GOAL on ANY existing chat by writing ~/.snippet/recurring/<id>.json. The user's Recurring screen on Mission Control only creates jobs for Mission Control itself — this tool is how you target other sessions. The daemon detects that file and delivers SetGoal to session_id. session_id must come from list_sessions (or mission-control). schedule is `every 5m|15m|1h|1d` (min 5 minutes) or `daily HH:MM`. prompt and/or plan_path required — plan_path is a markdown/plan file the target session rereads each fire. If that session is already on a goal, this fire queues and starts the moment the current goal completes.".into(),
+            description: "Schedule work on ANY existing chat by writing ~/.snippet/recurring/<id>.json. The user's Recurring screen on Mission Control only creates jobs for Mission Control itself — this tool is how you target other sessions. The daemon detects that file and delivers to session_id. session_id must come from list_sessions (or mission-control). schedule is `every 5m|15m|1h|1d` (min 5 minutes), `daily HH:MM`, `at HH:MM` (one-off), or `in 30m` (one-off). delivery is `goal` (default — autonomous, driven to complete_goal) or `message` (plain scheduled chat turn). prompt and/or plan_path required — plan_path is a markdown/plan file the target session rereads each fire. FIRST RUN IS IMMEDIATE: the job fires on the next daemon tick (≤15s) unless that session is busy, in which case it queues until the current goal completes.".into(),
             input_schema: schema(
                 json!({
                     "title": {"type": "string"},
                     "session_id": {"type": "string"},
                     "schedule": {"type": "string"},
                     "prompt": {"type": "string"},
-                    "plan_path": {"type": "string"}
+                    "plan_path": {"type": "string"},
+                    "delivery": {"type": "string", "enum": ["goal", "message"]}
                 }),
                 &["title", "session_id", "schedule"],
             ),
@@ -565,13 +570,23 @@ impl Tool for CreateRecurringJob {
             ));
         }
         let schedule = crate::recurring::Schedule::parse(&args.schedule).map_err(ToolError::msg)?;
-        let job = crate::recurring::create_job(
+        let delivery = match args.delivery.as_deref() {
+            None | Some("") | Some("goal") => crate::recurring::Delivery::Goal,
+            Some("message") => crate::recurring::Delivery::Message,
+            Some(other) => {
+                return Err(ToolError::msg(format!(
+                    "delivery must be 'goal' or 'message', got '{other}'"
+                )));
+            }
+        };
+        let job = crate::recurring::create_job_with(
             &crate::recurring::default_root(),
             args.title.trim(),
             session_id,
             args.prompt.trim(),
             schedule,
             args.plan_path.as_deref(),
+            delivery,
         )
         .map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({

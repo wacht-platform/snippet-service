@@ -3562,9 +3562,20 @@ async fn recurring_tick_loop(daemon: Shared) {
                 .filter(|p| p.is_dir());
             match job.render_goal(workspace.as_deref()) {
                 Ok(text) => {
-                    daemon
-                        .deliver(&job.session_id, LoopInput::SetGoal(text))
-                        .await;
+                    let delivery = job.delivery;
+                    // SetGoal before render so busy-check and delivery agree.
+                    match delivery {
+                        recurring::Delivery::Goal => {
+                            daemon
+                                .deliver(&job.session_id, LoopInput::SetGoal(text))
+                                .await;
+                        }
+                        recurring::Delivery::Message => {
+                            daemon
+                                .deliver(&job.session_id, LoopInput::UserMessage(text))
+                                .await;
+                        }
+                    }
                     let _ = recurring::mark_fired(&daemon.recurring_root, &job.id, now);
                 }
                 Err(error) => {
@@ -3605,6 +3616,9 @@ struct RecurringCreateReq {
     plan_path: Option<String>,
     #[serde(default)]
     schedule: String,
+    /// `goal` (default) or `message` — scheduled one-off chat turns.
+    #[serde(default)]
+    delivery: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3635,13 +3649,19 @@ async fn create_recurring(
         Ok(s) => s,
         Err(error) => return mission_error(error),
     };
-    match recurring::create_job(
+    let delivery = match req.delivery.as_deref() {
+        None | Some("") | Some("goal") => recurring::Delivery::Goal,
+        Some("message") => recurring::Delivery::Message,
+        Some(other) => return mission_error(format!("delivery must be goal or message, got `{other}`")),
+    };
+    match recurring::create_job_with(
         &d.recurring_root,
         &req.title,
         &req.session_id,
         &req.prompt,
         schedule,
         req.plan_path.as_deref(),
+        delivery,
     ) {
         Ok(job) => Json(job).into_response(),
         Err(error) => mission_error(error),

@@ -74,7 +74,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/recur",
-        "Schedule a recurring goal: /recur list · add every 5m <prompt> · add <session> every 5m … · add … @plan.md · pause|on|rm <id>",
+        "Schedule a goal or message: /recur list · add every 5m <prompt> · add at 14:00 <msg> (one-off) · add <session> every 5m … · add … @plan.md · pause|on|rm <id>",
     ),
 ];
 
@@ -1510,7 +1510,9 @@ impl App {
                 let mut tokens = tail.split_whitespace();
                 let first = tokens.next().unwrap_or("");
                 let looks_like_schedule = first.eq_ignore_ascii_case("every")
-                    || first.eq_ignore_ascii_case("daily");
+                    || first.eq_ignore_ascii_case("daily")
+                    || first.eq_ignore_ascii_case("at")
+                    || first.eq_ignore_ascii_case("in");
                 let (session_id, schedule_raw, rest) = if looks_like_schedule {
                     let spec = tokens.next().unwrap_or("");
                     let rest: String = tokens.collect::<Vec<_>>().join(" ");
