@@ -277,15 +277,31 @@ pub enum Delivery {
 
 impl RecurringJob {
     /// Body text shared by both deliveries: title, prompt, and the plan file
-    /// read now so the markdown/plan can change between runs.
+    /// read now so the markdown/plan can change between runs. Title and prompt
+    /// that restate each other render once (the longer variant) — firing
+    /// "say hi / say hi to me" as two lines reads like a glitch.
     fn render_body(&self, workspace: Option<&Path>) -> Result<String, String> {
-        let mut body = String::new();
         let title = self.title.trim();
+        let prompt = self.prompt.trim();
+        let (title, prompt) = if !title.is_empty() && !prompt.is_empty() {
+            let (t, p) = (normalize_fire_text(title), normalize_fire_text(prompt));
+            if !t.is_empty() && p.contains(&t) {
+                // Prompt restates the title — the prompt says it all.
+                ("", prompt)
+            } else if !p.is_empty() && t.contains(&p) {
+                // Title restates the prompt — the title says it all.
+                (title, "")
+            } else {
+                (title, prompt)
+            }
+        } else {
+            (title, prompt)
+        };
+        let mut body = String::new();
         if !title.is_empty() {
             body.push_str(title);
             body.push_str("\n\n");
         }
-        let prompt = self.prompt.trim();
         if !prompt.is_empty() {
             body.push_str(prompt);
             body.push('\n');
@@ -319,6 +335,21 @@ impl RecurringJob {
     pub fn render_message(&self, workspace: Option<&Path>) -> Result<String, String> {
         self.render_body(workspace)
     }
+}
+
+/// Lowercase and collapse every non-alphanumeric run to single spaces — the
+/// comparison basis for "title and prompt restate each other".
+fn normalize_fire_text(s: &str) -> String {
+    s.split_whitespace()
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 const PLAN_MAX_BYTES: usize = 64 * 1024;
