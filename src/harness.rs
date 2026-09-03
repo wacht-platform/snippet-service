@@ -4476,15 +4476,19 @@ fn replied_since_last_user(events: &[HarnessEvent]) -> bool {
     false
 }
 
-/// Record an assistant turn. Near-duplicate status prose is dropped before it
-/// enters `events` or `messages` so clients and the on-disk session never see
-/// it. Tool-call turns still persist (empty content) so pairing stays valid.
+/// Record an assistant turn. Near-duplicate *narration* (text accompanying
+/// tool calls) is dropped before it enters `events` or `messages` so clients
+/// and the on-disk session never see repeated working-aloud status. Turn-final
+/// text (no tool calls) is the actual reply and always records — filtering it
+/// made legitimate messages vanish from history and clients. Tool-call turns
+/// still persist (empty content when redundant) so pairing stays valid.
 fn record_assistant_text(
     state: &mut HarnessState,
     text: String,
     tool_calls: Option<Vec<crate::llm::ToolCallRecord>>,
 ) {
-    let redundant = assistant_text_is_redundant(&text, &state.events);
+    let narrating = tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    let redundant = narrating && assistant_text_is_redundant(&text, &state.events);
     let content = if redundant || text.trim().is_empty() {
         String::new()
     } else {
@@ -5189,23 +5193,33 @@ mod assistant_dedup_tests {
     fn restated_status_is_not_stored() {
         let mut state = empty_state();
         let first = "I'll inspect the hydrate path, keep loading until the first snapshot, then format worker reports.";
-        record_assistant_text(&mut state, first.into(), None);
+        // Narration (with tool calls) goes through the redundancy filter.
+        let calls = || {
+            Some(vec![ToolCallRecord {
+                id: "c".into(),
+                name: "read_file".into(),
+                arguments: json!({}),
+                signature: None,
+                origin_model: None,
+            }])
+        };
+        record_assistant_text(&mut state, first.into(), calls());
         record_assistant_text(
             &mut state,
             "I'll inspect the hydrate path, keep loading until the first snapshot.".into(),
-            None,
+            calls(),
         );
         record_assistant_text(
             &mut state,
             "I'll keep going on the MC chat: hide the terminal, make the list row distinct, add a dispatched-task list.".into(),
-            None,
+            calls(),
         );
         record_assistant_text(
             &mut state,
             "I'll keep going on the MC chat: distinct list row, hide terminal, dispatched-task list, and tool/handoff rows that only expand when they have something to show.".into(),
-            None,
+            calls(),
         );
-        record_assistant_text(&mut state, "Fresh direction now.".into(), None);
+        record_assistant_text(&mut state, "Fresh direction now.".into(), calls());
         assert_eq!(
             assistant_texts(&state),
             vec![
@@ -5214,7 +5228,60 @@ mod assistant_dedup_tests {
                 "Fresh direction now.",
             ]
         );
-        assert_eq!(state.messages.len(), 3);
+        // Every turn persists (tool calls must keep pairing valid); redundant
+        // narration turns carry empty content.
+        assert_eq!(state.messages.len(), 5);
+        let non_empty = state
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                HarnessMessage::Assistant { content, .. } => Some(content.is_empty()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(non_empty, vec![false, true, false, true, false]);
+    }
+
+    #[test]
+    fn terminal_text_always_records_even_if_near_duplicate() {
+        // A turn-final reply (no tool calls) is the actual answer — it must
+        // land in events and messages even when it repeats prior narration.
+        let mut state = empty_state();
+        let calls = || {
+            Some(vec![ToolCallRecord {
+                id: "c".into(),
+                name: "bash".into(),
+                arguments: json!({}),
+                signature: None,
+                origin_model: None,
+            }])
+        };
+        record_assistant_text(
+            &mut state,
+            "Scheduled goal finished: nightly review complete.".into(),
+            calls(),
+        );
+        // Terminal reply, near-duplicate of the narration above.
+        record_assistant_text(
+            &mut state,
+            "Scheduled goal finished: nightly review complete.".into(),
+            None,
+        );
+        assert_eq!(
+            assistant_texts(&state),
+            vec![
+                "Scheduled goal finished: nightly review complete.",
+                "Scheduled goal finished: nightly review complete.",
+            ]
+        );
+        assert_eq!(state.messages.len(), 2);
+        match &state.messages[1] {
+            HarnessMessage::Assistant { content, tool_calls } => {
+                assert_eq!(content, "Scheduled goal finished: nightly review complete.");
+                assert!(tool_calls.is_empty());
+            }
+            other => panic!("expected terminal assistant turn, got {other:?}"),
+        }
     }
 
     #[test]
