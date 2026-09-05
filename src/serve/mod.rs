@@ -3562,20 +3562,12 @@ async fn recurring_tick_loop(daemon: Shared) {
                 .filter(|p| p.is_dir());
             match job.render_goal(workspace.as_deref()) {
                 Ok(text) => {
-                    let delivery = job.delivery;
-                    // SetGoal before render so busy-check and delivery agree.
-                    match delivery {
-                        recurring::Delivery::Goal => {
-                            daemon
-                                .deliver(&job.session_id, LoopInput::SetGoal(text))
-                                .await;
-                        }
-                        recurring::Delivery::Message => {
-                            daemon
-                                .deliver(&job.session_id, LoopInput::UserMessage(text))
-                                .await;
-                        }
-                    }
+                    // Scheduled jobs are goal-only: every fire sets an
+                    // autonomous goal the agent drives to complete_goal and
+                    // reports the outcome of.
+                    daemon
+                        .deliver(&job.session_id, LoopInput::SetGoal(text))
+                        .await;
                     let _ = recurring::mark_fired(&daemon.recurring_root, &job.id, now);
                 }
                 Err(error) => {
