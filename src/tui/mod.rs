@@ -167,6 +167,13 @@ fn is_conversation_json(path: &std::path::Path) -> bool {
             .unwrap_or(false)
 }
 
+fn unix_secs_to_system_time(secs: i64) -> std::time::SystemTime {
+    if secs <= 0 {
+        return std::time::SystemTime::UNIX_EPOCH;
+    }
+    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+}
+
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn setup_terminal() -> Result<TuiTerminal, Box<dyn std::error::Error>> {
@@ -859,19 +866,16 @@ impl App {
     fn find_last_active_conversation(&self) -> Option<String> {
         let dir = self.conversations_dir();
         let mut best_path: Option<PathBuf> = None;
-        let mut best_time = std::time::SystemTime::UNIX_EPOCH;
+        let mut best_time: i64 = i64::MIN;
 
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if is_conversation_json(&path) {
-                    if let Ok(metadata) = std::fs::metadata(&path) {
-                        if let Ok(modified) = metadata.modified() {
-                            if modified > best_time {
-                                best_time = modified;
-                                best_path = Some(path);
-                            }
-                        }
+                    let t = crate::session::session_last_active(&path);
+                    if t > best_time {
+                        best_time = t;
+                        best_path = Some(path);
                     }
                 }
             }
@@ -880,12 +884,9 @@ impl App {
         // Also check default state_path if it exists
         let default_path = &self.options.config.state_path;
         if default_path.exists() {
-            if let Ok(metadata) = std::fs::metadata(default_path) {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > best_time {
-                        best_path = Some(default_path.clone());
-                    }
-                }
+            let t = crate::session::session_last_active(default_path);
+            if t > best_time {
+                best_path = Some(default_path.clone());
             }
         }
 
@@ -930,13 +931,9 @@ impl App {
                     }
 
                     let mut desc = "empty session".to_string();
-                    let mut mod_time = std::time::SystemTime::UNIX_EPOCH;
-
-                    if let Ok(metadata) = std::fs::metadata(&path) {
-                        if let Ok(m) = metadata.modified() {
-                            mod_time = m;
-                        }
-                    }
+                    let mod_time = unix_secs_to_system_time(
+                        crate::session::session_last_active(&path),
+                    );
 
                     if let Ok(bytes) = std::fs::read(&path) {
                         if let Ok(state) = crate::harness::deserialize_state(&bytes) {
@@ -972,12 +969,9 @@ impl App {
         let default_path = &self.options.config.state_path;
         if default_path.exists() {
             let mut desc = "default session".to_string();
-            let mut mod_time = std::time::SystemTime::UNIX_EPOCH;
-            if let Ok(metadata) = std::fs::metadata(default_path) {
-                if let Ok(m) = metadata.modified() {
-                    mod_time = m;
-                }
-            }
+            let mod_time = unix_secs_to_system_time(
+                crate::session::session_last_active(default_path),
+            );
             // Skip a contentless default state — a fresh install otherwise shows a
             // phantom "default session" entry with nothing to resume into.
             let mut has_content = false;
