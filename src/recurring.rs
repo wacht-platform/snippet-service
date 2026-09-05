@@ -326,14 +326,41 @@ impl RecurringJob {
         Ok(body)
     }
 
-    /// Goal text for this fire. The agent drives it to `complete_goal`.
+    /// Goal text for this fire: a formatted scheduled-run header (job,
+    /// schedule, fire time), the instruction, and a closing directive telling
+    /// the agent to report what happened via `complete_goal` — so the chat
+    /// shows what was scheduled, what was asked, and how the run went, not a
+    /// bare prompt dump.
     pub fn render_goal(&self, workspace: Option<&Path>) -> Result<String, String> {
-        self.render_body(workspace)
+        let body = self.render_body(workspace)?;
+        let job_label = if self.title.trim().is_empty() {
+            "untitled job"
+        } else {
+            self.title.trim()
+        };
+        let mut out = String::new();
+        out.push_str(&format!("**Scheduled run — {job_label}**\n\n"));
+        out.push_str(&format!("- Schedule: {}\n", self.schedule.display()));
+        out.push_str(&format!("- Fired: {}\n", fmt_local_time(epoch_secs())));
+        out.push_str("\n---\n\n");
+        out.push_str(&body);
+        out.push_str("\n\n---\n\nWhen the work is done (or blocked), call `complete_goal` with a short summary saying **what this run was**, **what you did**, and **how it went** — that summary is surfaced to the user as the run's outcome.");
+        Ok(out)
     }
 
-    /// Plain message text for a scheduled-message fire.
+    /// Plain message text for a scheduled-message fire (legacy job files).
     pub fn render_message(&self, workspace: Option<&Path>) -> Result<String, String> {
         self.render_body(workspace)
+    }
+}
+
+/// Local "YYYY-MM-DD HH:MM" for a unix timestamp (fire header).
+fn fmt_local_time(at: u64) -> String {
+    use chrono::TimeZone;
+    let at_i = i64::try_from(at).unwrap_or(i64::MAX);
+    match chrono::Local.timestamp_opt(at_i, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        None => "unknown time".into(),
     }
 }
 
@@ -813,10 +840,14 @@ mod tests {
             updated_at: 0,
         };
         let msg = job.render_goal(None).unwrap();
-        assert!(msg.starts_with("Ping"));
+        // Formatted header, then the instruction, then the outcome directive.
+        assert!(msg.starts_with("**Scheduled run — Ping**"));
         assert!(msg.contains("say hello"));
+        assert!(msg.contains("Schedule: every 5m"));
+        assert!(msg.contains("Fired: "));
+        assert!(msg.contains("complete_goal"));
+        assert!(msg.contains("how it went"));
         assert!(!msg.contains("[recurring_job]"));
-        assert!(!msg.contains("**Scheduled"));
     }
 
     #[test]
