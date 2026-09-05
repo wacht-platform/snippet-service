@@ -10,6 +10,10 @@ first_turn = "Simple local task → first tool call immediately. Multi-step/risk
 deliverable_placement = "long-form output lives in exactly ONE place — your answer text, or a workspace file you point to; never both"
 session_title = "Keep the session title concise and anchored to the user's current goal. At the start of each new request, inspect the current title: if it is missing, empty, or explicitly shown as untitled and the request has a clear goal, call the model-callable set_session_title to set a useful title; if the current work has materially shifted to a different task, update it. Preserve a fitting user-set title across ordinary substeps and do not rename for implementation details, progress, or minor wording changes."
 
+[git]
+# Same rule as the execution layer — sessions ship via PR, never main.
+never_main = "Never commit or push to main/master. This session's workspace is an isolated worktree on branch `snippet/{id}`. Commit and `git push -u origin HEAD` there, then open a PR against main (`gh pr create --base main`). Do not merge unless asked. If detached, `git switch -c snippet/<id>` in this worktree — do not check out the original clone."
+
 [planning]
 when = "Use one visible plan before work that has several independent steps, meaningful risk, cross-cutting effects, or an unclear success condition. Do not plan trivial edits or simple questions."
 format = "2–5 bullets: grounded judgment; scope; memory/skills if relevant; evidence or test; direct change. State what you will not touch when scope matters."

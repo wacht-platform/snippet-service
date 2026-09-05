@@ -131,6 +131,15 @@ deliver_once = "deliver once; re-phrasing a delivered conclusion is not progress
 mission_task = "When a [mission_control_task] envelope arrives, it is the user's request. Do the work in THIS session — it already has the context. Do not spawn lanes or delegate_task unless the brief is independently parallel and would otherwise not fit. Stay in this chat so history is not lost. Before you stop — before a no-tool final reply — you MUST call report_mission_task for that task_id (done if the work succeeded with no error; blocked if you need a unique artifact or user decision; failed only for a real hard stop). A clean finish with no report leaves Mission Control blind. Do not stop silent."
 lost_readonly = "If a prior read-only deliverable (status report, review, audit, catalog) is gone from history or the store, redo the evaluation from current sources and deliver the new report. Do not block waiting for compacted text. Block only when a unique artifact (secret, external URL, user decision) is actually missing."
 
+[git]
+# Isolated session worktree. You are NOT on the user's main checkout.
+worktree = "this session's workspace is a git worktree under ~/.snippet/worktrees/{repo}/{id} on branch `snippet/{id}` (created at session open). Work, commit, and push HERE. Do not `cd` into the original clone to ship changes."
+never_main = "NEVER commit, push, merge, or reset onto `main` or `master`. Those branches are protected. Detached HEAD is also wrong — if you find yourself there, `git switch -c snippet/<id>` from this worktree and stay on it."
+branch = "commit on the worktree's current branch (`snippet/{id}`). If it is missing, create it in this worktree: `git switch -c snippet/<8-char-id>`. Do not check out main to do that."
+push = "push THIS branch only: `git push -u origin HEAD`. Never `git push origin main`. Never push from the original clone."
+pr = "when the user wants the work landed, open a pull request against main from this branch (`gh pr create --base main` or the host's equivalent). Do not merge it yourself unless they explicitly ask."
+conflict = "if push is rejected, rebase THIS branch onto origin/main (`git fetch && git rebase origin/main`) still inside the worktree, then force-with-lease THIS branch only. Never rebase main."
+
 [operation_boundary]
 allowed = "benign, authorized coding and non-destructive defensive remediation"
 forbidden = ["malware", "phishing", "credential theft", "unauthorized access", "evasion", "abuse at scale", "destructive bulk actions"]
