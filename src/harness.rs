@@ -876,6 +876,7 @@ impl CodingHarness {
                                     content: format!("[steer]\n{text}"),
                                 });
                                 state.events.push(HarnessEvent::Steer { text });
+                                self.bump_activity();
                             } else {
                                 // The step ENDED while this was queued: it's the
                                 // next real request (or the answer to the question
@@ -1256,6 +1257,7 @@ impl CodingHarness {
         state.events.push(HarnessEvent::UserInput { text });
         state.status = HarnessStatus::Running;
         vars.empty_reply_reprompts = 0;
+        self.bump_activity();
     }
 
     /// Run a user-requested compaction pass now, surfacing the compaction UI
@@ -1554,6 +1556,7 @@ impl CodingHarness {
                         content: format!("[steer]\n{text}"),
                     });
                     state.events.push(HarnessEvent::Steer { text });
+                    self.bump_activity();
                 }
                 false
             }
@@ -3047,6 +3050,7 @@ impl CodingHarness {
                             content: request.clone(),
                         });
                         state.events.push(HarnessEvent::UserInput { text: request });
+                        self.bump_activity();
                         self.persist_state(&mut state).await?;
                     }
                     return Ok(state);
@@ -3121,6 +3125,9 @@ impl CodingHarness {
             tool_payloads_pruned: false,
         };
         self.persist_state(&mut state).await?;
+        if request.is_some() {
+            self.bump_activity();
+        }
         Ok(state)
     }
 
@@ -4007,6 +4014,9 @@ impl CodingHarness {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+        // Pin last_active to the pre-rewrite mtime so open/attach/compaction
+        // cannot jump the session list. User messages call bump_activity.
+        crate::session::freeze_session_activity(path);
         let temp_path = temp_state_path(path);
         let bytes = serialize_state(&state).map_err(ToolError::msg)?;
         tokio::fs::write(&temp_path, bytes).await?;
@@ -4015,6 +4025,14 @@ impl CodingHarness {
         // every conversation when enumerating (scales to thousands of sessions).
         crate::session::write_session_meta(path, &state);
         Ok(())
+    }
+
+    /// List sort uses the sidecar `last_active`, not state-file mtime — bump
+    /// only when the user actually sent a message (or a mid-run steer).
+    fn bump_activity(&self) {
+        if let Some(path) = &self.config.state_path {
+            crate::session::bump_session_activity(path);
+        }
     }
 }
 

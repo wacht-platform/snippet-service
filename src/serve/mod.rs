@@ -1884,6 +1884,7 @@ async fn rewind_session(
         )
             .into_response();
     };
+    crate::session::freeze_session_activity(&sp);
     if tokio::fs::write(&sp, &updated_bytes).await.is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "failed to write state").into_response();
     }

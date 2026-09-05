@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -305,17 +306,17 @@ fn mission_control_list_row() -> Option<SessionInfo> {
     if !path.exists() {
         return None;
     }
-    let last_active = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (folder, title, status) = if let Some(meta) = std::fs::read(meta_path(&path))
+    let (folder, title, status, last_active) = if let Some(meta) = std::fs::read(meta_path(&path))
         .ok()
         .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
     {
-        (meta.folder, meta.title, meta.status)
+        (
+            meta.folder,
+            meta.title,
+            meta.status,
+            meta.last_active
+                .unwrap_or_else(|| file_mtime_secs(&path)),
+        )
     } else {
         (
             crate::mission_control::workspace_path()
@@ -323,6 +324,7 @@ fn mission_control_list_row() -> Option<SessionInfo> {
                 .to_string(),
             "Mission Control".to_string(),
             "idle".to_string(),
+            file_mtime_secs(&path),
         )
     };
     Some(SessionInfo {
@@ -346,6 +348,11 @@ struct SessionMeta {
     folder: String,
     title: String,
     status: String,
+    /// Unix seconds of the last *user* message. Opening, attaching, or
+    /// persisting agent work must not move this — otherwise the list jumps
+    /// whenever a native app opens a chat.
+    #[serde(default)]
+    last_active: Option<i64>,
 }
 
 /// `<conv>.json` → `<conv>.meta.json`.
@@ -375,11 +382,34 @@ pub fn status_str(status: crate::harness::HarnessStatus) -> String {
         .unwrap_or_default()
 }
 
-fn meta_from_state(state: &HarnessState) -> SessionMeta {
+fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn file_mtime_secs(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn read_session_meta(state_path: &Path) -> Option<SessionMeta> {
+    std::fs::read(meta_path(state_path))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+fn meta_from_state(state: &HarnessState, last_active: Option<i64>) -> SessionMeta {
     SessionMeta {
         folder: state.workspace.clone(),
         title: effective_title(state),
         status: status_str(state.status),
+        last_active,
     }
 }
 
@@ -398,6 +428,7 @@ pub fn set_session_title(state_path: &Path, title: &str) -> Result<(), String> {
     let out = crate::harness::serialize_state(&state)?;
     // Temp + rename like `persist_state`: a crash mid-write must never leave a
     // truncated state file (an unreadable state is silently started-over on open).
+    freeze_session_activity(state_path);
     let tmp = state_path.with_extension("json.tmp");
     std::fs::write(&tmp, out).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, state_path).map_err(|e| e.to_string())?;
@@ -646,6 +677,8 @@ pub fn write_forked_conversation(
     std::fs::write(&tmp, &bytes).map_err(|e| format!("write fork: {e}"))?;
     std::fs::rename(&tmp, &dest).map_err(|e| format!("rename fork: {e}"))?;
     write_session_meta(&dest, &forked);
+    // Creating a branch is a user action — put it at the top of the list.
+    bump_session_activity(&dest);
 
     // Carry the per-conversation model override onto the branch.
     if let Some(profile) = read_session_profile(source_state_path) {
@@ -669,10 +702,81 @@ pub fn write_forked_conversation(
 }
 
 /// Write the metadata sidecar for a state file (best-effort). Called on every
-/// persist so the sidecar tracks the latest title/folder/status.
+/// persist so the sidecar tracks the latest title/folder/status. Preserves any
+/// existing `last_active` — open/attach/agent-persist must not invent a new
+/// stamp or the list jumps. Call [`freeze_session_activity`] *before* rewriting
+/// the state file so a missing stamp is pinned to the pre-rewrite mtime.
 pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
-    if let Ok(s) = serde_json::to_string(&meta_from_state(state)) {
+    let last_active = read_session_meta(state_path).and_then(|m| m.last_active);
+    if let Ok(s) = serde_json::to_string(&meta_from_state(state, last_active)) {
         let _ = std::fs::write(meta_path(state_path), s);
+    }
+}
+
+/// If the sidecar has no `last_active` yet, pin it to the state file's current
+/// mtime *before* a rewrite. No-op when the stamp already exists, or when the
+/// file does not exist yet (brand-new chats get a stamp from
+/// [`bump_session_activity`] on the first user message, or on create).
+pub fn freeze_session_activity(state_path: &Path) {
+    if read_session_meta(state_path)
+        .and_then(|m| m.last_active)
+        .is_some()
+    {
+        return;
+    }
+    if !state_path.exists() {
+        return;
+    }
+    let secs = file_mtime_secs(state_path);
+    let meta_file = meta_path(state_path);
+    if let Some(mut meta) = read_session_meta(state_path) {
+        meta.last_active = Some(secs);
+        if let Ok(s) = serde_json::to_string(&meta) {
+            let _ = std::fs::write(&meta_file, s);
+        }
+        return;
+    }
+    let stub = SessionMeta {
+        folder: String::new(),
+        title: String::new(),
+        status: String::new(),
+        last_active: Some(secs),
+    };
+    if let Ok(s) = serde_json::to_string(&stub) {
+        let _ = std::fs::write(&meta_file, s);
+    }
+}
+
+/// Last-active unix seconds for a state file: sidecar stamp if present,
+/// otherwise the file mtime (legacy sessions that have never been rewritten).
+pub fn session_last_active(state_path: &Path) -> i64 {
+    read_session_meta(state_path)
+        .and_then(|m| m.last_active)
+        .unwrap_or_else(|| file_mtime_secs(state_path))
+}
+
+/// Record that the user sent a message in this session. List sort uses this
+/// stamp, not state-file mtime.
+pub fn bump_session_activity(state_path: &Path) {
+    let meta_file = meta_path(state_path);
+    let now = now_unix_secs();
+    if let Some(mut meta) = read_session_meta(state_path) {
+        meta.last_active = Some(now);
+        if let Ok(s) = serde_json::to_string(&meta) {
+            let _ = std::fs::write(&meta_file, s);
+        }
+        return;
+    }
+    // No sidecar yet — a tiny stub is enough for listing until the next persist
+    // fills title/folder/status from live state.
+    let stub = SessionMeta {
+        folder: String::new(),
+        title: String::new(),
+        status: String::new(),
+        last_active: Some(now),
+    };
+    if let Ok(s) = serde_json::to_string(&stub) {
+        let _ = std::fs::write(&meta_file, s);
     }
 }
 
@@ -815,6 +919,9 @@ pub fn create_blank_session(
     std::fs::write(&tmp, &bytes).map_err(|e| format!("write session: {e}"))?;
     std::fs::rename(&tmp, &dest).map_err(|e| format!("rename session: {e}"))?;
     write_session_meta(&dest, &state);
+    // Brand-new chats belong at the top until the user opens something else
+    // and sends a message there. Opening this chat later must not re-bump.
+    bump_session_activity(&dest);
 
     let root = workspaces_root();
     let id = dest
@@ -835,7 +942,9 @@ pub fn create_blank_session(
         },
         title: effective_title(&state),
         status: status_str(state.status),
-        last_active: 0,
+        last_active: read_session_meta(&dest)
+            .and_then(|m| m.last_active)
+            .unwrap_or_else(now_unix_secs),
     })
 }
 
@@ -919,12 +1028,7 @@ fn linked_worktree_root(folder: &Path) -> Option<PathBuf> {
 }
 
 fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<SessionInfo>) {
-    let last_active = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let mtime = file_mtime_secs(path);
     let id = path
         .strip_prefix(root)
         .unwrap_or(path)
@@ -941,17 +1045,14 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
     }
 
     // Fast path: read the tiny sidecar, no decompression.
-    if let Some(meta) = std::fs::read(meta_path(path))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
-    {
+    if let Some(meta) = read_session_meta(path) {
         out.push(SessionInfo {
             id,
             folder: meta.folder,
             conversation: conversation.to_string(),
             title: meta.title,
             status: meta.status,
-            last_active,
+            last_active: meta.last_active.unwrap_or(mtime),
         });
         return;
     }
@@ -970,7 +1071,9 @@ fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<Sess
         conversation: conversation.to_string(),
         title: effective_title(&state),
         status: status_str(state.status),
-        last_active,
+        last_active: read_session_meta(path)
+            .and_then(|m| m.last_active)
+            .unwrap_or(mtime),
     });
 }
 
@@ -1215,5 +1318,75 @@ mod create_blank_tests {
         assert!(!workspace.exists(), "isolated worktree should be gone");
         assert!(repo.exists(), "original clone must stay");
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn persist_does_not_advance_last_active_but_a_message_does() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("snippet-last-active-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let state = HarnessState::blank(dir.display().to_string(), Some("Old chat".into()));
+        let bytes = crate::harness::serialize_state(&state).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        // Pretend this chat was last messaged an hour ago.
+        let frozen = now_unix_secs() - 3600;
+        let meta = SessionMeta {
+            folder: dir.display().to_string(),
+            title: "Old chat".into(),
+            status: "idle".into(),
+            last_active: Some(frozen),
+        };
+        fs::write(meta_path(&path), serde_json::to_string(&meta).unwrap()).unwrap();
+
+        // Opening / attaching rewrites state + sidecar — stamp must stay put.
+        let mut rewritten = state.clone();
+        rewritten.status = crate::harness::HarnessStatus::Idle;
+        freeze_session_activity(&path);
+        fs::write(&path, crate::harness::serialize_state(&rewritten).unwrap()).unwrap();
+        write_session_meta(&path, &rewritten);
+        assert_eq!(
+            read_session_meta(&path).and_then(|m| m.last_active),
+            Some(frozen)
+        );
+
+        // Sending a message is the only thing that moves the row.
+        bump_session_activity(&path);
+        let bumped = read_session_meta(&path)
+            .and_then(|m| m.last_active)
+            .unwrap();
+        assert!(bumped >= frozen + 3600 - 2, "bump should be ~now, got {bumped} vs frozen {frozen}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn freeze_pins_mtime_before_rewrite() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("snippet-freeze-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let state = HarnessState::blank(dir.display().to_string(), Some("Legacy".into()));
+        fs::write(&path, crate::harness::serialize_state(&state).unwrap()).unwrap();
+        let before = file_mtime_secs(&path);
+        assert!(before > 0);
+
+        // No sidecar yet. Freeze, then rewrite the state file (which would
+        // otherwise jump mtime and, without a pin, the list).
+        freeze_session_activity(&path);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(&path, crate::harness::serialize_state(&state).unwrap()).unwrap();
+        write_session_meta(&path, &state);
+        let pinned = read_session_meta(&path).and_then(|m| m.last_active).unwrap();
+        assert_eq!(pinned, before);
+        assert!(file_mtime_secs(&path) >= before);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
