@@ -84,10 +84,16 @@ mod tests {
         assert!(coding.contains("Do the work in THIS session"));
         assert!(coding.contains("you MUST call report_mission_task"));
         assert!(coding.contains("redo the evaluation from current sources"));
+        assert!(coding.contains("NEVER commit, push, merge, or reset onto `main`"));
+        assert!(coding.contains("git push -u origin HEAD"));
+        assert!(coding.contains("gh pr create --base main"));
+        assert!(coding.contains("snippet/{id}"));
         assert!(!coding.contains("You are Mission Control"));
         let conversation = conversation_system_prompt();
         assert!(conversation.contains("snippet_conversation_agent"));
         assert!(conversation.contains("a new lane will miss it"));
+        assert!(conversation.contains("Never commit or push to main/master"));
+        assert!(conversation.contains("gh pr create --base main"));
         assert!(!conversation.contains("[worker_envelope]"));
         assert!(!conversation.contains("You are Mission Control"));
     }

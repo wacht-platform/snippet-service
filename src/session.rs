@@ -849,11 +849,18 @@ fn try_session_worktree(folder: &Path) -> Option<PathBuf> {
     let parent = root.join(&repo);
     std::fs::create_dir_all(&parent).ok()?;
     // Unique per session so one repo can host many parallel worktrees.
+    // Named branch (not --detach) so the agent can commit/push without
+    // fighting detached HEAD, and never lands on main.
     let dest = unique_worktree_path(&parent)?;
+    let branch = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|id| format!("snippet/{id}"))
+        .unwrap_or_else(|| "snippet/session".into());
     let status = Command::new("git")
         .arg("-C")
         .arg(&toplevel)
-        .args(["worktree", "add", "--detach"])
+        .args(["worktree", "add", "-b", &branch])
         .arg(&dest)
         .status()
         .ok()?;
@@ -1268,6 +1275,12 @@ mod create_blank_tests {
         assert!(workspace.starts_with(&root));
         assert!(workspace.join(".git").is_file());
         assert!(workspace.join("README").exists());
+        let branch = git_stdout(&workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert!(
+            branch.starts_with("snippet/"),
+            "session worktree should be on snippet/{{id}}, got {branch}"
+        );
+        assert_ne!(branch, "HEAD", "must not be detached");
         drop_worktree(&repo, &workspace);
         let _ = fs::remove_dir_all(&repo);
     }
