@@ -26,8 +26,9 @@ use crate::harness::{GoalStatus, LoopInput, deserialize_state, serialize_state};
 use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
 use crate::recurring::{self, Schedule};
 use crate::session::{
-    list_device_sessions, prepare_new_session_workspace, read_session_profile, status_str,
-    start_mission_control_session, start_session_with_browser_summary, state_path_for_id,
+    list_device_sessions, prepare_new_session_workspace, read_session_profile,
+    session_id_for_state_path, start_mission_control_session,
+    start_session_with_browser_summary, state_path_for_id, status_str, subscribe_device_events,
     write_session_profile,
 };
 
@@ -83,6 +84,7 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
             .filter(|p| p.is_dir());
         from_state.unwrap_or(cwd)
     };
+    let session_id = session_id_for_state_path(&handle.state_path);
     LiveSession {
         input_tx: handle.input_tx,
         join: handle.join,
@@ -91,7 +93,7 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
         stream: handle.stream.unwrap_or_else(|| {
             std::sync::Arc::new(std::sync::Mutex::new(crate::llm::StreamBuffer::default()))
         }),
-        terms: SessionTerms::new(cwd),
+        terms: SessionTerms::new_for_session(cwd, session_id),
     }
 }
 
@@ -2543,93 +2545,54 @@ async fn events_ws(
     ws.on_upgrade(move |socket| handle_events_ws(socket, d))
 }
 
+fn allow_device_event(daemon: &Daemon, event: &serde_json::Value) -> bool {
+    let settings = mission_control::load_settings(&daemon.mission_control_root);
+    if settings.notification_policy == "none" {
+        return false;
+    }
+    if settings.notification_policy != "mission_control_only" {
+        return true;
+    }
+    let session = event.get("session").and_then(|v| v.as_str()).unwrap_or("");
+    settings.mission_control_session_id.as_deref() == Some(session)
+        || session == mission_control::SESSION_ID
+}
+
 async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
-    use std::collections::{HashMap, HashSet};
     let (mut sender, mut receiver) = socket.split();
+    let mut rx = subscribe_device_events();
     let push = tokio::spawn(async move {
-        let mut last: HashMap<String, String> = HashMap::new();
-        let mut first = true;
+        // Idle PTYs still need a pump so BEL / OSC fire when nobody is attached.
+        // 5s is plenty — the firehose itself is push, not this tick.
+        let mut harvest = tokio::time::interval(Duration::from_secs(5));
+        harvest.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            // Re-read the notification policy every tick so setting changes and
-            // MC-session re-opens apply to already-connected clients.
-            let settings = mission_control::load_settings(&daemon.mission_control_root);
-            let mission_id = settings.mission_control_session_id;
-            let suppress_workers = settings.notification_policy == "mission_control_only";
-            let suppress_all = settings.notification_policy == "none";
-            let sessions = list_device_sessions();
-            let mut seen = HashSet::new();
-            let mut out = Vec::new();
-            for s in &sessions {
-                seen.insert(s.id.clone());
-                let prev = last.insert(s.id.clone(), s.status.clone());
-                if first {
-                    continue;
-                }
-                let prevs = prev.as_deref().unwrap_or("");
-                if prevs == s.status {
-                    continue;
-                }
-                // Notify on a change into any attention state, regardless of the prior
-                // state (a session can go idle->running->waiting within one poll).
-                let kind = match s.status.as_str() {
-                    "waiting_for_input" => "waiting", // asked a question / needs approval
-                    "failed" => "error",
-                    "completed" => "done",
-                    "idle" if prevs == "running" => "idle", // a turn just finished
-                    _ => continue, // running / interrupted / newly-seen idle
-                };
-                if suppress_all
-                    || (suppress_workers && mission_id.as_deref() != Some(s.id.as_str()))
-                {
-                    continue;
-                }
-                out.push(serde_json::json!({
-                    "session": s.id,
-                    "title": s.title,
-                    "workspace": s.folder,
-                    "kind": kind,
-                    "status": s.status,
-                }));
-            }
-            last.retain(|k, _| seen.contains(k));
-            first = false;
-            // BEL / OSC 9 / OSC 777. Harvest also drains idle PTYs so a
-            // notification still fires when nobody is attached. Bytes drained
-            // with no subscriber are stashed for the next /attach.
-            {
-                let live = daemon.sessions.lock().await;
-                for (id, sess) in live.iter() {
-                    let notes = sess.terms.harvest();
-                    if notes.is_empty() {
-                        continue;
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        Ok(e) => {
+                            if !allow_device_event(&daemon, &e) {
+                                continue;
+                            }
+                            if sender
+                                .send(Message::Text(e.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
-                    let meta = sessions.iter().find(|s| s.id == *id);
-                    let title = meta.map(|s| s.title.as_str()).unwrap_or("");
-                    let folder = meta.map(|s| s.folder.as_str()).unwrap_or("");
-                    let status = meta.map(|s| s.status.as_str()).unwrap_or("");
-                    for n in notes {
-                        out.push(serde_json::json!({
-                            "session": id,
-                            "title": title,
-                            "workspace": folder,
-                            "kind": "term",
-                            "status": status,
-                            "message": n.message,
-                            "pane": n.pane,
-                        }));
+                }
+                _ = harvest.tick() => {
+                    let live = daemon.sessions.lock().await;
+                    for sess in live.values() {
+                        let _ = sess.terms.harvest();
                     }
                 }
             }
-            for e in out {
-                if sender
-                    .send(Message::Text(e.to_string().into()))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(1500)).await;
         }
     });
     while let Some(Ok(msg)) = receiver.next().await {

@@ -5,11 +5,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::builtins::coding_tools;
 use crate::config::{SnippetConfig, workspaces_root};
@@ -706,10 +706,78 @@ pub fn write_forked_conversation(
 /// existing `last_active` — open/attach/agent-persist must not invent a new
 /// stamp or the list jumps. Call [`freeze_session_activity`] *before* rewriting
 /// the state file so a missing stamp is pinned to the pre-rewrite mtime.
+/// Status transitions that should wake a phone are pushed on `/events` here —
+/// the WS firehose is idle until something actually happens.
 pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
-    let last_active = read_session_meta(state_path).and_then(|m| m.last_active);
-    if let Ok(s) = serde_json::to_string(&meta_from_state(state, last_active)) {
+    let prev = read_session_meta(state_path);
+    let last_active = prev.as_ref().and_then(|m| m.last_active);
+    let next = meta_from_state(state, last_active);
+    if let Ok(s) = serde_json::to_string(&next) {
         let _ = std::fs::write(meta_path(state_path), s);
+    }
+    let prev_status = prev.as_ref().map(|m| m.status.as_str()).unwrap_or("");
+    if let Some(kind) = notify_kind(prev_status, &next.status) {
+        emit_device_event(serde_json::json!({
+            "session": session_id_for_state_path(state_path),
+            "title": next.title,
+            "workspace": next.folder,
+            "kind": kind,
+            "status": next.status,
+        }));
+    }
+}
+
+fn notify_kind(prev: &str, status: &str) -> Option<&'static str> {
+    if prev == status {
+        return None;
+    }
+    match status {
+        "waiting_for_input" => Some("waiting"),
+        "failed" => Some("error"),
+        "completed" => Some("done"),
+        "idle" if prev == "running" => Some("idle"),
+        _ => None,
+    }
+}
+
+pub fn session_id_for_state_path(state_path: &Path) -> String {
+    if state_path == crate::mission_control::session_state_path() {
+        return crate::mission_control::SESSION_ID.to_string();
+    }
+    let root = workspaces_root();
+    state_path
+        .strip_prefix(&root)
+        .unwrap_or(state_path)
+        .display()
+        .to_string()
+}
+
+const DEVICE_EVENTS_CAP: usize = 64;
+
+static DEVICE_EVENTS: OnceLock<broadcast::Sender<serde_json::Value>> = OnceLock::new();
+
+fn device_events() -> &'static broadcast::Sender<serde_json::Value> {
+    DEVICE_EVENTS.get_or_init(|| broadcast::channel(DEVICE_EVENTS_CAP).0)
+}
+
+/// Subscribe to the device-wide `/events` firehose (status + terminal bells).
+pub fn subscribe_device_events() -> broadcast::Receiver<serde_json::Value> {
+    device_events().subscribe()
+}
+
+/// Push one compact notification frame. No-op when nobody is listening.
+pub fn emit_device_event(event: serde_json::Value) {
+    let _ = device_events().send(event);
+}
+
+/// Title / folder / status for a live session id (sidecar only — no full state).
+pub fn session_notify_meta(id: &str) -> (String, String, String) {
+    let Some(path) = state_path_for_id(id) else {
+        return (String::new(), String::new(), String::new());
+    };
+    match read_session_meta(&path) {
+        Some(m) => (m.title, m.folder, m.status),
+        None => (String::new(), String::new(), String::new()),
     }
 }
 
@@ -1399,6 +1467,42 @@ mod create_blank_tests {
         let pinned = read_session_meta(&path).and_then(|m| m.last_active).unwrap();
         assert_eq!(pinned, before);
         assert!(file_mtime_secs(&path) >= before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn notify_kind_only_on_attention_transitions() {
+        assert_eq!(notify_kind("running", "waiting_for_input"), Some("waiting"));
+        assert_eq!(notify_kind("waiting_for_input", "waiting_for_input"), None);
+        assert_eq!(notify_kind("running", "idle"), Some("idle"));
+        assert_eq!(notify_kind("idle", "idle"), None);
+        assert_eq!(notify_kind("running", "running"), None);
+        assert_eq!(notify_kind("", "idle"), None);
+        assert_eq!(notify_kind("idle", "failed"), Some("error"));
+    }
+
+    #[test]
+    fn write_session_meta_pushes_waiting_once() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("snippet-events-{stamp}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut state = HarnessState::blank(dir.display().to_string(), Some("Ping".into()));
+        fs::write(&path, crate::harness::serialize_state(&state).unwrap()).unwrap();
+        write_session_meta(&path, &state);
+
+        let mut rx = subscribe_device_events();
+        state.status = crate::harness::HarnessStatus::WaitingForInput;
+        write_session_meta(&path, &state);
+        let ev = rx.try_recv().expect("waiting should push");
+        assert_eq!(ev.get("kind").and_then(|v| v.as_str()), Some("waiting"));
+
+        write_session_meta(&path, &state);
+        assert!(rx.try_recv().is_err(), "same status must not re-fire");
 
         let _ = fs::remove_dir_all(&dir);
     }
