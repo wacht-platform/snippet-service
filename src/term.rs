@@ -187,6 +187,8 @@ impl Fanout {
 /// Several human PTYs for one session. Frames carry `id` (default `"0"`).
 pub struct SessionTerms {
     cwd: PathBuf,
+    /// Daemon session id so BEL / OSC can push on `/events` immediately.
+    session_id: String,
     next_id: Mutex<u32>,
     terms: Mutex<HashMap<String, Arc<SessionTerm>>>,
     /// Pane ids that must send a full snapshot on the next attach poll
@@ -218,8 +220,13 @@ impl Drop for TermClient {
 
 impl SessionTerms {
     pub fn new(cwd: PathBuf) -> Arc<Self> {
+        Self::new_for_session(cwd, String::new())
+    }
+
+    pub fn new_for_session(cwd: PathBuf, session_id: String) -> Arc<Self> {
         Arc::new(Self {
             cwd,
+            session_id,
             next_id: Mutex::new(1),
             terms: Mutex::new(HashMap::new()),
             snap_ids: Mutex::new(std::collections::HashSet::new()),
@@ -249,10 +256,10 @@ impl SessionTerms {
             return;
         }
         if let Ok(mut g) = self.notifies.lock() {
-            for message in messages {
+            for message in &messages {
                 g.push(TermNotify {
                     pane: pane.to_string(),
-                    message,
+                    message: message.clone(),
                 });
             }
             // Bound the mailbox so a looping `echo -e '\a'` cannot grow forever
@@ -261,6 +268,21 @@ impl SessionTerms {
                 let drop = g.len() - 32;
                 g.drain(..drop);
             }
+        }
+        if self.session_id.is_empty() {
+            return;
+        }
+        let (title, folder, status) = crate::session::session_notify_meta(&self.session_id);
+        for message in messages {
+            crate::session::emit_device_event(serde_json::json!({
+                "session": self.session_id,
+                "title": title,
+                "workspace": folder,
+                "kind": "term",
+                "status": status,
+                "message": message,
+                "pane": pane,
+            }));
         }
     }
 
