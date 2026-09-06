@@ -436,6 +436,13 @@ pub struct HarnessState {
     pub context_window: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tool_payloads_pruned: bool,
+    /// Messages typed while a run is in progress — held until the turn ends
+    /// (idle / interrupted), then submitted as the next turn. Shared across
+    /// TUI and app clients so every attach sees the same queue. Always serialized
+    /// (even empty) so a flush clears every attached client instead of leaving
+    /// a stale hold list.
+    #[serde(default)]
+    pub queued_inputs: Vec<String>,
 }
 
 impl HarnessState {
@@ -474,6 +481,7 @@ impl HarnessState {
         self.compacting_started_at = None;
         self.turn_started_at = None;
         self.tool_payloads_pruned = false;
+        self.queued_inputs.clear();
         self.status = HarnessStatus::Idle;
         Ok(cp.label)
     }
@@ -561,7 +569,14 @@ pub enum LoopInput {
     Deny,
     /// Switch between Auto and Manual (approval) mode.
     SetMode(ApprovalMode),
-    /// Drop messages queued mid-run (in `pending_inputs`) before they're applied.
+    /// Hold a message until the current run ends (idle / interrupted). Shown on
+    /// every attached client. Does not steer the in-flight turn.
+    Queue(String),
+    /// Drop one held message by index (from `queued_inputs`).
+    Unqueue(usize),
+    /// Send one held message now as a mid-run steer and remove it from the queue.
+    SteerQueued(usize),
+    /// Drop every held message (`queued_inputs`) and anything buffered mid-step.
     DropQueued,
     /// Rename the session (user-set title override).
     SetTitle(String),
@@ -848,6 +863,26 @@ impl CodingHarness {
         self.persist(&mut state, &lanes).await?;
 
         loop {
+            // Held messages (typed while a run was in flight) fire as the next
+            // turn once we're idle — never into waiting_for_input, where they'd
+            // answer the agent's own question.
+            if state.status == HarnessStatus::Idle && !state.queued_inputs.is_empty() {
+                let held: Vec<String> = std::mem::take(&mut state.queued_inputs);
+                for (i, text) in held.into_iter().enumerate() {
+                    if i == 0 {
+                        self.accept_user_message(&mut state, &mut vars, text).await;
+                        consecutive_errors = 0;
+                    } else {
+                        state.messages.push(HarnessMessage::User {
+                            content: format!("[steer]\n{text}"),
+                        });
+                        state.events.push(HarnessEvent::Steer { text });
+                        self.bump_activity();
+                    }
+                }
+                self.persist(&mut state, &lanes).await?;
+            }
+
             // Apply any input buffered during a step. A message that arrived mid- or
             // post-turn wakes the loop so the next step addresses it.
             if !pending_inputs.is_empty() {
@@ -864,6 +899,30 @@ impl CodingHarness {
                         // Buffered /compact must actually run — `apply_input`
                         // treated it as a no-op, silently swallowing the request.
                         LoopInput::Compact => wants_compact = true,
+                        LoopInput::Queue(_)
+                        | LoopInput::Unqueue(_)
+                        | LoopInput::DropQueued => {
+                            needs_persist = true;
+                            self.apply_input(&mut state, input);
+                        }
+                        LoopInput::SteerQueued(i) => {
+                            if let Some(text) = take_queued(&mut state, i) {
+                                had_user_msg = true;
+                                if was_running {
+                                    state.messages.push(HarnessMessage::User {
+                                        content: format!("[steer]\n{text}"),
+                                    });
+                                    state.events.push(HarnessEvent::Steer { text });
+                                    self.bump_activity();
+                                } else {
+                                    self.accept_user_message(&mut state, &mut vars, text)
+                                        .await;
+                                    consecutive_errors = 0;
+                                }
+                            } else {
+                                needs_persist = true;
+                            }
+                        }
                         LoopInput::UserMessage(text) | LoopInput::Answer(text) => {
                             let text = text.trim().to_string();
                             if text.is_empty() {
@@ -1003,7 +1062,8 @@ impl CodingHarness {
                                 Some(LoopInput::Deny) => {
                                     let _ = approval_tx.send(ApprovalDecision::Deny);
                                 }
-                                Some(LoopInput::DropQueued) => pending_inputs.clear(),
+                                // Queue/unqueue/drop land after this step — `state`
+                                // is borrowed by the in-flight tool/model call.
                                 Some(other) => pending_inputs.push(other),
                             }
                         }
@@ -1086,7 +1146,6 @@ impl CodingHarness {
                                     a = &mut recover_fut => break Some(a),
                                     msg = input_rx.recv() => match msg {
                                         Some(LoopInput::Interrupt) | None => break None,
-                                        Some(LoopInput::DropQueued) => pending_inputs.clear(),
                                         Some(other) => pending_inputs.push(other),
                                     }
                                 }
@@ -1167,8 +1226,27 @@ impl CodingHarness {
                         }
                         // No tool call is pending while idle — nothing to approve.
                         Some(LoopInput::Approve) | Some(LoopInput::ApproveAll) | Some(LoopInput::Deny) => {}
-                        // Nothing queued while idle.
-                        Some(LoopInput::DropQueued) => {}
+                        Some(LoopInput::Queue(text)) => {
+                            queue_held(&mut state, text);
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::Unqueue(i)) => {
+                            take_queued(&mut state, i);
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::SteerQueued(i)) => {
+                            if let Some(text) = take_queued(&mut state, i) {
+                                self.accept_user_message(&mut state, &mut vars, text).await;
+                                consecutive_errors = 0;
+                            }
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::DropQueued) => {
+                            if !state.queued_inputs.is_empty() {
+                                state.queued_inputs.clear();
+                                self.persist(&mut state, &lanes).await?;
+                            }
+                        }
                         Some(LoopInput::Interrupt) | None => {
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;
@@ -1569,9 +1647,28 @@ impl CodingHarness {
                 state.approval_mode = mode;
                 false
             }
-            // Cancelling queued input is handled where pending_inputs lives; by the
-            // time it reaches apply_input (between turns) there's nothing to drop.
-            LoopInput::DropQueued => false,
+            LoopInput::Queue(text) => {
+                queue_held(state, text);
+                false
+            }
+            LoopInput::Unqueue(i) => {
+                take_queued(state, i);
+                false
+            }
+            LoopInput::SteerQueued(i) => {
+                if let Some(text) = take_queued(state, i) {
+                    state.messages.push(HarnessMessage::User {
+                        content: format!("[steer]\n{text}"),
+                    });
+                    state.events.push(HarnessEvent::Steer { text });
+                    self.bump_activity();
+                }
+                false
+            }
+            LoopInput::DropQueued => {
+                state.queued_inputs.clear();
+                false
+            }
             LoopInput::SetTitle(title) => {
                 let t = title.trim();
                 state.title = if t.is_empty() {
@@ -3123,6 +3220,7 @@ impl CodingHarness {
             rate_limit: None,
             context_window: self.config.context_window_tokens,
             tool_payloads_pruned: false,
+            queued_inputs: Vec::new(),
         };
         self.persist_state(&mut state).await?;
         if request.is_some() {
@@ -4033,6 +4131,21 @@ impl CodingHarness {
         if let Some(path) = &self.config.state_path {
             crate::session::bump_session_activity(path);
         }
+    }
+}
+
+fn queue_held(state: &mut HarnessState, text: String) {
+    let text = text.trim().to_string();
+    if !text.is_empty() {
+        state.queued_inputs.push(text);
+    }
+}
+
+fn take_queued(state: &mut HarnessState, i: usize) -> Option<String> {
+    if i < state.queued_inputs.len() {
+        Some(state.queued_inputs.remove(i))
+    } else {
+        None
     }
 }
 
@@ -5193,6 +5306,7 @@ mod assistant_dedup_tests {
             rate_limit: None,
             context_window: 10_000,
             tool_payloads_pruned: false,
+            queued_inputs: Vec::new(),
         }
     }
 
@@ -5412,6 +5526,7 @@ mod tool_prune_tests {
             rate_limit: None,
             context_window: 10_000,
             tool_payloads_pruned: false,
+            queued_inputs: Vec::new(),
         }
     }
 
