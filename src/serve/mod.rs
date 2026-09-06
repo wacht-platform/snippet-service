@@ -1261,10 +1261,14 @@ async fn open_session(
     if !folder.is_dir() {
         return (StatusCode::BAD_REQUEST, "not a directory").into_response();
     }
-    // New conversations in a git repo get an isolated worktree under
-    // ~/.snippet/worktrees/{repo}/{id}. Resume / default stay in the original
-    // folder so existing chats are untouched.
-    if req.new_conversation {
+    // Git repos get an isolated worktree for any NEW session (first open of
+    // this folder, or an explicit new conversation). Resume of an existing
+    // chat stays in its original folder so old sessions are untouched.
+    let original_state = {
+        let c = d.config.lock().unwrap();
+        c.for_workspace(folder.clone()).state_path
+    };
+    if req.new_conversation || !original_state.exists() {
         folder = prepare_new_session_workspace(&folder);
     }
     let base_state = {
@@ -2462,7 +2466,15 @@ async fn handle_ws(
                             // retried across reconnects and must be idempotent.
                             let idempotent = matches!(
                                 kind,
-                                "user_message" | "answer" | "approve" | "approve_all" | "deny"
+                                "user_message"
+                                    | "answer"
+                                    | "approve"
+                                    | "approve_all"
+                                    | "deny"
+                                    | "queue"
+                                    | "unqueue"
+                                    | "steer_queued"
+                                    | "drop_queued"
                             );
                             if idempotent && !daemon.accept_nonce(&session, nonce, &state_path) {
                                 continue; // duplicate — drop silently
@@ -2531,9 +2543,10 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
     }
 }
 
-// WS /events — device-wide notification firehose. Emits a compact event whenever a
-// session leaves the running state (asked a question / needs approval / stopped /
-// errored), so the app can notify even for sessions it isn't actively watching.
+// WS /events — device-wide firehose. Emits a compact event on status changes
+// (including running) so the session list can update live, even for chats the
+// app isn't painting. `notify` is true when the event should also raise an OS
+// banner; the app still receives every frame for UI.
 async fn events_ws(
     ws: WebSocketUpgrade,
     State(d): State<Shared>,
@@ -2571,8 +2584,13 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
                 ev = rx.recv() => {
                     match ev {
                         Ok(e) => {
-                            if !allow_device_event(&daemon, &e) {
-                                continue;
+                            let mut e = e;
+                            let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                            // Always push to the UI. OS banners stay policy-gated
+                            // and never fire just because a chat started running.
+                            let notify = kind != "running" && allow_device_event(&daemon, &e);
+                            if let Some(obj) = e.as_object_mut() {
+                                obj.insert("notify".into(), serde_json::Value::Bool(notify));
                             }
                             if sender
                                 .send(Message::Text(e.to_string().into()))

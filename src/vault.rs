@@ -20,11 +20,9 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
-/// True when `name` appears in `command` as a whole identifier token — bounded
-/// by anything that isn't `[A-Za-z0-9_]` (or a string edge). So `DATABASE_URL`
-/// matches inside `os.environ['DATABASE_URL']`, `$DATABASE_URL`, `${DATABASE_URL}`,
-/// `process.env.DATABASE_URL`, or bare — but NOT inside `MY_DATABASE_URL_X`.
-fn references_token(command: &str, name: &str) -> bool {
+/// True when the shell would expand vault secret `name`: `$NAME` or `${NAME}` /
+/// `${NAME:…}`. A bare identifier or a substring is not a use.
+fn references_shell_var(command: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
@@ -35,10 +33,17 @@ fn references_token(command: &str, name: &str) -> bool {
     while let Some(rel) = command[from..].find(name) {
         let s = from + rel;
         let e = s + n.len();
-        let left = s == 0 || !ident(h[s - 1]);
-        let right = e == h.len() || !ident(h[e]);
-        if left && right {
-            return true;
+        if s >= 1 && h[s - 1] == b'$' {
+            let left_ok = s == 1 || !ident(h[s - 2]);
+            let right_ok = e == h.len() || !ident(h[e]);
+            if left_ok && right_ok {
+                return true;
+            }
+        } else if s >= 2 && h[s - 1] == b'{' && h[s - 2] == b'$' {
+            // `${NAME}` or `${NAME:-default}` / `${NAME:1:2}`
+            if e < h.len() && (h[e] == b'}' || h[e] == b':') {
+                return true;
+            }
         }
         from = s + 1;
     }
@@ -220,18 +225,19 @@ impl Vault {
     pub fn env_for_command(&self, command: &str) -> Vec<(String, String)> {
         self.secrets
             .iter()
-            .filter(|(name, _)| references_token(command, name))
+            .filter(|(name, _)| references_shell_var(command, name))
             .map(|(n, v)| (n.clone(), v.clone()))
             .collect()
     }
 
-    /// Names of secrets a command references (any form). Drives the "using a
-    /// secret always needs approval" gate — broader than injection needs, so a
-    /// command that merely reads a secret via a language env API is still gated.
+    /// Names of secrets a command would expand as a *shell* parameter — `$NAME`
+    /// or `${NAME}` / `${NAME:…}`. Bare identifiers (`os.environ['NAME']`,
+    /// comments, `echo NAME`) do not count: that was flooding approval prompts
+    /// for ordinary commands that merely mentioned a similar word.
     pub fn referenced_names(&self, command: &str) -> Vec<String> {
         self.secrets
             .keys()
-            .filter(|name| references_token(command, name))
+            .filter(|name| references_shell_var(command, name))
             .cloned()
             .collect()
     }
@@ -297,5 +303,22 @@ impl Vault {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_var_requires_dollar() {
+        assert!(references_shell_var("echo $HELLO", "HELLO"));
+        assert!(references_shell_var("echo ${HELLO}", "HELLO"));
+        assert!(references_shell_var("echo ${HELLO:-x}", "HELLO"));
+        assert!(!references_shell_var("echo 'hello'", "HELLO"));
+        assert!(!references_shell_var("echo hello", "HELLO"));
+        assert!(!references_shell_var("echo HELLO", "HELLO"));
+        assert!(!references_shell_var("echo $HELLOT", "HELLO"));
+        assert!(!references_shell_var("echo $XHELLO", "HELLO"));
     }
 }

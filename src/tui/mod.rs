@@ -414,9 +414,6 @@ struct App {
     /// render loop during streaming doesn't burn through it).
     compaction_anim_until: Option<std::time::Instant>,
     seen_compactions: usize,
-    /// Inputs typed while the agent is executing — held and submitted when the run
-    /// finishes (or is stopped), instead of steering mid-run.
-    queued_inputs: std::collections::VecDeque<String>,
     /// Steers already sent to the loop but not yet in `state.events`. The
     /// composer is cleared on send; without this the words vanish until the
     /// harness writes `HarnessEvent::Steer`.
@@ -578,7 +575,6 @@ impl App {
             compaction_anim_until: None,
             seen_compactions: usize::MAX, // uninitialized; first tick seeds it, no flash
 
-            queued_inputs: std::collections::VecDeque::new(),
             pending_steers: Vec::new(),
             sent_turn_pending: false,
             effective_model: (String::new(), String::new()),
@@ -1096,7 +1092,6 @@ impl App {
                     if let Some(st) = self.state.as_mut() {
                         let _ = st.apply_checkpoint_rewind(&id);
                     }
-                    self.queued_inputs.clear();
                     self.sent_turn_pending = false;
                     self.status = format!("Rewound to: {label}");
                 }
@@ -1112,7 +1107,6 @@ impl App {
                 if let Some(st) = self.state.as_mut() {
                     let _ = st.apply_checkpoint_rewind(&id);
                 }
-                self.queued_inputs.clear();
                 self.status = format!("Rewound workspace and history to: {label}");
             }
             Err(error) => self.error = Some(format!("rewind failed: {error}")),
@@ -1219,7 +1213,6 @@ impl App {
         // Drop anything held for the PREVIOUS conversation: queued messages must
         // never fire into the newly-switched session, stale busy flags must not
         // trigger a phantom flush, and a lingering error must not mask status.
-        self.queued_inputs.clear();
         self.pending_steers.clear();
         self.was_busy = false;
         self.sent_turn_pending = false;
@@ -3053,7 +3046,12 @@ impl App {
         // Do not toast the footer — the input-area queue preview is enough.
         // Ctrl+S steers immediately instead of queueing (see handle_key).
         if self.agent_busy() {
-            self.queued_inputs.push_back(text);
+            if let Some(st) = self.state.as_mut() {
+                st.queued_inputs.push(text.clone());
+            }
+            if let Err(error) = self.send_loop_input(LoopInput::Queue(text)) {
+                self.error = Some(error);
+            }
             return;
         }
 
@@ -3099,15 +3097,17 @@ impl App {
     fn steer_now(&mut self) {
         // Composer first. If it's empty but a message is already queued, that
         // queued text IS the steer — Ctrl+G must not no-op.
-        let mut text = self.message_for_send().trim().to_string();
+        let text = self.message_for_send().trim().to_string();
         if text.is_empty() {
-            if let Some(queued) = self.queued_inputs.pop_front() {
-                text = queued;
-            } else {
+            if self.held_queue().is_empty() {
                 return;
             }
-        } else {
-            self.queued_inputs.clear();
+            let _ = self.send_loop_input(LoopInput::SteerQueued(0));
+            self.input_clear();
+            self.scroll = 0;
+            return;
+        } else if !self.held_queue().is_empty() {
+            let _ = self.send_loop_input(LoopInput::DropQueued);
         }
         if text.starts_with('/') {
             self.handle_slash_command(&text);
@@ -3151,17 +3151,11 @@ impl App {
         self.pending_steers = remaining;
     }
 
-    /// Submit everything queued when the agent goes idle/stopped — as a BURST of
-    /// individual messages. The first opens the turn; the rest land before the
-    /// first model call and are folded in as steers, so the agent still sees the
-    /// full set up front in ONE turn, while each message keeps its own frame
-    /// (and its own attachments) instead of being blurred into a joined blob.
-    fn flush_queued_input(&mut self) {
-        let held: Vec<String> = self.queued_inputs.drain(..).collect();
-        for text in held {
-            self.submit_text(text);
-        }
-        self.status = String::new();
+    fn held_queue(&self) -> &[String] {
+        self.state
+            .as_ref()
+            .map(|s| s.queued_inputs.as_slice())
+            .unwrap_or(&[])
     }
 
     fn spawn_loop(&mut self, initial: Option<String>, resume: bool) {
@@ -3251,12 +3245,9 @@ impl App {
             self.global_usage = crate::chatgpt::read_global_usage();
         }
 
-        // Flush a queued input on the busy → not-busy edge: the run just finished or
-        // was stopped, so submit the next held message as its own turn.
+        // The daemon flushes held messages when a run lands on idle. Local busy
+        // still tracks the lag between send and persisted Running.
         let busy = self.agent_busy();
-        if self.was_busy && !busy && !self.queued_inputs.is_empty() {
-            self.flush_queued_input();
-        }
         // Interrupting a turn usually leaves the resident loop ALIVE (idle), so the
         // agent-finished branch never clears the "Interrupting..." footer — clear it
         // here the moment the loop is observed no longer busy.
@@ -3923,8 +3914,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             }
             // Cancel messages queued for after the current run.
             KeyCode::Char('x') => {
-                if !app.queued_inputs.is_empty() {
-                    app.queued_inputs.clear();
+                if !app.held_queue().is_empty() {
+                    let _ = app.send_loop_input(LoopInput::DropQueued);
                 }
                 return;
             }
@@ -6190,7 +6181,7 @@ fn lane_lines(app: &App) -> Vec<Line<'static>> {
 /// up to 3 previews behind a dim rail, then an overflow count. They send as ONE
 /// combined message on idle (see flush_queued_input).
 fn queued_lines(app: &App) -> Vec<Line<'static>> {
-    let n = app.queued_inputs.len();
+    let n = app.held_queue().len();
     if n == 0 {
         return Vec::new();
     }
@@ -6204,7 +6195,7 @@ fn queued_lines(app: &App) -> Vec<Line<'static>> {
         rail.clone(),
         Span::styled(header, Style::default().fg(faint())),
     ])];
-    for q in app.queued_inputs.iter().take(3) {
+    for q in app.held_queue().iter().take(3) {
         let first = q.lines().next().unwrap_or("");
         let mut text: String = first.chars().take(72).collect();
         if first.chars().count() > 72 || q.lines().count() > 1 {
@@ -6233,7 +6224,7 @@ fn input_height(app: &App, width: u16) -> u16 {
     let attach: u16 = if app.attachments.is_empty() { 0 } else { 1 };
     // Queued-message preview rows (see queued_lines): header + up to 3 previews
     // + an overflow line when more are held.
-    let qn = app.queued_inputs.len();
+    let qn = app.held_queue().len();
     let queued: u16 = if qn == 0 {
         0
     } else {
