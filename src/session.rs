@@ -621,6 +621,7 @@ pub fn build_forked_state(source: &HarnessState, point: ForkPoint) -> HarnessSta
     forked.completion_tokens = 0;
     forked.cache_read_tokens = 0;
     forked.tool_payloads_pruned = false;
+    forked.queued_inputs.clear();
     // Keep last_prompt_tokens / context_window as hints; model will refresh.
     forked.created_at = now.clone();
     forked.updated_at = now;
@@ -706,8 +707,8 @@ pub fn write_forked_conversation(
 /// existing `last_active` — open/attach/agent-persist must not invent a new
 /// stamp or the list jumps. Call [`freeze_session_activity`] *before* rewriting
 /// the state file so a missing stamp is pinned to the pre-rewrite mtime.
-/// Status transitions that should wake a phone are pushed on `/events` here —
-/// the WS firehose is idle until something actually happens.
+/// Status transitions are pushed on `/events` here so the session list can
+/// update live. The firehose is idle until something actually happens.
 pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
     let prev = read_session_meta(state_path);
     let last_active = prev.as_ref().and_then(|m| m.last_active);
@@ -725,6 +726,21 @@ pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
             "status": next.status,
         }));
     }
+    // A dispatched worker that dies without report_mission_task leaves MC
+    // unable to resume. Park the bound task and ping the MC conversation.
+    if next.status == "failed" && prev_status != "failed" {
+        let id = session_id_for_state_path(state_path);
+        let detail = state
+            .events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                crate::harness::HarnessEvent::ModelError { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        crate::mission_control::notify_session_runtime_failure(&id, detail);
+    }
 }
 
 fn notify_kind(prev: &str, status: &str) -> Option<&'static str> {
@@ -732,6 +748,7 @@ fn notify_kind(prev: &str, status: &str) -> Option<&'static str> {
         return None;
     }
     match status {
+        "running" => Some("running"),
         "waiting_for_input" => Some("waiting"),
         "failed" => Some("error"),
         "completed" => Some("done"),
@@ -946,7 +963,8 @@ fn try_session_worktree(folder: &Path) -> Option<PathBuf> {
 /// Persist a brand-new idle conversation in `folder` so Mission Control can
 /// dispatch to it. `new_conversation=false` uses the folder's default
 /// `state.json` (refuses if one already exists). `true` always writes a
-/// fresh `conversations/<uuid>.json`. Git repos get an isolated worktree.
+/// fresh `conversations/<uuid>.json`. Git repos always get an isolated
+/// worktree; non-git folders and already-isolated worktrees stay put.
 pub fn create_blank_session(
     folder: &Path,
     title: &str,
@@ -958,11 +976,9 @@ pub fn create_blank_session(
     if !folder.is_dir() {
         return Err("folder is not a directory".into());
     }
-    if new_conversation {
-        folder = prepare_new_session_workspace(&folder);
-        if let Ok(canonical) = folder.canonicalize() {
-            folder = canonical;
-        }
+    folder = prepare_new_session_workspace(&folder);
+    if let Ok(canonical) = folder.canonicalize() {
+        folder = canonical;
     }
     let base = crate::config::state_path_for_workspace(&folder);
     let dest = if new_conversation {
@@ -1385,6 +1401,27 @@ mod create_blank_tests {
     }
 
     #[test]
+    fn blank_session_in_git_repo_always_gets_a_worktree() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "mc-blank");
+        // Mission Control often creates with new_conversation=false.
+        let info = create_blank_session(&repo, "from mc", false).unwrap();
+        let root = crate::config::worktrees_root();
+        let folder = PathBuf::from(&info.folder);
+        assert_ne!(folder, repo);
+        assert!(folder.starts_with(&root), "expected isolated worktree, got {}", folder.display());
+        assert!(folder.join(".git").is_file());
+        let path = state_path_for_id(&info.id).expect("created session is resolvable");
+        remove_session_files(&path);
+        assert!(!folder.exists(), "isolated worktree should be gone");
+        assert!(repo.exists(), "original clone must stay");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn deleting_a_session_drops_its_worktree() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1472,7 +1509,8 @@ mod create_blank_tests {
     }
 
     #[test]
-    fn notify_kind_only_on_attention_transitions() {
+    fn notify_kind_on_status_transitions() {
+        assert_eq!(notify_kind("idle", "running"), Some("running"));
         assert_eq!(notify_kind("running", "waiting_for_input"), Some("waiting"));
         assert_eq!(notify_kind("waiting_for_input", "waiting_for_input"), None);
         assert_eq!(notify_kind("running", "idle"), Some("idle"));

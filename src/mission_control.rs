@@ -707,6 +707,47 @@ pub fn archive_all(root: &Path) -> Result<u32, String> {
     Ok(count)
 }
 
+/// A dispatched worker session died (Failed) without calling
+/// `report_mission_task`. Park every in-progress task bound to that session
+/// as Blocked and leave an undelivered MC notification so the orchestrator
+/// can retry or reassign.
+pub fn notify_session_runtime_failure(session_id: &str, detail: &str) {
+    notify_session_runtime_failure_in(&MissionControlStore::default_root(None), session_id, detail);
+}
+
+pub(crate) fn notify_session_runtime_failure_in(root: &Path, session_id: &str, detail: &str) {
+    if session_id.is_empty() || is_session_id(session_id) {
+        return;
+    }
+    let Ok(tasks) = list_tasks(root, Some(session_id), Some(TaskStatus::InProgress)) else {
+        return;
+    };
+    let message = if detail.trim().is_empty() {
+        "worker session failed without reporting; retry or reassign".to_string()
+    } else {
+        format!("worker session failed: {detail}")
+    };
+    for task in tasks {
+        if task.reporting_session.as_deref() != Some(session_id) {
+            continue;
+        }
+        let _ = update_task(root, &task.id, |t| {
+            if t.status != TaskStatus::InProgress {
+                return;
+            }
+            t.status = TaskStatus::Blocked;
+            t.reporting_session = None;
+            t.owned_paths.clear();
+            t.notifications.push(NotificationMarker {
+                target: "mission_control".into(),
+                kind: "blocked".into(),
+                message: message.clone(),
+                delivered: false,
+            });
+        });
+    }
+}
+
 /// Re-queue a blocked or failed task so dispatch can deliver it again.
 /// Use after a temporary failure (rate limit, dispatch ceiling, worker
 /// `blocked`). Refuses Done/Cancelled (finished) and InProgress (still
@@ -1430,6 +1471,28 @@ mod tests {
         assert_eq!(
             get_task(root.path(), "t1").unwrap().handoff_mode,
             HandoffMode::Fresh
+        );
+    }
+
+    #[test]
+    fn runtime_failure_parks_bound_in_progress_task() {
+        let root = tmp();
+        create_session(root.path(), "s1", "S", Path::new("/w")).unwrap();
+        create_task(root.path(), "t1", "s1", "T", "D", vec![]).unwrap();
+        update_task(root.path(), "t1", |t| {
+            t.status = TaskStatus::InProgress;
+            t.reporting_session = Some("s1".into());
+        })
+        .unwrap();
+        notify_session_runtime_failure_in(root.path(), "s1", "boom");
+        let parked = get_task(root.path(), "t1").unwrap();
+        assert_eq!(parked.status, TaskStatus::Blocked);
+        assert!(parked.reporting_session.is_none());
+        assert_eq!(parked.notifications.last().unwrap().kind, "blocked");
+        assert!(parked.notifications.last().unwrap().message.contains("boom"));
+        assert_eq!(
+            retry_task(root.path(), "t1").unwrap().status,
+            TaskStatus::Pending
         );
     }
 }
