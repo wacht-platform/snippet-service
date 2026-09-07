@@ -1521,7 +1521,13 @@ async fn put_profile(
         save_config(&c, &d.config_path).map(|_| name)
     };
     match result {
-        Ok(name) => Json(serde_json::json!({ "name": name })).into_response(),
+        Ok(name) => {
+            crate::session::emit_device_event(serde_json::json!({
+                "kind": "models",
+                "name": name,
+            }));
+            Json(serde_json::json!({ "name": name })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1549,7 +1555,13 @@ async fn set_active(
         save_config(&c, &d.config_path)
     };
     match result {
-        Ok(_) => Json(serde_json::json!({ "active": req.name })).into_response(),
+        Ok(_) => {
+            crate::session::emit_device_event(serde_json::json!({
+                "kind": "models",
+                "active": req.name,
+            }));
+            Json(serde_json::json!({ "active": req.name })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1784,7 +1796,13 @@ async fn set_delegate(
         save_config(&c, &d.config_path)
     };
     match result {
-        Ok(_) => Json(serde_json::json!({ "delegate": name })).into_response(),
+        Ok(_) => {
+            crate::session::emit_device_event(serde_json::json!({
+                "kind": "models",
+                "delegate": name,
+            }));
+            Json(serde_json::json!({ "delegate": name })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1807,7 +1825,13 @@ async fn delete_profile(State(d): State<Shared>, Query(q): Query<DeleteProfileQu
         save_config(&c, &d.config_path)
     };
     match result {
-        Ok(_) => Json(serde_json::json!({ "removed": q.name })).into_response(),
+        Ok(_) => {
+            crate::session::emit_device_event(serde_json::json!({
+                "kind": "models",
+                "removed": q.name,
+            }));
+            Json(serde_json::json!({ "removed": q.name })).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
@@ -1866,6 +1890,11 @@ async fn set_session_model(
         req.session.clone(),
         live_from_handle(handle, Some(req.profile.clone())),
     );
+    crate::session::emit_device_event(serde_json::json!({
+        "kind": "models",
+        "session": req.session,
+        "profile": req.profile,
+    }));
     Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
 }
 
@@ -2632,7 +2661,7 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
                             let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                             // Always push to the UI. OS banners stay policy-gated
                             // and never fire just because a chat started running.
-                            let notify = kind != "running" && allow_device_event(&daemon, &e);
+                            let notify = kind != "running" && kind != "models" && allow_device_event(&daemon, &e);
                             if let Some(obj) = e.as_object_mut() {
                                 obj.insert("notify".into(), serde_json::Value::Bool(notify));
                             }

@@ -439,6 +439,7 @@ fn apply_wire_frame(
                     acc.compacting = partial.compacting;
                     acc.turn_started_at = partial.turn_started_at;
                     acc.compacting_started_at = partial.compacting_started_at;
+                    acc.queued_inputs = partial.queued_inputs;
                     if let Some(t) = partial.title {
                         acc.title = Some(t);
                     }
