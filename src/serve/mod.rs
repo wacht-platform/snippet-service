@@ -2381,6 +2381,7 @@ async fn handle_ws(
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_stream_fp: u64 = 0;
         let mut last_queue_revision = 0;
+        let mut attach_revision: u64 = 0;
         let mut term_seq: u64 = 0;
         loop {
             let queue_revision = daemon.queue_revision.load(Ordering::Acquire);
@@ -2424,7 +2425,9 @@ async fn handle_ws(
                                         count < last_events.len()
                                             || state.events[..last_events.len()] != last_events[..]
                                     };
+                                    attach_revision = attach_revision.wrapping_add(1);
                                     if let Some(o) = v.as_object_mut() {
+                                        o.insert("revision".into(), serde_json::json!(attach_revision));
                                         if snapshot {
                                             o.insert("wire".into(), serde_json::json!("snapshot"));
                                         } else {
