@@ -863,28 +863,10 @@ impl CodingHarness {
         self.persist(&mut state, &lanes).await?;
 
         loop {
-            // Held messages (typed while a run was in flight) fire as the next
-            // turn once we're idle — never into waiting_for_input, where they'd
-            // answer the agent's own question.
-            if state.status == HarnessStatus::Idle && !state.queued_inputs.is_empty() {
-                let held: Vec<String> = std::mem::take(&mut state.queued_inputs);
-                for (i, text) in held.into_iter().enumerate() {
-                    if i == 0 {
-                        self.accept_user_message(&mut state, &mut vars, text).await;
-                        consecutive_errors = 0;
-                    } else {
-                        state.messages.push(HarnessMessage::User {
-                            content: format!("[steer]\n{text}"),
-                        });
-                        state.events.push(HarnessEvent::Steer { text });
-                        self.bump_activity();
-                    }
-                }
-                self.persist(&mut state, &lanes).await?;
-            }
-
             // Apply any input buffered during a step. A message that arrived mid- or
-            // post-turn wakes the loop so the next step addresses it.
+            // post-turn wakes the loop so the next step addresses it. Moving this
+            // before the idle-queue flush ensures mid-run queued messages land in
+            // state.queued_inputs and auto-fire immediately when the turn ends.
             if !pending_inputs.is_empty() {
                 let prior_status = state.status;
                 let was_running = prior_status == HarnessStatus::Running;
@@ -980,6 +962,26 @@ impl CodingHarness {
                     state.status = prior_status;
                     self.persist(&mut state, &lanes).await?;
                 }
+            }
+
+            // Held messages (typed while a run was in flight) fire as the next
+            // turn once we're idle — never into waiting_for_input, where they'd
+            // answer the agent's own question.
+            if state.status == HarnessStatus::Idle && !state.queued_inputs.is_empty() {
+                let held: Vec<String> = std::mem::take(&mut state.queued_inputs);
+                for (i, text) in held.into_iter().enumerate() {
+                    if i == 0 {
+                        self.accept_user_message(&mut state, &mut vars, text).await;
+                        consecutive_errors = 0;
+                    } else {
+                        state.messages.push(HarnessMessage::User {
+                            content: format!("[steer]\n{text}"),
+                        });
+                        state.events.push(HarnessEvent::Steer { text });
+                        self.bump_activity();
+                    }
+                }
+                self.persist(&mut state, &lanes).await?;
             }
 
             if state.status == HarnessStatus::Running {
