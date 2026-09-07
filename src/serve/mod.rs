@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -142,6 +143,11 @@ struct Daemon {
     /// first-seen time. Prevents duplicate user messages and decision retries when
     /// the mobile client resends after a reconnect.
     seen_nonces: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+    /// Queue entries removed/steered while an in-flight step still owns the
+    /// harness state. The attach stream applies this shared overlay immediately
+    /// for every connected client; the harness later persists the real removal.
+    queue_hidden: std::sync::Mutex<HashMap<String, Vec<String>>>,
+    queue_revision: AtomicU64,
     mission_control_root: PathBuf,
     recurring_root: PathBuf,
 }
@@ -386,10 +392,34 @@ impl Daemon {
         RebuildOutcome::Rebuilt
     }
 
+    /// Mark a queued entry invisible immediately for every attached client.
+    /// The harness may be borrowing its state in an in-flight step, so it still
+    /// receives the original control input and persists the durable mutation at
+    /// the next safe boundary.
+    async fn hide_queued(&self, id: &str, index: usize) {
+        let path = self.sessions.lock().await.get(id)
+            .map(|s| s.state_path.clone())
+            .or_else(|| state_path_for_id(id));
+        let Some(path) = path else { return; };
+        let Ok(bytes) = std::fs::read(path) else { return; };
+        let Ok(state) = deserialize_state(&bytes) else { return; };
+        let Some(text) = state.queued_inputs.get(index).cloned() else { return; };
+        let mut hidden = self.queue_hidden.lock().unwrap();
+        let entries = hidden.entry(id.to_string()).or_default();
+        if !entries.contains(&text) {
+            entries.push(text);
+            self.queue_revision.fetch_add(1, Ordering::Release);
+        }
+    }
+
     /// Send a loop input to a session. Audio attachment markers are expanded here,
     /// before the input reaches the harness, so every model/provider receives the
     /// same transcript plus the original attachment reference.
     async fn deliver(&self, id: &str, input: LoopInput) {
+        match &input {
+            LoopInput::Unqueue(i) | LoopInput::SteerQueued(i) => self.hide_queued(id, *i).await,
+            _ => {}
+        }
         let input = match input {
             LoopInput::UserMessage(text) => {
                 match transcribe::prepare_message(self, text.clone()).await {
@@ -514,6 +544,8 @@ pub async fn run_serve(
         git_write: Mutex::new(()),
         browser: BrowserManager::default(),
         seen_nonces: std::sync::Mutex::new(HashMap::new()),
+        queue_hidden: std::sync::Mutex::new(HashMap::new()),
+        queue_revision: AtomicU64::new(0),
         mission_control_root: mission_control::MissionControlStore::default_root(None),
         recurring_root: recurring::default_root(),
     });
@@ -2317,13 +2349,24 @@ async fn handle_ws(
         let mut last_mtime = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_stream_fp: u64 = 0;
+        let mut last_queue_revision = 0;
         let mut term_seq: u64 = 0;
         loop {
+            let queue_revision = daemon.queue_revision.load(Ordering::Acquire);
             if let Ok(meta) = tokio::fs::metadata(&state_path).await {
                 if let Ok(mtime) = meta.modified() {
-                    if Some(mtime) != last_mtime {
+                    if Some(mtime) != last_mtime || queue_revision != last_queue_revision {
                         if let Ok(bytes) = tokio::fs::read(&state_path).await {
-                            if let Ok(state) = deserialize_state(&bytes) {
+                            if let Ok(mut state) = deserialize_state(&bytes) {
+                                let hidden = {
+                                    let mut overlays = daemon.queue_hidden.lock().unwrap();
+                                    let entries = overlays.entry(session.clone()).or_default();
+                                    entries.retain(|m| state.queued_inputs.contains(m));
+                                    entries.clone()
+                                };
+                                if !hidden.is_empty() {
+                                    state.queued_inputs.retain(|m| !hidden.contains(m));
+                                }
                                 if let Ok(mut v) = serde_json::to_value(&state) {
                                     // `messages` (raw LLM history) is unused by the app — never wire it.
                                     if let Some(o) = v.as_object_mut() {
@@ -2367,6 +2410,7 @@ async fn handle_ws(
                                         }
                                     }
                                     last_events = state.events.clone();
+                                    last_queue_revision = queue_revision;
                                     if let Ok(json) = serde_json::to_string(&v) {
                                         if sender.send(Message::Text(json.into())).await.is_err() {
                                             break;
