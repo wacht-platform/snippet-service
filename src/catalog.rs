@@ -11,7 +11,8 @@
 //!   `reasoning_effort` are accepted (not which levels) + `context_length`.
 //! - OpenAI-compatible: IDs only — `/models` carries no capability metadata.
 //! - Gemini: ListModels has `thinking: bool` + token limits, no levels.
-//! - ChatGPT (Codex subscription): no catalog endpoint; returns an empty list.
+//! - ChatGPT (Codex subscription): no catalog endpoint; we return the known
+//!   Codex slugs so the editor can still offer a picker.
 //!
 //! Anything unknown stays `None` — the runtime effort auto-degrade in the
 //! harness is the universal fallback for what discovery can't tell us.
@@ -71,10 +72,31 @@ pub async fn fetch_models(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String
             fetch_openai_compatible(&c).await
         }
         "gemini" => fetch_gemini(cfg).await,
-        // Codex subscription backend has no models endpoint.
-        "chatgpt" => Ok(Vec::new()),
+        // Codex subscription backend has no models endpoint — offer the
+        // known slugs so the editor picker is not empty.
+        "chatgpt" => Ok(chatgpt_catalog()),
         other => Err(format!("no model catalog for provider `{other}`")),
     }
+}
+
+fn chatgpt_catalog() -> Vec<CatalogModel> {
+    const IDS: &[&str] = &[
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.1-codex",
+        "gpt-5.4-mini",
+    ];
+    IDS.iter()
+        .map(|id| CatalogModel {
+            id: id.to_string(),
+            display_name: None,
+            context_window: None,
+            efforts: None,
+            reasoning: Some(true),
+            supports_images: Some(true),
+        })
+        .collect()
 }
 
 /// `…/v1/messages` (from the shared URL builder) → `…/v1/models`, so catalog
