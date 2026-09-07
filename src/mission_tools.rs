@@ -518,7 +518,8 @@ impl Tool for ReportMissionTask {
 #[derive(Deserialize)]
 struct CreateRecurringArgs {
     title: String,
-    session_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
     schedule: String,
     #[serde(default)]
     prompt: String,
@@ -534,16 +535,16 @@ impl Tool for CreateRecurringJob {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_recurring_job".into(),
-            description: "Schedule work on ANY existing chat by writing ~/.snippet/recurring/<id>.json. The user's Scheduled screen on Mission Control only creates jobs for Mission Control itself — this tool is how you target other sessions. The daemon detects that file and each fire sets an autonomous GOAL on session_id (driven to complete_goal; the agent's complete_goal summary is surfaced to the user as the run outcome). session_id must come from list_sessions (or mission-control). schedule is `every 5m|15m|1h|1d` (min 5 minutes), `daily HH:MM`, `at HH:MM` (one-off), or `in 30m` (one-off). prompt and/or plan_path required — plan_path is a markdown/plan file the target session rereads each fire. FIRST RUN IS IMMEDIATE: the job fires on the next daemon tick (≤15s) unless that session is busy, in which case it queues until the current goal completes.".into(),
+            description: "Schedule a recurring goal or prompt by writing ~/.snippet/recurring/<id>.json. If session_id is omitted, schedules work on the current session. The daemon detects that file and each fire sets an autonomous GOAL on the target session (driven to complete_goal; the agent's complete_goal summary is surfaced to the user as the run outcome). schedule is `every 5m|15m|1h|1d` (min 5 minutes), `daily HH:MM`, `at HH:MM` (one-off), or `in 30m` (one-off). prompt and/or plan_path required — plan_path is a markdown/plan file the session rereads each fire. FIRST RUN IS IMMEDIATE: the job fires on the next daemon tick (≤15s) unless that session is busy, in which case it queues until the current goal completes.".into(),
             input_schema: schema(
                 json!({
                     "title": {"type": "string"},
-                    "session_id": {"type": "string"},
-                    "schedule": {"type": "string"},
+                    "session_id": {"type": "string", "description": "Target session id (defaults to current session)"},
+                    "schedule": {"type": "string", "description": "e.g. `every 1h`, `daily 09:00`, `at 14:00`, `in 30m`"},
                     "prompt": {"type": "string"},
                     "plan_path": {"type": "string"}
                 }),
-                &["title", "session_id", "schedule"],
+                &["title", "schedule"],
             ),
         }
     }
@@ -553,15 +554,24 @@ impl Tool for CreateRecurringJob {
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "create_recurring_job".into(),
             })?;
-        let session_id = args.session_id.trim();
-        if session_id.is_empty() {
-            return Err(ToolError::msg("session_id is required"));
-        }
+        let target_session_id = match args
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => id.to_string(),
+            None => match ctx.durable_session_id().as_deref() {
+                Some(id) => id.to_string(),
+                None => return Err(ToolError::msg("session_id is required")),
+            },
+        };
+        let session_id = target_session_id.as_str();
         if !crate::mission_control::is_session_id(session_id)
             && state_path_for_id(session_id).is_none()
         {
             return Err(ToolError::msg(
-                "unknown target session — pass an id from list_sessions",
+                "unknown target session — pass an id from list_sessions or omit to target current session",
             ));
         }
         let schedule = crate::recurring::Schedule::parse(&args.schedule).map_err(ToolError::msg)?;
