@@ -3691,6 +3691,15 @@ struct RecurringUpdateReq {
     enabled: Option<bool>,
 }
 
+fn emit_recurring_event(action: &str, job_id: &str, session: Option<&str>) {
+    crate::session::emit_device_event(serde_json::json!({
+        "kind": "recurring",
+        "action": action,
+        "job_id": job_id,
+        "session": session.unwrap_or(""),
+    }));
+}
+
 async fn create_recurring(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -3717,7 +3726,10 @@ async fn create_recurring(
         req.plan_path.as_deref(),
         delivery,
     ) {
-        Ok(job) => Json(job).into_response(),
+        Ok(job) => {
+            emit_recurring_event("created", &job.id, Some(&job.session_id));
+            Json(job).into_response()
+        },
         Err(error) => mission_error(error),
     }
 }
@@ -3786,7 +3798,10 @@ async fn update_recurring(
             }
         }
     }) {
-        Ok(job) => Json(job).into_response(),
+        Ok(job) => {
+            emit_recurring_event("updated", &job.id, Some(&job.session_id));
+            Json(job).into_response()
+        },
         Err(error) => mission_error(error),
     }
 }
@@ -3800,7 +3815,10 @@ async fn delete_recurring(
         return unauthorized();
     }
     match recurring::delete_job(&d.recurring_root, &id) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            emit_recurring_event("deleted", &id, None);
+            Json(serde_json::json!({ "ok": true })).into_response()
+        },
         Err(error) => mission_error(error),
     }
 }
