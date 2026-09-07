@@ -662,7 +662,6 @@ pub async fn run_serve(
         .route("/chatgpt/status", get(chatgpt_status))
         .route("/chatgpt/logout", post(chatgpt_logout))
         .route("/session/model", post(set_session_model))
-        .route("/session/events", get(session_events))
         .route("/session/rewind", post(rewind_session))
         .route("/session/fork", post(fork_session))
         .route("/session/exec", post(exec_in_session))
@@ -1907,16 +1906,6 @@ async fn set_session_model(
     Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
 }
 
-#[derive(Deserialize)]
-struct SessionEventsQuery {
-    token: Option<String>,
-    session: String,
-    #[serde(default)]
-    before: Option<usize>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
 fn session_event_page(
     events: &[crate::harness::HarnessEvent],
     before: Option<usize>,
@@ -1926,34 +1915,6 @@ fn session_event_page(
     let size = limit.unwrap_or(160).clamp(1, 500);
     let start = end.saturating_sub(size);
     (start, end, start > 0)
-}
-
-/// GET /session/events?session=…&before=N&limit=M — fetch an older bounded
-/// page of durable transcript events without expanding the attach snapshot.
-async fn session_events(
-    State(_d): State<Shared>,
-    Query(q): Query<SessionEventsQuery>,
-) -> Response {
-    if !_d.authed(&q.token) {
-        return unauthorized();
-    }
-    let Some(path) = state_path_for_id(&q.session) else {
-        return (StatusCode::NOT_FOUND, "no such session").into_response();
-    };
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
-    };
-    let (start, end, has_older) = session_event_page(&state.events, q.before, q.limit);
-    Json(serde_json::json!({
-        "events": &state.events[start..end],
-        "start": start,
-        "end": end,
-        "has_older": start > 0,
-    }))
-    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2420,6 +2381,9 @@ async fn handle_ws(
     terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
+    let (history_tx, history_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    let history_request_tx = history_tx.clone();
 
     let push_daemon = daemon.clone();
     let push_session = session.clone();
@@ -2432,6 +2396,7 @@ async fn handle_ws(
         let state_path = push_state_path;
         let stream = push_stream;
         let terms = push_terms;
+        let mut history_rx = history_rx;
         let term_client = terms.as_ref().map(|t| t.subscribe());
         let mut last_mtime = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
@@ -2575,6 +2540,24 @@ async fn handle_ws(
                     }
                 }
             }
+            if let Ok((before, limit)) = history_rx.try_recv() {
+                if let Ok(bytes) = tokio::fs::read(&state_path).await {
+                    if let Ok(state) = deserialize_state(&bytes) {
+                        let (start, end, has_older) =
+                            session_event_page(&state.events, Some(before), Some(limit));
+                        let frame = serde_json::json!({
+                            "wire": "history",
+                            "events": &state.events[start..end],
+                            "start": start,
+                            "end": end,
+                            "has_older": has_older,
+                        });
+                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
             tokio::time::sleep(Duration::from_millis(40)).await;
         }
     });
@@ -2592,6 +2575,12 @@ async fn handle_ws(
                         if let Some(terms) = terms.as_ref() {
                             apply_term_client(terms, &val);
                         }
+                        continue;
+                    }
+                    if val.get("kind").and_then(|k| k.as_str()) == Some("history") {
+                        let before = val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let limit = val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
+                        let _ = history_request_tx.send((before, limit));
                         continue;
                     }
                     if let Some(nonce) = val.get("nonce").and_then(|n| n.as_str()) {
