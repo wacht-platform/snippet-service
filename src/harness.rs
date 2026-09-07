@@ -354,6 +354,12 @@ fn earliest_reset(snap: &crate::llm::RateLimitSnapshot) -> Option<i64> {
         .min()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueuedInput {
+    pub id: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct HarnessState {
     pub version: u32,
@@ -442,7 +448,7 @@ pub struct HarnessState {
     /// (even empty) so a flush clears every attached client instead of leaving
     /// a stale hold list.
     #[serde(default)]
-    pub queued_inputs: Vec<String>,
+    pub queued_inputs: Vec<QueuedInput>,
 }
 
 impl HarnessState {
@@ -571,11 +577,11 @@ pub enum LoopInput {
     SetMode(ApprovalMode),
     /// Hold a message until the current run ends (idle / interrupted). Shown on
     /// every attached client. Does not steer the in-flight turn.
-    Queue(String),
-    /// Drop one held message by index (from `queued_inputs`).
-    Unqueue(usize),
-    /// Send one held message now as a mid-run steer and remove it from the queue.
-    SteerQueued(usize),
+    Queue(QueuedInput),
+    /// Drop one held message by its stable ID.
+    Unqueue(String),
+    /// Send one held message now as a mid-run steer and remove it by ID.
+    SteerQueued(String),
     /// Drop every held message (`queued_inputs`) and anything buffered mid-step.
     DropQueued,
     /// Rename the session (user-set title override).
@@ -887,8 +893,8 @@ impl CodingHarness {
                             needs_persist = true;
                             self.apply_input(&mut state, input);
                         }
-                        LoopInput::SteerQueued(i) => {
-                            if let Some(text) = take_queued(&mut state, i) {
+                        LoopInput::SteerQueued(id) => {
+                            if let Some(text) = take_queued(&mut state, &id) {
                                 had_user_msg = true;
                                 if was_running {
                                     state.messages.push(HarnessMessage::User {
@@ -968,8 +974,9 @@ impl CodingHarness {
             // turn once we're idle — never into waiting_for_input, where they'd
             // answer the agent's own question.
             if state.status == HarnessStatus::Idle && !state.queued_inputs.is_empty() {
-                let held: Vec<String> = std::mem::take(&mut state.queued_inputs);
-                for (i, text) in held.into_iter().enumerate() {
+                let held: Vec<QueuedInput> = std::mem::take(&mut state.queued_inputs);
+                for (i, item) in held.into_iter().enumerate() {
+                    let text = item.text;
                     if i == 0 {
                         self.accept_user_message(&mut state, &mut vars, text).await;
                         consecutive_errors = 0;
@@ -1228,16 +1235,16 @@ impl CodingHarness {
                         }
                         // No tool call is pending while idle — nothing to approve.
                         Some(LoopInput::Approve) | Some(LoopInput::ApproveAll) | Some(LoopInput::Deny) => {}
-                        Some(LoopInput::Queue(text)) => {
-                            queue_held(&mut state, text);
+                        Some(LoopInput::Queue(item)) => {
+                            queue_held(&mut state, item);
                             self.persist(&mut state, &lanes).await?;
                         }
-                        Some(LoopInput::Unqueue(i)) => {
-                            take_queued(&mut state, i);
+                        Some(LoopInput::Unqueue(id)) => {
+                            take_queued(&mut state, &id);
                             self.persist(&mut state, &lanes).await?;
                         }
-                        Some(LoopInput::SteerQueued(i)) => {
-                            if let Some(text) = take_queued(&mut state, i) {
+                        Some(LoopInput::SteerQueued(id)) => {
+                            if let Some(text) = take_queued(&mut state, &id) {
                                 self.accept_user_message(&mut state, &mut vars, text).await;
                                 consecutive_errors = 0;
                             }
@@ -1649,16 +1656,16 @@ impl CodingHarness {
                 state.approval_mode = mode;
                 false
             }
-            LoopInput::Queue(text) => {
-                queue_held(state, text);
+            LoopInput::Queue(item) => {
+                queue_held(state, item);
                 false
             }
-            LoopInput::Unqueue(i) => {
-                take_queued(state, i);
+            LoopInput::Unqueue(id) => {
+                take_queued(state, &id);
                 false
             }
-            LoopInput::SteerQueued(i) => {
-                if let Some(text) = take_queued(state, i) {
+            LoopInput::SteerQueued(id) => {
+                if let Some(text) = take_queued(state, &id) {
                     state.messages.push(HarnessMessage::User {
                         content: format!("[steer]\n{text}"),
                     });
@@ -4136,19 +4143,16 @@ impl CodingHarness {
     }
 }
 
-fn queue_held(state: &mut HarnessState, text: String) {
-    let text = text.trim().to_string();
+fn queue_held(state: &mut HarnessState, item: QueuedInput) {
+    let text = item.text.trim().to_string();
     if !text.is_empty() {
-        state.queued_inputs.push(text);
+        state.queued_inputs.push(QueuedInput { id: item.id, text });
     }
 }
 
-fn take_queued(state: &mut HarnessState, i: usize) -> Option<String> {
-    if i < state.queued_inputs.len() {
-        Some(state.queued_inputs.remove(i))
-    } else {
-        None
-    }
+fn take_queued(state: &mut HarnessState, id: &str) -> Option<String> {
+    let i = state.queued_inputs.iter().position(|item| item.id == id)?;
+    Some(state.queued_inputs.remove(i).text)
 }
 
 /// Keep compacting/thinking clocks anchored to when the activity actually
