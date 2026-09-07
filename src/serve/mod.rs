@@ -2709,6 +2709,8 @@ mod tests {
             git_write: Mutex::new(()),
             browser: BrowserManager::default(),
             seen_nonces: std::sync::Mutex::new(HashMap::new()),
+            queue_hidden: std::sync::Mutex::new(HashMap::new()),
+            queue_revision: AtomicU64::new(0),
             mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
             recurring_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
