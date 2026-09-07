@@ -158,6 +158,7 @@ fn start_session_with_role(
                 },
             );
             crate::mission_tools::add_worker_report_tool(&mut tools);
+            tools.insert(crate::mission_tools::CreateRecurringJob);
             tools
         };
         let harness = CodingHarness::new(
