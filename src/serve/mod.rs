@@ -662,6 +662,7 @@ pub async fn run_serve(
         .route("/chatgpt/status", get(chatgpt_status))
         .route("/chatgpt/logout", post(chatgpt_logout))
         .route("/session/model", post(set_session_model))
+        .route("/session/events", get(session_events))
         .route("/session/rewind", post(rewind_session))
         .route("/session/fork", post(fork_session))
         .route("/session/exec", post(exec_in_session))
@@ -1904,6 +1905,46 @@ async fn set_session_model(
         "profile": req.profile,
     }));
     Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
+}
+
+#[derive(Deserialize)]
+struct SessionEventsQuery {
+    token: Option<String>,
+    session: String,
+    #[serde(default)]
+    before: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// GET /session/events?session=…&before=N&limit=M — fetch an older bounded
+/// page of durable transcript events without expanding the attach snapshot.
+async fn session_events(
+    State(_d): State<Shared>,
+    Query(q): Query<SessionEventsQuery>,
+) -> Response {
+    if !_d.authed(&q.token) {
+        return unauthorized();
+    }
+    let Some(path) = state_path_for_id(&q.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return (StatusCode::NOT_FOUND, "session state unreadable").into_response();
+    };
+    let Ok(state) = deserialize_state(&bytes) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
+    };
+    let end = q.before.unwrap_or(state.events.len()).min(state.events.len());
+    let size = q.limit.unwrap_or(160).clamp(1, 500);
+    let start = end.saturating_sub(size);
+    Json(serde_json::json!({
+        "events": &state.events[start..end],
+        "start": start,
+        "end": end,
+        "has_older": start > 0,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
