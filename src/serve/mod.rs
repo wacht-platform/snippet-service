@@ -1917,6 +1917,17 @@ struct SessionEventsQuery {
     limit: Option<usize>,
 }
 
+fn session_event_page(
+    events: &[crate::harness::HarnessEvent],
+    before: Option<usize>,
+    limit: Option<usize>,
+) -> (usize, usize, bool) {
+    let end = before.unwrap_or(events.len()).min(events.len());
+    let size = limit.unwrap_or(160).clamp(1, 500);
+    let start = end.saturating_sub(size);
+    (start, end, start > 0)
+}
+
 /// GET /session/events?session=…&before=N&limit=M — fetch an older bounded
 /// page of durable transcript events without expanding the attach snapshot.
 async fn session_events(
@@ -1935,9 +1946,7 @@ async fn session_events(
     let Ok(state) = deserialize_state(&bytes) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response();
     };
-    let end = q.before.unwrap_or(state.events.len()).min(state.events.len());
-    let size = q.limit.unwrap_or(160).clamp(1, 500);
-    let start = end.saturating_sub(size);
+    let (start, end, has_older) = session_event_page(&state.events, q.before, q.limit);
     Json(serde_json::json!({
         "events": &state.events[start..end],
         "start": start,
@@ -2766,6 +2775,19 @@ mod tests {
             mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
             recurring_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
+    }
+
+    #[test]
+    fn session_event_page_returns_bounded_backward_cursor() {
+        let events = vec![
+            crate::harness::HarnessEvent::UserInput { text: "one".into() },
+            crate::harness::HarnessEvent::AssistantText { text: "two".into() },
+            crate::harness::HarnessEvent::UserInput { text: "three".into() },
+        ];
+        assert_eq!(session_event_page(&events, None, None), (0, 3, false));
+        assert_eq!(session_event_page(&events, Some(3), Some(2)), (1, 3, true));
+        assert_eq!(session_event_page(&events, Some(1), Some(50)), (0, 1, false));
+        assert_eq!(session_event_page(&events, Some(999), Some(0)), (2, 3, true));
     }
 
     #[test]
