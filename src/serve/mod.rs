@@ -409,6 +409,12 @@ impl Daemon {
         if !entries.contains(&item.id) {
             entries.push(item.id.clone());
             self.queue_revision.fetch_add(1, Ordering::Release);
+            crate::session::emit_device_event(serde_json::json!({
+                "kind": "queue",
+                "action": "hidden",
+                "session": id,
+                "queue_id": item.id,
+            }));
         }
     }
 
