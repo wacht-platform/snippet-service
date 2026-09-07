@@ -3047,10 +3047,14 @@ impl App {
         // Ctrl+S steers immediately instead of queueing (see handle_key).
         if self.agent_busy() {
             if let Some(st) = self.state.as_mut() {
-                st.queued_inputs.push(text.clone());
-            }
-            if let Err(error) = self.send_loop_input(LoopInput::Queue(text)) {
-                self.error = Some(error);
+                let item = crate::harness::QueuedInput {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    text: text.clone(),
+                };
+                st.queued_inputs.push(item.clone());
+                if let Err(error) = self.send_loop_input(LoopInput::Queue(item)) {
+                    self.error = Some(error);
+                }
             }
             return;
         }
@@ -3102,7 +3106,10 @@ impl App {
             if self.held_queue().is_empty() {
                 return;
             }
-            let _ = self.send_loop_input(LoopInput::SteerQueued(0));
+            let id = self.held_queue().first().map(|item| item.id.clone());
+            if let Some(id) = id {
+                let _ = self.send_loop_input(LoopInput::SteerQueued(id));
+            }
             self.input_clear();
             self.scroll = 0;
             return;
@@ -3151,7 +3158,7 @@ impl App {
         self.pending_steers = remaining;
     }
 
-    fn held_queue(&self) -> &[String] {
+    fn held_queue(&self) -> &[crate::harness::QueuedInput] {
         self.state
             .as_ref()
             .map(|s| s.queued_inputs.as_slice())
@@ -6196,9 +6203,9 @@ fn queued_lines(app: &App) -> Vec<Line<'static>> {
         Span::styled(header, Style::default().fg(faint())),
     ])];
     for q in app.held_queue().iter().take(3) {
-        let first = q.lines().next().unwrap_or("");
+        let first = q.text.lines().next().unwrap_or("");
         let mut text: String = first.chars().take(72).collect();
-        if first.chars().count() > 72 || q.lines().count() > 1 {
+        if first.chars().count() > 72 || q.text.lines().count() > 1 {
             text.push('…');
         }
         lines.push(Line::from(vec![
