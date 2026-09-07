@@ -396,18 +396,18 @@ impl Daemon {
     /// The harness may be borrowing its state in an in-flight step, so it still
     /// receives the original control input and persists the durable mutation at
     /// the next safe boundary.
-    async fn hide_queued(&self, id: &str, index: usize) {
+    async fn hide_queued(&self, id: &str, queue_id: &str) {
         let path = self.sessions.lock().await.get(id)
             .map(|s| s.state_path.clone())
             .or_else(|| state_path_for_id(id));
         let Some(path) = path else { return; };
         let Ok(bytes) = std::fs::read(path) else { return; };
         let Ok(state) = deserialize_state(&bytes) else { return; };
-        let Some(text) = state.queued_inputs.get(index).cloned() else { return; };
+        let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else { return; };
         let mut hidden = self.queue_hidden.lock().unwrap();
         let entries = hidden.entry(id.to_string()).or_default();
-        if !entries.contains(&text) {
-            entries.push(text);
+        if !entries.contains(&item.id) {
+            entries.push(item.id.clone());
             self.queue_revision.fetch_add(1, Ordering::Release);
         }
     }
@@ -417,7 +417,9 @@ impl Daemon {
     /// same transcript plus the original attachment reference.
     async fn deliver(&self, id: &str, input: LoopInput) {
         match &input {
-            LoopInput::Unqueue(i) | LoopInput::SteerQueued(i) => self.hide_queued(id, *i).await,
+            LoopInput::Unqueue(queue_id) | LoopInput::SteerQueued(queue_id) => {
+                self.hide_queued(id, &queue_id).await
+            }
             _ => {}
         }
         let input = match input {
@@ -2390,11 +2392,11 @@ async fn handle_ws(
                                 let hidden = {
                                     let mut overlays = daemon.queue_hidden.lock().unwrap();
                                     let entries = overlays.entry(session.clone()).or_default();
-                                    entries.retain(|m| state.queued_inputs.contains(m));
+                                    entries.retain(|id| state.queued_inputs.iter().any(|item| &item.id == id));
                                     entries.clone()
                                 };
                                 if !hidden.is_empty() {
-                                    state.queued_inputs.retain(|m| !hidden.contains(m));
+                                    state.queued_inputs.retain(|item| !hidden.contains(&item.id));
                                 }
                                 if let Ok(mut v) = serde_json::to_value(&state) {
                                     // `messages` (raw LLM history) is unused by the app — never wire it.
