@@ -418,12 +418,42 @@ fn message_item(role: &str, text: &str) -> Value {
 }
 
 fn is_server_tool_name(name: &str) -> bool {
-    matches!(name, "x_search" | "web_search" | "code_interpreter")
+    matches!(
+        name,
+        "x_search"
+            | "x_search_call"
+            | "web_search"
+            | "web_search_call"
+            | "code_interpreter"
+            | "code_interpreter_call"
+            | "code_execution"
+            | "code_execution_call"
+    )
 }
 
+fn is_x_search_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("x_search_call")
+        || ((item.get("type").and_then(Value::as_str) == Some("function_call")
+            || item.get("type").and_then(Value::as_str) == Some("function"))
+            && item
+                .get("name")
+                .or_else(|| item.pointer("/function/name"))
+                .and_then(Value::as_str)
+                == Some("x_search"))
+}
+
+/// Responses output items for provider-executed tools. These are observations
+/// from xAI, never client-side calls for our harness to execute.
 fn is_server_tool_item(item: &Value) -> bool {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
-        "x_search" | "web_search" | "code_interpreter" => true,
+        "x_search_call"
+        | "web_search_call"
+        | "code_interpreter_call"
+        | "code_execution_call"
+        | "x_search"
+        | "web_search"
+        | "code_interpreter"
+        | "code_execution" => true,
         "function_call" | "function" => item
             .get("name")
             .or_else(|| item.pointer("/function/name"))
@@ -555,7 +585,7 @@ fn parse_responses_value(
         .and_then(Value::as_array);
     if let Some(items) = output {
         for item in items {
-            if is_server_tool_item(item) {
+            if is_x_search_item(item) {
                 used_server_tools = true;
             }
             match item.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -786,7 +816,7 @@ mod tests {
     fn parser_maps_only_client_function_calls() {
         let value = json!({
             "output": [
-                {"type": "x_search", "name": "x_search"},
+                {"type": "x_search_call", "id": "xs_1", "status": "completed"},
                 {
                     "type": "function_call",
                     "name": "bash",
@@ -822,16 +852,33 @@ mod tests {
     }
 
     #[test]
-    fn parser_sets_used_server_tools_for_typed_items() {
+    fn parser_sets_used_server_tools_for_x_search_call() {
         let value = json!({
+            "status": "completed",
             "output": [
-                {"type": "x_search", "id": "xs_1"},
-                {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}
+                {"type": "x_search_call", "id": "xs_1", "status": "completed"},
+                {"type": "message", "content": [{"type": "output_text", "text": "answer"}]}
             ]
         });
         let out = parse_responses_value(&value, None).expect("parse");
         assert!(out.calls.is_empty());
         assert!(out.used_server_tools);
-        assert_eq!(out.content_text.as_deref(), Some("ok"));
+        assert_eq!(out.content_text.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn parser_filters_non_x_server_calls_from_client_calls() {
+        let value = json!({
+            "output": [
+                {"type": "x_search_call", "id": "xs_1", "status": "completed"},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+                {"type": "code_interpreter_call", "id": "ci_1", "status": "completed"},
+                {"type": "function_call", "name": "bash", "call_id": "c1", "arguments": "{}"}
+            ]
+        });
+        let out = parse_responses_value(&value, None).expect("parse");
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].tool_name, "bash");
+        assert!(out.used_server_tools);
     }
 }
