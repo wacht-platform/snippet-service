@@ -2558,7 +2558,7 @@ async fn handle_ws(
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     });
 
