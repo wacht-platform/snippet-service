@@ -242,6 +242,7 @@ enum SettingsField {
     Reasoning,
     ContextWindow,
     Compaction,
+    XSearch,
 }
 
 /// Providers offered by the login form, in display order.
@@ -460,6 +461,7 @@ struct App {
     form_reasoning_effort: Option<String>,
     form_context_window: String,
     form_compact_at_pct: String,
+    form_x_search: bool,
     form_focus: SettingsField,
     form_fetched_models: Option<Vec<String>>,
     models_fetch_handle: Option<tokio::task::JoinHandle<Result<Vec<String>, String>>>,
@@ -600,6 +602,7 @@ impl App {
             form_reasoning_effort: None,
             form_context_window: String::new(),
             form_compact_at_pct: String::new(),
+            form_x_search: false,
             form_focus: SettingsField::Provider,
             form_fetched_models: None,
             models_fetch_handle: None,
@@ -688,6 +691,7 @@ impl App {
                 self.form_reasoning_effort = cfg.reasoning_effort.clone();
                 self.form_context_window = cfg.context_window.to_string();
                 self.form_compact_at_pct = cfg.compact_at_pct.to_string();
+                self.form_x_search = cfg.x_search;
             }
             None => {
                 self.form_provider = "openai".to_string();
@@ -696,6 +700,7 @@ impl App {
                 self.form_model = model;
                 self.form_api_key = String::new();
                 self.form_reasoning_effort = Some("medium".to_string());
+                self.form_x_search = false;
                 let (context_window, compact_at_pct) =
                     provider_context_defaults(&self.form_provider);
                 self.form_context_window = context_window.to_string();
@@ -938,9 +943,8 @@ impl App {
                     }
 
                     let mut desc = "empty session".to_string();
-                    let mod_time = unix_secs_to_system_time(
-                        crate::session::session_last_active(&path),
-                    );
+                    let mod_time =
+                        unix_secs_to_system_time(crate::session::session_last_active(&path));
 
                     if let Ok(bytes) = std::fs::read(&path) {
                         if let Ok(state) = crate::harness::deserialize_state(&bytes) {
@@ -976,9 +980,8 @@ impl App {
         let default_path = &self.options.config.state_path;
         if default_path.exists() {
             let mut desc = "default session".to_string();
-            let mod_time = unix_secs_to_system_time(
-                crate::session::session_last_active(default_path),
-            );
+            let mod_time =
+                unix_secs_to_system_time(crate::session::session_last_active(default_path));
             // Skip a contentless default state — a fresh install otherwise shows a
             // phantom "default session" entry with nothing to resume into.
             let mut has_content = false;
@@ -1487,11 +1490,7 @@ impl App {
                             )
                         })
                         .collect();
-                    self.status = format!(
-                        "{} job(s):\n{}",
-                        jobs.len(),
-                        lines.join("\n")
-                    );
+                    self.status = format!("{} job(s):\n{}", jobs.len(), lines.join("\n"));
                 }
                 Err(e) => self.status = format!("recur list failed: {e}"),
             }
@@ -1514,11 +1513,7 @@ impl App {
                 let (session_id, schedule_raw, rest) = if looks_like_schedule {
                     let spec = tokens.next().unwrap_or("");
                     let rest: String = tokens.collect::<Vec<_>>().join(" ");
-                    (
-                        self.current_session_id(),
-                        format!("{first} {spec}"),
-                        rest,
-                    )
+                    (self.current_session_id(), format!("{first} {spec}"), rest)
                 } else if first.eq_ignore_ascii_case("mc")
                     || first.eq_ignore_ascii_case("mission-control")
                 {
@@ -1857,13 +1852,17 @@ impl App {
     fn login_focus_order(&self) -> Vec<SettingsField> {
         // Subscription providers sign in via OAuth — no API key / base URL fields.
         if self.form_provider == "chatgpt" || self.form_provider == "xai" {
-            return vec![
+            let mut order = vec![
                 SettingsField::Provider,
                 SettingsField::Model,
                 SettingsField::Reasoning,
                 SettingsField::ContextWindow,
                 SettingsField::Compaction,
             ];
+            if self.form_provider == "xai" {
+                order.push(SettingsField::XSearch);
+            }
+            return order;
         }
         let mut order = vec![SettingsField::Provider, SettingsField::ApiKey];
         if provider_needs_base_url(&self.form_provider) {
@@ -1914,6 +1913,7 @@ impl App {
             SettingsField::Model => self.login_cycle_model(forward),
             SettingsField::Reasoning => self.login_cycle_reasoning(forward),
             SettingsField::Compaction => self.login_cycle_compaction_pct(forward),
+            SettingsField::XSearch => self.form_x_search = !self.form_x_search,
             _ => {}
         }
     }
@@ -2282,6 +2282,7 @@ impl App {
             .or(Some("medium".to_string()));
         self.form_context_window = self.options.config.model.context_window.to_string();
         self.form_compact_at_pct = self.options.config.model.compact_at_pct.to_string();
+        self.form_x_search = self.options.config.model.x_search;
         self.form_focus = SettingsField::Provider;
         self.form_fetched_models = None;
         self.models_fetch_status = String::new();
@@ -2352,6 +2353,7 @@ impl App {
             .form_reasoning_effort
             .clone()
             .filter(|v| !v.trim().is_empty());
+        model_config.x_search = self.form_provider == "xai" && self.form_x_search;
 
         model_config.context_window = context_window;
         model_config.compact_at_pct = compact_at_pct;
@@ -6549,6 +6551,23 @@ fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         chooser(format!("{}%", app.form_compact_at_pct.trim()), cp_focus, ""),
     ));
 
+    if app.form_provider == "xai" {
+        let xs_focus = focus == SettingsField::XSearch;
+        lines.push(field_row(
+            "x search",
+            xs_focus,
+            chooser(
+                if app.form_x_search {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                },
+                xs_focus,
+                "",
+            ),
+        ));
+    }
+
     if m_focus {
         let rows = login_model_rows(app);
         if rows.is_empty() {
@@ -7039,7 +7058,10 @@ fn split_recur_prompt_and_plan(rest: &str) -> (String, Option<String>) {
     if rest.is_empty() {
         return (String::new(), None);
     }
-    if let Some(path) = rest.strip_prefix('@').or_else(|| rest.strip_prefix("file:")) {
+    if let Some(path) = rest
+        .strip_prefix('@')
+        .or_else(|| rest.strip_prefix("file:"))
+    {
         let path = path.trim();
         if !path.is_empty() {
             return (String::new(), Some(path.to_string()));
