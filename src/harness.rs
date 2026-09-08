@@ -665,6 +665,11 @@ struct LoopVars {
     /// this response cycle. Capped so we ask for an answer without looping forever.
     /// Reset on a new user message.
     empty_reply_reprompts: usize,
+    /// Extra generates after a provider-native server tool (xAI `x_search`, etc.)
+    /// with no client tool calls. Those calls never land in `calls`, so "no tool
+    /// calls = done" would otherwise end the turn mid-work. Capped / reset with
+    /// empty-reply reprompts.
+    server_tool_continues: usize,
     /// Turns spent on the CURRENT request (a soft budget surfaced each turn so the
     /// agent converges instead of sprawling). Reset on a new user request.
     turns_this_request: u64,
@@ -950,6 +955,7 @@ impl CodingHarness {
                 }
                 if had_user_msg {
                     vars.empty_reply_reprompts = 0;
+                    vars.server_tool_continues = 0;
                 }
                 if wants_compact {
                     self.run_manual_compaction(model, &mut state, &lanes)
@@ -1344,6 +1350,7 @@ impl CodingHarness {
         state.events.push(HarnessEvent::UserInput { text });
         state.status = HarnessStatus::Running;
         vars.empty_reply_reprompts = 0;
+        vars.server_tool_continues = 0;
         self.bump_activity();
     }
 
@@ -2043,6 +2050,7 @@ impl CodingHarness {
             vars.pending_signals.push(RuntimeSignal::ResponseTruncated);
         }
 
+        let used_server_tools = output.used_server_tools;
         let native_call_names: Vec<String> =
             output.calls.iter().map(|c| c.tool_name.clone()).collect();
         let raw_content = output.content_text.clone();
@@ -2116,6 +2124,20 @@ impl CodingHarness {
                     // Durably land model output before the next step/restart.
                     let _ = self.persist(state, lanes).await;
                 }
+                return StepResult::Continue;
+            }
+            // Provider-native server tools (xAI `x_search`, etc.) never appear in
+            // `calls`. Treat that like a tool turn, not a finished reply — record
+            // any prose so the next generate sees it, then keep going.
+            if used_server_tools && vars.server_tool_continues < 2 {
+                if let Some(text) = progress_text {
+                    record_assistant_text(state, text, None);
+                }
+                if let Some(sink) = sink {
+                    StreamBuffer::clear(sink);
+                }
+                let _ = self.persist(state, lanes).await;
+                vars.server_tool_continues += 1;
                 return StepResult::Continue;
             }
             // No tool calls: the turn is over and this text is the final answer
