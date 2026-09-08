@@ -2420,6 +2420,7 @@ async fn handle_ws(
         let mut history_rx = history_rx;
         let term_client = terms.as_ref().map(|t| t.subscribe());
         let mut last_mtime = None;
+        let mut last_state_len = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_event_offset = 0usize;
         let mut last_stream_fp: u64 = 0;
@@ -2430,7 +2431,10 @@ async fn handle_ws(
             let queue_revision = daemon.queue_revision.load(Ordering::Acquire);
             if let Ok(meta) = tokio::fs::metadata(&state_path).await {
                 if let Ok(mtime) = meta.modified() {
-                    if Some(mtime) != last_mtime || queue_revision != last_queue_revision {
+                    let state_len = meta.len();
+                    if Some(mtime) != last_mtime
+                        || Some(state_len) != last_state_len
+                        || queue_revision != last_queue_revision {
                         if let Ok(bytes) = tokio::fs::read(&state_path).await {
                             if let Ok(mut state) = deserialize_state(&bytes) {
                                 let hidden = {
@@ -2515,6 +2519,7 @@ async fn handle_ws(
                                         // replacement can briefly make the read miss;
                                         // leaving it unset retries that version next poll.
                                         last_mtime = Some(mtime);
+                                        last_state_len = Some(state_len);
                                     }
                                 }
                             }
