@@ -100,23 +100,31 @@ fn start_session_with_role(
     let memory_entry_budget_chars = config.memory_entry_budget_chars;
     let memory_max_entries = config.memory_max_entries;
     let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
-    // Delegated lanes may run on a different model than the active session
-    // (see `delegate_model_config`) — a cheaper model for parallel grunt work or
-    // a stronger one for hard sub-tasks. Falls back to the active model.
-    // Mission Control never gets a factory: it routes, it does not spawn lanes.
+    // Durable identity = state path relative to the workspaces root — the
+    // same id the daemon uses for managed sessions and task envelopes.
+    let durable_id = if mission_control {
+        Some(crate::mission_control::SESSION_ID.to_string())
+    } else {
+        state_path
+            .strip_prefix(crate::config::workspaces_root())
+            .ok()
+            .map(|p| p.display().to_string())
+    };
+    // Delegated lanes use the parent conversation identity for provider routing
+    // and prompt caching (OpenCode Go/Zen).
     let factory: Option<ModelFactory> = if mission_control {
         None
     } else {
         let mc = config.delegate_model_config();
-        Some(Arc::new(move || mc.build_model()))
+        let lane_session_id = durable_id.clone();
+        Some(Arc::new(move || {
+            mc.build_model_for_session(lane_session_id.clone())
+        }))
     };
     let sp = state_path.clone();
     let stream_out = stream.clone();
 
     let join = tokio::spawn(async move {
-        let mut model = model_config.build_model();
-        // Durable identity = state path relative to the workspaces root — the
-        // same id the daemon uses for managed sessions and task envelopes.
         let durable_id = if mission_control {
             Some(crate::mission_control::SESSION_ID.to_string())
         } else {
@@ -124,6 +132,9 @@ fn start_session_with_role(
                 .ok()
                 .map(|p| p.display().to_string())
         };
+        let mut model = model_config.build_model_for_session(durable_id.clone());
+        // Durable identity = state path relative to the workspaces root — the
+        // same id the daemon uses for managed sessions and task envelopes.
         let base_context = if mission_control {
             ToolContext::mission_control(workspace)
         } else {
