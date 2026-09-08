@@ -332,6 +332,11 @@ pub struct ModelOutput {
     /// ChatGPT-subscription rate-limit usage, when the provider reports it.
     #[serde(default)]
     pub rate_limit: Option<RateLimitSnapshot>,
+    /// True when the provider already ran a built-in server tool this generate
+    /// (e.g. xAI `x_search`). Those calls never land in `calls`, so the harness
+    /// must not treat "no client tool calls" as a finished reply.
+    #[serde(default)]
+    pub used_server_tools: bool,
 }
 
 impl ModelOutput {
