@@ -176,6 +176,10 @@ pub struct ModelConfig {
     /// empty non-streaming completion — so this makes them usable there.
     #[serde(default)]
     pub stream: bool,
+    /// xAI only: attach the built-in `{ "type": "x_search" }` server tool on
+    /// `/v1/responses` so Grok can search X. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub x_search: bool,
 }
 
 impl Default for SnippetConfig {
@@ -518,7 +522,10 @@ impl ModelConfig {
                 if config.model.is_empty() {
                     config.model = "grok-4".to_string();
                 }
-                Box::new(OpenAiCompatibleModel::new(config))
+                Box::new(crate::xai::XaiModel::new(crate::xai::XaiConfig {
+                    inner: config,
+                    x_search: self.x_search,
+                }))
             }
             _ => Box::new(OpenAiCompatibleModel::new(self.clone().into())),
         }
@@ -643,6 +650,7 @@ impl Default for ModelConfig {
             compact_at_pct: default_compact_at_pct(),
             cache_prompt: default_cache_prompt(),
             stream: false,
+            x_search: false,
         }
     }
 }
