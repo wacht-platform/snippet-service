@@ -1328,14 +1328,16 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             let current = obj[key].as_u64().unwrap_or(0);
             obj.insert(key.into(), serde_json::json!(current.saturating_add(value)));
         }
-        if let Some(rate) = state.rate_limit.filter(|rate| rate.is_reported()) {
-            let rates = obj
-                .get_mut("rate_limits")
-                .and_then(|v| v.as_array_mut())
-                .expect("rate_limits array");
-            let value = serde_json::to_value(rate).unwrap_or_default();
-            if !rates.iter().any(|existing| existing == &value) {
-                rates.push(value);
+        if provider != "gemini" {
+            if let Some(rate) = state.rate_limit.filter(|rate| rate.is_reported()) {
+                let rates = obj
+                    .get_mut("rate_limits")
+                    .and_then(|v| v.as_array_mut())
+                    .expect("rate_limits array");
+                let value = serde_json::to_value(rate).unwrap_or_default();
+                if !rates.iter().any(|existing| existing == &value) {
+                    rates.push(value);
+                }
             }
         }
     }
