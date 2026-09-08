@@ -1348,10 +1348,12 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
                     .get_mut("rate_limits")
                     .and_then(|v| v.as_array_mut())
                     .expect("rate_limits array");
+                // ChatGPT limits are account-wide. Replace session-local/history
+                // entries with the freshest global snapshot, rather than exposing
+                // stale duplicate windows in the provider Usage screen.
+                rates.clear();
                 let value = serde_json::to_value(rate).unwrap_or_default();
-                if !rates.iter().any(|existing| existing == &value) {
-                    rates.push(value);
-                }
+                rates.push(value);
             }
         }
     }
