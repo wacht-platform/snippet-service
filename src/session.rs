@@ -796,7 +796,74 @@ pub fn subscribe_device_events() -> broadcast::Receiver<serde_json::Value> {
 
 /// Push one compact notification frame. No-op when nobody is listening.
 pub fn emit_device_event(event: serde_json::Value) {
-    let _ = device_events().send(event);
+    let enriched = append_notification_event(event);
+    let _ = device_events().send(enriched);
+}
+
+const NOTIFICATION_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+fn notification_journal_path() -> PathBuf {
+    crate::config::snippet_home().join("notification-events.json")
+}
+
+fn notification_sequence_path() -> PathBuf {
+    crate::config::snippet_home().join("notification-events.seq")
+}
+
+fn next_notification_id(records: &[serde_json::Value]) -> u64 {
+    let persisted = std::fs::read_to_string(notification_sequence_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let current = records.iter().filter_map(|e| e.get("event_id").and_then(|v| v.as_u64())).max().unwrap_or(0);
+    let next = persisted.max(current).saturating_add(1);
+    let _ = std::fs::create_dir_all(crate::config::snippet_home());
+    let _ = std::fs::write(notification_sequence_path(), next.to_string());
+    next
+}
+
+static NOTIFICATION_JOURNAL_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+fn append_notification_event(event: serde_json::Value) -> serde_json::Value {
+    let kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(kind, "waiting" | "done" | "error" | "idle" | "term") {
+        return event;
+    }
+    let _guard = NOTIFICATION_JOURNAL_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut records = read_notification_journal();
+    let next_id = next_notification_id(&records);
+    let mut record = event;
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("event_id".into(), serde_json::json!(next_id));
+        obj.insert("created_at".into(), serde_json::json!(now));
+    }
+    records.push(record.clone());
+    records.retain(|e| e.get("created_at").and_then(|v| v.as_u64()).map(|t| now.saturating_sub(t) <= NOTIFICATION_RETENTION_SECS).unwrap_or(false));
+    let path = notification_journal_path();
+    let temp = path.with_extension("json.tmp");
+    if let Ok(bytes) = serde_json::to_vec(&records) {
+        if std::fs::write(&temp, bytes).is_ok() {
+            let _ = std::fs::rename(temp, path);
+        }
+    }
+    record
+}
+
+fn read_notification_journal() -> Vec<serde_json::Value> {
+    std::fs::read(notification_journal_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+pub fn replay_notification_events(since: u64) -> Vec<serde_json::Value> {
+    read_notification_journal().into_iter().filter(|e| {
+        e.get("event_id").and_then(|v| v.as_u64()).is_some_and(|id| id > since)
+    }).collect()
 }
 
 /// Title / folder / status for a live session id (sidecar only — no full state).

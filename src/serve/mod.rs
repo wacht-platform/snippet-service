@@ -30,7 +30,7 @@ use crate::session::{
     list_device_sessions, prepare_new_session_workspace, read_session_profile,
     session_id_for_state_path, start_mission_control_session,
     start_session_with_browser_summary, state_path_for_id, status_str, subscribe_device_events,
-    write_session_profile,
+    write_session_profile, replay_notification_events,
 };
 
 mod browser;
@@ -596,6 +596,7 @@ pub async fn run_serve(
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
+        .route("/notifications/replay", get(notification_replay))
         .route("/recurring", get(list_recurring).post(create_recurring))
         .route(
             "/recurring/{id}",
@@ -991,6 +992,26 @@ fn unauthorized() -> Response {
 #[derive(Deserialize)]
 struct Auth {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NotificationReplayQuery {
+    token: Option<String>,
+    #[serde(default)]
+    since: u64,
+}
+
+async fn notification_replay(
+    State(d): State<Shared>,
+    Query(q): Query<NotificationReplayQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    Json(serde_json::json!({
+        "events": replay_notification_events(q.since),
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
