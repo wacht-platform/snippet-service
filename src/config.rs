@@ -467,6 +467,22 @@ impl ModelConfig {
                 }
                 Box::new(OpenAiCompatibleModel::new(config))
             }
+            "opencode-zen" | "opencode-go" => {
+                let mut config: OpenAiCompatibleConfig = self.clone().into();
+                config.base_url = if self.provider == "opencode-go" {
+                    "https://opencode.ai/zen/go/v1".to_string()
+                } else {
+                    "https://opencode.ai/zen/v1".to_string()
+                };
+                if config.model.is_empty() {
+                    config.model = if self.provider == "opencode-go" {
+                        "kimi-k2.6".to_string()
+                    } else {
+                        "deepseek-v4-flash".to_string()
+                    };
+                }
+                Box::new(OpenAiCompatibleModel::new(config))
+            }
             "chatgpt" => {
                 let mut model = self.model.clone();
                 if model.is_empty() {
@@ -537,6 +553,8 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
     "anthropic",
     "gemini",
     "openrouter",
+    "opencode-zen",
+    "opencode-go",
     "chatgpt",
     "xai",
 ];

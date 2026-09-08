@@ -252,6 +252,8 @@ const LOGIN_PROVIDERS: &[&str] = &[
     "anthropic",
     "gemini",
     "openrouter",
+    "opencode-zen",
+    "opencode-go",
     "openai-compatible",
     "anthropic-compatible",
 ];
@@ -282,6 +284,14 @@ fn provider_defaults(provider: &str) -> (String, String) {
             "https://openrouter.ai/api/v1".to_string(),
             "anthropic/claude-opus-4-8".to_string(),
         ),
+        "opencode-zen" => (
+            "https://opencode.ai/zen/v1".to_string(),
+            "deepseek-v4-flash".to_string(),
+        ),
+        "opencode-go" => (
+            "https://opencode.ai/zen/go/v1".to_string(),
+            "kimi-k2.6".to_string(),
+        ),
         // openai-compatible: no sensible model default — the user picks from the
         // endpoint's fetched list or types one.
         _ => ("http://localhost:11434/v1".to_string(), String::new()),
@@ -291,6 +301,7 @@ fn provider_defaults(provider: &str) -> (String, String) {
 fn provider_context_defaults(provider: &str) -> (u64, u8) {
     match provider {
         "openai" | "chatgpt" | "anthropic" | "gemini" | "xai" => (250_000, 90),
+        "opencode-zen" | "opencode-go" => (250_000, 90),
         "openai-compatible" | "anthropic-compatible" => (130_000, 90),
         // Keep openrouter aligned with the hosted-provider defaults unless the
         // user overrides it per profile.
@@ -6763,6 +6774,20 @@ fn get_provider_models(provider: &str) -> &'static [&'static str] {
             "qwen/qwen3-coder",
             "openai/gpt-5.5",
         ],
+        "opencode-zen" => &[
+            "gpt-5.5",
+            "claude-opus-4-8",
+            "gemini-3.5-flash",
+            "grok-4.6",
+            "deepseek-v4-flash",
+        ],
+        "opencode-go" => &[
+            "kimi-k2.6",
+            "grok-4.6",
+            "glm-5.3",
+            "qwen3.8-flash",
+            "deepseek-v4-flash",
+        ],
         // openai-compatible points at an arbitrary endpoint — there are no
         // sensible static suggestions; the model list is fetched from its
         // /models endpoint (or typed by the user).
@@ -6928,8 +6953,14 @@ async fn fetch_models_from_provider(
             }
             Ok(models)
         }
-        "openai-compatible" => {
-            let mut url = base_url;
+        "opencode-zen" | "opencode-go" | "openai-compatible" => {
+            let mut url = if provider == "opencode-zen" {
+                "https://opencode.ai/zen/v1".to_string()
+            } else if provider == "opencode-go" {
+                "https://opencode.ai/zen/go/v1".to_string()
+            } else {
+                base_url
+            };
             if !url.ends_with("/models") {
                 if url.ends_with('/') {
                     url.push_str("models");
