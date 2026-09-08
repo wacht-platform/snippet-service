@@ -385,6 +385,26 @@ pub struct RateLimitWindow {
     pub resets_at: i64,
 }
 
+impl RateLimitWindow {
+    /// A default/empty window is not provider-reported usage. Do not render it
+    /// as `limit · 100% left`; that would turn missing data into a false claim.
+    pub fn is_reported(&self) -> bool {
+        self.window_minutes > 0
+            || self.resets_at > 0
+            || self.used_percent.is_finite() && self.used_percent > 0.0
+    }
+}
+
+impl RateLimitSnapshot {
+    pub fn is_reported(&self) -> bool {
+        self.primary.as_ref().is_some_and(RateLimitWindow::is_reported)
+            || self
+                .secondary
+                .as_ref()
+                .is_some_and(RateLimitWindow::is_reported)
+    }
+}
+
 #[async_trait]
 pub trait AgentModel: Send + Sync {
     /// `force_tool` requires at least one tool call this turn (`tool_choice:
