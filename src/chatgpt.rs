@@ -636,5 +636,6 @@ async fn parse_responses_sse(
         // presenting the fragment as the final answer.
         finish_reason: incomplete.then(|| "length".to_string()),
         rate_limit: None,
+        ..Default::default()
     })
 }

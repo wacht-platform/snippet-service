@@ -722,6 +722,7 @@ fn map_response(response: GeminiResponse, model: &str) -> (ModelOutput, Option<S
         usage,
         finish_reason,
         rate_limit: None,
+        ..Default::default()
     };
     let thought = thought_text.trim();
     (output, (!thought.is_empty()).then(|| thought.to_string()))
