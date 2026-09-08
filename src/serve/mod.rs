@@ -2421,6 +2421,7 @@ async fn handle_ws(
         let term_client = terms.as_ref().map(|t| t.subscribe());
         let mut last_mtime = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
+        let mut last_event_offset = 0usize;
         let mut last_stream_fp: u64 = 0;
         let mut last_queue_revision = 0;
         let mut attach_revision: u64 = 0;
@@ -2461,11 +2462,27 @@ async fn handle_ws(
                                         }
                                     }
                                     let count = state.events.len();
-                                    let snapshot = if last_events.is_empty() {
+                                    let first_attach = last_events.is_empty();
+                                    let snapshot = if first_attach {
+                                        const INITIAL_ATTACH_EVENTS: usize = 160;
+                                        let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
+                                        last_event_offset = start;
+                                        last_events = state.events[start..].to_vec();
+                                        if let Some(o) = v.as_object_mut() {
+                                            o.insert(
+                                                "events".into(),
+                                                serde_json::to_value(&state.events[start..])
+                                                    .unwrap_or_default(),
+                                            );
+                                            o.insert("event_offset".into(), serde_json::json!(start));
+                                        }
                                         true
                                     } else {
-                                        count < last_events.len()
-                                            || state.events[..last_events.len()] != last_events[..]
+                                        count < last_event_offset
+                                            || count < last_event_offset + last_events.len()
+                                            || state.events[last_event_offset
+                                                ..last_event_offset + last_events.len()]
+                                                != last_events[..]
                                     };
                                     attach_revision = attach_revision.wrapping_add(1);
                                     if let Some(o) = v.as_object_mut() {
@@ -2473,7 +2490,7 @@ async fn handle_ws(
                                         if snapshot {
                                             o.insert("wire".into(), serde_json::json!("snapshot"));
                                         } else {
-                                            let start = last_events.len();
+                                            let start = last_event_offset + last_events.len();
                                             let tail = serde_json::to_value(&state.events[start..])
                                                 .unwrap_or_default();
                                             o.remove("events");
@@ -2481,11 +2498,13 @@ async fn handle_ws(
                                             o.insert("new_events".into(), tail);
                                             o.insert(
                                                 "event_count".into(),
-                                                serde_json::json!(count),
+                                                serde_json::json!(count - last_event_offset),
                                             );
                                         }
                                     }
-                                    last_events = state.events.clone();
+                                    if !first_attach {
+                                        last_events = state.events[last_event_offset..].to_vec();
+                                    }
                                     last_queue_revision = queue_revision;
                                     if let Ok(json) = serde_json::to_string(&v) {
                                         if sender.send(Message::Text(json.into())).await.is_err() {
