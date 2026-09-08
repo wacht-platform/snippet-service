@@ -406,7 +406,15 @@ impl SnippetConfig {
 }
 
 impl ModelConfig {
+    pub fn build_model_for_session(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
+        self.build_model_with_session(session_id)
+    }
+
     pub fn build_model(&self) -> Box<dyn AgentModel> {
+        self.build_model_with_session(None)
+    }
+
+    fn build_model_with_session(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
         match self.provider.as_str() {
             "openai" => {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
@@ -469,6 +477,7 @@ impl ModelConfig {
             }
             "opencode-zen" | "opencode-go" => {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
+                config.session_id = session_id;
                 config.base_url = if self.provider == "opencode-go" {
                     "https://opencode.ai/zen/go/v1".to_string()
                 } else {
@@ -530,6 +539,7 @@ impl From<ModelConfig> for OpenAiCompatibleConfig {
             supports_images: value.supports_images,
             reasoning_effort: value.reasoning_effort,
             stream: value.stream,
+            session_id: None,
             oauth_xai: false,
         }
     }

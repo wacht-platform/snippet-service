@@ -33,6 +33,9 @@ pub struct OpenAiCompatibleConfig {
     /// stream-only providers (e.g. NVIDIA NIM MiniMax) work on the buffered
     /// serve/app/lanes path instead of returning an empty non-streaming completion.
     pub stream: bool,
+    /// Optional stable conversation identity for providers that use it for routing
+    /// and prompt caching (OpenCode Go/Zen).
+    pub session_id: Option<String>,
     /// Authenticate with the xAI (Grok/X) subscription: before each request the
     /// stored OAuth token is loaded and refreshed if stale, then used as the
     /// bearer key. `api_key` is ignored when this is set.
@@ -126,6 +129,9 @@ impl AgentModel for OpenAiCompatibleModel {
         if sink.is_some() || self.config.stream {
             let body = self.build_chat_request(messages, tools, force_tool, true);
             let mut headers = vec![("authorization", format!("Bearer {}", self.config.api_key))];
+            if let Some(session_id) = &self.config.session_id {
+                headers.push(("x-opencode-session", session_id.clone()));
+            }
             if self.is_openrouter() {
                 headers.push(("HTTP-Referer", OPENROUTER_REFERER.to_string()));
                 headers.push(("X-Title", OPENROUTER_TITLE.to_string()));
@@ -279,6 +285,9 @@ impl OpenAiCompatibleModel {
                 .post(url)
                 .header(AUTHORIZATION, format!("Bearer {}", self.config.api_key))
                 .header(CONTENT_TYPE, "application/json");
+            if let Some(session_id) = &self.config.session_id {
+                request = request.header("x-opencode-session", session_id);
+            }
             if self.is_openrouter() {
                 request = request
                     .header("HTTP-Referer", OPENROUTER_REFERER)
