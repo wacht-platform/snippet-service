@@ -1404,6 +1404,9 @@ struct ProfileView {
     /// Returned so profile editors can round-trip it — without it, an app edit
     /// can only guess and silently resets the flag.
     supports_images: bool,
+    /// xAI only: attach the built-in X search server tool.
+    #[serde(default)]
+    x_search: bool,
 }
 
 #[derive(Serialize)]
@@ -1439,6 +1442,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
                 reasoning_effort: m.reasoning_effort.clone(),
                 stream: m.stream,
                 supports_images: m.supports_images,
+                x_search: m.x_search,
             });
         }
     }
@@ -1472,6 +1476,8 @@ struct ProfileReq {
     /// Force the streaming wire protocol (needed by stream-only models, e.g. NIM MiniMax).
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    x_search: Option<bool>,
     #[serde(default)]
     set_active: bool,
 }
@@ -1542,6 +1548,9 @@ async fn put_profile(
         }
         if let Some(stream) = req.stream {
             mc.stream = stream;
+        }
+        if let Some(x_search) = req.x_search {
+            mc.x_search = x_search;
         }
         c.upsert_profile(&name, mc);
         if req.set_active {
