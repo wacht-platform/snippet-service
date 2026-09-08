@@ -1339,6 +1339,22 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             }
         }
     }
+    // ChatGPT Codex limits are account-wide, not session-local. Include the same
+    // reported snapshot used by the live chat Usage panel here as well.
+    if let Some(rate) = crate::chatgpt::read_global_usage().filter(|rate| rate.is_reported()) {
+        if let Some(entry) = totals.get_mut("chatgpt") {
+            if let Some(obj) = entry.as_object_mut() {
+                let rates = obj
+                    .get_mut("rate_limits")
+                    .and_then(|v| v.as_array_mut())
+                    .expect("rate_limits array");
+                let value = serde_json::to_value(rate).unwrap_or_default();
+                if !rates.iter().any(|existing| existing == &value) {
+                    rates.push(value);
+                }
+            }
+        }
+    }
     Json(serde_json::json!({
         "providers": totals.into_values().collect::<Vec<_>>()
     }))
