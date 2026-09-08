@@ -212,6 +212,7 @@ impl AgentModel for OpenAiCompatibleModel {
             }),
             finish_reason: choice.finish_reason,
             rate_limit: None,
+            ..Default::default()
         })
     }
 }
@@ -707,6 +708,7 @@ async fn parse_openai_sse(
         usage,
         finish_reason,
         rate_limit: None,
+        ..Default::default()
     })
 }
 

@@ -114,6 +114,7 @@ impl AgentModel for AnthropicModel {
             // `ModelOutput::is_truncated` catches it like the OpenAI `length`.
             finish_reason: response.stop_reason,
             rate_limit: None,
+            ..Default::default()
         })
     }
 }
@@ -586,6 +587,7 @@ async fn parse_anthropic_sse(
         }),
         finish_reason: stop_reason,
         rate_limit: None,
+        ..Default::default()
     })
 }
 

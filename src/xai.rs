@@ -417,6 +417,22 @@ fn message_item(role: &str, text: &str) -> Value {
     })
 }
 
+fn is_server_tool_name(name: &str) -> bool {
+    matches!(name, "x_search" | "web_search" | "code_interpreter")
+}
+
+fn is_server_tool_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str).unwrap_or("") {
+        "x_search" | "web_search" | "code_interpreter" => true,
+        "function_call" | "function" => item
+            .get("name")
+            .or_else(|| item.pointer("/function/name"))
+            .and_then(Value::as_str)
+            .is_some_and(is_server_tool_name),
+        _ => false,
+    }
+}
+
 fn is_client_function_item(item: &Value) -> bool {
     match item.get("type").and_then(Value::as_str) {
         Some("function_call") | Some("function") => true,
@@ -425,7 +441,7 @@ fn is_client_function_item(item: &Value) -> bool {
 }
 
 fn collect_client_call(item: &Value, calls: &mut Vec<GeneratedToolCall>) {
-    if !is_client_function_item(item) {
+    if !is_client_function_item(item) || is_server_tool_item(item) {
         return;
     }
     let name = item
@@ -433,7 +449,7 @@ fn collect_client_call(item: &Value, calls: &mut Vec<GeneratedToolCall>) {
         .or_else(|| item.pointer("/function/name"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if name.is_empty() || name == "x_search" || name == "web_search" || name == "code_interpreter" {
+    if name.is_empty() || is_server_tool_name(name) {
         return;
     }
     let args_str = item
@@ -532,12 +548,16 @@ fn parse_responses_value(
 
     let mut text = String::new();
     let mut calls: Vec<GeneratedToolCall> = Vec::new();
+    let mut used_server_tools = false;
     let output = value
         .get("output")
         .or_else(|| value.pointer("/response/output"))
         .and_then(Value::as_array);
     if let Some(items) = output {
         for item in items {
+            if is_server_tool_item(item) {
+                used_server_tools = true;
+            }
             match item.get("type").and_then(Value::as_str).unwrap_or("") {
                 "message" => {
                     if let Some(parts) = item.get("content").and_then(Value::as_array) {
@@ -593,6 +613,7 @@ fn parse_responses_value(
             .filter(|s| *s == "incomplete")
             .map(|_| "length".to_string()),
         rate_limit: None,
+        used_server_tools,
     })
 }
 
@@ -606,6 +627,7 @@ async fn parse_responses_sse(
     let mut failure: Option<String> = None;
     let mut incomplete = false;
     let mut citations: Option<Value> = None;
+    let mut used_server_tools = false;
 
     crate::sse::for_each_event(response, |data| {
         if data == "[DONE]" {
@@ -640,6 +662,9 @@ async fn parse_responses_sse(
             }
             "response.output_item.done" => {
                 if let Some(item) = chunk.get("item") {
+                    if is_server_tool_item(item) {
+                        used_server_tools = true;
+                    }
                     collect_client_call(item, &mut calls);
                 }
             }
@@ -687,6 +712,7 @@ async fn parse_responses_sse(
         usage,
         finish_reason: incomplete.then(|| "length".to_string()),
         rate_limit: None,
+        used_server_tools,
     })
 }
 
@@ -775,6 +801,7 @@ mod tests {
         assert_eq!(out.calls.len(), 1);
         assert_eq!(out.calls[0].tool_name, "bash");
         assert_eq!(out.calls[0].id.as_deref(), Some("call_1"));
+        assert!(out.used_server_tools);
         let text = out.content_text.unwrap();
         assert!(text.contains("done"));
         assert!(text.contains("https://x.com/status/1"));
@@ -791,5 +818,20 @@ mod tests {
         });
         let out = parse_responses_value(&value, None).expect("parse");
         assert!(out.calls.is_empty());
+        assert!(out.used_server_tools);
+    }
+
+    #[test]
+    fn parser_sets_used_server_tools_for_typed_items() {
+        let value = json!({
+            "output": [
+                {"type": "x_search", "id": "xs_1"},
+                {"type": "message", "content": [{"type": "output_text", "text": "ok"}]}
+            ]
+        });
+        let out = parse_responses_value(&value, None).expect("parse");
+        assert!(out.calls.is_empty());
+        assert!(out.used_server_tools);
+        assert_eq!(out.content_text.as_deref(), Some("ok"));
     }
 }
