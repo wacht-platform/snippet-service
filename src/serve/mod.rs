@@ -596,6 +596,7 @@ pub async fn run_serve(
         .route("/health", get(|| async { "ok" }))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
+        .route("/usage", get(usage_summary))
         .route("/notifications/replay", get(notification_replay))
         .route("/recurring", get(list_recurring).post(create_recurring))
         .route(
@@ -1274,6 +1275,74 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
         })
         .collect();
     Json(out).into_response()
+}
+
+async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let config = d.config.lock().unwrap().clone();
+    let mut totals: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    for session in list_device_sessions() {
+        let Some(path) = state_path_for_id(&session.id) else {
+            continue;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(state) = deserialize_state(&bytes) else {
+            continue;
+        };
+        let profile_name = read_session_profile(&path);
+        let model = profile_name
+            .as_ref()
+            .and_then(|name| config.setups.as_ref()?.get(name))
+            .unwrap_or(&config.model);
+        let provider = model.provider.clone();
+        let entry = totals.entry(provider.clone()).or_insert_with(|| {
+            serde_json::json!({
+                "provider": provider,
+                "profile": profile_name,
+                "model": model.model,
+                "sessions": 0,
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cache_read_tokens": 0,
+                "rate_limits": []
+            })
+        });
+        let Some(obj) = entry.as_object_mut() else { continue };
+        obj.insert(
+            "sessions".into(),
+            serde_json::json!(obj["sessions"].as_u64().unwrap_or(0) + 1),
+        );
+        for (key, value) in [
+            ("total_tokens", state.total_tokens),
+            ("prompt_tokens", state.prompt_tokens),
+            ("completion_tokens", state.completion_tokens),
+            ("cache_read_tokens", state.cache_read_tokens),
+        ] {
+            let current = obj[key].as_u64().unwrap_or(0);
+            obj.insert(key.into(), serde_json::json!(current.saturating_add(value)));
+        }
+        if let Some(rate) = state.rate_limit {
+            let rates = obj
+                .get_mut("rate_limits")
+                .and_then(|v| v.as_array_mut())
+                .expect("rate_limits array");
+            let value = serde_json::to_value(rate).unwrap_or_default();
+            if !rates.iter().any(|existing| existing == &value) {
+                rates.push(value);
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "providers": totals.into_values().collect::<Vec<_>>()
+    }))
+    .into_response()
 }
 
 // GET /sessions/counts — {folder: count} across all sessions (cheap, from
