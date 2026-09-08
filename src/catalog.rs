@@ -63,6 +63,16 @@ pub async fn fetch_models(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String
             c.base_url = "https://openrouter.ai/api/v1".to_string();
             fetch_openai_compatible(&c).await
         }
+        "opencode-zen" => {
+            let mut c = cfg.clone();
+            c.base_url = "https://opencode.ai/zen/v1".to_string();
+            fetch_openai_compatible(&c).await
+        }
+        "opencode-go" => {
+            let mut c = cfg.clone();
+            c.base_url = "https://opencode.ai/zen/go/v1".to_string();
+            fetch_openai_compatible(&c).await
+        }
         "xai" | "grok" => {
             let mut c = cfg.clone();
             c.base_url = "https://api.x.ai/v1".to_string();
