@@ -1403,9 +1403,19 @@ impl App {
                     } else {
                         self.status = "No active goal.".to_string();
                     }
+                } else if rest.eq_ignore_ascii_case("resume")
+                    || rest.eq_ignore_ascii_case("continue")
+                {
+                    if self.agent_alive() {
+                        let _ = self.send_loop_input(LoopInput::ResumeGoal);
+                        self.status = "Resuming the paused goal…".to_string();
+                    } else {
+                        self.status = "No active session to resume the goal.".to_string();
+                    }
                 } else if rest.is_empty() {
                     self.status =
-                        "Usage: /goal <what to accomplish>   ·   /goal cancel".to_string();
+                        "Usage: /goal <what to accomplish>   ·   /goal resume   ·   /goal cancel"
+                            .to_string();
                 } else {
                     // The agent must be running to receive the goal; start it if idle.
                     if !self.agent_alive() {

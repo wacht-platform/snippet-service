@@ -1,0 +1,1 @@
+Contract fixtures for the clean-slate SQLite coordination control plane. They are intentionally small and versioned by the Rust domain model tests.
