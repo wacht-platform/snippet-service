@@ -618,6 +618,7 @@ pub async fn run_serve(
             "/agents",
             get(coordination_agents).post(coordination_create_agent),
         )
+        .route("/agents/build", post(build_agent_from_prompt))
         .route(
             "/coordination/assignments",
             post(coordination_create_assignment),
@@ -3734,6 +3735,59 @@ fn release_failed_claim(
         }
     })
     .map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct AgentBuildReq {
+    prompt: String,
+}
+
+async fn build_agent_from_prompt(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<AgentBuildReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let prompt = req.prompt.trim();
+    if prompt.len() < 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "prompt must describe the desired agent",
+        )
+            .into_response();
+    }
+    let root = &d.mission_control_root;
+    let session_id = crate::mission_control::SESSION_ID;
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let title = "Build specialized agent";
+    let description = format!(
+        "Build a specialized agent from this user brief:\n\n{prompt}\n\nResearch the role using web_search/web_read when useful. Produce a proposed durable identity, capabilities, and Python tool manifests in the agent home. Do not execute generated tools or claim completion until the identity and manifests validate. Report the proposed agent id, identity summary, research sources, tools, validation, and blockers to Mission Control."
+    );
+    let task = match mission_control::create_task(
+        root,
+        &task_id,
+        session_id,
+        title,
+        &description,
+        Vec::new(),
+    ) {
+        Ok(task) => task,
+        Err(error) => return mission_error(error),
+    };
+    match dispatch_mission_task(&d, &task.id).await {
+        Ok(task) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "build_id": task.id,
+                "status": format!("{:?}", task.status).to_lowercase(),
+                "task_id": task.id,
+            })),
+        )
+            .into_response(),
+        Err(error) => mission_error(error),
+    }
 }
 
 async fn mission_control_create_task(
