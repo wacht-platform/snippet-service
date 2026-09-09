@@ -28,9 +28,9 @@ use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecor
 use crate::recurring::{self, Schedule};
 use crate::session::{
     list_device_sessions, prepare_new_session_workspace, read_session_profile,
-    session_id_for_state_path, start_mission_control_session,
+    replay_notification_events, session_id_for_state_path, start_mission_control_session,
     start_session_with_browser_summary, state_path_for_id, status_str, subscribe_device_events,
-    write_session_profile, replay_notification_events,
+    write_session_profile,
 };
 
 mod browser;
@@ -150,7 +150,8 @@ struct Daemon {
     queue_revision: AtomicU64,
     mission_control_root: PathBuf,
     coordination_db: crate::coordination::CoordinationDb,
-    coordination_events: tokio::sync::broadcast::Sender<crate::coordination::types::CoordinationEvent>,
+    coordination_events:
+        tokio::sync::broadcast::Sender<crate::coordination::types::CoordinationEvent>,
     recurring_root: PathBuf,
 }
 
@@ -399,13 +400,25 @@ impl Daemon {
     /// receives the original control input and persists the durable mutation at
     /// the next safe boundary.
     async fn hide_queued(&self, id: &str, queue_id: &str) {
-        let path = self.sessions.lock().await.get(id)
+        let path = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
             .map(|s| s.state_path.clone())
             .or_else(|| state_path_for_id(id));
-        let Some(path) = path else { return; };
-        let Ok(bytes) = std::fs::read(path) else { return; };
-        let Ok(state) = deserialize_state(&bytes) else { return; };
-        let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else { return; };
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(state) = deserialize_state(&bytes) else {
+            return;
+        };
+        let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else {
+            return;
+        };
         let mut hidden = self.queue_hidden.lock().unwrap();
         let entries = hidden.entry(id.to_string()).or_default();
         if !entries.contains(&item.id) {
@@ -601,14 +614,38 @@ pub async fn run_serve(
     const UPLOAD_BODY_LIMIT: usize = MAX_UPLOAD_FILE_BYTES / 3 * 4 + 64 * 1024;
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route("/coordination/agents", get(coordination_agents).post(coordination_create_agent))
-        .route("/coordination/assignments", post(coordination_create_assignment))
-        .route("/coordination/sessions/{session_id}/lease", post(coordination_acquire_lease))
-        .route("/coordination/sessions/{session_id}/lease/{lease_id}", delete(coordination_release_lease))
-        .route("/coordination/sessions/{session_id}/lease/{lease_id}/renew", post(coordination_renew_lease))
-        .route("/coordination/handoffs/{handoff_id}/acknowledge", post(coordination_acknowledge_handoff))
-        .route("/coordination/threads/{thread_id}/events", get(coordination_events))
-        .route("/coordination/threads/{thread_id}/messages", post(coordination_post_message))
+        .route(
+            "/agents",
+            get(coordination_agents).post(coordination_create_agent),
+        )
+        .route(
+            "/coordination/assignments",
+            post(coordination_create_assignment),
+        )
+        .route(
+            "/coordination/sessions/{session_id}/lease",
+            post(coordination_acquire_lease),
+        )
+        .route(
+            "/coordination/sessions/{session_id}/lease/{lease_id}",
+            delete(coordination_release_lease),
+        )
+        .route(
+            "/coordination/sessions/{session_id}/lease/{lease_id}/renew",
+            post(coordination_renew_lease),
+        )
+        .route(
+            "/coordination/handoffs/{handoff_id}/acknowledge",
+            post(coordination_acknowledge_handoff),
+        )
+        .route(
+            "/coordination/threads/{thread_id}/events",
+            get(coordination_events),
+        )
+        .route(
+            "/coordination/threads/{thread_id}/messages",
+            post(coordination_post_message),
+        )
         .route("/coordination/events", get(coordination_events_ws))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
@@ -1012,76 +1049,283 @@ struct Auth {
 }
 
 async fn coordination_agents(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
     match d.coordination_db.list_agents() {
         Ok(agents) => Json(agents).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("coordination database: {error}")).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("coordination database: {error}"),
+        )
+            .into_response(),
     }
 }
 
 #[derive(Deserialize)]
-struct CoordinationAgentReq { id: String, display_name: String, handle: String, #[serde(default = "default_coord_agent_kind")] kind: crate::coordination::types::AgentKind, #[serde(default = "default_coord_agent_status")] status: crate::coordination::types::AgentStatus, #[serde(default = "default_coord_agent_role")] role: crate::coordination::types::AgentRole, #[serde(default)] capabilities: Vec<String>, max_concurrent_assignments: u32, max_concurrent_sessions: u32 }
-fn default_coord_agent_kind() -> crate::coordination::types::AgentKind { crate::coordination::types::AgentKind::Worker }
-fn default_coord_agent_status() -> crate::coordination::types::AgentStatus { crate::coordination::types::AgentStatus::Active }
-fn default_coord_agent_role() -> crate::coordination::types::AgentRole { crate::coordination::types::AgentRole::Implementer }
+struct CoordinationAgentReq {
+    id: String,
+    display_name: String,
+    handle: String,
+    #[serde(default = "default_coord_agent_kind")]
+    kind: crate::coordination::types::AgentKind,
+    #[serde(default = "default_coord_agent_status")]
+    status: crate::coordination::types::AgentStatus,
+    #[serde(default = "default_coord_agent_role")]
+    role: crate::coordination::types::AgentRole,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    max_concurrent_assignments: u32,
+    max_concurrent_sessions: u32,
+}
+fn default_coord_agent_kind() -> crate::coordination::types::AgentKind {
+    crate::coordination::types::AgentKind::Worker
+}
+fn default_coord_agent_status() -> crate::coordination::types::AgentStatus {
+    crate::coordination::types::AgentStatus::Active
+}
+fn default_coord_agent_role() -> crate::coordination::types::AgentRole {
+    crate::coordination::types::AgentRole::Implementer
+}
 
-async fn coordination_create_agent(State(d): State<Shared>, Query(q): Query<Auth>, Json(req): Json<CoordinationAgentReq>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
-    if req.id.trim().is_empty() || req.handle.trim().is_empty() || req.max_concurrent_sessions == 0 { return (StatusCode::BAD_REQUEST, "id, handle, and max_concurrent_sessions are required").into_response(); }
-    let agent = crate::coordination::types::Agent { id:req.id, display_name:req.display_name, handle:req.handle, kind:req.kind, status:req.status, role:req.role, capabilities:req.capabilities, max_concurrent_assignments:req.max_concurrent_assignments, max_concurrent_sessions:req.max_concurrent_sessions, version:1 };
-    let home = match crate::coordination::AgentHome::new(crate::config::snippet_home().join("agents"), &agent.id) {
+async fn coordination_create_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<CoordinationAgentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.id.trim().is_empty() || req.handle.trim().is_empty() || req.max_concurrent_sessions == 0
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "id, handle, and max_concurrent_sessions are required",
+        )
+            .into_response();
+    }
+    let agent = crate::coordination::types::Agent {
+        id: req.id,
+        display_name: req.display_name,
+        handle: req.handle,
+        kind: req.kind,
+        status: req.status,
+        role: req.role,
+        capabilities: req.capabilities,
+        max_concurrent_assignments: req.max_concurrent_assignments,
+        max_concurrent_sessions: req.max_concurrent_sessions,
+        version: 1,
+    };
+    let home = match crate::coordination::AgentHome::new(
+        crate::config::snippet_home().join("agents"),
+        &agent.id,
+    ) {
         Ok(home) => home,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    let default_identity = format!("# {}\n\nAgent handle: @{}\n\nThis identity is awaiting its first build and research pass.\n", agent.display_name, agent.handle);
+    let default_identity = format!(
+        "# {}\n\nAgent handle: @{}\n\nThis identity is awaiting its first build and research pass.\n",
+        agent.display_name, agent.handle
+    );
     if let Err(error) = home.ensure_layout(&default_identity, "registration") {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("create agent home: {error}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create agent home: {error}"),
+        )
+            .into_response();
     }
-    match d.coordination_db.create_agent(&agent) { Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(), Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response() }
+    match d.coordination_db.create_agent(&agent) {
+        Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(),
+        Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
-struct CoordinationEventsQuery { token: Option<String>, #[serde(default)] after_sequence: u64, #[serde(default = "default_coord_event_limit")] limit: u32 }
-fn default_coord_event_limit() -> u32 { 100 }
+struct CoordinationEventsQuery {
+    token: Option<String>,
+    #[serde(default)]
+    after_sequence: u64,
+    #[serde(default = "default_coord_event_limit")]
+    limit: u32,
+}
+fn default_coord_event_limit() -> u32 {
+    100
+}
 
-async fn coordination_events(State(d): State<Shared>, axum::extract::Path(thread_id): axum::extract::Path<String>, Query(q): Query<CoordinationEventsQuery>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
-    match d.coordination_db.events_for_thread(&thread_id, q.after_sequence, q.limit.clamp(1,500)) { Ok(events) => Json(events).into_response(), Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("read coordination events: {error}")).into_response() }
+async fn coordination_events(
+    State(d): State<Shared>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    Query(q): Query<CoordinationEventsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .events_for_thread(&thread_id, q.after_sequence, q.limit.clamp(1, 500))
+    {
+        Ok(events) => Json(events).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read coordination events: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
-struct CoordinationMessageReq { actor_kind: String, actor_id: String, body: String, #[serde(default)] idempotency_key: String }
-
-async fn coordination_post_message(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path(thread_id): axum::extract::Path<String>, Json(req): Json<CoordinationMessageReq>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
-    if req.body.trim().is_empty() || req.actor_id.trim().is_empty() { return (StatusCode::BAD_REQUEST, "actor_id and body are required").into_response(); }
-    let event = crate::coordination::types::CoordinationEvent { event_id:uuid::Uuid::new_v4().to_string(), thread_id:thread_id.clone(), partition_key:format!("thread:{thread_id}"), sequence:0, event_type:"message.posted".into(), actor_kind:req.actor_kind, actor_id:req.actor_id, payload_version:1, payload:serde_json::json!({"body":req.body}), causation_id:None, correlation_id:None, idempotency_key:if req.idempotency_key.is_empty(){uuid::Uuid::new_v4().to_string()}else{req.idempotency_key}, created_at:chrono::Utc::now().to_rfc3339() };
-    match d.coordination_db.append_event(&event) { Ok(saved) => { let _ = d.coordination_events.send(saved.clone()); Json(saved).into_response() }, Err(error) => (StatusCode::CONFLICT, format!("post coordination message: {error}")).into_response() }
+struct CoordinationMessageReq {
+    actor_kind: String,
+    actor_id: String,
+    body: String,
+    #[serde(default)]
+    idempotency_key: String,
 }
 
-async fn coordination_events_ws(ws: WebSocketUpgrade, State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) { return unauthorized(); }
+async fn coordination_post_message(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationMessageReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.body.trim().is_empty() || req.actor_id.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "actor_id and body are required").into_response();
+    }
+    let event = crate::coordination::types::CoordinationEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        thread_id: thread_id.clone(),
+        partition_key: format!("thread:{thread_id}"),
+        sequence: 0,
+        event_type: "message.posted".into(),
+        actor_kind: req.actor_kind,
+        actor_id: req.actor_id,
+        payload_version: 1,
+        payload: serde_json::json!({"body":req.body}),
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: if req.idempotency_key.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            req.idempotency_key
+        },
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match d.coordination_db.append_event(&event) {
+        Ok(saved) => {
+            let _ = d.coordination_events.send(saved.clone());
+            Json(saved).into_response()
+        }
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("post coordination message: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_events_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
     let mut rx = d.coordination_events.subscribe();
-    ws.on_upgrade(move |mut socket| async move { while let Ok(event) = rx.recv().await { if socket.send(Message::Text(serde_json::json!({"wire":"coordination_event","event":event}).to_string().into())).await.is_err() { break; } } })
+    ws.on_upgrade(move |mut socket| async move {
+        while let Ok(event) = rx.recv().await {
+            if socket
+                .send(Message::Text(
+                    serde_json::json!({"wire":"coordination_event","event":event})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
 }
 
 #[derive(Deserialize)]
-struct CoordinationAssignmentReq { id: String, goal_id: String, session_id: String, agent_id: String, scope: String, definition_of_done: String }
+struct CoordinationAssignmentReq {
+    id: String,
+    goal_id: String,
+    session_id: String,
+    agent_id: String,
+    scope: String,
+    definition_of_done: String,
+}
 
-async fn coordination_create_assignment(State(d): State<Shared>, Query(q): Query<Auth>, Json(req): Json<CoordinationAssignmentReq>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
-    if req.id.trim().is_empty() || req.goal_id.trim().is_empty() || req.session_id.trim().is_empty() || req.agent_id.trim().is_empty() { return (StatusCode::BAD_REQUEST, "id, goal_id, session_id, and agent_id are required").into_response(); }
+async fn coordination_create_assignment(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<CoordinationAssignmentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.id.trim().is_empty()
+        || req.goal_id.trim().is_empty()
+        || req.session_id.trim().is_empty()
+        || req.agent_id.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "id, goal_id, session_id, and agent_id are required",
+        )
+            .into_response();
+    }
     let now = chrono::Utc::now().to_rfc3339();
-    let assignment = crate::coordination::Assignment { id:req.id, goal_id:req.goal_id, session_id:req.session_id, agent_id:req.agent_id, status:crate::coordination::AssignmentStatus::Offered, scope:req.scope, definition_of_done:req.definition_of_done, created_at:now.clone(), updated_at:now };
-    match d.coordination_db.create_assignment(&assignment) { Ok(()) => (StatusCode::CREATED, Json(assignment)).into_response(), Err(error) => (StatusCode::CONFLICT, format!("create assignment: {error}")).into_response() }
+    let assignment = crate::coordination::Assignment {
+        id: req.id,
+        goal_id: req.goal_id,
+        session_id: req.session_id,
+        agent_id: req.agent_id,
+        status: crate::coordination::AssignmentStatus::Offered,
+        scope: req.scope,
+        definition_of_done: req.definition_of_done,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    match d.coordination_db.create_assignment(&assignment) {
+        Ok(()) => (StatusCode::CREATED, Json(assignment)).into_response(),
+        Err(error) => (StatusCode::CONFLICT, format!("create assignment: {error}")).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
-struct CoordinationLeaseReq { lease_id: String, assignment_id: String, agent_id: String, expires_at: String }
+struct CoordinationLeaseReq {
+    lease_id: String,
+    assignment_id: String,
+    agent_id: String,
+    expires_at: String,
+}
 
-async fn coordination_acquire_lease(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path(session_id): axum::extract::Path<String>, Json(req): Json<CoordinationLeaseReq>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
-    let lease = crate::coordination::types::SessionLease { session_id, lease_id:req.lease_id, assignment_id:req.assignment_id, agent_id:req.agent_id, fencing_token:0, acquired_at:chrono::Utc::now().to_rfc3339(), renewed_at:chrono::Utc::now().to_rfc3339(), expires_at:req.expires_at };
+async fn coordination_acquire_lease(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationLeaseReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let lease = crate::coordination::types::SessionLease {
+        session_id,
+        lease_id: req.lease_id,
+        assignment_id: req.assignment_id,
+        agent_id: req.agent_id,
+        fencing_token: 0,
+        acquired_at: chrono::Utc::now().to_rfc3339(),
+        renewed_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: req.expires_at,
+    };
     match d.coordination_db.acquire_lease(&lease) {
         Ok(Some(acquired)) => (StatusCode::CREATED, Json(acquired)).into_response(),
         Ok(None) => (StatusCode::CONFLICT, "session already has an active lease").into_response(),
@@ -1090,10 +1334,20 @@ async fn coordination_acquire_lease(State(d): State<Shared>, Query(q): Query<Aut
 }
 
 #[derive(Deserialize)]
-struct CoordinationLeaseRenewReq { fencing_token: u64, expires_at: String }
+struct CoordinationLeaseRenewReq {
+    fencing_token: u64,
+    expires_at: String,
+}
 
-async fn coordination_renew_lease(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>, Json(req): Json<CoordinationLeaseRenewReq>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
+async fn coordination_renew_lease(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<CoordinationLeaseRenewReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
     let renewed_at = chrono::Utc::now().to_rfc3339();
     match d.coordination_db.renew_lease(&lease_id, req.fencing_token, &renewed_at, &req.expires_at) {
         Ok(true) => Json(serde_json::json!({"lease_id": lease_id, "fencing_token": req.fencing_token, "renewed_at": renewed_at, "expires_at": req.expires_at})).into_response(),
@@ -1102,18 +1356,55 @@ async fn coordination_renew_lease(State(d): State<Shared>, Query(q): Query<Auth>
     }
 }
 
-async fn coordination_release_lease(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
-    match d.coordination_db.release_lease(&lease_id, &chrono::Utc::now().to_rfc3339(), "released_by_client") { Ok(true) => StatusCode::NO_CONTENT.into_response(), Ok(false) => (StatusCode::NOT_FOUND, "lease not active").into_response(), Err(error) => (StatusCode::BAD_REQUEST, format!("release lease: {error}")).into_response() }
+async fn coordination_release_lease(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.release_lease(
+        &lease_id,
+        &chrono::Utc::now().to_rfc3339(),
+        "released_by_client",
+    ) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "lease not active").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("release lease: {error}")).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
-struct CoordinationHandoffAckReq { acknowledged_at: Option<String> }
+struct CoordinationHandoffAckReq {
+    acknowledged_at: Option<String>,
+}
 
-async fn coordination_acknowledge_handoff(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path(handoff_id): axum::extract::Path<String>, Json(req): Json<CoordinationHandoffAckReq>) -> Response {
-    if !d.authed(&q.token) { return unauthorized(); }
-    let at = req.acknowledged_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    match d.coordination_db.acknowledge_handoff(&handoff_id, &at) { Ok(true) => StatusCode::NO_CONTENT.into_response(), Ok(false) => (StatusCode::NOT_FOUND, "handoff not found or already acknowledged").into_response(), Err(error) => (StatusCode::BAD_REQUEST, format!("acknowledge handoff: {error}")).into_response() }
+async fn coordination_acknowledge_handoff(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(handoff_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationHandoffAckReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let at = req
+        .acknowledged_at
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    match d.coordination_db.acknowledge_handoff(&handoff_id, &at) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            "handoff not found or already acknowledged",
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            format!("acknowledge handoff: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1435,7 +1726,9 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
                 "rate_limits": []
             })
         });
-        let Some(obj) = entry.as_object_mut() else { continue };
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
         obj.insert(
             "sessions".into(),
             serde_json::json!(obj["sessions"].as_u64().unwrap_or(0) + 1),
@@ -2621,8 +2914,7 @@ async fn handle_ws(
     terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (history_tx, history_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
     let history_request_tx = history_tx.clone();
 
     let push_daemon = daemon.clone();
@@ -2653,91 +2945,95 @@ async fn handle_ws(
                 bytes.hash(&mut hasher);
                 let fingerprint = hasher.finish();
                 if Some(fingerprint) != last_state_fingerprint
-                    || queue_revision != last_queue_revision {
+                    || queue_revision != last_queue_revision
+                {
                     if let Ok(mut state) = deserialize_state(&bytes) {
-                                let hidden = {
-                                    let mut overlays = daemon.queue_hidden.lock().unwrap();
-                                    let entries = overlays.entry(session.clone()).or_default();
-                                    entries.retain(|id| state.queued_inputs.iter().any(|item| &item.id == id));
-                                    entries.clone()
-                                };
-                                if !hidden.is_empty() {
-                                    state.queued_inputs.retain(|item| !hidden.contains(&item.id));
+                        let hidden = {
+                            let mut overlays = daemon.queue_hidden.lock().unwrap();
+                            let entries = overlays.entry(session.clone()).or_default();
+                            entries
+                                .retain(|id| state.queued_inputs.iter().any(|item| &item.id == id));
+                            entries.clone()
+                        };
+                        if !hidden.is_empty() {
+                            state
+                                .queued_inputs
+                                .retain(|item| !hidden.contains(&item.id));
+                        }
+                        if let Ok(mut v) = serde_json::to_value(&state) {
+                            // `messages` (raw LLM history) is unused by the app — never wire it.
+                            if let Some(o) = v.as_object_mut() {
+                                o.remove("messages");
+                                // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
+                                // the account-wide overlay; every other provider gets NO
+                                // rate_limit — including scrubbing a stale snapshot persisted
+                                // before a model switch (it showed ChatGPT's monthly limits
+                                // on an anthropic-compatible chat).
+                                if daemon.session_provider(&session).await == "chatgpt" {
+                                    if let Some(g) = crate::chatgpt::read_global_usage() {
+                                        if let Ok(gv) = serde_json::to_value(&g) {
+                                            o.insert("rate_limit".into(), gv);
+                                        }
+                                    }
+                                } else {
+                                    o.remove("rate_limit");
                                 }
-                                if let Ok(mut v) = serde_json::to_value(&state) {
-                                    // `messages` (raw LLM history) is unused by the app — never wire it.
-                                    if let Some(o) = v.as_object_mut() {
-                                        o.remove("messages");
-                                        // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
-                                        // the account-wide overlay; every other provider gets NO
-                                        // rate_limit — including scrubbing a stale snapshot persisted
-                                        // before a model switch (it showed ChatGPT's monthly limits
-                                        // on an anthropic-compatible chat).
-                                        if daemon.session_provider(&session).await == "chatgpt" {
-                                            if let Some(g) = crate::chatgpt::read_global_usage() {
-                                                if let Ok(gv) = serde_json::to_value(&g) {
-                                                    o.insert("rate_limit".into(), gv);
-                                                }
-                                            }
-                                        } else {
-                                            o.remove("rate_limit");
-                                        }
-                                    }
-                                    let count = state.events.len();
-                                    let first_attach = last_events.is_empty();
-                                    let snapshot = if first_attach {
-                                        const INITIAL_ATTACH_EVENTS: usize = 160;
-                                        let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
-                                        last_event_offset = start;
-                                        last_events = state.events[start..].to_vec();
-                                        if let Some(o) = v.as_object_mut() {
-                                            o.insert(
-                                                "events".into(),
-                                                serde_json::to_value(&state.events[start..])
-                                                    .unwrap_or_default(),
-                                            );
-                                            o.insert("event_offset".into(), serde_json::json!(start));
-                                        }
-                                        true
-                                    } else {
-                                        count < last_event_offset
-                                            || count < last_event_offset + last_events.len()
-                                            || state.events[last_event_offset
-                                                ..last_event_offset + last_events.len()]
-                                                != last_events[..]
-                                    };
-                                    attach_revision = attach_revision.wrapping_add(1);
-                                    if let Some(o) = v.as_object_mut() {
-                                        o.insert("revision".into(), serde_json::json!(attach_revision));
-                                        if snapshot {
-                                            o.insert("wire".into(), serde_json::json!("snapshot"));
-                                        } else {
-                                            let start = last_event_offset + last_events.len();
-                                            let tail = serde_json::to_value(&state.events[start..])
-                                                .unwrap_or_default();
-                                            o.remove("events");
-                                            o.insert("wire".into(), serde_json::json!("delta"));
-                                            o.insert("new_events".into(), tail);
-                                            o.insert(
-                                                "event_count".into(),
-                                                serde_json::json!(count - last_event_offset),
-                                            );
-                                        }
-                                    }
-                                    if !first_attach {
-                                        last_events = state.events[last_event_offset..].to_vec();
-                                    }
-                                    last_queue_revision = queue_revision;
-                                    if let Ok(json) = serde_json::to_string(&v) {
-                                        if sender.send(Message::Text(json.into())).await.is_err() {
-                                            break;
-                                        }
-                                        last_state_fingerprint = Some(fingerprint);
-                                    }
+                            }
+                            let count = state.events.len();
+                            let first_attach = last_events.is_empty();
+                            let snapshot = if first_attach {
+                                const INITIAL_ATTACH_EVENTS: usize = 160;
+                                let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
+                                last_event_offset = start;
+                                last_events = state.events[start..].to_vec();
+                                if let Some(o) = v.as_object_mut() {
+                                    o.insert(
+                                        "events".into(),
+                                        serde_json::to_value(&state.events[start..])
+                                            .unwrap_or_default(),
+                                    );
+                                    o.insert("event_offset".into(), serde_json::json!(start));
                                 }
+                                true
+                            } else {
+                                count < last_event_offset
+                                    || count < last_event_offset + last_events.len()
+                                    || state.events
+                                        [last_event_offset..last_event_offset + last_events.len()]
+                                        != last_events[..]
+                            };
+                            attach_revision = attach_revision.wrapping_add(1);
+                            if let Some(o) = v.as_object_mut() {
+                                o.insert("revision".into(), serde_json::json!(attach_revision));
+                                if snapshot {
+                                    o.insert("wire".into(), serde_json::json!("snapshot"));
+                                } else {
+                                    let start = last_event_offset + last_events.len();
+                                    let tail = serde_json::to_value(&state.events[start..])
+                                        .unwrap_or_default();
+                                    o.remove("events");
+                                    o.insert("wire".into(), serde_json::json!("delta"));
+                                    o.insert("new_events".into(), tail);
+                                    o.insert(
+                                        "event_count".into(),
+                                        serde_json::json!(count - last_event_offset),
+                                    );
+                                }
+                            }
+                            if !first_attach {
+                                last_events = state.events[last_event_offset..].to_vec();
+                            }
+                            last_queue_revision = queue_revision;
+                            if let Ok(json) = serde_json::to_string(&v) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                                last_state_fingerprint = Some(fingerprint);
                             }
                         }
                     }
+                }
+            }
             {
                 use std::hash::{Hash, Hasher};
                 let snap = crate::llm::StreamBuffer::snapshot(&stream);
@@ -2808,7 +3104,11 @@ async fn handle_ws(
                             "end": end,
                             "has_older": has_older,
                         });
-                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                        if sender
+                            .send(Message::Text(frame.to_string().into()))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -2834,8 +3134,10 @@ async fn handle_ws(
                         continue;
                     }
                     if val.get("kind").and_then(|k| k.as_str()) == Some("history") {
-                        let before = val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let limit = val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
+                        let before =
+                            val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let limit =
+                            val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
                         let _ = history_request_tx.send((before, limit));
                         continue;
                     }
@@ -3029,12 +3331,20 @@ mod tests {
         let events = vec![
             crate::harness::HarnessEvent::UserInput { text: "one".into() },
             crate::harness::HarnessEvent::AssistantText { text: "two".into() },
-            crate::harness::HarnessEvent::UserInput { text: "three".into() },
+            crate::harness::HarnessEvent::UserInput {
+                text: "three".into(),
+            },
         ];
         assert_eq!(session_event_page(&events, None, None), (0, 3, false));
         assert_eq!(session_event_page(&events, Some(3), Some(2)), (1, 3, true));
-        assert_eq!(session_event_page(&events, Some(1), Some(50)), (0, 1, false));
-        assert_eq!(session_event_page(&events, Some(999), Some(0)), (2, 3, true));
+        assert_eq!(
+            session_event_page(&events, Some(1), Some(50)),
+            (0, 1, false)
+        );
+        assert_eq!(
+            session_event_page(&events, Some(999), Some(0)),
+            (2, 3, true)
+        );
     }
 
     #[test]
@@ -3340,10 +3650,7 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
                 owners.push(conflict.existing_task_id.clone());
             }
         }
-        let reason = format!(
-            "waiting on workspace owner(s): {}",
-            owners.join(", ")
-        );
+        let reason = format!("waiting on workspace owner(s): {}", owners.join(", "));
         let blocked = mission_control::update_task(root, task_id, |task| {
             task.status = TaskStatus::Blocked;
             task.reporting_session = None;
@@ -3851,16 +4158,10 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
             }
             let text = format!(
                 "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]",
-                task.id,
-                task.title,
-                marker.kind,
-                marker.message
+                task.id, task.title, marker.kind, marker.message
             );
             daemon
-                .deliver(
-                    mission_control::SESSION_ID,
-                    LoopInput::UserMessage(text),
-                )
+                .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))
                 .await;
             let _ = mission_control::mark_notification_delivered(root, &task.id, index);
         }
@@ -4031,7 +4332,9 @@ async fn create_recurring(
     let delivery = match req.delivery.as_deref() {
         None | Some("") | Some("goal") => recurring::Delivery::Goal,
         Some("message") => recurring::Delivery::Message,
-        Some(other) => return mission_error(format!("delivery must be goal or message, got `{other}`")),
+        Some(other) => {
+            return mission_error(format!("delivery must be goal or message, got `{other}`"));
+        }
     };
     match recurring::create_job_with(
         &d.recurring_root,
@@ -4045,7 +4348,7 @@ async fn create_recurring(
         Ok(job) => {
             emit_recurring_event("created", &job.id, Some(&job.session_id));
             Json(job).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
@@ -4117,7 +4420,7 @@ async fn update_recurring(
         Ok(job) => {
             emit_recurring_event("updated", &job.id, Some(&job.session_id));
             Json(job).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
@@ -4134,7 +4437,7 @@ async fn delete_recurring(
         Ok(()) => {
             emit_recurring_event("deleted", &id, None);
             Json(serde_json::json!({ "ok": true })).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
