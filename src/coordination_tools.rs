@@ -66,6 +66,14 @@ impl Tool for PostCoordinationMessage {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: PostArgs =
             serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        if args.thread_id.trim().is_empty()
+            || args.actor_kind.trim().is_empty()
+            || args.actor_id.trim().is_empty()
+        {
+            return Err(ToolError::msg(
+                "thread_id, actor_kind, and actor_id must not be empty",
+            ));
+        }
         if args.body.trim().is_empty() {
             return Err(ToolError::msg("body must not be empty"));
         }
