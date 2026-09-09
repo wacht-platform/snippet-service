@@ -11,6 +11,8 @@ pub mod chatgpt;
 pub mod chatgpt_auth;
 pub mod checkpoint;
 pub mod config;
+pub mod coordination;
+pub mod coordination_tools;
 pub mod gemini;
 pub mod harness;
 pub mod inline;

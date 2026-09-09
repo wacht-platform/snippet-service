@@ -15,7 +15,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -149,6 +149,8 @@ struct Daemon {
     queue_hidden: std::sync::Mutex<HashMap<String, Vec<String>>>,
     queue_revision: AtomicU64,
     mission_control_root: PathBuf,
+    coordination_db: crate::coordination::CoordinationDb,
+    coordination_events: tokio::sync::broadcast::Sender<crate::coordination::types::CoordinationEvent>,
     recurring_root: PathBuf,
 }
 
@@ -555,6 +557,11 @@ pub async fn run_serve(
         queue_hidden: std::sync::Mutex::new(HashMap::new()),
         queue_revision: AtomicU64::new(0),
         mission_control_root: mission_control::MissionControlStore::default_root(None),
+        coordination_db: crate::coordination::CoordinationDb::open(
+            mission_control::MissionControlStore::default_root(None).join("coordination.sqlite3"),
+        )
+        .map_err(|error| format!("open coordination database: {error}"))?,
+        coordination_events: tokio::sync::broadcast::channel(256).0,
         recurring_root: recurring::default_root(),
     });
 
@@ -594,6 +601,15 @@ pub async fn run_serve(
     const UPLOAD_BODY_LIMIT: usize = MAX_UPLOAD_FILE_BYTES / 3 * 4 + 64 * 1024;
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/coordination/agents", get(coordination_agents).post(coordination_create_agent))
+        .route("/coordination/assignments", post(coordination_create_assignment))
+        .route("/coordination/sessions/{session_id}/lease", post(coordination_acquire_lease))
+        .route("/coordination/sessions/{session_id}/lease/{lease_id}", delete(coordination_release_lease))
+        .route("/coordination/sessions/{session_id}/lease/{lease_id}/renew", post(coordination_renew_lease))
+        .route("/coordination/handoffs/{handoff_id}/acknowledge", post(coordination_acknowledge_handoff))
+        .route("/coordination/threads/{thread_id}/events", get(coordination_events))
+        .route("/coordination/threads/{thread_id}/messages", post(coordination_post_message))
+        .route("/coordination/events", get(coordination_events_ws))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
         .route("/usage", get(usage_summary))
@@ -993,6 +1009,103 @@ fn unauthorized() -> Response {
 #[derive(Deserialize)]
 struct Auth {
     token: Option<String>,
+}
+
+async fn coordination_agents(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    match d.coordination_db.list_agents() {
+        Ok(agents) => Json(agents).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("coordination database: {error}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationAgentReq { id: String, display_name: String, handle: String, #[serde(default = "default_coord_agent_kind")] kind: crate::coordination::types::AgentKind, #[serde(default = "default_coord_agent_status")] status: crate::coordination::types::AgentStatus, #[serde(default = "default_coord_agent_role")] role: crate::coordination::types::AgentRole, #[serde(default)] capabilities: Vec<String>, max_concurrent_assignments: u32, max_concurrent_sessions: u32 }
+fn default_coord_agent_kind() -> crate::coordination::types::AgentKind { crate::coordination::types::AgentKind::Worker }
+fn default_coord_agent_status() -> crate::coordination::types::AgentStatus { crate::coordination::types::AgentStatus::Active }
+fn default_coord_agent_role() -> crate::coordination::types::AgentRole { crate::coordination::types::AgentRole::Implementer }
+
+async fn coordination_create_agent(State(d): State<Shared>, Query(q): Query<Auth>, Json(req): Json<CoordinationAgentReq>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    if req.id.trim().is_empty() || req.handle.trim().is_empty() || req.max_concurrent_sessions == 0 { return (StatusCode::BAD_REQUEST, "id, handle, and max_concurrent_sessions are required").into_response(); }
+    let agent = crate::coordination::types::Agent { id:req.id, display_name:req.display_name, handle:req.handle, kind:req.kind, status:req.status, role:req.role, capabilities:req.capabilities, max_concurrent_assignments:req.max_concurrent_assignments, max_concurrent_sessions:req.max_concurrent_sessions, version:1 };
+    match d.coordination_db.create_agent(&agent) { Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(), Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response() }
+}
+
+#[derive(Deserialize)]
+struct CoordinationEventsQuery { token: Option<String>, #[serde(default)] after_sequence: u64, #[serde(default = "default_coord_event_limit")] limit: u32 }
+fn default_coord_event_limit() -> u32 { 100 }
+
+async fn coordination_events(State(d): State<Shared>, axum::extract::Path(thread_id): axum::extract::Path<String>, Query(q): Query<CoordinationEventsQuery>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    match d.coordination_db.events_for_thread(&thread_id, q.after_sequence, q.limit.clamp(1,500)) { Ok(events) => Json(events).into_response(), Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("read coordination events: {error}")).into_response() }
+}
+
+#[derive(Deserialize)]
+struct CoordinationMessageReq { actor_kind: String, actor_id: String, body: String, #[serde(default)] idempotency_key: String }
+
+async fn coordination_post_message(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path(thread_id): axum::extract::Path<String>, Json(req): Json<CoordinationMessageReq>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    if req.body.trim().is_empty() || req.actor_id.trim().is_empty() { return (StatusCode::BAD_REQUEST, "actor_id and body are required").into_response(); }
+    let event = crate::coordination::types::CoordinationEvent { event_id:uuid::Uuid::new_v4().to_string(), thread_id:thread_id.clone(), partition_key:format!("thread:{thread_id}"), sequence:0, event_type:"message.posted".into(), actor_kind:req.actor_kind, actor_id:req.actor_id, payload_version:1, payload:serde_json::json!({"body":req.body}), causation_id:None, correlation_id:None, idempotency_key:if req.idempotency_key.is_empty(){uuid::Uuid::new_v4().to_string()}else{req.idempotency_key}, created_at:chrono::Utc::now().to_rfc3339() };
+    match d.coordination_db.append_event(&event) { Ok(saved) => { let _ = d.coordination_events.send(saved.clone()); Json(saved).into_response() }, Err(error) => (StatusCode::CONFLICT, format!("post coordination message: {error}")).into_response() }
+}
+
+async fn coordination_events_ws(ws: WebSocketUpgrade, State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) { return unauthorized(); }
+    let mut rx = d.coordination_events.subscribe();
+    ws.on_upgrade(move |mut socket| async move { while let Ok(event) = rx.recv().await { if socket.send(Message::Text(serde_json::json!({"wire":"coordination_event","event":event}).to_string().into())).await.is_err() { break; } } })
+}
+
+#[derive(Deserialize)]
+struct CoordinationAssignmentReq { id: String, goal_id: String, session_id: String, agent_id: String, scope: String, definition_of_done: String }
+
+async fn coordination_create_assignment(State(d): State<Shared>, Query(q): Query<Auth>, Json(req): Json<CoordinationAssignmentReq>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    if req.id.trim().is_empty() || req.goal_id.trim().is_empty() || req.session_id.trim().is_empty() || req.agent_id.trim().is_empty() { return (StatusCode::BAD_REQUEST, "id, goal_id, session_id, and agent_id are required").into_response(); }
+    let now = chrono::Utc::now().to_rfc3339();
+    let assignment = crate::coordination::Assignment { id:req.id, goal_id:req.goal_id, session_id:req.session_id, agent_id:req.agent_id, status:crate::coordination::AssignmentStatus::Offered, scope:req.scope, definition_of_done:req.definition_of_done, created_at:now.clone(), updated_at:now };
+    match d.coordination_db.create_assignment(&assignment) { Ok(()) => (StatusCode::CREATED, Json(assignment)).into_response(), Err(error) => (StatusCode::CONFLICT, format!("create assignment: {error}")).into_response() }
+}
+
+#[derive(Deserialize)]
+struct CoordinationLeaseReq { lease_id: String, assignment_id: String, agent_id: String, expires_at: String }
+
+async fn coordination_acquire_lease(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path(session_id): axum::extract::Path<String>, Json(req): Json<CoordinationLeaseReq>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    let lease = crate::coordination::types::SessionLease { session_id, lease_id:req.lease_id, assignment_id:req.assignment_id, agent_id:req.agent_id, fencing_token:0, acquired_at:chrono::Utc::now().to_rfc3339(), renewed_at:chrono::Utc::now().to_rfc3339(), expires_at:req.expires_at };
+    match d.coordination_db.acquire_lease(&lease) {
+        Ok(Some(acquired)) => (StatusCode::CREATED, Json(acquired)).into_response(),
+        Ok(None) => (StatusCode::CONFLICT, "session already has an active lease").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("acquire lease: {error}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationLeaseRenewReq { fencing_token: u64, expires_at: String }
+
+async fn coordination_renew_lease(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>, Json(req): Json<CoordinationLeaseRenewReq>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    let renewed_at = chrono::Utc::now().to_rfc3339();
+    match d.coordination_db.renew_lease(&lease_id, req.fencing_token, &renewed_at, &req.expires_at) {
+        Ok(true) => Json(serde_json::json!({"lease_id": lease_id, "fencing_token": req.fencing_token, "renewed_at": renewed_at, "expires_at": req.expires_at})).into_response(),
+        Ok(false) => (StatusCode::CONFLICT, "lease is stale, released, or fenced").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("renew lease: {error}")).into_response(),
+    }
+}
+
+async fn coordination_release_lease(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    match d.coordination_db.release_lease(&lease_id, &chrono::Utc::now().to_rfc3339(), "released_by_client") { Ok(true) => StatusCode::NO_CONTENT.into_response(), Ok(false) => (StatusCode::NOT_FOUND, "lease not active").into_response(), Err(error) => (StatusCode::BAD_REQUEST, format!("release lease: {error}")).into_response() }
+}
+
+#[derive(Deserialize)]
+struct CoordinationHandoffAckReq { acknowledged_at: Option<String> }
+
+async fn coordination_acknowledge_handoff(State(d): State<Shared>, Query(q): Query<Auth>, axum::extract::Path(handoff_id): axum::extract::Path<String>, Json(req): Json<CoordinationHandoffAckReq>) -> Response {
+    if !d.authed(&q.token) { return unauthorized(); }
+    let at = req.acknowledged_at.unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    match d.coordination_db.acknowledge_handoff(&handoff_id, &at) { Ok(true) => StatusCode::NO_CONTENT.into_response(), Ok(false) => (StatusCode::NOT_FOUND, "handoff not found or already acknowledged").into_response(), Err(error) => (StatusCode::BAD_REQUEST, format!("acknowledge handoff: {error}")).into_response() }
 }
 
 #[derive(Deserialize)]
@@ -2897,6 +3010,8 @@ mod tests {
             queue_hidden: std::sync::Mutex::new(HashMap::new()),
             queue_revision: AtomicU64::new(0),
             mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
+            coordination_db: crate::coordination::CoordinationDb::open_in_memory().unwrap(),
+            coordination_events: tokio::sync::broadcast::channel(256).0,
             recurring_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
     }

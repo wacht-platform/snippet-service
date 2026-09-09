@@ -588,6 +588,8 @@ pub enum LoopInput {
     SetTitle(String),
     /// Set (or replace) the autonomous `/goal` — the agent begins driving toward it.
     SetGoal(String),
+    /// Resume a paused rate-limited goal without replacing its text.
+    ResumeGoal,
     /// Cancel the active goal — the agent is told and winds down.
     CancelGoal,
     /// Cancel the run.
@@ -887,9 +889,7 @@ impl CodingHarness {
                         // Buffered /compact must actually run — `apply_input`
                         // treated it as a no-op, silently swallowing the request.
                         LoopInput::Compact => wants_compact = true,
-                        LoopInput::Queue(_)
-                        | LoopInput::Unqueue(_)
-                        | LoopInput::DropQueued => {
+                        LoopInput::Queue(_) | LoopInput::Unqueue(_) | LoopInput::DropQueued => {
                             needs_persist = true;
                             self.apply_input(&mut state, input);
                         }
@@ -903,8 +903,7 @@ impl CodingHarness {
                                     state.events.push(HarnessEvent::Steer { text });
                                     self.bump_activity();
                                 } else {
-                                    self.accept_user_message(&mut state, &mut vars, text)
-                                        .await;
+                                    self.accept_user_message(&mut state, &mut vars, text).await;
                                     consecutive_errors = 0;
                                 }
                             } else {
@@ -940,6 +939,7 @@ impl CodingHarness {
                                 LoopInput::SetMode(_)
                                     | LoopInput::SetTitle(_)
                                     | LoopInput::SetGoal(_)
+                                    | LoopInput::ResumeGoal
                                     | LoopInput::CancelGoal
                             ) {
                                 needs_persist = true;
@@ -1218,6 +1218,11 @@ impl CodingHarness {
                         }
                         Some(LoopInput::SetGoal(text)) => {
                             self.begin_goal(&mut state, text);
+                            consecutive_errors = 0;
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::ResumeGoal) => {
+                            self.resume_goal(&mut state);
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
                         }
@@ -1694,6 +1699,10 @@ impl CodingHarness {
                 self.begin_goal(state, text);
                 false
             }
+            LoopInput::ResumeGoal => {
+                self.resume_goal(state);
+                false
+            }
             LoopInput::CancelGoal => {
                 self.end_goal(state);
                 false
@@ -1726,6 +1735,28 @@ impl CodingHarness {
         });
         state.events.push(HarnessEvent::SystemDecision {
             step: "goal_set".to_string(),
+            reasoning: text,
+        });
+        state.status = HarnessStatus::Running;
+    }
+
+    /// Resume a paused rate-limited goal without replacing its text.
+    fn resume_goal(&self, state: &mut HarnessState) {
+        let Some(goal) = state.goal.as_mut() else {
+            return;
+        };
+        if goal.status != GoalStatus::Paused {
+            return;
+        }
+        goal.status = GoalStatus::Active;
+        goal.resume_at = 0;
+        let text = goal.text.clone();
+        let dir = goal.dir.clone();
+        state.messages.push(HarnessMessage::User {
+            content: goal_continue_directive(&text, &dir),
+        });
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "goal_resumed".to_string(),
             reasoning: text,
         });
         state.status = HarnessStatus::Running;
@@ -2581,12 +2612,14 @@ impl CodingHarness {
             // Otherwise remember this discovery call so an exact repeat is caught.
             if MUTATING_TOOLS.contains(&tool_name.as_str()) {
                 // File/shell mutations stale workspace discovery, not memory.
-                vars.executed_calls.retain(|s| s.starts_with("memory_read:"));
+                vars.executed_calls
+                    .retain(|s| s.starts_with("memory_read:"));
             } else if matches!(
                 tool_name.as_str(),
                 "memory_write" | "memory_delete" | "memory_index"
             ) {
-                vars.executed_calls.retain(|s| !s.starts_with("memory_read:"));
+                vars.executed_calls
+                    .retain(|s| !s.starts_with("memory_read:"));
             } else if DEDUP_TOOLS.contains(&tool_name.as_str()) {
                 vars.executed_calls.insert(signature);
             }
@@ -5414,7 +5447,10 @@ mod assistant_dedup_tests {
         );
         assert_eq!(state.messages.len(), 2);
         match &state.messages[1] {
-            HarnessMessage::Assistant { content, tool_calls } => {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 assert_eq!(content, "Scheduled goal finished: nightly review complete.");
                 assert!(tool_calls.is_empty());
             }
@@ -5437,7 +5473,10 @@ mod assistant_dedup_tests {
                 origin_model: None,
             }]),
         );
-        assert_eq!(assistant_texts(&state), vec!["Checking the hydrate path now."]);
+        assert_eq!(
+            assistant_texts(&state),
+            vec!["Checking the hydrate path now."]
+        );
         match &state.messages[1] {
             HarnessMessage::Assistant {
                 content,
