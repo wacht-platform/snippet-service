@@ -6,10 +6,12 @@
 mod agents;
 mod db;
 mod events;
+mod identity;
 mod transfers;
 pub mod types;
 mod work;
 
 pub use db::{CoordinationDb, CoordinationDbError};
+pub use identity::{AgentHome, IdentityError, IdentityMetadata};
 pub use types::{Handoff, SessionLease};
 pub use work::{Assignment, AssignmentStatus};
