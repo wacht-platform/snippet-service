@@ -1044,7 +1044,7 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Auth {
     token: Option<String>,
 }
@@ -3759,6 +3759,15 @@ async fn build_agent_from_prompt(
             .into_response();
     }
     let root = &d.mission_control_root;
+    // Agent builds are routed through the dedicated MC session. Ensure that
+    // session is materialized before creating the task, including on a fresh
+    // daemon where the user has not opened Mission Control yet.
+    let _ = mission_control_open(
+        State(d.clone()),
+        Query(a.clone()),
+        Json(MissionOpenReq { profile: None }),
+    )
+    .await;
     let session_id = crate::mission_control::SESSION_ID;
     let task_id = uuid::Uuid::new_v4().to_string();
     let title = "Build specialized agent";
