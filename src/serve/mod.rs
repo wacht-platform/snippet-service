@@ -3768,6 +3768,16 @@ async fn build_agent_from_prompt(
         Json(MissionOpenReq { profile: None }),
     )
     .await;
+    if mission_control::get_session(root, crate::mission_control::SESSION_ID).is_err() {
+        if let Err(error) = mission_control::create_session(
+            root,
+            crate::mission_control::SESSION_ID,
+            "Mission Control",
+            &crate::mission_control::workspace_path(),
+        ) {
+            return mission_error(format!("initialize Mission Control session: {error}"));
+        }
+    }
     let session_id = crate::mission_control::SESSION_ID;
     let task_id = uuid::Uuid::new_v4().to_string();
     let title = "Build specialized agent";
