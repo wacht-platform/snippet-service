@@ -1029,6 +1029,14 @@ async fn coordination_create_agent(State(d): State<Shared>, Query(q): Query<Auth
     if !d.authed(&q.token) { return unauthorized(); }
     if req.id.trim().is_empty() || req.handle.trim().is_empty() || req.max_concurrent_sessions == 0 { return (StatusCode::BAD_REQUEST, "id, handle, and max_concurrent_sessions are required").into_response(); }
     let agent = crate::coordination::types::Agent { id:req.id, display_name:req.display_name, handle:req.handle, kind:req.kind, status:req.status, role:req.role, capabilities:req.capabilities, max_concurrent_assignments:req.max_concurrent_assignments, max_concurrent_sessions:req.max_concurrent_sessions, version:1 };
+    let home = match crate::coordination::AgentHome::new(crate::config::snippet_home().join("agents"), &agent.id) {
+        Ok(home) => home,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let default_identity = format!("# {}\n\nAgent handle: @{}\n\nThis identity is awaiting its first build and research pass.\n", agent.display_name, agent.handle);
+    if let Err(error) = home.ensure_layout(&default_identity, "registration") {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("create agent home: {error}")).into_response();
+    }
     match d.coordination_db.create_agent(&agent) { Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(), Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response() }
 }
 
