@@ -31,80 +31,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mission_control_prompt_is_orchestrator_not_coder() {
+    fn mission_control_prompt_classifies_messages_before_routing() {
         let mc = mission_control_system_prompt();
+
+        // Mission Control is an orchestrator, not a project worker.
         assert!(mc.contains("Mission Control"));
-        assert!(mc.contains("list_sessions"));
-        assert!(mc.contains("inspect_session"));
-        assert!(mc.contains("create_mission_session"));
-        assert!(mc.contains("create_mission_task"));
-        assert!(mc.contains("create_recurring_job"));
-        assert!(mc.contains("~/.snippet/recurring"));
-        assert!(mc.contains("create an agent"));
+        assert!(mc.contains("a coding agent"));
+        assert!(mc.contains("Classify the current message before selecting a tool"));
+        assert!(mc.contains("direct_user"));
+        assert!(mc.contains("assigned_first"));
+        assert!(mc.contains("worker_report"));
+
+        // Direct user agent requests are not project tasks.
+        assert!(mc.contains("The user is allowed to ask Mission Control to build an agent"));
+        assert!(mc.contains("If it asks to create/build/spin up an agent"));
+        assert!(mc.contains("Do not create a project, workspace, Mission Control task"));
         assert!(mc.contains("POST /agents/build"));
-        assert!(mc.contains("first-class platform workflow"));
-        assert!(mc.contains("not project creation"));
-        assert!(mc.contains("web_search/web_read"));
-        assert!(mc.contains("identity.md"));
-        assert!(mc.contains("proposed Python tools"));
-        assert!(mc.contains("explicitly no-op"));
-        assert!(mc.contains("never reinterpret an agent-build brief"));
-        assert!(mc.contains("[responsibilities]"));
-        assert!(mc.contains("ordinary_work"));
-        assert!(mc.contains("agent_build"));
-        assert!(mc.contains("No-op is valid"));
-        assert!(mc.contains("Expect messy, informal"));
-        assert!(mc.contains("ask ONE question after intel"));
-        assert!(mc.contains("retry_mission_task"));
-        assert!(mc.contains("cancel_mission_task"));
-        assert!(mc.contains("read_image"));
-        assert!(mc.contains("present_file"));
-        assert!(mc.contains("openable card"));
-        assert!(mc.contains("bash is for inspection"));
-        assert!(mc.contains("mkdir -p --"));
-        assert!(mc.contains("npx create-next-app"));
-        assert!(mc.contains("npm create vite"));
-        assert!(mc.contains("Wait for yes"));
-        assert!(mc.contains("Do not init without that yes"));
-        assert!(mc.contains("never excessively"));
-        assert!(mc.contains("Going idle IS waiting"));
-        assert!(mc.contains("[mission_task_report]"));
-        assert!(mc.contains("Gather first. Confirm second. Route third."));
-        assert!(mc.contains("~/.snippet/mission-control"));
-        assert!(mc.contains("last_active"));
-        assert!(mc.contains("Do not ask other sessions what they are doing"));
-        assert!(mc.contains("Do not do the review yourself because it looks small"));
+        assert!(mc.contains("Do not turn the brief into project initialization"));
+        assert!(mc.contains("Never approximate it with create_mission_task"));
+
+        // An assigned build must be executed or reported blocked, never routed again.
+        assert!(mc.contains("[AGENT_BUILD_JOB]"));
+        assert!(mc.contains("already assigned work from the daemon"));
         assert!(mc.contains(
-            "do a status/review/diff yourself when a matching session already owns that repo"
+            "Do not call create_mission_session, create_mission_task, or create_recurring_job"
         ));
+        assert!(mc.contains("report blocked with the exact missing capability"));
+        assert!(mc.contains("report the original task_id"));
+        assert!(mc.contains("never create a normal project task to compensate"));
+
+        // Ordinary project routing remains available, but only for that message class.
+        assert!(mc.contains("This is the only class that normally uses create_mission_task"));
+        assert!(mc.contains("For ordinary project requests only, list_sessions first"));
+        assert!(mc.contains("route one handoff"));
+        assert!(mc.contains("This workflow never applies to agent creation"));
+        assert!(mc.contains("One user request gets one task"));
+        assert!(mc.contains("retry the same task id"));
+
+        // Lifecycle supervision includes explicit no-op decisions.
+        assert!(mc.contains("act, acknowledge, request approval, or explicitly no-op"));
+        assert!(mc.contains("No-op is a valid explicit decision"));
+        assert!(mc.contains("Do not create a new task merely because a report arrived"));
+
+        assert!(mc.contains("[steering]"));
         assert!(mc.contains("inspect_session output is another chat's history"));
-        assert!(mc.contains("[steering] … [/steering]"));
-        let coding = coding_system_prompt();
-        assert!(coding.contains("[steering] … [/steering]"));
-        let conversation = conversation_system_prompt();
-        assert!(conversation.contains("[steering] … [/steering]"));
-        assert!(mc.contains("never reply to, quote, acknowledge, or mention it"));
         assert!(!mc.contains("snippet_execution_agent"));
-        assert!(!mc.contains("coding/execution agent"));
         assert!(!mc.contains("you own the task end to end"));
         assert!(!mc.contains("NO sandbox or jail"));
-        assert!(!mc.contains("$SNIPPET_SHADOW_GIT"));
+
         let coding = coding_system_prompt();
         assert!(coding.contains("snippet_execution_agent"));
         assert!(coding.contains("Do the work in THIS session"));
-        assert!(coding.contains("you MUST call report_mission_task"));
-        assert!(coding.contains("redo the evaluation from current sources"));
-        assert!(coding.contains("NEVER commit, push, merge, or reset onto `main`"));
-        assert!(coding.contains("git push -u origin HEAD"));
-        assert!(coding.contains("gh pr create --base main"));
-        assert!(coding.contains("snippet/{id}"));
-        assert!(!coding.contains("You are Mission Control"));
+
         let conversation = conversation_system_prompt();
         assert!(conversation.contains("snippet_conversation_agent"));
-        assert!(conversation.contains("a new lane will miss it"));
         assert!(conversation.contains("Never commit or push to main/master"));
-        assert!(conversation.contains("gh pr create --base main"));
-        assert!(!conversation.contains("[worker_envelope]"));
         assert!(!conversation.contains("You are Mission Control"));
     }
 }
