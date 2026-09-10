@@ -1296,6 +1296,22 @@ async fn coordination_post_message(
     match d.coordination_db.append_event(&event) {
         Ok(saved) => {
             let _ = d.coordination_events.send(saved.clone());
+            // A board post is a message TO someone: wake Mission Control so it
+            // can respond. Without this the human just sees their own message
+            // and no agent ever participates. Skipped for Mission Control's own
+            // posts so a reply can't wake the session that wrote it.
+            if should_wake_mission_control(&saved.actor_id) {
+                let daemon = d.clone();
+                let envelope = board_message_envelope(&saved);
+                tokio::spawn(async move {
+                    daemon
+                        .deliver(
+                            crate::mission_control::SESSION_ID,
+                            LoopInput::UserMessage(envelope),
+                        )
+                        .await;
+                });
+            }
             Json(saved).into_response()
         }
         Err(error) => (
@@ -1390,14 +1406,45 @@ async fn coordination_create_assignment(
     }
 }
 
+/// Whether a board post should wake Mission Control. Posts authored by Mission
+/// Control itself are skipped, so a reply cannot re-wake the session that wrote
+/// it (which would loop).
+fn should_wake_mission_control(actor_id: &str) -> bool {
+    actor_id != crate::mission_control::SESSION_ID
+}
+
+/// The board thread every participant shares: the human app posts here, and the
+/// daemon routes assignments and worker posts to the same thread so nobody has
+/// to guess an id.
+pub const COORDINATION_THREAD: &str = "system";
+
+/// The envelope handed to Mission Control when a human posts to the board. Wraps
+/// the message so it is not mistaken for a direct chat turn.
+fn board_message_envelope(event: &crate::coordination::types::CoordinationEvent) -> String {
+    let body = event
+        .payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    format!(
+        "[coordination_board_message]\nthread_id: {}\nfrom: {} ({})\nbody: {}\n\
+         rules: this is a board message, not an ordinary chat turn. Decide whether it needs a response, \
+         a handoff, or an assignment. Reply on this same thread with post_coordination_message so the \
+         sender actually sees it. If no action is needed, say so on the thread rather than staying silent.\n\
+         [/coordination_board_message]",
+        event.thread_id, event.actor_id, event.actor_kind, body
+    )
+}
+
 /// The envelope handed to the worker session that owns `assignment`. States the
 /// boundary and the report contract without restating the session prompt.
 fn coordination_assignment_envelope(assignment: &crate::coordination::Assignment) -> String {
     format!(
-        "[coordination_assignment]\nassignment_id: {}\ngoal_id: {}\nsession_id: {}\nagent_id: {}\nscope: {}\ndefinition_of_done: {}\n\
+        "[coordination_assignment]\nassignment_id: {}\ngoal_id: {}\nsession_id: {}\nagent_id: {}\nscope: {}\ndefinition_of_done: {}\nboard_thread: {}\n\
          rules: accept this assignment to acquire the turn (accept_coordination_assignment), \
          renew_coordination_lease while working, release_coordination_lease when done or handing off. \
-         Post progress to the board with post_coordination_message. Do not mutate the workspace until you hold the turn.\n\
+         Post progress to the board with post_coordination_message on board_thread — that is the thread the \
+         human reads, so a post anywhere else goes unseen. Do not mutate the workspace until you hold the turn.\n\
          [/coordination_assignment]",
         assignment.id,
         assignment.goal_id,
@@ -1405,6 +1452,7 @@ fn coordination_assignment_envelope(assignment: &crate::coordination::Assignment
         assignment.agent_id,
         assignment.scope,
         assignment.definition_of_done,
+        COORDINATION_THREAD,
     )
 }
 
@@ -3619,6 +3667,44 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A human post must wake Mission Control (that is what makes the board
+    /// interactive); Mission Control's own reply must not, or it would loop.
+    #[test]
+    fn board_posts_wake_mission_control_except_its_own() {
+        assert!(should_wake_mission_control("human"));
+        assert!(should_wake_mission_control("rust-pr-reviewer"));
+        assert!(!should_wake_mission_control(
+            crate::mission_control::SESSION_ID
+        ));
+    }
+
+    #[test]
+    fn board_message_envelope_carries_sender_thread_and_reply_rule() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e1".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 7,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "please investigate X"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event);
+        assert!(envelope.starts_with("[coordination_board_message]"));
+        assert!(envelope.contains("thread_id: system"));
+        assert!(envelope.contains("from: human (human)"));
+        assert!(envelope.contains("body: please investigate X"));
+        // The reply contract is what stops a silent no-op.
+        assert!(envelope.contains("post_coordination_message"));
+        assert!(envelope.contains("[/coordination_board_message]"));
     }
 
     #[tokio::test]
