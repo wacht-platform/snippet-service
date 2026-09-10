@@ -97,6 +97,26 @@ impl CoordinationDb {
         decode_handoff(raw)
     }
 
+    /// Handoffs that no successor has acknowledged yet, oldest first. Drives the
+    /// handoff inspector: the human (or a successor agent) sees what is waiting.
+    pub fn list_pending_handoffs(&self) -> Result<Vec<Handoff>, CoordinationDbError> {
+        let raws = self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT content_json FROM handoffs
+                 WHERE acknowledged_at IS NULL
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })?;
+        raws.into_iter()
+            .map(|raw| {
+                serde_json::from_str(&raw)
+                    .map_err(|e| CoordinationDbError::HandoffDecode(e.to_string()))
+            })
+            .collect()
+    }
+
     pub fn acquire_lease(
         &self,
         lease: &SessionLease,
@@ -424,5 +444,54 @@ mod tests {
             !db.check_fence("s", "l", held.fencing_token, &ts(100))
                 .unwrap()
         );
+    }
+
+    fn handoff(id: &str, target: &str) -> Handoff {
+        Handoff {
+            id: id.into(),
+            goal_id: "g".into(),
+            session_id: "s".into(),
+            source_assignment_id: "a".into(),
+            target_assignment_id: target.into(),
+            context_mode: crate::coordination::types::ContextMode::FreshNeedsContext,
+            objective: "finish".into(),
+            definition_of_done: "tests pass".into(),
+            scope: "src".into(),
+            non_goals: vec![],
+            workspace_ref: serde_json::json!({}),
+            completed_summary: "half done".into(),
+            next_action: "review".into(),
+            decisions: vec![],
+            risks: vec![],
+            blockers: vec![],
+            dependencies: vec![],
+            artifacts: vec![],
+            verification: vec![],
+            context_manifest: serde_json::json!({}),
+            created_at: ts(0),
+            content_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn pending_handoffs_are_listed_until_acknowledged() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        db.create_agent(&worker()).unwrap();
+        db.create_assignment(&assignment("a")).unwrap();
+        db.create_assignment(&assignment("a2")).unwrap();
+        let mut h = handoff("h1", "a2");
+        h.content_hash = h.compute_content_hash();
+        db.create_handoff(&h).unwrap();
+
+        assert_eq!(db.list_pending_handoffs().unwrap().len(), 1);
+        assert!(db.has_unacknowledged_handoff("a2").unwrap());
+        // Acknowledging by target clears it from the pending list.
+        assert!(
+            db.acknowledge_handoff_by_target("a2", &ts(5))
+                .unwrap()
+                .is_some()
+        );
+        assert!(db.list_pending_handoffs().unwrap().is_empty());
+        assert!(!db.has_unacknowledged_handoff("a2").unwrap());
     }
 }
