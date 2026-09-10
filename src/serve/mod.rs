@@ -282,7 +282,8 @@ impl Daemon {
         };
         // Role-aware resume: a session opened as Mission Control must come back
         // with the MC prompt/tools/lane restrictions after a daemon restart,
-        // not silently downgrade to an ordinary conversation session.
+        // not silently downgrade to an ordinary conversation session. A session
+        // opened for an agent resumes with that agent's specialized identity.
         let role = read_session_role(&sp);
         let handle = match role.as_deref() {
             Some("mission_control") => crate::session::start_mission_control_session(
@@ -295,6 +296,57 @@ impl Daemon {
                 ))),
                 Some(self.browser.summary_provider()),
             ),
+            Some(role) if role.starts_with("agent:") => {
+                let agent_id = role.trim_start_matches("agent:");
+                match crate::coordination::AgentHome::new(
+                    crate::coordination::agents_root(&self.mission_control_root),
+                    agent_id,
+                ) {
+                    // Identity revision is re-read on every resume, so an agent
+                    // whose identity was updated comes back with the new guidance.
+                    Ok(home) => match crate::session::start_specialized_agent_session(
+                        &cfg,
+                        sp.clone(),
+                        None,
+                        true,
+                        Some(std::sync::Arc::new(std::sync::Mutex::new(
+                            crate::llm::StreamBuffer::default(),
+                        ))),
+                        Some(self.browser.summary_provider()),
+                        home,
+                    ) {
+                        Ok(handle) => handle,
+                        // A missing/unreadable identity home must not wedge the
+                        // session; fall back to a plain session rather than fail.
+                        Err(error) => {
+                            eprintln!(
+                                "[coordination] agent `{agent_id}` identity unavailable ({error}); \
+                                 resuming as an ordinary session"
+                            );
+                            start_session_with_browser_summary(
+                                &cfg,
+                                sp.clone(),
+                                None,
+                                true,
+                                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                                    crate::llm::StreamBuffer::default(),
+                                ))),
+                                Some(self.browser.summary_provider()),
+                            )
+                        }
+                    },
+                    Err(_) => start_session_with_browser_summary(
+                        &cfg,
+                        sp.clone(),
+                        None,
+                        true,
+                        Some(std::sync::Arc::new(std::sync::Mutex::new(
+                            crate::llm::StreamBuffer::default(),
+                        ))),
+                        Some(self.browser.summary_provider()),
+                    ),
+                }
+            }
             _ => start_session_with_browser_summary(
                 &cfg,
                 sp.clone(),
@@ -1288,9 +1340,77 @@ async fn coordination_create_assignment(
         updated_at: now,
     };
     match d.coordination_db.create_assignment(&assignment) {
-        Ok(()) => (StatusCode::CREATED, Json(assignment)).into_response(),
+        Ok(()) => {
+            // Start (or revive) the target session under the assigned agent's
+            // identity, then deliver the assignment. Best-effort: the assignment
+            // is already durable, so a dispatch failure must not lose it.
+            if let Err(error) = ensure_agent_session(&d, &assignment).await {
+                eprintln!(
+                    "[coordination] assignment {} not dispatched: {error}",
+                    assignment.id
+                );
+            }
+            (StatusCode::CREATED, Json(assignment)).into_response()
+        }
         Err(error) => (StatusCode::CONFLICT, format!("create assignment: {error}")).into_response(),
     }
+}
+
+/// The envelope handed to the worker session that owns `assignment`. States the
+/// boundary and the report contract without restating the session prompt.
+fn coordination_assignment_envelope(assignment: &crate::coordination::Assignment) -> String {
+    format!(
+        "[coordination_assignment]\nassignment_id: {}\ngoal_id: {}\nsession_id: {}\nagent_id: {}\nscope: {}\ndefinition_of_done: {}\n\
+         rules: accept this assignment to acquire the turn (accept_coordination_assignment), \
+         renew_coordination_lease while working, release_coordination_lease when done or handing off. \
+         Post progress to the board with post_coordination_message. Do not mutate the workspace until you hold the turn.\n\
+         [/coordination_assignment]",
+        assignment.id,
+        assignment.goal_id,
+        assignment.session_id,
+        assignment.agent_id,
+        assignment.scope,
+        assignment.definition_of_done,
+    )
+}
+
+/// Start (or revive) the session that will execute `assignment`, running as the
+/// assigned agent's specialized identity, and deliver the assignment envelope.
+/// Writes the role sidecar first so a later resume keeps the agent identity.
+async fn ensure_agent_session(
+    d: &Shared,
+    assignment: &crate::coordination::Assignment,
+) -> Result<(), String> {
+    let sp = state_path_for_id(&assignment.session_id).ok_or_else(|| {
+        format!(
+            "assignment targets unknown durable session `{}`",
+            assignment.session_id
+        )
+    })?;
+    // The agent home must exist; otherwise the session would start with no identity.
+    let home = crate::coordination::AgentHome::new(
+        crate::coordination::agents_root(&d.mission_control_root),
+        &assignment.agent_id,
+    )
+    .map_err(|e| e.to_string())?;
+    if !home.identity_path().exists() {
+        return Err(format!(
+            "agent `{}` has no identity home at {}",
+            assignment.agent_id,
+            home.root().display()
+        ));
+    }
+    write_session_role(&sp, &format!("agent:{}", assignment.agent_id));
+    let Some((tx, _sp, _stream)) = d.ensure_live(&assignment.session_id).await else {
+        return Err(format!(
+            "could not start session `{}`",
+            assignment.session_id
+        ));
+    };
+    let _ = tx.send(LoopInput::UserMessage(coordination_assignment_envelope(
+        assignment,
+    )));
+    Ok(())
 }
 
 #[derive(Deserialize)]
