@@ -104,6 +104,29 @@ impl CoordinationDb {
         })
     }
 
+    /// The most recent `limit` events on a thread, returned oldest→newest.
+    /// Used to give a newly-woken participant a bounded slice of room history
+    /// without replaying the whole thread.
+    pub fn recent_events_for_thread(
+        &self,
+        thread_id: &str,
+        limit: u32,
+    ) -> Result<Vec<CoordinationEvent>, CoordinationDbError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, thread_id, partition_key, sequence, event_type,
+                        actor_kind, actor_id, payload_version, payload_json,
+                        causation_id, correlation_id, idempotency_key, created_at
+                 FROM board_events WHERE thread_id = ?1
+                 ORDER BY sequence DESC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![thread_id, limit], event_from_row)?;
+            let mut events = rows.collect::<Result<Vec<_>, _>>()?;
+            events.reverse();
+            Ok(events)
+        })
+    }
+
     pub fn events_after(
         &self,
         partition_key: &str,
