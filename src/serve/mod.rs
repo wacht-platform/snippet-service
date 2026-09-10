@@ -1420,6 +1420,10 @@ pub const COORDINATION_THREAD: &str = "system";
 
 /// The envelope handed to Mission Control when a human posts to the board. Wraps
 /// the message so it is not mistaken for a direct chat turn.
+///
+/// Field order matters: `body` is deliberately last, so a client can take
+/// everything up to the closing tag as the message — including newlines — and
+/// the internal `rules` never run into the sender's text.
 fn board_message_envelope(event: &crate::coordination::types::CoordinationEvent) -> String {
     let body = event
         .payload
@@ -1427,10 +1431,10 @@ fn board_message_envelope(event: &crate::coordination::types::CoordinationEvent)
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     format!(
-        "[coordination_board_message]\nthread_id: {}\nfrom: {} ({})\nbody: {}\n\
-         rules: this is a board message, not an ordinary chat turn. Decide whether it needs a response, \
-         a handoff, or an assignment. Reply on this same thread with post_coordination_message so the \
-         sender actually sees it. If no action is needed, say so on the thread rather than staying silent.\n\
+        "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n\
+         rules: board message, not an ordinary chat turn. Decide whether it needs a response, a handoff, \
+         or an assignment; reply on this same thread with post_coordination_message so the sender sees it. \
+         If no action is needed, say so on the thread rather than staying silent.\nbody: {}\n\
          [/coordination_board_message]",
         event.thread_id, event.actor_id, event.actor_kind, body
     )
@@ -3700,11 +3704,41 @@ mod tests {
         let envelope = board_message_envelope(&event);
         assert!(envelope.starts_with("[coordination_board_message]"));
         assert!(envelope.contains("thread_id: system"));
-        assert!(envelope.contains("from: human (human)"));
+        assert!(envelope.contains("from_id: human"));
+        assert!(envelope.contains("from_kind: human"));
         assert!(envelope.contains("body: please investigate X"));
         // The reply contract is what stops a silent no-op.
         assert!(envelope.contains("post_coordination_message"));
         assert!(envelope.contains("[/coordination_board_message]"));
+    }
+
+    /// The body is last so a client can read everything up to the closing tag as
+    /// the message; this pins that ordering so it can't silently regress.
+    #[test]
+    fn board_message_body_is_the_final_field_before_the_closing_tag() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e2".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 8,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "line one\nline two"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k2".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event);
+        let after_body = envelope.split_once("body: ").expect("body field present").1;
+        assert!(after_body.starts_with("line one\nline two"));
+        assert!(
+            after_body
+                .trim_end()
+                .ends_with("[/coordination_board_message]")
+        );
     }
 
     #[tokio::test]
