@@ -687,6 +687,7 @@ pub async fn run_serve(
             "/coordination/sessions/{session_id}/lease/{lease_id}/renew",
             post(coordination_renew_lease),
         )
+        .route("/coordination/handoffs", get(coordination_list_handoffs))
         .route(
             "/coordination/handoffs/{handoff_id}/acknowledge",
             post(coordination_acknowledge_handoff),
@@ -1492,6 +1493,22 @@ async fn coordination_release_lease(
 #[derive(Deserialize)]
 struct CoordinationHandoffAckReq {
     acknowledged_at: Option<String>,
+}
+
+/// Pending (unacknowledged) handoffs, oldest first. Read-only; the ack is a
+/// separate POST.
+async fn coordination_list_handoffs(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.list_pending_handoffs() {
+        Ok(handoffs) => Json(handoffs).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list handoffs: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn coordination_acknowledge_handoff(
