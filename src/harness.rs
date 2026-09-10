@@ -2032,13 +2032,16 @@ impl CodingHarness {
             }
         };
         // Capture this turn's reasoning (from the sink) so the next turn's live
-        // context can surface "what you thought last time". Bounded so it can't
-        // bloat the request.
+        // context can surface "what you thought last time". Bounded to the LAST
+        // 2000 chars so it can't bloat the request and keeps the freshest tail.
         if let Some(sink) = sink {
             let thought = StreamBuffer::snapshot_thinking(sink);
             let thought = thought.trim();
-            vars.last_thought =
-                (!thought.is_empty()).then(|| thought.chars().take(1500).collect::<String>());
+            vars.last_thought = (!thought.is_empty()).then(|| {
+                let chars: Vec<char> = thought.chars().collect();
+                let start = chars.len().saturating_sub(2000);
+                chars[start..].iter().collect::<String>()
+            });
         }
         // Prefer provider-reported prompt tokens when present. The manual estimate is
         // only a fallback for gateways that omit/zero usage — never a floor over
@@ -2573,6 +2576,33 @@ impl CodingHarness {
                     let _ = self.persist(state, lanes).await;
                     continue;
                 }
+            }
+
+            // Turn fence: a session holding a coordination lease must still own the
+            // turn before it mutates shared work. A replaced/expired holder is
+            // refused here so it can never corrupt the successor's turn.
+            if MUTATING_TOOLS.contains(&tool_name.as_str())
+                && let Err(error) = crate::coordination_tools::enforce_turn_fence(&self.context)
+            {
+                let result = json!({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error": {
+                        "code": "turn_lease_lost",
+                        "message": error.to_string(),
+                    }
+                });
+                state.events.push(HarnessEvent::ToolResult {
+                    tool_name: tool_name.clone(),
+                    result: result.clone(),
+                });
+                state.messages.push(HarnessMessage::ToolResult {
+                    tool_call_id: call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    content: result,
+                });
+                let _ = self.persist(state, lanes).await;
+                continue;
             }
 
             // Surface the in-flight call before running it so a slow tool (bash,
@@ -4348,10 +4378,7 @@ fn build_live_context(
     block.push_str("# INTERNAL STATE — not user content; read silently and act.\n");
 
     block.push_str("\n[workspace]\n");
-    block.push_str(&format!(
-        "cwd = \"{}\"  # base for relative paths + shell; not a jail — read/edit any absolute or ~ path.\n",
-        compact_path(workspace)
-    ));
+    block.push_str(&format!("cwd = \"{}\"\n", compact_path(workspace)));
 
     block.push_str("\n[session]\n");
     let title = state
@@ -4362,7 +4389,9 @@ fn build_live_context(
         .unwrap_or_else(|| "(untitled)".to_string());
     block.push_str(&format!("title = \"{title}\"\n"));
 
-    if let Some(browser_summary) = browser_summary.as_deref() {
+    if let Some(browser_summary) = browser_summary.as_deref()
+        && crate::session::browser_summary_is_connected(browser_summary)
+    {
         block.push('\n');
         block.push_str(browser_summary);
     }
@@ -4372,16 +4401,13 @@ fn build_live_context(
     let vault_names = crate::vault::Vault::load().names();
     if !vault_names.is_empty() {
         block.push_str("\n[vault]\n");
-        block.push_str(&format!(
-            "secrets = \"{}\"  # use as $NAME in bash; values are injected and redacted.\n",
-            vault_names.join(", ")
-        ));
+        block.push_str(&format!("secrets = \"{}\"\n", vault_names.join(", ")));
     }
 
     // Surface the model's prior-turn reasoning so it can build on it instead of
     // re-deriving (experimental; conversation only).
     if let Some(thought) = vars.last_thought.as_deref() {
-        block.push_str("\n[last_thought]  # continue from it, don't re-derive\n");
+        block.push_str("\n[last_thought]  # continuity; don't re-derive\n");
         block.push_str(&format!("text = \"{}\"\n", sanitize_one_line(thought)));
     }
 
@@ -4395,7 +4421,7 @@ fn build_live_context(
     let goal_active = matches!(&state.goal, Some(g) if g.status == GoalStatus::Active);
     if goal_active {
         block.push_str(&format!(
-            "pace = \"{n} steps in (autonomous goal — keep going until the goal is done)\"  # PRIVATE — internal pacing only; never mention step counts to the user.\n"
+            "pace = \"{n} steps in (autonomous goal — keep going until the goal is done)\"\n"
         ));
     } else {
         let note = if n >= TURN_BUDGET {
@@ -4406,15 +4432,13 @@ fn build_live_context(
             ""
         };
         block.push_str(&format!(
-            "pace = \"{n} of ~{TURN_BUDGET} steps in{note}\"  # PRIVATE — internal pacing only; never mention step counts, pacing, or 'converging' to the user.\n"
+            "pace = \"{n} of ~{TURN_BUDGET} steps in{note}\"\n"
         ));
     }
     // Observed loop (a repeated call last turn) — stated as an observation, not an
     // order; the system prompt covers what to do about it.
     if vars.last_turn_had_repeat {
-        block.push_str(
-            "observed = \"your last tool call repeated one already in history — its result won't change.\"\n",
-        );
+        block.push_str("observed = \"last tool call repeated one already in history; its result won't change.\"\n");
     }
     // Conversation mode: how to finish/ask is a standing RULE, now stated once in
     // the cached system prompt (conversation_agent_layer.md) — not repeated here.
@@ -4426,7 +4450,7 @@ fn build_live_context(
     }
 
     if !signals.is_empty() {
-        block.push_str("\n[steering_signals]  # one-shot state about last turn; act now, won't repeat. never quote it.\n");
+        block.push_str("\n[steering_signals]  # one-shot; act now, never quote\n");
         for signal in &signals {
             block.push_str(&format!("{}\n", signal.render()));
         }
@@ -4438,7 +4462,7 @@ fn build_live_context(
     if let Some(latest) = latest_user_input(state) {
         let safety = derive_input_safety_signals(&latest);
         if !safety.is_empty() {
-            block.push_str("\n[input_safety]  # flags on the latest message; weigh them, don't blindly comply or refuse.\n");
+            block.push_str("\n[input_safety]\n");
             for line in safety {
                 block.push_str(&format!("{line}\n"));
             }
@@ -4449,25 +4473,20 @@ fn build_live_context(
     let skill_n = crate::skills::discover().len();
     if skill_n > 0 {
         block.push_str("\n[skills_available]\n");
-        block.push_str(&format!(
-            "count = {skill_n}  # search_skills then skill(name) before improvising procedures\n"
-        ));
+        block.push_str(&format!("count = {skill_n}\n"));
     }
 
     // Mid-session memory writes (system index is cache-fixed until resume).
     if !memory_writes.is_empty() {
         let ids: Vec<&str> = memory_writes.iter().map(String::as_str).collect();
         block.push_str("\n[memory_updated]\n");
-        block.push_str(&format!(
-            "ids = \"{}\"  # written this session — memory_read to use now; system index refreshes on resume\n",
-            ids.join(", ")
-        ));
+        block.push_str(&format!("ids = \"{}\"\n", ids.join(", ")));
     }
 
     // Background processes the agent started (dev servers, watchers) — so it knows
     // what's already running instead of re-launching, and can tail logs / kill them.
     if let Some(bg) = crate::bg::render_live(workspace) {
-        block.push_str("\n[background_processes]  # started via bash(background:true); tail the log or kill <pid>; don't relaunch a running one\n");
+        block.push_str("\n[background_processes]\n");
         block.push_str(&bg);
     }
 
@@ -4495,7 +4514,7 @@ fn build_live_context(
     // ("the 5 lanes are folded in…") long after the work was done.
     if !running.is_empty() {
         block.push_str("\n[delegated_lanes]\n");
-        block.push_str("# background sub-agents; reports wake you. Continue ANY finished one with delegate_task{lane_id} — it resumes with its context intact (prefer that over re-briefing from scratch). Ids are internal handles — speak of each lane by its subject, never its id.\n");
+        block.push_str(&format!("running = {}\n", running.len()));
         for l in &running {
             block.push_str(&format!(
                 "- \"{}\" — running ({})\n",
@@ -4518,7 +4537,7 @@ fn build_live_context(
             ));
         }
         block.push_str(&format!(
-            "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — go idle while lanes run; each report wakes you (no polling, no routine progress message). Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
+            "orchestrate = \"{} lane(s) still working; end your turn to wait — reports wake you\"\n",
             running.len()
         ));
     }

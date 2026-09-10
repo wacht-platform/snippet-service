@@ -35,8 +35,8 @@ impl CoordinationDb {
             conn.execute(
                 "INSERT INTO agents
                  (id, display_name, handle, kind, status, role, capabilities_json,
-                  max_concurrent_assignments, max_concurrent_sessions, version, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                  max_concurrent_assignments, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
                     agent.id,
                     agent.display_name,
@@ -46,7 +46,6 @@ impl CoordinationDb {
                     enum_text(&agent.role),
                     capabilities,
                     agent.max_concurrent_assignments,
-                    agent.max_concurrent_sessions,
                     agent.version,
                     timestamp,
                 ],
@@ -59,7 +58,7 @@ impl CoordinationDb {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, display_name, handle, kind, status, role, capabilities_json,
-                        max_concurrent_assignments, max_concurrent_sessions, version
+                        max_concurrent_assignments, version
                  FROM agents ORDER BY display_name",
             )?;
             let rows = stmt.query_map([], |row| {
@@ -78,8 +77,7 @@ impl CoordinationDb {
                         rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(e))
                     })?,
                     max_concurrent_assignments: row.get::<_, i64>(7)? as u32,
-                    max_concurrent_sessions: row.get::<_, i64>(8)? as u32,
-                    version: row.get::<_, i64>(9)? as u64,
+                    version: row.get::<_, i64>(8)? as u64,
                 })
             })?;
             rows.collect()
@@ -108,7 +106,6 @@ mod tests {
             role: AgentRole::Implementer,
             capabilities: vec!["rust".into()],
             max_concurrent_assignments: 2,
-            max_concurrent_sessions: 1,
             version: 1,
         };
         db.create_agent(&agent).unwrap();

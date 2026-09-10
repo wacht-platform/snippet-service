@@ -165,11 +165,7 @@ mod inspect_tests {
     #[test]
     fn strip_steering_blocks_from_other_sessions() {
         let raw = "user said hi\n[steering]\n# INTERNAL STATE\n[/steering]\nkeep this";
-        let cleaned = strip_harness_markup(raw);
-        assert!(!cleaned.contains("[steering]"));
-        assert!(!cleaned.contains("INTERNAL STATE"));
-        assert!(cleaned.contains("user said hi"));
-        assert!(cleaned.contains("keep this"));
+        assert_eq!(strip_harness_markup(raw), "user said hi\n\nkeep this");
     }
 
     #[test]
@@ -179,10 +175,7 @@ mod inspect_tests {
         };
         let row = inspect_event_row(&event).expect("row");
         assert_eq!(row["kind"], "user");
-        let text = row["text"].as_str().unwrap();
-        assert!(text.contains("go over the changes"));
-        assert!(!text.contains("[steering]"));
-        assert!(!text.contains("ignore me"));
+        assert_eq!(row["text"], "go over the changes");
     }
 }
 

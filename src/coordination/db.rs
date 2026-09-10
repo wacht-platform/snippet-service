@@ -11,6 +11,8 @@ pub enum CoordinationDbError {
     NoParent(PathBuf),
     #[error("database lock poisoned")]
     LockPoisoned,
+    #[error("handoff record is malformed: {0}")]
+    HandoffDecode(String),
 }
 
 /// Shared SQLite connection for the local coordination control plane.
@@ -95,7 +97,6 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              role TEXT NOT NULL,
              capabilities_json TEXT NOT NULL,
              max_concurrent_assignments INTEGER NOT NULL,
-             max_concurrent_sessions INTEGER NOT NULL,
              version INTEGER NOT NULL,
              created_at TEXT NOT NULL,
              updated_at TEXT NOT NULL,

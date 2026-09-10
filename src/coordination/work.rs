@@ -92,7 +92,6 @@ mod tests {
             role: AgentRole::Implementer,
             capabilities: vec![],
             max_concurrent_assignments: 2,
-            max_concurrent_sessions: 1,
             version: 1,
         };
         db.create_agent(&agent).unwrap();

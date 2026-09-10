@@ -571,7 +571,7 @@ pub async fn run_serve(
         queue_revision: AtomicU64::new(0),
         mission_control_root: mission_control::MissionControlStore::default_root(None),
         coordination_db: crate::coordination::CoordinationDb::open(
-            mission_control::MissionControlStore::default_root(None).join("coordination.sqlite3"),
+            crate::coordination::default_db_path(),
         )
         .map_err(|error| format!("open coordination database: {error}"))?,
         coordination_events: tokio::sync::broadcast::channel(256).0,
@@ -1077,7 +1077,6 @@ struct CoordinationAgentReq {
     #[serde(default)]
     capabilities: Vec<String>,
     max_concurrent_assignments: u32,
-    max_concurrent_sessions: u32,
 }
 fn default_coord_agent_kind() -> crate::coordination::types::AgentKind {
     crate::coordination::types::AgentKind::Worker
@@ -1097,13 +1096,8 @@ async fn coordination_create_agent(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    if req.id.trim().is_empty() || req.handle.trim().is_empty() || req.max_concurrent_sessions == 0
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "id, handle, and max_concurrent_sessions are required",
-        )
-            .into_response();
+    if req.id.trim().is_empty() || req.handle.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "id and handle are required").into_response();
     }
     let agent = crate::coordination::types::Agent {
         id: req.id,
@@ -1114,11 +1108,10 @@ async fn coordination_create_agent(
         role: req.role,
         capabilities: req.capabilities,
         max_concurrent_assignments: req.max_concurrent_assignments,
-        max_concurrent_sessions: req.max_concurrent_sessions,
         version: 1,
     };
     let home = match crate::coordination::AgentHome::new(
-        crate::config::snippet_home().join("agents"),
+        crate::coordination::agents_root(&d.mission_control_root),
         &agent.id,
     ) {
         Ok(home) => home,
@@ -3361,6 +3354,122 @@ mod tests {
         assert!(!restarted.accept_nonce("session", "nonce-1", &state_path));
         assert!(restarted.accept_nonce("session", "nonce-2", &state_path));
     }
+
+    // -- Coordination route handlers -----------------------------------------
+    // These drive the real axum handlers (with their extractors) so auth,
+    // validation, and store wiring are covered, not just the DB beneath them.
+
+    fn authed_daemon() -> Shared {
+        let mut daemon = test_daemon();
+        daemon.token = "test-token".into();
+        Arc::new(daemon)
+    }
+
+    fn with_token() -> Auth {
+        Auth {
+            token: Some("test-token".into()),
+        }
+    }
+
+    fn create_agent_req(id: &str) -> CoordinationAgentReq {
+        CoordinationAgentReq {
+            id: id.into(),
+            display_name: "Web Research Specialist".into(),
+            handle: format!("handle-{id}"),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Researcher,
+            capabilities: vec!["web_search".into()],
+            max_concurrent_assignments: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_route_rejects_an_unauthenticated_request() {
+        let d = authed_daemon();
+        let response = coordination_agents(State(d), Query(Auth { token: None })).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn agents_route_requires_id_and_handle() {
+        let d = authed_daemon();
+        let mut req = create_agent_req("researcher");
+        req.handle = "  ".into();
+        let response = coordination_create_agent(State(d), Query(with_token()), Json(req)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agents_route_creates_then_lists() {
+        let d = authed_daemon();
+        let created = coordination_create_agent(
+            State(d.clone()),
+            Query(with_token()),
+            Json(create_agent_req("researcher")),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        // A duplicate id is a conflict, not a silent overwrite.
+        let duplicate = coordination_create_agent(
+            State(d.clone()),
+            Query(with_token()),
+            Json(create_agent_req("researcher")),
+        )
+        .await;
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let listed = coordination_agents(State(d), Query(with_token())).await;
+        assert_eq!(listed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn message_route_requires_a_body() {
+        let d = authed_daemon();
+        let response = coordination_post_message(
+            State(d),
+            Query(with_token()),
+            axum::extract::Path("t1".to_string()),
+            Json(CoordinationMessageReq {
+                actor_kind: "agent".into(),
+                actor_id: "mission-control".into(),
+                body: "   ".into(),
+                idempotency_key: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn message_route_posts_and_replays_by_cursor() {
+        let d = authed_daemon();
+        for body in ["first", "second"] {
+            let posted = coordination_post_message(
+                State(d.clone()),
+                Query(with_token()),
+                axum::extract::Path("t1".to_string()),
+                Json(CoordinationMessageReq {
+                    actor_kind: "agent".into(),
+                    actor_id: "mission-control".into(),
+                    body: body.into(),
+                    idempotency_key: String::new(),
+                }),
+            )
+            .await;
+            assert_eq!(posted.status(), StatusCode::OK);
+        }
+
+        // Full replay returns both; a cursor past the first returns only the tail.
+        let all = d.coordination_db.events_for_thread("t1", 0, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].sequence, 1);
+        assert_eq!(all[1].sequence, 2);
+        let tail = d.coordination_db.events_for_thread("t1", 1, 10).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].sequence, 2);
+    }
 }
 
 #[derive(Deserialize)]
@@ -3786,8 +3895,8 @@ async fn build_agent_from_prompt(
             "Build a specialized agent from this user brief:\n\n{}\n\n",
             "[AGENT_BUILD_JOB — not a project or workspace request]\n",
             "You are the agent builder. Do not create a project, do not create a new Mission Control session, do not ask the user to choose or confirm a folder, and do not route this request as ordinary work. Build the agent directly from the brief.\n",
-            "Research the role using web_search/web_read when useful. Choose a stable agent id and display name, create the durable agent home under ~/.snippet/agents/<agent-id>/, and write identity.md plus a validated profile and proposed Python tool manifests. Do not execute generated tools.\n",
-            "When finished, report the exact agent id, files created, research sources, tool proposals, validation, and blockers. Call report_mission_task with the final result. If the brief is insufficient, make sensible defaults rather than asking a workspace question."
+            "Build the shared specialized-session path first: every specialized agent receives the established session system prompt plus a researched, bounded identity.md overlay. Keep scheduling, turn-taking, handoffs, and state in shared runtime code; do not create per-agent role modules or runtime.json. Then create the durable agent home under ~/.snippet/agents/<agent-id>/ and write identity.md plus profile metadata. Tools are only narrow executable boundaries such as shell, third-party API, MCP, or vault-backed operations; do not emit workflow helpers as tools. Use web_search/web_read for research only when those schemas are present. Do not execute generated tools.\n",
+            "When finished, report the exact agent id, shared-session validation, files created, research sources, executable tool proposals, and blockers. Call report_mission_task with the final result. If the brief is insufficient, make sensible defaults rather than asking a workspace question."
         ),
         prompt
     );

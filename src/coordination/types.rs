@@ -40,7 +40,6 @@ pub struct Agent {
     pub role: AgentRole,
     pub capabilities: Vec<String>,
     pub max_concurrent_assignments: u32,
-    pub max_concurrent_sessions: u32,
     pub version: u64,
 }
 
@@ -114,6 +113,18 @@ pub struct Handoff {
     pub context_manifest: Value,
     pub created_at: String,
     pub content_hash: String,
+}
+
+impl Handoff {
+    /// Stable hash over the handoff's material fields (the hash itself excluded),
+    /// so a recipient can detect any silent mutation of the record it acknowledged.
+    pub fn compute_content_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut probe = self.clone();
+        probe.content_hash = String::new();
+        let bytes = serde_json::to_vec(&probe).unwrap_or_default();
+        format!("sha256:{:x}", Sha256::digest(&bytes))
+    }
 }
 
 #[cfg(test)]

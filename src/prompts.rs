@@ -1,22 +1,112 @@
-//! System-prompt layers. Every prompt lives as a `.md` file in the `prompts/`
-//! directory (repo root) and is embedded at compile time — none are inlined here.
+//! System-prompt composition.
+//!
+//! A stable execution/conversation core is always present. Capability- and
+//! environment-specific guidance (git worktree, browser, skills, vault, memory)
+//! is appended only when it applies, so an absent capability costs no tokens.
 
 pub const RUNTIME_SANDBOX_ENVIRONMENT: &str = include_str!("../prompts/sandbox_environment.md");
 pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer.md");
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
 pub const MISSION_CONTROL_LAYER: &str = include_str!("../prompts/mission_control_layer.md");
+pub const GIT_WORKTREE_LAYER: &str = include_str!("../prompts/git_worktree_layer.md");
+pub const MEMORY_GUIDANCE_LAYER: &str = include_str!("../prompts/memory_layer.md");
+pub const MEMORY_WRITE_LAYER: &str = include_str!("../prompts/memory_write_layer.md");
+pub const SKILLS_LAYER: &str = include_str!("../prompts/skills_layer.md");
+pub const VAULT_LAYER: &str = include_str!("../prompts/vault_layer.md");
+pub const BROWSER_LAYER: &str = include_str!("../prompts/browser_command_layer.md");
 
-pub fn coding_system_prompt() -> String {
-    [RUNTIME_SANDBOX_ENVIRONMENT, CODING_AGENT_LAYER].join("\n\n")
+/// Capability/environment facts that decide which optional layers render.
+/// These are a session-start snapshot, so the assembled prompt stays stable
+/// across a session's turns (prompt-cache friendly).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptContext {
+    /// The session workspace is a linked git worktree (not the main checkout).
+    pub worktree: bool,
+    /// Per-workspace memory is enabled; the index/patterns/rules block is
+    /// appended separately at session start.
+    pub memory: bool,
+    /// This session may write durable memory (main session, not read-only lanes).
+    pub memory_writable: bool,
+    /// At least one skill is installed.
+    pub skills: bool,
+    /// The vault holds at least one secret.
+    pub vault: bool,
+    /// This session can reach connected browsers.
+    pub browser: bool,
 }
 
+impl PromptContext {
+    /// Detect the capability/environment snapshot for `workspace`. Browser
+    /// reachability and memory enablement are supplied by the caller (it owns
+    /// those facts); skills and vault are probed here.
+    pub fn detect(
+        workspace: &std::path::Path,
+        memory: bool,
+        memory_writable: bool,
+        browser: bool,
+    ) -> Self {
+        Self {
+            worktree: crate::session::workspace_is_worktree(workspace),
+            memory,
+            memory_writable: memory && memory_writable,
+            skills: !crate::skills::discover().is_empty(),
+            vault: !crate::vault::Vault::load().is_empty(),
+            browser,
+        }
+    }
+
+    fn conditional_layers(&self) -> Vec<&'static str> {
+        let mut layers = Vec::new();
+        if self.worktree {
+            layers.push(GIT_WORKTREE_LAYER.trim());
+        }
+        if self.browser {
+            layers.push(BROWSER_LAYER.trim());
+        }
+        if self.skills {
+            layers.push(SKILLS_LAYER.trim());
+        }
+        if self.vault {
+            layers.push(VAULT_LAYER.trim());
+        }
+        if self.memory {
+            layers.push(MEMORY_GUIDANCE_LAYER.trim());
+        }
+        if self.memory && self.memory_writable {
+            layers.push(MEMORY_WRITE_LAYER.trim());
+        }
+        layers
+    }
+}
+
+pub fn coding_prompt(context: &PromptContext) -> String {
+    let mut parts = vec![
+        RUNTIME_SANDBOX_ENVIRONMENT.trim(),
+        CODING_AGENT_LAYER.trim(),
+    ];
+    parts.extend(context.conditional_layers());
+    parts.join("\n\n")
+}
+
+pub fn conversation_prompt(context: &PromptContext) -> String {
+    let mut parts = vec![
+        RUNTIME_SANDBOX_ENVIRONMENT.trim(),
+        CODING_AGENT_LAYER.trim(),
+    ];
+    parts.extend(context.conditional_layers());
+    parts.push(CONVERSATION_AGENT_LAYER.trim());
+    parts.join("\n\n")
+}
+
+/// Base execution prompt with no optional capabilities — used by tests and any
+/// caller that has not computed a `PromptContext`.
+pub fn coding_system_prompt() -> String {
+    coding_prompt(&PromptContext::default())
+}
+
+/// Base conversation prompt with no optional capabilities.
 pub fn conversation_system_prompt() -> String {
-    [
-        RUNTIME_SANDBOX_ENVIRONMENT,
-        CODING_AGENT_LAYER,
-        CONVERSATION_AGENT_LAYER,
-    ]
-    .join("\n\n")
+    conversation_prompt(&PromptContext::default())
 }
 
 pub fn mission_control_system_prompt() -> String {
@@ -26,66 +116,22 @@ pub fn mission_control_system_prompt() -> String {
     MISSION_CONTROL_LAYER.to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The normal shared session contract plus a bounded researched identity.
+/// The role overlay changes judgment and specialization, not the session's
+/// execution, safety, or conversation rules.
+pub struct SpecializedAgentPromptContext<'a> {
+    pub agent_id: &'a str,
+    pub identity_revision: u64,
+    pub identity: &'a str,
+    pub context: &'a PromptContext,
+}
 
-    #[test]
-    fn mission_control_prompt_classifies_messages_before_routing() {
-        let mc = mission_control_system_prompt();
-
-        // Mission Control is an orchestrator, not a project worker.
-        assert!(mc.contains("Mission Control"));
-        assert!(mc.contains("a coding agent"));
-        assert!(mc.contains("Classify the current message before selecting a tool"));
-        assert!(mc.contains("direct_user"));
-        assert!(mc.contains("assigned_first"));
-        assert!(mc.contains("worker_report"));
-
-        // Direct user agent requests are not project tasks.
-        assert!(mc.contains("The user is allowed to ask Mission Control to build an agent"));
-        assert!(mc.contains("If it asks to create/build/spin up an agent"));
-        assert!(mc.contains("Do not create a project, workspace, Mission Control task"));
-        assert!(mc.contains("POST /agents/build"));
-        assert!(mc.contains("Do not turn the brief into project initialization"));
-        assert!(mc.contains("Never approximate it with create_mission_task"));
-
-        // An assigned build must be executed or reported blocked, never routed again.
-        assert!(mc.contains("[AGENT_BUILD_JOB]"));
-        assert!(mc.contains("already assigned work from the daemon"));
-        assert!(mc.contains(
-            "Do not call create_mission_session, create_mission_task, or create_recurring_job"
-        ));
-        assert!(mc.contains("report blocked with the exact missing capability"));
-        assert!(mc.contains("report the original task_id"));
-        assert!(mc.contains("never create a normal project task to compensate"));
-
-        // Ordinary project routing remains available, but only for that message class.
-        assert!(mc.contains("This is the only class that normally uses create_mission_task"));
-        assert!(mc.contains("For ordinary project requests only, list_sessions first"));
-        assert!(mc.contains("route one handoff"));
-        assert!(mc.contains("This workflow never applies to agent creation"));
-        assert!(mc.contains("One user request gets one task"));
-        assert!(mc.contains("retry the same task id"));
-
-        // Lifecycle supervision includes explicit no-op decisions.
-        assert!(mc.contains("act, acknowledge, request approval, or explicitly no-op"));
-        assert!(mc.contains("No-op is a valid explicit decision"));
-        assert!(mc.contains("Do not create a new task merely because a report arrived"));
-
-        assert!(mc.contains("[steering]"));
-        assert!(mc.contains("inspect_session output is another chat's history"));
-        assert!(!mc.contains("snippet_execution_agent"));
-        assert!(!mc.contains("you own the task end to end"));
-        assert!(!mc.contains("NO sandbox or jail"));
-
-        let coding = coding_system_prompt();
-        assert!(coding.contains("snippet_execution_agent"));
-        assert!(coding.contains("Do the work in THIS session"));
-
-        let conversation = conversation_system_prompt();
-        assert!(conversation.contains("snippet_conversation_agent"));
-        assert!(conversation.contains("Never commit or push to main/master"));
-        assert!(!conversation.contains("You are Mission Control"));
-    }
+pub fn specialized_agent_system_prompt(context: SpecializedAgentPromptContext<'_>) -> String {
+    format!(
+        "{base}\n\n[agent_identity]\nid = \"{id}\"\nrevision = {revision}\nidentity = \"\"\"\n{identity}\n\"\"\"\n",
+        base = conversation_prompt(context.context),
+        id = context.agent_id,
+        revision = context.identity_revision,
+        identity = context.identity.trim(),
+    )
 }

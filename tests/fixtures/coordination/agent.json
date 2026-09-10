@@ -1,1 +1,1 @@
-{"id":"agent-implementer","display_name":"Implementer","handle":"implementer","kind":"worker","status":"active","role":"implementer","capabilities":["rust","flutter"],"max_concurrent_assignments":4,"max_concurrent_sessions":2,"version":1}
+{"id":"agent-implementer","display_name":"Implementer","handle":"implementer","kind":"worker","status":"active","role":"implementer","capabilities":["rust","flutter"],"max_concurrent_assignments":4,"version":1}
