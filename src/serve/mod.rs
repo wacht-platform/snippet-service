@@ -1102,11 +1102,44 @@ struct Auth {
     token: Option<String>,
 }
 
-async fn coordination_agents(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
+#[derive(Deserialize)]
+struct CoordinationAgentsQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(display_name, id)`.
+    #[serde(default)]
+    after_name: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_coord_page_limit")]
+    limit: u32,
+}
+fn default_coord_page_limit() -> u32 {
+    200
+}
+
+async fn coordination_agents(
+    State(d): State<Shared>,
+    Query(q): Query<CoordinationAgentsQuery>,
+) -> Response {
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match d.coordination_db.list_agents() {
+    let after = match (q.after_name.as_deref(), q.after_id.as_deref()) {
+        (Some(name), Some(id)) => Some((name, id)),
+        // A lone cursor half is a caller error, not a silent full listing.
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_name and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    match d
+        .coordination_db
+        .list_agents_page(after, q.limit.clamp(1, 500))
+    {
         Ok(agents) => Json(agents).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3521,10 +3554,19 @@ mod tests {
         }
     }
 
+    fn agents_query(token: Option<&str>) -> CoordinationAgentsQuery {
+        CoordinationAgentsQuery {
+            token: token.map(str::to_string),
+            after_name: None,
+            after_id: None,
+            limit: default_coord_page_limit(),
+        }
+    }
+
     #[tokio::test]
     async fn agents_route_rejects_an_unauthenticated_request() {
         let d = authed_daemon();
-        let response = coordination_agents(State(d), Query(Auth { token: None })).await;
+        let response = coordination_agents(State(d), Query(agents_query(None))).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -3557,7 +3599,7 @@ mod tests {
         .await;
         assert_eq!(duplicate.status(), StatusCode::CONFLICT);
 
-        let listed = coordination_agents(State(d), Query(with_token())).await;
+        let listed = coordination_agents(State(d), Query(agents_query(Some("test-token")))).await;
         assert_eq!(listed.status(), StatusCode::OK);
     }
 
