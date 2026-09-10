@@ -68,6 +68,45 @@ fn actor(ctx: &ToolContext) -> Result<(&'static str, String), ToolError> {
         })
 }
 
+/// Best-effort git facts for the handoff's `workspace_ref`. The successor needs
+/// the repository/branch/revision it will inherit; a non-git workspace yields an
+/// empty object rather than failing the handoff.
+fn derive_workspace_ref(workspace: &std::path::Path) -> Value {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let mut map = serde_json::Map::new();
+    if let Some(root) = git(&["rev-parse", "--show-toplevel"]) {
+        map.insert("repository".into(), json!(root));
+    }
+    if let Some(branch) = git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        map.insert("branch".into(), json!(branch));
+    }
+    if let Some(revision) = git(&["rev-parse", "HEAD"]) {
+        map.insert("revision".into(), json!(revision));
+    }
+    Value::Object(map)
+}
+
+/// The handoff's `context_manifest`: what the successor should read to rebuild
+/// context, derived from live state rather than supplied by the model.
+fn derive_context_manifest(workspace: &std::path::Path) -> Value {
+    json!({
+        "workspace": workspace.display().to_string(),
+        "session_scope": "the session transcript holds the full history; this manifest is only retrieval pointers",
+    })
+}
+
 pub struct ListCoordinationAgents;
 #[async_trait]
 impl Tool for ListCoordinationAgents {
@@ -509,8 +548,6 @@ struct HandoffArgs {
     #[serde(default)]
     non_goals: Vec<String>,
     #[serde(default)]
-    workspace_ref: Value,
-    #[serde(default)]
     completed_summary: String,
     #[serde(default)]
     next_action: String,
@@ -526,8 +563,6 @@ struct HandoffArgs {
     artifacts: Vec<Value>,
     #[serde(default)]
     verification: Vec<Value>,
-    #[serde(default)]
-    context_manifest: Value,
 }
 
 pub struct CreateCoordinationHandoff;
@@ -547,7 +582,6 @@ impl Tool for CreateCoordinationHandoff {
                     "definition_of_done":{"type":"string"},
                     "scope":{"type":"string"},
                     "non_goals":{"type":"array","items":{"type":"string"}},
-                    "workspace_ref":{"type":"object"},
                     "completed_summary":{"type":"string"},
                     "next_action":{"type":"string"},
                     "decisions":{"type":"array","items":{"type":"string"}},
@@ -555,8 +589,7 @@ impl Tool for CreateCoordinationHandoff {
                     "blockers":{"type":"array","items":{"type":"string"}},
                     "dependencies":{"type":"array","items":{"type":"string"}},
                     "artifacts":{"type":"array","items":{"type":"object"}},
-                    "verification":{"type":"array","items":{"type":"object"}},
-                    "context_manifest":{"type":"object"}
+                    "verification":{"type":"array","items":{"type":"object"}}
                 }),
                 &[
                     "goal_id",
@@ -622,7 +655,7 @@ impl Tool for CreateCoordinationHandoff {
             definition_of_done: args.definition_of_done,
             scope: args.scope,
             non_goals: args.non_goals,
-            workspace_ref: args.workspace_ref,
+            workspace_ref: derive_workspace_ref(ctx.workspace_root()),
             completed_summary: args.completed_summary,
             next_action: args.next_action,
             decisions: args.decisions,
@@ -631,7 +664,7 @@ impl Tool for CreateCoordinationHandoff {
             dependencies: args.dependencies,
             artifacts: args.artifacts,
             verification: args.verification,
-            context_manifest: args.context_manifest,
+            context_manifest: derive_context_manifest(ctx.workspace_root()),
             created_at: now_rfc3339(),
             content_hash: String::new(),
         };
@@ -1227,5 +1260,58 @@ mod tests {
                 .to_string()
                 .contains("does not match its recorded hash")
         );
+    }
+
+    #[tokio::test]
+    async fn handoff_workspace_ref_and_manifest_are_derived_not_supplied() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = two_workers(dir.path());
+        let holder = worker_ctx(dir.path(), "s1", "w1");
+        AcceptCoordinationAssignment
+            .execute(&holder, json!({"assignment_id":"a1"}))
+            .await
+            .unwrap();
+
+        // Caller-supplied workspace_ref/context_manifest are not part of the schema
+        // any more; the tool derives both from live state.
+        let created = CreateCoordinationHandoff
+            .execute(&holder, handoff_args())
+            .await
+            .unwrap();
+        let id = created.value["data"]["handoff_id"].as_str().unwrap();
+        let stored = db.get_handoff(id).unwrap().unwrap();
+
+        // A non-git workspace yields an empty ref rather than a bogus one.
+        assert_eq!(stored.workspace_ref, json!({}));
+        // The manifest records the real workspace the successor inherits.
+        assert_eq!(
+            stored.context_manifest["workspace"].as_str().unwrap(),
+            dir.path().display().to_string()
+        );
+    }
+
+    #[test]
+    fn workspace_ref_reports_branch_and_revision_in_a_git_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(path.join("f.txt"), "x").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        let workspace_ref = derive_workspace_ref(path);
+        assert!(workspace_ref["branch"].is_string());
+        let revision = workspace_ref["revision"].as_str().unwrap();
+        assert_eq!(revision.len(), 40, "expected a full sha, got {revision}");
     }
 }
