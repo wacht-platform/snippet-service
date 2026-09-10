@@ -673,8 +673,9 @@ pub async fn run_serve(
         .route("/agents/build", post(build_agent_from_prompt))
         .route(
             "/coordination/assignments",
-            post(coordination_create_assignment),
+            get(coordination_list_assignments).post(coordination_create_assignment),
         )
+        .route("/coordination/leases", get(coordination_list_leases))
         .route(
             "/coordination/sessions/{session_id}/lease",
             post(coordination_acquire_lease),
@@ -1369,6 +1370,80 @@ struct CoordinationAssignmentReq {
     agent_id: String,
     scope: String,
     definition_of_done: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinationAssignmentsQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(created_at, id)`.
+    #[serde(default)]
+    after_created: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_coord_page_limit")]
+    limit: u32,
+    /// Optional filter by agent, for "what is this agent working on".
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Assignments, newest page first by `(created_at, id)` keyset. Optionally
+/// filtered to one agent or one session, which is how the UI answers "who is
+/// working on what".
+async fn coordination_list_assignments(
+    State(d): State<Shared>,
+    Query(q): Query<CoordinationAssignmentsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let after = match (q.after_created.as_deref(), q.after_id.as_deref()) {
+        (Some(created), Some(id)) => Some((created, id)),
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_created and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    let filter = crate::coordination::AssignmentFilter {
+        agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
+        session_id: q.session_id.as_deref().filter(|s| !s.trim().is_empty()),
+    };
+    match d
+        .coordination_db
+        .list_assignments_page(&filter, after, q.limit.clamp(1, 500))
+    {
+        Ok(assignments) => Json(assignments).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list assignments: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Sessions that currently have an active turn holder: the live view of which
+/// agent is working in which session, and since when.
+async fn coordination_list_leases(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .list_active_leases(&chrono::Utc::now().to_rfc3339())
+    {
+        Ok(leases) => Json(leases).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list leases: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn coordination_create_assignment(
@@ -3912,6 +3987,155 @@ mod tests {
         let tail = d.coordination_db.events_for_thread("t1", 1, 10).unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].sequence, 2);
+    }
+
+    // -- Coordination visibility routes -------------------------------------
+
+    fn assignments_query(token: Option<&str>, agent: Option<&str>) -> CoordinationAssignmentsQuery {
+        CoordinationAssignmentsQuery {
+            token: token.map(str::to_string),
+            after_created: None,
+            after_id: None,
+            limit: default_coord_page_limit(),
+            agent_id: agent.map(str::to_string),
+            session_id: None,
+        }
+    }
+
+    /// Register an agent so assignments satisfy the FK to agents(id).
+    fn seed_agent(d: &Shared, id: &str) {
+        d.coordination_db
+            .create_agent(&crate::coordination::types::Agent {
+                id: id.into(),
+                display_name: id.into(),
+                handle: id.into(),
+                kind: crate::coordination::types::AgentKind::Worker,
+                status: crate::coordination::types::AgentStatus::Active,
+                role: crate::coordination::types::AgentRole::Implementer,
+                capabilities: vec![],
+                max_concurrent_assignments: 2,
+                version: 1,
+            })
+            .unwrap();
+    }
+
+    fn seed_assignment(d: &Shared, id: &str, agent: &str, created: &str) {
+        d.coordination_db
+            .create_assignment(&crate::coordination::Assignment {
+                id: id.into(),
+                goal_id: "g1".into(),
+                session_id: "s1".into(),
+                agent_id: agent.into(),
+                status: crate::coordination::AssignmentStatus::Offered,
+                scope: "src".into(),
+                definition_of_done: "tests".into(),
+                created_at: created.into(),
+                updated_at: created.into(),
+            })
+            .unwrap();
+    }
+
+    /// Read a response body as JSON, so tests assert on content rather than
+    /// just the status code.
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn assignments_route_rejects_an_unauthenticated_request() {
+        let d = authed_daemon();
+        let response =
+            coordination_list_assignments(State(d), Query(assignments_query(None, None))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn assignments_route_lists_all_and_filters_by_agent() {
+        let d = authed_daemon();
+        seed_agent(&d, "w1");
+        seed_agent(&d, "w2");
+        seed_assignment(&d, "a1", "w1", "2020-01-01T00:00:01Z");
+        seed_assignment(&d, "a2", "w2", "2020-01-01T00:00:02Z");
+        seed_assignment(&d, "a3", "w1", "2020-01-01T00:00:03Z");
+
+        let all = coordination_list_assignments(
+            State(d.clone()),
+            Query(assignments_query(Some("test-token"), None)),
+        )
+        .await;
+        let all = json_body(all).await;
+        assert_eq!(all.as_array().unwrap().len(), 3);
+
+        // Filtering happens in SQL, so the page contains only this agent's work.
+        let filtered = coordination_list_assignments(
+            State(d.clone()),
+            Query(assignments_query(Some("test-token"), Some("w1"))),
+        )
+        .await;
+        let filtered = json_body(filtered).await;
+        let ids: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["a1", "a3"]);
+    }
+
+    #[tokio::test]
+    async fn assignments_route_rejects_a_lone_cursor_half() {
+        let d = authed_daemon();
+        let mut q = assignments_query(Some("test-token"), None);
+        q.after_created = Some("2020-01-01T00:00:00Z".into());
+        let response = coordination_list_assignments(State(d), Query(q)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn leases_route_reports_who_holds_the_session() {
+        let d = authed_daemon();
+        seed_agent(&d, "w1");
+        seed_assignment(&d, "a1", "w1", "2020-01-01T00:00:00Z");
+        let now = chrono::Utc::now();
+        d.coordination_db
+            .acquire_lease(&crate::coordination::SessionLease {
+                session_id: "s1".into(),
+                lease_id: "l1".into(),
+                assignment_id: "a1".into(),
+                agent_id: "w1".into(),
+                fencing_token: 0,
+                acquired_at: now.to_rfc3339(),
+                renewed_at: now.to_rfc3339(),
+                expires_at: (now + chrono::Duration::seconds(90)).to_rfc3339(),
+            })
+            .unwrap();
+
+        let response = coordination_list_leases(State(d), Query(with_token())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let holders = body.as_array().unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0]["agent_id"], "w1");
+        assert_eq!(holders[0]["session_id"], "s1");
+        assert_eq!(holders[0]["assignment_id"], "a1");
+    }
+
+    #[tokio::test]
+    async fn leases_route_is_empty_when_nothing_is_held() {
+        let d = authed_daemon();
+        let response = coordination_list_leases(State(d), Query(with_token())).await;
+        let body = json_body(response).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leases_route_rejects_an_unauthenticated_request() {
+        let d = authed_daemon();
+        let response = coordination_list_leases(State(d), Query(Auth { token: None })).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
 

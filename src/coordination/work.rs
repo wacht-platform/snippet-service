@@ -41,6 +41,15 @@ fn parse_status(value: String) -> Result<AssignmentStatus, rusqlite::Error> {
     })
 }
 
+/// Optional narrowing for an assignment page. Filters are applied in SQL so a
+/// filtered page is still filled to `limit` — filtering after pagination would
+/// silently return short pages and break paging.
+#[derive(Debug, Clone, Default)]
+pub struct AssignmentFilter<'a> {
+    pub agent_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+}
+
 impl CoordinationDb {
     pub fn create_assignment(&self, assignment: &Assignment) -> Result<(), CoordinationDbError> {
         self.with_connection(|conn| {
@@ -61,6 +70,7 @@ impl CoordinationDb {
     /// A short page signals the end.
     pub fn list_assignments_page(
         &self,
+        filter: &AssignmentFilter<'_>,
         after: Option<(&str, &str)>,
         limit: u32,
     ) -> Result<Vec<Assignment>, CoordinationDbError> {
@@ -73,23 +83,34 @@ impl CoordinationDb {
                 "SELECT id, goal_id, session_id, agent_id, status, scope,
                         definition_of_done, created_at, updated_at
                  FROM assignments
-                 WHERE ?1 IS NULL OR (created_at, id) > (?1, ?2)
+                 WHERE (?1 IS NULL OR (created_at, id) > (?1, ?2))
+                   AND (?3 IS NULL OR agent_id = ?3)
+                   AND (?4 IS NULL OR session_id = ?4)
                  ORDER BY created_at, id
-                 LIMIT ?3",
+                 LIMIT ?5",
             )?;
-            let rows = stmt.query_map(params![after_created, after_id, limit], |row| {
-                Ok(Assignment {
-                    id: row.get(0)?,
-                    goal_id: row.get(1)?,
-                    session_id: row.get(2)?,
-                    agent_id: row.get(3)?,
-                    status: parse_status(row.get(4)?)?,
-                    scope: row.get(5)?,
-                    definition_of_done: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![
+                    after_created,
+                    after_id,
+                    filter.agent_id,
+                    filter.session_id,
+                    limit
+                ],
+                |row| {
+                    Ok(Assignment {
+                        id: row.get(0)?,
+                        goal_id: row.get(1)?,
+                        session_id: row.get(2)?,
+                        agent_id: row.get(3)?,
+                        status: parse_status(row.get(4)?)?,
+                        scope: row.get(5)?,
+                        definition_of_done: row.get(6)?,
+                        created_at: row.get(7)?,
+                        updated_at: row.get(8)?,
+                    })
+                },
+            )?;
             rows.collect()
         })
     }
@@ -199,18 +220,86 @@ mod tests {
             .unwrap();
         }
 
-        let first = db.list_assignments_page(None, 2).unwrap();
+        let first = db
+            .list_assignments_page(&AssignmentFilter::default(), None, 2)
+            .unwrap();
         assert_eq!(
             first.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
             ["a1", "a2"]
         );
         let last = first.last().unwrap();
         let second = db
-            .list_assignments_page(Some((&last.created_at, &last.id)), 2)
+            .list_assignments_page(
+                &AssignmentFilter::default(),
+                Some((&last.created_at, &last.id)),
+                2,
+            )
             .unwrap();
         assert_eq!(
             second.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
             ["a3"]
+        );
+    }
+
+    /// A filtered page must still be filled to the limit: filtering after
+    /// pagination would return short pages and silently break paging.
+    #[test]
+    fn assignment_pages_apply_filters_before_limiting() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        for id in ["w1", "w2"] {
+            db.create_agent(&Agent {
+                id: id.into(),
+                display_name: id.into(),
+                handle: id.into(),
+                kind: AgentKind::Worker,
+                status: AgentStatus::Active,
+                role: AgentRole::Implementer,
+                capabilities: vec![],
+                max_concurrent_assignments: 2,
+                version: 1,
+            })
+            .unwrap();
+        }
+        // Interleave two agents so an unfiltered page would be mixed.
+        let rows = [
+            ("a1", "w1", "2020-01-01T00:00:01Z"),
+            ("a2", "w2", "2020-01-01T00:00:02Z"),
+            ("a3", "w1", "2020-01-01T00:00:03Z"),
+            ("a4", "w1", "2020-01-01T00:00:04Z"),
+        ];
+        for (id, agent, created) in rows {
+            db.create_assignment(&Assignment {
+                id: id.into(),
+                goal_id: "g".into(),
+                session_id: "s".into(),
+                agent_id: agent.into(),
+                status: AssignmentStatus::Offered,
+                scope: "x".into(),
+                definition_of_done: "y".into(),
+                created_at: created.into(),
+                updated_at: created.into(),
+            })
+            .unwrap();
+        }
+
+        let filter = AssignmentFilter {
+            agent_id: Some("w1"),
+            ..Default::default()
+        };
+        // w1 has three assignments; a limit of 2 must return exactly 2 of them
+        // (not fewer because w2's row occupied a slot).
+        let page = db.list_assignments_page(&filter, None, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a1", "a3"]
+        );
+        let last = page.last().unwrap();
+        let next = db
+            .list_assignments_page(&filter, Some((&last.created_at, &last.id)), 2)
+            .unwrap();
+        assert_eq!(
+            next.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["a4"]
         );
     }
 }
