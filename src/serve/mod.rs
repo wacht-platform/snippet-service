@@ -1302,7 +1302,20 @@ async fn coordination_post_message(
             // posts so a reply can't wake the session that wrote it.
             if should_wake_mission_control(&saved.actor_id) {
                 let daemon = d.clone();
-                let envelope = board_message_envelope(&saved);
+                // Hand over a bounded slice of the room, excluding the message
+                // just posted (the envelope carries it separately as `body`), so
+                // the wake reads as a group chat rather than one isolated line.
+                let history: Vec<_> = d
+                    .coordination_db
+                    .recent_events_for_thread(
+                        &saved.thread_id,
+                        crate::coordination_tools::BOARD_HISTORY_ON_WAKE + 1,
+                    )
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| e.sequence < saved.sequence)
+                    .collect();
+                let envelope = board_message_envelope(&saved, &history);
                 tokio::spawn(async move {
                     daemon
                         .deliver(
@@ -1418,25 +1431,64 @@ fn should_wake_mission_control(actor_id: &str) -> bool {
 /// to guess an id.
 pub const COORDINATION_THREAD: &str = "system";
 
-/// The envelope handed to Mission Control when a human posts to the board. Wraps
-/// the message so it is not mistaken for a direct chat turn.
+/// Collapse a message body to a single line for the history digest, so a
+/// multi-line message can't break the field-per-line layout.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The envelope handed to Mission Control when someone posts to the board — the
+/// shared room. Wraps the message so it is not mistaken for a direct chat turn,
+/// and carries a bounded slice of recent history so the room reads as a group
+/// chat rather than a single isolated line.
 ///
 /// Field order matters: `body` is deliberately last, so a client can take
 /// everything up to the closing tag as the message — including newlines — and
-/// the internal `rules` never run into the sender's text.
-fn board_message_envelope(event: &crate::coordination::types::CoordinationEvent) -> String {
+/// the internal `rules` and history never run into the sender's text.
+fn board_message_envelope(
+    event: &crate::coordination::types::CoordinationEvent,
+    history: &[crate::coordination::types::CoordinationEvent],
+) -> String {
     let body = event
         .payload
         .get("body")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    let mut digest = String::new();
+    if history.is_empty() {
+        digest.push_str("history: (start of the room)\n");
+    } else {
+        digest.push_str(&format!(
+            "history: last {} message(s), oldest first\n",
+            history.len()
+        ));
+        for prior in history {
+            let prior_body = one_line(
+                prior
+                    .payload
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            );
+            digest.push_str(&format!(
+                "  {} [{}] {}: {}\n",
+                prior.sequence, prior.actor_kind, prior.actor_id, prior_body
+            ));
+        }
+    }
     format!(
         "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n\
-         rules: board message, not an ordinary chat turn. Decide whether it needs a response, a handoff, \
-         or an assignment; reply on this same thread with post_coordination_message so the sender sees it. \
-         If no action is needed, say so on the thread rather than staying silent.\nbody: {}\n\
+         rules: board message, not an ordinary chat turn. This is a shared group room, not a direct \
+         message. Decide whether it needs a response, a handoff, or an assignment; reply on this same \
+         thread with post_coordination_message so everyone sees it. If no action is needed, say so on \
+         the thread rather than staying silent. Only the recent history is included — call \
+         read_coordination_thread to see more.\n{history}body: {body}\n\
          [/coordination_board_message]",
-        event.thread_id, event.actor_id, event.actor_kind, body
+        event.thread_id,
+        event.actor_id,
+        event.actor_kind,
+        history = digest,
+        body = body,
     )
 }
 
@@ -1448,7 +1500,9 @@ fn coordination_assignment_envelope(assignment: &crate::coordination::Assignment
          rules: accept this assignment to acquire the turn (accept_coordination_assignment), \
          renew_coordination_lease while working, release_coordination_lease when done or handing off. \
          Post progress to the board with post_coordination_message on board_thread — that is the thread the \
-         human reads, so a post anywhere else goes unseen. Do not mutate the workspace until you hold the turn.\n\
+         human reads, so a post anywhere else goes unseen. Read the room with \
+         read_coordination_thread when you need more history than the wake message included. \
+         Do not mutate the workspace until you hold the turn.\n\
          [/coordination_assignment]",
         assignment.id,
         assignment.goal_id,
@@ -3701,7 +3755,7 @@ mod tests {
             idempotency_key: "k".into(),
             created_at: "2020-01-01T00:00:00Z".into(),
         };
-        let envelope = board_message_envelope(&event);
+        let envelope = board_message_envelope(&event, &[]);
         assert!(envelope.starts_with("[coordination_board_message]"));
         assert!(envelope.contains("thread_id: system"));
         assert!(envelope.contains("from_id: human"));
@@ -3731,7 +3785,7 @@ mod tests {
             idempotency_key: "k2".into(),
             created_at: "2020-01-01T00:00:00Z".into(),
         };
-        let envelope = board_message_envelope(&event);
+        let envelope = board_message_envelope(&event, &[]);
         let after_body = envelope.split_once("body: ").expect("body field present").1;
         assert!(after_body.starts_with("line one\nline two"));
         assert!(
@@ -3739,6 +3793,68 @@ mod tests {
                 .trim_end()
                 .ends_with("[/coordination_board_message]")
         );
+    }
+
+    /// The wake must read as a group room: recent messages are included, and the
+    /// digest can't be confused with the new message or the field layout.
+    #[test]
+    fn board_message_envelope_includes_bounded_history() {
+        let prior =
+            |seq: u64, who: &str, body: &str| crate::coordination::types::CoordinationEvent {
+                event_id: format!("e{seq}"),
+                thread_id: COORDINATION_THREAD.into(),
+                partition_key: format!("thread:{COORDINATION_THREAD}"),
+                sequence: seq,
+                event_type: "message.posted".into(),
+                actor_kind: "agent".into(),
+                actor_id: who.into(),
+                payload_version: 1,
+                payload: serde_json::json!({"body": body}),
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: format!("k{seq}"),
+                created_at: "2020-01-01T00:00:00Z".into(),
+            };
+        let current = prior(5, "human", "what is the status?");
+        let history = [
+            prior(3, "mission-control", "started the review"),
+            prior(4, "reviewer", "found two issues"),
+        ];
+
+        let envelope = board_message_envelope(&current, &history);
+        // Both prior turns appear, attributed.
+        assert!(envelope.contains("mission-control: started the review"));
+        assert!(envelope.contains("reviewer: found two issues"));
+        assert!(envelope.contains("history: last 2 message(s)"));
+        // The new message is still the final body, and history precedes it.
+        let body_at = envelope.find("body: what is the status?").unwrap();
+        let history_at = envelope.find("history:").unwrap();
+        assert!(history_at < body_at);
+        // A multi-line prior body is collapsed so it can't break the layout.
+        let wrapped = board_message_envelope(&current, &[prior(1, "a", "line one\nline two")]);
+        assert!(wrapped.contains("a: line one line two"));
+    }
+
+    /// With no history the room is honestly reported as just starting.
+    #[test]
+    fn board_message_envelope_marks_an_empty_room() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e1".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 1,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "first ever message"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event, &[]);
+        assert!(envelope.contains("history: (start of the room)"));
     }
 
     #[tokio::test]

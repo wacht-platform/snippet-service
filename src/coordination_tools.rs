@@ -19,6 +19,7 @@ fn schema(properties: Value, required: &[&str]) -> Value {
 pub fn add_coordination_tools(registry: &mut ToolRegistry) {
     registry.insert(ListCoordinationAgents);
     registry.insert(PostCoordinationMessage);
+    registry.insert(ReadCoordinationThread);
 }
 
 /// Tools only Mission Control may use to offer new work.
@@ -183,6 +184,92 @@ impl Tool for PostCoordinationMessage {
             .append_event(&event)
             .map_err(|e| ToolError::msg(format!("post message: {e}")))?;
         Ok(ToolResult::success(json!({"event": saved})))
+    }
+}
+
+/// Default slice of room history handed over when a participant is woken. Small
+/// enough to keep the wake cheap, large enough to hold the current exchange.
+pub const BOARD_HISTORY_ON_WAKE: u32 = 10;
+
+#[derive(Deserialize)]
+struct ReadThreadArgs {
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// Page forward from just after this sequence. Omit to get the most recent
+    /// messages instead (the usual first call).
+    #[serde(default)]
+    after_sequence: Option<u64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// One board message, flattened for the model: who said what, when.
+fn flatten_event(event: &CoordinationEvent) -> Value {
+    json!({
+        "sequence": event.sequence,
+        "from": event.actor_id,
+        "kind": event.actor_kind,
+        "at": event.created_at,
+        "body": event.payload.get("body").and_then(|v| v.as_str()).unwrap_or_default(),
+    })
+}
+
+pub struct ReadCoordinationThread;
+#[async_trait]
+impl Tool for ReadCoordinationThread {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "read_coordination_thread".into(),
+            description: "Read the coordination room's messages, oldest first. Call with no arguments for the most recent messages; pass after_sequence to page further back (use the returned oldest_sequence) or forward. The wake message already includes the recent history, so use this only to see more.".into(),
+            input_schema: schema(
+                json!({
+                    "thread_id":{"type":"string","description":"defaults to the shared room"},
+                    "after_sequence":{"type":"integer","minimum":0,"description":"omit for the most recent messages"},
+                    "limit":{"type":"integer","minimum":1,"maximum":100}
+                }),
+                &[],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ReadThreadArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let thread_id = args
+            .thread_id
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| crate::serve::COORDINATION_THREAD.to_string());
+        let limit = args.limit.unwrap_or(20).clamp(1, 100);
+        let db = db(ctx)?;
+
+        // No cursor → the most recent messages. Cursor → the next page forward.
+        // `after_sequence: 0` deliberately means "from the beginning".
+        let (events, page_forward) = match args.after_sequence {
+            Some(after) => (
+                db.events_for_thread(&thread_id, after, limit)
+                    .map_err(|e| ToolError::msg(format!("read thread: {e}")))?,
+                true,
+            ),
+            None => (
+                db.recent_events_for_thread(&thread_id, limit)
+                    .map_err(|e| ToolError::msg(format!("read thread: {e}")))?,
+                false,
+            ),
+        };
+
+        let oldest = events.first().map(|e| e.sequence).unwrap_or(0);
+        let newest = events.last().map(|e| e.sequence).unwrap_or(0);
+        // A full page is a hint there may be more; the caller pages with the
+        // oldest sequence to go back, or the newest to move forward.
+        let full_page = events.len() as u32 >= limit;
+        Ok(ToolResult::success(json!({
+            "thread_id": thread_id,
+            "messages": events.iter().map(flatten_event).collect::<Vec<_>>(),
+            "oldest_sequence": oldest,
+            "newest_sequence": newest,
+            "may_have_more": full_page,
+            "direction": if page_forward { "forward" } else { "recent" },
+        })))
     }
 }
 
@@ -1313,5 +1400,96 @@ mod tests {
         assert!(workspace_ref["branch"].is_string());
         let revision = workspace_ref["revision"].as_str().unwrap();
         assert_eq!(revision.len(), 40, "expected a full sha, got {revision}");
+    }
+
+    #[tokio::test]
+    async fn read_thread_defaults_to_the_shared_room_most_recent_first() {
+        let dir = tempfile::tempdir().unwrap();
+        migrate(dir.path());
+        let ctx = context(dir.path(), "mission-control");
+        for body in ["one", "two", "three"] {
+            PostCoordinationMessage
+                .execute(
+                    &ctx,
+                    json!({"thread_id": crate::serve::COORDINATION_THREAD, "body": body}),
+                )
+                .await
+                .unwrap();
+        }
+
+        // No arguments: the most recent messages, oldest first, defaults to the
+        // shared room.
+        let read = ReadCoordinationThread
+            .execute(&ctx, json!({}))
+            .await
+            .unwrap();
+        let data = &read.value["data"];
+        assert_eq!(data["thread_id"], crate::serve::COORDINATION_THREAD);
+        let bodies: Vec<&str> = data["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap())
+            .collect();
+        assert_eq!(bodies, ["one", "two", "three"]);
+        assert_eq!(data["oldest_sequence"], 1);
+        assert_eq!(data["newest_sequence"], 3);
+    }
+
+    #[tokio::test]
+    async fn read_thread_pages_forward_and_back_by_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        migrate(dir.path());
+        let ctx = context(dir.path(), "mission-control");
+        for body in ["m1", "m2", "m3", "m4"] {
+            PostCoordinationMessage
+                .execute(&ctx, json!({"thread_id": "t", "body": body}))
+                .await
+                .unwrap();
+        }
+
+        // Recent window, then page further back using the returned oldest.
+        let recent = ReadCoordinationThread
+            .execute(&ctx, json!({"thread_id": "t", "limit": 2}))
+            .await
+            .unwrap();
+        let data = &recent.value["data"];
+        assert_eq!(
+            data["messages"].as_array().unwrap().len(),
+            2,
+            "limit bounds the window"
+        );
+        assert_eq!(data["newest_sequence"], 4);
+        assert_eq!(data["oldest_sequence"], 3);
+        assert_eq!(data["may_have_more"], true);
+
+        // after_sequence pages forward from a cursor.
+        let forward = ReadCoordinationThread
+            .execute(&ctx, json!({"thread_id": "t", "after_sequence": 2}))
+            .await
+            .unwrap();
+        let fwd: Vec<&str> = forward.value["data"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["body"].as_str().unwrap())
+            .collect();
+        assert_eq!(fwd, ["m3", "m4"]);
+        assert_eq!(forward.value["data"]["direction"], "forward");
+    }
+
+    #[tokio::test]
+    async fn read_thread_reports_an_empty_room_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        migrate(dir.path());
+        let ctx = context(dir.path(), "mission-control");
+        let read = ReadCoordinationThread
+            .execute(&ctx, json!({}))
+            .await
+            .unwrap();
+        let data = &read.value["data"];
+        assert!(data["messages"].as_array().unwrap().is_empty());
+        assert_eq!(data["may_have_more"], false);
+        assert_eq!(data["newest_sequence"], 0);
     }
 }
