@@ -3622,6 +3622,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_route_publishes_to_the_live_event_feed() {
+        let d = authed_daemon();
+        // The websocket handler forwards everything from this broadcast channel,
+        // so receiving here proves a posted event reaches live subscribers.
+        let mut feed = d.coordination_events.subscribe();
+
+        coordination_post_message(
+            State(d.clone()),
+            Query(with_token()),
+            axum::extract::Path("live".to_string()),
+            Json(CoordinationMessageReq {
+                actor_kind: "agent".into(),
+                actor_id: "mission-control".into(),
+                body: "hello live".into(),
+                idempotency_key: String::new(),
+            }),
+        )
+        .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), feed.recv())
+            .await
+            .expect("event delivered to live subscribers")
+            .expect("channel open");
+        assert_eq!(event.thread_id, "live");
+        assert_eq!(event.payload["body"], "hello live");
+    }
+
+    #[tokio::test]
     async fn message_route_posts_and_replays_by_cursor() {
         let d = authed_daemon();
         for body in ["first", "second"] {
