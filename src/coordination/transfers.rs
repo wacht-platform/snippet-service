@@ -202,6 +202,33 @@ impl CoordinationDb {
         })
     }
 
+    /// Every session that currently has an active turn holder, with who holds it
+    /// and since when. This is the "which agent is active where" view.
+    pub fn list_active_leases(&self, now: &str) -> Result<Vec<SessionLease>, CoordinationDbError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, lease_id, assignment_id, agent_id, fencing_token,
+                        acquired_at, renewed_at, expires_at
+                 FROM session_leases
+                 WHERE released_at IS NULL AND expires_at > ?1
+                 ORDER BY acquired_at DESC",
+            )?;
+            let rows = stmt.query_map(params![now], |row| {
+                Ok(SessionLease {
+                    session_id: row.get(0)?,
+                    lease_id: row.get(1)?,
+                    assignment_id: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    fencing_token: row.get::<_, i64>(4)? as u64,
+                    acquired_at: row.get(5)?,
+                    renewed_at: row.get(6)?,
+                    expires_at: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
     /// True when `lease_id` + `fencing_token` still own the session's active
     /// turn. A stale holder — one whose lease expired, was released, or was
     /// superseded by a higher token — fails this check and must not mutate.
@@ -493,5 +520,36 @@ mod tests {
         );
         assert!(db.list_pending_handoffs().unwrap().is_empty());
         assert!(!db.has_unacknowledged_handoff("a2").unwrap());
+    }
+
+    #[test]
+    fn active_leases_lists_only_unexpired_holders() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        db.create_agent(&worker()).unwrap();
+        db.create_assignment(&assignment("a")).unwrap();
+        // No holder yet.
+        assert!(db.list_active_leases(&ts(0)).unwrap().is_empty());
+
+        db.acquire_lease(&lease("l")).unwrap();
+        let active = db.list_active_leases(&ts(50)).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].lease_id, "l");
+        assert_eq!(active[0].agent_id, "w");
+        assert_eq!(active[0].session_id, "s");
+
+        // An expired holder is not active, so it drops out of the view.
+        assert!(db.list_active_leases(&ts(101)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_leases_excludes_released_holders() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        db.create_agent(&worker()).unwrap();
+        db.create_assignment(&assignment("a")).unwrap();
+        db.acquire_lease(&lease("l")).unwrap();
+        assert_eq!(db.list_active_leases(&ts(50)).unwrap().len(), 1);
+
+        db.release_lease("l", &ts(51), "done").unwrap();
+        assert!(db.list_active_leases(&ts(52)).unwrap().is_empty());
     }
 }
