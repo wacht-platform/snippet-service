@@ -66,6 +66,14 @@ impl AgentHome {
         updated_by: &str,
     ) -> Result<(), IdentityError> {
         std::fs::create_dir_all(self.tools_path())?;
+        self.ensure_identity_metadata(default_identity, updated_by)
+    }
+
+    fn ensure_identity_metadata(
+        &self,
+        default_identity: &str,
+        updated_by: &str,
+    ) -> Result<(), IdentityError> {
         if !self.identity_path().exists() {
             atomic_write(&self.identity_path(), default_identity.as_bytes())?;
         }
