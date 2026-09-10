@@ -134,6 +134,14 @@ struct Daemon {
     token: String,
     hostname: String,
     sessions: Mutex<HashMap<String, LiveSession>>,
+    /// Daemon-wide interactive shells, NOT tied to any session.
+    ///
+    /// A shell belongs to the machine: switching or closing a session must not
+    /// kill it. The pty machinery was already sessionless (`SessionTerms::new`);
+    /// only the transport was not, because `/attach` requires a live session.
+    /// `/shells` exposes the same `wire: term` frames over a socket that needs no
+    /// session at all.
+    shells: Arc<crate::term::SessionTerms>,
     /// Serializes git WRITE operations daemon-wide so a user's git action can't
     /// race the agent's edits (or another git write) on the same index.
     git_write: Mutex<()>,
@@ -168,6 +176,16 @@ fn machine_hostname() -> String {
 }
 
 type Shared = Arc<Daemon>;
+
+/// Working directory for daemon-wide shells.
+///
+/// Deliberately the daemon's own cwd (`~` when started by the service manager),
+/// NOT a session workspace: a global shell belongs to the machine, so it must
+/// not silently follow whichever session happened to be open. A session that
+/// wants its own workspace shell already gets one through its `wire: term`.
+fn global_shell_cwd() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
 
 /// Constant-time token check: hash both sides to a fixed 32-byte digest and compare
 /// without short-circuiting, so neither token length nor content leaks via timing.
@@ -616,6 +634,7 @@ pub async fn run_serve(
         token,
         hostname: machine_hostname(),
         sessions: Mutex::new(HashMap::new()),
+        shells: crate::term::SessionTerms::new(global_shell_cwd()),
         git_write: Mutex::new(()),
         browser: BrowserManager::default(),
         seen_nonces: std::sync::Mutex::new(HashMap::new()),
@@ -756,6 +775,7 @@ pub async fn run_serve(
         .route("/fs/delete", post(delete_fs_path))
         .route("/fs/download", get(download_fs_file))
         .route("/attach", get(attach_ws))
+        .route("/shells", get(shells_ws))
         .route("/events", get(events_ws))
         .route("/browser/ws", get(browser_ws))
         .route("/browsers", get(list_browsers))
@@ -3252,6 +3272,99 @@ struct AttachQuery {
     session: String,
 }
 
+#[derive(Deserialize)]
+struct ShellsQuery {
+    token: Option<String>,
+}
+
+// WS /shells — daemon-WIDE interactive shells, with no session at all.
+//
+// A shell belongs to the machine: switching or closing a session must not kill
+// it. `/attach` cannot serve this because it calls `ensure_live`, so a socket
+// with no live session gets a 404. This route carries the same `wire: term`
+// frames over a socket that requires no session.
+//
+// Lifecycle is still explicit: the client creates and closes shells through the
+// same `open`/`new`/`close` ops, so a dropped socket never destroys a pty.
+async fn shells_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(q): Query<ShellsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let terms = d.shells.clone();
+    ws.on_upgrade(move |socket| handle_shells_ws(socket, terms))
+}
+
+async fn handle_shells_ws(socket: WebSocket, terms: Arc<crate::term::SessionTerms>) {
+    use base64::Engine;
+    let (mut sender, mut receiver) = socket.split();
+    let term_client = terms.subscribe();
+    let push_terms = terms.clone();
+    let mut term_seq: u64 = 0;
+
+    // Reconnect support: report what already exists, so a client that
+    // reattaches rebuilds its strip instead of showing nothing while the ptys
+    // keep running.
+    let existing: Vec<serde_json::Value> = terms
+        .list()
+        .into_iter()
+        .map(|(id, alive)| serde_json::json!({ "id": id, "alive": alive }))
+        .collect();
+    let hello = serde_json::json!({ "wire": "term", "op": "list", "shells": existing });
+    if let Ok(json) = serde_json::to_string(&hello) {
+        if sender.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    let push = tokio::spawn(async move {
+        loop {
+            // Drain the PTY so idle shells still fire BEL / OSC.
+            let _ = push_terms.take_snapshots();
+            for (id, chunk, cols, rows, alive) in push_terms.poll_client(&term_client) {
+                if chunk.is_empty() && alive {
+                    continue;
+                }
+                term_seq = term_seq.wrapping_add(1);
+                let frame = serde_json::json!({
+                    "wire": "term",
+                    "op": "out",
+                    "id": id,
+                    "seq": term_seq,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&chunk),
+                    "cols": cols,
+                    "rows": rows,
+                    "alive": alive,
+                });
+                if let Ok(json) = serde_json::to_string(&frame) {
+                    if sender.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(t) => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
+                    if val.get("wire").and_then(|w| w.as_str()) == Some("term") {
+                        apply_term_client(&terms, &val);
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    push.abort();
+}
+
 // WS /attach?session= — stream this session's HarnessState + receive LoopInput.
 async fn attach_ws(
     ws: WebSocketUpgrade,
@@ -3686,6 +3799,7 @@ mod tests {
             token: String::new(),
             hostname: String::from("test"),
             sessions: Mutex::new(HashMap::new()),
+            shells: crate::term::SessionTerms::new(global_shell_cwd()),
             git_write: Mutex::new(()),
             browser: BrowserManager::default(),
             seen_nonces: std::sync::Mutex::new(HashMap::new()),

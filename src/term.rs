@@ -318,6 +318,24 @@ impl SessionTerms {
         self.terms.lock().ok()?.get(id).cloned()
     }
 
+    /// Ids of the live shells, with their alive state.
+    ///
+    /// Used by `/shells` so a (re)connecting client can rebuild its tabs from
+    /// what already exists. Without it a reconnect would show an empty strip
+    /// while the ptys kept running — the tabs would silently disappear.
+    pub fn list(&self) -> Vec<(String, bool)> {
+        let g = match self.terms.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<(String, bool)> = g
+            .iter()
+            .map(|(id, t)| (id.clone(), t.is_alive()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn request_snapshot(&self, id: &str) {
         if let Ok(mut g) = self.snap_ids.lock() {
             g.insert(id.to_string());
