@@ -13,7 +13,7 @@ mod work;
 
 pub use db::{CoordinationDb, CoordinationDbError};
 pub use identity::{AgentHome, IdentityError, IdentityMetadata};
-pub use types::{Handoff, SessionLease};
+pub use types::{Handoff, SessionAgent, SessionLease};
 pub use work::{Assignment, AssignmentFilter, AssignmentStatus};
 
 /// Canonical location of the coordination SQLite database. Single source of truth

@@ -19,7 +19,7 @@ fn enum_text<T: serde::Serialize>(value: &T) -> String {
         .to_string()
 }
 
-fn decode_enum<T: serde::de::DeserializeOwned>(
+pub(crate) fn decode_enum<T: serde::de::DeserializeOwned>(
     value: String,
     column: usize,
 ) -> Result<T, rusqlite::Error> {

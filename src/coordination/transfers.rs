@@ -2,7 +2,8 @@ use rusqlite::{OptionalExtension, params};
 
 use super::{
     CoordinationDb, CoordinationDbError,
-    types::{Handoff, SessionLease},
+    agents::decode_enum,
+    types::{Handoff, SessionAgent, SessionLease},
 };
 
 impl CoordinationDb {
@@ -223,6 +224,76 @@ impl CoordinationDb {
                     acquired_at: row.get(5)?,
                     renewed_at: row.get(6)?,
                     expires_at: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Every lease a session has ever had — active first, then history newest
+    /// first. This is what "who is / was active in this session" is answered
+    /// from: the active holder (if any) plus the released/expired past.
+    pub fn list_session_leases(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionLease>, CoordinationDbError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT session_id, lease_id, assignment_id, agent_id, fencing_token,
+                        acquired_at, renewed_at, expires_at
+                 FROM session_leases
+                 WHERE session_id = ?1
+                 ORDER BY (released_at IS NULL) DESC, acquired_at DESC",
+            )?;
+            let rows = stmt.query_map(params![session_id], |row| {
+                Ok(SessionLease {
+                    session_id: row.get(0)?,
+                    lease_id: row.get(1)?,
+                    assignment_id: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    fencing_token: row.get::<_, i64>(4)? as u64,
+                    acquired_at: row.get(5)?,
+                    renewed_at: row.get(6)?,
+                    expires_at: row.get(7)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Who is — and was — active in this session. One row per lease, joined to
+    /// the agent's identity so the UI can name people rather than ids. Active
+    /// holders come first, then the history newest-first.
+    ///
+    /// `active` is computed against `now`, not just `released_at IS NULL`, so an
+    /// expired-but-unreleased lease is not misreported as the current holder.
+    pub fn list_session_agents(
+        &self,
+        session_id: &str,
+        now: &str,
+    ) -> Result<Vec<SessionAgent>, CoordinationDbError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT l.agent_id, a.display_name, a.handle, a.role, a.status,
+                        l.assignment_id, l.acquired_at, l.released_at, l.release_reason,
+                        (l.released_at IS NULL AND l.expires_at > ?2) AS active
+                 FROM session_leases l
+                 JOIN agents a ON a.id = l.agent_id
+                 WHERE l.session_id = ?1
+                 ORDER BY active DESC, l.acquired_at DESC",
+            )?;
+            let rows = stmt.query_map(params![session_id, now], |row| {
+                Ok(SessionAgent {
+                    agent_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    handle: row.get(2)?,
+                    role: decode_enum(row.get::<_, String>(3)?, 3)?,
+                    status: decode_enum(row.get::<_, String>(4)?, 4)?,
+                    assignment_id: row.get(5)?,
+                    acquired_at: row.get(6)?,
+                    released_at: row.get(7)?,
+                    release_reason: row.get(8)?,
+                    active: row.get::<_, i64>(9)? == 1,
                 })
             })?;
             rows.collect()
@@ -551,5 +622,106 @@ mod tests {
 
         db.release_lease("l", &ts(51), "done").unwrap();
         assert!(db.list_active_leases(&ts(52)).unwrap().is_empty());
+    }
+
+    /// The join is what lets the UI name people rather than show raw ids.
+    #[test]
+    fn session_agents_join_agent_identity() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        db.create_agent(&worker()).unwrap();
+        db.create_assignment(&assignment("a")).unwrap();
+        db.acquire_lease(&lease("l")).unwrap();
+
+        let rows = db.list_session_agents("s", &ts(50)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent_id, "w");
+        assert_eq!(rows[0].display_name, "W");
+        assert_eq!(rows[0].handle, "w");
+        assert!(rows[0].active);
+        assert!(rows[0].released_at.is_none());
+    }
+
+    /// Released leases stay visible as history — the "track of everything" that
+    /// the current UI has no way to show.
+    #[test]
+    fn session_agents_keep_history_after_release() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        db.create_agent(&worker()).unwrap();
+        db.create_assignment(&assignment("a")).unwrap();
+        db.acquire_lease(&lease("l")).unwrap();
+        db.release_lease("l", &ts(51), "handoff").unwrap();
+
+        let rows = db.list_session_agents("s", &ts(52)).unwrap();
+        assert_eq!(rows.len(), 1, "history must survive release");
+        assert!(!rows[0].active);
+        assert_eq!(rows[0].released_at.as_deref(), Some(ts(51).as_str()));
+        assert_eq!(rows[0].release_reason.as_deref(), Some("handoff"));
+    }
+
+    /// An expired-but-unreleased lease is NOT the current holder: `active` is
+    /// computed against `now`, so a dead holder can't read as present.
+    #[test]
+    fn session_agents_treat_an_expired_lease_as_inactive() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        db.create_agent(&worker()).unwrap();
+        db.create_assignment(&assignment("a")).unwrap();
+        db.acquire_lease(&lease("l")).unwrap(); // expires at ts(100)
+
+        assert!(db.list_session_agents("s", &ts(50)).unwrap()[0].active);
+        let after = db.list_session_agents("s", &ts(101)).unwrap();
+        assert_eq!(after.len(), 1, "an expired lease is still history");
+        assert!(!after[0].active, "expired lease must not read as active");
+    }
+
+    /// The whole point for the user: "how many agents are in this session".
+    /// Two agents, one session, both listed with the active one first.
+    #[test]
+    fn session_agents_lists_every_agent_active_first() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        db.create_agent(&worker()).unwrap();
+        db.create_agent(&Agent {
+            id: "w2".into(),
+            display_name: "Second".into(),
+            handle: "w2".into(),
+            kind: AgentKind::Worker,
+            status: AgentStatus::Active,
+            role: AgentRole::Reviewer,
+            capabilities: vec![],
+            max_concurrent_assignments: 1,
+            version: 1,
+        })
+        .unwrap();
+        db.create_assignment(&assignment("a")).unwrap();
+        db.create_assignment(&Assignment {
+            agent_id: "w2".into(),
+            ..assignment("a2")
+        })
+        .unwrap();
+
+        // w2 holds the turn; w held it earlier and released.
+        db.acquire_lease(&lease("l")).unwrap();
+        db.release_lease("l", &ts(10), "done").unwrap();
+        db.acquire_lease(&SessionLease {
+            lease_id: "l2".into(),
+            assignment_id: "a2".into(),
+            agent_id: "w2".into(),
+            ..lease("l")
+        })
+        .unwrap();
+
+        let rows = db.list_session_agents("s", &ts(50)).unwrap();
+        assert_eq!(rows.len(), 2, "both agents appear");
+        // Active first, then history.
+        assert_eq!(rows[0].agent_id, "w2");
+        assert!(rows[0].active);
+        assert_eq!(rows[1].agent_id, "w");
+        assert!(!rows[1].active);
+    }
+
+    /// A session nobody has touched returns nothing rather than erroring.
+    #[test]
+    fn session_agents_is_empty_for_an_untouched_session() {
+        let db = CoordinationDb::open_in_memory().unwrap();
+        assert!(db.list_session_agents("nope", &ts(0)).unwrap().is_empty());
     }
 }

@@ -677,6 +677,10 @@ pub async fn run_serve(
         )
         .route("/coordination/leases", get(coordination_list_leases))
         .route(
+            "/coordination/sessions/{session_id}/agents",
+            get(coordination_session_agents),
+        )
+        .route(
             "/coordination/sessions/{session_id}/lease",
             post(coordination_acquire_lease),
         )
@@ -1441,6 +1445,29 @@ async fn coordination_list_leases(State(d): State<Shared>, Query(q): Query<Auth>
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("list leases: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Who is — and was — active in a session: the active holder first, then the
+/// history. This is what answers "when is an agent active in this session".
+async fn coordination_session_agents(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .list_session_agents(&session_id, &chrono::Utc::now().to_rfc3339())
+    {
+        Ok(agents) => Json(agents).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list session agents: {error}"),
         )
             .into_response(),
     }

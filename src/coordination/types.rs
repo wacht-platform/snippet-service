@@ -89,6 +89,28 @@ pub struct SessionLease {
     pub expires_at: String,
 }
 
+/// One agent's participation in one session: the agent's identity joined to the
+/// holding period of a lease. One row per lease, so an agent that held the turn
+/// twice appears twice — that repetition is the activity history, which is why
+/// `released_at` is carried here even though `SessionLease` omits it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionAgent {
+    pub agent_id: String,
+    pub display_name: String,
+    pub handle: String,
+    pub role: AgentRole,
+    /// The agent's registry status (active/paused/…), not this holding period.
+    pub status: AgentStatus,
+    /// True when this lease is the session's current, unexpired holder.
+    pub active: bool,
+    pub assignment_id: String,
+    pub acquired_at: String,
+    /// None while the agent still holds the turn.
+    pub released_at: Option<String>,
+    /// Why it ended: `released`, `expired`, `handoff`, … None while active.
+    pub release_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Handoff {
     pub id: String,
