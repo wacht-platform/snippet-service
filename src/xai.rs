@@ -417,18 +417,29 @@ fn message_item(role: &str, text: &str) -> Value {
     })
 }
 
-fn is_server_tool_name(name: &str) -> bool {
+/// xAI server-executed tools are returned as dedicated *item types*. These are
+/// observations from xAI — we never execute them locally.
+fn is_server_tool_type(kind: &str) -> bool {
     matches!(
-        name,
-        "x_search"
-            | "x_search_call"
-            | "web_search"
+        kind,
+        "x_search_call"
             | "web_search_call"
-            | "code_interpreter"
             | "code_interpreter_call"
-            | "code_execution"
             | "code_execution_call"
+            | "x_search"
+            | "web_search"
+            | "code_interpreter"
+            | "code_execution"
     )
+}
+
+/// The only server-side tool this client ever declares to xAI (`x_search`, when
+/// enabled — see `build_responses_request`). A `function_call` whose name is not
+/// this one is a CLIENT call we must execute, even when the name happens to
+/// coincide with an xAI server tool: `web_search` is our Exa client tool and is
+/// also an xAI server-tool name, so matching by name alone silently swallowed it.
+fn is_declared_server_tool_name(name: &str) -> bool {
+    name == "x_search"
 }
 
 fn is_x_search_item(item: &Value) -> bool {
@@ -446,19 +457,12 @@ fn is_x_search_item(item: &Value) -> bool {
 /// from xAI, never client-side calls for our harness to execute.
 fn is_server_tool_item(item: &Value) -> bool {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
-        "x_search_call"
-        | "web_search_call"
-        | "code_interpreter_call"
-        | "code_execution_call"
-        | "x_search"
-        | "web_search"
-        | "code_interpreter"
-        | "code_execution" => true,
+        kind if is_server_tool_type(kind) => true,
         "function_call" | "function" => item
             .get("name")
             .or_else(|| item.pointer("/function/name"))
             .and_then(Value::as_str)
-            .is_some_and(is_server_tool_name),
+            .is_some_and(is_declared_server_tool_name),
         _ => false,
     }
 }
@@ -479,7 +483,7 @@ fn collect_client_call(item: &Value, calls: &mut Vec<GeneratedToolCall>) {
         .or_else(|| item.pointer("/function/name"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if name.is_empty() || is_server_tool_name(name) {
+    if name.is_empty() || is_declared_server_tool_name(name) {
         return;
     }
     let args_str = item
@@ -879,6 +883,50 @@ mod tests {
         let out = parse_responses_value(&value, None).expect("parse");
         assert_eq!(out.calls.len(), 1);
         assert_eq!(out.calls[0].tool_name, "bash");
+        assert!(out.used_server_tools);
+    }
+
+    /// Regression: our own client tool is named `web_search` (Exa), which also
+    /// happens to be an xAI server-tool name. A `function_call` for it is OUR
+    /// tool and must be surfaced for local execution. Dropping it is silent: the
+    /// harness never runs the search, so the model narrates "running the search
+    /// now", produces no tool call, and the turn ends having done nothing.
+    ///
+    /// We never declare xAI's server-side `web_search` (the request only ever
+    /// adds `{"type":"x_search"}`), so a `web_search` function_call can only be
+    /// our client tool.
+    #[test]
+    fn parser_surfaces_client_web_search_despite_server_tool_name_collision() {
+        let value = json!({
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "web_search",
+                    "call_id": "call_ws",
+                    "arguments": "{\"query\":\"latest AI hardware\"}"
+                }
+            ]
+        });
+        let out = parse_responses_value(&value, None).expect("parse");
+        assert_eq!(out.calls.len(), 1, "client web_search call must survive");
+        assert_eq!(out.calls[0].tool_name, "web_search");
+        assert_eq!(out.calls[0].id.as_deref(), Some("call_ws"));
+        // It is a client call, so it must not be reported as a server-tool use.
+        assert!(!out.used_server_tools);
+    }
+
+    /// The converse: the one server tool we DO declare (`x_search`) must still be
+    /// recognised as provider-executed and never handed back for local execution.
+    #[test]
+    fn parser_never_hands_declared_x_search_to_the_client() {
+        let value = json!({
+            "output": [
+                {"type": "x_search_call", "id": "xs_1", "status": "completed"},
+                {"type": "function_call", "name": "x_search", "call_id": "c9", "arguments": "{}"}
+            ]
+        });
+        let out = parse_responses_value(&value, None).expect("parse");
+        assert!(out.calls.is_empty(), "x_search runs on xAI, not locally");
         assert!(out.used_server_tools);
     }
 }
