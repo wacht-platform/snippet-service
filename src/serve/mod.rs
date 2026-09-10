@@ -3782,7 +3782,14 @@ async fn build_agent_from_prompt(
     let task_id = uuid::Uuid::new_v4().to_string();
     let title = "Build specialized agent";
     let description = format!(
-        "Build a specialized agent from this user brief:\n\n{prompt}\n\nResearch the role using web_search/web_read when useful. Produce a proposed durable identity, capabilities, and Python tool manifests in the agent home. Do not execute generated tools or claim completion until the identity and manifests validate. Report the proposed agent id, identity summary, research sources, tools, validation, and blockers to Mission Control."
+        concat!(
+            "Build a specialized agent from this user brief:\n\n{}\n\n",
+            "[AGENT_BUILD_JOB — not a project or workspace request]\n",
+            "You are the agent builder. Do not create a project, do not create a new Mission Control session, do not ask the user to choose or confirm a folder, and do not route this request as ordinary work. Build the agent directly from the brief.\n",
+            "Research the role using web_search/web_read when useful. Choose a stable agent id and display name, create the durable agent home under ~/.snippet/agents/<agent-id>/, and write identity.md plus a validated profile and proposed Python tool manifests. Do not execute generated tools.\n",
+            "When finished, report the exact agent id, files created, research sources, tool proposals, validation, and blockers. Call report_mission_task with the final result. If the brief is insufficient, make sensible defaults rather than asking a workspace question."
+        ),
+        prompt
     );
     let task = match mission_control::create_task(
         root,
