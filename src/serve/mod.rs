@@ -2105,6 +2105,13 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             .and_then(|name| config.setups.as_ref()?.get(name))
             .unwrap_or(&config.model);
         let provider = model.provider.clone();
+        // Does this provider report rate-limit data AT ALL? Only ChatGPT parses
+        // the Codex headers; every other model hardcodes an empty snapshot, and
+        // opencode returns no such headers even in principle. So an empty list
+        // means two very different things — "cannot report" vs "hasn't reported
+        // yet" — and the UI must tell them apart instead of showing one generic
+        // empty state for both.
+        let reports_limits = crate::config::provider_reports_rate_limits(&provider);
         let entry = totals.entry(provider.clone()).or_insert_with(|| {
             serde_json::json!({
                 "provider": provider,
@@ -2115,6 +2122,7 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "cache_read_tokens": 0,
+                "rate_limits_supported": reports_limits,
                 "rate_limits": []
             })
         });
