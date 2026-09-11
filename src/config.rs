@@ -580,6 +580,19 @@ pub fn provider_supported(provider: &str) -> bool {
     SUPPORTED_PROVIDERS.contains(&provider)
 }
 
+/// Whether a provider publishes rate-limit data at all.
+///
+/// Only the ChatGPT/Codex subscription exposes it via response headers
+/// (`x-codex-*`). Every other provider hardcodes an empty snapshot, and
+/// opencode returns no such headers even in principle — verified by probing the
+/// endpoint directly (HTTP 200, seven headers, none rate-related).
+///
+/// This exists so the Usage screen can distinguish "cannot report" from "hasn't
+/// reported yet" instead of showing one generic empty state for both.
+pub fn provider_reports_rate_limits(provider: &str) -> bool {
+    provider == "chatgpt"
+}
+
 fn default_provider() -> String {
     "openai-compatible".to_string()
 }
