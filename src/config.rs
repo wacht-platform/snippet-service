@@ -124,13 +124,13 @@ pub struct SnippetConfig {
         alias = "setups",
         skip_serializing_if = "Option::is_none"
     )]
-    pub setups: Option<BTreeMap<String, ModelConfig>>,
+    pub setups: Option<BTreeMap<String, InferenceProfileConfig>>,
     #[serde(default)]
-    pub model: ModelConfig,
+    pub model: InferenceProfileConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
+pub struct InferenceProfileConfig {
     #[serde(default = "default_provider")]
     pub provider: String,
     pub api_key: String,
@@ -192,7 +192,7 @@ impl Default for SnippetConfig {
             active_setup: None,
             delegate_setup: None,
             setups: None,
-            model: ModelConfig::default(),
+            model: InferenceProfileConfig::default(),
             exa_api_key: None,
             assemblyai_api_key: None,
             theme: None,
@@ -319,7 +319,7 @@ impl SnippetConfig {
         // real deviation (a key, a different provider/model/base_url — including
         // chatgpt's OAuth) is a user-configured model worth migrating.
         let m = &self.model;
-        let placeholder = ModelConfig::default();
+        let placeholder = InferenceProfileConfig::default();
         let is_placeholder = m.api_key.trim().is_empty()
             && m.provider == placeholder.provider
             && m.model == placeholder.model
@@ -360,7 +360,7 @@ impl SnippetConfig {
     }
 
     /// Insert or replace a profile; mirror it into `model` when it's the active one.
-    pub fn upsert_profile(&mut self, name: &str, cfg: ModelConfig) {
+    pub fn upsert_profile(&mut self, name: &str, cfg: InferenceProfileConfig) {
         let map = self.setups.get_or_insert_with(BTreeMap::new);
         map.insert(name.to_string(), cfg.clone());
         if self.active_setup.as_deref() == Some(name) || self.active_setup.is_none() {
@@ -396,10 +396,10 @@ impl SnippetConfig {
         }
     }
 
-    /// The model config for delegated lanes. Uses the `delegate_setup` profile
-    /// when it names a known one; otherwise falls back to the active model, so
+    /// The inference profile for delegated lanes. Uses the `delegate_setup` profile
+    /// when it names a known one; otherwise falls back to the active profile, so
     /// delegation keeps working unchanged when no separate profile is chosen.
-    pub fn delegate_model_config(&self) -> ModelConfig {
+    pub fn delegate_profile(&self) -> InferenceProfileConfig {
         if let Some(name) = self.delegate_setup.as_deref() {
             if let Some(cfg) = self.setups.as_ref().and_then(|m| m.get(name)) {
                 return cfg.clone();
@@ -409,7 +409,7 @@ impl SnippetConfig {
     }
 }
 
-impl ModelConfig {
+impl InferenceProfileConfig {
     pub fn build_model_for_session(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
         self.build_model_with_session(session_id)
     }
@@ -532,8 +532,8 @@ impl ModelConfig {
     }
 }
 
-impl From<ModelConfig> for OpenAiCompatibleConfig {
-    fn from(value: ModelConfig) -> Self {
+impl From<InferenceProfileConfig> for OpenAiCompatibleConfig {
+    fn from(value: InferenceProfileConfig) -> Self {
         Self {
             api_key: value.api_key,
             base_url: value.base_url,
@@ -632,7 +632,7 @@ fn default_memory_reflect_on_compaction() -> bool {
     true
 }
 
-impl Default for ModelConfig {
+impl Default for InferenceProfileConfig {
     fn default() -> Self {
         Self {
             provider: default_provider(),

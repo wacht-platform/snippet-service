@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
+use crate::config::{InferenceProfileConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{GoalStatus, LoopInput, deserialize_state, serialize_state};
 use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
 use crate::recurring::{self, Schedule};
@@ -2435,7 +2435,7 @@ async fn put_profile(
         if let Some(url) = req.base_url.clone().filter(|s| !s.trim().is_empty()) {
             mc.base_url = url;
         } else if mc.base_url.trim().is_empty() {
-            mc.base_url = ModelConfig::default().base_url;
+            mc.base_url = InferenceProfileConfig::default().base_url;
         }
         // An omitted/blank api_key keeps the existing one (editing doesn't wipe it).
         if let Some(key) = req.api_key.clone().filter(|s| !s.is_empty()) {
@@ -2683,7 +2683,7 @@ async fn provider_models(
             .and_then(|n| c.setups.as_ref().and_then(|m| m.get(n)).cloned());
         match stored {
             Some(m) => m,
-            None if req.provider.is_some() => crate::config::ModelConfig {
+            None if req.provider.is_some() => crate::config::InferenceProfileConfig {
                 provider: req.provider.clone().unwrap_or_default(),
                 ..Default::default()
             },

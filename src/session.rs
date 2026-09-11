@@ -172,7 +172,7 @@ fn start_session_with_role(
     let factory: Option<ModelFactory> = if mission_control {
         None
     } else {
-        let mc = config.delegate_model_config();
+        let mc = config.delegate_profile();
         let lane_session_id = durable_id.clone();
         Some(Arc::new(move || {
             mc.build_model_for_session(lane_session_id.clone())
