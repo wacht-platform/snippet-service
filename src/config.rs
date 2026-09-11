@@ -580,15 +580,23 @@ pub fn provider_supported(provider: &str) -> bool {
     SUPPORTED_PROVIDERS.contains(&provider)
 }
 
-/// Whether a provider publishes rate-limit data at all.
+/// Whether a provider exposes its SUBSCRIPTION rate limits over the API.
 ///
-/// Only the ChatGPT/Codex subscription exposes it via response headers
-/// (`x-codex-*`). Every other provider hardcodes an empty snapshot, and
-/// opencode returns no such headers even in principle — verified by probing the
-/// endpoint directly (HTTP 200, seven headers, none rate-related).
+/// Only the ChatGPT/Codex subscription does, via response headers
+/// (`x-codex-primary/secondary-*`) that carry a window, a used percentage and a
+/// reset time — exactly the shape the Usage screen renders.
 ///
-/// This exists so the Usage screen can distinguish "cannot report" from "hasn't
-/// reported yet" instead of showing one generic empty state for both.
+/// xAI is deliberately NOT counted, even though it does send rate-limit headers.
+/// Probed directly: it returns only flat API caps
+/// (`x-ratelimit-limit-tokens: 53000000`, `...-limit-requests: 8300`, and their
+/// `remaining-` twins) with NO window, reset, period or percentage. Those are
+/// per-API-tier ceilings, not the weekly SuperGrok quota — they report ~0% used
+/// while the subscription itself reads 43%. Rendering them would invent a
+/// figure unrelated to what the user is actually consuming.
+///
+/// opencode returns no such headers at all. Everything else hardcodes an empty
+/// snapshot. So this exists to let the Usage screen distinguish "cannot report"
+/// from "hasn't reported yet" instead of one generic empty state for both.
 pub fn provider_reports_rate_limits(provider: &str) -> bool {
     provider == "chatgpt"
 }
