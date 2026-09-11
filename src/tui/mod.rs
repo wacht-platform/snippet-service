@@ -5066,7 +5066,7 @@ fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 /// One-line auth/endpoint status for a profile card.
-fn profile_status(cfg: &crate::config::ModelConfig) -> String {
+fn profile_status(cfg: &crate::config::InferenceProfileConfig) -> String {
     match cfg.provider.as_str() {
         "chatgpt" => {
             if crate::chatgpt_auth::is_signed_in() {
