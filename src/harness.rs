@@ -2067,9 +2067,15 @@ impl CodingHarness {
         };
         let anchor_msg_len = state.messages.len();
         state.last_prompt_tokens = anchor_tokens;
-        if output.rate_limit.is_some() {
-            state.rate_limit = output.rate_limit.clone();
-        }
+        // Assign UNCONDITIONALLY: the snapshot describes the most recent call, so
+        // a model that reports nothing must CLEAR it.
+        //
+        // Overwriting only on `Some` let a ChatGPT snapshot outlive its session
+        // forever. Switching the profile to a provider that reports no
+        // rate-limit headers (opencode, anthropic, gemini) left the old figure in
+        // place, where it was rendered as that provider's current limit — the
+        // "stuck on awaiting update" report.
+        state.rate_limit = output.rate_limit.clone();
 
         // A response cut off at the token cap is never a finished reply.
         let truncated = output.is_truncated();
