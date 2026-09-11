@@ -2134,28 +2134,15 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             let current = obj[key].as_u64().unwrap_or(0);
             obj.insert(key.into(), serde_json::json!(current.saturating_add(value)));
         }
-        if provider != "gemini" && provider != "xai" {
-            if let Some(rate) = state.rate_limit.filter(|rate| rate.is_reported()) {
-                let rates = obj
-                    .get_mut("rate_limits")
-                    .and_then(|v| v.as_array_mut())
-                    .expect("rate_limits array");
-                // Rate limits are ACCOUNT-wide, not session-local: every session
-                // stores the window as it looked when that session last ran. So
-                // these are historical observations, not concurrent limits, and
-                // appending them all rendered four stale snapshots as if they
-                // were live (six rows, four reading "awaiting update").
-                //
-                // `list_device_sessions()` is sorted by last_active DESCENDING,
-                // so the first reported snapshot for a provider is the freshest
-                // observation — keep only it. Same intent as the ChatGPT branch
-                // below, which clears and replaces from a global store.
-                if rates.is_empty() {
-                    let value = serde_json::to_value(rate).unwrap_or_default();
-                    rates.push(value);
-                }
-            }
-        }
+        // NOTE: no per-session rate_limit is attributed to a provider here.
+        //
+        // `HarnessState.rate_limit` can only ever hold a CHATGPT snapshot —
+        // `chatgpt.rs` is the only model that parses rate-limit headers
+        // (`openai.rs` hardcodes `None`, as do anthropic/gemini/xai), and
+        // opencode's API returns no such headers at all. So reading it while
+        // iterating a session of ANY provider mis-attributed a ChatGPT figure to
+        // whatever that session ran: an `opencode-go` session displayed ChatGPT's
+        // numbers as its own. ChatGPT is handled once, globally, below.
     }
     // ChatGPT Codex limits are account-wide, not session-local. Include the same
     // reported snapshot used by the live chat Usage panel here as well.
