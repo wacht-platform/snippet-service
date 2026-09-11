@@ -2140,8 +2140,18 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
                     .get_mut("rate_limits")
                     .and_then(|v| v.as_array_mut())
                     .expect("rate_limits array");
-                let value = serde_json::to_value(rate).unwrap_or_default();
-                if !rates.iter().any(|existing| existing == &value) {
+                // Rate limits are ACCOUNT-wide, not session-local: every session
+                // stores the window as it looked when that session last ran. So
+                // these are historical observations, not concurrent limits, and
+                // appending them all rendered four stale snapshots as if they
+                // were live (six rows, four reading "awaiting update").
+                //
+                // `list_device_sessions()` is sorted by last_active DESCENDING,
+                // so the first reported snapshot for a provider is the freshest
+                // observation — keep only it. Same intent as the ChatGPT branch
+                // below, which clears and replaces from a global store.
+                if rates.is_empty() {
+                    let value = serde_json::to_value(rate).unwrap_or_default();
                     rates.push(value);
                 }
             }
