@@ -12,12 +12,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::builtins::coding_tools;
-use crate::config::{SnippetConfig, workspaces_root};
+use crate::config::{InferenceProfileConfig, SnippetConfig, workspaces_root};
+use crate::coordination::{AgentHome, IdentityError};
 use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, deserialize_state};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
-use crate::prompts::{conversation_system_prompt, mission_control_system_prompt};
-use crate::tools::{BrowserSummaryProvider, ToolContext, ToolRegistry};
+use crate::prompts::{conversation_prompt, mission_control_system_prompt};
+use crate::tools::{BrowserSummaryProvider, ToolContext, ToolError, ToolRegistry};
 
 pub struct SessionHandle {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
@@ -37,7 +38,44 @@ pub fn start_session(
     resume: bool,
     stream: Option<StreamHandle>,
 ) -> SessionHandle {
-    start_session_with_role(config, state_path, initial, resume, stream, None, false)
+    start_session_with_role(
+        config,
+        state_path,
+        initial,
+        resume,
+        stream,
+        None,
+        SessionRole::Standard,
+    )
+}
+
+/// Spawn a durable specialized-agent session. It keeps the same predefined
+/// session contract as a normal conversation, then appends the researched,
+/// versioned identity stored in the agent home.
+pub fn start_specialized_agent_session(
+    config: &SnippetConfig,
+    state_path: PathBuf,
+    initial: Option<String>,
+    resume: bool,
+    stream: Option<StreamHandle>,
+    browser_summary: Option<BrowserSummaryProvider>,
+    agent_home: AgentHome,
+) -> Result<SessionHandle, IdentityError> {
+    let identity = agent_home.read_identity()?;
+    let identity_revision = agent_home.read_metadata()?.revision;
+    Ok(start_session_with_role(
+        config,
+        state_path,
+        initial,
+        resume,
+        stream,
+        browser_summary,
+        SessionRole::Specialized {
+            agent_id: agent_home.agent_id().to_string(),
+            identity_revision,
+            identity,
+        },
+    ))
 }
 
 pub fn start_mission_control_session(
@@ -55,7 +93,7 @@ pub fn start_mission_control_session(
         resume,
         stream,
         browser_summary,
-        true,
+        SessionRole::MissionControl,
     )
 }
 
@@ -74,8 +112,159 @@ pub fn start_session_with_browser_summary(
         resume,
         stream,
         browser_summary,
-        false,
+        SessionRole::Standard,
     )
+}
+
+enum SessionRole {
+    Standard,
+    MissionControl,
+    Specialized {
+        agent_id: String,
+        identity_revision: u64,
+        identity: String,
+    },
+}
+
+/// Everything that distinguishes one kind of session from another, resolved once.
+///
+/// Replaces a single `mission_control: bool` that drove five separate branches
+/// in `start_session_with_role` — model factory, tool context, tool registry,
+/// system prompt, and lane control. Adding a kind meant finding all five, and
+/// nothing said when one was missed: the two places that read a role back off
+/// disk drifted, so a specialized agent was silently rebuilt as an ordinary
+/// session on a config reload.
+///
+/// There are two RUNTIMES, not three. `Standard` and `Specialized` differ only
+/// by an identity overlay appended to the SAME prompt and the SAME tool set,
+/// which is what `specialized_agent_system_prompt` already did.
+struct AgentRuntime {
+    factory: Option<ModelFactory>,
+    context: ToolContext,
+    tools: ToolRegistry,
+    prompt: String,
+    /// Mission Control coordinates durable sessions; it does not spawn lanes.
+    allow_lane_control: bool,
+}
+
+/// The config-derived inputs every runtime shares.
+///
+/// Bundled rather than passed positionally: they are mostly `Option`s and `Arc`s
+/// of similar shape, and a long positional list of those transposes silently at
+/// a call site.
+struct RuntimeInputs {
+    workspace: PathBuf,
+    durable_id: Option<String>,
+    prompt_ctx: crate::prompts::PromptContext,
+    browser_summary: Option<BrowserSummaryProvider>,
+    exa_api_key: Option<String>,
+    memory: crate::memory::MemoryLimits,
+    delegate: InferenceProfileConfig,
+}
+
+/// A researched, versioned identity overlaid on the snippet runtime.
+type AgentIdentity<'a> = (&'a str, u64, &'a str);
+
+impl AgentRuntime {
+    /// Mission Control: routing and orchestration only.
+    ///
+    /// No model factory (the daemon drives it rather than delegating to it), a
+    /// routing-only tool set, and the orchestrator prompt — which deliberately
+    /// does NOT stack the coding-agent layer, because that identity ("own the
+    /// task end to end") made Mission Control advertise as a general engineer
+    /// and skip `list_sessions`.
+    fn mission_control(i: RuntimeInputs) -> Result<Self, ToolError> {
+        let context = ToolContext::mission_control(i.workspace)?
+            .with_durable_session_id_opt(i.durable_id)
+            .with_coordination_db_path(crate::coordination::default_db_path())
+            // Mission Control is an ADDRESSABLE agent: it holds a directory row
+            // and an agent id, so a peer can name it and a lease can attribute a
+            // turn to it. Without this it could post to the board but nothing
+            // could address it back.
+            .with_agent_id(crate::mission_control::SESSION_ID);
+
+        let mut tools = ToolRegistry::new();
+        tools.insert(crate::builtins::BashTool);
+        tools.insert(crate::builtins::ReadImageTool);
+        crate::mission_tools::add_mission_control_tools(&mut tools);
+        crate::coordination_tools::add_coordination_tools(&mut tools);
+        crate::coordination_tools::add_coordination_dispatch_tools(&mut tools);
+
+        Ok(Self {
+            factory: None,
+            context,
+            tools,
+            prompt: mission_control_system_prompt(),
+            allow_lane_control: false,
+        })
+    }
+
+    /// The snippet agent: a coding conversation, optionally wearing an identity.
+    ///
+    /// `identity` is the ONLY difference between `Standard` and `Specialized`.
+    /// The base prompt and the tool set are shared either way; the overlay
+    /// changes judgment and specialization, not the session's execution, safety
+    /// or conversation rules — and not its executable permissions.
+    fn snippet(i: RuntimeInputs, identity: Option<AgentIdentity<'_>>) -> Result<Self, ToolError> {
+        let context = match i.browser_summary {
+            Some(provider) => ToolContext::with_browser_summary(i.workspace, provider)?,
+            None => ToolContext::new(i.workspace)?,
+        }
+        .with_durable_session_id_opt(i.durable_id.clone())
+        // Every session's coordination tools open the same database the daemon
+        // owns, so board posts and assignments share one store.
+        .with_coordination_db_path(crate::coordination::default_db_path())
+        // A specialized session acts as its directory agent, so lease tools can
+        // attribute turn ownership to the right identity.
+        .with_agent_id_opt(identity.map(|(agent_id, _, _)| agent_id.to_string()));
+
+        let mut tools = coding_tools(i.exa_api_key.clone(), i.memory);
+        crate::mission_tools::add_worker_report_tool(&mut tools);
+        tools.insert(crate::mission_tools::CreateRecurringJob);
+        // Workers discover peers, post to the board, and take/hold/release their
+        // own turn lease; they do not offer assignments — that is Mission
+        // Control's dispatch role.
+        crate::coordination_tools::add_coordination_tools(&mut tools);
+        crate::coordination_tools::add_coordination_lease_tools(&mut tools);
+        crate::coordination_tools::add_coordination_handoff_tools(&mut tools);
+
+        let prompt = match identity {
+            Some((agent_id, revision, body)) => crate::prompts::specialized_agent_system_prompt(
+                crate::prompts::SpecializedAgentPromptContext {
+                    agent_id,
+                    identity_revision: revision,
+                    identity: body,
+                    context: &i.prompt_ctx,
+                },
+            ),
+            None => conversation_prompt(&i.prompt_ctx),
+        };
+
+        let delegate = i.delegate;
+        let lane_session_id = i.durable_id;
+        Ok(Self {
+            factory: Some(Arc::new(move || {
+                delegate.build_model_for_session(lane_session_id.clone())
+            })),
+            context,
+            tools,
+            prompt,
+            allow_lane_control: true,
+        })
+    }
+
+    /// Resolve a role to its runtime. THE one place a kind is defined.
+    fn resolve(role: SessionRole, inputs: RuntimeInputs) -> Result<Self, ToolError> {
+        match role {
+            SessionRole::MissionControl => Self::mission_control(inputs),
+            SessionRole::Standard => Self::snippet(inputs, None),
+            SessionRole::Specialized {
+                agent_id,
+                identity_revision,
+                identity,
+            } => Self::snippet(inputs, Some((&agent_id, identity_revision, &identity))),
+        }
+    }
 }
 
 fn start_session_with_role(
@@ -85,100 +274,67 @@ fn start_session_with_role(
     resume: bool,
     stream: Option<StreamHandle>,
     browser_summary: Option<BrowserSummaryProvider>,
-    mission_control: bool,
+    role: SessionRole,
 ) -> SessionHandle {
     let (input_tx, rx) = mpsc::unbounded_channel();
 
+    // Config-derived values, snapshotted here because `config` is a borrow and
+    // the session task must be `'static`.
     let workspace = config.workspace.clone();
     let model_config = config.model.clone();
+    let delegate = config.delegate_profile();
     let exa_api_key = config.exa_api_key.clone();
     let manual_approval = config.manual_approval;
     let context_window_tokens = model_config.context_window;
     let compact_at_pct = model_config.compact_at_pct;
+    let memory = crate::memory::MemoryLimits {
+        enabled: config.memory_enabled,
+        writable: true,
+        index_budget_chars: config.memory_index_budget_chars,
+        entry_budget_chars: config.memory_entry_budget_chars,
+        max_entries: config.memory_max_entries,
+    };
     let memory_enabled = config.memory_enabled;
     let memory_index_budget_chars = config.memory_index_budget_chars;
     let memory_entry_budget_chars = config.memory_entry_budget_chars;
     let memory_max_entries = config.memory_max_entries;
     let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
-    // Durable identity = state path relative to the workspaces root — the
-    // same id the daemon uses for managed sessions and task envelopes.
-    let durable_id = if mission_control {
-        Some(crate::mission_control::SESSION_ID.to_string())
-    } else {
-        state_path
-            .strip_prefix(crate::config::workspaces_root())
-            .ok()
-            .map(|p| p.display().to_string())
-    };
-    // Delegated lanes use the parent conversation identity for provider routing
-    // and prompt caching (OpenCode Go/Zen).
-    let factory: Option<ModelFactory> = if mission_control {
-        None
-    } else {
-        let mc = config.delegate_model_config();
-        let lane_session_id = durable_id.clone();
-        Some(Arc::new(move || {
-            mc.build_model_for_session(lane_session_id.clone())
-        }))
-    };
     let sp = state_path.clone();
     let stream_out = stream.clone();
 
     let join = tokio::spawn(async move {
-        let durable_id = if mission_control {
-            Some(crate::mission_control::SESSION_ID.to_string())
-        } else {
-            sp.strip_prefix(crate::config::workspaces_root())
-                .ok()
-                .map(|p| p.display().to_string())
-        };
+        let durable_id = Some(session_id_for_state_path(&sp));
         let mut model = model_config.build_model_for_session(durable_id.clone());
-        // Durable identity = state path relative to the workspaces root — the
-        // same id the daemon uses for managed sessions and task envelopes.
-        let base_context = if mission_control {
-            ToolContext::mission_control(workspace)
-        } else {
-            match browser_summary {
-                Some(provider) => ToolContext::with_browser_summary(workspace, provider),
-                None => ToolContext::new(workspace),
-            }
-        }
+        // Session-start capability snapshot for conditional prompt layers. This
+        // is computed once and stays fixed for the session (cache-stable).
+        let prompt_ctx = crate::prompts::PromptContext {
+            worktree: workspace_is_worktree(&workspace),
+            memory: memory_enabled,
+            memory_writable: memory_enabled,
+            skills: !crate::skills::discover().is_empty(),
+            vault: !crate::vault::Vault::load().is_empty(),
+            browser: browser_summary
+                .as_ref()
+                .map(|provider| browser_summary_is_connected(&provider()))
+                .unwrap_or(false),
+        };
+        let runtime = AgentRuntime::resolve(
+            role,
+            RuntimeInputs {
+                workspace,
+                durable_id,
+                prompt_ctx,
+                browser_summary,
+                exa_api_key: exa_api_key.clone(),
+                memory,
+                delegate,
+            },
+        )
         .map_err(|e| e.to_string())?;
-        let context = match durable_id {
-            Some(id) => base_context.with_durable_session_id(id),
-            None => base_context,
-        };
-        // MC is a router. Whitelist inspection + routing only — never the
-        // coding toolkit or a lane factory. bash/read_image are for seeing
-        // status and screenshots, not implementing.
-        let tools = if mission_control {
-            let mut tools = ToolRegistry::new();
-            tools.insert(crate::builtins::BashTool);
-            tools.insert(crate::builtins::ReadImageTool);
-            crate::mission_tools::add_mission_control_tools(&mut tools);
-            tools
-        } else {
-            let mut tools = coding_tools(
-                exa_api_key.clone(),
-                crate::memory::MemoryLimits {
-                    enabled: memory_enabled,
-                    writable: true,
-                    index_budget_chars: memory_index_budget_chars,
-                    entry_budget_chars: memory_entry_budget_chars,
-                    max_entries: memory_max_entries,
-                },
-            );
-            crate::mission_tools::add_worker_report_tool(&mut tools);
-            tools.insert(crate::mission_tools::CreateRecurringJob);
-            tools
-        };
+
         let harness = CodingHarness::new(
             HarnessConfig {
-                system_prompt: if mission_control {
-                    mission_control_system_prompt()
-                } else {
-                    conversation_system_prompt()
-                },
+                system_prompt: runtime.prompt,
                 state_path: Some(sp),
                 resume,
                 exa_api_key: exa_api_key.clone(),
@@ -190,14 +346,14 @@ fn start_session_with_role(
                 memory_entry_budget_chars,
                 memory_max_entries,
                 memory_reflect_on_compaction,
-                allow_lane_control: !mission_control,
+                allow_lane_control: runtime.allow_lane_control,
                 ..HarnessConfig::default()
             },
-            tools,
-            context,
+            runtime.tools,
+            runtime.context,
         );
         harness
-            .run_interactive(&mut model, initial, rx, factory, stream)
+            .run_interactive(&mut model, initial, rx, runtime.factory, stream)
             .await
             .map_err(|e| e.to_string())
     });
@@ -326,8 +482,7 @@ fn mission_control_list_row() -> Option<SessionInfo> {
             meta.folder,
             meta.title,
             meta.status,
-            meta.last_active
-                .unwrap_or_else(|| file_mtime_secs(&path)),
+            meta.last_active.unwrap_or_else(|| file_mtime_secs(&path)),
         )
     } else {
         (
@@ -815,7 +970,11 @@ fn next_notification_id(records: &[serde_json::Value]) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    let current = records.iter().filter_map(|e| e.get("event_id").and_then(|v| v.as_u64())).max().unwrap_or(0);
+    let current = records
+        .iter()
+        .filter_map(|e| e.get("event_id").and_then(|v| v.as_u64()))
+        .max()
+        .unwrap_or(0);
     let next = persisted.max(current).saturating_add(1);
     let _ = std::fs::create_dir_all(crate::config::snippet_home());
     let _ = std::fs::write(notification_sequence_path(), next.to_string());
@@ -833,7 +992,10 @@ fn append_notification_event(event: serde_json::Value) -> serde_json::Value {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut records = read_notification_journal();
     let next_id = next_notification_id(&records);
     let mut record = event;
@@ -842,7 +1004,12 @@ fn append_notification_event(event: serde_json::Value) -> serde_json::Value {
         obj.insert("created_at".into(), serde_json::json!(now));
     }
     records.push(record.clone());
-    records.retain(|e| e.get("created_at").and_then(|v| v.as_u64()).map(|t| now.saturating_sub(t) <= NOTIFICATION_RETENTION_SECS).unwrap_or(false));
+    records.retain(|e| {
+        e.get("created_at")
+            .and_then(|v| v.as_u64())
+            .map(|t| now.saturating_sub(t) <= NOTIFICATION_RETENTION_SECS)
+            .unwrap_or(false)
+    });
     let path = notification_journal_path();
     let temp = path.with_extension("json.tmp");
     if let Ok(bytes) = serde_json::to_vec(&records) {
@@ -861,9 +1028,14 @@ fn read_notification_journal() -> Vec<serde_json::Value> {
 }
 
 pub fn replay_notification_events(since: u64) -> Vec<serde_json::Value> {
-    read_notification_journal().into_iter().filter(|e| {
-        e.get("event_id").and_then(|v| v.as_u64()).is_some_and(|id| id > since)
-    }).collect()
+    read_notification_journal()
+        .into_iter()
+        .filter(|e| {
+            e.get("event_id")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|id| id > since)
+        })
+        .collect()
 }
 
 /// Title / folder / status for a live session id (sidecar only — no full state).
@@ -963,11 +1135,7 @@ fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 fn sanitize_repo_name(name: &str) -> String {
@@ -981,11 +1149,7 @@ fn sanitize_repo_name(name: &str) -> String {
             }
         })
         .collect();
-    if s.is_empty() {
-        "repo".into()
-    } else {
-        s
-    }
+    if s.is_empty() { "repo".into() } else { s }
 }
 
 fn unique_worktree_path(parent: &Path) -> Option<PathBuf> {
@@ -1150,11 +1314,34 @@ fn workspace_from_state_file(state_path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// True when `folder` sits inside an isolated linked git worktree (created for
+/// this session) rather than the user's main checkout. Drives whether the
+/// worktree-specific prompt layer renders.
+pub(crate) fn workspace_is_worktree(folder: &Path) -> bool {
+    let folder = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
+    linked_worktree_root(&folder).is_some()
+}
+
+/// Parse the `connected = N` count out of a rendered browser summary. Drives both
+/// the conditional browser prompt layer (session start) and whether the live
+/// context shows the [browsers] section at all.
+pub(crate) fn browser_summary_is_connected(summary: &str) -> bool {
+    summary
+        .lines()
+        .find_map(|line| line.strip_prefix("connected = "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .is_some_and(|count| count > 0)
+}
+
 /// Best-effort: drop a linked git worktree created for this session.
 /// A linked worktree has a `.git` *file* (not a directory). Never touches
 /// the original clone.
 fn drop_session_worktree(folder: &Path) {
-    let folder = folder.canonicalize().unwrap_or_else(|_| folder.to_path_buf());
+    let folder = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
     let Some(worktree) = linked_worktree_root(&folder) else {
         return;
     };
@@ -1375,7 +1562,10 @@ mod create_blank_tests {
         let info = create_blank_session(&folder, "Odd request", true).unwrap();
         assert_eq!(info.title, "Odd request");
         assert_eq!(info.status, "idle");
-        assert_eq!(info.folder, folder.canonicalize().unwrap().display().to_string());
+        assert_eq!(
+            info.folder,
+            folder.canonicalize().unwrap().display().to_string()
+        );
         let path = state_path_for_id(&info.id).expect("created session is resolvable");
         assert!(path.exists());
         let state = deserialize_state(&fs::read(&path).unwrap()).unwrap();
@@ -1491,7 +1681,11 @@ mod create_blank_tests {
         let root = crate::config::worktrees_root();
         let folder = PathBuf::from(&info.folder);
         assert_ne!(folder, repo);
-        assert!(folder.starts_with(&root), "expected isolated worktree, got {}", folder.display());
+        assert!(
+            folder.starts_with(&root),
+            "expected isolated worktree, got {}",
+            folder.display()
+        );
         assert!(folder.join(".git").is_file());
         let path = state_path_for_id(&info.id).expect("created session is resolvable");
         remove_session_files(&path);
@@ -1555,7 +1749,10 @@ mod create_blank_tests {
         let bumped = read_session_meta(&path)
             .and_then(|m| m.last_active)
             .unwrap();
-        assert!(bumped >= frozen + 3600 - 2, "bump should be ~now, got {bumped} vs frozen {frozen}");
+        assert!(
+            bumped >= frozen + 3600 - 2,
+            "bump should be ~now, got {bumped} vs frozen {frozen}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1580,7 +1777,9 @@ mod create_blank_tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(&path, crate::harness::serialize_state(&state).unwrap()).unwrap();
         write_session_meta(&path, &state);
-        let pinned = read_session_meta(&path).and_then(|m| m.last_active).unwrap();
+        let pinned = read_session_meta(&path)
+            .and_then(|m| m.last_active)
+            .unwrap();
         assert_eq!(pinned, before);
         assert!(file_mtime_secs(&path) >= before);
 

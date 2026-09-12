@@ -65,6 +65,17 @@ fn content_hash(bytes: &[u8]) -> u64 {
 
 pub type BrowserSummaryProvider = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// The turn lease a session currently holds. Set when the session accepts a
+/// coordination assignment, cleared when it releases or hands off. The harness
+/// checks this fence before any workspace mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseClaim {
+    pub session_id: String,
+    pub lease_id: String,
+    pub assignment_id: String,
+    pub fencing_token: u64,
+}
+
 #[derive(Clone)]
 pub struct ToolContext {
     workspace_root: PathBuf,
@@ -88,6 +99,16 @@ pub struct ToolContext {
     /// Same store the daemon dispatcher uses. Set for Mission Control so tools
     /// do not recompute the root from HOME independently.
     mission_control_root: Option<PathBuf>,
+    /// Absolute path to the SQLite coordination database (`coordination.sqlite3`).
+    /// Set for every daemon-managed session so coordination tools reach the same
+    /// store the daemon writes.
+    coordination_db_path: Option<PathBuf>,
+    /// The directory agent id this session runs as (specialized sessions only).
+    /// Lease tools record it so turn ownership is attributed correctly.
+    agent_id: Option<String>,
+    /// Fenced turn lease this session holds, if any. Interior-mutable because the
+    /// lease tools run against a shared `&ToolContext`.
+    lease_claim: Arc<Mutex<Option<LeaseClaim>>>,
 }
 
 impl ToolContext {
@@ -140,6 +161,9 @@ impl ToolContext {
             mission_control: false,
             durable_session_id: None,
             mission_control_root: None,
+            coordination_db_path: None,
+            agent_id: None,
+            lease_claim: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -162,12 +186,56 @@ impl ToolContext {
         self
     }
 
+    /// Bind a durable id that may be absent, so a caller wiring several kinds of
+    /// session can apply it uniformly rather than branching on `Option` itself.
+    pub fn with_durable_session_id_opt(mut self, id: Option<String>) -> Self {
+        self.durable_session_id = id;
+        self
+    }
+
     pub fn durable_session_id(&self) -> Option<&str> {
         self.durable_session_id.as_deref()
     }
 
     pub fn mission_control_root(&self) -> Option<PathBuf> {
         self.mission_control_root.clone()
+    }
+
+    /// Bind the coordination database path for this session's tools.
+    pub fn with_coordination_db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.coordination_db_path = Some(path.into());
+        self
+    }
+
+    pub fn coordination_db_path(&self) -> Option<PathBuf> {
+        self.coordination_db_path.clone()
+    }
+
+    /// Bind the directory agent id this session runs as.
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = Some(id.into());
+        self
+    }
+
+    /// Bind an optional agent id, so a caller wiring several kinds of session
+    /// applies it uniformly instead of branching on `Option` itself.
+    pub fn with_agent_id_opt(mut self, id: Option<String>) -> Self {
+        self.agent_id = id;
+        self
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
+    /// Record the fenced turn lease this session now holds.
+    pub fn set_lease_claim(&self, claim: Option<LeaseClaim>) {
+        *self.lease_claim.lock().unwrap() = claim;
+    }
+
+    /// The turn lease this session holds, if any.
+    pub fn lease_claim(&self) -> Option<LeaseClaim> {
+        self.lease_claim.lock().unwrap().clone()
     }
 
     /// Record a successful memory_write id for live-context [memory_updated].

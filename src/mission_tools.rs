@@ -56,9 +56,8 @@ impl Tool for ListSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_sessions".into(),
-            description: "Catalog of every durable chat on this device except Mission Control itself, newest last_active first. Each row: id (pass to inspect_session / create_mission_task), title (tab name), folder (workspace/repo), status (idle/running/waiting_for_input), last_active (unix seconds). This IS what other sessions are doing — do not ask them. Call before routing.".into(),
-            input_schema: schema(json!({}), &[]),
-        }
+            description: "Catalog of durable project chats on this device. Use only for ordinary project work, status, or session requests. Do not call it before a direct agent-build request; agent builds do not require a project workspace or session.".into(),
+            input_schema: schema(json!({}), &[]),        }
     }
     async fn execute(
         &self,
@@ -134,13 +133,20 @@ fn inspect_event_row(event: &crate::harness::HarnessEvent) -> Option<Value> {
             }
             Some(json!({"kind": "assistant", "text": text}))
         }
-        UserQuestion { questions } => Some(json!({"kind": "waiting_for_input", "questions": questions})),
+        UserQuestion { questions } => {
+            Some(json!({"kind": "waiting_for_input", "questions": questions}))
+        }
         ModelError { message } => Some(json!({"kind": "error", "text": clip(message, 240)})),
         ApprovalRequest {
             tool_name, summary, ..
-        } => Some(json!({"kind": "needs_approval", "tool": tool_name, "summary": clip(summary, 240)})),
+        } => Some(
+            json!({"kind": "needs_approval", "tool": tool_name, "summary": clip(summary, 240)}),
+        ),
         LaneCompleted {
-            title, status, summary, ..
+            title,
+            status,
+            summary,
+            ..
         } => Some(json!({
             "kind": "worker_done",
             "title": title,
@@ -159,11 +165,7 @@ mod inspect_tests {
     #[test]
     fn strip_steering_blocks_from_other_sessions() {
         let raw = "user said hi\n[steering]\n# INTERNAL STATE\n[/steering]\nkeep this";
-        let cleaned = strip_harness_markup(raw);
-        assert!(!cleaned.contains("[steering]"));
-        assert!(!cleaned.contains("INTERNAL STATE"));
-        assert!(cleaned.contains("user said hi"));
-        assert!(cleaned.contains("keep this"));
+        assert_eq!(strip_harness_markup(raw), "user said hi\n\nkeep this");
     }
 
     #[test]
@@ -173,10 +175,7 @@ mod inspect_tests {
         };
         let row = inspect_event_row(&event).expect("row");
         assert_eq!(row["kind"], "user");
-        let text = row["text"].as_str().unwrap();
-        assert!(text.contains("go over the changes"));
-        assert!(!text.contains("[steering]"));
-        assert!(!text.contains("ignore me"));
+        assert_eq!(row["text"], "go over the changes");
     }
 }
 
@@ -248,7 +247,7 @@ impl Tool for CreateMissionSession {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_mission_session".into(),
-            description: "Open a new durable chat in an existing folder so you can dispatch to it. Use when list_sessions has no matching row but the user named a real directory. folder must already exist. Prefer routing to an existing session; only create when none fits. Then create_mission_task on the returned id with handoff_mode=fresh.".into(),
+            description: "Open a durable project chat in an existing folder. Use only for ordinary project work when no existing session owns the folder. Never use this for an agent build; agent identity homes are separate from project sessions.".into(),
             input_schema: schema(
                 json!({
                     "folder": {"type": "string"},
@@ -294,7 +293,7 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist and queue a structured handoff to an existing durable session. The daemon dispatches it safely; do not use this for trivial work. handoff_mode: 'resume' when the target session already has the context, 'fresh' when the description must be a self-contained briefing.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist exactly one ordinary project handoff to an existing durable session. Never use for direct user agent-build requests, [AGENT_BUILD_JOB] envelopes, worker reports, or build-status notifications. Use handoff_mode 'resume' when the target already has context and 'fresh' otherwise.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =

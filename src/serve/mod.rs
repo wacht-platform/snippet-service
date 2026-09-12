@@ -15,22 +15,22 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
+use crate::config::{InferenceProfileConfig, SnippetConfig, save_config, workspaces_root};
 use crate::harness::{GoalStatus, LoopInput, deserialize_state, serialize_state};
 use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
 use crate::recurring::{self, Schedule};
 use crate::session::{
     list_device_sessions, prepare_new_session_workspace, read_session_profile,
-    session_id_for_state_path, start_mission_control_session,
+    replay_notification_events, session_id_for_state_path, start_mission_control_session,
     start_session_with_browser_summary, state_path_for_id, status_str, subscribe_device_events,
-    write_session_profile, replay_notification_events,
+    write_session_profile,
 };
 
 mod browser;
@@ -134,6 +134,14 @@ struct Daemon {
     token: String,
     hostname: String,
     sessions: Mutex<HashMap<String, LiveSession>>,
+    /// Daemon-wide interactive shells, NOT tied to any session.
+    ///
+    /// A shell belongs to the machine: switching or closing a session must not
+    /// kill it. The pty machinery was already sessionless (`SessionTerms::new`);
+    /// only the transport was not, because `/attach` requires a live session.
+    /// `/shells` exposes the same `wire: term` frames over a socket that needs no
+    /// session at all.
+    shells: Arc<crate::term::SessionTerms>,
     /// Serializes git WRITE operations daemon-wide so a user's git action can't
     /// race the agent's edits (or another git write) on the same index.
     git_write: Mutex<()>,
@@ -149,6 +157,9 @@ struct Daemon {
     queue_hidden: std::sync::Mutex<HashMap<String, Vec<String>>>,
     queue_revision: AtomicU64,
     mission_control_root: PathBuf,
+    coordination_db: crate::coordination::CoordinationDb,
+    coordination_events:
+        tokio::sync::broadcast::Sender<crate::coordination::types::CoordinationEvent>,
     recurring_root: PathBuf,
 }
 
@@ -165,6 +176,16 @@ fn machine_hostname() -> String {
 }
 
 type Shared = Arc<Daemon>;
+
+/// Working directory for daemon-wide shells.
+///
+/// Deliberately the daemon's own cwd (`~` when started by the service manager),
+/// NOT a session workspace: a global shell belongs to the machine, so it must
+/// not silently follow whichever session happened to be open. A session that
+/// wants its own workspace shell already gets one through its `wire: term`.
+fn global_shell_cwd() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
 
 /// Constant-time token check: hash both sides to a fixed 32-byte digest and compare
 /// without short-circuiting, so neither token length nor content leaks via timing.
@@ -277,37 +298,103 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        // Role-aware resume: a session opened as Mission Control must come back
-        // with the MC prompt/tools/lane restrictions after a daemon restart,
-        // not silently downgrade to an ordinary conversation session.
-        let role = read_session_role(&sp);
-        let handle = match role.as_deref() {
-            Some("mission_control") => crate::session::start_mission_control_session(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-            _ => start_session_with_browser_summary(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-        };
+        // Role-aware resume. ONE place decides the role — see `start_role_aware`.
+        // A session opened as Mission Control must come back with the MC
+        // prompt/tools/lane restrictions, and an agent session with its
+        // specialized identity, rather than silently downgrading either.
+        let handle = self.start_role_aware(&cfg, sp.clone()).await;
         let tx = handle.input_tx.clone();
         let live = live_from_handle(handle, profile);
         let stream = live.stream.clone();
         sessions.insert(id.to_string(), live);
         Some((tx, sp, stream))
+    }
+
+    /// Start (or resume) a session with the ROLE it was created with.
+    ///
+    /// The single place that decides role. Two callers need it and previously
+    /// only one had it: `ensure_live` dispatched on the `.role` sidecar, while
+    /// `set_session_model` always started a plain session. Switching the model
+    /// mid-conversation therefore DOWNGRADED a Mission Control or agent session
+    /// to an ordinary one — losing the MC prompt/tools/lane restrictions until
+    /// the next daemon restart restored them from the sidecar.
+    ///
+    /// Falls back to a plain session whenever the role's home is unavailable, so
+    /// a missing identity can never wedge a session.
+    async fn start_role_aware(
+        &self,
+        cfg: &SnippetConfig,
+        sp: PathBuf,
+    ) -> crate::session::SessionHandle {
+        // Cloned per call: a `StreamHandle` is an `Arc<Mutex<StreamBuffer>>`, so
+        // cloning is a refcount bump, and each call site needs its own value
+        // because the match arms move it.
+        let stream = || {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            )))
+        };
+        match read_session_role(&sp).as_deref() {
+            Some("mission_control") => crate::session::start_mission_control_session(
+                cfg,
+                sp,
+                None,
+                true,
+                stream(),
+                Some(self.browser.summary_provider()),
+            ),
+            Some(role) if role.starts_with("agent:") => {
+                let agent_id = role.trim_start_matches("agent:");
+                match crate::coordination::AgentHome::new(
+                    crate::coordination::agents_root(&self.mission_control_root),
+                    agent_id,
+                ) {
+                    // Identity revision is re-read on every resume, so an agent
+                    // whose identity was updated comes back with the new guidance.
+                    Ok(home) => match crate::session::start_specialized_agent_session(
+                        cfg,
+                        sp.clone(),
+                        None,
+                        true,
+                        stream(),
+                        Some(self.browser.summary_provider()),
+                        home,
+                    ) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            eprintln!(
+                                "[coordination] agent `{agent_id}` identity unavailable ({error}); \
+                                 running as an ordinary session"
+                            );
+                            start_session_with_browser_summary(
+                                cfg,
+                                sp,
+                                None,
+                                true,
+                                stream(),
+                                Some(self.browser.summary_provider()),
+                            )
+                        }
+                    },
+                    Err(_) => start_session_with_browser_summary(
+                        cfg,
+                        sp,
+                        None,
+                        true,
+                        stream(),
+                        Some(self.browser.summary_provider()),
+                    ),
+                }
+            }
+            _ => start_session_with_browser_summary(
+                cfg,
+                sp,
+                None,
+                true,
+                stream(),
+                Some(self.browser.summary_provider()),
+            ),
+        }
     }
 
     /// The provider actually driving a session: its per-chat profile's provider
@@ -365,29 +452,12 @@ impl Daemon {
         if let Some(old) = sessions.remove(id) {
             old.join.abort();
         }
-        let role = read_session_role(&sp);
-        let handle = match role.as_deref() {
-            Some("mission_control") => start_mission_control_session(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-            _ => start_session_with_browser_summary(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-        };
+        // ONE resolver for every role. This path used to handle only
+        // `mission_control`, so a config reload silently rebuilt a specialized
+        // agent as an ordinary session — losing its identity, prompt and tool
+        // set, with nothing logged. Routing both readers through
+        // `start_role_aware` makes that asymmetry unrepresentable.
+        let handle = self.start_role_aware(&cfg, sp.clone()).await;
         sessions.insert(id.to_string(), live_from_handle(handle, profile));
         RebuildOutcome::Rebuilt
     }
@@ -397,13 +467,25 @@ impl Daemon {
     /// receives the original control input and persists the durable mutation at
     /// the next safe boundary.
     async fn hide_queued(&self, id: &str, queue_id: &str) {
-        let path = self.sessions.lock().await.get(id)
+        let path = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
             .map(|s| s.state_path.clone())
             .or_else(|| state_path_for_id(id));
-        let Some(path) = path else { return; };
-        let Ok(bytes) = std::fs::read(path) else { return; };
-        let Ok(state) = deserialize_state(&bytes) else { return; };
-        let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else { return; };
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(state) = deserialize_state(&bytes) else {
+            return;
+        };
+        let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else {
+            return;
+        };
         let mut hidden = self.queue_hidden.lock().unwrap();
         let entries = hidden.entry(id.to_string()).or_default();
         if !entries.contains(&item.id) {
@@ -549,14 +631,23 @@ pub async fn run_serve(
         token,
         hostname: machine_hostname(),
         sessions: Mutex::new(HashMap::new()),
+        shells: crate::term::SessionTerms::new(global_shell_cwd()),
         git_write: Mutex::new(()),
         browser: BrowserManager::default(),
         seen_nonces: std::sync::Mutex::new(HashMap::new()),
         queue_hidden: std::sync::Mutex::new(HashMap::new()),
         queue_revision: AtomicU64::new(0),
         mission_control_root: mission_control::MissionControlStore::default_root(None),
+        coordination_db: crate::coordination::CoordinationDb::open(
+            crate::coordination::default_db_path(),
+        )
+        .map_err(|error| format!("open coordination database: {error}"))?,
+        coordination_events: tokio::sync::broadcast::channel(256).0,
         recurring_root: recurring::default_root(),
     });
+
+    // Register the built-in agents before anything can address them.
+    register_builtin_agents(&daemon);
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
@@ -594,6 +685,74 @@ pub async fn run_serve(
     const UPLOAD_BODY_LIMIT: usize = MAX_UPLOAD_FILE_BYTES / 3 * 4 + 64 * 1024;
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route(
+            "/agents",
+            get(coordination_agents).post(coordination_create_agent),
+        )
+        .route("/agents/build", post(build_agent_from_prompt))
+        .route(
+            "/coordination/tasks",
+            get(coordination_list_tasks).post(coordination_create_task),
+        )
+        .route(
+            "/coordination/tasks/{task_id}",
+            get(coordination_get_task).patch(coordination_update_task),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/status",
+            post(coordination_set_task_status),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/links",
+            get(coordination_task_links).post(coordination_link_tasks),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/links/{other_id}",
+            delete(coordination_unlink_tasks),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/agents",
+            get(coordination_task_agents).post(coordination_add_task_agent),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/agents/{agent_id}",
+            delete(coordination_remove_task_agent),
+        )
+        .route(
+            "/coordination/assignments",
+            get(coordination_list_assignments).post(coordination_create_assignment),
+        )
+        .route("/coordination/leases", get(coordination_list_leases))
+        .route(
+            "/coordination/sessions/{session_id}/agents",
+            get(coordination_session_agents),
+        )
+        .route(
+            "/coordination/sessions/{session_id}/lease",
+            post(coordination_acquire_lease),
+        )
+        .route(
+            "/coordination/sessions/{session_id}/lease/{lease_id}",
+            delete(coordination_release_lease),
+        )
+        .route(
+            "/coordination/sessions/{session_id}/lease/{lease_id}/renew",
+            post(coordination_renew_lease),
+        )
+        .route("/coordination/handoffs", get(coordination_list_handoffs))
+        .route(
+            "/coordination/handoffs/{handoff_id}/acknowledge",
+            post(coordination_acknowledge_handoff),
+        )
+        .route(
+            "/coordination/threads/{thread_id}/events",
+            get(coordination_events),
+        )
+        .route(
+            "/coordination/threads/{thread_id}/messages",
+            post(coordination_post_message),
+        )
+        .route("/coordination/events", get(coordination_events_ws))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
         .route("/usage", get(usage_summary))
@@ -644,6 +803,7 @@ pub async fn run_serve(
         .route("/fs/delete", post(delete_fs_path))
         .route("/fs/download", get(download_fs_file))
         .route("/attach", get(attach_ws))
+        .route("/shells", get(shells_ws))
         .route("/events", get(events_ws))
         .route("/browser/ws", get(browser_ws))
         .route("/browsers", get(list_browsers))
@@ -990,9 +1150,1120 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Auth {
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CoordinationAgentsQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(display_name, id)`.
+    #[serde(default)]
+    after_name: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_coord_page_limit")]
+    limit: u32,
+}
+fn default_coord_page_limit() -> u32 {
+    200
+}
+
+async fn coordination_agents(
+    State(d): State<Shared>,
+    Query(q): Query<CoordinationAgentsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let after = match (q.after_name.as_deref(), q.after_id.as_deref()) {
+        (Some(name), Some(id)) => Some((name, id)),
+        // A lone cursor half is a caller error, not a silent full listing.
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_name and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    match d
+        .coordination_db
+        .list_agents_page(after, q.limit.clamp(1, 500))
+    {
+        Ok(agents) => Json(agents).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("coordination database: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationAgentReq {
+    id: String,
+    display_name: String,
+    handle: String,
+    #[serde(default = "default_coord_agent_kind")]
+    kind: crate::coordination::types::AgentKind,
+    #[serde(default = "default_coord_agent_status")]
+    status: crate::coordination::types::AgentStatus,
+    #[serde(default = "default_coord_agent_role")]
+    role: crate::coordination::types::AgentRole,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    max_concurrent_assignments: u32,
+}
+fn default_coord_agent_kind() -> crate::coordination::types::AgentKind {
+    crate::coordination::types::AgentKind::Worker
+}
+fn default_coord_agent_status() -> crate::coordination::types::AgentStatus {
+    crate::coordination::types::AgentStatus::Active
+}
+fn default_coord_agent_role() -> crate::coordination::types::AgentRole {
+    crate::coordination::types::AgentRole::Implementer
+}
+
+async fn coordination_create_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<CoordinationAgentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.id.trim().is_empty() || req.handle.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "id and handle are required").into_response();
+    }
+    let agent = crate::coordination::types::Agent {
+        id: req.id,
+        display_name: req.display_name,
+        handle: req.handle,
+        kind: req.kind,
+        status: req.status,
+        role: req.role,
+        capabilities: req.capabilities,
+        max_concurrent_assignments: req.max_concurrent_assignments,
+        version: 1,
+    };
+    let home = match crate::coordination::AgentHome::new(
+        crate::coordination::agents_root(&d.mission_control_root),
+        &agent.id,
+    ) {
+        Ok(home) => home,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let default_identity = format!(
+        "# {}\n\nAgent handle: @{}\n\nThis identity is awaiting its first build and research pass.\n",
+        agent.display_name, agent.handle
+    );
+    if let Err(error) = home.ensure_layout(&default_identity, "registration") {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create agent home: {error}"),
+        )
+            .into_response();
+    }
+    match d.coordination_db.create_agent(&agent) {
+        Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(),
+        Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationEventsQuery {
+    token: Option<String>,
+    #[serde(default)]
+    after_sequence: u64,
+    #[serde(default = "default_coord_event_limit")]
+    limit: u32,
+}
+fn default_coord_event_limit() -> u32 {
+    100
+}
+
+async fn coordination_events(
+    State(d): State<Shared>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    Query(q): Query<CoordinationEventsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .events_for_thread(&thread_id, q.after_sequence, q.limit.clamp(1, 500))
+    {
+        Ok(events) => Json(events).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read coordination events: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationMessageReq {
+    actor_kind: String,
+    actor_id: String,
+    body: String,
+    #[serde(default)]
+    idempotency_key: String,
+}
+
+async fn coordination_post_message(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationMessageReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.body.trim().is_empty() || req.actor_id.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "actor_id and body are required").into_response();
+    }
+    let event = crate::coordination::types::CoordinationEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        thread_id: thread_id.clone(),
+        partition_key: format!("thread:{thread_id}"),
+        sequence: 0,
+        event_type: "message.posted".into(),
+        actor_kind: req.actor_kind,
+        actor_id: req.actor_id,
+        payload_version: 1,
+        payload: serde_json::json!({"body":req.body}),
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: if req.idempotency_key.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            req.idempotency_key
+        },
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match d.coordination_db.append_event(&event) {
+        Ok(saved) => {
+            let _ = d.coordination_events.send(saved.clone());
+            // A board post is a message TO someone: wake Mission Control so it
+            // can respond. Without this the human just sees their own message
+            // and no agent ever participates. Skipped for Mission Control's own
+            // posts so a reply can't wake the session that wrote it.
+            if should_wake_mission_control(&saved.actor_id) {
+                let daemon = d.clone();
+                // Hand over a bounded slice of the room, excluding the message
+                // just posted (the envelope carries it separately as `body`), so
+                // the wake reads as a group chat rather than one isolated line.
+                let history: Vec<_> = d
+                    .coordination_db
+                    .recent_events_for_thread(
+                        &saved.thread_id,
+                        crate::coordination_tools::BOARD_HISTORY_ON_WAKE + 1,
+                    )
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| e.sequence < saved.sequence)
+                    .collect();
+                let envelope = board_message_envelope(&saved, &history);
+                tokio::spawn(async move {
+                    daemon
+                        .deliver(
+                            crate::mission_control::SESSION_ID,
+                            LoopInput::UserMessage(envelope),
+                        )
+                        .await;
+                });
+            }
+            Json(saved).into_response()
+        }
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("post coordination message: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_events_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let mut rx = d.coordination_events.subscribe();
+    ws.on_upgrade(move |mut socket| async move {
+        while let Ok(event) = rx.recv().await {
+            if socket
+                .send(Message::Text(
+                    serde_json::json!({"wire":"coordination_event","event":event})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+#[derive(Deserialize)]
+struct CoordinationAssignmentReq {
+    id: String,
+    goal_id: String,
+    session_id: String,
+    agent_id: String,
+    scope: String,
+    definition_of_done: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinationAssignmentsQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(created_at, id)`.
+    #[serde(default)]
+    after_created: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_coord_page_limit")]
+    limit: u32,
+    /// Optional filter by agent, for "what is this agent working on".
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+/// Assignments, newest page first by `(created_at, id)` keyset. Optionally
+/// filtered to one agent or one session, which is how the UI answers "who is
+/// working on what".
+async fn coordination_list_assignments(
+    State(d): State<Shared>,
+    Query(q): Query<CoordinationAssignmentsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let after = match (q.after_created.as_deref(), q.after_id.as_deref()) {
+        (Some(created), Some(id)) => Some((created, id)),
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_created and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    let filter = crate::coordination::AssignmentFilter {
+        agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
+        session_id: q.session_id.as_deref().filter(|s| !s.trim().is_empty()),
+    };
+    match d
+        .coordination_db
+        .list_assignments_page(&filter, after, q.limit.clamp(1, 500))
+    {
+        Ok(assignments) => Json(assignments).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list assignments: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Sessions that currently have an active turn holder: the live view of which
+/// agent is working in which session, and since when.
+async fn coordination_list_leases(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .list_active_leases(&chrono::Utc::now().to_rfc3339())
+    {
+        Ok(leases) => Json(leases).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list leases: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Who is — and was — active in a session: the active holder first, then the
+/// history. This is what answers "when is an agent active in this session".
+async fn coordination_session_agents(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .list_session_agents(&session_id, &chrono::Utc::now().to_rfc3339())
+    {
+        Ok(agents) => Json(agents).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list session agents: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// The task board's own columns are narrower than the assignment states — a task
+/// is what a HUMAN filed, so it carries Todo/InProgress/Blocked/Done/Cancelled
+/// and nothing about dispatch.
+#[derive(Deserialize)]
+struct CoordinationTasksQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(created_at, id)`.
+    #[serde(default)]
+    after_created: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_coord_page_limit")]
+    limit: u32,
+    /// Board column to show. Omitted returns every column.
+    #[serde(default)]
+    status: Option<String>,
+    /// "What is this agent on" — the roster filter.
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+fn parse_task_status(value: &str) -> Result<crate::coordination::TaskStatus, String> {
+    serde_json::from_str(&format!("\"{value}\""))
+        .map_err(|_| format!("unknown task status: {value}"))
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskReq {
+    /// Optional so a client can supply its own id (offline creation); the daemon
+    /// generates one otherwise.
+    #[serde(default)]
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    priority: i64,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskPatch {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskStatusReq {
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskLinkReq {
+    to_task_id: String,
+    /// `blocks` (default) or `relates_to`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskAgentReq {
+    agent_id: String,
+    #[serde(default)]
+    role: String,
+}
+
+/// Tasks on the board, newest priority first. The board is the human's view:
+/// creating and moving a task never touches the dispatch machinery, which is
+/// Mission Control's job once it picks the task up.
+async fn coordination_list_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<CoordinationTasksQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let after = match (q.after_created.as_deref(), q.after_id.as_deref()) {
+        (Some(created), Some(id)) => Some((created, id)),
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_created and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    let status = match q.status.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => match parse_task_status(raw) {
+            Ok(status) => Some(status),
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        },
+        None => None,
+    };
+    let filter = crate::coordination::TaskFilter {
+        status,
+        agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
+    };
+    match d
+        .coordination_db
+        .list_tasks_page(&filter, after, q.limit.clamp(1, 500))
+    {
+        Ok(tasks) => Json(tasks).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list tasks: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_create_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<CoordinationTaskReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let title = req.title.trim();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let id = req
+        .id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let task = crate::coordination::Task {
+        thread_id: crate::coordination::Task::thread_for(&id),
+        id,
+        title: title.to_string(),
+        description: req.description.trim().to_string(),
+        status: crate::coordination::TaskStatus::Todo,
+        priority: req.priority,
+        created_by_kind: "human".into(),
+        created_by_id: "local".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        completed_at: None,
+    };
+    match d.coordination_db.create_task(&task) {
+        Ok(()) => (StatusCode::CREATED, Json(task)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_get_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.get_task(&task_id) {
+        Ok(Some(task)) => Json(task).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("get task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_update_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskPatch>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let description = req.description.as_deref().map(str::trim);
+    match d.coordination_db.update_task(
+        &task_id,
+        title,
+        description,
+        req.priority,
+        &now,
+    ) {
+        Ok(true) => match d.coordination_db.get_task(&task_id) {
+            Ok(Some(task)) => Json(task).into_response(),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("update task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_set_task_status(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskStatusReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let status = match parse_task_status(req.status.trim()) {
+        Ok(status) => status,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    match d.coordination_db.set_task_status(&task_id, &status, &now) {
+        Ok(true) => match d.coordination_db.get_task(&task_id) {
+            Ok(Some(task)) => Json(task).into_response(),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("set task status: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Every edge touching the task, both directions, plus the blockers resolved to
+/// ids. A reader needs the incoming edges as much as the outgoing ones — that is
+/// what makes a blocked task render as blocked.
+async fn coordination_task_links(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let links = match d.coordination_db.task_links(&task_id) {
+        Ok(links) => links,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task links: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let blockers = match d.coordination_db.blockers_of(&task_id) {
+        Ok(blockers) => blockers,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task blockers: {error}"),
+            )
+                .into_response();
+        }
+    };
+    Json(serde_json::json!({ "links": links, "blocked_by": blockers })).into_response()
+}
+
+async fn coordination_link_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskLinkReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let to = req.to_task_id.trim();
+    if to.is_empty() {
+        return (StatusCode::BAD_REQUEST, "to_task_id is required").into_response();
+    }
+    if to == task_id {
+        return (StatusCode::BAD_REQUEST, "a task cannot link to itself")
+            .into_response();
+    }
+    let kind = match req.kind.as_deref().unwrap_or("blocks") {
+        "blocks" => crate::coordination::TaskLinkKind::Blocks,
+        "relates_to" => crate::coordination::TaskLinkKind::RelatesTo,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown link kind: {other}"),
+            )
+                .into_response();
+        }
+    };
+    // Both ends must exist, or the edge dangles and the board draws a blank node.
+    for id in [task_id.as_str(), to] {
+        match d.coordination_db.get_task(id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (StatusCode::NOT_FOUND, format!("no such task: {id}"))
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("read task: {error}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let link = crate::coordination::TaskLink {
+        from_task_id: task_id,
+        to_task_id: to.to_string(),
+        kind,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match d.coordination_db.link_tasks(&link) {
+        Ok(()) => (StatusCode::CREATED, Json(link)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("link tasks: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_unlink_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((task_id, other_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    // Both directions are removed: the caller names the pair, and which end was
+    // stored as `from` is an implementation detail it should not have to know.
+    let mut removed = false;
+    for (from, to) in [
+        (task_id.as_str(), other_id.as_str()),
+        (other_id.as_str(), task_id.as_str()),
+    ] {
+        for kind in [
+            crate::coordination::TaskLinkKind::Blocks,
+            crate::coordination::TaskLinkKind::RelatesTo,
+        ] {
+            match d.coordination_db.unlink_tasks(from, to, &kind) {
+                Ok(true) => removed = true,
+                Ok(false) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unlink tasks: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    if removed {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such link").into_response()
+    }
+}
+
+async fn coordination_task_agents(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.list_task_agents(&task_id) {
+        Ok(agents) => Json(agents).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task agents: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_add_task_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskAgentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let agent_id = req.agent_id.trim();
+    if agent_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "agent_id is required").into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    match d
+        .coordination_db
+        .add_task_agent(&task_id, agent_id, req.role.trim(), &now)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("add task agent: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_remove_task_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((task_id, agent_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .remove_task_agent(&task_id, &agent_id, &chrono::Utc::now().to_rfc3339())
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "agent is not on this task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("remove task agent: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_create_assignment(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<CoordinationAssignmentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.id.trim().is_empty()
+        || req.goal_id.trim().is_empty()
+        || req.session_id.trim().is_empty()
+        || req.agent_id.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "id, goal_id, session_id, and agent_id are required",
+        )
+            .into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let assignment = crate::coordination::Assignment {
+        id: req.id,
+        goal_id: req.goal_id,
+        session_id: req.session_id,
+        agent_id: req.agent_id,
+        status: crate::coordination::AssignmentStatus::Offered,
+        scope: req.scope,
+        definition_of_done: req.definition_of_done,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    match d.coordination_db.create_assignment(&assignment) {
+        Ok(()) => {
+            // Start (or revive) the target session under the assigned agent's
+            // identity, then deliver the assignment. Best-effort: the assignment
+            // is already durable, so a dispatch failure must not lose it.
+            if let Err(error) = ensure_agent_session(&d, &assignment).await {
+                eprintln!(
+                    "[coordination] assignment {} not dispatched: {error}",
+                    assignment.id
+                );
+            }
+            (StatusCode::CREATED, Json(assignment)).into_response()
+        }
+        Err(error) => (StatusCode::CONFLICT, format!("create assignment: {error}")).into_response(),
+    }
+}
+
+/// Whether a board post should wake Mission Control. Posts authored by Mission
+/// Control itself are skipped, so a reply cannot re-wake the session that wrote
+/// it (which would loop).
+fn should_wake_mission_control(actor_id: &str) -> bool {
+    actor_id != crate::mission_control::SESSION_ID
+}
+
+/// The board thread every participant shares: the human app posts here, and the
+/// daemon routes assignments and worker posts to the same thread so nobody has
+/// to guess an id.
+pub const COORDINATION_THREAD: &str = "system";
+
+/// Collapse a message body to a single line for the history digest, so a
+/// multi-line message can't break the field-per-line layout.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The envelope handed to Mission Control when someone posts to the board — the
+/// shared room. Wraps the message so it is not mistaken for a direct chat turn,
+/// and carries a bounded slice of recent history so the room reads as a group
+/// chat rather than a single isolated line.
+///
+/// Field order matters: `body` is deliberately last, so a client can take
+/// everything up to the closing tag as the message — including newlines — and
+/// the internal `rules` and history never run into the sender's text.
+fn board_message_envelope(
+    event: &crate::coordination::types::CoordinationEvent,
+    history: &[crate::coordination::types::CoordinationEvent],
+) -> String {
+    let body = event
+        .payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let mut digest = String::new();
+    if history.is_empty() {
+        digest.push_str("history: (start of the room)\n");
+    } else {
+        digest.push_str(&format!(
+            "history: last {} message(s), oldest first\n",
+            history.len()
+        ));
+        for prior in history {
+            let prior_body = one_line(
+                prior
+                    .payload
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            );
+            digest.push_str(&format!(
+                "  {} [{}] {}: {}\n",
+                prior.sequence, prior.actor_kind, prior.actor_id, prior_body
+            ));
+        }
+    }
+    format!(
+        "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n\
+         rules: board message, not an ordinary chat turn. This is a shared group room, not a direct \
+         message. Decide whether it needs a response, a handoff, or an assignment; reply on this same \
+         thread with post_coordination_message so everyone sees it. If no action is needed, say so on \
+         the thread rather than staying silent. Only the recent history is included — call \
+         read_coordination_thread to see more.\n{history}body: {body}\n\
+         [/coordination_board_message]",
+        event.thread_id,
+        event.actor_id,
+        event.actor_kind,
+        history = digest,
+        body = body,
+    )
+}
+
+/// The envelope handed to the worker session that owns `assignment`. States the
+/// boundary and the report contract without restating the session prompt.
+fn coordination_assignment_envelope(assignment: &crate::coordination::Assignment) -> String {
+    format!(
+        "[coordination_assignment]\nassignment_id: {}\ngoal_id: {}\nsession_id: {}\nagent_id: {}\nscope: {}\ndefinition_of_done: {}\nboard_thread: {}\n\
+         rules: accept this assignment to acquire the turn (accept_coordination_assignment), \
+         renew_coordination_lease while working, release_coordination_lease when done or handing off. \
+         Post progress to the board with post_coordination_message on board_thread — that is the thread the \
+         human reads, so a post anywhere else goes unseen. Read the room with \
+         read_coordination_thread when you need more history than the wake message included. \
+         Do not mutate the workspace until you hold the turn.\n\
+         [/coordination_assignment]",
+        assignment.id,
+        assignment.goal_id,
+        assignment.session_id,
+        assignment.agent_id,
+        assignment.scope,
+        assignment.definition_of_done,
+        COORDINATION_THREAD,
+    )
+}
+
+/// Start (or revive) the session that will execute `assignment`, running as the
+/// assigned agent's specialized identity, and deliver the assignment envelope.
+/// Writes the role sidecar first so a later resume keeps the agent identity.
+async fn ensure_agent_session(
+    d: &Shared,
+    assignment: &crate::coordination::Assignment,
+) -> Result<(), String> {
+    let sp = state_path_for_id(&assignment.session_id).ok_or_else(|| {
+        format!(
+            "assignment targets unknown durable session `{}`",
+            assignment.session_id
+        )
+    })?;
+    // The agent home must exist; otherwise the session would start with no identity.
+    let home = crate::coordination::AgentHome::new(
+        crate::coordination::agents_root(&d.mission_control_root),
+        &assignment.agent_id,
+    )
+    .map_err(|e| e.to_string())?;
+    if !home.identity_path().exists() {
+        return Err(format!(
+            "agent `{}` has no identity home at {}",
+            assignment.agent_id,
+            home.root().display()
+        ));
+    }
+    write_session_role(&sp, &format!("agent:{}", assignment.agent_id));
+    let Some((tx, _sp, _stream)) = d.ensure_live(&assignment.session_id).await else {
+        return Err(format!(
+            "could not start session `{}`",
+            assignment.session_id
+        ));
+    };
+    let _ = tx.send(LoopInput::UserMessage(coordination_assignment_envelope(
+        assignment,
+    )));
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct CoordinationLeaseReq {
+    lease_id: String,
+    assignment_id: String,
+    agent_id: String,
+    expires_at: String,
+}
+
+async fn coordination_acquire_lease(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationLeaseReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let lease = crate::coordination::types::SessionLease {
+        session_id,
+        lease_id: req.lease_id,
+        assignment_id: req.assignment_id,
+        agent_id: req.agent_id,
+        fencing_token: 0,
+        acquired_at: chrono::Utc::now().to_rfc3339(),
+        renewed_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: req.expires_at,
+    };
+    match d.coordination_db.acquire_lease(&lease) {
+        Ok(Some(acquired)) => (StatusCode::CREATED, Json(acquired)).into_response(),
+        Ok(None) => (StatusCode::CONFLICT, "session already has an active lease").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("acquire lease: {error}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationLeaseRenewReq {
+    fencing_token: u64,
+    expires_at: String,
+}
+
+async fn coordination_renew_lease(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<CoordinationLeaseRenewReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let renewed_at = chrono::Utc::now().to_rfc3339();
+    match d.coordination_db.renew_lease(&lease_id, req.fencing_token, &renewed_at, &req.expires_at) {
+        Ok(true) => Json(serde_json::json!({"lease_id": lease_id, "fencing_token": req.fencing_token, "renewed_at": renewed_at, "expires_at": req.expires_at})).into_response(),
+        Ok(false) => (StatusCode::CONFLICT, "lease is stale, released, or fenced").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("renew lease: {error}")).into_response(),
+    }
+}
+
+async fn coordination_release_lease(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.release_lease(
+        &lease_id,
+        &chrono::Utc::now().to_rfc3339(),
+        "released_by_client",
+    ) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "lease not active").into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, format!("release lease: {error}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationHandoffAckReq {
+    acknowledged_at: Option<String>,
+}
+
+/// Pending (unacknowledged) handoffs, oldest first. Read-only; the ack is a
+/// separate POST.
+async fn coordination_list_handoffs(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.list_pending_handoffs() {
+        Ok(handoffs) => Json(handoffs).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list handoffs: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_acknowledge_handoff(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(handoff_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationHandoffAckReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let at = req
+        .acknowledged_at
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    match d.coordination_db.acknowledge_handoff(&handoff_id, &at) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            "handoff not found or already acknowledged",
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            format!("acknowledge handoff: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1301,6 +2572,13 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             .and_then(|name| config.setups.as_ref()?.get(name))
             .unwrap_or(&config.model);
         let provider = model.provider.clone();
+        // Does this provider report rate-limit data AT ALL? Only ChatGPT parses
+        // the Codex headers; every other model hardcodes an empty snapshot, and
+        // opencode returns no such headers even in principle. So an empty list
+        // means two very different things — "cannot report" vs "hasn't reported
+        // yet" — and the UI must tell them apart instead of showing one generic
+        // empty state for both.
+        let reports_limits = crate::config::provider_reports_rate_limits(&provider);
         let entry = totals.entry(provider.clone()).or_insert_with(|| {
             serde_json::json!({
                 "provider": provider,
@@ -1311,10 +2589,13 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "cache_read_tokens": 0,
+                "rate_limits_supported": reports_limits,
                 "rate_limits": []
             })
         });
-        let Some(obj) = entry.as_object_mut() else { continue };
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
         obj.insert(
             "sessions".into(),
             serde_json::json!(obj["sessions"].as_u64().unwrap_or(0) + 1),
@@ -1328,18 +2609,15 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             let current = obj[key].as_u64().unwrap_or(0);
             obj.insert(key.into(), serde_json::json!(current.saturating_add(value)));
         }
-        if provider != "gemini" && provider != "xai" {
-            if let Some(rate) = state.rate_limit.filter(|rate| rate.is_reported()) {
-                let rates = obj
-                    .get_mut("rate_limits")
-                    .and_then(|v| v.as_array_mut())
-                    .expect("rate_limits array");
-                let value = serde_json::to_value(rate).unwrap_or_default();
-                if !rates.iter().any(|existing| existing == &value) {
-                    rates.push(value);
-                }
-            }
-        }
+        // NOTE: no per-session rate_limit is attributed to a provider here.
+        //
+        // `HarnessState.rate_limit` can only ever hold a CHATGPT snapshot —
+        // `chatgpt.rs` is the only model that parses rate-limit headers
+        // (`openai.rs` hardcodes `None`, as do anthropic/gemini/xai), and
+        // opencode's API returns no such headers at all. So reading it while
+        // iterating a session of ANY provider mis-attributed a ChatGPT figure to
+        // whatever that session ran: an `opencode-go` session displayed ChatGPT's
+        // numbers as its own. ChatGPT is handled once, globally, below.
     }
     // ChatGPT Codex limits are account-wide, not session-local. Include the same
     // reported snapshot used by the live chat Usage panel here as well.
@@ -1619,7 +2897,7 @@ async fn put_profile(
         if let Some(url) = req.base_url.clone().filter(|s| !s.trim().is_empty()) {
             mc.base_url = url;
         } else if mc.base_url.trim().is_empty() {
-            mc.base_url = ModelConfig::default().base_url;
+            mc.base_url = InferenceProfileConfig::default().base_url;
         }
         // An omitted/blank api_key keeps the existing one (editing doesn't wipe it).
         if let Some(key) = req.api_key.clone().filter(|s| !s.is_empty()) {
@@ -1867,7 +3145,7 @@ async fn provider_models(
             .and_then(|n| c.setups.as_ref().and_then(|m| m.get(n)).cloned());
         match stored {
             Some(m) => m,
-            None if req.provider.is_some() => crate::config::ModelConfig {
+            None if req.provider.is_some() => crate::config::InferenceProfileConfig {
                 provider: req.provider.clone().unwrap_or_default(),
                 ..Default::default()
             },
@@ -2002,16 +3280,10 @@ async fn set_session_model(
     if let Some(old) = sessions.remove(&req.session) {
         old.join.abort();
     }
-    let handle = start_session_with_browser_summary(
-        &cfg,
-        sp.clone(),
-        None,
-        true,
-        Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::llm::StreamBuffer::default(),
-        ))),
-        Some(d.browser.summary_provider()),
-    );
+    // Role-aware restart. Switching the model must NOT downgrade the session:
+    // a Mission Control or agent session keeps its prompt/tools/lane limits,
+    // which previously were lost here until the next daemon restart.
+    let handle = d.start_role_aware(&cfg, sp.clone()).await;
     write_session_profile(&sp, &req.profile); // persist so it survives restart
     sessions.insert(
         req.session.clone(),
@@ -2466,6 +3738,99 @@ struct AttachQuery {
     session: String,
 }
 
+#[derive(Deserialize)]
+struct ShellsQuery {
+    token: Option<String>,
+}
+
+// WS /shells — daemon-WIDE interactive shells, with no session at all.
+//
+// A shell belongs to the machine: switching or closing a session must not kill
+// it. `/attach` cannot serve this because it calls `ensure_live`, so a socket
+// with no live session gets a 404. This route carries the same `wire: term`
+// frames over a socket that requires no session.
+//
+// Lifecycle is still explicit: the client creates and closes shells through the
+// same `open`/`new`/`close` ops, so a dropped socket never destroys a pty.
+async fn shells_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(q): Query<ShellsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let terms = d.shells.clone();
+    ws.on_upgrade(move |socket| handle_shells_ws(socket, terms))
+}
+
+async fn handle_shells_ws(socket: WebSocket, terms: Arc<crate::term::SessionTerms>) {
+    use base64::Engine;
+    let (mut sender, mut receiver) = socket.split();
+    let term_client = terms.subscribe();
+    let push_terms = terms.clone();
+    let mut term_seq: u64 = 0;
+
+    // Reconnect support: report what already exists, so a client that
+    // reattaches rebuilds its strip instead of showing nothing while the ptys
+    // keep running.
+    let existing: Vec<serde_json::Value> = terms
+        .list()
+        .into_iter()
+        .map(|(id, alive)| serde_json::json!({ "id": id, "alive": alive }))
+        .collect();
+    let hello = serde_json::json!({ "wire": "term", "op": "list", "shells": existing });
+    if let Ok(json) = serde_json::to_string(&hello) {
+        if sender.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    let push = tokio::spawn(async move {
+        loop {
+            // Drain the PTY so idle shells still fire BEL / OSC.
+            let _ = push_terms.take_snapshots();
+            for (id, chunk, cols, rows, alive) in push_terms.poll_client(&term_client) {
+                if chunk.is_empty() && alive {
+                    continue;
+                }
+                term_seq = term_seq.wrapping_add(1);
+                let frame = serde_json::json!({
+                    "wire": "term",
+                    "op": "out",
+                    "id": id,
+                    "seq": term_seq,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&chunk),
+                    "cols": cols,
+                    "rows": rows,
+                    "alive": alive,
+                });
+                if let Ok(json) = serde_json::to_string(&frame) {
+                    if sender.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(t) => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
+                    if val.get("wire").and_then(|w| w.as_str()) == Some("term") {
+                        apply_term_client(&terms, &val);
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    push.abort();
+}
+
 // WS /attach?session= — stream this session's HarnessState + receive LoopInput.
 async fn attach_ws(
     ws: WebSocketUpgrade,
@@ -2500,8 +3865,7 @@ async fn handle_ws(
     terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (history_tx, history_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
     let history_request_tx = history_tx.clone();
 
     let push_daemon = daemon.clone();
@@ -2532,91 +3896,95 @@ async fn handle_ws(
                 bytes.hash(&mut hasher);
                 let fingerprint = hasher.finish();
                 if Some(fingerprint) != last_state_fingerprint
-                    || queue_revision != last_queue_revision {
+                    || queue_revision != last_queue_revision
+                {
                     if let Ok(mut state) = deserialize_state(&bytes) {
-                                let hidden = {
-                                    let mut overlays = daemon.queue_hidden.lock().unwrap();
-                                    let entries = overlays.entry(session.clone()).or_default();
-                                    entries.retain(|id| state.queued_inputs.iter().any(|item| &item.id == id));
-                                    entries.clone()
-                                };
-                                if !hidden.is_empty() {
-                                    state.queued_inputs.retain(|item| !hidden.contains(&item.id));
+                        let hidden = {
+                            let mut overlays = daemon.queue_hidden.lock().unwrap();
+                            let entries = overlays.entry(session.clone()).or_default();
+                            entries
+                                .retain(|id| state.queued_inputs.iter().any(|item| &item.id == id));
+                            entries.clone()
+                        };
+                        if !hidden.is_empty() {
+                            state
+                                .queued_inputs
+                                .retain(|item| !hidden.contains(&item.id));
+                        }
+                        if let Ok(mut v) = serde_json::to_value(&state) {
+                            // `messages` (raw LLM history) is unused by the app — never wire it.
+                            if let Some(o) = v.as_object_mut() {
+                                o.remove("messages");
+                                // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
+                                // the account-wide overlay; every other provider gets NO
+                                // rate_limit — including scrubbing a stale snapshot persisted
+                                // before a model switch (it showed ChatGPT's monthly limits
+                                // on an anthropic-compatible chat).
+                                if daemon.session_provider(&session).await == "chatgpt" {
+                                    if let Some(g) = crate::chatgpt::read_global_usage() {
+                                        if let Ok(gv) = serde_json::to_value(&g) {
+                                            o.insert("rate_limit".into(), gv);
+                                        }
+                                    }
+                                } else {
+                                    o.remove("rate_limit");
                                 }
-                                if let Ok(mut v) = serde_json::to_value(&state) {
-                                    // `messages` (raw LLM history) is unused by the app — never wire it.
-                                    if let Some(o) = v.as_object_mut() {
-                                        o.remove("messages");
-                                        // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
-                                        // the account-wide overlay; every other provider gets NO
-                                        // rate_limit — including scrubbing a stale snapshot persisted
-                                        // before a model switch (it showed ChatGPT's monthly limits
-                                        // on an anthropic-compatible chat).
-                                        if daemon.session_provider(&session).await == "chatgpt" {
-                                            if let Some(g) = crate::chatgpt::read_global_usage() {
-                                                if let Ok(gv) = serde_json::to_value(&g) {
-                                                    o.insert("rate_limit".into(), gv);
-                                                }
-                                            }
-                                        } else {
-                                            o.remove("rate_limit");
-                                        }
-                                    }
-                                    let count = state.events.len();
-                                    let first_attach = last_events.is_empty();
-                                    let snapshot = if first_attach {
-                                        const INITIAL_ATTACH_EVENTS: usize = 160;
-                                        let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
-                                        last_event_offset = start;
-                                        last_events = state.events[start..].to_vec();
-                                        if let Some(o) = v.as_object_mut() {
-                                            o.insert(
-                                                "events".into(),
-                                                serde_json::to_value(&state.events[start..])
-                                                    .unwrap_or_default(),
-                                            );
-                                            o.insert("event_offset".into(), serde_json::json!(start));
-                                        }
-                                        true
-                                    } else {
-                                        count < last_event_offset
-                                            || count < last_event_offset + last_events.len()
-                                            || state.events[last_event_offset
-                                                ..last_event_offset + last_events.len()]
-                                                != last_events[..]
-                                    };
-                                    attach_revision = attach_revision.wrapping_add(1);
-                                    if let Some(o) = v.as_object_mut() {
-                                        o.insert("revision".into(), serde_json::json!(attach_revision));
-                                        if snapshot {
-                                            o.insert("wire".into(), serde_json::json!("snapshot"));
-                                        } else {
-                                            let start = last_event_offset + last_events.len();
-                                            let tail = serde_json::to_value(&state.events[start..])
-                                                .unwrap_or_default();
-                                            o.remove("events");
-                                            o.insert("wire".into(), serde_json::json!("delta"));
-                                            o.insert("new_events".into(), tail);
-                                            o.insert(
-                                                "event_count".into(),
-                                                serde_json::json!(count - last_event_offset),
-                                            );
-                                        }
-                                    }
-                                    if !first_attach {
-                                        last_events = state.events[last_event_offset..].to_vec();
-                                    }
-                                    last_queue_revision = queue_revision;
-                                    if let Ok(json) = serde_json::to_string(&v) {
-                                        if sender.send(Message::Text(json.into())).await.is_err() {
-                                            break;
-                                        }
-                                        last_state_fingerprint = Some(fingerprint);
-                                    }
+                            }
+                            let count = state.events.len();
+                            let first_attach = last_events.is_empty();
+                            let snapshot = if first_attach {
+                                const INITIAL_ATTACH_EVENTS: usize = 160;
+                                let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
+                                last_event_offset = start;
+                                last_events = state.events[start..].to_vec();
+                                if let Some(o) = v.as_object_mut() {
+                                    o.insert(
+                                        "events".into(),
+                                        serde_json::to_value(&state.events[start..])
+                                            .unwrap_or_default(),
+                                    );
+                                    o.insert("event_offset".into(), serde_json::json!(start));
                                 }
+                                true
+                            } else {
+                                count < last_event_offset
+                                    || count < last_event_offset + last_events.len()
+                                    || state.events
+                                        [last_event_offset..last_event_offset + last_events.len()]
+                                        != last_events[..]
+                            };
+                            attach_revision = attach_revision.wrapping_add(1);
+                            if let Some(o) = v.as_object_mut() {
+                                o.insert("revision".into(), serde_json::json!(attach_revision));
+                                if snapshot {
+                                    o.insert("wire".into(), serde_json::json!("snapshot"));
+                                } else {
+                                    let start = last_event_offset + last_events.len();
+                                    let tail = serde_json::to_value(&state.events[start..])
+                                        .unwrap_or_default();
+                                    o.remove("events");
+                                    o.insert("wire".into(), serde_json::json!("delta"));
+                                    o.insert("new_events".into(), tail);
+                                    o.insert(
+                                        "event_count".into(),
+                                        serde_json::json!(count - last_event_offset),
+                                    );
+                                }
+                            }
+                            if !first_attach {
+                                last_events = state.events[last_event_offset..].to_vec();
+                            }
+                            last_queue_revision = queue_revision;
+                            if let Ok(json) = serde_json::to_string(&v) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                                last_state_fingerprint = Some(fingerprint);
                             }
                         }
                     }
+                }
+            }
             {
                 use std::hash::{Hash, Hasher};
                 let snap = crate::llm::StreamBuffer::snapshot(&stream);
@@ -2687,7 +4055,11 @@ async fn handle_ws(
                             "end": end,
                             "has_older": has_older,
                         });
-                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                        if sender
+                            .send(Message::Text(frame.to_string().into()))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -2713,8 +4085,10 @@ async fn handle_ws(
                         continue;
                     }
                     if val.get("kind").and_then(|k| k.as_str()) == Some("history") {
-                        let before = val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let limit = val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
+                        let before =
+                            val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let limit =
+                            val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
                         let _ = history_request_tx.send((before, limit));
                         continue;
                     }
@@ -2891,12 +4265,15 @@ mod tests {
             token: String::new(),
             hostname: String::from("test"),
             sessions: Mutex::new(HashMap::new()),
+            shells: crate::term::SessionTerms::new(global_shell_cwd()),
             git_write: Mutex::new(()),
             browser: BrowserManager::default(),
             seen_nonces: std::sync::Mutex::new(HashMap::new()),
             queue_hidden: std::sync::Mutex::new(HashMap::new()),
             queue_revision: AtomicU64::new(0),
             mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
+            coordination_db: crate::coordination::CoordinationDb::open_in_memory().unwrap(),
+            coordination_events: tokio::sync::broadcast::channel(256).0,
             recurring_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
     }
@@ -2906,12 +4283,20 @@ mod tests {
         let events = vec![
             crate::harness::HarnessEvent::UserInput { text: "one".into() },
             crate::harness::HarnessEvent::AssistantText { text: "two".into() },
-            crate::harness::HarnessEvent::UserInput { text: "three".into() },
+            crate::harness::HarnessEvent::UserInput {
+                text: "three".into(),
+            },
         ];
         assert_eq!(session_event_page(&events, None, None), (0, 3, false));
         assert_eq!(session_event_page(&events, Some(3), Some(2)), (1, 3, true));
-        assert_eq!(session_event_page(&events, Some(1), Some(50)), (0, 1, false));
-        assert_eq!(session_event_page(&events, Some(999), Some(0)), (2, 3, true));
+        assert_eq!(
+            session_event_page(&events, Some(1), Some(50)),
+            (0, 1, false)
+        );
+        assert_eq!(
+            session_event_page(&events, Some(999), Some(0)),
+            (2, 3, true)
+        );
     }
 
     #[test]
@@ -2926,6 +4311,438 @@ mod tests {
         let restarted = test_daemon();
         assert!(!restarted.accept_nonce("session", "nonce-1", &state_path));
         assert!(restarted.accept_nonce("session", "nonce-2", &state_path));
+    }
+
+    // -- Coordination route handlers -----------------------------------------
+    // These drive the real axum handlers (with their extractors) so auth,
+    // validation, and store wiring are covered, not just the DB beneath them.
+
+    fn authed_daemon() -> Shared {
+        let mut daemon = test_daemon();
+        daemon.token = "test-token".into();
+        Arc::new(daemon)
+    }
+
+    fn with_token() -> Auth {
+        Auth {
+            token: Some("test-token".into()),
+        }
+    }
+
+    fn create_agent_req(id: &str) -> CoordinationAgentReq {
+        CoordinationAgentReq {
+            id: id.into(),
+            display_name: "Web Research Specialist".into(),
+            handle: format!("handle-{id}"),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Researcher,
+            capabilities: vec!["web_search".into()],
+            max_concurrent_assignments: 3,
+        }
+    }
+
+    fn agents_query(token: Option<&str>) -> CoordinationAgentsQuery {
+        CoordinationAgentsQuery {
+            token: token.map(str::to_string),
+            after_name: None,
+            after_id: None,
+            limit: default_coord_page_limit(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_route_rejects_an_unauthenticated_request() {
+        let d = authed_daemon();
+        let response = coordination_agents(State(d), Query(agents_query(None))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn agents_route_requires_id_and_handle() {
+        let d = authed_daemon();
+        let mut req = create_agent_req("researcher");
+        req.handle = "  ".into();
+        let response = coordination_create_agent(State(d), Query(with_token()), Json(req)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agents_route_creates_then_lists() {
+        let d = authed_daemon();
+        let created = coordination_create_agent(
+            State(d.clone()),
+            Query(with_token()),
+            Json(create_agent_req("researcher")),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        // A duplicate id is a conflict, not a silent overwrite.
+        let duplicate = coordination_create_agent(
+            State(d.clone()),
+            Query(with_token()),
+            Json(create_agent_req("researcher")),
+        )
+        .await;
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let listed = coordination_agents(State(d), Query(agents_query(Some("test-token")))).await;
+        assert_eq!(listed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn message_route_requires_a_body() {
+        let d = authed_daemon();
+        let response = coordination_post_message(
+            State(d),
+            Query(with_token()),
+            axum::extract::Path("t1".to_string()),
+            Json(CoordinationMessageReq {
+                actor_kind: "agent".into(),
+                actor_id: "mission-control".into(),
+                body: "   ".into(),
+                idempotency_key: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A human post must wake Mission Control (that is what makes the board
+    /// interactive); Mission Control's own reply must not, or it would loop.
+    #[test]
+    fn board_posts_wake_mission_control_except_its_own() {
+        assert!(should_wake_mission_control("human"));
+        assert!(should_wake_mission_control("rust-pr-reviewer"));
+        assert!(!should_wake_mission_control(
+            crate::mission_control::SESSION_ID
+        ));
+    }
+
+    #[test]
+    fn board_message_envelope_carries_sender_thread_and_reply_rule() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e1".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 7,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "please investigate X"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event, &[]);
+        assert!(envelope.starts_with("[coordination_board_message]"));
+        assert!(envelope.contains("thread_id: system"));
+        assert!(envelope.contains("from_id: human"));
+        assert!(envelope.contains("from_kind: human"));
+        assert!(envelope.contains("body: please investigate X"));
+        // The reply contract is what stops a silent no-op.
+        assert!(envelope.contains("post_coordination_message"));
+        assert!(envelope.contains("[/coordination_board_message]"));
+    }
+
+    /// The body is last so a client can read everything up to the closing tag as
+    /// the message; this pins that ordering so it can't silently regress.
+    #[test]
+    fn board_message_body_is_the_final_field_before_the_closing_tag() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e2".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 8,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "line one\nline two"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k2".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event, &[]);
+        let after_body = envelope.split_once("body: ").expect("body field present").1;
+        assert!(after_body.starts_with("line one\nline two"));
+        assert!(
+            after_body
+                .trim_end()
+                .ends_with("[/coordination_board_message]")
+        );
+    }
+
+    /// The wake must read as a group room: recent messages are included, and the
+    /// digest can't be confused with the new message or the field layout.
+    #[test]
+    fn board_message_envelope_includes_bounded_history() {
+        let prior =
+            |seq: u64, who: &str, body: &str| crate::coordination::types::CoordinationEvent {
+                event_id: format!("e{seq}"),
+                thread_id: COORDINATION_THREAD.into(),
+                partition_key: format!("thread:{COORDINATION_THREAD}"),
+                sequence: seq,
+                event_type: "message.posted".into(),
+                actor_kind: "agent".into(),
+                actor_id: who.into(),
+                payload_version: 1,
+                payload: serde_json::json!({"body": body}),
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: format!("k{seq}"),
+                created_at: "2020-01-01T00:00:00Z".into(),
+            };
+        let current = prior(5, "human", "what is the status?");
+        let history = [
+            prior(3, "mission-control", "started the review"),
+            prior(4, "reviewer", "found two issues"),
+        ];
+
+        let envelope = board_message_envelope(&current, &history);
+        // Both prior turns appear, attributed.
+        assert!(envelope.contains("mission-control: started the review"));
+        assert!(envelope.contains("reviewer: found two issues"));
+        assert!(envelope.contains("history: last 2 message(s)"));
+        // The new message is still the final body, and history precedes it.
+        let body_at = envelope.find("body: what is the status?").unwrap();
+        let history_at = envelope.find("history:").unwrap();
+        assert!(history_at < body_at);
+        // A multi-line prior body is collapsed so it can't break the layout.
+        let wrapped = board_message_envelope(&current, &[prior(1, "a", "line one\nline two")]);
+        assert!(wrapped.contains("a: line one line two"));
+    }
+
+    /// With no history the room is honestly reported as just starting.
+    #[test]
+    fn board_message_envelope_marks_an_empty_room() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e1".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 1,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "first ever message"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event, &[]);
+        assert!(envelope.contains("history: (start of the room)"));
+    }
+
+    #[tokio::test]
+    async fn message_route_publishes_to_the_live_event_feed() {
+        let d = authed_daemon();
+        // The websocket handler forwards everything from this broadcast channel,
+        // so receiving here proves a posted event reaches live subscribers.
+        let mut feed = d.coordination_events.subscribe();
+
+        coordination_post_message(
+            State(d.clone()),
+            Query(with_token()),
+            axum::extract::Path("live".to_string()),
+            Json(CoordinationMessageReq {
+                actor_kind: "agent".into(),
+                actor_id: "mission-control".into(),
+                body: "hello live".into(),
+                idempotency_key: String::new(),
+            }),
+        )
+        .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), feed.recv())
+            .await
+            .expect("event delivered to live subscribers")
+            .expect("channel open");
+        assert_eq!(event.thread_id, "live");
+        assert_eq!(event.payload["body"], "hello live");
+    }
+
+    #[tokio::test]
+    async fn message_route_posts_and_replays_by_cursor() {
+        let d = authed_daemon();
+        for body in ["first", "second"] {
+            let posted = coordination_post_message(
+                State(d.clone()),
+                Query(with_token()),
+                axum::extract::Path("t1".to_string()),
+                Json(CoordinationMessageReq {
+                    actor_kind: "agent".into(),
+                    actor_id: "mission-control".into(),
+                    body: body.into(),
+                    idempotency_key: String::new(),
+                }),
+            )
+            .await;
+            assert_eq!(posted.status(), StatusCode::OK);
+        }
+
+        // Full replay returns both; a cursor past the first returns only the tail.
+        let all = d.coordination_db.events_for_thread("t1", 0, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].sequence, 1);
+        assert_eq!(all[1].sequence, 2);
+        let tail = d.coordination_db.events_for_thread("t1", 1, 10).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].sequence, 2);
+    }
+
+    // -- Coordination visibility routes -------------------------------------
+
+    fn assignments_query(token: Option<&str>, agent: Option<&str>) -> CoordinationAssignmentsQuery {
+        CoordinationAssignmentsQuery {
+            token: token.map(str::to_string),
+            after_created: None,
+            after_id: None,
+            limit: default_coord_page_limit(),
+            agent_id: agent.map(str::to_string),
+            session_id: None,
+        }
+    }
+
+    /// Register an agent so assignments satisfy the FK to agents(id).
+    fn seed_agent(d: &Shared, id: &str) {
+        d.coordination_db
+            .create_agent(&crate::coordination::types::Agent {
+                id: id.into(),
+                display_name: id.into(),
+                handle: id.into(),
+                kind: crate::coordination::types::AgentKind::Worker,
+                status: crate::coordination::types::AgentStatus::Active,
+                role: crate::coordination::types::AgentRole::Implementer,
+                capabilities: vec![],
+                max_concurrent_assignments: 2,
+                version: 1,
+            })
+            .unwrap();
+    }
+
+    fn seed_assignment(d: &Shared, id: &str, agent: &str, created: &str) {
+        d.coordination_db
+            .create_assignment(&crate::coordination::Assignment {
+                id: id.into(),
+                goal_id: "g1".into(),
+                session_id: "s1".into(),
+                agent_id: agent.into(),
+                status: crate::coordination::AssignmentStatus::Offered,
+                scope: "src".into(),
+                definition_of_done: "tests".into(),
+                created_at: created.into(),
+                updated_at: created.into(),
+            })
+            .unwrap();
+    }
+
+    /// Read a response body as JSON, so tests assert on content rather than
+    /// just the status code.
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn assignments_route_rejects_an_unauthenticated_request() {
+        let d = authed_daemon();
+        let response =
+            coordination_list_assignments(State(d), Query(assignments_query(None, None))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn assignments_route_lists_all_and_filters_by_agent() {
+        let d = authed_daemon();
+        seed_agent(&d, "w1");
+        seed_agent(&d, "w2");
+        seed_assignment(&d, "a1", "w1", "2020-01-01T00:00:01Z");
+        seed_assignment(&d, "a2", "w2", "2020-01-01T00:00:02Z");
+        seed_assignment(&d, "a3", "w1", "2020-01-01T00:00:03Z");
+
+        let all = coordination_list_assignments(
+            State(d.clone()),
+            Query(assignments_query(Some("test-token"), None)),
+        )
+        .await;
+        let all = json_body(all).await;
+        assert_eq!(all.as_array().unwrap().len(), 3);
+
+        // Filtering happens in SQL, so the page contains only this agent's work.
+        let filtered = coordination_list_assignments(
+            State(d.clone()),
+            Query(assignments_query(Some("test-token"), Some("w1"))),
+        )
+        .await;
+        let filtered = json_body(filtered).await;
+        let ids: Vec<&str> = filtered
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["a1", "a3"]);
+    }
+
+    #[tokio::test]
+    async fn assignments_route_rejects_a_lone_cursor_half() {
+        let d = authed_daemon();
+        let mut q = assignments_query(Some("test-token"), None);
+        q.after_created = Some("2020-01-01T00:00:00Z".into());
+        let response = coordination_list_assignments(State(d), Query(q)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn leases_route_reports_who_holds_the_session() {
+        let d = authed_daemon();
+        seed_agent(&d, "w1");
+        seed_assignment(&d, "a1", "w1", "2020-01-01T00:00:00Z");
+        let now = chrono::Utc::now();
+        d.coordination_db
+            .acquire_lease(&crate::coordination::SessionLease {
+                session_id: "s1".into(),
+                lease_id: "l1".into(),
+                assignment_id: "a1".into(),
+                agent_id: "w1".into(),
+                fencing_token: 0,
+                acquired_at: now.to_rfc3339(),
+                renewed_at: now.to_rfc3339(),
+                expires_at: (now + chrono::Duration::seconds(90)).to_rfc3339(),
+            })
+            .unwrap();
+
+        let response = coordination_list_leases(State(d), Query(with_token())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let holders = body.as_array().unwrap();
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0]["agent_id"], "w1");
+        assert_eq!(holders[0]["session_id"], "s1");
+        assert_eq!(holders[0]["assignment_id"], "a1");
+    }
+
+    #[tokio::test]
+    async fn leases_route_is_empty_when_nothing_is_held() {
+        let d = authed_daemon();
+        let response = coordination_list_leases(State(d), Query(with_token())).await;
+        let body = json_body(response).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn leases_route_rejects_an_unauthenticated_request() {
+        let d = authed_daemon();
+        let response = coordination_list_leases(State(d), Query(Auth { token: None })).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
 
@@ -3217,10 +5034,7 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
                 owners.push(conflict.existing_task_id.clone());
             }
         }
-        let reason = format!(
-            "waiting on workspace owner(s): {}",
-            owners.join(", ")
-        );
+        let reason = format!("waiting on workspace owner(s): {}", owners.join(", "));
         let blocked = mission_control::update_task(root, task_id, |task| {
             task.status = TaskStatus::Blocked;
             task.reporting_session = None;
@@ -3304,6 +5118,85 @@ fn release_failed_claim(
         }
     })
     .map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct AgentBuildReq {
+    prompt: String,
+}
+
+async fn build_agent_from_prompt(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<AgentBuildReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let prompt = req.prompt.trim();
+    if prompt.len() < 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "prompt must describe the desired agent",
+        )
+            .into_response();
+    }
+    let root = &d.mission_control_root;
+    // Agent builds are routed through the dedicated MC session. Ensure that
+    // session is materialized before creating the task, including on a fresh
+    // daemon where the user has not opened Mission Control yet.
+    let _ = mission_control_open(
+        State(d.clone()),
+        Query(a.clone()),
+        Json(MissionOpenReq { profile: None }),
+    )
+    .await;
+    if mission_control::get_session(root, crate::mission_control::SESSION_ID).is_err() {
+        if let Err(error) = mission_control::create_session(
+            root,
+            crate::mission_control::SESSION_ID,
+            "Mission Control",
+            &crate::mission_control::workspace_path(),
+        ) {
+            return mission_error(format!("initialize Mission Control session: {error}"));
+        }
+    }
+    let session_id = crate::mission_control::SESSION_ID;
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let title = "Build specialized agent";
+    let description = format!(
+        concat!(
+            "Build a specialized agent from this user brief:\n\n{}\n\n",
+            "[AGENT_BUILD_JOB — not a project or workspace request]\n",
+            "You are the agent builder. Do not create a project, do not create a new Mission Control session, do not ask the user to choose or confirm a folder, and do not route this request as ordinary work. Build the agent directly from the brief.\n",
+            "Build the shared specialized-session path first: every specialized agent receives the established session system prompt plus a researched, bounded identity.md overlay. Keep scheduling, turn-taking, handoffs, and state in shared runtime code; do not create per-agent role modules or runtime.json. Then create the durable agent home under ~/.snippet/agents/<agent-id>/ and write identity.md plus profile metadata. Tools are only narrow executable boundaries such as shell, third-party API, MCP, or vault-backed operations; do not emit workflow helpers as tools. Use web_search/web_read for research only when those schemas are present. Do not execute generated tools.\n",
+            "When finished, report the exact agent id, shared-session validation, files created, research sources, executable tool proposals, and blockers. Call report_mission_task with the final result. If the brief is insufficient, make sensible defaults rather than asking a workspace question."
+        ),
+        prompt
+    );
+    let task = match mission_control::create_task(
+        root,
+        &task_id,
+        session_id,
+        title,
+        &description,
+        Vec::new(),
+    ) {
+        Ok(task) => task,
+        Err(error) => return mission_error(error),
+    };
+    match dispatch_mission_task(&d, &task.id).await {
+        Ok(task) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "build_id": task.id,
+                "status": format!("{:?}", task.status).to_lowercase(),
+                "task_id": task.id,
+            })),
+        )
+            .into_response(),
+        Err(error) => mission_error(error),
+    }
 }
 
 async fn mission_control_create_task(
@@ -3695,6 +5588,44 @@ pub fn read_session_role(state_path: &std::path::Path) -> Option<String> {
     (!role.is_empty()).then_some(role)
 }
 
+/// Give the built-in agents a directory row so a peer can ADDRESS them.
+///
+/// Mission Control could already post to the board, but it was not an agent: no
+/// directory row, so nothing could name it by agent id, and `lease_agent_id`
+/// fell back to the raw session id. Registering it makes the coordinator a peer
+/// that others can mention, assign to, and take a turn from.
+///
+/// Idempotent by construction (`upsert_agent`) — this runs on every boot, and a
+/// plain INSERT would fail the primary key on the second start.
+///
+/// The `Snippet` agent needs no row here: every ordinary session acts as itself
+/// already, since `lease_agent_id` falls back to the durable session id.
+fn register_builtin_agents(d: &Shared) {
+    let coordinator = crate::coordination::types::Agent {
+        id: crate::mission_control::SESSION_ID.to_string(),
+        display_name: "Mission Control".into(),
+        handle: "mission-control".into(),
+        kind: crate::coordination::types::AgentKind::MissionControl,
+        status: crate::coordination::types::AgentStatus::Active,
+        role: crate::coordination::types::AgentRole::Coordinator,
+        capabilities: vec![
+            "orchestration".into(),
+            "agent-directory".into(),
+            "task-dispatch".into(),
+        ],
+        // The coordinator offers work to many sessions at once; it does not
+        // accept a turn of its own through this limit.
+        max_concurrent_assignments: 0,
+        version: 1,
+    };
+    if let Err(error) = d.coordination_db.upsert_agent(&coordinator) {
+        // A failure here must not stop the daemon: the board and sessions work
+        // without the directory row, and MC can still post. It just cannot be
+        // addressed until the next successful boot.
+        eprintln!("[coordination] could not register Mission Control as an agent: {error}");
+    }
+}
+
 /// Dispatch loop: claims and delivers every Pending task, then re-queues any
 /// Blocked tasks whose dependencies have completed. Failures roll the claim
 /// back with a retry counter; at the ceiling the task parks as Blocked.
@@ -3728,16 +5659,10 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
             }
             let text = format!(
                 "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]",
-                task.id,
-                task.title,
-                marker.kind,
-                marker.message
+                task.id, task.title, marker.kind, marker.message
             );
             daemon
-                .deliver(
-                    mission_control::SESSION_ID,
-                    LoopInput::UserMessage(text),
-                )
+                .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))
                 .await;
             let _ = mission_control::mark_notification_delivered(root, &task.id, index);
         }
@@ -3908,7 +5833,9 @@ async fn create_recurring(
     let delivery = match req.delivery.as_deref() {
         None | Some("") | Some("goal") => recurring::Delivery::Goal,
         Some("message") => recurring::Delivery::Message,
-        Some(other) => return mission_error(format!("delivery must be goal or message, got `{other}`")),
+        Some(other) => {
+            return mission_error(format!("delivery must be goal or message, got `{other}`"));
+        }
     };
     match recurring::create_job_with(
         &d.recurring_root,
@@ -3922,7 +5849,7 @@ async fn create_recurring(
         Ok(job) => {
             emit_recurring_event("created", &job.id, Some(&job.session_id));
             Json(job).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
@@ -3994,7 +5921,7 @@ async fn update_recurring(
         Ok(job) => {
             emit_recurring_event("updated", &job.id, Some(&job.session_id));
             Json(job).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
@@ -4011,7 +5938,7 @@ async fn delete_recurring(
         Ok(()) => {
             emit_recurring_event("deleted", &id, None);
             Json(serde_json::json!({ "ok": true })).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
