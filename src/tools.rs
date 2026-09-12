@@ -186,6 +186,13 @@ impl ToolContext {
         self
     }
 
+    /// Bind a durable id that may be absent, so a caller wiring several kinds of
+    /// session can apply it uniformly rather than branching on `Option` itself.
+    pub fn with_durable_session_id_opt(mut self, id: Option<String>) -> Self {
+        self.durable_session_id = id;
+        self
+    }
+
     pub fn durable_session_id(&self) -> Option<&str> {
         self.durable_session_id.as_deref()
     }
@@ -207,6 +214,13 @@ impl ToolContext {
     /// Bind the directory agent id this session runs as.
     pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
         self.agent_id = Some(id.into());
+        self
+    }
+
+    /// Bind an optional agent id, so a caller wiring several kinds of session
+    /// applies it uniformly instead of branching on `Option` itself.
+    pub fn with_agent_id_opt(mut self, id: Option<String>) -> Self {
+        self.agent_id = id;
         self
     }
 

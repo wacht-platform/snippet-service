@@ -452,29 +452,12 @@ impl Daemon {
         if let Some(old) = sessions.remove(id) {
             old.join.abort();
         }
-        let role = read_session_role(&sp);
-        let handle = match role.as_deref() {
-            Some("mission_control") => start_mission_control_session(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-            _ => start_session_with_browser_summary(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-        };
+        // ONE resolver for every role. This path used to handle only
+        // `mission_control`, so a config reload silently rebuilt a specialized
+        // agent as an ordinary session — losing its identity, prompt and tool
+        // set, with nothing logged. Routing both readers through
+        // `start_role_aware` makes that asymmetry unrepresentable.
+        let handle = self.start_role_aware(&cfg, sp.clone()).await;
         sessions.insert(id.to_string(), live_from_handle(handle, profile));
         RebuildOutcome::Rebuilt
     }
@@ -662,6 +645,9 @@ pub async fn run_serve(
         coordination_events: tokio::sync::broadcast::channel(256).0,
         recurring_root: recurring::default_root(),
     });
+
+    // Register the built-in agents before anything can address them.
+    register_builtin_agents(&daemon);
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
@@ -5600,6 +5586,44 @@ pub fn read_session_role(state_path: &std::path::Path) -> Option<String> {
     .ok()?;
     let role = raw.trim().to_string();
     (!role.is_empty()).then_some(role)
+}
+
+/// Give the built-in agents a directory row so a peer can ADDRESS them.
+///
+/// Mission Control could already post to the board, but it was not an agent: no
+/// directory row, so nothing could name it by agent id, and `lease_agent_id`
+/// fell back to the raw session id. Registering it makes the coordinator a peer
+/// that others can mention, assign to, and take a turn from.
+///
+/// Idempotent by construction (`upsert_agent`) — this runs on every boot, and a
+/// plain INSERT would fail the primary key on the second start.
+///
+/// The `Snippet` agent needs no row here: every ordinary session acts as itself
+/// already, since `lease_agent_id` falls back to the durable session id.
+fn register_builtin_agents(d: &Shared) {
+    let coordinator = crate::coordination::types::Agent {
+        id: crate::mission_control::SESSION_ID.to_string(),
+        display_name: "Mission Control".into(),
+        handle: "mission-control".into(),
+        kind: crate::coordination::types::AgentKind::MissionControl,
+        status: crate::coordination::types::AgentStatus::Active,
+        role: crate::coordination::types::AgentRole::Coordinator,
+        capabilities: vec![
+            "orchestration".into(),
+            "agent-directory".into(),
+            "task-dispatch".into(),
+        ],
+        // The coordinator offers work to many sessions at once; it does not
+        // accept a turn of its own through this limit.
+        max_concurrent_assignments: 0,
+        version: 1,
+    };
+    if let Err(error) = d.coordination_db.upsert_agent(&coordinator) {
+        // A failure here must not stop the daemon: the board and sessions work
+        // without the directory row, and MC can still post. It just cannot be
+        // addressed until the next successful boot.
+        eprintln!("[coordination] could not register Mission Control as an agent: {error}");
+    }
 }
 
 /// Dispatch loop: claims and delivers every Pending task, then re-queues any
