@@ -298,20 +298,49 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        // Role-aware resume: a session opened as Mission Control must come back
-        // with the MC prompt/tools/lane restrictions after a daemon restart,
-        // not silently downgrade to an ordinary conversation session. A session
-        // opened for an agent resumes with that agent's specialized identity.
-        let role = read_session_role(&sp);
-        let handle = match role.as_deref() {
+        // Role-aware resume. ONE place decides the role — see `start_role_aware`.
+        // A session opened as Mission Control must come back with the MC
+        // prompt/tools/lane restrictions, and an agent session with its
+        // specialized identity, rather than silently downgrading either.
+        let handle = self.start_role_aware(&cfg, sp.clone()).await;
+        let tx = handle.input_tx.clone();
+        let live = live_from_handle(handle, profile);
+        let stream = live.stream.clone();
+        sessions.insert(id.to_string(), live);
+        Some((tx, sp, stream))
+    }
+
+    /// Start (or resume) a session with the ROLE it was created with.
+    ///
+    /// The single place that decides role. Two callers need it and previously
+    /// only one had it: `ensure_live` dispatched on the `.role` sidecar, while
+    /// `set_session_model` always started a plain session. Switching the model
+    /// mid-conversation therefore DOWNGRADED a Mission Control or agent session
+    /// to an ordinary one — losing the MC prompt/tools/lane restrictions until
+    /// the next daemon restart restored them from the sidecar.
+    ///
+    /// Falls back to a plain session whenever the role's home is unavailable, so
+    /// a missing identity can never wedge a session.
+    async fn start_role_aware(
+        &self,
+        cfg: &SnippetConfig,
+        sp: PathBuf,
+    ) -> crate::session::SessionHandle {
+        // Cloned per call: a `StreamHandle` is an `Arc<Mutex<StreamBuffer>>`, so
+        // cloning is a refcount bump, and each call site needs its own value
+        // because the match arms move it.
+        let stream = || {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            )))
+        };
+        match read_session_role(&sp).as_deref() {
             Some("mission_control") => crate::session::start_mission_control_session(
-                &cfg,
-                sp.clone(),
+                cfg,
+                sp,
                 None,
                 true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
+                stream(),
                 Some(self.browser.summary_provider()),
             ),
             Some(role) if role.starts_with("agent:") => {
@@ -323,64 +352,49 @@ impl Daemon {
                     // Identity revision is re-read on every resume, so an agent
                     // whose identity was updated comes back with the new guidance.
                     Ok(home) => match crate::session::start_specialized_agent_session(
-                        &cfg,
+                        cfg,
                         sp.clone(),
                         None,
                         true,
-                        Some(std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::llm::StreamBuffer::default(),
-                        ))),
+                        stream(),
                         Some(self.browser.summary_provider()),
                         home,
                     ) {
                         Ok(handle) => handle,
-                        // A missing/unreadable identity home must not wedge the
-                        // session; fall back to a plain session rather than fail.
                         Err(error) => {
                             eprintln!(
                                 "[coordination] agent `{agent_id}` identity unavailable ({error}); \
-                                 resuming as an ordinary session"
+                                 running as an ordinary session"
                             );
                             start_session_with_browser_summary(
-                                &cfg,
-                                sp.clone(),
+                                cfg,
+                                sp,
                                 None,
                                 true,
-                                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                                    crate::llm::StreamBuffer::default(),
-                                ))),
+                                stream(),
                                 Some(self.browser.summary_provider()),
                             )
                         }
                     },
                     Err(_) => start_session_with_browser_summary(
-                        &cfg,
-                        sp.clone(),
+                        cfg,
+                        sp,
                         None,
                         true,
-                        Some(std::sync::Arc::new(std::sync::Mutex::new(
-                            crate::llm::StreamBuffer::default(),
-                        ))),
+                        stream(),
                         Some(self.browser.summary_provider()),
                     ),
                 }
             }
             _ => start_session_with_browser_summary(
-                &cfg,
-                sp.clone(),
+                cfg,
+                sp,
                 None,
                 true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
+                stream(),
                 Some(self.browser.summary_provider()),
             ),
-        };
-        let tx = handle.input_tx.clone();
-        let live = live_from_handle(handle, profile);
-        let stream = live.stream.clone();
-        sessions.insert(id.to_string(), live);
-        Some((tx, sp, stream))
+        }
     }
 
     /// The provider actually driving a session: its per-chat profile's provider
@@ -2813,16 +2827,10 @@ async fn set_session_model(
     if let Some(old) = sessions.remove(&req.session) {
         old.join.abort();
     }
-    let handle = start_session_with_browser_summary(
-        &cfg,
-        sp.clone(),
-        None,
-        true,
-        Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::llm::StreamBuffer::default(),
-        ))),
-        Some(d.browser.summary_provider()),
-    );
+    // Role-aware restart. Switching the model must NOT downgrade the session:
+    // a Mission Control or agent session keeps its prompt/tools/lane limits,
+    // which previously were lost here until the next daemon restart.
+    let handle = d.start_role_aware(&cfg, sp.clone()).await;
     write_session_profile(&sp, &req.profile); // persist so it survives restart
     sessions.insert(
         req.session.clone(),
