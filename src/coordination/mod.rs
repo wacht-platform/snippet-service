@@ -7,12 +7,16 @@ mod agents;
 mod db;
 mod events;
 mod identity;
+mod tasks;
 mod transfers;
 pub mod types;
 mod work;
 
 pub use db::{CoordinationDb, CoordinationDbError};
 pub use identity::{AgentHome, IdentityError, IdentityMetadata};
+pub use tasks::{
+    Task, TaskAgent, TaskFilter, TaskLink, TaskLinkKind, TaskStatus,
+};
 pub use types::{Handoff, SessionAgent, SessionLease};
 pub use work::{Assignment, AssignmentFilter, AssignmentStatus};
 

@@ -705,6 +705,34 @@ pub async fn run_serve(
         )
         .route("/agents/build", post(build_agent_from_prompt))
         .route(
+            "/coordination/tasks",
+            get(coordination_list_tasks).post(coordination_create_task),
+        )
+        .route(
+            "/coordination/tasks/{task_id}",
+            get(coordination_get_task).patch(coordination_update_task),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/status",
+            post(coordination_set_task_status),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/links",
+            get(coordination_task_links).post(coordination_link_tasks),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/links/{other_id}",
+            delete(coordination_unlink_tasks),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/agents",
+            get(coordination_task_agents).post(coordination_add_task_agent),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/agents/{agent_id}",
+            delete(coordination_remove_task_agent),
+        )
+        .route(
             "/coordination/assignments",
             get(coordination_list_assignments).post(coordination_create_assignment),
         )
@@ -1502,6 +1530,445 @@ async fn coordination_session_agents(
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("list session agents: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// The task board's own columns are narrower than the assignment states — a task
+/// is what a HUMAN filed, so it carries Todo/InProgress/Blocked/Done/Cancelled
+/// and nothing about dispatch.
+#[derive(Deserialize)]
+struct CoordinationTasksQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(created_at, id)`.
+    #[serde(default)]
+    after_created: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_coord_page_limit")]
+    limit: u32,
+    /// Board column to show. Omitted returns every column.
+    #[serde(default)]
+    status: Option<String>,
+    /// "What is this agent on" — the roster filter.
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+fn parse_task_status(value: &str) -> Result<crate::coordination::TaskStatus, String> {
+    serde_json::from_str(&format!("\"{value}\""))
+        .map_err(|_| format!("unknown task status: {value}"))
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskReq {
+    /// Optional so a client can supply its own id (offline creation); the daemon
+    /// generates one otherwise.
+    #[serde(default)]
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    priority: i64,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskPatch {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskStatusReq {
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskLinkReq {
+    to_task_id: String,
+    /// `blocks` (default) or `relates_to`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskAgentReq {
+    agent_id: String,
+    #[serde(default)]
+    role: String,
+}
+
+/// Tasks on the board, newest priority first. The board is the human's view:
+/// creating and moving a task never touches the dispatch machinery, which is
+/// Mission Control's job once it picks the task up.
+async fn coordination_list_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<CoordinationTasksQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let after = match (q.after_created.as_deref(), q.after_id.as_deref()) {
+        (Some(created), Some(id)) => Some((created, id)),
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_created and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    let status = match q.status.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => match parse_task_status(raw) {
+            Ok(status) => Some(status),
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        },
+        None => None,
+    };
+    let filter = crate::coordination::TaskFilter {
+        status,
+        agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
+    };
+    match d
+        .coordination_db
+        .list_tasks_page(&filter, after, q.limit.clamp(1, 500))
+    {
+        Ok(tasks) => Json(tasks).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list tasks: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_create_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<CoordinationTaskReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let title = req.title.trim();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let id = req
+        .id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let task = crate::coordination::Task {
+        thread_id: crate::coordination::Task::thread_for(&id),
+        id,
+        title: title.to_string(),
+        description: req.description.trim().to_string(),
+        status: crate::coordination::TaskStatus::Todo,
+        priority: req.priority,
+        created_by_kind: "human".into(),
+        created_by_id: "local".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        completed_at: None,
+    };
+    match d.coordination_db.create_task(&task) {
+        Ok(()) => (StatusCode::CREATED, Json(task)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_get_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.get_task(&task_id) {
+        Ok(Some(task)) => Json(task).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("get task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_update_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskPatch>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let description = req.description.as_deref().map(str::trim);
+    match d.coordination_db.update_task(
+        &task_id,
+        title,
+        description,
+        req.priority,
+        &now,
+    ) {
+        Ok(true) => match d.coordination_db.get_task(&task_id) {
+            Ok(Some(task)) => Json(task).into_response(),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("update task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_set_task_status(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskStatusReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let status = match parse_task_status(req.status.trim()) {
+        Ok(status) => status,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    match d.coordination_db.set_task_status(&task_id, &status, &now) {
+        Ok(true) => match d.coordination_db.get_task(&task_id) {
+            Ok(Some(task)) => Json(task).into_response(),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("set task status: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Every edge touching the task, both directions, plus the blockers resolved to
+/// ids. A reader needs the incoming edges as much as the outgoing ones — that is
+/// what makes a blocked task render as blocked.
+async fn coordination_task_links(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let links = match d.coordination_db.task_links(&task_id) {
+        Ok(links) => links,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task links: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let blockers = match d.coordination_db.blockers_of(&task_id) {
+        Ok(blockers) => blockers,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task blockers: {error}"),
+            )
+                .into_response();
+        }
+    };
+    Json(serde_json::json!({ "links": links, "blocked_by": blockers })).into_response()
+}
+
+async fn coordination_link_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskLinkReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let to = req.to_task_id.trim();
+    if to.is_empty() {
+        return (StatusCode::BAD_REQUEST, "to_task_id is required").into_response();
+    }
+    if to == task_id {
+        return (StatusCode::BAD_REQUEST, "a task cannot link to itself")
+            .into_response();
+    }
+    let kind = match req.kind.as_deref().unwrap_or("blocks") {
+        "blocks" => crate::coordination::TaskLinkKind::Blocks,
+        "relates_to" => crate::coordination::TaskLinkKind::RelatesTo,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown link kind: {other}"),
+            )
+                .into_response();
+        }
+    };
+    // Both ends must exist, or the edge dangles and the board draws a blank node.
+    for id in [task_id.as_str(), to] {
+        match d.coordination_db.get_task(id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (StatusCode::NOT_FOUND, format!("no such task: {id}"))
+                    .into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("read task: {error}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let link = crate::coordination::TaskLink {
+        from_task_id: task_id,
+        to_task_id: to.to_string(),
+        kind,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match d.coordination_db.link_tasks(&link) {
+        Ok(()) => (StatusCode::CREATED, Json(link)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("link tasks: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_unlink_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((task_id, other_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    // Both directions are removed: the caller names the pair, and which end was
+    // stored as `from` is an implementation detail it should not have to know.
+    let mut removed = false;
+    for (from, to) in [
+        (task_id.as_str(), other_id.as_str()),
+        (other_id.as_str(), task_id.as_str()),
+    ] {
+        for kind in [
+            crate::coordination::TaskLinkKind::Blocks,
+            crate::coordination::TaskLinkKind::RelatesTo,
+        ] {
+            match d.coordination_db.unlink_tasks(from, to, &kind) {
+                Ok(true) => removed = true,
+                Ok(false) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unlink tasks: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    if removed {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such link").into_response()
+    }
+}
+
+async fn coordination_task_agents(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.coordination_db.list_task_agents(&task_id) {
+        Ok(agents) => Json(agents).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task agents: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_add_task_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskAgentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let agent_id = req.agent_id.trim();
+    if agent_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "agent_id is required").into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    match d
+        .coordination_db
+        .add_task_agent(&task_id, agent_id, req.role.trim(), &now)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("add task agent: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_remove_task_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((task_id, agent_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .coordination_db
+        .remove_task_agent(&task_id, &agent_id, &chrono::Utc::now().to_rfc3339())
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "agent is not on this task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("remove task agent: {error}"),
         )
             .into_response(),
     }
