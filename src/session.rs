@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::builtins::coding_tools;
-use crate::config::{SnippetConfig, workspaces_root};
+use crate::config::{InferenceProfileConfig, SnippetConfig, workspaces_root};
 use crate::coordination::{AgentHome, IdentityError};
 use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, deserialize_state};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
 use crate::prompts::{conversation_prompt, mission_control_system_prompt};
-use crate::tools::{BrowserSummaryProvider, ToolContext, ToolRegistry};
+use crate::tools::{BrowserSummaryProvider, ToolContext, ToolError, ToolRegistry};
 
 pub struct SessionHandle {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
@@ -126,6 +126,147 @@ enum SessionRole {
     },
 }
 
+/// Everything that distinguishes one kind of session from another, resolved once.
+///
+/// Replaces a single `mission_control: bool` that drove five separate branches
+/// in `start_session_with_role` — model factory, tool context, tool registry,
+/// system prompt, and lane control. Adding a kind meant finding all five, and
+/// nothing said when one was missed: the two places that read a role back off
+/// disk drifted, so a specialized agent was silently rebuilt as an ordinary
+/// session on a config reload.
+///
+/// There are two RUNTIMES, not three. `Standard` and `Specialized` differ only
+/// by an identity overlay appended to the SAME prompt and the SAME tool set,
+/// which is what `specialized_agent_system_prompt` already did.
+struct AgentRuntime {
+    factory: Option<ModelFactory>,
+    context: ToolContext,
+    tools: ToolRegistry,
+    prompt: String,
+    /// Mission Control coordinates durable sessions; it does not spawn lanes.
+    allow_lane_control: bool,
+}
+
+/// The config-derived inputs every runtime shares.
+///
+/// Bundled rather than passed positionally: they are mostly `Option`s and `Arc`s
+/// of similar shape, and a long positional list of those transposes silently at
+/// a call site.
+struct RuntimeInputs {
+    workspace: PathBuf,
+    durable_id: Option<String>,
+    prompt_ctx: crate::prompts::PromptContext,
+    browser_summary: Option<BrowserSummaryProvider>,
+    exa_api_key: Option<String>,
+    memory: crate::memory::MemoryLimits,
+    delegate: InferenceProfileConfig,
+}
+
+/// A researched, versioned identity overlaid on the snippet runtime.
+type AgentIdentity<'a> = (&'a str, u64, &'a str);
+
+impl AgentRuntime {
+    /// Mission Control: routing and orchestration only.
+    ///
+    /// No model factory (the daemon drives it rather than delegating to it), a
+    /// routing-only tool set, and the orchestrator prompt — which deliberately
+    /// does NOT stack the coding-agent layer, because that identity ("own the
+    /// task end to end") made Mission Control advertise as a general engineer
+    /// and skip `list_sessions`.
+    fn mission_control(i: RuntimeInputs) -> Result<Self, ToolError> {
+        let context = ToolContext::mission_control(i.workspace)?
+            .with_durable_session_id_opt(i.durable_id)
+            .with_coordination_db_path(crate::coordination::default_db_path())
+            // Mission Control is an ADDRESSABLE agent: it holds a directory row
+            // and an agent id, so a peer can name it and a lease can attribute a
+            // turn to it. Without this it could post to the board but nothing
+            // could address it back.
+            .with_agent_id(crate::mission_control::SESSION_ID);
+
+        let mut tools = ToolRegistry::new();
+        tools.insert(crate::builtins::BashTool);
+        tools.insert(crate::builtins::ReadImageTool);
+        crate::mission_tools::add_mission_control_tools(&mut tools);
+        crate::coordination_tools::add_coordination_tools(&mut tools);
+        crate::coordination_tools::add_coordination_dispatch_tools(&mut tools);
+
+        Ok(Self {
+            factory: None,
+            context,
+            tools,
+            prompt: mission_control_system_prompt(),
+            allow_lane_control: false,
+        })
+    }
+
+    /// The snippet agent: a coding conversation, optionally wearing an identity.
+    ///
+    /// `identity` is the ONLY difference between `Standard` and `Specialized`.
+    /// The base prompt and the tool set are shared either way; the overlay
+    /// changes judgment and specialization, not the session's execution, safety
+    /// or conversation rules — and not its executable permissions.
+    fn snippet(i: RuntimeInputs, identity: Option<AgentIdentity<'_>>) -> Result<Self, ToolError> {
+        let context = match i.browser_summary {
+            Some(provider) => ToolContext::with_browser_summary(i.workspace, provider)?,
+            None => ToolContext::new(i.workspace)?,
+        }
+        .with_durable_session_id_opt(i.durable_id.clone())
+        // Every session's coordination tools open the same database the daemon
+        // owns, so board posts and assignments share one store.
+        .with_coordination_db_path(crate::coordination::default_db_path())
+        // A specialized session acts as its directory agent, so lease tools can
+        // attribute turn ownership to the right identity.
+        .with_agent_id_opt(identity.map(|(agent_id, _, _)| agent_id.to_string()));
+
+        let mut tools = coding_tools(i.exa_api_key.clone(), i.memory);
+        crate::mission_tools::add_worker_report_tool(&mut tools);
+        tools.insert(crate::mission_tools::CreateRecurringJob);
+        // Workers discover peers, post to the board, and take/hold/release their
+        // own turn lease; they do not offer assignments — that is Mission
+        // Control's dispatch role.
+        crate::coordination_tools::add_coordination_tools(&mut tools);
+        crate::coordination_tools::add_coordination_lease_tools(&mut tools);
+        crate::coordination_tools::add_coordination_handoff_tools(&mut tools);
+
+        let prompt = match identity {
+            Some((agent_id, revision, body)) => crate::prompts::specialized_agent_system_prompt(
+                crate::prompts::SpecializedAgentPromptContext {
+                    agent_id,
+                    identity_revision: revision,
+                    identity: body,
+                    context: &i.prompt_ctx,
+                },
+            ),
+            None => conversation_prompt(&i.prompt_ctx),
+        };
+
+        let delegate = i.delegate;
+        let lane_session_id = i.durable_id;
+        Ok(Self {
+            factory: Some(Arc::new(move || {
+                delegate.build_model_for_session(lane_session_id.clone())
+            })),
+            context,
+            tools,
+            prompt,
+            allow_lane_control: true,
+        })
+    }
+
+    /// Resolve a role to its runtime. THE one place a kind is defined.
+    fn resolve(role: SessionRole, inputs: RuntimeInputs) -> Result<Self, ToolError> {
+        match role {
+            SessionRole::MissionControl => Self::mission_control(inputs),
+            SessionRole::Standard => Self::snippet(inputs, None),
+            SessionRole::Specialized {
+                agent_id,
+                identity_revision,
+                identity,
+            } => Self::snippet(inputs, Some((&agent_id, identity_revision, &identity))),
+        }
+    }
+}
+
 fn start_session_with_role(
     config: &SnippetConfig,
     state_path: PathBuf,
@@ -135,50 +276,29 @@ fn start_session_with_role(
     browser_summary: Option<BrowserSummaryProvider>,
     role: SessionRole,
 ) -> SessionHandle {
-    let mission_control = matches!(&role, SessionRole::MissionControl);
-    let specialized_identity = match role {
-        SessionRole::Specialized {
-            agent_id,
-            identity_revision,
-            identity,
-        } => Some((agent_id, identity_revision, identity)),
-        SessionRole::Standard | SessionRole::MissionControl => None,
-    };
     let (input_tx, rx) = mpsc::unbounded_channel();
 
+    // Config-derived values, snapshotted here because `config` is a borrow and
+    // the session task must be `'static`.
     let workspace = config.workspace.clone();
     let model_config = config.model.clone();
+    let delegate = config.delegate_profile();
     let exa_api_key = config.exa_api_key.clone();
     let manual_approval = config.manual_approval;
     let context_window_tokens = model_config.context_window;
     let compact_at_pct = model_config.compact_at_pct;
+    let memory = crate::memory::MemoryLimits {
+        enabled: config.memory_enabled,
+        writable: true,
+        index_budget_chars: config.memory_index_budget_chars,
+        entry_budget_chars: config.memory_entry_budget_chars,
+        max_entries: config.memory_max_entries,
+    };
     let memory_enabled = config.memory_enabled;
     let memory_index_budget_chars = config.memory_index_budget_chars;
     let memory_entry_budget_chars = config.memory_entry_budget_chars;
     let memory_max_entries = config.memory_max_entries;
     let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
-        // Durable identity = the same id the daemon uses for managed sessions
-        // and task envelopes.
-        //
-        // `session_id_for_state_path` handles Mission Control, whose state lives
-        // OUTSIDE the workspaces root, and falls back to the full path for any
-        // other out-of-root session. The previous `strip_prefix(workspaces_root)`
-        // returned None for those, and a None here means the model is built with
-        // no session id at all — which is what silently dropped the
-        // `x-opencode-session` header and broke opencode on any non-workspace
-        // session.
-        let durable_id = Some(session_id_for_state_path(&state_path));
-    // Specialized sessions keep the established full session prompt and append
-    // researched, versioned identity guidance. The session runtime remains shared.
-    let factory: Option<ModelFactory> = if mission_control {
-        None
-    } else {
-        let mc = config.delegate_profile();
-        let lane_session_id = durable_id.clone();
-        Some(Arc::new(move || {
-            mc.build_model_for_session(lane_session_id.clone())
-        }))
-    };
     let sp = state_path.clone();
     let stream_out = stream.clone();
 
@@ -198,79 +318,23 @@ fn start_session_with_role(
                 .map(|provider| browser_summary_is_connected(&provider()))
                 .unwrap_or(false),
         };
-        let base_context = if mission_control {
-            ToolContext::mission_control(workspace)
-        } else {
-            match browser_summary {
-                Some(provider) => ToolContext::with_browser_summary(workspace, provider),
-                None => ToolContext::new(workspace),
-            }
-        }
+        let runtime = AgentRuntime::resolve(
+            role,
+            RuntimeInputs {
+                workspace,
+                durable_id,
+                prompt_ctx,
+                browser_summary,
+                exa_api_key: exa_api_key.clone(),
+                memory,
+                delegate,
+            },
+        )
         .map_err(|e| e.to_string())?;
-        let context = match durable_id {
-            Some(id) => base_context.with_durable_session_id(id),
-            None => base_context,
-        }
-        // Every session's coordination tools open the same database the daemon
-        // owns, so board posts and assignments share one store.
-        .with_coordination_db_path(crate::coordination::default_db_path());
-        // A specialized session acts as its directory agent, so lease tools can
-        // attribute turn ownership to the right identity.
-        let context = match specialized_identity.as_ref() {
-            Some((agent_id, _, _)) => context.with_agent_id(agent_id.clone()),
-            None => context,
-        };
-        // Router sessions get only routing tools. Specialized sessions retain
-        // the standard registry and shared system contract; the researched
-        // identity changes role guidance, not executable permissions.
-        let tools = if mission_control {
-            let mut tools = ToolRegistry::new();
-            tools.insert(crate::builtins::BashTool);
-            tools.insert(crate::builtins::ReadImageTool);
-            crate::mission_tools::add_mission_control_tools(&mut tools);
-            // Mission Control discovers peers, posts to the board, and offers work.
-            crate::coordination_tools::add_coordination_tools(&mut tools);
-            crate::coordination_tools::add_coordination_dispatch_tools(&mut tools);
-            tools
-        } else {
-            let mut tools = coding_tools(
-                exa_api_key.clone(),
-                crate::memory::MemoryLimits {
-                    enabled: memory_enabled,
-                    writable: true,
-                    index_budget_chars: memory_index_budget_chars,
-                    entry_budget_chars: memory_entry_budget_chars,
-                    max_entries: memory_max_entries,
-                },
-            );
-            crate::mission_tools::add_worker_report_tool(&mut tools);
-            tools.insert(crate::mission_tools::CreateRecurringJob);
-            // Workers discover peers, post to the board, and take/hold/release
-            // their own turn lease; they do not offer assignments (that is
-            // Mission Control's dispatch role).
-            crate::coordination_tools::add_coordination_tools(&mut tools);
-            crate::coordination_tools::add_coordination_lease_tools(&mut tools);
-            crate::coordination_tools::add_coordination_handoff_tools(&mut tools);
-            tools
-        };
-        let system_prompt = if mission_control {
-            mission_control_system_prompt()
-        } else if let Some((agent_id, identity_revision, identity)) = specialized_identity.as_ref()
-        {
-            crate::prompts::specialized_agent_system_prompt(
-                crate::prompts::SpecializedAgentPromptContext {
-                    agent_id,
-                    identity_revision: *identity_revision,
-                    identity,
-                    context: &prompt_ctx,
-                },
-            )
-        } else {
-            conversation_prompt(&prompt_ctx)
-        };
+
         let harness = CodingHarness::new(
             HarnessConfig {
-                system_prompt,
+                system_prompt: runtime.prompt,
                 state_path: Some(sp),
                 resume,
                 exa_api_key: exa_api_key.clone(),
@@ -282,14 +346,14 @@ fn start_session_with_role(
                 memory_entry_budget_chars,
                 memory_max_entries,
                 memory_reflect_on_compaction,
-                allow_lane_control: !mission_control,
+                allow_lane_control: runtime.allow_lane_control,
                 ..HarnessConfig::default()
             },
-            tools,
-            context,
+            runtime.tools,
+            runtime.context,
         );
         harness
-            .run_interactive(&mut model, initial, rx, factory, stream)
+            .run_interactive(&mut model, initial, rx, runtime.factory, stream)
             .await
             .map_err(|e| e.to_string())
     });

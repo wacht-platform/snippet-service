@@ -54,6 +54,49 @@ impl CoordinationDb {
         })
     }
 
+    /// Create the agent, or refresh it if the id already exists.
+    ///
+    /// The daemon registers its built-in agents (Mission Control) on every boot,
+    /// so this has to be idempotent — `create_agent` is a plain INSERT and would
+    /// hit the primary key on the second start. The DESCRIPTIVE fields are
+    /// refreshed so a changed display name or role lands; `created_at` and
+    /// `version` are preserved, because rewriting those would erase the row's
+    /// history rather than update it.
+    pub fn upsert_agent(&self, agent: &Agent) -> Result<(), CoordinationDbError> {
+        let capabilities = serde_json::to_string(&agent.capabilities).unwrap();
+        let timestamp = now();
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO agents
+                 (id, display_name, handle, kind, status, role, capabilities_json,
+                  max_concurrent_assignments, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                     display_name = excluded.display_name,
+                     handle = excluded.handle,
+                     kind = excluded.kind,
+                     status = excluded.status,
+                     role = excluded.role,
+                     capabilities_json = excluded.capabilities_json,
+                     max_concurrent_assignments = excluded.max_concurrent_assignments,
+                     updated_at = excluded.updated_at",
+                params![
+                    agent.id,
+                    agent.display_name,
+                    agent.handle,
+                    enum_text(&agent.kind),
+                    enum_text(&agent.status),
+                    enum_text(&agent.role),
+                    capabilities,
+                    agent.max_concurrent_assignments,
+                    agent.version,
+                    timestamp,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn list_agents(&self) -> Result<Vec<Agent>, CoordinationDbError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -169,6 +212,33 @@ mod tests {
             max_concurrent_assignments: 1,
             version: 1,
         }
+    }
+
+    #[test]
+    fn upsert_agent_is_idempotent_and_refreshes_descriptors() {
+        // The daemon registers its built-in agents on EVERY boot, so a plain
+        // INSERT would hit the primary key on the second start.
+        let db = CoordinationDb::open_in_memory().unwrap();
+        let first = agent("mission-control", "Mission Control");
+        db.upsert_agent(&first).unwrap();
+        db.upsert_agent(&first).unwrap();
+
+        assert_eq!(db.list_agents().unwrap().len(), 1, "must not duplicate");
+
+        // A changed descriptor lands; created_at is preserved rather than
+        // rewritten, so the row keeps its history.
+        let renamed = Agent {
+            display_name: "Coordinator".into(),
+            kind: AgentKind::MissionControl,
+            role: AgentRole::Coordinator,
+            ..agent("mission-control", "Coordinator")
+        };
+        db.upsert_agent(&renamed).unwrap();
+
+        let stored = db.get_agent("mission-control").unwrap().unwrap();
+        assert_eq!(stored.display_name, "Coordinator");
+        assert_eq!(stored.kind, AgentKind::MissionControl);
+        assert_eq!(db.list_agents().unwrap().len(), 1, "still one row");
     }
 
     #[test]
