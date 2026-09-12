@@ -157,16 +157,17 @@ fn start_session_with_role(
     let memory_entry_budget_chars = config.memory_entry_budget_chars;
     let memory_max_entries = config.memory_max_entries;
     let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
-    // Durable identity = state path relative to the workspaces root — the
-    // same id the daemon uses for managed sessions and task envelopes.
-    let durable_id = if mission_control {
-        Some(crate::mission_control::SESSION_ID.to_string())
-    } else {
-        state_path
-            .strip_prefix(crate::config::workspaces_root())
-            .ok()
-            .map(|p| p.display().to_string())
-    };
+        // Durable identity = the same id the daemon uses for managed sessions
+        // and task envelopes.
+        //
+        // `session_id_for_state_path` handles Mission Control, whose state lives
+        // OUTSIDE the workspaces root, and falls back to the full path for any
+        // other out-of-root session. The previous `strip_prefix(workspaces_root)`
+        // returned None for those, and a None here means the model is built with
+        // no session id at all — which is what silently dropped the
+        // `x-opencode-session` header and broke opencode on any non-workspace
+        // session.
+        let durable_id = Some(session_id_for_state_path(&state_path));
     // Specialized sessions keep the established full session prompt and append
     // researched, versioned identity guidance. The session runtime remains shared.
     let factory: Option<ModelFactory> = if mission_control {
@@ -182,13 +183,7 @@ fn start_session_with_role(
     let stream_out = stream.clone();
 
     let join = tokio::spawn(async move {
-        let durable_id = if mission_control {
-            Some(crate::mission_control::SESSION_ID.to_string())
-        } else {
-            sp.strip_prefix(crate::config::workspaces_root())
-                .ok()
-                .map(|p| p.display().to_string())
-        };
+        let durable_id = Some(session_id_for_state_path(&sp));
         let mut model = model_config.build_model_for_session(durable_id.clone());
         // Session-start capability snapshot for conditional prompt layers. This
         // is computed once and stays fixed for the session (cache-stable).
