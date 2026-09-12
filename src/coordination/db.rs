@@ -86,7 +86,7 @@ fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
 
 fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.execute_batch(
-        "PRAGMA user_version = 1;
+        "PRAGMA user_version = 2;
 
          CREATE TABLE IF NOT EXISTS agents (
              id TEXT PRIMARY KEY NOT NULL,
@@ -190,12 +190,63 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              delivered_at TEXT
          );
 
+         -- The task board. A task is the unit of work a human creates; Mission
+         -- Control decomposes it into assignments, and each task owns one board
+         -- thread (its message room) so the agents on that task can talk without
+         -- a global room every participant has to read.
+         CREATE TABLE IF NOT EXISTS tasks (
+             id TEXT PRIMARY KEY NOT NULL,
+             title TEXT NOT NULL,
+             description TEXT NOT NULL,
+             status TEXT NOT NULL,
+             priority INTEGER NOT NULL DEFAULT 0,
+             created_by_kind TEXT NOT NULL,
+             created_by_id TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL,
+             completed_at TEXT,
+             -- The board thread that IS this task's message room. Derived from
+             -- the id so it can never drift from the task it belongs to.
+             thread_id TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS tasks_status_priority
+             ON tasks(status, priority DESC, created_at);
+         CREATE INDEX IF NOT EXISTS tasks_thread
+             ON tasks(thread_id);
+
+         -- Directed edges between tasks. `kind` distinguishes a blocks edge (an
+         -- ordering constraint) from a relates_to edge (context), so the board
+         -- can draw both without inferring intent.
+         CREATE TABLE IF NOT EXISTS task_links (
+             from_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             to_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             kind TEXT NOT NULL,
+             created_at TEXT NOT NULL,
+             PRIMARY KEY (from_task_id, to_task_id, kind)
+         );
+         CREATE INDEX IF NOT EXISTS task_links_to ON task_links(to_task_id, kind);
+
+         -- Which agents are on a task, and what they own. Kept as a membership
+         -- row with a removal timestamp rather than a hard delete: the record of
+         -- who worked on a task outlives the assignment, and the roster is
+         -- expected to change as Mission Control learns more about the work.
+         CREATE TABLE IF NOT EXISTS task_agents (
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             agent_id TEXT NOT NULL REFERENCES agents(id),
+             role TEXT NOT NULL DEFAULT '',
+             added_at TEXT NOT NULL,
+             removed_at TEXT,
+             PRIMARY KEY (task_id, agent_id)
+         );
+         CREATE INDEX IF NOT EXISTS task_agents_agent
+             ON task_agents(agent_id, removed_at);
+
          CREATE TABLE IF NOT EXISTS schema_metadata (
              key TEXT PRIMARY KEY NOT NULL,
              value TEXT NOT NULL
          );
          INSERT OR IGNORE INTO schema_metadata(key, value)
-             VALUES ('coordination_schema_version', '1');",
+             VALUES ('coordination_schema_version', '2');",
     )
 }
 
