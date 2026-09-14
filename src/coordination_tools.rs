@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::coordination::{
-    CoordinationDb,
+    Store,
     types::{ContextMode, CoordinationEvent, Handoff},
 };
 use crate::llm::NativeToolDefinition;
@@ -18,8 +18,18 @@ fn schema(properties: Value, required: &[&str]) -> Value {
 /// to discover peers and post to the board.
 pub fn add_coordination_tools(registry: &mut ToolRegistry) {
     registry.insert(ListCoordinationAgents);
+    registry.insert(ListCoordinationAssignments);
     registry.insert(PostCoordinationMessage);
     registry.insert(ReadCoordinationThread);
+    // Direct peer conversation: the human and any agent can address one named
+    // agent, and every agent can always reach Mission Control.
+    registry.insert(SendAgentMessage);
+    registry.insert(ReadAgentThread);
+    registry.insert(ReadAgentInbox);
+    // Per-agent coordination memory: recall before acting, and record what is
+    // worth keeping.
+    registry.insert(ReadCoordinationBoard);
+    registry.insert(RecordCoordinationNote);
 }
 
 /// Tools only Mission Control may use to offer new work.
@@ -34,6 +44,9 @@ pub fn add_coordination_lease_tools(registry: &mut ToolRegistry) {
     registry.insert(RenewCoordinationLease);
     registry.insert(ReleaseCoordinationLease);
     registry.insert(CoordinationLeaseStatus);
+    // Closing an assignment belongs with the turn tools: it reports the outcome
+    // and releases the lease, so it is the last thing a turn does.
+    registry.insert(CompleteCoordinationAssignment);
 }
 
 /// Handoff tools: the current holder records an immutable transfer for a
@@ -43,29 +56,29 @@ pub fn add_coordination_handoff_tools(registry: &mut ToolRegistry) {
     registry.insert(AcknowledgeCoordinationHandoff);
 }
 
-/// Open the coordination database the daemon owns. Prefers the path bound to this
-/// session; falls back to the Mission Control root for older call sites.
-fn db(ctx: &ToolContext) -> Result<CoordinationDb, ToolError> {
+/// Open the store the daemon owns: the path bound to this session when present,
+/// otherwise the canonical general-purpose store.
+fn db(ctx: &ToolContext) -> Result<Store, ToolError> {
     let path = ctx
-        .coordination_db_path()
-        .or_else(|| {
-            ctx.mission_control_root()
-                .map(|root| root.join("coordination.sqlite3"))
-        })
-        .ok_or_else(|| {
-            ToolError::msg("coordination tools require a coordination database context")
-        })?;
-    CoordinationDb::open(path)
-        .map_err(|e| ToolError::msg(format!("open coordination database: {e}")))
+        .store_path()
+        .unwrap_or_else(crate::store::default_db_path);
+    Store::open(path).map_err(|e| ToolError::msg(format!("open store: {e}")))
 }
 
-/// The board identity of the current session. The model never supplies this:
-/// a session posts as itself, so it cannot impersonate another agent.
+/// The board identity of the current session. The model never supplies this: a
+/// session posts as itself, so it cannot impersonate another agent.
+///
+/// The kind separates the two cases that used to be conflated: an agent working
+/// the session posts as `agent`, a plain session posts as `session`. Both are
+/// addressable, but only the former is an identity the directory knows.
 fn actor(ctx: &ToolContext) -> Result<(&'static str, String), ToolError> {
+    if let Some(agent_id) = ctx.agent_id() {
+        return Ok(("agent", agent_id.to_string()));
+    }
     ctx.durable_session_id()
-        .map(|id| ("agent", id.to_string()))
+        .map(|id| ("session", id.to_string()))
         .ok_or_else(|| {
-            ToolError::msg("posting to the coordination board requires a durable session identity")
+            ToolError::msg("posting to the coordination board requires a session identity")
         })
 }
 
@@ -125,6 +138,63 @@ impl Tool for ListCoordinationAgents {
         Ok(ToolResult::success(json!({"agents": agents})))
     }
 }
+
+#[derive(Deserialize)]
+struct ListAssignmentsArgs {
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Read-only view of the assignment board. A worker uses it to find work offered
+/// to it — the offer is delivered as a turn, but the envelope can be missed on a
+/// resume, and this is how a session re-finds its own outstanding assignments.
+pub struct ListCoordinationAssignments;
+#[async_trait]
+impl Tool for ListCoordinationAssignments {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "list_coordination_assignments".into(),
+            description: "List assignments in the coordination directory, optionally filtered by agent_id, session_id, or status (offered, accepted, active, awaiting_handoff, completed, blocked, failed, cancelled, expired). Use it to find work offered to you; the assigned agent is the only one who can accept an assignment.".into(),
+            input_schema: schema(
+                json!({
+                    "agent_id":{"type":"string","description":"optional filter"},
+                    "session_id":{"type":"string","description":"optional filter"},
+                    "status":{"type":"string","description":"optional filter"}
+                }),
+                &[],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ListAssignmentsArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let status = match args.status.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(value) => Some(
+                serde_json::from_value::<crate::coordination::AssignmentStatus>(json!(value))
+                    .map_err(|_| ToolError::msg(format!("unknown assignment status `{value}`")))?,
+            ),
+        };
+        let filter = crate::coordination::AssignmentFilter {
+            agent_id: args.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
+            session_id: args.session_id.as_deref().filter(|s| !s.trim().is_empty()),
+            status,
+        };
+        let assignments = db(ctx)?
+            .list_assignments_page(&filter, None, ASSIGNMENT_PAGE_LIMIT)
+            .map_err(|e| ToolError::msg(format!("list assignments: {e}")))?;
+        Ok(ToolResult::success(json!({"assignments": assignments})))
+    }
+}
+
+/// Enough for a session's outstanding work; the model rarely needs more, and a
+/// larger ceiling only invites dumping the whole table into context.
+const ASSIGNMENT_PAGE_LIMIT: u32 = 50;
 
 #[derive(Deserialize)]
 struct PostArgs {
@@ -274,14 +344,475 @@ impl Tool for ReadCoordinationThread {
 }
 
 #[derive(Deserialize)]
+struct SendAgentMessageArgs {
+    recipient_agent_id: String,
+    body: String,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// Send a direct message to a peer agent by id.
+///
+/// The recipient is an AGENT ID from the directory, never a raw thread id: the
+/// thread is derived from the pair, so two agents exchanging messages cannot
+/// each invent a different conversation. The message is written durably and the
+/// daemon's delivery loop wakes the recipient — a tool call never delivers
+/// inline, or a message sent to a stopped session would be lost.
+pub struct SendAgentMessage;
+#[async_trait]
+impl Tool for SendAgentMessage {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "send_agent_message".into(),
+            description: "Send a direct message to another agent, or reply where you were asked. Address an agent by its agent id (list_coordination_agents shows the directory), use `human` to reply to the person, or `session:<id>` to reply in the session the message came from — the envelope's reply_to line names the right one. It is a conversation, not a command: it never creates a task, transfers ownership, or authorises a workspace change. Task and status messages belong on a task room instead.".into(),
+            input_schema: schema(
+                json!({
+                    "recipient_agent_id":{"type":"string","description":"agent id from list_coordination_agents"},
+                    "body":{"type":"string"},
+                    "idempotency_key":{"type":"string","description":"optional; a retry with the same key does not duplicate"}
+                }),
+                &["recipient_agent_id", "body"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: SendAgentMessageArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let recipient = args.recipient_agent_id.trim();
+        if recipient.is_empty() {
+            return Err(ToolError::msg("recipient_agent_id must not be empty"));
+        }
+        if args.body.trim().is_empty() {
+            return Err(ToolError::msg("body must not be empty"));
+        }
+        // `human` (or `local`) addresses the operator who is talking to this
+        // agent. `session:<id>` answers a message in the session it was asked
+        // from, which is where the asker is reading. Without these an agent could
+        // receive a message and have no way to answer where it matters.
+        let (to_kind, to_id) = match recipient {
+            "human" | "local" => ("human", crate::coordination::LOCAL_HUMAN_ID),
+            other => match other.strip_prefix("session:") {
+                Some(session) if !session.trim().is_empty() => ("session", session.trim()),
+                _ => ("agent", other),
+            },
+        };
+        let db = db(ctx)?;
+        if to_kind == "agent" {
+            // A recipient that is not in the directory would sit undelivered
+            // forever, so an unknown id is refused rather than accepted and dropped.
+            if db
+                .get_agent(to_id)
+                .map_err(|e| ToolError::msg(format!("look up agent: {e}")))?
+                .is_none()
+            {
+                return Err(ToolError::msg(format!(
+                    "unknown agent `{to_id}` — list_coordination_agents shows the directory. Use `human` to reply to the person."
+                )));
+            }
+        }
+        let (sender_kind, sender_id) = actor(ctx)?;
+        let key = args
+            .idempotency_key
+            .filter(|k| !k.trim().is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // The session this message is asked FROM, taken from the context rather
+        // than the model's arguments: the model must not be able to claim a
+        // different origin any more than it can claim a different sender.
+        let origin = ctx.durable_session_id().map(str::to_string);
+        let saved = db
+            .send_direct_message_from(
+                (&sender_kind, &sender_id),
+                (to_kind, to_id),
+                args.body.trim(),
+                &key,
+                &chrono::Utc::now().to_rfc3339(),
+                origin.as_deref(),
+            )
+            .map_err(|e| ToolError::msg(format!("send message: {e}")))?;
+        Ok(ToolResult::success(json!({
+            "thread_id": saved.thread_id,
+            "sequence": saved.sequence,
+            "to": format!("{to_kind}:{to_id}"),
+            "note": "Accepted and queued for delivery. This is conversation only — it does not start work.",
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct ReadAgentThreadArgs {
+    peer_agent_id: String,
+    #[serde(default)]
+    after_sequence: Option<u64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Read the direct conversation between this session's actor and one peer.
+pub struct ReadAgentThread;
+#[async_trait]
+impl Tool for ReadAgentThread {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "read_agent_thread".into(),
+            description: "Read your direct conversation with one agent, oldest first. Omit after_sequence for the most recent messages; pass it to page forward. The wake message already includes the recent history, so use this only to see more.".into(),
+            input_schema: schema(
+                json!({
+                    "peer_agent_id":{"type":"string"},
+                    "after_sequence":{"type":"integer","minimum":0},
+                    "limit":{"type":"integer","minimum":1,"maximum":100}
+                }),
+                &["peer_agent_id"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ReadAgentThreadArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let peer = args.peer_agent_id.trim();
+        if peer.is_empty() {
+            return Err(ToolError::msg("peer_agent_id must not be empty"));
+        }
+        let (kind, id) = actor(ctx)?;
+        let thread_id =
+            crate::coordination::direct_thread_id((&kind, &id), ("agent", peer));
+        let limit = args.limit.unwrap_or(20).clamp(1, 100);
+        let db = db(ctx)?;
+        let events = match args.after_sequence {
+            Some(after) => db
+                .direct_thread_events(&thread_id, after, limit)
+                .map_err(|e| ToolError::msg(format!("read thread: {e}")))?,
+            None => db
+                .recent_direct_thread_events(&thread_id, limit)
+                .map_err(|e| ToolError::msg(format!("read thread: {e}")))?,
+        };
+        Ok(ToolResult::success(json!({
+            "thread_id": thread_id,
+            "peer": peer,
+            "messages": events.iter().map(flatten_event).collect::<Vec<_>>(),
+            "oldest_sequence": events.first().map(|e| e.sequence).unwrap_or(0),
+            "newest_sequence": events.last().map(|e| e.sequence).unwrap_or(0),
+        })))
+    }
+}
+
+/// The conversations this actor is part of, with unread counts — the inbox.
+pub struct ReadAgentInbox;
+#[async_trait]
+impl Tool for ReadAgentInbox {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "read_agent_inbox".into(),
+            description: "List your direct conversations with unread counts, most recent first. Use it to find messages you have not answered; read one with read_agent_thread.".into(),
+            input_schema: schema(json!({}), &[]),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, _: Value) -> Result<ToolResult, ToolError> {
+        let (kind, id) = actor(ctx)?;
+        let threads = db(ctx)?
+            .list_direct_threads(&kind, &id)
+            .map_err(|e| ToolError::msg(format!("list inbox: {e}")))?;
+        Ok(ToolResult::success(json!({
+            "actor": format!("{kind}:{id}"),
+            "threads": threads,
+        })))
+    }
+}
+
+/// Read back this agent's own coordination memory.
+///
+/// The point of the board is recall: before dispatching, an agent asks "have I
+/// sent work about this workspace before, and how did it go". Filtering by
+/// workspace and searching the summaries are what make that a query instead of
+/// a re-read of every transcript.
+pub struct ReadCoordinationBoard;
+#[async_trait]
+impl Tool for ReadCoordinationBoard {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "read_coordination_board".into(),
+            description: "Read your own coordination memory: work you dispatched, what came back, and notes you recorded. Newest first. Filter with workspace to scope to one folder, contains to search the summaries, and kind to narrow to dispatched/reported/noted. Use it before dispatching to see whether you have done something similar, and what worked. Set outstanding_only to list dispatches that have not reported back yet.".into(),
+            input_schema: schema(
+                json!({
+                    "workspace":{"type":"string","description":"only rows about this folder"},
+                    "contains":{"type":"string","description":"substring to find in summaries"},
+                    "kind":{"type":"string","enum":["dispatched","reported","noted"]},
+                    "outstanding_only":{"type":"boolean","description":"only dispatches with no report yet"},
+                    "limit":{"type":"integer","minimum":1,"maximum":100}
+                }),
+                &[],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            workspace: Option<String>,
+            #[serde(default)]
+            contains: Option<String>,
+            #[serde(default)]
+            kind: Option<String>,
+            #[serde(default)]
+            outstanding_only: bool,
+            #[serde(default)]
+            limit: Option<u32>,
+        }
+        let args: Args =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let agent_id = board_agent_id(ctx)?;
+        let db = db(ctx)?;
+        if args.outstanding_only {
+            let outstanding = db
+                .board_awaiting_report(&agent_id)
+                .map_err(|e| ToolError::msg(format!("read board: {e}")))?;
+            return Ok(ToolResult::success(json!({
+                "agent_id": agent_id,
+                "outstanding": outstanding,
+                "note": "Dispatches with no report yet. Read a specific one by searching its correlation id.",
+            })));
+        }
+        let kind = match args.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            None => None,
+            Some(raw) => Some(
+                crate::coordination::BoardEntryKind::parse(raw).ok_or_else(|| {
+                    ToolError::msg(format!(
+                        "unknown kind `{raw}` — use dispatched, reported, or noted"
+                    ))
+                })?,
+            ),
+        };
+        let query = crate::coordination::BoardQuery {
+            workspace: args.workspace.as_deref().filter(|w| !w.trim().is_empty()),
+            contains: args.contains.as_deref().filter(|c| !c.trim().is_empty()),
+            kind,
+        };
+        let entries = db
+            .read_board(&agent_id, &query, args.limit.unwrap_or(30).clamp(1, 100))
+            .map_err(|e| ToolError::msg(format!("read board: {e}")))?;
+        Ok(ToolResult::success(json!({
+            "agent_id": agent_id,
+            "count": entries.len(),
+            "entries": entries,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct NoteArgs {
+    summary: String,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    correlation_id: Option<String>,
+}
+
+/// Record a note on this agent's board.
+///
+/// For conclusions the mechanical record cannot capture — which agent suited a
+/// kind of work, what a workspace's conventions are, why an approach failed.
+/// Dispatches and reports are recorded automatically; this is the agent's own
+/// judgment, which is exactly the part worth keeping.
+pub struct RecordCoordinationNote;
+#[async_trait]
+impl Tool for RecordCoordinationNote {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "record_coordination_note".into(),
+            description: "Write a note to your own coordination memory, so a later turn can recall it. Use it for conclusions worth keeping: what a workspace needs, which agent fits a kind of work, why an approach failed. Keep it to one or two sentences — it is a memory row, not a report. Dispatches and their reports are recorded for you; do not duplicate those.".into(),
+            input_schema: schema(
+                json!({
+                    "summary":{"type":"string","description":"one or two sentences"},
+                    "workspace":{"type":"string","description":"the folder it concerns, when it concerns one"},
+                    "session_id":{"type":"string","description":"the session it concerns, when it concerns one"},
+                    "correlation_id":{"type":"string","description":"an assignment or goal id to link it to"}
+                }),
+                &["summary"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: NoteArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let summary = args.summary.trim();
+        if summary.is_empty() {
+            return Err(ToolError::msg("summary must not be empty"));
+        }
+        let agent_id = board_agent_id(ctx)?;
+        let id = db(ctx)?
+            .record_board_entry(
+                &agent_id,
+                crate::coordination::BoardEntryKind::Noted,
+                &crate::coordination::NewBoardEntry {
+                    session_id: args.session_id.as_deref().filter(|s| !s.trim().is_empty()),
+                    workspace: args.workspace.as_deref().filter(|w| !w.trim().is_empty()),
+                    summary,
+                    correlation_id: args
+                        .correlation_id
+                        .as_deref()
+                        .filter(|c| !c.trim().is_empty()),
+                    created_at: &now_rfc3339(),
+                },
+            )
+            .map_err(|e| ToolError::msg(format!("record note: {e}")))?;
+        Ok(ToolResult::success(json!({"id": id, "recorded": true})))
+    }
+}
+
+/// The agent identity a board row belongs to.
+///
+/// The board is PER AGENT, so a session with no agent identity has no board —
+/// this is the same rule the turn lease uses, and for the same reason: a session
+/// is not an agent.
+fn board_agent_id(ctx: &ToolContext) -> Result<String, ToolError> {
+    ctx.agent_id().map(str::to_string).ok_or_else(|| {
+        ToolError::msg(
+            "this session is not working as an agent — coordination memory requires an agent identity",
+        )
+    })
+}
+
+#[derive(Deserialize)]
+struct CompleteAssignmentArgs {
+    assignment_id: String,
+    /// `done`, `blocked`, or `failed`.
+    status: String,
+    summary: String,
+}
+
+/// Finish an assignment this session holds the turn for.
+///
+/// This is the missing half of dispatch: without it an assignment could never
+/// reach a terminal state, so a dispatcher's board would record what it sent and
+/// never learn what came back — recall would be worthless.
+///
+/// Only the current lease holder may complete, enforced by the same turn fence
+/// that guards workspace mutation, so a replaced or expired agent cannot close
+/// work it no longer owns. Completion releases the lease, because the turn is
+/// over.
+pub struct CompleteCoordinationAssignment;
+#[async_trait]
+impl Tool for CompleteCoordinationAssignment {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "complete_coordination_assignment".into(),
+            description: "Finish the assignment you are working: report the outcome and what you did. Call this once when the work is finished, blocked, or has failed. It releases your turn, and the result is recorded for whoever dispatched the work. Use status done for a finished task, blocked when you need something from the dispatcher, and failed when the work cannot be completed. The summary is what the dispatcher will read, so state the outcome plainly.".into(),
+            input_schema: schema(
+                json!({
+                    "assignment_id":{"type":"string","description":"the assignment from your wake envelope"},
+                    "status":{"type":"string","enum":["done","blocked","failed"]},
+                    "summary":{"type":"string","description":"what happened and what you changed"}
+                }),
+                &["assignment_id", "status", "summary"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: CompleteAssignmentArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let summary = args.summary.trim();
+        if summary.is_empty() {
+            return Err(ToolError::msg("summary must not be empty"));
+        }
+        let target = match args.status.as_str() {
+            "done" => crate::coordination::AssignmentStatus::Completed,
+            "blocked" => crate::coordination::AssignmentStatus::Blocked,
+            "failed" => crate::coordination::AssignmentStatus::Failed,
+            other => {
+                return Err(ToolError::msg(format!(
+                    "status must be done, blocked, or failed — got `{other}`"
+                )));
+            }
+        };
+        // Only the turn holder may close the work: the same fence that guards a
+        // workspace mutation. A session holding no lease is unconstrained, which
+        // is what lets a plain session complete an assignment it was handed
+        // without the full lease dance.
+        enforce_turn_fence(ctx)?;
+
+        let db = db(ctx)?;
+        let assignment = db
+            .get_assignment(&args.assignment_id)
+            .map_err(|e| ToolError::msg(format!("load assignment: {e}")))?
+            .ok_or_else(|| {
+                ToolError::msg(format!("unknown assignment `{}`", args.assignment_id))
+            })?;
+        let at = now_rfc3339();
+        let transitioned = db
+            .transition_assignment(&assignment.id, assignment.status.clone(), target.clone(), &at)
+            .map_err(|e| ToolError::msg(format!("complete assignment: {e}")))?;
+        if !transitioned {
+            return Err(ToolError::msg(format!(
+                "assignment `{}` is already {:?} — nothing left to complete",
+                assignment.id, assignment.status
+            )));
+        }
+
+        // The report lands on the DISPATCHER's board, which is what turns their
+        // record from "what I sent" into "how it went". A human-dispatched
+        // assignment has no dispatcher, so there is nothing to report to.
+        if let Some(dispatcher) = assignment
+            .dispatched_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            let verb = match target {
+                crate::coordination::AssignmentStatus::Completed => "finished",
+                crate::coordination::AssignmentStatus::Blocked => "blocked",
+                _ => "failed",
+            };
+            let _ = db.record_board_entry(
+                dispatcher,
+                crate::coordination::BoardEntryKind::Reported,
+                &crate::coordination::NewBoardEntry {
+                    session_id: Some(&assignment.session_id),
+                    workspace: None,
+                    summary: &format!("{} — {}: {summary}", assignment.id, verb),
+                    correlation_id: Some(&assignment.id),
+                    created_at: &at,
+                },
+            );
+        }
+
+        // The turn is over, so the lease goes with it. Leaving it held would
+        // block the session until it expired.
+        if let Some(claim) = ctx.lease_claim() {
+            let _ = db.release_lease(&claim.lease_id, &at, "completed");
+        }
+        Ok(ToolResult::success(json!({
+            "assignment_id": assignment.id,
+            "status": target,
+            "reported_to": assignment.dispatched_by,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
 struct AssignmentArgs {
     #[serde(default)]
     id: Option<String>,
-    goal_id: String,
+    /// Groups related dispatches. Generated when omitted, so an agent
+    /// dispatching work never has to invent an identifier.
+    #[serde(default)]
+    goal_id: Option<String>,
     session_id: String,
-    agent_id: String,
+    /// Omitted for ordinary work: the default agent takes it.
+    #[serde(default)]
+    agent_id: Option<String>,
     scope: String,
     definition_of_done: String,
+    /// Optional inference profile for this dispatch; omitting it leaves the
+    /// target session's own profile in place.
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 pub struct CreateCoordinationAssignment;
@@ -290,25 +821,33 @@ impl Tool for CreateCoordinationAssignment {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_coordination_assignment".into(),
-            description: "Offer an assignment to a specialized agent. This records ownership intent only; the agent must accept it and acquire a session lease before executing. A board message alone never grants ownership.".into(),
+            description: "Offer an assignment to an agent working in a session. This records ownership intent only; the agent must accept it and acquire a session lease before executing. A board message alone never grants ownership. Omit agent_id to dispatch to the default agent (snippet); name one only when a specialized agent is the right fit.".into(),
             input_schema: schema(json!({
                 "id":{"type":"string","description":"optional; generated when omitted"},
                 "goal_id":{"type":"string"},
                 "session_id":{"type":"string"},
-                "agent_id":{"type":"string"},
+                "agent_id":{"type":"string","description":"optional; defaults to the general coding agent"},
                 "scope":{"type":"string"},
                 "definition_of_done":{"type":"string"}
-            }), &["goal_id","session_id","agent_id","scope","definition_of_done"]),
+            }), &["goal_id","session_id","scope","definition_of_done"]),
         }
     }
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: AssignmentArgs =
             serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        // The default is the general coding agent, so ordinary work needs no
+        // naming decision. The row still records a concrete agent: the default
+        // RESOLVES the choice, it does not leave the assignment unattributed.
+        let agent_id = args
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(crate::coordination::SNIPPET_AGENT_ID)
+            .to_string();
         for (field, value) in [
-            ("goal_id", &args.goal_id),
             ("session_id", &args.session_id),
-            ("agent_id", &args.agent_id),
             ("scope", &args.scope),
             ("definition_of_done", &args.definition_of_done),
         ] {
@@ -316,24 +855,65 @@ impl Tool for CreateCoordinationAssignment {
                 return Err(ToolError::msg(format!("{field} must not be empty")));
             }
         }
+        let db = db(ctx)?;
+        // A named agent must exist: dispatching to a well-formed id that is not
+        // in the directory would sit undelivered until the failure ceiling.
+        if db
+            .get_agent(&agent_id)
+            .map_err(|e| ToolError::msg(format!("look up agent: {e}")))?
+            .is_none()
+        {
+            return Err(ToolError::msg(format!(
+                "unknown agent `{agent_id}` — list_coordination_agents shows the directory"
+            )));
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let assignment = crate::coordination::Assignment {
             id: args
                 .id
                 .filter(|id| !id.trim().is_empty())
                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
-            goal_id: args.goal_id,
+            goal_id: args
+                .goal_id
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .unwrap_or_else(|| format!("goal-{}", Uuid::new_v4())),
             session_id: args.session_id,
-            agent_id: args.agent_id,
+            agent_id,
             status: crate::coordination::AssignmentStatus::Offered,
             scope: args.scope,
             definition_of_done: args.definition_of_done,
+            profile: args.profile.filter(|p| !p.trim().is_empty()),
+            // The calling agent IS the dispatcher, so completion writes back to
+            // its board.
+            dispatched_by: ctx.agent_id().map(str::to_string),
             created_at: now.clone(),
             updated_at: now,
         };
-        db(ctx)?
-            .create_assignment(&assignment)
+        db.create_assignment(&assignment)
             .map_err(|e| ToolError::msg(format!("create assignment: {e}")))?;
+        // Record the dispatch in the DISPATCHER's own memory. Without this the
+        // board would only ever hold notes, and "what have I sent, and how did it
+        // go" — the whole reason the board exists — would be unanswerable.
+        if let Some(dispatcher) = ctx.agent_id() {
+            let workspace = crate::session::state_path_for_id(&assignment.session_id)
+                .and_then(|path| crate::session::read_session_state(&path))
+                .map(|state| state.workspace);
+            let _ = db.record_board_entry(
+                dispatcher,
+                crate::coordination::BoardEntryKind::Dispatched,
+                &crate::coordination::NewBoardEntry {
+                    session_id: Some(&assignment.session_id),
+                    workspace: workspace.as_deref().filter(|w| !w.is_empty()),
+                    summary: &format!(
+                        "dispatched to {}: {}",
+                        assignment.agent_id, assignment.scope
+                    ),
+                    correlation_id: Some(&assignment.id),
+                    created_at: &assignment.created_at,
+                },
+            );
+        }
         Ok(ToolResult::success(json!({"assignment": assignment})))
     }
 }
@@ -350,13 +930,18 @@ fn expiry_from_now() -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(LEASE_TTL_SECS)).to_rfc3339()
 }
 
-/// The agent id this session acts as: the bound directory id when present,
-/// otherwise the durable session id acts on its own behalf.
+/// The agent identity this session acts as.
+///
+/// A session is not an agent. A turn is held by an agent identity, so a session
+/// with no agent bound cannot take one — previously this fell back to the
+/// durable session id, which made every session masquerade as an agent and left
+/// no way to tell a real identity from an address.
 fn lease_agent_id(ctx: &ToolContext) -> Result<String, ToolError> {
-    ctx.agent_id()
-        .map(str::to_string)
-        .or_else(|| ctx.durable_session_id().map(str::to_string))
-        .ok_or_else(|| ToolError::msg("lease tools require a durable session identity"))
+    ctx.agent_id().map(str::to_string).ok_or_else(|| {
+        ToolError::msg(
+            "this session is not working as an agent — a turn lease requires an agent identity",
+        )
+    })
 }
 
 /// Enforce this session's turn fence before a workspace mutation.
@@ -822,11 +1407,11 @@ mod tests {
         ToolContext::new(root)
             .unwrap()
             .with_durable_session_id(session)
-            .with_coordination_db_path(root.join("coordination.sqlite3"))
+            .with_store_path(root.join("snippet.db"))
     }
 
-    fn migrate(root: &std::path::Path) -> CoordinationDb {
-        CoordinationDb::open(root.join("coordination.sqlite3")).unwrap()
+    fn migrate(root: &std::path::Path) -> Store {
+        Store::open(root.join("snippet.db")).unwrap()
     }
 
     #[tokio::test]
@@ -847,13 +1432,33 @@ mod tests {
         let events = db.events_for_thread("t1", 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_id, event_id);
-        // Identity came from the session, not from caller arguments.
+        // Identity came from the session, not from caller arguments. This session
+        // has no agent bound, so it posts as the session — not as an "agent",
+        // which is exactly the conflation this split removes.
         assert_eq!(events[0].actor_id, "mission-control");
+        assert_eq!(events[0].actor_kind, "session");
+    }
+
+    #[tokio::test]
+    async fn post_message_posts_as_the_bound_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrate(dir.path());
+        let ctx = worker_ctx(dir.path(), "s1", "rust-pr-reviewer");
+
+        PostCoordinationMessage
+            .execute(&ctx, json!({"thread_id":"t1","body":"reviewing"}))
+            .await
+            .unwrap();
+
+        let events = db.events_for_thread("t1", 0, 10).unwrap();
+        // An agent-bound session posts as the AGENT, so the board names the
+        // identity rather than the address it happens to run in.
+        assert_eq!(events[0].actor_id, "rust-pr-reviewer");
         assert_eq!(events[0].actor_kind, "agent");
     }
 
     #[tokio::test]
-    async fn post_message_requires_a_durable_session_identity() {
+    async fn post_message_requires_a_session_identity() {
         let dir = tempfile::tempdir().unwrap();
         migrate(dir.path());
         let ctx = ToolContext::new(dir.path()).unwrap();
@@ -861,7 +1466,7 @@ mod tests {
             .execute(&ctx, json!({"thread_id":"t1","body":"hi"}))
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("durable session identity"));
+        assert!(error.to_string().contains("session identity"));
     }
 
     #[tokio::test]
@@ -892,8 +1497,6 @@ mod tests {
             status: AgentStatus::Active,
             role: AgentRole::Researcher,
             capabilities: vec!["web_search".into()],
-            max_concurrent_assignments: 3,
-            version: 1,
         })
         .unwrap();
         let ctx = context(dir.path(), "mission-control");
@@ -919,8 +1522,6 @@ mod tests {
             status: AgentStatus::Active,
             role: AgentRole::Implementer,
             capabilities: vec![],
-            max_concurrent_assignments: 1,
-            version: 1,
         })
         .unwrap();
         let ctx = context(dir.path(), "mission-control");
@@ -944,8 +1545,111 @@ mod tests {
         );
     }
 
+    /// Ordinary work names no agent: the assignment resolves to the general
+    /// coding agent rather than being left unattributed.
+    #[tokio::test]
+    async fn assignment_defaults_to_the_general_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrate(dir.path());
+        db.create_agent(&Agent {
+            id: crate::coordination::SNIPPET_AGENT_ID.into(),
+            display_name: "Snippet".into(),
+            handle: "snippet".into(),
+            kind: AgentKind::Worker,
+            status: AgentStatus::Active,
+            role: AgentRole::Implementer,
+            capabilities: vec![],
+        })
+        .unwrap();
+        let ctx = context(dir.path(), "mission-control");
+
+        let result = CreateCoordinationAssignment
+            .execute(
+                &ctx,
+                json!({
+                    "goal_id":"g1","session_id":"s1",
+                    "scope":"src","definition_of_done":"tests pass"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value["data"]["assignment"]["agent_id"],
+            crate::coordination::SNIPPET_AGENT_ID
+        );
+    }
+
+    /// A named agent that is not in the directory is refused up front, rather
+    /// than sitting undelivered until the dispatcher's failure ceiling.
+    #[tokio::test]
+    async fn assignment_rejects_an_unknown_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        migrate(dir.path());
+        let ctx = context(dir.path(), "mission-control");
+
+        let error = CreateCoordinationAssignment
+            .execute(
+                &ctx,
+                json!({
+                    "goal_id":"g1","session_id":"s1","agent_id":"nobody",
+                    "scope":"src","definition_of_done":"tests pass"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown agent"));
+    }
+
+    /// The separation itself: a session is not an agent, so a session with no
+    /// agent bound cannot take a turn. Before this split the session id stood in
+    /// as the identity, which made every session an agent.
+    #[tokio::test]
+    async fn a_session_without_an_agent_cannot_take_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        offered(dir.path(), "w1", "a1");
+        // `context` binds a durable session id but no agent.
+        let ctx = context(dir.path(), "s1");
+
+        let error = AcceptCoordinationAssignment
+            .execute(&ctx, json!({"assignment_id":"a1"}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("agent identity"));
+    }
+
+    #[tokio::test]
+    async fn list_assignments_finds_work_offered_to_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        offered(dir.path(), "w1", "a1");
+        let ctx = context(dir.path(), "s1");
+
+        let result = ListCoordinationAssignments
+            .execute(&ctx, json!({"agent_id":"w1"}))
+            .await
+            .unwrap();
+        let assignments = result.value["data"]["assignments"].as_array().unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0]["id"], "a1");
+        assert_eq!(assignments[0]["status"], "offered");
+
+        // A filter that matches nothing is an empty list, not an error.
+        let none = ListCoordinationAssignments
+            .execute(&ctx, json!({"agent_id":"nobody"}))
+            .await
+            .unwrap();
+        assert!(none.value["data"]["assignments"].as_array().unwrap().is_empty());
+
+        // An unknown status is rejected rather than silently ignored.
+        assert!(
+            ListCoordinationAssignments
+                .execute(&ctx, json!({"status":"nonsense"}))
+                .await
+                .is_err()
+        );
+    }
+
     /// Register a worker agent and offer it an assignment in a fresh store.
-    fn offered(dir: &std::path::Path, agent_id: &str, assignment_id: &str) -> CoordinationDb {
+    fn offered(dir: &std::path::Path, agent_id: &str, assignment_id: &str) -> Store {
         let db = migrate(dir);
         db.create_agent(&Agent {
             id: agent_id.into(),
@@ -955,8 +1659,6 @@ mod tests {
             status: AgentStatus::Active,
             role: AgentRole::Implementer,
             capabilities: vec![],
-            max_concurrent_assignments: 1,
-            version: 1,
         })
         .unwrap();
         db.create_assignment(&crate::coordination::Assignment {
@@ -967,6 +1669,8 @@ mod tests {
             status: crate::coordination::AssignmentStatus::Offered,
             scope: "src".into(),
             definition_of_done: "tests pass".into(),
+            profile: None,
+            dispatched_by: None,
             created_at: "1".into(),
             updated_at: "1".into(),
         })
@@ -1034,8 +1738,6 @@ mod tests {
             status: AgentStatus::Active,
             role: AgentRole::Reviewer,
             capabilities: vec![],
-            max_concurrent_assignments: 1,
-            version: 1,
         })
         .unwrap();
         db.create_assignment(&crate::coordination::Assignment {
@@ -1046,6 +1748,8 @@ mod tests {
             status: crate::coordination::AssignmentStatus::Offered,
             scope: "src".into(),
             definition_of_done: "review".into(),
+            profile: None,
+            dispatched_by: None,
             created_at: "1".into(),
             updated_at: "1".into(),
         })
@@ -1189,7 +1893,7 @@ mod tests {
 
     /// Two workers on one session: `w1` holds the source turn, `w2` is offered
     /// the successor assignment the handoff will target.
-    fn two_workers(dir: &std::path::Path) -> CoordinationDb {
+    fn two_workers(dir: &std::path::Path) -> Store {
         let db = migrate(dir);
         for (id, role) in [("w1", AgentRole::Implementer), ("w2", AgentRole::Reviewer)] {
             db.create_agent(&Agent {
@@ -1200,8 +1904,6 @@ mod tests {
                 status: AgentStatus::Active,
                 role,
                 capabilities: vec![],
-                max_concurrent_assignments: 1,
-                version: 1,
             })
             .unwrap();
         }
@@ -1214,6 +1916,8 @@ mod tests {
                 status: crate::coordination::AssignmentStatus::Offered,
                 scope: "src".into(),
                 definition_of_done: "tests pass".into(),
+                profile: None,
+                dispatched_by: None,
                 created_at: "1".into(),
                 updated_at: "1".into(),
             })
