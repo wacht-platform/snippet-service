@@ -290,6 +290,115 @@ pub async fn open_session(
         .ok_or_else(|| format!("open session: missing id in {body}"))
 }
 
+/// One session as the daemon reports it in `GET /sessions`.
+///
+/// Mirrors `session::SessionInfo` — the TUI renders from this instead of walking
+/// the filesystem, so a conversation that lives in the database appears in the
+/// picker exactly like one on disk.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SessionRow {
+    /// Stable id (path relative to the workspaces root). Used to attach.
+    pub id: String,
+    /// Conversation name: `default` for the workspace root state, else the stem.
+    #[serde(default)]
+    pub conversation: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub last_active: i64,
+}
+
+/// GET /sessions[?folder=] — the daemon's session catalog.
+///
+/// `folder` scopes the list to one workspace, which is what the TUI wants: the
+/// resume picker only ever shows the sessions belonging to the folder it is
+/// currently working in.
+pub async fn list_sessions(
+    info: &DaemonInfo,
+    folder: Option<&Path>,
+) -> Result<Vec<SessionRow>, String> {
+    let url = format!("{}/sessions", info.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut query: Vec<(&str, String)> = vec![("token", info.token.clone())];
+    if let Some(folder) = folder {
+        query.push(("folder", folder.display().to_string()));
+    }
+    let resp = client
+        .get(&url)
+        .query(&query)
+        .send()
+        .await
+        .map_err(|e| format!("list sessions: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("list sessions {status}: {body}"));
+    }
+    resp.json::<Vec<SessionRow>>()
+        .await
+        .map_err(|e| format!("list sessions body: {e}"))
+}
+
+/// POST /session/delete — remove a conversation from wherever it lives.
+///
+/// Goes through the daemon rather than deleting files, so the store row, its
+/// messages, and its events all go with it.
+pub async fn delete_session(info: &DaemonInfo, session_id: &str) -> Result<(), String> {
+    post_session_op(info, "/session/delete", session_id, serde_json::json!({})).await
+}
+
+/// POST /session/rename — set a conversation's title override.
+pub async fn rename_session(
+    info: &DaemonInfo,
+    session_id: &str,
+    title: &str,
+) -> Result<(), String> {
+    post_session_op(
+        info,
+        "/session/rename",
+        session_id,
+        serde_json::json!({ "title": title }),
+    )
+    .await
+}
+
+async fn post_session_op(
+    info: &DaemonInfo,
+    path: &str,
+    session_id: &str,
+    extra: serde_json::Value,
+) -> Result<(), String> {
+    let url = format!("{}{path}", info.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut body = serde_json::json!({ "session": session_id });
+    if let (Some(dst), Some(src)) = (body.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    let resp = client
+        .post(&url)
+        .query(&[("token", info.token.as_str())])
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("{path}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("{path} {status}: {text}"));
+    }
+    Ok(())
+}
+
 /// POST /session/model — switch the model profile for one live conversation.
 pub async fn set_session_model(
     info: &DaemonInfo,

@@ -99,10 +99,10 @@ pub struct ToolContext {
     /// Same store the daemon dispatcher uses. Set for Mission Control so tools
     /// do not recompute the root from HOME independently.
     mission_control_root: Option<PathBuf>,
-    /// Absolute path to the SQLite coordination database (`coordination.sqlite3`).
-    /// Set for every daemon-managed session so coordination tools reach the same
-    /// store the daemon writes.
-    coordination_db_path: Option<PathBuf>,
+    /// Absolute path to the SQLite store (`~/.snippet/snippet.db`). Set for every
+    /// daemon-managed session so coordination tools reach the same database the
+    /// daemon writes.
+    store_path: Option<PathBuf>,
     /// The directory agent id this session runs as (specialized sessions only).
     /// Lease tools record it so turn ownership is attributed correctly.
     agent_id: Option<String>,
@@ -161,7 +161,7 @@ impl ToolContext {
             mission_control: false,
             durable_session_id: None,
             mission_control_root: None,
-            coordination_db_path: None,
+            store_path: None,
             agent_id: None,
             lease_claim: Arc::new(Mutex::new(None)),
         })
@@ -201,14 +201,14 @@ impl ToolContext {
         self.mission_control_root.clone()
     }
 
-    /// Bind the coordination database path for this session's tools.
-    pub fn with_coordination_db_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.coordination_db_path = Some(path.into());
+    /// Bind the store path for this session's tools.
+    pub fn with_store_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.store_path = Some(path.into());
         self
     }
 
-    pub fn coordination_db_path(&self) -> Option<PathBuf> {
-        self.coordination_db_path.clone()
+    pub fn store_path(&self) -> Option<PathBuf> {
+        self.store_path.clone()
     }
 
     /// Bind the directory agent id this session runs as.

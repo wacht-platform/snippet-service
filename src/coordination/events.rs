@@ -1,15 +1,15 @@
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
-use super::{CoordinationDb, CoordinationDbError, types::CoordinationEvent};
+use super::{Store, StoreError, types::CoordinationEvent};
 
-impl CoordinationDb {
+impl Store {
     /// Append an event and its outbox entry atomically. Repeating an idempotency
     /// key returns the original event without creating a duplicate sequence.
     pub fn append_event(
         &self,
         event: &CoordinationEvent,
-    ) -> Result<CoordinationEvent, CoordinationDbError> {
+    ) -> Result<CoordinationEvent, StoreError> {
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
             if let Some(existing) = tx
@@ -90,7 +90,7 @@ impl CoordinationDb {
         thread_id: &str,
         after_sequence: u64,
         limit: u32,
-    ) -> Result<Vec<CoordinationEvent>, CoordinationDbError> {
+    ) -> Result<Vec<CoordinationEvent>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, thread_id, partition_key, sequence, event_type,
@@ -111,7 +111,7 @@ impl CoordinationDb {
         &self,
         thread_id: &str,
         limit: u32,
-    ) -> Result<Vec<CoordinationEvent>, CoordinationDbError> {
+    ) -> Result<Vec<CoordinationEvent>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, thread_id, partition_key, sequence, event_type,
@@ -132,7 +132,7 @@ impl CoordinationDb {
         partition_key: &str,
         after_sequence: u64,
         limit: u32,
-    ) -> Result<Vec<CoordinationEvent>, CoordinationDbError> {
+    ) -> Result<Vec<CoordinationEvent>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, thread_id, partition_key, sequence, event_type,
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn append_replay_is_idempotent() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         let first = db.append_event(&event(1, "one")).unwrap();
         let replay = db.append_event(&event(1, "one")).unwrap();
         assert_eq!(replay, first);
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn events_for_thread_filters_other_threads() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         let first = event(1, "first");
         db.append_event(&first).unwrap();
         let mut second = event(1, "second");
@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn append_assigns_zero_sequence() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         let mut first = event(0, "auto");
         first.event_id = "event-auto".into();
         let saved = db.append_event(&first).unwrap();
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn sequences_are_partition_local() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.append_event(&event(1, "one")).unwrap();
         let mut other = event(1, "two");
         other.partition_key = "session:1".into();

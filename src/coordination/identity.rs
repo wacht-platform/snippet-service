@@ -1,8 +1,6 @@
 //! Durable agent identity homes, independent from execution workspaces.
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 const MAX_IDENTITY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -15,14 +13,6 @@ pub enum IdentityError {
     Io(#[from] std::io::Error),
     #[error("identity metadata: {0}")]
     Json(#[from] serde_json::Error),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct IdentityMetadata {
-    pub agent_id: String,
-    pub revision: u64,
-    pub updated_at: String,
-    pub updated_by: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,42 +42,18 @@ impl AgentHome {
         self.root.join("identity.md")
     }
 
-    pub fn metadata_path(&self) -> PathBuf {
-        self.root.join("identity.json")
-    }
-
     pub fn tools_path(&self) -> PathBuf {
         self.root.join("tools")
     }
 
-    pub fn ensure_layout(
-        &self,
-        default_identity: &str,
-        updated_by: &str,
-    ) -> Result<(), IdentityError> {
+    /// Create the home if absent: the tools directory and `identity.md`.
+    ///
+    /// Idempotent — an existing identity is never overwritten, so a researched
+    /// identity survives every daemon boot.
+    pub fn ensure_layout(&self, default_identity: &str) -> Result<(), IdentityError> {
         std::fs::create_dir_all(self.tools_path())?;
-        self.ensure_identity_metadata(default_identity, updated_by)
-    }
-
-    fn ensure_identity_metadata(
-        &self,
-        default_identity: &str,
-        updated_by: &str,
-    ) -> Result<(), IdentityError> {
         if !self.identity_path().exists() {
             atomic_write(&self.identity_path(), default_identity.as_bytes())?;
-        }
-        if !self.metadata_path().exists() {
-            let metadata = IdentityMetadata {
-                agent_id: self.agent_id.clone(),
-                revision: 1,
-                updated_at: unix_seconds(),
-                updated_by: updated_by.to_string(),
-            };
-            atomic_write(
-                &self.metadata_path(),
-                serde_json::to_vec_pretty(&metadata)?.as_slice(),
-            )?;
         }
         Ok(())
     }
@@ -98,12 +64,6 @@ impl AgentHome {
             return Err(IdentityError::TooLarge(bytes.len()));
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    pub fn read_metadata(&self) -> Result<IdentityMetadata, IdentityError> {
-        Ok(serde_json::from_slice(&std::fs::read(
-            self.metadata_path(),
-        )?)?)
     }
 }
 
@@ -127,14 +87,6 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     std::fs::rename(tmp, path)
 }
 
-fn unix_seconds() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,9 +95,8 @@ mod tests {
     fn creates_independent_agent_home_and_reads_identity() {
         let root = tempfile::tempdir().unwrap();
         let home = AgentHome::new(root.path(), "rust-reviewer").unwrap();
-        home.ensure_layout("# Rust reviewer\n", "system").unwrap();
+        home.ensure_layout("# Rust reviewer\n").unwrap();
         assert_eq!(home.read_identity().unwrap(), "# Rust reviewer\n");
-        assert_eq!(home.read_metadata().unwrap().revision, 1);
         assert!(home.tools_path().is_dir());
     }
 
@@ -154,7 +105,7 @@ mod tests {
         assert!(AgentHome::new("/tmp", "../escape").is_err());
         let root = tempfile::tempdir().unwrap();
         let home = AgentHome::new(root.path(), "worker").unwrap();
-        home.ensure_layout("x", "system").unwrap();
+        home.ensure_layout("x").unwrap();
         std::fs::write(home.identity_path(), vec![b'x'; MAX_IDENTITY_BYTES + 1]).unwrap();
         assert!(matches!(
             home.read_identity(),

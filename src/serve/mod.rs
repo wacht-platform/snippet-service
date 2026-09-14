@@ -23,17 +23,22 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
 use crate::config::{InferenceProfileConfig, SnippetConfig, save_config, workspaces_root};
-use crate::harness::{GoalStatus, LoopInput, deserialize_state, serialize_state};
-use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
+use crate::coordination::{
+    HandoffMode, NotificationMarker, Task, TaskLink, TaskLinkKind, TaskResult, TaskStatus,
+};
+use crate::harness::{GoalStatus, LoopInput};
+use crate::mission_control::{self, ManagedSession};
 use crate::recurring::{self, Schedule};
 use crate::session::{
-    list_device_sessions, prepare_new_session_workspace, read_session_profile,
-    replay_notification_events, session_id_for_state_path, start_mission_control_session,
-    start_session_with_browser_summary, state_path_for_id, status_str, subscribe_device_events,
-    write_session_profile,
+    SessionRole, SessionSidecar, list_device_sessions, prepare_new_session_workspace,
+    read_session_profile, read_session_sidecar, read_session_state, replay_notification_events,
+    session_id_for_state_path, start_mission_control_session, start_session_with_browser_summary,
+    state_path_for_id, status_str, subscribe_device_events, write_session_profile,
+    write_session_sidecar,
 };
 
 mod browser;
+mod direct;
 mod fs;
 mod git;
 mod lifecycle;
@@ -66,24 +71,13 @@ struct LiveSession {
 }
 
 fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<String>) -> LiveSession {
-    let cwd = handle
-        .state_path
-        .parent()
-        .and_then(|p| {
-            deserialize_state(&std::fs::read(p.join("state.json")).unwrap_or_default())
-                .ok()
-                .map(|s| PathBuf::from(s.workspace))
-        })
-        .filter(|p| p.is_dir())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
     let cwd = {
-        let from_state = std::fs::read(&handle.state_path)
-            .ok()
-            .and_then(|b| deserialize_state(&b).ok())
+        let from_state = read_session_state(&handle.state_path)
             .map(|s| PathBuf::from(s.workspace))
             .filter(|p| p.is_dir());
-        from_state.unwrap_or(cwd)
+        from_state
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     };
     let session_id = session_id_for_state_path(&handle.state_path);
     LiveSession {
@@ -115,11 +109,10 @@ fn load_session_workspace(session: &str) -> Result<(PathBuf, PathBuf), Response>
     let Some(sp) = state_path_for_id(session) else {
         return Err((StatusCode::NOT_FOUND, "no such session").into_response());
     };
-    let Ok(bytes) = std::fs::read(&sp) else {
+    // Store-or-file: a session ported to the database has no state file, so
+    // reading the file directly would 404 every migrated session.
+    let Some(state) = read_session_state(&sp) else {
         return Err((StatusCode::NOT_FOUND, "session state unreadable").into_response());
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response());
     };
     let folder = PathBuf::from(&state.workspace);
     if state.workspace.is_empty() || !folder.is_dir() {
@@ -157,7 +150,7 @@ struct Daemon {
     queue_hidden: std::sync::Mutex<HashMap<String, Vec<String>>>,
     queue_revision: AtomicU64,
     mission_control_root: PathBuf,
-    coordination_db: crate::coordination::CoordinationDb,
+    store: crate::store::Store,
     coordination_events:
         tokio::sync::broadcast::Sender<crate::coordination::types::CoordinationEvent>,
     recurring_root: PathBuf,
@@ -207,49 +200,31 @@ impl Daemon {
             .is_some_and(|t| token_matches(t, &self.token))
     }
 
-    /// Returns true if this nonce is new. The ledger is persisted beside the
-    /// conversation state so a daemon restart cannot accept the same retry twice.
     fn accept_nonce(&self, session_id: &str, nonce: &str, state_path: &Path) -> bool {
         let key = format!("{session_id}:{nonce}");
         let mut map = self.seen_nonces.lock().unwrap();
         if map.contains_key(&key) {
             return false;
         }
-
-        let ledger_path = state_path.with_extension("nonces.json");
-        let mut persisted = std::fs::read_to_string(&ledger_path)
+        // Existing sidecars remain a read-only compatibility fallback. New
+        // nonces go only to SQLite; no legacy file is migrated or modified.
+        if std::fs::read_to_string(state_path.with_extension("nonces.json"))
             .ok()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-            .unwrap_or_default();
-        if persisted.iter().any(|n| n == nonce) {
+            .and_then(|contents| serde_json::from_str::<Vec<String>>(&contents).ok())
+            .is_some_and(|nonces| nonces.iter().any(|saved| saved == nonce))
+        {
             map.insert(key, std::time::Instant::now());
             return false;
         }
-
-        // Bound the durable ledger. Nonces are unique client request IDs, so
-        // retaining the most recent 512 is enough to cover reconnect retries
-        // without allowing an unbounded sidecar to grow.
-        persisted.push(nonce.to_string());
-        if persisted.len() > 512 {
-            let drop_count = persisted.len() - 512;
-            persisted.drain(..drop_count);
-        }
-        let persisted_bytes = match serde_json::to_vec(&persisted) {
-            Ok(bytes) => bytes,
-            Err(_) => return false,
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let Ok(inserted) = self.store.claim_request_nonce(session_id, nonce, now) else {
+            return false;
         };
-        let tmp = ledger_path.with_extension("nonces.json.tmp");
-        let persisted_ok = (|| {
-            let mut file = std::fs::File::create(&tmp).ok()?;
-            use std::io::Write;
-            file.write_all(&persisted_bytes).ok()?;
-            file.sync_all().ok()?;
-            std::fs::rename(&tmp, &ledger_path).ok()?;
-            Some(())
-        })()
-        .is_some();
-        if !persisted_ok {
-            let _ = std::fs::remove_file(&tmp);
+        if !inserted {
+            map.insert(key, std::time::Instant::now());
             return false;
         }
         map.insert(key, std::time::Instant::now());
@@ -284,8 +259,10 @@ impl Daemon {
             return Some((s.input_tx.clone(), s.state_path.clone(), s.stream.clone()));
         }
         let sp = state_path_for_id(id)?;
-        let bytes = std::fs::read(&sp).ok()?;
-        let state = deserialize_state(&bytes).ok()?;
+        // Read through the store-or-file reader: a session ported to the
+        // database has no state file, and reading the file directly would make
+        // every such session unopenable.
+        let state = read_session_state(&sp)?;
         let folder = PathBuf::from(&state.workspace);
         if state.workspace.is_empty() || !folder.is_dir() {
             return None;
@@ -334,24 +311,37 @@ impl Daemon {
                 crate::llm::StreamBuffer::default(),
             )))
         };
-        match read_session_role(&sp).as_deref() {
-            Some("mission_control") => crate::session::start_mission_control_session(
+        // One reader, one shape. The arms are on the enum rather than on a
+        // hand-parsed string, so a grammar this function does not know about is
+        // now impossible to write.
+        let sidecar = read_session_sidecar(&sp);
+        if let Some(sidecar) = sidecar.as_ref()
+            && sidecar.role == SessionRole::MissionControl
+        {
+            return crate::session::start_mission_control_session(
                 cfg,
                 sp,
                 None,
                 true,
                 stream(),
                 Some(self.browser.summary_provider()),
-            ),
-            Some(role) if role.starts_with("agent:") => {
-                let agent_id = role.trim_start_matches("agent:");
-                match crate::coordination::AgentHome::new(
-                    crate::coordination::agents_root(&self.mission_control_root),
-                    agent_id,
-                ) {
-                    // Identity revision is re-read on every resume, so an agent
-                    // whose identity was updated comes back with the new guidance.
-                    Ok(home) => match crate::session::start_specialized_agent_session(
+            );
+        }
+        if let Some(agent_id) = sidecar.as_ref().and_then(|s| s.agent_id.as_deref()) {
+            // Identity revision is re-read on every resume, so an agent whose
+            // identity was updated comes back with the new guidance.
+            match crate::coordination::AgentHome::new(
+                crate::coordination::agents_root(&self.mission_control_root),
+                agent_id,
+            ) {
+                // An agent's INBOX is its coordination session: it answers direct
+                // messages and dispatches work, with no workspace tools. The same
+                // agent runs the full coding runtime in a work session, so the
+                // choice is made on the session, not on the agent.
+                Ok(home)
+                    if crate::session::is_inbox_session_id(&session_id_for_state_path(&sp)) =>
+                {
+                    match crate::session::start_specialized_coordination_session(
                         cfg,
                         sp.clone(),
                         None,
@@ -360,41 +350,43 @@ impl Daemon {
                         Some(self.browser.summary_provider()),
                         home,
                     ) {
-                        Ok(handle) => handle,
+                        Ok(handle) => return handle,
                         Err(error) => {
                             eprintln!(
-                                "[coordination] agent `{agent_id}` identity unavailable ({error}); \
-                                 running as an ordinary session"
+                                "[coordination] agent `{agent_id}` coordination identity \
+                                 unavailable ({error}); running as an ordinary session"
                             );
-                            start_session_with_browser_summary(
-                                cfg,
-                                sp,
-                                None,
-                                true,
-                                stream(),
-                                Some(self.browser.summary_provider()),
-                            )
                         }
-                    },
-                    Err(_) => start_session_with_browser_summary(
-                        cfg,
-                        sp,
-                        None,
-                        true,
-                        stream(),
-                        Some(self.browser.summary_provider()),
-                    ),
+                    }
                 }
+                Ok(home) => match crate::session::start_specialized_agent_session(
+                    cfg,
+                    sp.clone(),
+                    None,
+                    true,
+                    stream(),
+                    Some(self.browser.summary_provider()),
+                    home,
+                ) {
+                    Ok(handle) => return handle,
+                    Err(error) => {
+                        eprintln!(
+                            "[coordination] agent `{agent_id}` identity unavailable ({error}); \
+                             running as an ordinary session"
+                        );
+                    }
+                },
+                Err(_) => {}
             }
-            _ => start_session_with_browser_summary(
-                cfg,
-                sp,
-                None,
-                true,
-                stream(),
-                Some(self.browser.summary_provider()),
-            ),
         }
+        start_session_with_browser_summary(
+            cfg,
+            sp,
+            None,
+            true,
+            stream(),
+            Some(self.browser.summary_provider()),
+        )
     }
 
     /// The provider actually driving a session: its per-chat profile's provider
@@ -429,10 +421,7 @@ impl Daemon {
         let profile = existing.profile.clone();
 
         // Don't restart mid-turn: only Idle / terminal states are safe.
-        let Ok(bytes) = std::fs::read(&sp) else {
-            return RebuildOutcome::Gone;
-        };
-        let Ok(state) = deserialize_state(&bytes) else {
+        let Some(state) = read_session_state(&sp) else {
             return RebuildOutcome::Gone;
         };
         use crate::harness::HarnessStatus::*;
@@ -477,10 +466,7 @@ impl Daemon {
         let Some(path) = path else {
             return;
         };
-        let Ok(bytes) = std::fs::read(path) else {
-            return;
-        };
-        let Ok(state) = deserialize_state(&bytes) else {
+        let Some(state) = read_session_state(&path) else {
             return;
         };
         let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else {
@@ -549,10 +535,7 @@ impl Daemon {
                 None => return,
             },
         };
-        let Ok(bytes) = std::fs::read(&sp) else {
-            return;
-        };
-        let Ok(state) = deserialize_state(&bytes) else {
+        let Some(state) = read_session_state(&sp) else {
             return;
         };
         let folder = PathBuf::from(&state.workspace);
@@ -625,6 +608,8 @@ pub async fn run_serve(
     let token_for_print = token.clone();
     let mut config = config;
     config.ensure_setups();
+    let store = crate::store::Store::open(crate::store::default_db_path())
+        .map_err(|error| format!("open store: {error}"))?;
     let daemon: Shared = Arc::new(Daemon {
         config: std::sync::Mutex::new(config),
         config_path,
@@ -638,10 +623,7 @@ pub async fn run_serve(
         queue_hidden: std::sync::Mutex::new(HashMap::new()),
         queue_revision: AtomicU64::new(0),
         mission_control_root: mission_control::MissionControlStore::default_root(None),
-        coordination_db: crate::coordination::CoordinationDb::open(
-            crate::coordination::default_db_path(),
-        )
-        .map_err(|error| format!("open coordination database: {error}"))?,
+        store,
         coordination_events: tokio::sync::broadcast::channel(256).0,
         recurring_root: recurring::default_root(),
     });
@@ -675,6 +657,14 @@ pub async fn run_serve(
     }
     {
         let d = daemon.clone();
+        tokio::spawn(async move { coordination_dispatch_loop(d).await });
+    }
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { direct::direct_dispatch_loop(d).await });
+    }
+    {
+        let d = daemon.clone();
         tokio::spawn(async move { recurring_tick_loop(d).await });
     }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
@@ -685,11 +675,9 @@ pub async fn run_serve(
     const UPLOAD_BODY_LIMIT: usize = MAX_UPLOAD_FILE_BYTES / 3 * 4 + 64 * 1024;
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
-        .route(
-            "/agents",
-            get(coordination_agents).post(coordination_create_agent),
-        )
+        .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/build", post(build_agent_from_prompt))
+        .route("/agents/{agent_id}/board", get(agent_board))
         .route(
             "/coordination/tasks",
             get(coordination_list_tasks).post(coordination_create_task),
@@ -722,6 +710,7 @@ pub async fn run_serve(
             "/coordination/assignments",
             get(coordination_list_assignments).post(coordination_create_assignment),
         )
+        .route("/coordination/dispatch", post(coordination_dispatch))
         .route("/coordination/leases", get(coordination_list_leases))
         .route(
             "/coordination/sessions/{session_id}/agents",
@@ -753,6 +742,12 @@ pub async fn run_serve(
             post(coordination_post_message),
         )
         .route("/coordination/events", get(coordination_events_ws))
+        .route(
+            "/coordination/direct/messages",
+            get(direct::direct_list_messages).post(direct::direct_send_message),
+        )
+        .route("/coordination/direct/threads", get(direct::direct_list_threads))
+        .route("/coordination/direct/read", post(direct::direct_mark_read))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
         .route("/usage", get(usage_summary))
@@ -1104,12 +1099,10 @@ fn self_restart_process() {
 async fn any_session_busy(daemon: &Shared) -> bool {
     let sessions = daemon.sessions.lock().await;
     for s in sessions.values() {
-        if let Ok(bytes) = std::fs::read(&s.state_path) {
-            if let Ok(state) = deserialize_state(&bytes) {
-                if state.status == crate::harness::HarnessStatus::Running {
-                    return true;
-                }
-            }
+        if read_session_state(&s.state_path)
+            .is_some_and(|state| state.status == crate::harness::HarnessStatus::Running)
+        {
+            return true;
         }
     }
     false
@@ -1156,24 +1149,21 @@ struct Auth {
 }
 
 #[derive(Deserialize)]
-struct CoordinationAgentsQuery {
+struct AgentsQuery {
     token: Option<String>,
     /// Keyset cursor: the previous page's last `(display_name, id)`.
     #[serde(default)]
     after_name: Option<String>,
     #[serde(default)]
     after_id: Option<String>,
-    #[serde(default = "default_coord_page_limit")]
+    #[serde(default = "default_agent_page_limit")]
     limit: u32,
 }
-fn default_coord_page_limit() -> u32 {
+fn default_agent_page_limit() -> u32 {
     200
 }
 
-async fn coordination_agents(
-    State(d): State<Shared>,
-    Query(q): Query<CoordinationAgentsQuery>,
-) -> Response {
+async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQuery>) -> Response {
     if !d.authed(&q.token) {
         return unauthorized();
     }
@@ -1189,48 +1179,106 @@ async fn coordination_agents(
         }
         (None, None) => None,
     };
-    match d
-        .coordination_db
-        .list_agents_page(after, q.limit.clamp(1, 500))
-    {
+    match d.store.list_agents_page(after, q.limit.clamp(1, 500)) {
         Ok(agents) => Json(agents).into_response(),
+        Err(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {error}")).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentBoardQuery {
+    token: Option<String>,
+    /// Only rows about this folder.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Substring to find in the recorded summaries.
+    #[serde(default)]
+    contains: Option<String>,
+    /// `dispatched`, `reported`, or `noted`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default = "default_agent_page_limit")]
+    limit: u32,
+}
+
+/// GET /agents/{agent_id}/board — one agent's coordination memory.
+///
+/// Read-only: the board is written by the agent as it works, and by the
+/// dispatcher/report paths. This is what makes an agent's history inspectable
+/// rather than invisible — what it sent, what came back, what it concluded.
+async fn agent_board(
+    State(d): State<Shared>,
+    Query(q): Query<AgentBoardQuery>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let kind = match q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None => None,
+        Some(raw) => match crate::coordination::BoardEntryKind::parse(raw) {
+            Some(kind) => Some(kind),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown kind `{raw}` — use dispatched, reported, or noted"),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let query = crate::coordination::BoardQuery {
+        workspace: q.workspace.as_deref().filter(|w| !w.trim().is_empty()),
+        contains: q.contains.as_deref().filter(|c| !c.trim().is_empty()),
+        kind,
+    };
+    match d
+        .store
+        .read_board(&agent_id, &query, q.limit.clamp(1, 200))
+    {
+        Ok(entries) => Json(serde_json::json!({
+            "agent_id": agent_id,
+            "entries": entries,
+        }))
+        .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("coordination database: {error}"),
+            format!("read board: {error}"),
         )
             .into_response(),
     }
 }
 
 #[derive(Deserialize)]
-struct CoordinationAgentReq {
+struct AgentReq {
     id: String,
     display_name: String,
     handle: String,
-    #[serde(default = "default_coord_agent_kind")]
+    #[serde(default = "default_agent_kind")]
     kind: crate::coordination::types::AgentKind,
-    #[serde(default = "default_coord_agent_status")]
+    #[serde(default = "default_agent_status")]
     status: crate::coordination::types::AgentStatus,
-    #[serde(default = "default_coord_agent_role")]
+    #[serde(default = "default_agent_role")]
     role: crate::coordination::types::AgentRole,
     #[serde(default)]
     capabilities: Vec<String>,
-    max_concurrent_assignments: u32,
 }
-fn default_coord_agent_kind() -> crate::coordination::types::AgentKind {
+fn default_agent_kind() -> crate::coordination::types::AgentKind {
     crate::coordination::types::AgentKind::Worker
 }
-fn default_coord_agent_status() -> crate::coordination::types::AgentStatus {
+fn default_agent_status() -> crate::coordination::types::AgentStatus {
     crate::coordination::types::AgentStatus::Active
 }
-fn default_coord_agent_role() -> crate::coordination::types::AgentRole {
+fn default_agent_role() -> crate::coordination::types::AgentRole {
     crate::coordination::types::AgentRole::Implementer
 }
 
-async fn coordination_create_agent(
+async fn create_agent(
     State(d): State<Shared>,
     Query(q): Query<Auth>,
-    Json(req): Json<CoordinationAgentReq>,
+    Json(req): Json<AgentReq>,
 ) -> Response {
     if !d.authed(&q.token) {
         return unauthorized();
@@ -1246,8 +1294,6 @@ async fn coordination_create_agent(
         status: req.status,
         role: req.role,
         capabilities: req.capabilities,
-        max_concurrent_assignments: req.max_concurrent_assignments,
-        version: 1,
     };
     let home = match crate::coordination::AgentHome::new(
         crate::coordination::agents_root(&d.mission_control_root),
@@ -1260,14 +1306,14 @@ async fn coordination_create_agent(
         "# {}\n\nAgent handle: @{}\n\nThis identity is awaiting its first build and research pass.\n",
         agent.display_name, agent.handle
     );
-    if let Err(error) = home.ensure_layout(&default_identity, "registration") {
+    if let Err(error) = home.ensure_layout(&default_identity) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("create agent home: {error}"),
         )
             .into_response();
     }
-    match d.coordination_db.create_agent(&agent) {
+    match d.store.create_agent(&agent) {
         Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(),
         Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response(),
     }
@@ -1294,7 +1340,7 @@ async fn coordination_events(
         return unauthorized();
     }
     match d
-        .coordination_db
+        .store
         .events_for_thread(&thread_id, q.after_sequence, q.limit.clamp(1, 500))
     {
         Ok(events) => Json(events).into_response(),
@@ -1346,7 +1392,7 @@ async fn coordination_post_message(
         },
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    match d.coordination_db.append_event(&event) {
+    match d.store.append_event(&event) {
         Ok(saved) => {
             let _ = d.coordination_events.send(saved.clone());
             // A board post is a message TO someone: wake Mission Control so it
@@ -1359,7 +1405,7 @@ async fn coordination_post_message(
                 // just posted (the envelope carries it separately as `body`), so
                 // the wake reads as a group chat rather than one isolated line.
                 let history: Vec<_> = d
-                    .coordination_db
+                    .store
                     .recent_events_for_thread(
                         &saved.thread_id,
                         crate::coordination_tools::BOARD_HISTORY_ON_WAKE + 1,
@@ -1422,6 +1468,13 @@ struct CoordinationAssignmentReq {
     agent_id: String,
     scope: String,
     definition_of_done: String,
+    /// Inference profile to run this dispatch with. Optional: omitting it leaves
+    /// the session's own profile in place.
+    #[serde(default)]
+    profile: Option<String>,
+    /// The agent dispatching this work, when one is.
+    #[serde(default)]
+    dispatched_by: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1432,7 +1485,7 @@ struct CoordinationAssignmentsQuery {
     after_created: Option<String>,
     #[serde(default)]
     after_id: Option<String>,
-    #[serde(default = "default_coord_page_limit")]
+    #[serde(default = "default_agent_page_limit")]
     limit: u32,
     /// Optional filter by agent, for "what is this agent working on".
     #[serde(default)]
@@ -1465,9 +1518,10 @@ async fn coordination_list_assignments(
     let filter = crate::coordination::AssignmentFilter {
         agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
         session_id: q.session_id.as_deref().filter(|s| !s.trim().is_empty()),
+        status: None,
     };
     match d
-        .coordination_db
+        .store
         .list_assignments_page(&filter, after, q.limit.clamp(1, 500))
     {
         Ok(assignments) => Json(assignments).into_response(),
@@ -1485,10 +1539,7 @@ async fn coordination_list_leases(State(d): State<Shared>, Query(q): Query<Auth>
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match d
-        .coordination_db
-        .list_active_leases(&chrono::Utc::now().to_rfc3339())
-    {
+    match d.store.list_active_leases(&chrono::Utc::now().to_rfc3339()) {
         Ok(leases) => Json(leases).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1509,7 +1560,7 @@ async fn coordination_session_agents(
         return unauthorized();
     }
     match d
-        .coordination_db
+        .store
         .list_session_agents(&session_id, &chrono::Utc::now().to_rfc3339())
     {
         Ok(agents) => Json(agents).into_response(),
@@ -1532,7 +1583,7 @@ struct CoordinationTasksQuery {
     after_created: Option<String>,
     #[serde(default)]
     after_id: Option<String>,
-    #[serde(default = "default_coord_page_limit")]
+    #[serde(default = "default_agent_page_limit")]
     limit: u32,
     /// Board column to show. Omitted returns every column.
     #[serde(default)]
@@ -1623,7 +1674,7 @@ async fn coordination_list_tasks(
         agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
     };
     match d
-        .coordination_db
+        .store
         .list_tasks_page(&filter, after, q.limit.clamp(1, 500))
     {
         Ok(tasks) => Json(tasks).into_response(),
@@ -1653,20 +1704,14 @@ async fn coordination_create_task(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let task = crate::coordination::Task {
-        thread_id: crate::coordination::Task::thread_for(&id),
+    let task = crate::coordination::Task::filed_by_human(
         id,
-        title: title.to_string(),
-        description: req.description.trim().to_string(),
-        status: crate::coordination::TaskStatus::Todo,
-        priority: req.priority,
-        created_by_kind: "human".into(),
-        created_by_id: "local".into(),
-        created_at: now.clone(),
-        updated_at: now,
-        completed_at: None,
-    };
-    match d.coordination_db.create_task(&task) {
+        title.to_string(),
+        req.description.trim().to_string(),
+        req.priority,
+        now,
+    );
+    match d.store.create_task(&task) {
         Ok(()) => (StatusCode::CREATED, Json(task)).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1684,7 +1729,7 @@ async fn coordination_get_task(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match d.coordination_db.get_task(&task_id) {
+    match d.store.get_task(&task_id) {
         Ok(Some(task)) => Json(task).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such task").into_response(),
         Err(error) => (
@@ -1711,14 +1756,11 @@ async fn coordination_update_task(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let description = req.description.as_deref().map(str::trim);
-    match d.coordination_db.update_task(
-        &task_id,
-        title,
-        description,
-        req.priority,
-        &now,
-    ) {
-        Ok(true) => match d.coordination_db.get_task(&task_id) {
+    match d
+        .store
+        .update_task(&task_id, title, description, req.priority, &now)
+    {
+        Ok(true) => match d.store.get_task(&task_id) {
             Ok(Some(task)) => Json(task).into_response(),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
         },
@@ -1745,8 +1787,8 @@ async fn coordination_set_task_status(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let now = chrono::Utc::now().to_rfc3339();
-    match d.coordination_db.set_task_status(&task_id, &status, &now) {
-        Ok(true) => match d.coordination_db.get_task(&task_id) {
+    match d.store.set_task_status(&task_id, &status, &now) {
+        Ok(true) => match d.store.get_task(&task_id) {
             Ok(Some(task)) => Json(task).into_response(),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
         },
@@ -1770,7 +1812,7 @@ async fn coordination_task_links(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    let links = match d.coordination_db.task_links(&task_id) {
+    let links = match d.store.task_links(&task_id) {
         Ok(links) => links,
         Err(error) => {
             return (
@@ -1780,7 +1822,7 @@ async fn coordination_task_links(
                 .into_response();
         }
     };
-    let blockers = match d.coordination_db.blockers_of(&task_id) {
+    let blockers = match d.store.blockers_of(&task_id) {
         Ok(blockers) => blockers,
         Err(error) => {
             return (
@@ -1807,8 +1849,7 @@ async fn coordination_link_tasks(
         return (StatusCode::BAD_REQUEST, "to_task_id is required").into_response();
     }
     if to == task_id {
-        return (StatusCode::BAD_REQUEST, "a task cannot link to itself")
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "a task cannot link to itself").into_response();
     }
     let kind = match req.kind.as_deref().unwrap_or("blocks") {
         "blocks" => crate::coordination::TaskLinkKind::Blocks,
@@ -1823,11 +1864,10 @@ async fn coordination_link_tasks(
     };
     // Both ends must exist, or the edge dangles and the board draws a blank node.
     for id in [task_id.as_str(), to] {
-        match d.coordination_db.get_task(id) {
+        match d.store.get_task(id) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                return (StatusCode::NOT_FOUND, format!("no such task: {id}"))
-                    .into_response();
+                return (StatusCode::NOT_FOUND, format!("no such task: {id}")).into_response();
             }
             Err(error) => {
                 return (
@@ -1844,7 +1884,7 @@ async fn coordination_link_tasks(
         kind,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    match d.coordination_db.link_tasks(&link) {
+    match d.store.link_tasks(&link) {
         Ok(()) => (StatusCode::CREATED, Json(link)).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1873,7 +1913,7 @@ async fn coordination_unlink_tasks(
             crate::coordination::TaskLinkKind::Blocks,
             crate::coordination::TaskLinkKind::RelatesTo,
         ] {
-            match d.coordination_db.unlink_tasks(from, to, &kind) {
+            match d.store.unlink_tasks(from, to, &kind) {
                 Ok(true) => removed = true,
                 Ok(false) => {}
                 Err(error) => {
@@ -1901,7 +1941,7 @@ async fn coordination_task_agents(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match d.coordination_db.list_task_agents(&task_id) {
+    match d.store.list_task_agents(&task_id) {
         Ok(agents) => Json(agents).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1926,7 +1966,7 @@ async fn coordination_add_task_agent(
     }
     let now = chrono::Utc::now().to_rfc3339();
     match d
-        .coordination_db
+        .store
         .add_task_agent(&task_id, agent_id, req.role.trim(), &now)
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1947,7 +1987,7 @@ async fn coordination_remove_task_agent(
         return unauthorized();
     }
     match d
-        .coordination_db
+        .store
         .remove_task_agent(&task_id, &agent_id, &chrono::Utc::now().to_rfc3339())
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -1957,6 +1997,153 @@ async fn coordination_remove_task_agent(
             format!("remove task agent: {error}"),
         )
             .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DispatchReq {
+    session_id: String,
+    /// Omitted means the default agent; naming one is how a specialist is chosen.
+    #[serde(default)]
+    agent_id: Option<String>,
+    scope: String,
+    definition_of_done: String,
+    /// Optional inference profile for THIS dispatch. Omitted leaves the
+    /// session's own profile in place.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Groups related dispatches. Generated when omitted, so a standalone
+    /// "give this agent work" needs no goal to exist first.
+    #[serde(default)]
+    goal_id: Option<String>,
+}
+
+/// POST /coordination/dispatch — give an agent work in a session, in one call.
+///
+/// This exists because creating an assignment by hand requires ids a client
+/// cannot safely invent: the goal it belongs to, the assignment id, and the turn
+/// lease the runtime acquires. A UI that manufactures those would be guessing at
+/// server-owned state. Here the WORK is described and the daemon mints the rest,
+/// then lets the ordinary dispatch loop deliver it — so a dispatch made from the
+/// CLI, the TUI, the app, or Mission Control's tool all take the same path.
+async fn coordination_dispatch(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<DispatchReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.session_id.trim().is_empty()
+        || req.scope.trim().is_empty()
+        || req.definition_of_done.trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "session_id, scope, and definition_of_done are required",
+        )
+            .into_response();
+    }
+    let agent_id = req
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(crate::coordination::SNIPPET_AGENT_ID)
+        .to_string();
+    match d.store.get_agent(&agent_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "unknown agent").into_response(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("look up agent: {error}"),
+            )
+                .into_response();
+        }
+    }
+    // The target session must exist: an assignment pointing at an unknown
+    // session can never be delivered, and would sit in the queue forever.
+    if state_path_for_id(&req.session_id).is_none()
+        || crate::session::read_session_state(
+            &state_path_for_id(&req.session_id).expect("checked above"),
+        )
+        .is_none()
+    {
+        return (StatusCode::NOT_FOUND, "unknown session").into_response();
+    }
+    // A named profile that does not exist would silently fall back to the
+    // session's own model, so it is refused rather than ignored.
+    if let Some(profile) = req.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let known = {
+            let c = d.config.lock().unwrap();
+            c.setups.as_ref().is_some_and(|setups| setups.contains_key(profile))
+        };
+        if !known {
+            return (StatusCode::NOT_FOUND, "no such profile").into_response();
+        }
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let assignment = crate::coordination::Assignment {
+        id: uuid::Uuid::new_v4().to_string(),
+        goal_id: req
+            .goal_id
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty())
+            .unwrap_or_else(|| format!("goal-{}", uuid::Uuid::new_v4())),
+        session_id: req.session_id.trim().to_string(),
+        agent_id,
+        status: crate::coordination::AssignmentStatus::Offered,
+        scope: req.scope.trim().to_string(),
+        definition_of_done: req.definition_of_done.trim().to_string(),
+        profile: req
+            .profile
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty()),
+        // Deliberately NOT taken from the request. This endpoint is how a human
+        // or client dispatches, and a client-supplied dispatcher would let a
+        // caller claim to be any agent — the same impersonation the direct-message
+        // route refuses. An agent dispatching from its own turn goes through
+        // `create_coordination_assignment`, which derives the dispatcher from the
+        // session's identity.
+        dispatched_by: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    match d.store.create_assignment(&assignment) {
+        Ok(()) => {
+            // The dispatcher's own memory records what it sent, so completion can
+            // report back to a board that knows about this dispatch.
+            if let Some(dispatcher) = assignment.dispatched_by.as_deref() {
+                let workspace = state_path_for_id(&assignment.session_id)
+                    .and_then(|path| read_session_state(&path))
+                    .map(|state| state.workspace);
+                let _ = d.store.record_board_entry(
+                    dispatcher,
+                    crate::coordination::BoardEntryKind::Dispatched,
+                    &crate::coordination::NewBoardEntry {
+                        session_id: Some(&assignment.session_id),
+                        workspace: workspace.as_deref().filter(|w| !w.is_empty()),
+                        summary: &format!(
+                            "dispatched to {}: {}",
+                            assignment.agent_id, assignment.scope
+                        ),
+                        correlation_id: Some(&assignment.id),
+                        created_at: &assignment.created_at,
+                    },
+                );
+            }
+            crate::session::emit_device_event(serde_json::json!({
+                "kind": "dispatch",
+                "session": assignment.session_id,
+                "agent": assignment.agent_id,
+                "assignment": assignment.id,
+                "profile": assignment.profile,
+            }));
+            (StatusCode::ACCEPTED, Json(assignment)).into_response()
+        }
+        Err(error) => (StatusCode::CONFLICT, format!("dispatch: {error}")).into_response(),
     }
 }
 
@@ -1988,20 +2175,21 @@ async fn coordination_create_assignment(
         status: crate::coordination::AssignmentStatus::Offered,
         scope: req.scope,
         definition_of_done: req.definition_of_done,
+        profile: req.profile.filter(|p| !p.trim().is_empty()),
+        dispatched_by: req
+            .dispatched_by
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty()),
         created_at: now.clone(),
         updated_at: now,
     };
-    match d.coordination_db.create_assignment(&assignment) {
+    match d.store.create_assignment(&assignment) {
         Ok(()) => {
-            // Start (or revive) the target session under the assigned agent's
-            // identity, then deliver the assignment. Best-effort: the assignment
-            // is already durable, so a dispatch failure must not lose it.
-            if let Err(error) = ensure_agent_session(&d, &assignment).await {
-                eprintln!(
-                    "[coordination] assignment {} not dispatched: {error}",
-                    assignment.id
-                );
-            }
+            // Recording the offer is all this does. Delivery belongs to the
+            // dispatch loop, so an offer made here and one made by Mission
+            // Control's tool reach the worker through the same path — the
+            // previous shape delivered only on this route, so a tool-created
+            // offer sat undelivered forever.
             (StatusCode::CREATED, Json(assignment)).into_response()
         }
         Err(error) => (StatusCode::CONFLICT, format!("create assignment: {error}")).into_response(),
@@ -2129,7 +2317,32 @@ async fn ensure_agent_session(
             home.root().display()
         ));
     }
-    write_session_role(&sp, &format!("agent:{}", assignment.agent_id));
+    write_session_sidecar(
+        &sp,
+        &SessionSidecar {
+            // A session worked by an agent is still a STANDARD session; the
+            // agent is who is working it, not what it is.
+            role: SessionRole::Standard,
+            agent_id: Some(assignment.agent_id.clone()),
+        },
+    );
+    // Apply the dispatch's inference profile BEFORE the session starts, for the
+    // same reason the sidecar is written first: `ensure_live` returns an existing
+    // live session untouched, so a profile set afterwards would only take effect
+    // on the next restart. Omitting it leaves the session's own profile in place.
+    if let Some(profile) = assignment.profile.as_deref() {
+        write_session_profile(&sp, profile);
+        let mut sessions = d.sessions.lock().await;
+        if let Some(existing) = sessions.get(&assignment.session_id) {
+            // Only tear the loop down when the profile actually differs; a
+            // re-dispatch with the same profile must not interrupt work.
+            if existing.profile.as_deref() != Some(profile) {
+                if let Some(old) = sessions.remove(&assignment.session_id) {
+                    old.join.abort();
+                }
+            }
+        }
+    }
     let Some((tx, _sp, _stream)) = d.ensure_live(&assignment.session_id).await else {
         return Err(format!(
             "could not start session `{}`",
@@ -2140,6 +2353,71 @@ async fn ensure_agent_session(
         assignment,
     )));
     Ok(())
+}
+
+/// Deliver every assignment that has not yet been handed to its session.
+///
+/// This is the ONE delivery path, and it is a loop rather than a direct call so
+/// it does not matter who created the assignment: a Mission Control tool call and
+/// the REST route both just write a row, and both are delivered here. The
+/// `dispatched_at` marker is durable, which fixes the two ways the old
+/// route-only delivery failed — an offer created by a tool was never delivered
+/// at all, and a delivery lost to a restart was never retried.
+async fn coordination_dispatch_loop(daemon: Shared) {
+    loop {
+        // A read failure is reported rather than swallowed: silent non-delivery
+        // is the exact bug this loop exists to fix, so a broken read must not
+        // look like "nothing to do".
+        let pending = match daemon.store.list_undelivered_assignments() {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!("[coordination] could not list undelivered assignments: {error}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        for assignment in pending {
+            match ensure_agent_session(&daemon, &assignment).await {
+                Ok(()) => {
+                    // Mark only after the envelope is in the session's queue, so a
+                    // failure below retries on the next tick instead of stranding
+                    // the offer.
+                    let _ = daemon.store.mark_assignment_dispatched(
+                        &assignment.id,
+                        &chrono::Utc::now().to_rfc3339(),
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[coordination] assignment {} not dispatched: {error}",
+                        assignment.id
+                    );
+                    // A failure that retrying cannot fix (a missing agent home,
+                    // an unknown session) must not spin the loop forever. Park it
+                    // as blocked at the ceiling, the same way the JSON dispatch
+                    // path parks an undeliverable task.
+                    const MAX_DISPATCH_FAILURES: u32 = 5;
+                    let failures = daemon
+                        .store
+                        .record_assignment_dispatch_failure(&assignment.id)
+                        .unwrap_or(0);
+                    if failures >= MAX_DISPATCH_FAILURES {
+                        let _ = daemon.store.transition_assignment(
+                            &assignment.id,
+                            crate::coordination::AssignmentStatus::Offered,
+                            crate::coordination::AssignmentStatus::Blocked,
+                            &chrono::Utc::now().to_rfc3339(),
+                        );
+                        eprintln!(
+                            "[coordination] assignment {} blocked after {failures} dispatch failures",
+                            assignment.id
+                        );
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -2169,7 +2447,7 @@ async fn coordination_acquire_lease(
         renewed_at: chrono::Utc::now().to_rfc3339(),
         expires_at: req.expires_at,
     };
-    match d.coordination_db.acquire_lease(&lease) {
+    match d.store.acquire_lease(&lease) {
         Ok(Some(acquired)) => (StatusCode::CREATED, Json(acquired)).into_response(),
         Ok(None) => (StatusCode::CONFLICT, "session already has an active lease").into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, format!("acquire lease: {error}")).into_response(),
@@ -2192,7 +2470,7 @@ async fn coordination_renew_lease(
         return unauthorized();
     }
     let renewed_at = chrono::Utc::now().to_rfc3339();
-    match d.coordination_db.renew_lease(&lease_id, req.fencing_token, &renewed_at, &req.expires_at) {
+    match d.store.renew_lease(&lease_id, req.fencing_token, &renewed_at, &req.expires_at) {
         Ok(true) => Json(serde_json::json!({"lease_id": lease_id, "fencing_token": req.fencing_token, "renewed_at": renewed_at, "expires_at": req.expires_at})).into_response(),
         Ok(false) => (StatusCode::CONFLICT, "lease is stale, released, or fenced").into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, format!("renew lease: {error}")).into_response(),
@@ -2207,7 +2485,7 @@ async fn coordination_release_lease(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match d.coordination_db.release_lease(
+    match d.store.release_lease(
         &lease_id,
         &chrono::Utc::now().to_rfc3339(),
         "released_by_client",
@@ -2229,7 +2507,7 @@ async fn coordination_list_handoffs(State(d): State<Shared>, Query(q): Query<Aut
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match d.coordination_db.list_pending_handoffs() {
+    match d.store.list_pending_handoffs() {
         Ok(handoffs) => Json(handoffs).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2251,7 +2529,7 @@ async fn coordination_acknowledge_handoff(
     let at = req
         .acknowledged_at
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    match d.coordination_db.acknowledge_handoff(&handoff_id, &at) {
+    match d.store.acknowledge_handoff(&handoff_id, &at) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -2560,10 +2838,7 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
         let Some(path) = state_path_for_id(&session.id) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(state) = deserialize_state(&bytes) else {
+        let Some(state) = read_session_state(&path) else {
             continue;
         };
         let profile_name = read_session_profile(&path);
@@ -2696,7 +2971,12 @@ async fn open_session(
         let c = d.config.lock().unwrap();
         c.for_workspace(folder.clone()).state_path
     };
-    if req.new_conversation || !original_state.exists() {
+    // A session lives in the store, so `state_path.exists()` alone reports
+    // "new" for every migrated workspace — which created a second worktree and
+    // a second session beside the real one.
+    let has_existing =
+        original_state.exists() || crate::session::store_default_session_id(&folder).is_some();
+    if req.new_conversation || !has_existing {
         folder = prepare_new_session_workspace(&folder);
     }
     let base_state = {
@@ -3332,18 +3612,11 @@ async fn rewind_session(
     };
     let checkpoint_id = req.checkpoint.clone();
 
-    // Load current state from disk (authoritative for history indices).
-    let Ok(bytes) = tokio::fs::read(&sp).await else {
+    // Load current state (store or file — authoritative for history indices).
+    let Some(mut state) = read_session_state(&sp) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to read session state",
-        )
-            .into_response();
-    };
-    let Ok(mut state) = deserialize_state(&bytes) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to parse session state",
         )
             .into_response();
     };
@@ -3354,19 +3627,15 @@ async fn rewind_session(
     };
 
     // Persist truncated history first so any client re-read sees the cut.
-    let Ok(updated_bytes) = serialize_state(&state) else {
+    // `write_session_state` targets whichever store holds the session, so a
+    // rewind does not silently write a file a DB session will never read.
+    if let Err(error) = crate::session::write_session_state(&sp, &state) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to serialize state",
+            format!("failed to write state: {error}"),
         )
             .into_response();
-    };
-    crate::session::freeze_session_activity(&sp);
-    if tokio::fs::write(&sp, &updated_bytes).await.is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to write state").into_response();
     }
-    crate::session::write_session_meta(&sp, &state);
-
     // Keep a live loop in sync (it may overwrite disk on its next persist otherwise).
     {
         let sessions = d.sessions.lock().await;
@@ -3521,14 +3790,31 @@ async fn bg_log(
         .into_response()
 }
 
+/// Change-detector for a session, from whichever store holds it: the store's
+/// row timestamp plus its log lengths, else the state file's bytes.
+///
+/// The attach stream re-checks on a timer, so this must stay cheap and must NOT
+/// load the transcript — not loading it is the whole point of having moved it
+/// into the database.
+fn session_state_fingerprint(store: &crate::store::Store, state_path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let id = session_id_for_state_path(state_path);
+    if let Ok(Some(fingerprint)) = store.conversation_fingerprint(&id) {
+        fingerprint.hash(&mut hasher);
+        return Some(hasher.finish());
+    }
+    let bytes = std::fs::read(state_path).ok()?;
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 fn resolve_session_dir(session: &str) -> Result<PathBuf, Response> {
     if let Some(sp) = state_path_for_id(session) {
-        if let Ok(bytes) = std::fs::read(&sp) {
-            if let Ok(state) = deserialize_state(&bytes) {
-                let dir = PathBuf::from(&state.workspace);
-                if !state.workspace.is_empty() && dir.is_dir() {
-                    return Ok(dir);
-                }
+        if let Some(state) = read_session_state(&sp) {
+            let dir = PathBuf::from(&state.workspace);
+            if !state.workspace.is_empty() && dir.is_dir() {
+                return Ok(dir);
             }
         }
     }
@@ -3639,74 +3925,27 @@ async fn fork_session(
         return (StatusCode::NOT_FOUND, "no such session").into_response();
     };
 
-    // Prefer live in-memory state when the session is running so the fork sees
-    // events that may not have flushed yet; fall back to the on-disk snapshot.
+    // Prefer the live session's own path when it is running, so the fork sees a
+    // turn that has not flushed yet. The reader resolves whichever store holds
+    // the session, so a database-backed session forks exactly like a file one.
+    // This used to be a nested if/else cascade that repeated the same read four
+    // times, which is how the file-only assumption got baked in four times over.
     let state = {
         let sessions = d.sessions.lock().await;
-        if let Some(live) = sessions.get(&req.session) {
-            if !live.join.is_finished() {
-                if let Ok(bytes) = std::fs::read(&live.state_path) {
-                    if let Ok(s) = deserialize_state(&bytes) {
-                        s
-                    } else {
-                        drop(sessions);
-                        match std::fs::read(&sp)
-                            .ok()
-                            .and_then(|b| deserialize_state(&b).ok())
-                        {
-                            Some(s) => s,
-                            None => {
-                                return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state")
-                                    .into_response();
-                            }
-                        }
-                    }
-                } else {
-                    drop(sessions);
-                    match std::fs::read(&sp)
-                        .ok()
-                        .and_then(|b| deserialize_state(&b).ok())
-                    {
-                        Some(s) => s,
-                        None => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "session state unreadable",
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-            } else {
-                drop(sessions);
-                match std::fs::read(&sp)
-                    .ok()
-                    .and_then(|b| deserialize_state(&b).ok())
-                {
-                    Some(s) => s,
-                    None => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "session state unreadable",
-                        )
-                            .into_response();
-                    }
-                }
-            }
-        } else {
-            drop(sessions);
-            match std::fs::read(&sp)
-                .ok()
-                .and_then(|b| deserialize_state(&b).ok())
-            {
-                Some(s) => s,
-                None => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "session state unreadable",
-                    )
-                        .into_response();
-                }
+        let path = sessions
+            .get(&req.session)
+            .filter(|live| !live.join.is_finished())
+            .map(|live| live.state_path.clone())
+            .unwrap_or_else(|| sp.clone());
+        drop(sessions);
+        match read_session_state(&path) {
+            Some(state) => state,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session state unreadable",
+                )
+                    .into_response();
             }
         }
     };
@@ -3890,15 +4129,11 @@ async fn handle_ws(
         let mut term_seq: u64 = 0;
         loop {
             let queue_revision = daemon.queue_revision.load(Ordering::Acquire);
-            if let Ok(bytes) = tokio::fs::read(&state_path).await {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                bytes.hash(&mut hasher);
-                let fingerprint = hasher.finish();
+            if let Some(fingerprint) = session_state_fingerprint(&daemon.store, &state_path) {
                 if Some(fingerprint) != last_state_fingerprint
                     || queue_revision != last_queue_revision
                 {
-                    if let Ok(mut state) = deserialize_state(&bytes) {
+                    if let Some(mut state) = read_session_state(&state_path) {
                         let hidden = {
                             let mut overlays = daemon.queue_hidden.lock().unwrap();
                             let entries = overlays.entry(session.clone()).or_default();
@@ -4044,24 +4279,22 @@ async fn handle_ws(
                 }
             }
             if let Ok((before, limit)) = history_rx.try_recv() {
-                if let Ok(bytes) = tokio::fs::read(&state_path).await {
-                    if let Ok(state) = deserialize_state(&bytes) {
-                        let (start, end, has_older) =
-                            session_event_page(&state.events, Some(before), Some(limit));
-                        let frame = serde_json::json!({
-                            "wire": "history",
-                            "events": &state.events[start..end],
-                            "start": start,
-                            "end": end,
-                            "has_older": has_older,
-                        });
-                        if sender
-                            .send(Message::Text(frame.to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                if let Some(state) = read_session_state(&state_path) {
+                    let (start, end, has_older) =
+                        session_event_page(&state.events, Some(before), Some(limit));
+                    let frame = serde_json::json!({
+                        "wire": "history",
+                        "events": &state.events[start..end],
+                        "start": start,
+                        "end": end,
+                        "has_older": has_older,
+                    });
+                    if sender
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
@@ -4272,7 +4505,7 @@ mod tests {
             queue_hidden: std::sync::Mutex::new(HashMap::new()),
             queue_revision: AtomicU64::new(0),
             mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
-            coordination_db: crate::coordination::CoordinationDb::open_in_memory().unwrap(),
+            store: crate::store::Store::open_in_memory().unwrap(),
             coordination_events: tokio::sync::broadcast::channel(256).0,
             recurring_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
@@ -4303,12 +4536,15 @@ mod tests {
     fn nonce_is_rejected_after_daemon_state_is_recreated() {
         let dir = tempdir().expect("temporary directory");
         let state_path = dir.path().join("state.json");
-        let first = test_daemon();
+        let mut first = test_daemon();
+        first.store = crate::store::Store::open_in_memory().unwrap();
+        let store = first.store.clone();
 
         assert!(first.accept_nonce("session", "nonce-1", &state_path));
         assert!(!first.accept_nonce("session", "nonce-1", &state_path));
 
-        let restarted = test_daemon();
+        let mut restarted = test_daemon();
+        restarted.store = store;
         assert!(!restarted.accept_nonce("session", "nonce-1", &state_path));
         assert!(restarted.accept_nonce("session", "nonce-2", &state_path));
     }
@@ -4329,8 +4565,8 @@ mod tests {
         }
     }
 
-    fn create_agent_req(id: &str) -> CoordinationAgentReq {
-        CoordinationAgentReq {
+    fn create_agent_req(id: &str) -> AgentReq {
+        AgentReq {
             id: id.into(),
             display_name: "Web Research Specialist".into(),
             handle: format!("handle-{id}"),
@@ -4338,23 +4574,22 @@ mod tests {
             status: crate::coordination::types::AgentStatus::Active,
             role: crate::coordination::types::AgentRole::Researcher,
             capabilities: vec!["web_search".into()],
-            max_concurrent_assignments: 3,
         }
     }
 
-    fn agents_query(token: Option<&str>) -> CoordinationAgentsQuery {
-        CoordinationAgentsQuery {
+    fn agents_query(token: Option<&str>) -> AgentsQuery {
+        AgentsQuery {
             token: token.map(str::to_string),
             after_name: None,
             after_id: None,
-            limit: default_coord_page_limit(),
+            limit: default_agent_page_limit(),
         }
     }
 
     #[tokio::test]
     async fn agents_route_rejects_an_unauthenticated_request() {
         let d = authed_daemon();
-        let response = coordination_agents(State(d), Query(agents_query(None))).await;
+        let response = list_agents(State(d), Query(agents_query(None))).await;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -4363,14 +4598,14 @@ mod tests {
         let d = authed_daemon();
         let mut req = create_agent_req("researcher");
         req.handle = "  ".into();
-        let response = coordination_create_agent(State(d), Query(with_token()), Json(req)).await;
+        let response = create_agent(State(d), Query(with_token()), Json(req)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn agents_route_creates_then_lists() {
         let d = authed_daemon();
-        let created = coordination_create_agent(
+        let created = create_agent(
             State(d.clone()),
             Query(with_token()),
             Json(create_agent_req("researcher")),
@@ -4379,7 +4614,7 @@ mod tests {
         assert_eq!(created.status(), StatusCode::CREATED);
 
         // A duplicate id is a conflict, not a silent overwrite.
-        let duplicate = coordination_create_agent(
+        let duplicate = create_agent(
             State(d.clone()),
             Query(with_token()),
             Json(create_agent_req("researcher")),
@@ -4387,7 +4622,7 @@ mod tests {
         .await;
         assert_eq!(duplicate.status(), StatusCode::CONFLICT);
 
-        let listed = coordination_agents(State(d), Query(agents_query(Some("test-token")))).await;
+        let listed = list_agents(State(d), Query(agents_query(Some("test-token")))).await;
         assert_eq!(listed.status(), StatusCode::OK);
     }
 
@@ -4587,11 +4822,11 @@ mod tests {
         }
 
         // Full replay returns both; a cursor past the first returns only the tail.
-        let all = d.coordination_db.events_for_thread("t1", 0, 10).unwrap();
+        let all = d.store.events_for_thread("t1", 0, 10).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].sequence, 1);
         assert_eq!(all[1].sequence, 2);
-        let tail = d.coordination_db.events_for_thread("t1", 1, 10).unwrap();
+        let tail = d.store.events_for_thread("t1", 1, 10).unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].sequence, 2);
     }
@@ -4603,7 +4838,7 @@ mod tests {
             token: token.map(str::to_string),
             after_created: None,
             after_id: None,
-            limit: default_coord_page_limit(),
+            limit: default_agent_page_limit(),
             agent_id: agent.map(str::to_string),
             session_id: None,
         }
@@ -4611,7 +4846,7 @@ mod tests {
 
     /// Register an agent so assignments satisfy the FK to agents(id).
     fn seed_agent(d: &Shared, id: &str) {
-        d.coordination_db
+        d.store
             .create_agent(&crate::coordination::types::Agent {
                 id: id.into(),
                 display_name: id.into(),
@@ -4620,14 +4855,12 @@ mod tests {
                 status: crate::coordination::types::AgentStatus::Active,
                 role: crate::coordination::types::AgentRole::Implementer,
                 capabilities: vec![],
-                max_concurrent_assignments: 2,
-                version: 1,
             })
             .unwrap();
     }
 
     fn seed_assignment(d: &Shared, id: &str, agent: &str, created: &str) {
-        d.coordination_db
+        d.store
             .create_assignment(&crate::coordination::Assignment {
                 id: id.into(),
                 goal_id: "g1".into(),
@@ -4636,6 +4869,8 @@ mod tests {
                 status: crate::coordination::AssignmentStatus::Offered,
                 scope: "src".into(),
                 definition_of_done: "tests".into(),
+                profile: None,
+                dispatched_by: None,
                 created_at: created.into(),
                 updated_at: created.into(),
             })
@@ -4707,7 +4942,7 @@ mod tests {
         seed_agent(&d, "w1");
         seed_assignment(&d, "a1", "w1", "2020-01-01T00:00:00Z");
         let now = chrono::Utc::now();
-        d.coordination_db
+        d.store
             .acquire_lease(&crate::coordination::SessionLease {
                 session_id: "s1".into(),
                 lease_id: "l1".into(),
@@ -4844,7 +5079,9 @@ struct MissionSessionUpdate {
 
 fn task_status(raw: &str) -> Option<TaskStatus> {
     match raw {
-        "pending" => Some(TaskStatus::Pending),
+        // `pending` is what clients sent when `Todo` was named `Pending`; accept
+        // it permanently so a stored client config does not silently stop working.
+        "pending" | "todo" => Some(TaskStatus::Todo),
         "in_progress" => Some(TaskStatus::InProgress),
         "blocked" => Some(TaskStatus::Blocked),
         "done" | "completed" => Some(TaskStatus::Done),
@@ -4854,7 +5091,7 @@ fn task_status(raw: &str) -> Option<TaskStatus> {
     }
 }
 
-fn mission_task_view(task: &TaskRecord) -> serde_json::Value {
+fn mission_task_view(task: &Task) -> serde_json::Value {
     serde_json::json!({
         "id": task.id,
         "title": task.title,
@@ -4865,10 +5102,11 @@ fn mission_task_view(task: &TaskRecord) -> serde_json::Value {
         "updated_at": task.updated_at,
         "archived": task.status.is_terminal(),
         "owned_paths": task.owned_paths,
-        "dependencies": task.dependencies,
         "handoff": task.handoff,
+        "handoff_mode": task.handoff_mode,
         "result": task.result,
         "notifications": task.notifications,
+        "dispatch_failures": task.dispatch_failures,
     })
 }
 
@@ -4899,7 +5137,7 @@ async fn mission_control_overview(
         return unauthorized();
     }
     let root = &d.mission_control_root;
-    let Ok(tasks) = mission_control::list_tasks(root, None, None) else {
+    let Ok(tasks) = d.store.list_tasks(None, None) else {
         return mission_error("could not read Mission Control tasks".to_string());
     };
     let Ok(sessions) = mission_control::list_sessions(root, false) else {
@@ -4956,7 +5194,7 @@ async fn mission_control_tasks(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match mission_control::list_tasks(&d.mission_control_root, None, None) {
+    match d.store.list_tasks(None, None) {
         Ok(tasks) => Json(
             tasks
                 .iter()
@@ -4968,46 +5206,62 @@ async fn mission_control_tasks(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(error) => mission_error(error),
+        Err(error) => mission_error(error.to_string()),
     }
 }
 
-async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, String> {
+async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String> {
     let root = &d.mission_control_root;
-    // Atomic claim: Pending → InProgress exactly once. Concurrent dispatchers
+    let now = chrono::Utc::now().to_rfc3339();
+    // Atomic claim: Todo → InProgress exactly once. Concurrent dispatchers
     // (loop + REST paths) lose the race here and return without delivering.
-    let task = mission_control::claim_task_for_dispatch(root, task_id)?;
+    let task = d
+        .store
+        .claim_task_for_dispatch(task_id, &now)
+        .map_err(|error| error.to_string())?;
     if task.status != TaskStatus::InProgress || task.reporting_session.is_none() {
         // Not claimed by us (already in progress/terminal) — nothing to do.
         return Ok(task);
     }
     if task.session_id.trim().is_empty() {
-        release_failed_claim(root, &task, "task has no target session")?;
+        release_failed_claim(d, &task, "task has no target session")?;
         return Err("task has no target session".to_string());
     }
-    for dependency in &task.dependencies {
-        // A missing/unreadable dependency record must roll the claim back like
-        // every other failure path — otherwise the task strands InProgress.
-        let other = match mission_control::get_task(root, &dependency.task_id) {
-            Ok(other) => other,
-            Err(error) => {
-                release_failed_claim(root, &task, &error)?;
+    // Blocked-by edges live in task_links now, so a dependency is read as the
+    // reverse edge rather than an embedded field on the task row.
+    for blocker_id in d
+        .store
+        .blockers_of(task_id)
+        .map_err(|error| error.to_string())?
+    {
+        let other = match d.store.get_task(&blocker_id) {
+            Ok(Some(other)) => other,
+            Ok(None) => {
+                let error = format!("dependency {blocker_id} no longer exists");
+                release_failed_claim(d, &task, &error)?;
                 return Err(error);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                release_failed_claim(d, &task, &message)?;
+                return Err(message);
             }
         };
         if other.status != TaskStatus::Done {
-            let reason = format!("waiting on dependency {}", dependency.task_id);
-            let blocked = mission_control::update_task(root, task_id, |task| {
-                task.status = TaskStatus::Blocked;
-                task.reporting_session = None;
-                task.notifications
-                    .push(mission_control::NotificationMarker {
+            let reason = format!("waiting on dependency {blocker_id}");
+            let blocked = d
+                .store
+                .update_task_in(task_id, &now, |task| {
+                    task.status = TaskStatus::Blocked;
+                    task.reporting_session = None;
+                    task.notifications.push(NotificationMarker {
                         target: "mission_control".to_string(),
                         kind: "blocked".to_string(),
                         message: reason.clone(),
                         delivered: false,
                     });
-            })?;
+                })
+                .map_err(|error| error.to_string())?;
             // Report the stored (blocked) state, not the pre-update claim.
             return Ok(blocked);
         }
@@ -5015,48 +5269,55 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
     let managed = match mission_control::get_session(root, &task.session_id) {
         Ok(managed) => managed,
         Err(error) => {
-            release_failed_claim(root, &task, &error)?;
+            release_failed_claim(d, &task, &error)?;
             return Err(error);
         }
     };
     if managed.status != mission_control::SessionStatus::Active {
         let error = "target session is archived".to_string();
-        release_failed_claim(root, &task, &error)?;
+        release_failed_claim(d, &task, &error)?;
         return Err(error);
     }
-    let conflicts = mission_control::detect_conflicts(root, task_id, &task.owned_paths)?;
+    let conflicts = d
+        .store
+        .task_path_conflicts(task_id, &task.owned_paths)
+        .map_err(|error| error.to_string())?;
     if !conflicts.is_empty() {
         // Queue behind the current owner. This is waiting, not a dispatch
         // failure — do not burn the retry ceiling.
         let mut owners = Vec::new();
         for conflict in &conflicts {
-            if !owners.contains(&conflict.existing_task_id) {
-                owners.push(conflict.existing_task_id.clone());
+            if !owners.contains(&conflict.0) {
+                owners.push(conflict.0.clone());
             }
         }
         let reason = format!("waiting on workspace owner(s): {}", owners.join(", "));
-        let blocked = mission_control::update_task(root, task_id, |task| {
-            task.status = TaskStatus::Blocked;
-            task.reporting_session = None;
-            task.dispatch_failures = 0;
-            for owner in &owners {
-                if !task.dependencies.iter().any(|d| d.task_id == *owner) {
-                    task.dependencies.push(mission_control::Dependency {
-                        task_id: owner.clone(),
-                        reason: Some("workspace path already in use".into()),
-                    });
-                }
-            }
-            if !task.notifications.iter().any(|n| n.message == reason) {
-                task.notifications
-                    .push(mission_control::NotificationMarker {
+        let blocked = d
+            .store
+            .update_task_in(task_id, &now, |task| {
+                task.status = TaskStatus::Blocked;
+                task.reporting_session = None;
+                task.dispatch_failures = 0;
+                if !task.notifications.iter().any(|n| n.message == reason) {
+                    task.notifications.push(NotificationMarker {
                         target: "mission_control".to_string(),
                         kind: "blocked".to_string(),
                         message: reason.clone(),
                         delivered: false,
                     });
-            }
-        })?;
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        // Record the ordering constraint so `unblock_ready_tasks` can requeue
+        // this once the owner finishes — the edge IS the dependency.
+        for owner in &owners {
+            let _ = d.store.link_tasks(&TaskLink {
+                from_task_id: owner.clone(),
+                to_task_id: task_id.to_string(),
+                kind: TaskLinkKind::Blocks,
+                created_at: now.clone(),
+            });
+        }
         return Ok(blocked);
     }
     let handoff = task
@@ -5067,10 +5328,10 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
     // Fresh-mode handoffs must be self-contained briefings; resume-mode ones
     // assume the session already holds the context.
     let mode_line = match task.handoff_mode {
-        mission_control::HandoffMode::Fresh => {
+        HandoffMode::Fresh => {
             "handoff_mode: fresh (self-contained briefing; the session has no prior context)\n"
         }
-        mission_control::HandoffMode::Resume => "",
+        HandoffMode::Resume => "",
     };
     let text = format!(
         "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nrules: do not confirm scope; begin immediately. If handoff_mode is fresh, this envelope is the complete briefing — do not ask for missing history. Stay in this session — it already has the context; do not spawn lanes unless the work is independently parallel. Stay in scope; do not manage other sessions. If a prior read-only report is gone, redo the evaluation from current sources and deliver it. You MUST call report_mission_task for task_id {} before you stop — even on a clean success with no errors. Status done if finished; blocked if you need a unique artifact or user decision; failed only for a hard stop. A silent finish leaves Mission Control unable to resume. Block only for a missing unique artifact or user decision, not compacted history.\n[/mission_control_task]",
@@ -5088,36 +5349,38 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
     d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
     // Delivery succeeded — clear the retry counter so the ceiling stays
     // "consecutive failures" as documented.
-    mission_control::update_task(root, task_id, |t| t.dispatch_failures = 0)?;
-    mission_control::get_task(root, task_id)
+    let task = d
+        .store
+        .update_task_in(task_id, &now, |t| t.dispatch_failures = 0)
+        .map_err(|error| error.to_string())?;
+    Ok(task)
 }
 
-/// Roll a claimed-but-undeliverable task back to Pending and record why, so
-/// the loop can retry later instead of silently spinning with a stale claim.
-/// After `MAX_DISPATCH_FAILURES` consecutive failures the task is parked as
-/// Blocked so it stops consuming the loop.
-fn release_failed_claim(
-    root: &std::path::Path,
-    task: &TaskRecord,
-    error: &str,
-) -> Result<(), String> {
+/// Roll a claimed-but-undeliverable task back to Todo and record why, so the
+/// loop can retry later instead of silently spinning with a stale claim. After
+/// `MAX_DISPATCH_FAILURES` consecutive failures the task parks as Blocked so it
+/// stops consuming the loop.
+fn release_failed_claim(d: &Daemon, task: &Task, error: &str) -> Result<(), String> {
     const MAX_DISPATCH_FAILURES: u32 = 5;
-    mission_control::update_task(root, &task.id, |t| {
-        t.dispatch_failures += 1;
-        t.reporting_session = None;
-        if t.dispatch_failures >= MAX_DISPATCH_FAILURES {
-            t.status = TaskStatus::Blocked;
-            t.notifications.push(NotificationMarker {
-                target: "mission_control".to_string(),
-                kind: "blocked".to_string(),
-                message: format!("dispatch failed {} times: {error}", t.dispatch_failures),
-                delivered: false,
-            });
-        } else {
-            t.status = TaskStatus::Pending;
-        }
-    })
-    .map(|_| ())
+    let now = chrono::Utc::now().to_rfc3339();
+    d.store
+        .update_task_in(&task.id, &now, |t| {
+            t.dispatch_failures += 1;
+            t.reporting_session = None;
+            if t.dispatch_failures >= MAX_DISPATCH_FAILURES {
+                t.status = TaskStatus::Blocked;
+                t.notifications.push(NotificationMarker {
+                    target: "mission_control".to_string(),
+                    kind: "blocked".to_string(),
+                    message: format!("dispatch failed {} times: {error}", t.dispatch_failures),
+                    delivered: false,
+                });
+            } else {
+                t.status = TaskStatus::Todo;
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Deserialize)]
@@ -5222,36 +5485,41 @@ async fn mission_control_create_task(
         Err(error) => return mission_error(error),
     };
     let id = uuid::Uuid::new_v4().to_string();
-    let task = match mission_control::create_task(
-        root,
-        &id,
-        &req.session_id,
-        req.title.trim(),
-        req.description.trim(),
+    let task = crate::coordination::Task::dispatched_to(
+        id,
+        req.session_id.clone(),
+        req.title.trim().to_string(),
+        req.description.trim().to_string(),
         owned_paths,
-    ) {
-        Ok(task) => task,
-        Err(error) => return mission_error(error),
-    };
+        HandoffMode::Resume,
+        "mission-control",
+        "mission-control",
+        chrono::Utc::now().to_rfc3339(),
+    );
+    if let Err(error) = d.store.create_task(&task) {
+        return mission_error(error.to_string());
+    }
     let task = if req.status.as_deref() == Some("pending") {
         task
     } else {
         match dispatch_mission_task(&d, &task.id).await {
             Ok(task) => task,
-            Err(error) => match mission_control::update_task(root, &task.id, |task| {
-                task.status = TaskStatus::Blocked;
-                task.reporting_session = None;
-                task.notifications
-                    .push(mission_control::NotificationMarker {
+            Err(error) => {
+                let now = chrono::Utc::now().to_rfc3339();
+                match d.store.update_task_in(&task.id, &now, |task| {
+                    task.status = TaskStatus::Blocked;
+                    task.reporting_session = None;
+                    task.notifications.push(NotificationMarker {
                         target: "mission_control".to_string(),
                         kind: "blocked".to_string(),
                         message: error,
                         delivered: false,
                     });
-            }) {
-                Ok(task) => task,
-                Err(error) => return mission_error(error),
-            },
+                }) {
+                    Ok(task) => task,
+                    Err(error) => return mission_error(error.to_string()),
+                }
+            }
         }
     };
     Json(mission_task_view(&task)).into_response()
@@ -5297,7 +5565,7 @@ async fn mission_control_update_task(
     let status = req.status.as_deref().and_then(task_status);
     let handoff_mode = match req.handoff_mode.as_deref() {
         None => None,
-        Some(mode_raw) => match mission_control::HandoffMode::parse(mode_raw) {
+        Some(mode_raw) => match HandoffMode::parse(mode_raw) {
             Some(mode) => Some(mode),
             None => {
                 return mission_error(format!(
@@ -5306,39 +5574,43 @@ async fn mission_control_update_task(
             }
         },
     };
-    let updated = mission_control::update_task(root, &id, |task| {
-        if !req.title.trim().is_empty() {
-            task.title = req.title.trim().to_string();
-        }
-        if !req.description.trim().is_empty() {
-            task.description = req.description.trim().to_string();
-        }
-        if !req.session_id.trim().is_empty() && req.session_id.trim() != existing.session_id {
-            task.session_id = req.session_id.trim().to_string();
-            task.reporting_session = None; // re-bind on retarget
-        }
-        if let Some(paths) = &validated_paths {
-            task.owned_paths = paths.clone();
-        }
-        if let Some(mode) = handoff_mode {
-            task.handoff_mode = mode;
-        }
-        if let Some(status) = status {
-            task.status = status;
-            if status.is_terminal() || status == TaskStatus::Blocked {
-                task.reporting_session = None;
+    let updated = d
+        .store
+        .update_task_in(&id, &chrono::Utc::now().to_rfc3339(), |task| {
+            if !req.title.trim().is_empty() {
+                task.title = req.title.trim().to_string();
             }
-        }
-    });
+            if !req.description.trim().is_empty() {
+                task.description = req.description.trim().to_string();
+            }
+            if !req.session_id.trim().is_empty() && req.session_id.trim() != existing.session_id {
+                task.session_id = req.session_id.trim().to_string();
+                task.reporting_session = None; // re-bind on retarget
+            }
+            if let Some(paths) = &validated_paths {
+                task.owned_paths = paths.clone();
+            }
+            if let Some(mode) = handoff_mode {
+                task.handoff_mode = mode;
+            }
+            if let Some(status) = status {
+                // Read the flags BEFORE the move: `task.status = status`
+                // consumes it, and `status.is_terminal()` would then borrow a
+                // moved value.
+                let clears_binding = status.is_terminal() || status == TaskStatus::Blocked;
+                task.status = status;
+                if clears_binding {
+                    task.reporting_session = None;
+                }
+            }
+        });
     match updated {
-        Ok(task) if task.status == TaskStatus::Pending => {
-            match dispatch_mission_task(&d, &id).await {
-                Ok(task) => Json(mission_task_view(&task)).into_response(),
-                Err(error) => mission_error(error),
-            }
-        }
+        Ok(task) if task.status == TaskStatus::Todo => match dispatch_mission_task(&d, &id).await {
+            Ok(task) => Json(mission_task_view(&task)).into_response(),
+            Err(error) => mission_error(error),
+        },
         Ok(task) => Json(mission_task_view(&task)).into_response(),
-        Err(error) => mission_error(error),
+        Err(error) => mission_error(error.to_string()),
     }
 }
 
@@ -5350,17 +5622,17 @@ async fn mission_control_archive_task(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    match mission_control::complete_task(
-        &d.mission_control_root,
+    match d.store.complete_task(
         &id,
         TaskStatus::Cancelled,
-        mission_control::TaskResult {
+        TaskResult {
             summary: "Archived by Mission Control.".to_string(),
             ..Default::default()
         },
+        &chrono::Utc::now().to_rfc3339(),
     ) {
         Ok(task) => Json(mission_task_view(&task)).into_response(),
-        Err(error) => mission_error(error),
+        Err(error) => mission_error(error.to_string()),
     }
 }
 
@@ -5372,7 +5644,7 @@ async fn mission_control_sessions(
         return unauthorized();
     }
     let root = &d.mission_control_root;
-    let tasks = mission_control::list_tasks(root, None, None).unwrap_or_default();
+    let tasks = d.store.list_tasks(None, None).unwrap_or_default();
     match mission_control::list_sessions(root, false) {
         Ok(sessions) => Json(
             sessions
@@ -5530,7 +5802,13 @@ async fn mission_control_open(
         .profile
         .clone()
         .or_else(|| read_session_profile(&state_path));
-    write_session_role(&state_path, "mission_control");
+    write_session_sidecar(
+        &state_path,
+        &SessionSidecar {
+            role: SessionRole::MissionControl,
+            agent_id: None,
+        },
+    );
     let cfg = {
         let config = d.config.lock().unwrap();
         let mut workspace = config.for_workspace(home.clone());
@@ -5564,42 +5842,26 @@ async fn mission_control_open(
     Json(serde_json::json!({ "id": id, "folder": home })).into_response()
 }
 
-/// Persist the MC session id next to the session's state file so a daemon
-/// restart can resume it with the Mission Control role (prompt + tools +
-/// lane restrictions) instead of silently downgrading it to an ordinary
-/// conversation session.
-const MC_ROLE_SIDECAR_SUFFIX: &str = ".role";
-
-fn write_session_role(state_path: &std::path::Path, role: &str) {
-    let sidecar = PathBuf::from(format!("{}{MC_ROLE_SIDECAR_SUFFIX}", state_path.display()));
-    if let Some(parent) = sidecar.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(sidecar, role);
-}
-
-pub fn read_session_role(state_path: &std::path::Path) -> Option<String> {
-    let raw = std::fs::read_to_string(PathBuf::from(format!(
-        "{}{MC_ROLE_SIDECAR_SUFFIX}",
-        state_path.display()
-    )))
-    .ok()?;
-    let role = raw.trim().to_string();
-    (!role.is_empty()).then_some(role)
-}
+// The session role sidecar lives in `session.rs`: it is written by the daemon
+// and READ by the session list, so it cannot belong to either one. This module
+// used to own it and hand-parse the grammar, which is how the reader here and
+// the reader in `session.rs` came to disagree.
 
 /// Give the built-in agents a directory row so a peer can ADDRESS them.
 ///
-/// Mission Control could already post to the board, but it was not an agent: no
-/// directory row, so nothing could name it by agent id, and `lease_agent_id`
-/// fell back to the raw session id. Registering it makes the coordinator a peer
-/// that others can mention, assign to, and take a turn from.
+/// Both built-ins are registered here, and the distinction between them is the
+/// point: Mission Control is the coordinator that dispatches work; `snippet` is
+/// the general coding agent that work is dispatched TO by default. They are two
+/// identities, not one identity with a fallback.
 ///
-/// Idempotent by construction (`upsert_agent`) — this runs on every boot, and a
-/// plain INSERT would fail the primary key on the second start.
+/// A row alone is not enough for `snippet`: a turn is held by an agent identity,
+/// and `ensure_agent_session` refuses an agent with no identity home, so the home
+/// is materialized here too. Without it the default agent could be named and
+/// assigned to but never actually start.
 ///
-/// The `Snippet` agent needs no row here: every ordinary session acts as itself
-/// already, since `lease_agent_id` falls back to the durable session id.
+/// Idempotent by construction — this runs on every boot, so it uses
+/// `upsert_agent` (a plain INSERT would fail the primary key on the second
+/// start) and `ensure_layout` (which only writes a home that is missing).
 fn register_builtin_agents(d: &Shared) {
     let coordinator = crate::coordination::types::Agent {
         id: crate::mission_control::SESSION_ID.to_string(),
@@ -5613,16 +5875,61 @@ fn register_builtin_agents(d: &Shared) {
             "agent-directory".into(),
             "task-dispatch".into(),
         ],
-        // The coordinator offers work to many sessions at once; it does not
-        // accept a turn of its own through this limit.
-        max_concurrent_assignments: 0,
-        version: 1,
     };
-    if let Err(error) = d.coordination_db.upsert_agent(&coordinator) {
-        // A failure here must not stop the daemon: the board and sessions work
-        // without the directory row, and MC can still post. It just cannot be
-        // addressed until the next successful boot.
-        eprintln!("[coordination] could not register Mission Control as an agent: {error}");
+    let default_worker = crate::coordination::types::Agent {
+        id: crate::coordination::SNIPPET_AGENT_ID.to_string(),
+        display_name: "Snippet".into(),
+        handle: "snippet".into(),
+        kind: crate::coordination::types::AgentKind::Worker,
+        status: crate::coordination::types::AgentStatus::Active,
+        role: crate::coordination::types::AgentRole::Implementer,
+        capabilities: vec![
+            "coding".into(),
+            "bash".into(),
+            "files".into(),
+            "web-search".into(),
+        ],
+    };
+    for agent in [&coordinator, &default_worker] {
+        // The default worker needs a home before it can hold a turn; the
+        // coordinator works through the board and never takes one.
+        if agent.id == crate::coordination::SNIPPET_AGENT_ID {
+            let home = match crate::coordination::AgentHome::new(
+                crate::coordination::agents_root(&d.mission_control_root),
+                &agent.id,
+            ) {
+                Ok(home) => home,
+                Err(error) => {
+                    eprintln!(
+                        "[coordination] invalid built-in agent id `{}`: {error}",
+                        agent.id
+                    );
+                    continue;
+                }
+            };
+            let identity = "# Snippet\n\nYou are Snippet, the general coding agent. You own work \
+                            end to end: read the relevant code before you change it, make the \
+                            smallest change that achieves the goal, and verify it with the \
+                            narrowest check that proves it.\n\nThis identity is the default. \
+                            Mission Control dispatches work here unless a user names a more \
+                            specialized agent.\n";
+            if let Err(error) = home.ensure_layout(identity) {
+                eprintln!(
+                    "[coordination] could not create the home for agent `{}`: {error}",
+                    agent.id
+                );
+                continue;
+            }
+        }
+        if let Err(error) = d.store.upsert_agent(agent) {
+            // A failure here must not stop the daemon: the board and sessions work
+            // without the directory row. The agent just cannot be addressed until
+            // the next successful boot.
+            eprintln!(
+                "[coordination] could not register agent `{}`: {error}",
+                agent.id
+            );
+        }
     }
 }
 
@@ -5631,10 +5938,12 @@ fn register_builtin_agents(d: &Shared) {
 /// back with a retry counter; at the ceiling the task parks as Blocked.
 async fn mission_control_dispatch_loop(daemon: Shared) {
     loop {
-        let root = &daemon.mission_control_root;
-        let _ = mission_control::unblock_ready_tasks(root);
-        let tasks =
-            mission_control::list_tasks(root, None, Some(TaskStatus::Pending)).unwrap_or_default();
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = daemon.store.unblock_ready_tasks(&now);
+        let tasks = daemon
+            .store
+            .list_tasks(None, Some(&TaskStatus::Todo))
+            .unwrap_or_default();
         for task in tasks {
             if let Err(error) = dispatch_mission_task(&daemon, &task.id).await {
                 tracing_log_dispatch_failure(&task.id, &error);
@@ -5648,8 +5957,7 @@ async fn mission_control_dispatch_loop(daemon: Shared) {
 /// Worker `report_mission_task` only writes the JSON store. Push undelivered
 /// markers into the Mission Control conversation so the user sees the result.
 async fn deliver_mission_control_reports(daemon: &Daemon) {
-    let root = &daemon.mission_control_root;
-    let Ok(tasks) = mission_control::list_tasks(root, None, None) else {
+    let Ok(tasks) = daemon.store.list_tasks(None, None) else {
         return;
     };
     for task in tasks {
@@ -5664,7 +5972,13 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
             daemon
                 .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))
                 .await;
-            let _ = mission_control::mark_notification_delivered(root, &task.id, index);
+            let _ = daemon
+                .store
+                .update_task_in(&task.id, &chrono::Utc::now().to_rfc3339(), |t| {
+                    if let Some(n) = t.notifications.get_mut(index) {
+                        n.delivered = true;
+                    }
+                });
         }
     }
 }
@@ -5706,10 +6020,7 @@ fn session_busy_for_recurring(id: &str) -> bool {
     let Some(sp) = state_path_for_id(id) else {
         return false;
     };
-    let Ok(bytes) = std::fs::read(&sp) else {
-        return false;
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
+    let Some(state) = read_session_state(&sp) else {
         return false;
     };
     recurring::session_is_busy(&status_str(state.status))
@@ -5736,8 +6047,7 @@ async fn recurring_tick_loop(daemon: Shared) {
                 continue;
             }
             let workspace = state_path_for_id(&job.session_id)
-                .and_then(|sp| std::fs::read(&sp).ok())
-                .and_then(|bytes| deserialize_state(&bytes).ok())
+                .and_then(|sp| read_session_state(&sp))
                 .map(|s| PathBuf::from(s.workspace))
                 .filter(|p| p.is_dir());
             match job.render_goal(workspace.as_deref()) {

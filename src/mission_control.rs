@@ -1427,13 +1427,7 @@ mod tests {
             TaskStatus::Pending
         );
 
-        complete_task(
-            root.path(),
-            "t1",
-            TaskStatus::Done,
-            TaskResult::default(),
-        )
-        .unwrap();
+        complete_task(root.path(), "t1", TaskStatus::Done, TaskResult::default()).unwrap();
         assert!(retry_task(root.path(), "t1").is_err());
 
         create_task(root.path(), "t2", "s1", "T2", "D", vec![]).unwrap();
@@ -1489,7 +1483,14 @@ mod tests {
         assert_eq!(parked.status, TaskStatus::Blocked);
         assert!(parked.reporting_session.is_none());
         assert_eq!(parked.notifications.last().unwrap().kind, "blocked");
-        assert!(parked.notifications.last().unwrap().message.contains("boom"));
+        assert!(
+            parked
+                .notifications
+                .last()
+                .unwrap()
+                .message
+                .contains("boom")
+        );
         assert_eq!(
             retry_task(root.path(), "t1").unwrap().status,
             TaskStatus::Pending

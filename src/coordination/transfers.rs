@@ -1,13 +1,13 @@
 use rusqlite::{OptionalExtension, params};
 
 use super::{
-    CoordinationDb, CoordinationDbError,
+    Store, StoreError,
     agents::decode_enum,
     types::{Handoff, SessionAgent, SessionLease},
 };
 
-impl CoordinationDb {
-    pub fn create_handoff(&self, handoff: &Handoff) -> Result<(), CoordinationDbError> {
+impl Store {
+    pub fn create_handoff(&self, handoff: &Handoff) -> Result<(), StoreError> {
         let content = serde_json::to_string(handoff).unwrap();
         self.with_connection(|conn| {
             conn.execute("INSERT INTO handoffs (id,goal_id,session_id,source_assignment_id,target_assignment_id,context_mode,content_json,content_hash,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![handoff.id, handoff.goal_id, handoff.session_id, handoff.source_assignment_id, handoff.target_assignment_id, serde_json::to_string(&handoff.context_mode).unwrap().trim_matches('"'), content, handoff.content_hash, handoff.created_at])?;
@@ -15,7 +15,7 @@ impl CoordinationDb {
         })
     }
 
-    pub fn acknowledge_handoff(&self, id: &str, at: &str) -> Result<bool, CoordinationDbError> {
+    pub fn acknowledge_handoff(&self, id: &str, at: &str) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             Ok(conn.execute(
                 "UPDATE handoffs SET acknowledged_at=?1 WHERE id=?2 AND acknowledged_at IS NULL",
@@ -24,7 +24,7 @@ impl CoordinationDb {
         })
     }
 
-    pub fn get_handoff(&self, id: &str) -> Result<Option<Handoff>, CoordinationDbError> {
+    pub fn get_handoff(&self, id: &str) -> Result<Option<Handoff>, StoreError> {
         let raw = self.with_connection(|conn| {
             conn.query_row(
                 "SELECT content_json FROM handoffs WHERE id = ?1",
@@ -41,7 +41,7 @@ impl CoordinationDb {
     pub fn handoff_for_target(
         &self,
         target_assignment_id: &str,
-    ) -> Result<Option<Handoff>, CoordinationDbError> {
+    ) -> Result<Option<Handoff>, StoreError> {
         let raw = self.with_connection(|conn| {
             conn.query_row(
                 "SELECT content_json FROM handoffs
@@ -60,7 +60,7 @@ impl CoordinationDb {
     pub fn has_unacknowledged_handoff(
         &self,
         target_assignment_id: &str,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM handoffs
@@ -76,7 +76,7 @@ impl CoordinationDb {
         &self,
         target_assignment_id: &str,
         at: &str,
-    ) -> Result<Option<Handoff>, CoordinationDbError> {
+    ) -> Result<Option<Handoff>, StoreError> {
         let raw = self.with_connection(|conn| {
             let changed = conn.execute(
                 "UPDATE handoffs SET acknowledged_at=?1
@@ -100,7 +100,7 @@ impl CoordinationDb {
 
     /// Handoffs that no successor has acknowledged yet, oldest first. Drives the
     /// handoff inspector: the human (or a successor agent) sees what is waiting.
-    pub fn list_pending_handoffs(&self) -> Result<Vec<Handoff>, CoordinationDbError> {
+    pub fn list_pending_handoffs(&self) -> Result<Vec<Handoff>, StoreError> {
         let raws = self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT content_json FROM handoffs
@@ -113,7 +113,7 @@ impl CoordinationDb {
         raws.into_iter()
             .map(|raw| {
                 serde_json::from_str(&raw)
-                    .map_err(|e| CoordinationDbError::HandoffDecode(e.to_string()))
+                    .map_err(|e| StoreError::HandoffDecode(e.to_string()))
             })
             .collect()
     }
@@ -121,7 +121,7 @@ impl CoordinationDb {
     pub fn acquire_lease(
         &self,
         lease: &SessionLease,
-    ) -> Result<Option<SessionLease>, CoordinationDbError> {
+    ) -> Result<Option<SessionLease>, StoreError> {
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
             let active: Option<i64> = tx.query_row(
@@ -153,7 +153,7 @@ impl CoordinationDb {
         fencing_token: u64,
         renewed_at: &str,
         expires_at: &str,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             Ok(conn.execute(
                 "UPDATE session_leases SET renewed_at=?1, expires_at=?2 WHERE lease_id=?3 AND fencing_token=?4 AND released_at IS NULL",
@@ -167,7 +167,7 @@ impl CoordinationDb {
         lease_id: &str,
         at: &str,
         reason: &str,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         self.with_connection(|conn| Ok(conn.execute("UPDATE session_leases SET released_at=?1, release_reason=?2 WHERE lease_id=?3 AND released_at IS NULL", params![at,reason,lease_id])? == 1))
     }
 
@@ -177,7 +177,7 @@ impl CoordinationDb {
         &self,
         session_id: &str,
         now: &str,
-    ) -> Result<Option<SessionLease>, CoordinationDbError> {
+    ) -> Result<Option<SessionLease>, StoreError> {
         self.with_connection(|conn| {
             conn.query_row(
                 "SELECT session_id, lease_id, assignment_id, agent_id, fencing_token,
@@ -205,7 +205,7 @@ impl CoordinationDb {
 
     /// Every session that currently has an active turn holder, with who holds it
     /// and since when. This is the "which agent is active where" view.
-    pub fn list_active_leases(&self, now: &str) -> Result<Vec<SessionLease>, CoordinationDbError> {
+    pub fn list_active_leases(&self, now: &str) -> Result<Vec<SessionLease>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT session_id, lease_id, assignment_id, agent_id, fencing_token,
@@ -215,37 +215,6 @@ impl CoordinationDb {
                  ORDER BY acquired_at DESC",
             )?;
             let rows = stmt.query_map(params![now], |row| {
-                Ok(SessionLease {
-                    session_id: row.get(0)?,
-                    lease_id: row.get(1)?,
-                    assignment_id: row.get(2)?,
-                    agent_id: row.get(3)?,
-                    fencing_token: row.get::<_, i64>(4)? as u64,
-                    acquired_at: row.get(5)?,
-                    renewed_at: row.get(6)?,
-                    expires_at: row.get(7)?,
-                })
-            })?;
-            rows.collect()
-        })
-    }
-
-    /// Every lease a session has ever had — active first, then history newest
-    /// first. This is what "who is / was active in this session" is answered
-    /// from: the active holder (if any) plus the released/expired past.
-    pub fn list_session_leases(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<SessionLease>, CoordinationDbError> {
-        self.with_connection(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT session_id, lease_id, assignment_id, agent_id, fencing_token,
-                        acquired_at, renewed_at, expires_at
-                 FROM session_leases
-                 WHERE session_id = ?1
-                 ORDER BY (released_at IS NULL) DESC, acquired_at DESC",
-            )?;
-            let rows = stmt.query_map(params![session_id], |row| {
                 Ok(SessionLease {
                     session_id: row.get(0)?,
                     lease_id: row.get(1)?,
@@ -271,7 +240,7 @@ impl CoordinationDb {
         &self,
         session_id: &str,
         now: &str,
-    ) -> Result<Vec<SessionAgent>, CoordinationDbError> {
+    ) -> Result<Vec<SessionAgent>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT l.agent_id, a.display_name, a.handle, a.role, a.status,
@@ -309,7 +278,7 @@ impl CoordinationDb {
         lease_id: &str,
         fencing_token: u64,
         now: &str,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         Ok(self.active_lease(session_id, now)?.is_some_and(|active| {
             active.lease_id == lease_id && active.fencing_token == fencing_token
         }))
@@ -322,7 +291,7 @@ impl CoordinationDb {
         &self,
         id: &str,
         content_json: &str,
-    ) -> Result<(), CoordinationDbError> {
+    ) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             conn.execute(
                 "UPDATE handoffs SET content_json = ?1 WHERE id = ?2",
@@ -335,7 +304,7 @@ impl CoordinationDb {
     /// Test-only: force a lease past its expiry so fence checks can be exercised
     /// without sleeping.
     #[doc(hidden)]
-    pub fn expire_lease_for_test(&self, lease_id: &str) -> Result<(), CoordinationDbError> {
+    pub fn expire_lease_for_test(&self, lease_id: &str) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             conn.execute(
                 "UPDATE session_leases SET expires_at = ?1 WHERE lease_id = ?2",
@@ -348,11 +317,11 @@ impl CoordinationDb {
 
 /// Decode a handoff row's JSON payload, propagating a malformed row as a typed
 /// conversion error rather than panicking.
-fn decode_handoff(raw: Option<String>) -> Result<Option<Handoff>, CoordinationDbError> {
+fn decode_handoff(raw: Option<String>) -> Result<Option<Handoff>, StoreError> {
     match raw {
         Some(json) => serde_json::from_str(&json)
             .map(Some)
-            .map_err(|e| CoordinationDbError::HandoffDecode(e.to_string())),
+            .map_err(|e| StoreError::HandoffDecode(e.to_string())),
         None => Ok(None),
     }
 }
@@ -366,7 +335,7 @@ mod tests {
     };
     #[test]
     fn lease_is_single_active_owner() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&Agent {
             id: "w".into(),
             display_name: "W".into(),
@@ -375,8 +344,6 @@ mod tests {
             status: AgentStatus::Active,
             role: AgentRole::Implementer,
             capabilities: vec![],
-            max_concurrent_assignments: 2,
-            version: 1,
         })
         .unwrap();
         db.create_assignment(&Assignment {
@@ -387,6 +354,8 @@ mod tests {
             status: AssignmentStatus::Accepted,
             scope: "x".into(),
             definition_of_done: "y".into(),
+            profile: None,
+            dispatched_by: None,
             created_at: "1".into(),
             updated_at: "1".into(),
         })
@@ -446,8 +415,6 @@ mod tests {
             status: AgentStatus::Active,
             role: AgentRole::Implementer,
             capabilities: vec![],
-            max_concurrent_assignments: 2,
-            version: 1,
         }
     }
 
@@ -460,6 +427,8 @@ mod tests {
             status: AssignmentStatus::Accepted,
             scope: "x".into(),
             definition_of_done: "y".into(),
+            profile: None,
+            dispatched_by: None,
             created_at: ts(0),
             updated_at: ts(0),
         }
@@ -480,7 +449,7 @@ mod tests {
 
     #[test]
     fn active_lease_reports_the_current_holder() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         assert!(db.active_lease("s", &ts(1)).unwrap().is_none());
@@ -496,7 +465,7 @@ mod tests {
 
     #[test]
     fn fence_accepts_only_the_current_token_and_rejects_a_replaced_holder() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
 
@@ -529,7 +498,7 @@ mod tests {
 
     #[test]
     fn fence_rejects_an_expired_holder() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         let held = db.acquire_lease(&lease("l")).unwrap().unwrap();
@@ -573,7 +542,7 @@ mod tests {
 
     #[test]
     fn pending_handoffs_are_listed_until_acknowledged() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         db.create_assignment(&assignment("a2")).unwrap();
@@ -595,7 +564,7 @@ mod tests {
 
     #[test]
     fn active_leases_lists_only_unexpired_holders() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         // No holder yet.
@@ -614,7 +583,7 @@ mod tests {
 
     #[test]
     fn active_leases_excludes_released_holders() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         db.acquire_lease(&lease("l")).unwrap();
@@ -627,7 +596,7 @@ mod tests {
     /// The join is what lets the UI name people rather than show raw ids.
     #[test]
     fn session_agents_join_agent_identity() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         db.acquire_lease(&lease("l")).unwrap();
@@ -645,7 +614,7 @@ mod tests {
     /// the current UI has no way to show.
     #[test]
     fn session_agents_keep_history_after_release() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         db.acquire_lease(&lease("l")).unwrap();
@@ -662,7 +631,7 @@ mod tests {
     /// computed against `now`, so a dead holder can't read as present.
     #[test]
     fn session_agents_treat_an_expired_lease_as_inactive() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_assignment(&assignment("a")).unwrap();
         db.acquire_lease(&lease("l")).unwrap(); // expires at ts(100)
@@ -677,7 +646,7 @@ mod tests {
     /// Two agents, one session, both listed with the active one first.
     #[test]
     fn session_agents_lists_every_agent_active_first() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         db.create_agent(&worker()).unwrap();
         db.create_agent(&Agent {
             id: "w2".into(),
@@ -687,8 +656,6 @@ mod tests {
             status: AgentStatus::Active,
             role: AgentRole::Reviewer,
             capabilities: vec![],
-            max_concurrent_assignments: 1,
-            version: 1,
         })
         .unwrap();
         db.create_assignment(&assignment("a")).unwrap();
@@ -721,7 +688,7 @@ mod tests {
     /// A session nobody has touched returns nothing rather than erroring.
     #[test]
     fn session_agents_is_empty_for_an_untouched_session() {
-        let db = CoordinationDb::open_in_memory().unwrap();
+        let db = Store::open_in_memory().unwrap();
         assert!(db.list_session_agents("nope", &ts(0)).unwrap().is_empty());
     }
 }
