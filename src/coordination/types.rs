@@ -39,8 +39,6 @@ pub struct Agent {
     pub status: AgentStatus,
     pub role: AgentRole,
     pub capabilities: Vec<String>,
-    pub max_concurrent_assignments: u32,
-    pub version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

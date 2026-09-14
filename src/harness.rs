@@ -449,6 +449,13 @@ pub struct HarnessState {
     /// a stale hold list.
     #[serde(default)]
     pub queued_inputs: Vec<QueuedInput>,
+    /// Set by the few writers that rewrite history in place — compaction,
+    /// checkpoint rewind, interrupt rollback, tool-payload pruning. Those are the
+    /// only cases where the append-only store cannot be appended to, so the flag
+    /// is what lets a persist be an append the rest of the time. Never
+    /// serialized: it describes the pending write, not the session.
+    #[serde(skip)]
+    pub history_rewritten: bool,
 }
 
 impl HarnessState {
@@ -480,6 +487,9 @@ impl HarnessState {
         let message_index = cp.message_index.min(self.messages.len());
         self.events.truncate(event_index);
         self.messages.truncate(message_index);
+        // A rewind moves history backwards, which an append-only store cannot
+        // express — mark the pending write as a full replace.
+        self.history_rewritten = true;
         self.checkpoints.retain(|c| c.event_index <= event_index);
         self.final_text = None;
         self.pending_question = None;
@@ -707,7 +717,20 @@ pub struct CodingHarness {
     config: HarnessConfig,
     tools: ToolRegistry,
     context: ToolContext,
+    /// Which store this session's history lives in. `Unknown` until the load
+    /// resolves it; `File` keeps a pre-existing session on its state file so the
+    /// migration to the database stays an explicit step, not a side effect of
+    /// running.
+    backing: std::sync::atomic::AtomicU8,
+    /// Ordinals already durable, so a persist can append the tail instead of
+    /// rewriting the transcript.
+    written_messages: std::sync::atomic::AtomicUsize,
+    written_events: std::sync::atomic::AtomicUsize,
 }
+
+const BACKING_UNKNOWN: u8 = 0;
+const BACKING_FILE: u8 = 1;
+const BACKING_DB: u8 = 2;
 
 impl CodingHarness {
     pub fn new(config: HarnessConfig, tools: ToolRegistry, context: ToolContext) -> Self {
@@ -715,7 +738,143 @@ impl CodingHarness {
             config,
             tools,
             context,
+            backing: std::sync::atomic::AtomicU8::new(BACKING_UNKNOWN),
+            written_messages: std::sync::atomic::AtomicUsize::new(0),
+            written_events: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// The durable session id: the bound id when present, else the state path's
+    /// id, which is the same identity the session list and tools use.
+    fn session_id(&self) -> Option<String> {
+        if let Some(id) = self.context.durable_session_id() {
+            return Some(id.to_string());
+        }
+        self.config
+            .state_path
+            .as_deref()
+            .map(crate::session::session_id_for_state_path)
+    }
+
+    fn store(&self) -> Option<crate::store::Store> {
+        let path = self.context.store_path()?;
+        crate::store::Store::open(path).ok()
+    }
+
+    fn backing(&self) -> u8 {
+        self.backing.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Save the session to the database: scalar state plus the transcript tail.
+    ///
+    /// Appends only the messages and events that are not already durable, so the
+    /// common persist writes a handful of rows instead of re-serializing and
+    /// recompressing the whole conversation. `history_rewritten` is the signal
+    /// that a writer replaced the middle (compaction, rewind, rollback), where an
+    /// append would duplicate or misorder — those fall back to a full replace.
+    async fn persist_to_store(&self, state: &HarnessState) -> Result<(), ToolError> {
+        let Some(store) = self.store() else {
+            return Ok(());
+        };
+        let Some(id) = self.session_id() else {
+            return Ok(());
+        };
+        let workspace = self.context.workspace_root().display().to_string();
+        let key = crate::config::workspace_key(self.context.workspace_root());
+        let title = state.title.clone();
+        let status = crate::session::status_str(state.status);
+        let scalar = scalar_json(state).map_err(ToolError::msg)?;
+        let now = state.updated_at.clone();
+
+        let result = async {
+            store
+                .save_session_scalar(
+                    &id,
+                    &key,
+                    &workspace,
+                    title.as_deref(),
+                    &status,
+                    &scalar,
+                    &state.created_at,
+                    &now,
+                )
+                .map_err(|e| e.to_string())?;
+
+            let rewritten = state.history_rewritten
+                || self.written_messages.load(std::sync::atomic::Ordering::Acquire)
+                    > state.messages.len()
+                || self.written_events.load(std::sync::atomic::Ordering::Acquire) > state.events.len();
+            if rewritten {
+                store
+                    .replace_conversation_messages(&id, &state.messages, &now)
+                    .map_err(|e| e.to_string())?;
+                store
+                    .replace_conversation_events(&id, &state.events, &now)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let from = self.written_messages.load(std::sync::atomic::Ordering::Acquire);
+                if from < state.messages.len() {
+                    store
+                        .append_conversation_messages(&id, &state.messages[from..], &now)
+                        .map_err(|e| e.to_string())?;
+                }
+                let from = self.written_events.load(std::sync::atomic::Ordering::Acquire);
+                if from < state.events.len() {
+                    store
+                        .append_conversation_events(&id, &state.events[from..], &now)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                self.written_messages
+                    .store(state.messages.len(), std::sync::atomic::Ordering::Release);
+                self.written_events
+                    .store(state.events.len(), std::sync::atomic::Ordering::Release);
+                // Keep the list-readable sidecar in step: the session list still
+                // reads it, and a DB session must be as visible as a file one.
+                if let Some(path) = &self.config.state_path {
+                    crate::session::write_session_meta(path, state);
+                }
+                Ok(())
+            }
+            Err(error) => Err(ToolError::msg(format!("persist session: {error}"))),
+        }
+    }
+
+    /// Load a session from the database, if this store has it.
+    ///
+    /// Returns `None` when there is no row, which is what keeps a session that
+    /// predates the store on its state file instead of silently re-initializing.
+    async fn load_from_store(&self) -> Result<Option<HarnessState>, ToolError> {
+        let Some(store) = self.store() else {
+            return Ok(None);
+        };
+        let Some(id) = self.session_id() else {
+            return Ok(None);
+        };
+        let Some(scalar) = store
+            .load_session_scalar(&id)
+            .map_err(|e| ToolError::msg(format!("load session: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let messages = store
+            .load_conversation_messages(&id)
+            .map_err(|e| ToolError::msg(format!("load messages: {e}")))?;
+        let events = store
+            .load_conversation_events(&id)
+            .map_err(|e| ToolError::msg(format!("load events: {e}")))?;
+        self.written_messages
+            .store(messages.len(), std::sync::atomic::Ordering::Release);
+        self.written_events
+            .store(events.len(), std::sync::atomic::Ordering::Release);
+        let state = state_from_scalar(&scalar, messages, events).map_err(ToolError::msg)?;
+        Ok(Some(state))
     }
 
     /// One-shot run: drive the agent until it ends a turn (via `complete`), then
@@ -1083,6 +1242,7 @@ impl CodingHarness {
                     // Interrupted mid-step: discard the partial turn and stop.
                     state.messages.truncate(msg_mark);
                     state.events.truncate(evt_mark);
+                    state.history_rewritten = true;
                     state.status = HarnessStatus::Interrupted;
                     state.events.push(HarnessEvent::SystemDecision {
                         step: "interrupted".to_string(),
@@ -3166,6 +3326,52 @@ impl CodingHarness {
         RecoveryAction::Retry
     }
 
+    /// Bring a session loaded from either store into the current run.
+    ///
+    /// Both stores converge here so a resumed session behaves identically
+    /// regardless of where it came from: the workspace and context window are
+    /// refreshed, the system prefix is re-seeded (so new workspace memory lands),
+    /// and any half-written tool batch is repaired so strict providers don't 400
+    /// on the history forever after.
+    async fn resume_loaded_state(
+        &self,
+        mut state: HarnessState,
+        seeded_system: String,
+        initial_request: Option<String>,
+    ) -> Result<HarnessState, ToolError> {
+        // Migrate old metadata in memory; the next persist omits the legacy
+        // `user_request` field and keeps the title as identity.
+        normalize_state_title(&mut state);
+        // Reflect the current run's folder (backfills pre-field states).
+        state.workspace = self.context.workspace_root().display().to_string();
+        state.context_window = self.config.context_window_tokens;
+        // Refresh the system prefix so resumed sessions pick up the latest
+        // workspace memory (guarded: no-op if messages[0] isn't System).
+        if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
+            *content = seeded_system;
+        }
+        // A crash mid tool-batch persists an assistant `tool_calls` message whose
+        // later calls never got results; strict providers (Anthropic, DeepSeek)
+        // 400 on that history forever after. Repair on load so a resumed session
+        // is always well-formed.
+        repair_unanswered_tool_calls(&mut state.messages);
+        if let Some(request) = initial_request
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+        {
+            state.status = HarnessStatus::Running;
+            state.final_text = None;
+            state.pending_question = None;
+            state.messages.push(HarnessMessage::User {
+                content: request.clone(),
+            });
+            state.events.push(HarnessEvent::UserInput { text: request });
+            self.bump_activity();
+            self.persist_state(&mut state).await?;
+        }
+        Ok(state)
+    }
+
     async fn load_or_initialize_state(
         &self,
         initial_request: Option<String>,
@@ -3190,6 +3396,16 @@ impl CodingHarness {
         };
 
         if self.config.resume
+            && let Some(state) = self.load_from_store().await?
+        {
+            // The store is authoritative for a session that has a row, so this
+            // is the only place `backing` becomes DB.
+            self.backing
+                .store(BACKING_DB, std::sync::atomic::Ordering::Release);
+            return self.resume_loaded_state(state, seeded_system, initial_request).await;
+        }
+
+        if self.config.resume
             && let Some(path) = &self.config.state_path
             && tokio::fs::try_exists(path).await?
         {
@@ -3197,38 +3413,12 @@ impl CodingHarness {
             // A state file saved by an older build may be unreadable. Don't fail
             // the run — fall through and start a fresh session, overwriting it.
             match deserialize_state(&bytes) {
-                Ok(mut state) => {
-                    // Migrate old metadata in memory; the next persist omits the
-                    // legacy `user_request` field and keeps the title as identity.
-                    normalize_state_title(&mut state);
-                    // Reflect the current run's folder (backfills pre-field states).
-                    state.workspace = self.context.workspace_root().display().to_string();
-                    state.context_window = self.config.context_window_tokens;
-                    // Refresh the system prefix so resumed sessions pick up the
-                    // latest workspace memory (guarded: no-op if messages[0] isn't System).
-                    if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
-                        *content = seeded_system.clone();
-                    }
-                    // A crash mid tool-batch persists an assistant `tool_calls`
-                    // message whose later calls never got results; strict providers
-                    // (Anthropic, DeepSeek) 400 on that history forever after.
-                    // Repair on load so a resumed session is always well-formed.
-                    repair_unanswered_tool_calls(&mut state.messages);
-                    if let Some(request) = initial_request
-                        .map(|r| r.trim().to_string())
-                        .filter(|r| !r.is_empty())
-                    {
-                        state.status = HarnessStatus::Running;
-                        state.final_text = None;
-                        state.pending_question = None;
-                        state.messages.push(HarnessMessage::User {
-                            content: request.clone(),
-                        });
-                        state.events.push(HarnessEvent::UserInput { text: request });
-                        self.bump_activity();
-                        self.persist_state(&mut state).await?;
-                    }
-                    return Ok(state);
+                Ok(state) => {
+                    self.backing
+                        .store(BACKING_FILE, std::sync::atomic::Ordering::Release);
+                    return self
+                        .resume_loaded_state(state, seeded_system, initial_request)
+                        .await;
                 }
                 Err(err) => {
                     self.debug_log(&format!("resume: ignoring unreadable state file: {err}"));
@@ -3299,7 +3489,17 @@ impl CodingHarness {
             context_window: self.config.context_window_tokens,
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
+            history_rewritten: false,
         };
+        // A NEW session is born in the store whenever one is available — that is
+        // what porting the harness means for anything started from now on.
+        // Sessions that already exist keep their state file until they are
+        // migrated, which stays an explicit step rather than a side effect of
+        // opening a session.
+        if self.store().is_some() {
+            self.backing
+                .store(BACKING_DB, std::sync::atomic::Ordering::Release);
+        }
         self.persist_state(&mut state).await?;
         if request.is_some() {
             self.bump_activity();
@@ -3391,6 +3591,10 @@ impl CodingHarness {
 
         state.messages = messages;
         state.tool_payloads_pruned = true;
+        // Pruning REPLACES tool bodies in place, so the transcript is the same
+        // LENGTH with different content. A length check cannot see that, which is
+        // exactly why the flag exists.
+        state.history_rewritten = true;
         state.events.push(HarnessEvent::SystemDecision {
             step: "tool_payloads_pruned".to_string(),
             reasoning: "Pruned older tool data.".to_string(),
@@ -3711,6 +3915,9 @@ impl CodingHarness {
         messages.extend(preserved_prefix.into_iter().skip(1));
         messages.extend(working);
         state.messages = messages;
+        // Compaction replaces a span of history with a summary, so the stored
+        // transcript must be rewritten rather than appended to.
+        state.history_rewritten = true;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
@@ -3859,6 +4066,9 @@ impl CodingHarness {
             },
         ];
         state.messages.extend(trailing_user);
+        // The whole conversation became the table, so this is the largest rewrite
+        // there is — the stored rows must be replaced wholesale.
+        state.history_rewritten = true;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
@@ -4183,10 +4393,23 @@ impl CodingHarness {
 
     async fn persist_state(&self, state: &mut HarnessState) -> Result<(), ToolError> {
         stamp_activity_times(state);
+        if self.config.state_path.is_none() {
+            return Ok(());
+        }
+        state.updated_at = Utc::now().to_rfc3339();
+        // A session's history lives in exactly one place. Which one is decided
+        // when it is loaded (DB if the store has a row, else its state file), so
+        // a persist never migrates a session by itself.
+        if self.backing() == BACKING_DB {
+            return self.persist_to_store(state).await;
+        }
+        self.persist_state_to_file(state).await
+    }
+
+    async fn persist_state_to_file(&self, state: &mut HarnessState) -> Result<(), ToolError> {
         let Some(path) = &self.config.state_path else {
             return Ok(());
         };
-        state.updated_at = Utc::now().to_rfc3339();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -4831,6 +5054,35 @@ fn normalize_tool_aliases(calls: &mut [GeneratedToolCall]) {
     }
 }
 
+/// The session's scalar state as JSON: everything EXCEPT the two append-only
+/// logs, which live in their own tables.
+///
+/// Cloning and emptying the logs is deliberate — it keeps the stored shape a
+/// real `HarnessState`, so a field added to the struct flows through without a
+/// second schema to maintain.
+pub fn scalar_json(state: &HarnessState) -> Result<String, String> {
+    let mut probe = state.clone();
+    probe.messages = Vec::new();
+    probe.events = Vec::new();
+    probe.history_rewritten = false;
+    serde_json::to_string(&probe).map_err(|e| format!("serialize session scalar: {e}"))
+}
+
+/// Rebuild a session from its stored scalar plus the logs loaded from their
+/// tables.
+pub fn state_from_scalar(
+    scalar: &str,
+    messages: Vec<HarnessMessage>,
+    events: Vec<HarnessEvent>,
+) -> Result<HarnessState, String> {
+    let mut state: HarnessState = serde_json::from_str(scalar)
+        .map_err(|e| format!("deserialize session scalar: {e}"))?;
+    state.messages = messages;
+    state.events = events;
+    state.history_rewritten = false;
+    Ok(state)
+}
+
 pub fn serialize_state(state: &HarnessState) -> Result<Vec<u8>, String> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -5371,6 +5623,7 @@ mod assistant_dedup_tests {
             context_window: 10_000,
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
+            history_rewritten: false,
         }
     }
 
@@ -5597,6 +5850,7 @@ mod tool_prune_tests {
             context_window: 10_000,
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
+            history_rewritten: false,
         }
     }
 

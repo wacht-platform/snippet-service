@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 
 use crate::llm::NativeToolDefinition;
 use crate::mission_control::{self, TaskResult, TaskStatus};
-use crate::session::{create_blank_session, list_routable_sessions, state_path_for_id};
+use crate::session::{
+    create_blank_session, list_routable_sessions, read_session_state, state_path_for_id,
+};
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 fn schema(properties: Value, required: &[&str]) -> Value {
@@ -48,6 +50,19 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
 
 pub fn add_worker_report_tool(registry: &mut ToolRegistry) {
     registry.insert(ReportMissionTask);
+}
+
+/// Read-only session awareness, for a session that ROUTES work rather than doing
+/// it.
+///
+/// Deliberately only the two read tools: a coordination session needs to know
+/// which sessions exist and what a given one is doing so it can dispatch into the
+/// right place, but the task board stays Mission Control's — the runtime owns
+/// task state, and a peer agent reading it would invite it to start managing work
+/// it does not own.
+pub fn add_coordination_session_tools(registry: &mut ToolRegistry) {
+    registry.insert(ListSessions);
+    registry.insert(InspectSession);
 }
 
 pub struct ListSessions;
@@ -196,8 +211,10 @@ impl Tool for InspectSession {
             })?;
         let path =
             state_path_for_id(&args.session_id).ok_or_else(|| ToolError::msg("unknown session"))?;
-        let state =
-            crate::harness::deserialize_state(&std::fs::read(&path)?).map_err(ToolError::msg)?;
+        // Store-or-file: MC inspecting a session that lives in the database must
+        // not fail just because it has no state file.
+        let state = read_session_state(&path)
+            .ok_or_else(|| ToolError::msg("session state unreadable"))?;
         let from = state.events.len().saturating_sub(args.event_limit.min(100));
         let recent: Vec<Value> = state.events[from..]
             .iter()
@@ -306,8 +323,8 @@ impl Tool for CreateMissionTask {
         let root = root(ctx)?;
         let path = state_path_for_id(&args.session_id)
             .ok_or_else(|| ToolError::msg("unknown target session"))?;
-        let state =
-            crate::harness::deserialize_state(&std::fs::read(&path)?).map_err(ToolError::msg)?;
+        let state = read_session_state(&path)
+            .ok_or_else(|| ToolError::msg("session state unreadable"))?;
         if mission_control::get_session(&root, &args.session_id).is_err() {
             mission_control::create_session(
                 &root,

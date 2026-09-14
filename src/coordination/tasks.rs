@@ -1,13 +1,15 @@
 use rusqlite::{OptionalExtension, params};
 
-use super::{CoordinationDb, CoordinationDbError};
+use super::{Store, StoreError};
 
 /// Lifecycle of a task on the board.
 ///
-/// Deliberately smaller than [`super::work::AssignmentStatus`]: a task is what a
-/// HUMAN asked for, and the assignment states that matter to a worker (offered,
-/// accepted, awaiting handoff) are not meaningful to the person who filed it.
-/// Mission Control owns the decomposition; the task just moves.
+/// This is the ONE task vocabulary. It used to be two — the board spoke
+/// `todo/in_progress/blocked/done/cancelled` while a parallel JSON store spoke
+/// `pending/…/failed` — so a task's state depended on which store you asked.
+/// The union is what a task actually goes through: `Todo` is filed-but-unstarted
+/// (the dispatcher's queue), and `Failed` is how a worker reports a hard stop,
+/// which the board previously had no way to express.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -15,7 +17,16 @@ pub enum TaskStatus {
     InProgress,
     Blocked,
     Done,
+    Failed,
     Cancelled,
+}
+
+impl TaskStatus {
+    /// Terminal states are finished: nothing dispatches them and nothing
+    /// reopens them implicitly. `Blocked` is NOT terminal — it is waiting.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
 }
 
 /// How two tasks relate. `Blocks` is an ordering constraint the scheduler must
@@ -44,14 +55,164 @@ pub struct Task {
     pub completed_at: Option<String>,
     /// The board thread that IS this task's message room.
     pub thread_id: String,
+    // ---- dispatch state (folded in from the retired JSON store) ----
+    /// The durable session this task is routed to. Empty until dispatched.
+    pub session_id: String,
+    /// Structured briefing for the successor, when the task was handed off.
+    pub handoff: Option<TaskHandoff>,
+    /// How the envelope should be delivered to the target session.
+    pub handoff_mode: HandoffMode,
+    /// The session allowed to report this task's outcome. Set at dispatch time,
+    /// so `report_mission_task` is only honoured for the bound caller.
+    pub reporting_session: Option<String>,
+    /// Consecutive failed dispatch attempts; reset on successful delivery. At
+    /// the ceiling the task parks as Blocked instead of spinning the loop.
+    pub dispatch_failures: u32,
+    /// Terminal outcome, when a worker reported one.
+    pub result: Option<TaskResult>,
+    /// Pending / undelivered notification markers for Mission Control.
+    pub notifications: Vec<NotificationMarker>,
+    /// Workspace paths this task is *currently* writing to, for ownership
+    /// conflict detection.
+    pub owned_paths: Vec<std::path::PathBuf>,
 }
 
+/// Structured handoff information passed into a task.
+///
+/// Distinct from the agent [`super::types::Handoff`], which is the immutable
+/// turn-transfer record between assignments. This is the lighter briefing a
+/// dispatched task carries.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TaskHandoff {
+    pub description: String,
+    pub paths: Vec<std::path::PathBuf>,
+    pub context: std::collections::BTreeMap<String, String>,
+}
+
+/// How a dispatched task should be delivered to its target session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffMode {
+    /// The target session already holds the relevant context.
+    #[default]
+    Resume,
+    /// The target lacks context; the handoff description is the full briefing.
+    Fresh,
+}
+
+impl HandoffMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "resume" => Some(Self::Resume),
+            "fresh" => Some(Self::Fresh),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Resume => "resume",
+            Self::Fresh => "fresh",
+        }
+    }
+}
+
+/// Terminal outcome reported by the worker that ran the task.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TaskResult {
+    pub summary: String,
+    pub artifacts: Vec<std::path::PathBuf>,
+    pub authoritative: bool,
+}
+
+/// A notification marker attached to a task, for Mission Control to read.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct NotificationMarker {
+    pub target: String,
+    pub kind: String,
+    pub message: String,
+    pub delivered: bool,
+}
+
+/// Create a task's initial dispatch state in one value, so a caller cannot
+/// forget `handoff_mode` and leave delivery semantics unset.
 impl Task {
     /// The message room for a task, derived from its id so the two can never
     /// drift. Every participant on the task — agents and the human — reads and
     /// posts to exactly this thread.
     pub fn thread_for(id: &str) -> String {
         format!("task:{id}")
+    }
+
+    /// A task as the human files it: unstarted, unassigned, and owned by nobody
+    /// yet. Constructed here rather than at each call site so a new field's
+    /// default is decided once, next to the type it belongs to.
+    pub fn filed_by_human(
+        id: String,
+        title: String,
+        description: String,
+        priority: i64,
+        now: String,
+    ) -> Self {
+        Self {
+            thread_id: Self::thread_for(&id),
+            id,
+            title,
+            description,
+            status: TaskStatus::Todo,
+            priority,
+            created_by_kind: "human".into(),
+            created_by_id: "local".into(),
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+            session_id: String::new(),
+            handoff: None,
+            handoff_mode: HandoffMode::default(),
+            reporting_session: None,
+            dispatch_failures: 0,
+            result: None,
+            notifications: Vec::new(),
+            owned_paths: Vec::new(),
+        }
+    }
+
+    /// A task routed to a session by Mission Control or an agent tool. Unlike a
+    /// human filing, this carries the target session, owned paths, and delivery
+    /// semantics from the moment it exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatched_to(
+        id: String,
+        session_id: String,
+        title: String,
+        description: String,
+        owned_paths: Vec<std::path::PathBuf>,
+        handoff_mode: HandoffMode,
+        created_by_kind: &str,
+        created_by_id: &str,
+        now: String,
+    ) -> Self {
+        Self {
+            thread_id: Self::thread_for(&id),
+            id,
+            title,
+            description,
+            status: TaskStatus::Todo,
+            priority: 0,
+            created_by_kind: created_by_kind.to_string(),
+            created_by_id: created_by_id.to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+            session_id,
+            handoff: None,
+            handoff_mode,
+            reporting_session: None,
+            dispatch_failures: 0,
+            result: None,
+            notifications: Vec::new(),
+            owned_paths,
+        }
     }
 }
 
@@ -117,6 +278,38 @@ fn parse_link_kind(value: String, column: usize) -> Result<TaskLinkKind, rusqlit
     })
 }
 
+/// Decode an optional JSON column. `NULL` is `None`; a malformed payload is a
+/// conversion error rather than a silent default, so a corrupted row surfaces
+/// instead of reading as "no handoff".
+fn decode_optional_json<T: serde::de::DeserializeOwned>(
+    raw: Option<String>,
+    column: usize,
+) -> Result<Option<T>, rusqlite::Error> {
+    match raw {
+        None => Ok(None),
+        // Decode as `Option<T>`, not `T`: a written `None` is the JSON literal
+        // `null`, and deserializing that into `T` is an error rather than `None`.
+        Some(text) => serde_json::from_str::<Option<T>>(&text).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        }),
+    }
+}
+
+/// Decode a NOT NULL JSON column that has a default, so a row written before the
+/// column existed still reads as an empty collection.
+fn decode_json_vec<T: serde::de::DeserializeOwned>(
+    raw: String,
+    column: usize,
+) -> Result<Vec<T>, rusqlite::Error> {
+    serde_json::from_str(&raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
 fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
     Ok(Task {
         id: row.get(0)?,
@@ -130,27 +323,84 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
         updated_at: row.get(8)?,
         completed_at: row.get(9)?,
         thread_id: row.get(10)?,
+        session_id: row.get(11)?,
+        handoff: decode_optional_json(row.get(12)?, 12)?,
+        handoff_mode: HandoffMode::parse(&row.get::<_, String>(13)?).unwrap_or_default(),
+        reporting_session: row.get(14)?,
+        dispatch_failures: row.get::<_, i64>(15)? as u32,
+        result: decode_optional_json(row.get(16)?, 16)?,
+        notifications: decode_json_vec(row.get(17)?, 17)?,
+        owned_paths: decode_json_vec(row.get(18)?, 18)?,
     })
 }
 
 const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
-     created_by_id, created_at, updated_at, completed_at, thread_id";
+     created_by_id, created_at, updated_at, completed_at, thread_id, session_id,
+     handoff_json, handoff_mode, reporting_session, dispatch_failures, result_json,
+     notifications_json, owned_paths_json";
 
-impl CoordinationDb {
+/// Persist every mutable column of a task. Takes the connection so it composes
+/// into the read-modify-write transaction in `update_task_in` — a separate
+/// connection would break the isolation that transaction exists to provide.
+///
+/// `created_at` and `created_by_*` are deliberately absent: a task's origin is
+/// history, not state, and a rewrite must not be able to change it.
+fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE tasks SET
+            title = ?2,
+            description = ?3,
+            status = ?4,
+            priority = ?5,
+            updated_at = ?6,
+            completed_at = ?7,
+            session_id = ?8,
+            handoff_json = ?9,
+            handoff_mode = ?10,
+            reporting_session = ?11,
+            dispatch_failures = ?12,
+            result_json = ?13,
+            notifications_json = ?14,
+            owned_paths_json = ?15
+         WHERE id = ?1",
+        params![
+            task.id,
+            task.title,
+            task.description,
+            status_text(&task.status),
+            task.priority,
+            task.updated_at,
+            task.completed_at,
+            task.session_id,
+            serde_json::to_string(&task.handoff).unwrap_or_else(|_| "null".into()),
+            task.handoff_mode.as_str(),
+            task.reporting_session,
+            task.dispatch_failures,
+            serde_json::to_string(&task.result).unwrap_or_else(|_| "null".into()),
+            serde_json::to_string(&task.notifications).unwrap_or_else(|_| "[]".into()),
+            serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
+        ],
+    )?;
+    Ok(())
+}
+
+impl Store {
     /// Create a task AND its message room in one transaction.
     ///
     /// The thread row is written here with `scope = 'task'` and the task id as
     /// `subject_id`, so a task room is distinguishable from the shared room. The
     /// `INSERT OR IGNORE` in `append_event` then no-ops on it, which is why that
     /// path needs no special case.
-    pub fn create_task(&self, task: &Task) -> Result<(), CoordinationDbError> {
+    pub fn create_task(&self, task: &Task) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute(
                 "INSERT INTO tasks (id, title, description, status, priority,
                     created_by_kind, created_by_id, created_at, updated_at,
-                    completed_at, thread_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10)",
+                    completed_at, thread_id, session_id, handoff_json, handoff_mode,
+                    reporting_session, dispatch_failures, result_json,
+                    notifications_json, owned_paths_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![
                     task.id,
                     task.title,
@@ -162,6 +412,14 @@ impl CoordinationDb {
                     task.created_at,
                     task.completed_at,
                     task.thread_id,
+                    task.session_id,
+                    serde_json::to_string(&task.handoff).unwrap_or_else(|_| "null".into()),
+                    task.handoff_mode.as_str(),
+                    task.reporting_session,
+                    task.dispatch_failures,
+                    serde_json::to_string(&task.result).unwrap_or_else(|_| "null".into()),
+                    serde_json::to_string(&task.notifications).unwrap_or_else(|_| "[]".into()),
+                    serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
                 ],
             )?;
             tx.execute(
@@ -182,12 +440,250 @@ impl CoordinationDb {
         })
     }
 
-    pub fn get_task(&self, id: &str) -> Result<Option<Task>, CoordinationDbError> {
+    pub fn get_task(&self, id: &str) -> Result<Option<Task>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt =
                 conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))?;
             Ok(stmt.query_row(params![id], task_from_row).optional()?)
         })
+    }
+
+    /// Every task matching a filter, in board order.
+    ///
+    /// The dispatcher's whole queue is `list_tasks(None, Some(Todo))`, and the
+    /// session view is `list_tasks(Some(id), None)` — the two reads that used to
+    /// walk a directory of JSON files.
+    pub fn list_tasks(
+        &self,
+        session_id: Option<&str>,
+        status: Option<&TaskStatus>,
+    ) -> Result<Vec<Task>, StoreError> {
+        let status = status.map(status_text);
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {TASK_COLUMNS} FROM tasks
+                 WHERE (?1 IS NULL OR session_id = ?1)
+                   AND (?2 IS NULL OR status = ?2)
+                 ORDER BY priority DESC, created_at, id"
+            ))?;
+            let rows = stmt.query_map(params![session_id, status], task_from_row)?;
+            rows.collect()
+        })
+    }
+
+    /// Tasks whose title or description contains `query`, case-insensitively.
+    pub fn find_tasks(
+        &self,
+        session_id: Option<&str>,
+        query: &str,
+    ) -> Result<Vec<Task>, StoreError> {
+        let needle = format!("%{}%", query.to_lowercase());
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {TASK_COLUMNS} FROM tasks
+                 WHERE (?1 IS NULL OR session_id = ?1)
+                   AND (lower(title) LIKE ?2 OR lower(description) LIKE ?2)
+                 ORDER BY priority DESC, created_at, id"
+            ))?;
+            let rows = stmt.query_map(params![session_id, needle], task_from_row)?;
+            rows.collect()
+        })
+    }
+
+    /// Read-modify-write one task in a single transaction, stamping `updated_at`.
+    ///
+    /// This is the ONE mutation path. The dispatcher, the REST handlers and the
+    /// worker tool calls all funnel through it, so a concurrent notification or
+    /// report can never be lost to a stale read — which is what the process-wide
+    /// file lock existed to prevent when the store was JSON files.
+    pub fn update_task_in(
+        &self,
+        id: &str,
+        now: &str,
+        f: impl FnOnce(&mut Task),
+    ) -> Result<Task, StoreError> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut task: Task = tx
+                .query_row(
+                    &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+                    params![id],
+                    task_from_row,
+                )
+                .optional()?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            f(&mut task);
+            task.updated_at = now.to_string();
+            write_task(&tx, &task)?;
+            tx.commit()?;
+            Ok(task)
+        })
+    }
+
+    /// Atomically claim a `Todo` task for dispatch: flips it to `InProgress`
+    /// exactly once, binding the reporting session.
+    ///
+    /// The load/check/write runs in one transaction, so concurrent dispatchers
+    /// (the loop and a REST path) race through it and only one wins. Returning
+    /// the task unchanged when it is already claimed lets the loser exit without
+    /// delivering a second envelope.
+    pub fn claim_task_for_dispatch(
+        &self,
+        id: &str,
+        now: &str,
+    ) -> Result<Task, StoreError> {
+        self.update_task_in(id, now, |task| {
+            if task.status != TaskStatus::Todo {
+                return;
+            }
+            task.status = TaskStatus::InProgress;
+            task.reporting_session = Some(task.session_id.clone());
+        })
+    }
+
+    /// Move a task to a terminal status with its result.
+    ///
+    /// Refuses a non-terminal status and refuses to overwrite an already-terminal
+    /// task, so a second completion cannot flip a `Done` task to `Failed` or
+    /// replace its result.
+    pub fn complete_task(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        result: TaskResult,
+        now: &str,
+    ) -> Result<Task, StoreError> {
+        if !status.is_terminal() {
+            return Err(StoreError::NotTerminal(format!("{status:?}")));
+        }
+        let kind = match status {
+            TaskStatus::Done => "done",
+            TaskStatus::Failed => "failed",
+            _ => "info",
+        };
+        let mut already_terminal = None;
+        let task = self.update_task_in(id, now, |task| {
+            if task.status.is_terminal() {
+                already_terminal = Some(task.status.clone());
+                return;
+            }
+            task.status = status.clone();
+            task.result = Some(result.clone());
+            task.owned_paths.clear();
+            task.reporting_session = None;
+            task.notifications.push(NotificationMarker {
+                target: "mission_control".into(),
+                kind: kind.into(),
+                message: result.summary.clone(),
+                delivered: false,
+            });
+        })?;
+        if let Some(existing) = already_terminal {
+            return Err(StoreError::AlreadyTerminal {
+                id: id.to_string(),
+                status: format!("{existing:?}"),
+            });
+        }
+        Ok(task)
+    }
+
+    /// Re-queue a blocked or failed task so dispatch can deliver it again.
+    ///
+    /// Refuses `Done`/`Cancelled` (finished) and `InProgress` (still delivered to
+    /// a worker) — only work that is genuinely waiting can be retried.
+    pub fn retry_task(&self, id: &str, now: &str) -> Result<Task, StoreError> {
+        let mut refused = None;
+        let task = self.update_task_in(id, now, |task| {
+            if matches!(
+                task.status,
+                TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::InProgress
+            ) {
+                refused = Some(task.status.clone());
+                return;
+            }
+            task.status = TaskStatus::Todo;
+            task.dispatch_failures = 0;
+            task.reporting_session = None;
+            task.owned_paths.clear();
+            task.notifications.push(NotificationMarker {
+                target: "mission_control".into(),
+                kind: "info".into(),
+                message: "re-queued after temporary failure".into(),
+                delivered: true,
+            });
+        })?;
+        if let Some(status) = refused {
+            return Err(StoreError::NotRetryable {
+                id: id.to_string(),
+                status: format!("{status:?}"),
+            });
+        }
+        Ok(task)
+    }
+
+    /// Return every `Blocked` task whose dependencies are all terminal back to
+    /// `Todo`, so the dispatch loop can pick them up. Returns the ids re-queued.
+    ///
+    /// Tasks parked by the dispatch retry ceiling are excluded: they are blocked
+    /// with no dependencies, and re-queuing them would spin the loop forever.
+    /// A user resets those explicitly.
+    pub fn unblock_ready_tasks(
+        &self,
+        now: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let blocked = self.list_tasks(None, Some(&TaskStatus::Blocked))?;
+        let mut unblocked = Vec::new();
+        for task in blocked {
+            if task.dispatch_failures > 0 {
+                continue;
+            }
+            let blockers = self.blockers_of(&task.id)?;
+            if blockers.is_empty() {
+                continue;
+            }
+            let all_done = blockers.iter().all(|id| {
+                self.get_task(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|other| other.status.is_terminal())
+            });
+            if !all_done {
+                continue;
+            }
+            let updated = self.update_task_in(&task.id, now, |t| {
+                if t.status == TaskStatus::Blocked {
+                    t.status = TaskStatus::Todo;
+                }
+            })?;
+            if updated.status == TaskStatus::Todo {
+                unblocked.push(task.id);
+            }
+        }
+        Ok(unblocked)
+    }
+
+    /// Other in-progress tasks that already own any of `candidate_paths`.
+    ///
+    /// Only `InProgress` counts as ownership: a blocked or finished task has
+    /// released its paths, so re-dispatching into them is safe.
+    pub fn task_path_conflicts(
+        &self,
+        candidate_task_id: &str,
+        candidate_paths: &[std::path::PathBuf],
+    ) -> Result<Vec<(String, std::path::PathBuf)>, StoreError> {
+        let active = self.list_tasks(None, Some(&TaskStatus::InProgress))?;
+        let mut conflicts = Vec::new();
+        for task in active {
+            if task.id == candidate_task_id {
+                continue;
+            }
+            for path in candidate_paths {
+                if task.owned_paths.iter().any(|owned| owned == path) {
+                    conflicts.push((task.id.clone(), path.clone()));
+                }
+            }
+        }
+        Ok(conflicts)
     }
 
     /// Tasks in board order: status column order is left to the caller, but
@@ -198,7 +694,7 @@ impl CoordinationDb {
         filter: &TaskFilter<'_>,
         after: Option<(&str, &str)>,
         limit: u32,
-    ) -> Result<Vec<Task>, CoordinationDbError> {
+    ) -> Result<Vec<Task>, StoreError> {
         let (after_created, after_id) = match after {
             Some((created, id)) => (Some(created), Some(id)),
             None => (None, None),
@@ -234,7 +730,7 @@ impl CoordinationDb {
         description: Option<&str>,
         priority: Option<i64>,
         now: &str,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             Ok(conn.execute(
                 "UPDATE tasks SET
@@ -256,7 +752,7 @@ impl CoordinationDb {
         id: &str,
         status: &TaskStatus,
         now: &str,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         let completed = if *status == TaskStatus::Done {
             Some(now)
         } else {
@@ -274,7 +770,7 @@ impl CoordinationDb {
         })
     }
 
-    pub fn link_tasks(&self, link: &TaskLink) -> Result<(), CoordinationDbError> {
+    pub fn link_tasks(&self, link: &TaskLink) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (from_task_id, to_task_id, kind, created_at)
@@ -295,7 +791,7 @@ impl CoordinationDb {
         from_task_id: &str,
         to_task_id: &str,
         kind: &TaskLinkKind,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             Ok(conn.execute(
                 "DELETE FROM task_links
@@ -310,7 +806,7 @@ impl CoordinationDb {
     /// An incoming `blocks` edge is as important as an outgoing one — it is what
     /// tells a reader this task is waiting on something. Returning only outgoing
     /// edges would render a blocked task as unblocked.
-    pub fn task_links(&self, task_id: &str) -> Result<Vec<TaskLink>, CoordinationDbError> {
+    pub fn task_links(&self, task_id: &str) -> Result<Vec<TaskLink>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT from_task_id, to_task_id, kind, created_at
@@ -334,7 +830,7 @@ impl CoordinationDb {
     ///
     /// Stored as `A blocks B` and read as "B is blocked by A", so the query
     /// follows `to_task_id` and identifies the blockers by `from_task_id`.
-    pub fn blockers_of(&self, task_id: &str) -> Result<Vec<String>, CoordinationDbError> {
+    pub fn blockers_of(&self, task_id: &str) -> Result<Vec<String>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT from_task_id FROM task_links
@@ -357,7 +853,7 @@ impl CoordinationDb {
         agent_id: &str,
         role: &str,
         now: &str,
-    ) -> Result<(), CoordinationDbError> {
+    ) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
             let thread: Option<String> = tx
@@ -395,7 +891,7 @@ impl CoordinationDb {
         task_id: &str,
         agent_id: &str,
         now: &str,
-    ) -> Result<bool, CoordinationDbError> {
+    ) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             Ok(conn.execute(
                 "UPDATE task_agents SET removed_at = ?3
@@ -409,7 +905,7 @@ impl CoordinationDb {
     ///
     /// Includes removed members so the UI can show who worked on it; `removed_at`
     /// is how a caller tells them apart.
-    pub fn list_task_agents(&self, task_id: &str) -> Result<Vec<TaskAgent>, CoordinationDbError> {
+    pub fn list_task_agents(&self, task_id: &str) -> Result<Vec<TaskAgent>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT task_id, agent_id, role, added_at, removed_at
@@ -436,23 +932,17 @@ mod tests {
     use super::*;
 
     fn task(id: &str) -> Task {
-        Task {
-            id: id.into(),
-            title: format!("Task {id}"),
-            description: "do the thing".into(),
-            status: TaskStatus::Todo,
-            priority: 0,
-            created_by_kind: "human".into(),
-            created_by_id: "local".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            completed_at: None,
-            thread_id: Task::thread_for(id),
-        }
+        Task::filed_by_human(
+            id.into(),
+            format!("Task {id}"),
+            "do the thing".into(),
+            0,
+            "2026-01-01T00:00:00Z".into(),
+        )
     }
 
-    fn db() -> CoordinationDb {
-        CoordinationDb::open_in_memory().unwrap()
+    fn db() -> Store {
+        Store::open_in_memory().unwrap()
     }
 
     #[test]
@@ -553,8 +1043,6 @@ mod tests {
             status: crate::coordination::types::AgentStatus::Active,
             role: crate::coordination::types::AgentRole::Implementer,
             capabilities: vec![],
-            max_concurrent_assignments: 1,
-            version: 1,
         })
         .unwrap();
 

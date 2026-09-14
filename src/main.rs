@@ -75,6 +75,108 @@ enum Command {
         #[command(subcommand)]
         action: VaultAction,
     },
+    /// Create and inspect the snippet database (~/.snippet/snippet.db) — the
+    /// general-purpose store for coordination and conversations.
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
+    /// Message internal agents and give one work in a session, through the
+    /// running serve daemon. The daemon owns delivery, so a message accepted here
+    /// is still delivered after a restart.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentAction {
+    /// List the agents in the coordination directory.
+    List {
+        /// Print the response as raw JSON.
+        /// Print the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a direct message to an agent.
+    Message {
+        /// Recipient agent id, as shown by `snippet agent list`.
+        agent_id: String,
+        /// The message body. Omit to read it from stdin.
+        body: Vec<String>,
+        /// Send as this agent instead of the local human.
+        #[arg(long)]
+        from_agent: Option<String>,
+        /// A retry with the same key does not duplicate the message.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Read a direct conversation, oldest first.
+    Thread {
+        /// The peer agent id (or `human` for the local human).
+        peer: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Show only messages after this sequence.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// The local participant: `human` (default) or an agent id.
+        #[arg(long)]
+        as_actor: Option<String>,
+        /// Print the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List your direct conversations with unread counts.
+    Inbox {
+        /// The local participant: `human` (default) or an agent id.
+        #[arg(long)]
+        as_actor: Option<String>,
+        /// Print the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Give an agent work in a session: creates the assignment and lets the
+    /// daemon dispatch it.
+    Dispatch {
+        /// Target durable session id (`snippet sessions` lists them).
+        session_id: String,
+        /// Agent id to work it; defaults to the general agent.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// What the work is.
+        #[arg(long)]
+        scope: String,
+        /// How the agent knows it is finished.
+        #[arg(long)]
+        definition_of_done: String,
+        /// Inference profile for this dispatch; defaults to the session's own.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Group related dispatches under one goal.
+        #[arg(long)]
+        goal_id: Option<String>,
+        /// Print the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DbAction {
+    /// Create the database and its tables if absent, then report what exists.
+    /// Idempotent: running it against an existing store only migrates.
+    Init,
+    /// Show the store's path, integrity, and per-table row counts.
+    Status,
+    /// Copy file-backed sessions into the store. Read-only: the state files are
+    /// left in place, so this can be re-run and the originals stay the fallback.
+    Migrate {
+        /// Report what would be copied without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -260,6 +362,384 @@ fn vault_cli(action: VaultAction) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Create and inspect the snippet store.
+///
+/// Opening the database is what creates it — `Store::open` runs the
+/// schema migration — so `init` is deliberately just an open plus a report, not a
+/// separate creation path that could drift from what the daemon does at startup.
+fn db_cli(action: DbAction) -> Result<(), Box<dyn std::error::Error>> {
+    let path = snippet::store::default_db_path();
+    let existed = path.exists();
+    let store = snippet::store::Store::open(&path)?;
+    match action {
+        DbAction::Init => {
+            println!(
+                "{} {}",
+                if existed { "ready" } else { "created" },
+                path.display()
+            );
+            report_store(&store)?;
+        }
+        DbAction::Status => {
+            println!("path: {}", store.path().display());
+            report_store(&store)?;
+        }
+        DbAction::Migrate { dry_run } => {
+            if dry_run {
+                // A dry run applies the SAME staleness rule the real run does,
+                // so the preview shows exactly what would be written.
+                let (sessions, failed) =
+                    snippet::conversations::scan_file_sessions(&store)?;
+                println!("would migrate {} session(s):", sessions.len());
+                for s in &sessions {
+                    println!(
+                        "  {:<52} {:>5} msgs  {:>4} events",
+                        s.id, s.messages, s.events
+                    );
+                }
+                report_failures(&failed);
+                return Ok(());
+            }
+            let (migrated, failed) = snippet::conversations::migrate_file_sessions(&store)?;
+            println!("migrated {} session(s):", migrated.len());
+            for s in &migrated {
+                println!(
+                    "  {:<52} {:>5} msgs  {:>4} events",
+                    s.id, s.messages, s.events
+                );
+            }
+            report_failures(&failed);
+            report_store(&store)?;
+        }
+    }
+    Ok(())
+}
+
+/// The CLI's acting participant: the local human unless an agent is named.
+///
+/// The daemon refuses an unknown sender, so naming an agent here can only speak
+/// as an identity the directory already knows.
+fn cli_actor(as_actor: Option<&str>) -> (String, String) {
+    match as_actor.map(str::trim).filter(|actor| !actor.is_empty()) {
+        None | Some("human") | Some("local") => ("human".to_string(), "local".to_string()),
+        Some(agent) => ("agent".to_string(), agent.to_string()),
+    }
+}
+
+/// Resolve a `thread <peer>` argument to a participant reference. `human` is the
+/// local human, which is what an agent uses to read its conversation with you.
+fn peer_actor(peer: &str) -> (String, String) {
+    match peer.trim() {
+        "human" | "local" => ("human".to_string(), "local".to_string()),
+        other => ("agent".to_string(), other.to_string()),
+    }
+}
+
+fn print_json(value: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// Call one daemon route, authenticating with the published token.
+async fn daemon_http(
+    state: &ServeState,
+    method: &str,
+    route: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let mut url = browser_route_url(state.base_url(), route)?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("token", &state.token);
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
+    let request = match method {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        other => return Err(format!("unsupported daemon method `{other}`").into()),
+    };
+    let request = match body {
+        Some(value) => request.json(&value),
+        None => request,
+    };
+    let response = request.send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .unwrap_or_else(|_| serde_json::json!({ "error": text }));
+    if !status.is_success() {
+        // An error body is a bare string, not an object, so it is read directly
+        // before falling back to an `error` field.
+        let detail = value
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(text);
+        return Err(format!("daemon returned {status}: {detail}").into());
+    }
+    Ok(value)
+}
+
+/// Message internal agents and dispatch work, over the running daemon.
+///
+/// These commands go through the daemon rather than writing SQLite directly: the
+/// daemon owns delivery, wake-up, and the retry ledger, so a message this CLI
+/// accepts is still delivered after a restart.
+async fn agent_cli(action: AgentAction) -> Result<(), Box<dyn std::error::Error>> {
+    let state = browser_connection().map_err(|error| {
+        format!(
+            "{error}\n\nis the daemon running? start it with `snippet serve`, then check `snippet serve --status`"
+        )
+    })?;
+    match action {
+        AgentAction::List { json } => {
+            let value = daemon_http(&state, "GET", "agents", &[], None).await?;
+            if json {
+                return print_json(&value);
+            }
+            let agents = value.as_array().cloned().unwrap_or_default();
+            if agents.is_empty() {
+                println!("no agents in the directory");
+            }
+            for agent in agents {
+                let id = agent.get("id").and_then(serde_json::Value::as_str).unwrap_or("?");
+                let name = agent
+                    .get("display_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(id);
+                let kind = agent.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+                let role = agent.get("role").and_then(serde_json::Value::as_str).unwrap_or("");
+                let status = agent
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                println!("{id:<24} {name:<20} {kind:<14} {role:<12} {status}");
+            }
+            Ok(())
+        }
+        AgentAction::Message {
+            agent_id,
+            body,
+            from_agent,
+            idempotency_key,
+        } => {
+            let body = if body.is_empty() {
+                use std::io::Read;
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                text.trim().to_string()
+            } else {
+                body.join(" ")
+            };
+            if body.trim().is_empty() {
+                return Err("message body must not be empty".into());
+            }
+            let (from_kind, from_id) = cli_actor(from_agent.as_deref());
+            let mut payload = serde_json::json!({
+                "from_kind": from_kind,
+                "from_id": from_id,
+                "to_kind": "agent",
+                "to_id": agent_id,
+                "body": body.trim(),
+            });
+            if let Some(key) = idempotency_key {
+                payload["idempotency_key"] = serde_json::json!(key);
+            }
+            let value = daemon_http(
+                &state,
+                "POST",
+                "coordination/direct/messages",
+                &[],
+                Some(payload),
+            )
+            .await?;
+            let thread = value
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let sequence = value
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            println!("✓ sent to {agent_id} (thread {thread}, seq {sequence})");
+            Ok(())
+        }
+        AgentAction::Thread {
+            peer,
+            limit,
+            after,
+            as_actor,
+            json,
+        } => {
+            let (actor_kind, actor_id) = cli_actor(as_actor.as_deref());
+            let (peer_kind, peer_id) = peer_actor(&peer);
+            let value = daemon_http(
+                &state,
+                "GET",
+                "coordination/direct/messages",
+                &[
+                    ("actor_kind", actor_kind),
+                    ("actor_id", actor_id),
+                    ("peer_kind", peer_kind),
+                    ("peer_id", peer_id),
+                    ("after_sequence", after.to_string()),
+                    ("limit", limit.to_string()),
+                ],
+                None,
+            )
+            .await?;
+            if json {
+                return print_json(&value);
+            }
+            let events = value
+                .get("events")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if events.is_empty() {
+                println!("no messages yet");
+            }
+            for event in events {
+                let sequence = event
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let kind = event
+                    .get("actor_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let id = event
+                    .get("actor_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let at = event
+                    .get("created_at")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let body = event
+                    .pointer("/payload/body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                println!("[{sequence}] {kind}:{id}  {at}\n  {body}");
+            }
+            Ok(())
+        }
+        AgentAction::Inbox { as_actor, json } => {
+            let (actor_kind, actor_id) = cli_actor(as_actor.as_deref());
+            let value = daemon_http(
+                &state,
+                "GET",
+                "coordination/direct/threads",
+                &[("actor_kind", actor_kind), ("actor_id", actor_id)],
+                None,
+            )
+            .await?;
+            if json {
+                return print_json(&value);
+            }
+            let threads = value.as_array().cloned().unwrap_or_default();
+            if threads.is_empty() {
+                println!("no conversations yet");
+            }
+            for thread in threads {
+                let title = thread
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let peer = thread
+                    .get("peer_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let unread = thread
+                    .get("unread")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let badge = if unread > 0 {
+                    format!("{unread} unread")
+                } else {
+                    "read".to_string()
+                };
+                println!("{title:<40} peer={peer:<16} {badge}");
+            }
+            Ok(())
+        }
+        AgentAction::Dispatch {
+            session_id,
+            agent_id,
+            scope,
+            definition_of_done,
+            profile,
+            goal_id,
+            json,
+        } => {
+            let mut payload = serde_json::json!({
+                "session_id": session_id,
+                "scope": scope,
+                "definition_of_done": definition_of_done,
+            });
+            if let Some(agent_id) = agent_id {
+                payload["agent_id"] = serde_json::json!(agent_id);
+            }
+            if let Some(profile) = profile {
+                payload["profile"] = serde_json::json!(profile);
+            }
+            if let Some(goal_id) = goal_id {
+                payload["goal_id"] = serde_json::json!(goal_id);
+            }
+            let value =
+                daemon_http(&state, "POST", "coordination/dispatch", &[], Some(payload)).await?;
+            if json {
+                return print_json(&value);
+            }
+            let assignment = value
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let agent = value
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let profile = value
+                .get("profile")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("session default");
+            println!("✓ dispatched to {agent} (assignment {assignment}, profile {profile})");
+            Ok(())
+        }
+    }
+}
+
+fn report_failures(failed: &[(String, String)]) {
+    if failed.is_empty() {
+        return;
+    }
+    println!("skipped {} session(s):", failed.len());
+    for (id, reason) in failed {
+        println!("  {id}: {reason}");
+    }
+}
+
+fn report_store(
+    store: &snippet::store::Store,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("integrity: {}", if store.integrity_check()? { "ok" } else { "FAILED" });
+    let tables = store.table_names()?;
+    println!("tables ({}):", tables.len());
+    for table in tables {
+        println!("  {table:<20} {:>6} rows", store.table_row_count(&table)?);
+    }
+    Ok(())
+}
+
 /// Read a line from the TTY with echo disabled (crossterm raw mode) — no extra
 /// password-prompt dependency needed.
 fn rpassword_read() -> Result<String, Box<dyn std::error::Error>> {
@@ -305,6 +785,22 @@ fn runtime() -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
 struct ServeState {
     url: String,
     token: String,
+    /// The daemon's local address. Preferred by the CLI: a CLI on the same
+    /// machine should not reach its own daemon through the public tunnel.
+    #[serde(default)]
+    api_url: Option<String>,
+}
+
+impl ServeState {
+    /// The base URL the CLI talks to: the local address when published, else the
+    /// public one.
+    fn base_url(&self) -> &str {
+        self.api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or(&self.url)
+    }
 }
 
 fn serve_state_path() -> PathBuf {
@@ -754,6 +1250,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(Command::Vault { action }) => return vault_cli(action),
+        Some(Command::Db { action }) => return db_cli(action),
+        Some(Command::Agent { action }) => return runtime()?.block_on(agent_cli(action)),
         Some(Command::Browser { action }) => return runtime()?.block_on(browser_cli(action)),
         Some(Command::Serve {
             port,

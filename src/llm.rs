@@ -397,7 +397,9 @@ impl RateLimitWindow {
 
 impl RateLimitSnapshot {
     pub fn is_reported(&self) -> bool {
-        self.primary.as_ref().is_some_and(RateLimitWindow::is_reported)
+        self.primary
+            .as_ref()
+            .is_some_and(RateLimitWindow::is_reported)
             || self
                 .secondary
                 .as_ref()

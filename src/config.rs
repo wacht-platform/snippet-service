@@ -3,21 +3,90 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Per-workspace state path: `~/.snippet/workspaces/{name}-{hash}/state.json`.
-/// Single source of truth, used by the per-launch config and the serve daemon.
-pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    workspace.hash(&mut hasher);
-    let hash = hasher.finish();
+/// Stable key for a workspace folder, derived from its full path.
+///
+/// SHA-256 rather than `DefaultHasher`: the std hasher's algorithm is explicitly
+/// unspecified and may change between Rust releases, which would silently
+/// re-key every workspace at once and strand all history on a toolchain bump.
+///
+/// Keyed on the absolute path, so a MOVE changes the key (a moved folder is a
+/// new project from the store's point of view). Renames and moves are accepted
+/// as breaking; the value of a stable algorithm is that it breaks ONCE and
+/// predictably, never spontaneously.
+pub fn workspace_key(workspace: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    format!("{digest:x}")[..16].to_string()
+}
+
+/// The workspace's state directory name: `<folder-name>-<stable-key>`.
+pub fn workspace_dir_name(workspace: &Path) -> String {
     let name = workspace
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(format!(".snippet/workspaces/{name}-{hash:x}/state.json"))
+    format!("{name}-{}", workspace_key(workspace))
+}
+
+/// Per-workspace state path: `~/.snippet/workspaces/{name}-{key}/state.json`.
+/// Single source of truth, used by the per-launch config and the serve daemon.
+pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
+    snippet_home()
+        .join("workspaces")
+        .join(workspace_dir_name(workspace))
+        .join("state.json")
+}
+
+/// A workspace's state path for READING: an existing directory wins over a
+/// freshly computed one.
+///
+/// The key is derived from the absolute path, so a directory recorded under an
+/// older key still holds this workspace's history. Resolving that first keeps
+/// the history reachable instead of silently starting a blank session; only when
+/// nothing matches is the new path chosen (and created on first write).
+pub fn resolve_state_path_for_workspace(workspace: &Path) -> PathBuf {
+    let fresh = state_path_for_workspace(workspace);
+    if fresh.exists() {
+        return fresh;
+    }
+    find_existing_workspace_state(workspace).unwrap_or(fresh)
+}
+
+/// Scan the workspace root for a directory whose recorded folder is this one.
+///
+/// The `state.meta.json` sidecar records the absolute folder, so it is the only
+/// thing that can tie a directory back to a workspace when the key no longer
+/// matches. Directories without a sidecar are skipped rather than guessed at.
+fn find_existing_workspace_state(workspace: &Path) -> Option<PathBuf> {
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let target = canonical.to_string_lossy().to_string();
+    for entry in std::fs::read_dir(workspaces_root()).ok()?.flatten() {
+        let dir = entry.path();
+        let raw = match std::fs::read_to_string(dir.join("state.meta.json")) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if meta.get("folder").and_then(|f| f.as_str()) != Some(target.as_str()) {
+            continue;
+        }
+        let state = dir.join("state.json");
+        if state.exists() {
+            return Some(state);
+        }
+    }
+    // Migrated sessions have no sidecar or state file, so the disk scan cannot
+    // see them. The store records the folder directly, which is what keeps a
+    // session keyed by an older algorithm reachable instead of starting blank.
+    let id = crate::session::store_default_session_id(workspace)?;
+    Some(workspaces_root().join(id))
 }
 
 /// Root holding every workspace's session state.
@@ -282,7 +351,7 @@ impl SnippetConfig {
         } else if self.workspace.as_os_str().is_empty() {
             self.workspace = PathBuf::from(".");
         }
-        self.state_path = state_path_for_workspace(&self.workspace);
+        self.state_path = resolve_state_path_for_workspace(&self.workspace);
     }
 
     /// A copy of this config pinned to a different workspace folder — keeps the
@@ -290,7 +359,10 @@ impl SnippetConfig {
     /// daemon uses this to open a session in any folder the user picks.
     pub fn for_workspace(&self, workspace: PathBuf) -> SnippetConfig {
         let mut c = self.clone();
-        c.state_path = state_path_for_workspace(&workspace);
+        // Resolve, not compute: a folder whose state directory was keyed by an
+        // older algorithm still holds this workspace's history, and opening a
+        // blank session beside it would look like data loss.
+        c.state_path = resolve_state_path_for_workspace(&workspace);
         c.workspace = workspace;
         c
     }

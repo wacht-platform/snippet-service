@@ -83,6 +83,20 @@ struct PendingSidecarAttach {
     resume: bool,
 }
 
+/// A session mutation the picker asked for, to be sent to the daemon on the next
+/// tick.
+///
+/// `handle_key` is synchronous and the daemon call is not, so the key handler
+/// records the intent here and the async tick performs it. The daemon owns every
+/// session, so routing delete/rename through it is what keeps the store row, its
+/// messages, and its events consistent — a file-only delete leaves a migrated
+/// conversation readable.
+#[derive(Debug, Clone)]
+enum PendingSessionOp {
+    Delete { session_id: String },
+    Rename { session_id: String, title: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
     pub config_path: PathBuf,
@@ -154,24 +168,42 @@ impl ExitInfo {
     }
 }
 
-/// A real conversation state file: `<name>.json`, but NOT the `<name>.meta.json`
-/// sidecar (`Path::extension` of `foo.meta.json` is still `json`). Sidecars are
-/// written after every persist, so treating them as sessions made the resume
-/// picker list phantoms — and resuming one wrote real state over the sidecar.
-fn is_conversation_json(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("json")
-        && path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| !s.ends_with(".meta"))
-            .unwrap_or(false)
-}
-
 fn unix_secs_to_system_time(secs: i64) -> std::time::SystemTime {
     if secs <= 0 {
         return std::time::SystemTime::UNIX_EPOCH;
     }
     std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+}
+
+/// "just now" / "5m ago" / "3h ago" / "2d ago" from a last-active stamp.
+///
+/// One definition: the disk walk and the daemon catalog both label entries with
+/// it, and two copies would drift on the boundary rounding.
+fn relative_age(last_active: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(last_active);
+    let secs = now.saturating_sub(last_active).max(0) as u64;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// Clip a label to 40 chars with an ellipsis, so a long title cannot push the
+/// picker's layout around.
+fn shorten(desc: String) -> String {
+    if desc.chars().count() > 40 {
+        format!("{}...", desc.chars().take(37).collect::<String>())
+    } else {
+        desc
+    }
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -450,6 +482,15 @@ struct App {
     /// made the picker laggy at scale. Populated on picker open, refreshed after
     /// rename/delete, dropped on close.
     conv_cache: Option<Vec<(String, String)>>,
+    /// The daemon's session catalog for this workspace, refreshed periodically.
+    ///
+    /// The picker renders from this rather than walking the filesystem: the
+    /// daemon owns sessions, and a migrated conversation has no state file at
+    /// all, so a directory walk would leave it out of the list entirely.
+    daemon_sessions: Option<Vec<crate::serve::sidecar::SessionRow>>,
+    daemon_sessions_refresh:
+        Option<tokio::task::JoinHandle<Result<Vec<crate::serve::sidecar::SessionRow>, String>>>,
+    daemon_sessions_refreshed_at: Option<std::time::Instant>,
     /// Account-wide ChatGPT usage (read from the shared sidecar), shown globally
     /// whenever signed in — not tied to the active chat's own last request.
     global_usage: Option<crate::llm::RateLimitSnapshot>,
@@ -482,7 +523,10 @@ struct App {
         Option<tokio::task::JoinHandle<Result<crate::xai_auth::DeviceCodeInfo, String>>>,
     models_fetch_status: String,
     original_config: Option<crate::config::SnippetConfig>,
-    last_state_modified: Option<std::time::SystemTime>,
+    /// Change-detector for the active session's state, taken from the state
+    /// itself rather than the file's mtime — a session in the database has no
+    /// file to stat, so mtime would never change and the view would never update.
+    last_state_stamp: Option<(String, usize)>,
     /// When true, the compact inline model-connect form is shown and owns key
     /// input. It edits the shared `form_*` state.
     login_active: bool,
@@ -507,6 +551,9 @@ struct App {
     sidecar_attach: Option<crate::serve::sidecar::SidecarAttach>,
     /// Set by `spawn_loop` in sidecar mode; consumed by `ensure_sidecar_attached`.
     pending_sidecar_attach: Option<PendingSidecarAttach>,
+    /// A session mutation requested from the picker, performed on the next tick
+    /// (the key handler is sync; the daemon call is not).
+    pending_session_op: Option<PendingSessionOp>,
     /// Interactive session PTYs (daemon-owned). Rendered when `screen == Term`.
     term_panes: Vec<TermPane>,
     term_focus: usize,
@@ -592,6 +639,9 @@ impl App {
             sent_turn_pending: false,
             effective_model: (String::new(), String::new()),
             conv_cache: None,
+            daemon_sessions: None,
+            daemon_sessions_refresh: None,
+            daemon_sessions_refreshed_at: None,
             global_usage: None,
             was_busy: false,
             form_provider: String::new(),
@@ -616,7 +666,7 @@ impl App {
             models_fetch_status: String::new(),
             update_notice: std::sync::Arc::new(std::sync::Mutex::new(None)),
             original_config: None,
-            last_state_modified: None,
+            last_state_stamp: None,
             login_active: false,
             q_index: 0,
             q_sel: 0,
@@ -626,6 +676,7 @@ impl App {
             sidecar: None,
             sidecar_attach: None,
             pending_sidecar_attach: None,
+            pending_session_op: None,
             term_panes: Vec::new(),
             term_focus: 0,
             connecting_phase: Some("Looking for local serve…".to_string()),
@@ -875,6 +926,20 @@ impl App {
         dir
     }
 
+    /// The state path a picker entry names.
+    ///
+    /// `default` is the workspace-root state; anything else is a saved
+    /// conversation under `conversations/`. THE one mapping — `switch_conversation`
+    /// and the delete/rename paths all need it, and a drift between them would
+    /// mutate a different session than the one the user selected.
+    fn state_path_for_conversation(&self, name: &str) -> PathBuf {
+        if name == "default" {
+            self.options.config.state_path.clone()
+        } else {
+            self.conversations_dir().join(format!("{name}.json"))
+        }
+    }
+
     fn find_last_active_conversation(&self) -> Option<String> {
         let dir = self.conversations_dir();
         let mut best_path: Option<PathBuf> = None;
@@ -883,7 +948,7 @@ impl App {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if is_conversation_json(&path) {
+                if crate::session::is_conversation_json(&path) {
                     let t = crate::session::session_last_active(&path);
                     if t > best_time {
                         best_time = t;
@@ -913,26 +978,138 @@ impl App {
         })
     }
 
-    /// Delete a saved conversation file + its metadata sidecar (resume picker `d`).
-    fn delete_conversation(&self, name: &str) {
-        let path = self.conversations_dir().join(format!("{name}.json"));
+    /// Delete a saved conversation (resume picker `d`).
+    ///
+    /// Queues the mutation for the next tick when a daemon is available: the
+    /// daemon owns every session, so routing through it keeps the store row and
+    /// its messages/events consistent — deleting files alone leaves a migrated
+    /// conversation readable. Falls back to the local delete with no daemon.
+    fn delete_conversation(&mut self, name: &str) {
+        if self.sidecar.is_some() {
+            let session_id = self.session_id_for(name);
+            // Drop it from the catalog now. The op is deferred to the next tick,
+            // so without this the entry the user just deleted keeps rendering
+            // until the daemon round-trip lands.
+            self.forget_session(&session_id);
+            self.pending_session_op = Some(PendingSessionOp::Delete { session_id });
+            return;
+        }
+        let path = self.state_path_for_conversation(name);
         crate::session::remove_session_files(&path);
     }
 
     /// Set a saved conversation's title override (resume picker `r`).
-    fn rename_conversation(&self, name: &str, title: &str) {
-        let path = self.conversations_dir().join(format!("{name}.json"));
+    fn rename_conversation(&mut self, name: &str, title: &str) {
+        if self.sidecar.is_some() {
+            let session_id = self.session_id_for(name);
+            if let Some(rows) = self.daemon_sessions.as_mut()
+                && let Some(row) = rows.iter_mut().find(|s| s.id == session_id)
+            {
+                row.title = title.to_string();
+            }
+            self.pending_session_op = Some(PendingSessionOp::Rename {
+                session_id,
+                title: title.to_string(),
+            });
+            return;
+        }
+        let path = self.state_path_for_conversation(name);
         let _ = crate::session::set_session_title(&path, title);
     }
 
+    /// Drop one session from the cached catalog, so a queued mutation renders
+    /// immediately instead of after the next daemon refresh.
+    fn forget_session(&mut self, session_id: &str) {
+        if let Some(rows) = self.daemon_sessions.as_mut() {
+            rows.retain(|s| s.id != session_id);
+        }
+    }
+
+    /// The daemon's session id for a picker entry.
+    ///
+    /// The picker speaks in conversation names; the API speaks in session ids
+    /// (path relative to the workspaces root). Derived from the same path helper
+    /// the picker uses, so the two can never disagree about which session it is.
+    fn session_id_for(&self, name: &str) -> String {
+        crate::session::session_id_for_state_path(&self.state_path_for_conversation(name))
+    }
+
+    /// Perform a picker mutation through the daemon.
+    ///
+    /// The key handler is synchronous and the daemon call is not, so the intent is
+    /// recorded there and run here. On success the catalog is re-fetched so the
+    /// picker reflects the change on its next frame instead of after the next
+    /// unrelated refresh.
+    async fn apply_pending_session_op(&mut self) {
+        let Some(op) = self.pending_session_op.take() else {
+            return;
+        };
+        let Some(info) = self.sidecar.clone() else {
+            return;
+        };
+        let result = match &op {
+            PendingSessionOp::Delete { session_id } => {
+                crate::serve::sidecar::delete_session(&info, session_id).await
+            }
+            PendingSessionOp::Rename { session_id, title } => {
+                crate::serve::sidecar::rename_session(&info, session_id, title).await
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.refresh_daemon_sessions(true).await;
+                // Drop the picker snapshot so it rebuilds from the fresh catalog.
+                self.conv_cache = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
     fn list_conversations(&self) -> Vec<(String, String)> {
+        // The daemon is the source of truth for the catalog. A migrated
+        // conversation has no state file, so walking the directory below would
+        // silently omit it — the picker would show a subset of what exists.
+        if let Some(rows) = self.daemon_sessions.as_ref() {
+            let mut list: Vec<(String, String, i64)> = rows
+                .iter()
+                .filter(|s| {
+                    if s.conversation.is_empty() {
+                        return false;
+                    }
+                    // Every workspace has a root `default` state, but the disk
+                    // walk only surfaces it once it has content — otherwise a
+                    // fresh folder shows a phantom "default session" with
+                    // nothing to resume into. Match that: a titled root state
+                    // means someone has actually used it.
+                    s.conversation != "default" || !s.title.trim().is_empty()
+                })
+                .map(|s| {
+                    let desc = if s.title.trim().is_empty() {
+                        "empty session".to_string()
+                    } else {
+                        s.title.trim().to_string()
+                    };
+                    (s.conversation.clone(), desc, s.last_active)
+                })
+                .collect();
+            list.sort_by(|a, b| b.2.cmp(&a.2));
+            return list
+                .into_iter()
+                .map(|(name, desc, last_active)| {
+                    (
+                        name,
+                        format!("({}) — {}", relative_age(last_active), shorten(desc)),
+                    )
+                })
+                .collect();
+        }
         let dir = self.conversations_dir();
         let mut list = Vec::new();
 
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if is_conversation_json(&path) {
+                if crate::session::is_conversation_json(&path) {
                     let name = path
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -946,16 +1123,16 @@ impl App {
                     let mod_time =
                         unix_secs_to_system_time(crate::session::session_last_active(&path));
 
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        if let Ok(state) = crate::harness::deserialize_state(&bytes) {
-                            if let Some(t) = state
-                                .title
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                            {
-                                desc = t.to_string();
-                            }
+                    // Store-or-file: a migrated conversation has no state file, so
+                    // reading the file directly would label it "empty session".
+                    if let Some(state) = crate::session::read_session_state(&path) {
+                        if let Some(t) = state
+                            .title
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                        {
+                            desc = t.to_string();
                         }
                     }
 
@@ -985,13 +1162,11 @@ impl App {
             // Skip a contentless default state — a fresh install otherwise shows a
             // phantom "default session" entry with nothing to resume into.
             let mut has_content = false;
-            if let Ok(bytes) = std::fs::read(default_path) {
-                if let Ok(state) = crate::harness::deserialize_state(&bytes) {
-                    has_content = state.title.as_deref().is_some_and(|t| !t.trim().is_empty())
-                        || !state.events.is_empty();
-                    if let Some(title) = state.title.as_deref().filter(|t| !t.trim().is_empty()) {
-                        desc = title.to_string();
-                    }
+            if let Some(state) = crate::session::read_session_state(default_path) {
+                has_content = state.title.as_deref().is_some_and(|t| !t.trim().is_empty())
+                    || !state.events.is_empty();
+                if let Some(title) = state.title.as_deref().filter(|t| !t.trim().is_empty()) {
+                    desc = title.to_string();
                 }
             }
             if has_content {
@@ -1014,15 +1189,53 @@ impl App {
         list.sort_by(|a, b| b.2.cmp(&a.2));
 
         list.into_iter()
-            .map(|(name, desc, _, relative)| {
-                let short_desc = if desc.chars().count() > 40 {
-                    format!("{}...", desc.chars().take(37).collect::<String>())
-                } else {
-                    desc
-                };
-                (name, format!("({}) — {}", relative, short_desc))
-            })
+            .map(|(name, desc, _, relative)| (name, format!("({}) — {}", relative, shorten(desc))))
             .collect()
+    }
+
+    /// Poll the daemon catalog without putting an HTTP round trip on the render
+    /// loop. A stalled local daemon must not make terminal input wait on a request.
+    async fn refresh_daemon_sessions(&mut self, force: bool) {
+        if self
+            .daemon_sessions_refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.is_finished())
+        {
+            let refresh = self
+                .daemon_sessions_refresh
+                .take()
+                .expect("checked is_some");
+            self.daemon_sessions_refreshed_at = Some(std::time::Instant::now());
+            if let Ok(Ok(rows)) = refresh.await {
+                self.daemon_sessions = Some(rows);
+            }
+        }
+
+        let Some(info) = self.sidecar.clone() else {
+            if let Some(refresh) = self.daemon_sessions_refresh.take() {
+                refresh.abort();
+            }
+            self.daemon_sessions = None;
+            self.daemon_sessions_refreshed_at = None;
+            return;
+        };
+
+        if force {
+            if let Some(refresh) = self.daemon_sessions_refresh.take() {
+                refresh.abort();
+            }
+        } else if self.daemon_sessions_refresh.is_some()
+            || self
+                .daemon_sessions_refreshed_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+
+        let folder = self.options.config.workspace.clone();
+        self.daemon_sessions_refresh = Some(tokio::spawn(async move {
+            crate::serve::sidecar::list_sessions(&info, Some(folder.as_path())).await
+        }));
     }
 
     fn open_checkpoint_picker(&mut self, action: CheckpointAction) {
@@ -1213,14 +1426,10 @@ impl App {
 
         // Update active_conversation and active_state_path
         self.active_conversation = name.to_string();
-        if name == "default" {
-            self.active_state_path = self.options.config.state_path.clone();
-        } else {
-            self.active_state_path = self.conversations_dir().join(format!("{}.json", name));
-        }
+        self.active_state_path = self.state_path_for_conversation(name);
 
         // Force a fresh state read for the new session's file.
-        self.last_state_modified = None;
+        self.last_state_stamp = None;
         self.state = None;
         self.scroll = 0;
         self.status = String::new();
@@ -3232,6 +3441,11 @@ impl App {
     async fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.ensure_sidecar_attached().await;
+        // Keep the daemon's session catalog current. Without this the picker
+        // falls back to the disk walk, which cannot see a migrated conversation.
+        self.refresh_daemon_sessions(false).await;
+        // Then apply any picker mutation queued by a key handler.
+        self.apply_pending_session_op().await;
         // If the sidecar dropped, clear attachment so the next spawn can recover.
         if self
             .sidecar_attach
@@ -3511,51 +3725,36 @@ impl App {
             return;
         }
 
-        if let Ok(metadata) = tokio::fs::metadata(&self.active_state_path).await {
-            if let Ok(modified) = metadata.modified() {
-                if Some(modified) == self.last_state_modified {
-                    return;
-                }
-                self.last_state_modified = Some(modified);
-                // The persisted state has caught up with our optimistic send — from
-                // here the real status governs busy/idle (and the flush edge).
-                self.sent_turn_pending = false;
-                // A newer persisted state means the turn that was streaming has
-                // committed its text into events — drop the live buffer so the
-                // committed copy doesn't render twice.
-                crate::llm::StreamBuffer::clear(&self.stream);
-            }
-        } else {
+        // Fallback path: no live attach yet (daemon still coming up, or the
+        // attach failed). Read through the dual reader so a session in the
+        // database renders here too — reading the file directly would show a
+        // migrated conversation as empty.
+        //
+        // Change is detected from the state itself, not the file's mtime: a
+        // database-backed session has no file to stat, so mtime would never move
+        // and the view would freeze on its first paint.
+        let Some(state) = crate::session::read_session_state(&self.active_state_path) else {
             self.state = None;
-            self.last_state_modified = None;
+            self.last_state_stamp = None;
+            return;
+        };
+        let stamp = (
+            state.updated_at.clone(),
+            state.events.len() + state.messages.len(),
+        );
+        if Some(&stamp) == self.last_state_stamp.as_ref() {
             return;
         }
-
-        match tokio::fs::read(&self.active_state_path).await {
-            Ok(bytes) => match crate::harness::deserialize_state(&bytes) {
-                Ok(state) => {
-                    self.state = Some(state);
-                    self.prune_pending_steers();
-                }
-                // An unreadable file (e.g. saved by an older build) shouldn't pin a
-                // red error in the footer. Show the session empty; starting a new
-                // run overwrites it cleanly.
-                Err(_) => {
-                    self.state = None;
-                    self.status =
-                        "This session's saved state is unreadable — start a new task to replace it."
-                            .to_string();
-                }
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.state = None;
-                self.last_state_modified = None;
-            }
-            Err(error) => {
-                self.error = Some(format!("state read error: {error}"));
-                self.last_state_modified = None;
-            }
-        }
+        self.last_state_stamp = Some(stamp);
+        // The persisted state has caught up with our optimistic send — from
+        // here the real status governs busy/idle (and the flush edge).
+        self.sent_turn_pending = false;
+        // A newer persisted state means the turn that was streaming has
+        // committed its text into events — drop the live buffer so the
+        // committed copy doesn't render twice.
+        crate::llm::StreamBuffer::clear(&self.stream);
+        self.state = Some(state);
+        self.prune_pending_steers();
     }
 
     /// If a session attach is pending, open/attach it via the local serve daemon.
@@ -5656,11 +5855,6 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(false);
 
     if !has_events {
-        let right_line = Line::from(vec![Span::styled("->9", Style::default().fg(faint()))]);
-        frame.render_widget(
-            Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
-            area,
-        );
         return;
     }
 
@@ -5672,18 +5866,10 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .filter(|title| !title.is_empty())
         .unwrap_or("snippet");
 
-    let left = vec![
-        Span::styled(
-            "☉ > ",
-            Style::default()
-                .fg(Color::Rgb(125, 207, 245))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            prompt_text,
-            Style::default().fg(text()).add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let left = vec![Span::styled(
+        prompt_text,
+        Style::default().fg(text()).add_modifier(Modifier::BOLD),
+    )];
 
     let mut right: Vec<Span<'static>> = vec![Span::styled(
         format!("·  {model}"),

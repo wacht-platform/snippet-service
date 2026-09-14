@@ -47,10 +47,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     }
     let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let pid = std::process::id();
-    let file = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("job");
+    let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("job");
     let tmp = path.with_file_name(format!(".{file}.{pid}.{n}.tmp"));
     fs::write(&tmp, &content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     if let Err(e) = fs::rename(&tmp, path) {
@@ -306,7 +303,12 @@ impl RecurringJob {
             body.push_str(prompt);
             body.push('\n');
         }
-        if let Some(path) = self.plan_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some(path) = self
+            .plan_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
             let contents = read_plan(path, workspace)?;
             if !prompt.is_empty() || !title.is_empty() {
                 body.push('\n');
@@ -386,9 +388,8 @@ fn read_plan(path: &str, workspace: Option<&Path>) -> Result<String, String> {
     let resolved = if given.is_absolute() {
         given
     } else {
-        let ws = workspace.ok_or_else(|| {
-            "plan path is relative but this session has no workspace".to_string()
-        })?;
+        let ws = workspace
+            .ok_or_else(|| "plan path is relative but this session has no workspace".to_string())?;
         let joined = ws.join(&given);
         let canon_ws = ws.canonicalize().unwrap_or_else(|_| ws.to_path_buf());
         match joined.canonicalize() {
@@ -403,8 +404,8 @@ fn read_plan(path: &str, workspace: Option<&Path>) -> Result<String, String> {
             }
         }
     };
-    let bytes = fs::read(&resolved)
-        .map_err(|e| format!("read plan {}: {e}", resolved.display()))?;
+    let bytes =
+        fs::read(&resolved).map_err(|e| format!("read plan {}: {e}", resolved.display()))?;
     if bytes.len() > PLAN_MAX_BYTES {
         return Err("plan file is larger than 64 KiB".into());
     }
@@ -464,7 +465,15 @@ pub fn create_job(
     schedule: Schedule,
     plan_path: Option<&str>,
 ) -> Result<RecurringJob, String> {
-    create_job_with(root, title, session_id, prompt, schedule, plan_path, Delivery::Goal)
+    create_job_with(
+        root,
+        title,
+        session_id,
+        prompt,
+        schedule,
+        plan_path,
+        Delivery::Goal,
+    )
 }
 
 /// Same as [`create_job`] with an explicit delivery and immediate first run:
@@ -715,10 +724,12 @@ mod tests {
         let fired = mark_fired(root.path(), &job.id, epoch_secs()).unwrap();
         assert!(!fired.enabled, "Once should disable after firing");
         // Due-filter ignores it now.
-        assert!(due_jobs(root.path(), epoch_secs())
-            .unwrap()
-            .iter()
-            .all(|j| j.id != job.id));
+        assert!(
+            due_jobs(root.path(), epoch_secs())
+                .unwrap()
+                .iter()
+                .all(|j| j.id != job.id)
+        );
     }
 
     #[test]
@@ -741,10 +752,7 @@ mod tests {
         })
         .unwrap();
         // Old on-disk jobs (no delivery field) must parse as Goal.
-        let without_delivery = raw.replace(
-            r#","delivery":"goal""#,
-            "",
-        );
+        let without_delivery = raw.replace(r#","delivery":"goal""#, "");
         let job: RecurringJob = serde_json::from_str(&without_delivery).unwrap();
         assert_eq!(job.delivery, Delivery::Goal);
     }
