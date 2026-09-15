@@ -15,14 +15,24 @@ pub(super) struct Theme {
 }
 
 const AMOLED: Theme = Theme {
-    accent: Color::Rgb(96, 165, 250),
+    // Slate, not blue. A neutral accent keeps the accent channel about BRIGHTNESS
+    // rather than hue, so it cannot be confused with a status colour.
+    //
+    // #B4BECD, not the client's #94A3B8: this palette's `muted` (#9CA3AF) is also
+    // a grey, and the two collide at 1.01:1 — and they DO share a surface, since a
+    // lane list shows "running" (accent) directly above "cancelled" (muted). This
+    // slate sits midway between `muted` (1.35:1) and `text` (1.52:1), the widest
+    // separation available inside that narrow band.
+    accent: Color::Rgb(180, 190, 205),
     text: Color::Rgb(229, 231, 235),
     muted: Color::Rgb(156, 163, 175),
     faint: Color::Rgb(107, 114, 128),
     success: Color::Rgb(52, 211, 153),
     danger: Color::Rgb(248, 113, 113),
     warn: Color::Rgb(251, 191, 36),
-    lane: Color::Rgb(96, 165, 250),
+    // Lane activity is the same "something is live" signal as `accent`, so it
+    // shares its tone; the lane rows carry a glyph and a label of their own.
+    lane: Color::Rgb(180, 190, 205),
     code: Color::Rgb(209, 213, 219),
 };
 

@@ -774,7 +774,13 @@ fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<S
     out
 }
 
-pub fn list_device_sessions() -> Vec<SessionInfo> {
+/// Every session the store holds, unfiltered — INCLUDING agent inboxes.
+///
+/// Only usage accounting wants this. An inbox runs a real model, so its tokens
+/// are real spend; dropping it from the totals would under-report what the
+/// device actually used. Everything that presents sessions to a person uses
+/// [`list_device_sessions`] instead.
+pub fn all_device_sessions() -> Vec<SessionInfo> {
     let workers = working_agents_by_session();
     let mut out: Vec<SessionInfo> = store_for_sessions()
         .and_then(|store| store.list_all_sessions().ok())
@@ -804,6 +810,21 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
         out.insert(0, mc);
     }
     out
+}
+
+/// The session catalog as a PERSON sees it: no agent inboxes.
+///
+/// An inbox is an agent's private mailbox — the session it answers direct
+/// messages in. It is not a chat anyone chose, resumed, renamed or deleted, and
+/// listing it put the agent's private correspondence in the user's chat list and
+/// made the app's per-folder badge count a folder the user never opened. It
+/// stays reachable where it belongs: addressing the agent by name, and
+/// `state_path_for_id`, which is how delivery and `/attach` resolve it.
+pub fn list_device_sessions() -> Vec<SessionInfo> {
+    all_device_sessions()
+        .into_iter()
+        .filter(|s| !is_inbox_session_id(&s.id))
+        .collect()
 }
 
 /// The conversation name a session id encodes.
