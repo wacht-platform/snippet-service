@@ -9,6 +9,7 @@ pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
 pub const MISSION_CONTROL_LAYER: &str = include_str!("../prompts/mission_control_layer.md");
 pub const COORDINATION_LAYER: &str = include_str!("../prompts/coordination_layer.md");
+pub const WORK_BOUNDARY_LAYER: &str = include_str!("../prompts/work_boundary_layer.md");
 pub const GIT_WORKTREE_LAYER: &str = include_str!("../prompts/git_worktree_layer.md");
 pub const MEMORY_GUIDANCE_LAYER: &str = include_str!("../prompts/memory_layer.md");
 pub const MEMORY_WRITE_LAYER: &str = include_str!("../prompts/memory_write_layer.md");
@@ -105,6 +106,10 @@ pub fn conversation_prompt(context: &PromptContext) -> String {
     ];
     parts.extend(context.conditional_layers());
     parts.push(CONVERSATION_AGENT_LAYER.trim());
+    // Last, and only for an AGENT's work session: it has coordination tools but
+    // no dispatch tool, and the boundary is not inferable from the tool list —
+    // an absent tool reads as an oversight unless it is stated.
+    parts.push(WORK_BOUNDARY_LAYER.trim());
     parts.join("\n\n")
 }
 

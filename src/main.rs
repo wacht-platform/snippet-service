@@ -137,30 +137,6 @@ enum AgentAction {
         #[arg(long)]
         json: bool,
     },
-    /// Give an agent work in a session: creates the assignment and lets the
-    /// daemon dispatch it.
-    Dispatch {
-        /// Target durable session id (`snippet sessions` lists them).
-        session_id: String,
-        /// Agent id to work it; defaults to the general agent.
-        #[arg(long)]
-        agent_id: Option<String>,
-        /// What the work is.
-        #[arg(long)]
-        scope: String,
-        /// How the agent knows it is finished.
-        #[arg(long)]
-        definition_of_done: String,
-        /// Inference profile for this dispatch; defaults to the session's own.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Group related dispatches under one goal.
-        #[arg(long)]
-        goal_id: Option<String>,
-        /// Print the response as raw JSON.
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,13 +146,6 @@ enum DbAction {
     Init,
     /// Show the store's path, integrity, and per-table row counts.
     Status,
-    /// Copy file-backed sessions into the store. Read-only: the state files are
-    /// left in place, so this can be re-run and the originals stay the fallback.
-    Migrate {
-        /// Report what would be copied without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -382,33 +351,6 @@ fn db_cli(action: DbAction) -> Result<(), Box<dyn std::error::Error>> {
         }
         DbAction::Status => {
             println!("path: {}", store.path().display());
-            report_store(&store)?;
-        }
-        DbAction::Migrate { dry_run } => {
-            if dry_run {
-                // A dry run applies the SAME staleness rule the real run does,
-                // so the preview shows exactly what would be written.
-                let (sessions, failed) =
-                    snippet::conversations::scan_file_sessions(&store)?;
-                println!("would migrate {} session(s):", sessions.len());
-                for s in &sessions {
-                    println!(
-                        "  {:<52} {:>5} msgs  {:>4} events",
-                        s.id, s.messages, s.events
-                    );
-                }
-                report_failures(&failed);
-                return Ok(());
-            }
-            let (migrated, failed) = snippet::conversations::migrate_file_sessions(&store)?;
-            println!("migrated {} session(s):", migrated.len());
-            for s in &migrated {
-                println!(
-                    "  {:<52} {:>5} msgs  {:>4} events",
-                    s.id, s.messages, s.events
-                );
-            }
-            report_failures(&failed);
             report_store(&store)?;
         }
     }
@@ -672,59 +614,6 @@ async fn agent_cli(action: AgentAction) -> Result<(), Box<dyn std::error::Error>
             }
             Ok(())
         }
-        AgentAction::Dispatch {
-            session_id,
-            agent_id,
-            scope,
-            definition_of_done,
-            profile,
-            goal_id,
-            json,
-        } => {
-            let mut payload = serde_json::json!({
-                "session_id": session_id,
-                "scope": scope,
-                "definition_of_done": definition_of_done,
-            });
-            if let Some(agent_id) = agent_id {
-                payload["agent_id"] = serde_json::json!(agent_id);
-            }
-            if let Some(profile) = profile {
-                payload["profile"] = serde_json::json!(profile);
-            }
-            if let Some(goal_id) = goal_id {
-                payload["goal_id"] = serde_json::json!(goal_id);
-            }
-            let value =
-                daemon_http(&state, "POST", "coordination/dispatch", &[], Some(payload)).await?;
-            if json {
-                return print_json(&value);
-            }
-            let assignment = value
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let agent = value
-                .get("agent_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let profile = value
-                .get("profile")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("session default");
-            println!("✓ dispatched to {agent} (assignment {assignment}, profile {profile})");
-            Ok(())
-        }
-    }
-}
-
-fn report_failures(failed: &[(String, String)]) {
-    if failed.is_empty() {
-        return;
-    }
-    println!("skipped {} session(s):", failed.len());
-    for (id, reason) in failed {
-        println!("  {id}: {reason}");
     }
 }
 

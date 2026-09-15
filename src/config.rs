@@ -31,13 +31,17 @@ pub fn workspace_dir_name(workspace: &Path) -> String {
     format!("{name}-{}", workspace_key(workspace))
 }
 
-/// Per-workspace state path: `~/.snippet/workspaces/{name}-{key}/state.json`.
-/// Single source of truth, used by the per-launch config and the serve daemon.
+/// The default session's path for a workspace:
+/// `~/.snippet/workspaces/{name}-{key}`.
+///
+/// The DIRECTORY, not a file in it. A session id is this path, so appending
+/// `state.json` would put a filename back into an identifier — the thing ids
+/// were cleaned of, because a model handed it drops the suffix and the reply is
+/// rejected. Nothing is written here any more; it is a key.
 pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
     snippet_home()
         .join("workspaces")
         .join(workspace_dir_name(workspace))
-        .join("state.json")
 }
 
 /// A workspace's state path for READING: an existing directory wins over a
@@ -55,36 +59,19 @@ pub fn resolve_state_path_for_workspace(workspace: &Path) -> PathBuf {
     find_existing_workspace_state(workspace).unwrap_or(fresh)
 }
 
-/// Scan the workspace root for a directory whose recorded folder is this one.
+/// Find the directory holding a workspace's session when the freshly computed
+/// name does not exist.
 ///
-/// The `state.meta.json` sidecar records the absolute folder, so it is the only
-/// thing that can tie a directory back to a workspace when the key no longer
-/// matches. Directories without a sidecar are skipped rather than guessed at.
+/// That happens when the workspace key changed: the directory was created under
+/// an older algorithm, so deriving the name again misses it. The store records
+/// the folder directly, which makes it the authority here.
+///
+/// This used to start with a disk scan reading a `state.meta.json` sidecar's
+/// `folder` field. That scan could only ever report what a store row already
+/// said — measured against the live workspaces, it returned the same directory
+/// for every one — and it read a file nothing writes any more. The store lookup
+/// below is the whole job.
 fn find_existing_workspace_state(workspace: &Path) -> Option<PathBuf> {
-    let canonical = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let target = canonical.to_string_lossy().to_string();
-    for entry in std::fs::read_dir(workspaces_root()).ok()?.flatten() {
-        let dir = entry.path();
-        let raw = match std::fs::read_to_string(dir.join("state.meta.json")) {
-            Ok(raw) => raw,
-            Err(_) => continue,
-        };
-        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        if meta.get("folder").and_then(|f| f.as_str()) != Some(target.as_str()) {
-            continue;
-        }
-        let state = dir.join("state.json");
-        if state.exists() {
-            return Some(state);
-        }
-    }
-    // Migrated sessions have no sidecar or state file, so the disk scan cannot
-    // see them. The store records the folder directly, which is what keeps a
-    // session keyed by an older algorithm reachable instead of starting blank.
     let id = crate::session::store_default_session_id(workspace)?;
     Some(workspaces_root().join(id))
 }
@@ -628,8 +615,16 @@ fn default_workspace() -> PathBuf {
     ".".into()
 }
 
+/// The placeholder for `state_path` before a workspace is resolved.
+///
+/// Derived rather than hardcoded: the field is `#[serde(skip)]` and every real
+/// path goes through `resolve_state_path_for_workspace`, so this value is only
+/// ever read by code that built a config and did not resolve one. Returning the
+/// default workspace's actual session directory keeps that fallback meaningful,
+/// where the previous `.snippet/state.json` named a file that no longer exists
+/// in any shape.
 fn default_state_path() -> PathBuf {
-    ".snippet/state.json".into()
+    state_path_for_workspace(&default_workspace())
 }
 
 /// The providers `load` accepts for the active model. Config writers (the serve

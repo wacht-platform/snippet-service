@@ -464,9 +464,39 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             }
             lines
         }
+        // A direct message to or from another agent. Both directions render, so
+        // the exchange reads as one conversation rather than a reply appearing
+        // with nothing before it.
+        HarnessEvent::AgentMessage {
+            agent_id,
+            body,
+            outbound,
+        } => marker_block(
+            if *outbound { "→" } else { "←" },
+            if *outbound { muted() } else { lane() },
+            &format!(
+                "{} {agent_id}: {body}",
+                if *outbound { "to" } else { "from" }
+            ),
+            width,
+        ),
         HarnessEvent::FilePresented { path, caption } => {
             present_file_lines(path, caption.as_deref(), width)
         }
+        // Work routed on this session's behalf by someone else (usually the
+        // user). A quiet aside: it is already dispatched, so it is a record of
+        // what went out, not a decision to make.
+        HarnessEvent::TaskDispatched {
+            task_id,
+            title,
+            session_id,
+            by,
+        } => marker_block(
+            "→",
+            muted(),
+            &format!("{by} dispatched: {title}\ntask {task_id} → {session_id}"),
+            width,
+        ),
         HarnessEvent::SystemDecision { step, reasoning } => {
             if step == "history_compaction_pass" {
                 // Keep the live banner only during the turn; the durable

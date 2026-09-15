@@ -24,6 +24,8 @@ pub enum StoreError {
     ScalarEncode(String),
     #[error("no such table in this store: {0}")]
     UnknownTable(String),
+    #[error("stored record is malformed: {0}")]
+    AppDecode(String),
 }
 
 /// Canonical location of the snippet database.
@@ -32,8 +34,29 @@ pub enum StoreError {
 /// (coordination, sessions, conversations), not a file belonging to any one
 /// subsystem. It used to live under `mission-control/` only because the
 /// coordination plane grew out of that store.
+///
+/// Under `cfg(test)` this resolves to a per-process temp path instead. `cargo
+/// test` runs with the developer's real `HOME`, so the production path here made
+/// the suite open, MIGRATE and mutate the live database — observed directly: a
+/// test run rewrote session rows and merged a duplicate in the real store. Every
+/// caller (`store_for_sessions`, `AppStore`, each `ToolContext`) funnels through
+/// this one function, so redirecting it here is what makes the suite hermetic.
 pub fn default_db_path() -> PathBuf {
-    crate::config::snippet_home().join("snippet.db")
+    #[cfg(test)]
+    {
+        static TEST_DB: OnceLock<PathBuf> = OnceLock::new();
+        TEST_DB
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join(format!("snippet-test-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&dir);
+                dir.join("snippet.db")
+            })
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        crate::config::snippet_home().join("snippet.db")
+    }
 }
 
 fn cached_stores() -> &'static Mutex<HashMap<PathBuf, Store>> {
@@ -182,6 +205,7 @@ fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
 fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     crate::coordination::schema::ensure(connection)?;
     crate::conversations::ensure_schema(connection)?;
+    crate::app_schema::ensure(connection)?;
     Ok(())
 }
 

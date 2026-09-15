@@ -168,13 +168,6 @@ impl ExitInfo {
     }
 }
 
-fn unix_secs_to_system_time(secs: i64) -> std::time::SystemTime {
-    if secs <= 0 {
-        return std::time::SystemTime::UNIX_EPOCH;
-    }
-    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
-}
-
 /// "just now" / "5m ago" / "3h ago" / "2d ago" from a last-active stamp.
 ///
 /// One definition: the disk walk and the daemon catalog both label entries with
@@ -940,42 +933,26 @@ impl App {
         }
     }
 
+    /// The conversation this workspace was last used in.
+    ///
+    /// Read from the store, which is the only inventory: a filesystem walk would
+    /// miss every session that has no state file, which is all of them.
     fn find_last_active_conversation(&self) -> Option<String> {
-        let dir = self.conversations_dir();
-        let mut best_path: Option<PathBuf> = None;
-        let mut best_time: i64 = i64::MIN;
-
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if crate::session::is_conversation_json(&path) {
-                    let t = crate::session::session_last_active(&path);
-                    if t > best_time {
-                        best_time = t;
-                        best_path = Some(path);
-                    }
+        let default_id = crate::session::session_id_for_state_path(
+            &self.options.config.state_path,
+        );
+        let folder = self.options.config.workspace.clone();
+        crate::session::list_device_sessions()
+            .into_iter()
+            .filter(|s| s.folder == folder)
+            .max_by_key(|s| s.last_active)
+            .map(|s| {
+                if s.id == default_id {
+                    "default".to_string()
+                } else {
+                    s.conversation
                 }
-            }
-        }
-
-        // Also check default state_path if it exists
-        let default_path = &self.options.config.state_path;
-        if default_path.exists() {
-            let t = crate::session::session_last_active(default_path);
-            if t > best_time {
-                best_path = Some(default_path.clone());
-            }
-        }
-
-        best_path.and_then(|p| {
-            if p == *default_path {
-                Some("default".to_string())
-            } else {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            }
-        })
+            })
     }
 
     /// Delete a saved conversation (resume picker `d`).
@@ -1103,93 +1080,33 @@ impl App {
                 })
                 .collect();
         }
-        let dir = self.conversations_dir();
-        let mut list = Vec::new();
-
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if crate::session::is_conversation_json(&path) {
-                    let name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if name.is_empty() || name == "default" {
-                        continue;
-                    }
-
-                    let mut desc = "empty session".to_string();
-                    let mod_time =
-                        unix_secs_to_system_time(crate::session::session_last_active(&path));
-
-                    // Store-or-file: a migrated conversation has no state file, so
-                    // reading the file directly would label it "empty session".
-                    if let Some(state) = crate::session::read_session_state(&path) {
-                        if let Some(t) = state
-                            .title
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                        {
-                            desc = t.to_string();
-                        }
-                    }
-
-                    let duration = std::time::SystemTime::now()
-                        .duration_since(mod_time)
-                        .unwrap_or_default();
-                    let relative = if duration.as_secs() < 60 {
-                        "just now".to_string()
-                    } else if duration.as_secs() < 3600 {
-                        format!("{}m ago", duration.as_secs() / 60)
-                    } else if duration.as_secs() < 86400 {
-                        format!("{}h ago", duration.as_secs() / 3600)
-                    } else {
-                        format!("{}d ago", duration.as_secs() / 86400)
-                    };
-
-                    list.push((name, desc, mod_time, relative));
+        // No daemon catalog yet: build the same list straight from the store, so
+        // the picker shows real sessions instead of an empty directory walk.
+        let mut list: Vec<(String, String, i64)> = crate::session::list_device_sessions()
+            .into_iter()
+            .filter(|s| {
+                if s.conversation.is_empty() {
+                    return false;
                 }
-            }
-        }
-
-        let default_path = &self.options.config.state_path;
-        if default_path.exists() {
-            let mut desc = "default session".to_string();
-            let mod_time =
-                unix_secs_to_system_time(crate::session::session_last_active(default_path));
-            // Skip a contentless default state — a fresh install otherwise shows a
-            // phantom "default session" entry with nothing to resume into.
-            let mut has_content = false;
-            if let Some(state) = crate::session::read_session_state(default_path) {
-                has_content = state.title.as_deref().is_some_and(|t| !t.trim().is_empty())
-                    || !state.events.is_empty();
-                if let Some(title) = state.title.as_deref().filter(|t| !t.trim().is_empty()) {
-                    desc = title.to_string();
-                }
-            }
-            if has_content {
-                let duration = std::time::SystemTime::now()
-                    .duration_since(mod_time)
-                    .unwrap_or_default();
-                let relative = if duration.as_secs() < 60 {
-                    "just now".to_string()
-                } else if duration.as_secs() < 3600 {
-                    format!("{}m ago", duration.as_secs() / 60)
-                } else if duration.as_secs() < 86400 {
-                    format!("{}h ago", duration.as_secs() / 3600)
+                s.conversation != "default" || !s.title.trim().is_empty()
+            })
+            .map(|s| {
+                let desc = if s.title.trim().is_empty() {
+                    "empty session".to_string()
                 } else {
-                    format!("{}d ago", duration.as_secs() / 86400)
+                    s.title.trim().to_string()
                 };
-                list.push(("default".to_string(), desc, mod_time, relative));
-            }
-        }
-
+                (s.conversation, desc, s.last_active)
+            })
+            .collect();
         list.sort_by(|a, b| b.2.cmp(&a.2));
-
         list.into_iter()
-            .map(|(name, desc, _, relative)| (name, format!("({}) — {}", relative, shorten(desc))))
+            .map(|(name, desc, last_active)| {
+                (
+                    name,
+                    format!("({}) — {}", relative_age(last_active), shorten(desc)),
+                )
+            })
             .collect()
     }
 

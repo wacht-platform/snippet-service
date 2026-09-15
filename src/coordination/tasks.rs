@@ -79,8 +79,7 @@ pub struct Task {
 
 /// Structured handoff information passed into a task.
 ///
-/// Distinct from the agent [`super::types::Handoff`], which is the immutable
-/// turn-transfer record between assignments. This is the lighter briefing a
+/// The briefing a task carries into the session that will do it. This is the
 /// dispatched task carries.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct TaskHandoff {
@@ -144,13 +143,19 @@ impl Task {
         format!("task:{id}")
     }
 
-    /// A task as the human files it: unstarted, unassigned, and owned by nobody
-    /// yet. Constructed here rather than at each call site so a new field's
-    /// default is decided once, next to the type it belongs to.
+    /// A task as the human files it: unstarted and owned by nobody yet, but
+    /// already pointed at the session that should do the work.
+    ///
+    /// The target session is REQUIRED. A task with no session can never be
+    /// dispatched — the loop claims it, finds no destination, and parks it as
+    /// Blocked after the failure ceiling — so accepting one would file dead
+    /// weight instead of work. Constructed here rather than at each call site so
+    /// a new field's default is decided once, next to the type it belongs to.
     pub fn filed_by_human(
         id: String,
         title: String,
         description: String,
+        session_id: String,
         priority: i64,
         now: String,
     ) -> Self {
@@ -166,9 +171,12 @@ impl Task {
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
-            session_id: String::new(),
+            session_id,
             handoff: None,
-            handoff_mode: HandoffMode::default(),
+            // A human's description IS the briefing: the target session holds no
+            // prior context about work someone just thought of, so the envelope
+            // must be self-contained.
+            handoff_mode: HandoffMode::Fresh,
             reporting_session: None,
             dispatch_failures: 0,
             result: None,
@@ -925,6 +933,60 @@ impl Store {
             rows.collect()
         })
     }
+
+    /// Park the work a failed session was doing, so it can be retried or
+    /// reassigned instead of sitting InProgress forever.
+    ///
+    /// A dispatched worker session that dies without calling
+    /// `report_mission_task` leaves its task looking active. This is the one
+    /// place that notices, so the board does not quietly accumulate work that
+    /// nothing is doing. The notification marker is deliberately left
+    /// undelivered: it is what surfaces the failure to Mission Control.
+    pub fn block_tasks_for_failed_session(
+        &self,
+        session_id: &str,
+        detail: &str,
+        now: &str,
+    ) -> Result<usize, StoreError> {
+        if session_id.is_empty() {
+            return Ok(0);
+        }
+        let message = if detail.trim().is_empty() {
+            "worker session failed without reporting; retry or reassign".to_string()
+        } else {
+            format!("worker session failed: {detail}")
+        };
+        let tasks = self.list_tasks(Some(session_id), Some(&TaskStatus::InProgress))?;
+        let mut parked = 0usize;
+        for task in tasks {
+            // Only the task this session was actually reporting for. A session id
+            // reused across tasks must not park work someone else is doing.
+            if task.reporting_session.as_deref() != Some(session_id) {
+                continue;
+            }
+            let id = task.id.clone();
+            if self
+                .update_task_in(&id, now, |t| {
+                    if t.status != TaskStatus::InProgress {
+                        return;
+                    }
+                    t.status = TaskStatus::Blocked;
+                    t.reporting_session = None;
+                    t.owned_paths.clear();
+                    t.notifications.push(NotificationMarker {
+                        target: "mission_control".into(),
+                        kind: "blocked".into(),
+                        message: message.clone(),
+                        delivered: false,
+                    });
+                })
+                .is_ok()
+            {
+                parked += 1;
+            }
+        }
+        Ok(parked)
+    }
 }
 
 #[cfg(test)]
@@ -936,6 +998,7 @@ mod tests {
             id.into(),
             format!("Task {id}"),
             "do the thing".into(),
+            "s1".into(),
             0,
             "2026-01-01T00:00:00Z".into(),
         )

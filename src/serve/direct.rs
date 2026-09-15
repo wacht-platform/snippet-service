@@ -99,7 +99,9 @@ fn direct_message_envelope(
          conversation. Reply with send_agent_message to `reply_to` above — that is where the \
          sender is reading, and where the exchange is recorded. A message alone never \
          authorises work: do not modify a workspace in response to one. If it asks for work, \
-         dispatch it; if it is unclear, ask ONE question back. Only the recent history is \
+         Mission Control is the one that dispatches: create and route the task if you ARE \
+         Mission Control — otherwise hand it to Mission Control and do not start it yourself. \
+         If it is unclear, ask ONE question back. Only the recent history is \
          included — call read_agent_thread to see more.\n{history}body: {body}\n\
          [/direct_message]",
         thread = event.thread_id,
@@ -137,7 +139,9 @@ async fn ensure_agent_inbox(d: &Shared, agent_id: &str) -> Result<(), String> {
     let identity = format!(
         "# {name}\n\nYou are {name}, a durable agent in this device's coordination \
          directory. Direct messages from the human and from peer agents arrive in this \
-         inbox. Answer them here; use Mission Control when a message should become work.\n",
+         inbox. Answer each one where it came from: the envelope's `reply_to` names that \n\
+         session, and that is where the sender is reading — not this inbox. Use Mission \n\
+         Control when a message should become work.\n",
         name = agent.display_name,
     );
     home.ensure_layout(&identity)
@@ -168,6 +172,18 @@ async fn ensure_agent_inbox(d: &Shared, agent_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The canonical session id a stored delivery recipient names.
+///
+/// A reply is addressed with the id the sender was handed, which is not always
+/// the stored key: a model routinely drops the `/state.json` suffix, and the
+/// message is then recorded against an id no session has — where
+/// `record_agent_message` silently drops it. Resolving through the state path
+/// first puts both forms in the same session.
+fn canonical_session_id(id: &str) -> Option<String> {
+    let path = state_path_for_id(id)?;
+    Some(crate::session::session_id_for_state_path(&path))
+}
+
 /// Hand one accepted message to its recipient.
 ///
 /// A human recipient has nothing to wake — clients read the thread — so it
@@ -179,16 +195,28 @@ async fn deliver_direct(
     let event = &pending.event;
 
     // A reply addressed to a SESSION comes back to where the question was asked.
-    // It is delivered as a user-turn envelope so the session's agent sees the
-    // answer and the transcript keeps a durable record of the exchange.
+    // Recorded as a NOTICE: it lands in the transcript and in the model's next
+    // context, but the session's agent is NOT woken. Waking it would spend a turn
+    // on a reply whose own envelope says not to act on it — and would start a
+    // cold session just to hand it a notice.
     if pending.recipient_kind == "session" {
-        let session_id = pending.recipient_id.as_str();
-        let Some((tx, _path, _stream)) = d.ensure_live(session_id).await else {
-            return Err(format!("could not start session `{session_id}`"));
+        // A session that no longer resolves cannot be retried into existence:
+        // resolution is a pure lookup, so retrying every 500ms would only storm
+        // the log. Report it once and let the delivery row be marked done.
+        let Some(session_id) = canonical_session_id(pending.recipient_id.as_str()) else {
+            eprintln!(
+                "[coordination] direct message {event_id} addressed to unknown session `{session}`",
+                event_id = event.event_id,
+                session = pending.recipient_id
+            );
+            return Ok(());
         };
-        let envelope = coordination_reply_envelope(event);
-        tx.send(LoopInput::UserMessage(envelope))
-            .map_err(|error| format!("deliver coordination reply: {error}"))?;
+        let body = event
+            .payload
+            .get("body")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        super::record_agent_message(d, &session_id, &event.actor_id, body, false).await;
         return Ok(());
     }
 
@@ -215,31 +243,6 @@ async fn deliver_direct(
     tx.send(LoopInput::UserMessage(envelope))
         .map_err(|error| format!("deliver direct message: {error}"))?;
     Ok(())
-}
-
-/// The envelope delivered back into a session when an agent answers a question
-/// that session asked.
-///
-/// Distinct from `[direct_message]`: this is not a message TO the session's
-/// agent, it is the ANSWER to something that agent asked, arriving in the place
-/// it asked. The rules say so, because the alternative — treating it as a new
-/// request — would make the session start working on its own reply.
-fn coordination_reply_envelope(event: &crate::coordination::types::CoordinationEvent) -> String {
-    let body = event
-        .payload
-        .get("body")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default();
-    format!(
-        "[coordination_reply]\nfrom: {}:{}\nthread_id: {}\n\
-         rules: this is the REPLY to a message you sent to another agent. It is information, \
-         not a new request: do not treat it as work to do, and do not answer it back. If it \
-         resolves what you were asking, you are done — reply to the user in this session if \
-         they are waiting. If you need to follow up with that agent, use \
-         send_agent_message.\nbody: {body}\n\
-         [/coordination_reply]",
-        event.actor_kind, event.actor_id, event.thread_id,
-    )
 }
 
 /// Deliver every accepted-but-undelivered direct message.
@@ -410,12 +413,12 @@ pub(super) async fn direct_send_message(
     ) {
         Ok(saved) => {
             let _ = d.coordination_events.send(saved.clone());
-            crate::session::emit_device_event(json!({
-                "kind": "direct_message",
-                "thread_id": saved.thread_id,
-                "from": format!("{}:{}", saved.actor_kind, saved.actor_id),
-                "to": format!("{}:{}", to.0, to.1),
-            }));
+            // Record what this session SENT, so a later reply has something to
+            // attach to. Without it the answer would appear with no question
+            // before it and the model could not tell what was asked.
+            if let Some(origin) = origin {
+                super::record_agent_message(&d, origin, to.1, req.body.trim(), true).await;
+            }
             (StatusCode::ACCEPTED, Json(saved)).into_response()
         }
         Err(error) => (
@@ -576,7 +579,7 @@ mod tests {
     fn other_agents_get_a_dedicated_inbox_session() {
         let id = recipient_session_id("snippet");
         assert!(crate::session::is_inbox_session_id(&id));
-        assert_eq!(id, "inbox-snippet/state.json");
+        assert_eq!(id, "inbox-snippet");
     }
 
     #[test]
