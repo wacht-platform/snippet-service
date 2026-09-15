@@ -596,10 +596,16 @@ pub struct SessionInfo {
     pub status: String,
     /// Last-active time, unix seconds.
     pub last_active: i64,
-    /// The agent bound to this session, if any. Drives the "who is working in
-    /// this chat" indicator in the session list, so a client can show it from
-    /// the catalog alone instead of making a second coordination call per row.
+    /// The agent this session IS, if any — its inbox, or a specialized session.
+    /// A durable property of the session: it survives restarts and does not
+    /// change just because work was routed here.
     pub agent_id: Option<String>,
+    /// The agent dispatched to work here RIGHT NOW, from the task board's
+    /// roster. Different question from [`Self::agent_id`]: a plain project
+    /// session is nobody's, yet an agent can be working in it. Without this the
+    /// session list showed nothing for exactly the case the badge exists for —
+    /// the user asked to see "the agent when it is working in a session".
+    pub worker_agent_id: Option<String>,
 }
 
 /// The inbox session id for an agent: `inbox-<agent-id>`.
@@ -719,13 +725,66 @@ pub fn write_session_profile(state_path: &std::path::Path, profile: &str) {
 /// The store IS the inventory. There is no filesystem walk: a session's row is
 /// the only thing that makes it a session, so a walk could only ever rediscover
 /// rows or resurrect sessions nothing owns.
+/// Which agent is dispatched to work in each session right now.
+///
+/// The TASK BOARD is the source, not `sessions.agent_id`. They answer different
+/// questions: `sessions.agent_id` is what a session IS (an inbox belongs to an
+/// agent, a specialized session runs as one), while this is who was sent to work
+/// there. A plain project session is nobody's — yet Mission Control can dispatch
+/// an agent into it, and that is precisely the case the session list needs to
+/// show. Reading only the binding made the badge invisible for the work the user
+/// actually dispatches.
+///
+/// Built in one pass over the board so the session list stays a single query per
+/// table, rather than one per row.
+fn working_agents_by_session() -> std::collections::HashMap<String, String> {
+    match store_for_sessions() {
+        Some(store) => working_agents_in(&store),
+        None => std::collections::HashMap::new(),
+    }
+}
+
+/// The mapping itself, against a given store — so it can be asserted directly
+/// rather than only through the global session path.
+fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(tasks) = store.list_tasks(None, None) else {
+        return out;
+    };
+    for task in tasks.iter().filter(|task| !task.status.is_terminal()) {
+        if task.session_id.trim().is_empty() {
+            continue;
+        }
+        // Canonical, so the key matches the id this catalog stores: a task may
+        // carry the pre-canonicalisation form (`x/state.json`).
+        let session = crate::conversations::canonical_session_id(&task.session_id).0;
+        let Ok(members) = store.list_task_agents(&task.id) else {
+            continue;
+        };
+        if let Some(agent) = members
+            .into_iter()
+            .find(|member| member.removed_at.is_none())
+            .map(|member| member.agent_id)
+        {
+            // Newest wins: `list_tasks` returns newest first, and the most
+            // recent dispatch is the one actually working.
+            out.entry(session).or_insert(agent);
+        }
+    }
+    out
+}
+
 pub fn list_device_sessions() -> Vec<SessionInfo> {
+    let workers = working_agents_by_session();
     let mut out: Vec<SessionInfo> = store_for_sessions()
         .and_then(|store| store.list_all_sessions().ok())
         .unwrap_or_default()
         .into_iter()
         .map(|row| SessionInfo {
             conversation: conversation_name_from_id(&row.id).to_string(),
+            // Read before `row.id` is moved out below — struct-literal fields
+            // evaluate in the order written.
+            worker_agent_id: workers.get(&row.id).cloned(),
             id: row.id,
             folder: row.workspace,
             title: row.title.unwrap_or_default(),
@@ -1496,6 +1555,8 @@ pub fn create_blank_session_in(
         // No agent is bound at creation: an agent binds a session afterwards
         // (an inbox by `ensure_agent_inbox`, a specialized session at start).
         agent_id: None,
+        // Nor is anyone working in it yet — a dispatch sets this, not creation.
+        worker_agent_id: None,
     })
 }
 
@@ -2091,5 +2152,118 @@ mod routable_target_tests {
     fn a_folder_named_like_an_inbox_stays_routable() {
         assert!(is_routable_target("inboxing-app-1234abcd"));
         assert!(is_routable_target("mission-control-ui-5678ef90"));
+    }
+}
+
+#[cfg(test)]
+mod working_agents_tests {
+    use super::working_agents_in;
+    use crate::coordination::{HandoffMode, Task, TaskStatus};
+    use crate::store::Store;
+
+    /// The roster row has a real FK to `agents(id)`, so the agent must exist.
+    fn worker(id: &str) -> crate::coordination::types::Agent {
+        crate::coordination::types::Agent {
+            id: id.into(),
+            display_name: id.into(),
+            handle: id.into(),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Implementer,
+            capabilities: vec![],
+        }
+    }
+
+    fn dispatched(id: &str, session: &str, now: &str) -> Task {
+        let mut task = Task::dispatched_to(
+            id.into(),
+            session.into(),
+            format!("task {id}"),
+            "scope".into(),
+            vec![],
+            HandoffMode::Resume,
+            "agent",
+            crate::mission_control::SESSION_ID,
+            now.into(),
+        );
+        task.profile = None;
+        task
+    }
+
+    /// A plain project session is nobody's — `sessions.agent_id` is NULL — yet an
+    /// agent dispatched into it is exactly who the session list must name. This
+    /// is the case the badge missed: it read the session's own binding, which
+    /// dispatch never writes.
+    #[test]
+    fn a_dispatched_agent_is_reported_for_its_target_session() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        let task = dispatched("t1", "proj-1", "2026-01-01T00:00:00Z");
+        db.create_task(&task).unwrap();
+        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        let map = working_agents_in(&db);
+        assert_eq!(
+            map.get("proj-1").map(String::as_str),
+            Some("snippet"),
+            "the dispatched agent must be reported for the target session"
+        );
+    }
+
+    /// Finished work is not someone working. A terminal task must drop out, or
+    /// every session an agent ever touched would keep claiming a worker.
+    #[test]
+    fn a_finished_task_stops_reporting_a_worker() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        let task = dispatched("t1", "proj-1", "2026-01-01T00:00:00Z");
+        db.create_task(&task).unwrap();
+        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
+            .unwrap();
+        assert!(working_agents_in(&db).contains_key("proj-1"));
+
+        for terminal in [TaskStatus::Done, TaskStatus::Failed, TaskStatus::Cancelled] {
+            db.update_task_in("t1", "2026-01-02T00:00:00Z", |t| {
+                t.status = terminal.clone()
+            })
+            .unwrap();
+            assert!(
+                !working_agents_in(&db).contains_key("proj-1"),
+                "a {terminal:?} task must not report a worker"
+            );
+        }
+    }
+
+    /// The task row may carry the pre-canonicalisation id (`x/state.json`) while
+    /// the catalog keys on `x`. Without canonicalising the key the lookup misses
+    /// and the badge silently disappears for those sessions.
+    #[test]
+    fn a_legacy_shaped_target_still_matches_its_session() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        let task = dispatched("t1", "proj-1/state.json", "2026-01-01T00:00:00Z");
+        db.create_task(&task).unwrap();
+        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        assert_eq!(
+            working_agents_in(&db).get("proj-1").map(String::as_str),
+            Some("snippet"),
+            "a legacy-shaped target must key to the canonical session id"
+        );
+    }
+
+    /// A task with no target cannot be delivered, so it must not claim a worker.
+    #[test]
+    fn a_targetless_task_reports_nothing() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        let task = dispatched("t1", "", "2026-01-01T00:00:00Z");
+        db.create_task(&task).unwrap();
+        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        assert!(working_agents_in(&db).is_empty());
     }
 }
