@@ -1741,21 +1741,25 @@ async fn coordination_create_task(
     }
     // The target must resolve, or the task would be filed against a session no
     // dispatch could ever reach.
-    let session_id = req.session_id.trim();
-    let state = crate::session::state_path_for_id(session_id)
-        .and_then(|path| crate::session::read_session_state(&path));
-    let Some(state) = state else {
+    let Some(target_path) = crate::session::state_path_for_id(req.session_id.trim()) else {
         return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
     };
+    let Some(state) = crate::session::read_session_state(&target_path) else {
+        return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
+    };
+    // Canonical, so the task binds to the id the runtime will report with.
+    // Storing the id as typed let a task filed against `x/state.json` become
+    // unreportable by the session whose canonical id is `x`.
+    let session_id = crate::session::session_id_for_state_path(&target_path);
     // Dispatch delivers through the MANAGED session record, so a target that is
     // not managed yet would be claimed, found undeliverable, and parked Blocked
     // after the failure ceiling. Registering it here is what makes a task filed
     // against any real session runnable — the same step Mission Control's own
     // task tool performs.
-    if mission_control::get_session(&d.mission_control_root, session_id).is_err() {
+    if mission_control::get_session(&d.mission_control_root, &session_id).is_err() {
         if let Err(error) = mission_control::create_session(
             &d.mission_control_root,
-            session_id,
+            &session_id,
             state.title.as_deref().unwrap_or("Managed session"),
             std::path::Path::new(&state.workspace),
         ) {
@@ -1776,7 +1780,7 @@ async fn coordination_create_task(
         id,
         title.to_string(),
         req.description.trim().to_string(),
-        session_id.to_string(),
+        session_id.clone(),
         req.priority,
         now,
     );
