@@ -75,6 +75,11 @@ pub struct Task {
     /// Workspace paths this task is *currently* writing to, for ownership
     /// conflict detection.
     pub owned_paths: Vec<std::path::PathBuf>,
+    /// Inference profile the target session should run on, when the dispatcher
+    /// named one. A model is bound when a session's loop starts, so this is
+    /// applied at dispatch — restarting a running session, not waiting for one.
+    /// `None` leaves the session on whatever it already has.
+    pub profile: Option<String>,
 }
 
 /// Structured handoff information passed into a task.
@@ -182,6 +187,7 @@ impl Task {
             result: None,
             notifications: Vec::new(),
             owned_paths: Vec::new(),
+            profile: None,
         }
     }
 
@@ -220,6 +226,7 @@ impl Task {
             result: None,
             notifications: Vec::new(),
             owned_paths,
+            profile: None,
         }
     }
 }
@@ -339,13 +346,14 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
         result: decode_optional_json(row.get(16)?, 16)?,
         notifications: decode_json_vec(row.get(17)?, 17)?,
         owned_paths: decode_json_vec(row.get(18)?, 18)?,
+        profile: row.get(19)?,
     })
 }
 
 const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
      created_by_id, created_at, updated_at, completed_at, thread_id, session_id,
      handoff_json, handoff_mode, reporting_session, dispatch_failures, result_json,
-     notifications_json, owned_paths_json";
+     notifications_json, owned_paths_json, profile";
 
 /// Persist every mutable column of a task. Takes the connection so it composes
 /// into the read-modify-write transaction in `update_task_in` — a separate
@@ -369,7 +377,8 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             dispatch_failures = ?12,
             result_json = ?13,
             notifications_json = ?14,
-            owned_paths_json = ?15
+            owned_paths_json = ?15,
+            profile = ?16
          WHERE id = ?1",
         params![
             task.id,
@@ -387,6 +396,7 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             serde_json::to_string(&task.result).unwrap_or_else(|_| "null".into()),
             serde_json::to_string(&task.notifications).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
+            task.profile,
         ],
     )?;
     Ok(())
@@ -407,8 +417,8 @@ impl Store {
                     created_by_kind, created_by_id, created_at, updated_at,
                     completed_at, thread_id, session_id, handoff_json, handoff_mode,
                     reporting_session, dispatch_failures, result_json,
-                    notifications_json, owned_paths_json)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                    notifications_json, owned_paths_json, profile)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
                 params![
                     task.id,
                     task.title,
@@ -428,6 +438,7 @@ impl Store {
                     serde_json::to_string(&task.result).unwrap_or_else(|_| "null".into()),
                     serde_json::to_string(&task.notifications).unwrap_or_else(|_| "[]".into()),
                     serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
+                    task.profile,
                 ],
             )?;
             tx.execute(
@@ -1006,6 +1017,51 @@ mod tests {
 
     fn db() -> Store {
         Store::open_in_memory().unwrap()
+    }
+
+    /// A task's profile must survive both write paths.
+    ///
+    /// The column is written by two separate statements (`create_task`'s INSERT
+    /// and `write_task`'s UPDATE) and read by a third. A column added to only one
+    /// of them round-trips as `None`, which would silently drop the model the
+    /// dispatcher chose — the task would run on the session's existing model with
+    /// nothing reported.
+    #[test]
+    fn a_tasks_profile_survives_create_and_update() {
+        let db = db();
+
+        // Absent by default: an ordinary task must not acquire a model.
+        let plain = task("t-plain");
+        assert_eq!(plain.profile, None);
+        db.create_task(&plain).unwrap();
+        assert_eq!(
+            db.get_task("t-plain").unwrap().unwrap().profile,
+            None,
+            "a task filed without a profile must stay model-agnostic"
+        );
+
+        // Set at creation.
+        let mut routed = task("t-routed");
+        routed.profile = Some("xai".into());
+        db.create_task(&routed).unwrap();
+        assert_eq!(
+            db.get_task("t-routed").unwrap().unwrap().profile.as_deref(),
+            Some("xai"),
+            "the INSERT must carry the profile"
+        );
+
+        // And preserved across an unrelated update, which rewrites every column.
+        let updated = db
+            .update_task_in("t-routed", "2026-01-02T00:00:00Z", |t| {
+                t.title = "renamed".into();
+            })
+            .unwrap();
+        assert_eq!(updated.profile.as_deref(), Some("xai"));
+        assert_eq!(
+            db.get_task("t-routed").unwrap().unwrap().profile.as_deref(),
+            Some("xai"),
+            "the UPDATE must carry the profile, not clear it"
+        );
     }
 
     #[test]
