@@ -765,12 +765,27 @@ fn conversation_name_from_id(id: &str) -> &str {
     "default"
 }
 
-/// Same catalog as [`list_device_sessions`], without Mission Control itself —
-/// the routing agent must not treat its own home as a dispatch target.
+/// Whether a session is a valid target for dispatched work.
+///
+/// Two exclusions, both structural rather than stylistic:
+///
+/// - Mission Control coordinates; routing work to itself is a loop.
+/// - An agent's INBOX is a mailbox. It runs the coordination runtime — no file
+///   or shell tools, and no `report_mission_task` — so work sent there can be
+///   neither done nor reported, and the task sits InProgress forever.
+///
+/// Named so the rule has one home and can be asserted directly; when this was
+/// an inline filter, the inbox case was simply missing.
+pub fn is_routable_target(id: &str) -> bool {
+    !crate::mission_control::is_session_id(id) && !is_inbox_session_id(id)
+}
+
+/// Same catalog as [`list_device_sessions`], without Mission Control itself and
+/// without agent inboxes — neither is a place work runs.
 pub fn list_routable_sessions() -> Vec<SessionInfo> {
     list_device_sessions()
         .into_iter()
-        .filter(|s| !crate::mission_control::is_session_id(&s.id))
+        .filter(|s| is_routable_target(&s.id))
         .collect()
 }
 
@@ -2034,5 +2049,47 @@ mod conversation_name_tests {
             conversation_name_from_id("inbox-snippet/state.json"),
             "default"
         );
+    }
+}
+
+#[cfg(test)]
+mod routable_target_tests {
+    use super::is_routable_target;
+
+    /// An ordinary project session is the only thing work routes to.
+    #[test]
+    fn a_project_session_is_routable() {
+        assert!(is_routable_target("snippet-service-61c2d836aee8dc5b"));
+        assert!(is_routable_target(
+            "wacht-480461c289235d72/conversations/e000736e-da39-4bd0-a307-52f52fc71241"
+        ));
+        // A pre-canonical id names the same session and must stay routable.
+        assert!(is_routable_target("snippet-service-61c2d836aee8dc5b/state.json"));
+    }
+
+    /// The bug this predicate exists for: MC routed a real task into an agent's
+    /// inbox, which runs the coordination runtime. It has no workspace tools and
+    /// no `report_mission_task`, so the task could be neither done nor reported
+    /// and sat InProgress forever while the inbox spun on it.
+    #[test]
+    fn an_agent_inbox_is_not_routable() {
+        assert!(!is_routable_target("inbox-snippet"));
+        assert!(!is_routable_target("inbox-snippet/state.json"));
+        assert!(!is_routable_target("inbox-rust-pr-reviewer"));
+    }
+
+    /// Mission Control coordinates; routing work to itself is a loop.
+    #[test]
+    fn mission_control_is_not_routable() {
+        assert!(!is_routable_target("mission-control"));
+        assert!(!is_routable_target("mission-control/session.json"));
+    }
+
+    /// The two exclusions must not swallow a workspace that merely starts with
+    /// the same letters — `inboxing-app-1234` is a real project folder.
+    #[test]
+    fn a_folder_named_like_an_inbox_stays_routable() {
+        assert!(is_routable_target("inboxing-app-1234abcd"));
+        assert!(is_routable_target("mission-control-ui-5678ef90"));
     }
 }

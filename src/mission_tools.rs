@@ -399,6 +399,18 @@ impl Tool for CreateMissionTask {
         }
         let store = db(ctx)?;
         let root = root(ctx)?;
+        // An agent's INBOX is a mailbox, not a workspace. It runs the
+        // coordination runtime — no file or shell tools, and no
+        // `report_mission_task` — so work routed there cannot be done and cannot
+        // be reported: the task sits InProgress forever. Refuse it and say where
+        // to route instead, rather than delivering into a dead end.
+        if crate::session::is_inbox_session_id(&args.session_id) {
+            return Err(ToolError::msg(
+                "that session is an agent's inbox — it answers messages and routes work, it cannot \
+                 do work. Dispatch to a session in the target workspace instead; list_sessions \
+                 does not offer inboxes.",
+            ));
+        }
         let path = state_path_for_id(&args.session_id)
             .ok_or_else(|| ToolError::msg("unknown target session"))?;
         let state = read_session_state(&path)
