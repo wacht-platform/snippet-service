@@ -277,7 +277,7 @@ impl Daemon {
         // A session opened as Mission Control must come back with the MC
         // prompt/tools/lane restrictions, and an agent session with its
         // specialized identity, rather than silently downgrading either.
-        let handle = self.start_role_aware(&cfg, sp.clone()).await;
+        let handle = self.start_role_aware(&cfg, sp.clone(), None).await;
         let tx = handle.input_tx.clone();
         let live = live_from_handle(handle, profile);
         let stream = live.stream.clone();
@@ -300,6 +300,7 @@ impl Daemon {
         &self,
         cfg: &SnippetConfig,
         sp: PathBuf,
+        initial: Option<String>,
     ) -> crate::session::SessionHandle {
         // Cloned per call: a `StreamHandle` is an `Arc<Mutex<StreamBuffer>>`, so
         // cloning is a refcount bump, and each call site needs its own value
@@ -319,7 +320,7 @@ impl Daemon {
             return crate::session::start_mission_control_session(
                 cfg,
                 sp,
-                None,
+                initial,
                 true,
                 stream(),
                 Some(self.browser.summary_provider()),
@@ -342,7 +343,7 @@ impl Daemon {
                     match crate::session::start_specialized_coordination_session(
                         cfg,
                         sp.clone(),
-                        None,
+                        initial.clone(),
                         true,
                         stream(),
                         Some(self.browser.summary_provider()),
@@ -360,7 +361,7 @@ impl Daemon {
                 Ok(home) => match crate::session::start_specialized_agent_session(
                     cfg,
                     sp.clone(),
-                    None,
+                    initial.clone(),
                     true,
                     stream(),
                     Some(self.browser.summary_provider()),
@@ -380,7 +381,7 @@ impl Daemon {
         start_session_with_browser_summary(
             cfg,
             sp,
-            None,
+            initial,
             true,
             stream(),
             Some(self.browser.summary_provider()),
@@ -439,7 +440,7 @@ impl Daemon {
         // Role-aware restart. Switching the model must NOT downgrade the
         // session: a Mission Control or agent session keeps its prompt, tools,
         // and lane limits, which a plain restart would silently drop.
-        let handle = self.start_role_aware(&cfg, sp.clone()).await;
+        let handle = self.start_role_aware(&cfg, sp.clone(), None).await;
         if persist {
             write_session_profile(&sp, profile); // outlives this run
         }
@@ -507,7 +508,7 @@ impl Daemon {
         // agent as an ordinary session — losing its identity, prompt and tool
         // set, with nothing logged. Routing both readers through
         // `start_role_aware` makes that asymmetry unrepresentable.
-        let handle = self.start_role_aware(&cfg, sp.clone()).await;
+        let handle = self.start_role_aware(&cfg, sp.clone(), None).await;
         sessions.insert(id.to_string(), live_from_handle(handle, profile));
         RebuildOutcome::Rebuilt
     }
@@ -604,16 +605,12 @@ impl Daemon {
             w
         };
         let forward = initial.is_none();
-        let handle = start_session_with_browser_summary(
-            &cfg,
-            sp.clone(),
-            initial,
-            true,
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                crate::llm::StreamBuffer::default(),
-            ))),
-            Some(self.browser.summary_provider()),
-        );
+        // ROLE-AWARE revive. This used to call the plain standard start, so any
+        // session revived by a delivery came back as an ordinary coding session —
+        // an agent's inbox got bash and workspace tools it must never have, and a
+        // specialized agent lost its identity. The role is a property of the
+        // session, and a delivery is not a reason to change it.
+        let handle = self.start_role_aware(&cfg, sp.clone(), initial).await;
         // Control inputs weren't consumed as the first turn — hand them to the
         // freshly-parked loop so it acts on them (idle-arm compaction, goal, etc.).
         if forward {
@@ -1730,6 +1727,17 @@ async fn coordination_create_task(
     let title = req.title.trim();
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    // An inbox is an agent's mailbox, not a place work runs: it holds the
+    // coordination runtime, which has no workspace tools and cannot report a
+    // task. Filing work there leaves it InProgress forever, so it is refused
+    // here for the same reason a nonexistent session is.
+    if crate::session::is_inbox_session_id(req.session_id.trim()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "session_id names an agent's inbox; route to a work session instead",
+        )
+            .into_response();
     }
     // The target must resolve, or the task would be filed against a session no
     // dispatch could ever reach.
