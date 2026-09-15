@@ -387,7 +387,7 @@ impl Daemon {
         )
     }
 
-    /// Switch a session onto a named inference profile, restarting its loop.
+    /// Run a session on a named inference profile, restarting its loop.
     ///
     /// A model is bound when the loop STARTS (`build_model_for_session`), and
     /// nothing switches it per turn. So changing the profile of a live session
@@ -396,10 +396,23 @@ impl Daemon {
     ///
     /// Stops the old loop first, so its in-flight turn is abandoned rather than
     /// left generating on a model the caller just replaced.
-    async fn restart_session_on_profile(
+    ///
+    /// `persist` decides whether this becomes the session's own model or only
+    /// this run's. They are different questions:
+    ///
+    /// - `POST /session/model` — the user is pinning THIS chat to a model. The
+    ///   choice outlives the run, so it is written to `sessions.profile` and
+    ///   survives a daemon restart or a resume.
+    /// - A dispatch — Mission Control is choosing a model for ONE assignment.
+    ///   The next task may want a different one, and the session's own default
+    ///   is not the dispatcher's to overwrite. So the profile is in-memory only:
+    ///   it drives this run, and a later start falls back to whatever the
+    ///   session was already set to.
+    async fn run_session_on_profile(
         &self,
         session: &str,
         profile: &str,
+        persist: bool,
     ) -> Result<(), String> {
         self.reload_config().await; // a profile added in the TUI must be usable
         let model_cfg = {
@@ -427,7 +440,9 @@ impl Daemon {
         // session: a Mission Control or agent session keeps its prompt, tools,
         // and lane limits, which a plain restart would silently drop.
         let handle = self.start_role_aware(&cfg, sp.clone()).await;
-        write_session_profile(&sp, profile); // persist so it survives a restart
+        if persist {
+            write_session_profile(&sp, profile); // outlives this run
+        }
         sessions.insert(
             session.to_string(),
             live_from_handle(handle, Some(profile.to_string())),
@@ -3094,8 +3109,9 @@ struct SessionModelReq {
     profile: String,
 }
 
-// POST /session/model {session, profile} — switch one conversation's model until
-// daemon restart: rebuild its loop on the chosen profile, resuming from disk.
+// POST /session/model {session, profile} — pin one conversation to a profile.
+// Rebuilds its loop on the chosen model, resuming from disk, and persists the
+// choice so it survives a daemon restart.
 async fn set_session_model(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -3106,8 +3122,12 @@ async fn set_session_model(
     }
     // One implementation, shared with dispatch: both need the same
     // resolve → abort → restart-on-new-model sequence, and a second copy would
-    // be free to drift on the role-aware details.
-    match d.restart_session_on_profile(&req.session, &req.profile).await {
+    // be free to drift on the role-aware details. The DIFFERENCE is persistence:
+    // this route is the user pinning the chat's model, so `true`.
+    match d
+        .run_session_on_profile(&req.session, &req.profile, true)
+        .await
+    {
         Ok(()) => {
             Json(serde_json::json!({ "session": req.session, "profile": req.profile }))
                 .into_response()
@@ -4776,8 +4796,12 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String
     // envelope runs on the model the dispatcher chose. A failure here is a
     // dispatch failure, not a silent downgrade: the task is released and
     // retried rather than delivered onto the wrong model.
+    //
+    // `persist: false` — this is a model for ONE assignment, not the session's
+    // new default. Mission Control does not own the chat's model, and the next
+    // task may want a different one, so the choice drives this run only.
     if let Some(profile) = task.profile.as_deref() {
-        if let Err(error) = d.restart_session_on_profile(&managed.id, profile).await {
+        if let Err(error) = d.run_session_on_profile(&managed.id, profile, false).await {
             release_failed_claim(d, &task, &error)?;
             return Err(error);
         }
