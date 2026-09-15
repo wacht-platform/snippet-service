@@ -163,10 +163,17 @@ pub fn update_session(
 
 /// List all managed sessions.  If `active_only` is true, only active ones
 /// are returned.
+///
+/// Agent inboxes are filtered out here, not at the store: a stale row can name
+/// one (an older build registered handoff targets before the routability guard
+/// existed). An inbox is private mail, not a session a person manages, so it
+/// must never reach a list rendered to the human.
 pub fn list_sessions(root: &Path, active_only: bool) -> Result<Vec<ManagedSession>, String> {
-    app_store(root)?
+    let mut sessions = app_store(root)?
         .list_managed_sessions(active_only)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    sessions.retain(|s| !crate::session::is_inbox_session_id(&s.id));
+    Ok(sessions)
 }
 
 /// Find sessions whose label contains `query` (case-insensitive).
@@ -269,6 +276,20 @@ mod tests {
         let active = list_sessions(root.path(), true).unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, "s1");
+    }
+
+    #[test]
+    fn list_sessions_hides_agent_inboxes() {
+        let root = tmp();
+        create_session(root.path(), "s1", "Real work", Path::new("/w")).unwrap();
+        create_session(root.path(), "inbox-snippet", "Snippet inbox", Path::new("/a")).unwrap();
+
+        let listed = list_sessions(root.path(), false).unwrap();
+        assert_eq!(listed.len(), 1, "an inbox is private mail, not a managed session");
+        assert_eq!(listed[0].id, "s1");
+
+        // Still addressable by id — filtering the list must not orphan it.
+        assert!(get_session(root.path(), "inbox-snippet").is_ok());
     }
 
     #[test]

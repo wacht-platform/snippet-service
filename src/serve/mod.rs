@@ -30,7 +30,8 @@ use crate::harness::{GoalStatus, HarnessEvent, LoopInput};
 use crate::mission_control::{self, ManagedSession};
 use crate::recurring::{self, Schedule};
 use crate::session::{
-    SessionRole, SessionSidecar, list_device_sessions, prepare_new_session_workspace,
+    SessionRole, SessionSidecar, all_device_sessions, list_device_sessions,
+    prepare_new_session_workspace,
     read_session_profile, read_session_sidecar, read_session_state, replay_notification_events,
     session_id_for_state_path, start_mission_control_session, start_session_with_browser_summary,
     state_path_for_id, status_str, subscribe_device_events, write_session_profile,
@@ -2441,7 +2442,9 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
     let config = d.config.lock().unwrap().clone();
     let mut totals: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
-    for session in list_device_sessions() {
+    // The RAW catalog: an inbox runs a real model, so its tokens are real spend.
+    // Listing sessions to a person excludes it; accounting for cost must not.
+    for session in all_device_sessions() {
         let Some(path) = state_path_for_id(&session.id) else {
             continue;
         };
