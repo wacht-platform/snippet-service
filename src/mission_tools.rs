@@ -415,6 +415,13 @@ impl Tool for CreateMissionTask {
             .ok_or_else(|| ToolError::msg("unknown target session"))?;
         let state = read_session_state(&path)
             .ok_or_else(|| ToolError::msg("session state unreadable"))?;
+        // Store the CANONICAL id. A caller may name the session in either form
+        // (`x` or `x/state.json`), but the runtime binds its own canonical id and
+        // `report_mission_task` compares the two literally. Storing the id as
+        // typed therefore meant a task dispatched to `x/state.json` could never be
+        // reported by `x` — the worker's completion was refused, the board never
+        // heard the outcome, and the task sat InProgress until someone noticed.
+        let session_id = crate::session::session_id_for_state_path(&path);
         // The worker, in order of specificity: what the caller named, then the
         // agent the target session is already bound to, then the general coding
         // agent. The session's own binding is the right default because that is
@@ -459,10 +466,10 @@ impl Tool for CreateMissionTask {
                 )));
             }
         }
-        if mission_control::get_session(&root, &args.session_id).is_err() {
+        if mission_control::get_session(&root, &session_id).is_err() {
             mission_control::create_session(
                 &root,
-                &args.session_id,
+                &session_id,
                 state.title.as_deref().unwrap_or("Managed session"),
                 std::path::Path::new(&state.workspace),
             )
@@ -488,7 +495,7 @@ impl Tool for CreateMissionTask {
         // shows who filed the work rather than an anonymous row.
         let mut task = Task::dispatched_to(
             id,
-            args.session_id.clone(),
+            session_id.clone(),
             args.title.trim().to_string(),
             args.description.trim().to_string(),
             owned_paths,
@@ -656,7 +663,14 @@ impl Tool for ReportMissionTask {
                 .get_task(&args.task_id)
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
-            if bound.reporting_session.as_deref() != Some(caller) {
+            // Compare CANONICAL forms. Tasks filed before the ids were
+            // canonicalised stored whatever was typed (`x/state.json`), while the
+            // runtime binds `x` — so a literal comparison rejected the very
+            // session that had been dispatched to, and the report was lost. Both
+            // sides are normalised so a legacy row still reports.
+            let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
+            let bound_to = bound.reporting_session.as_deref().map(canonical);
+            if bound_to.as_deref() != Some(canonical(caller).as_str()) {
                 return Err(ToolError::msg("task was not dispatched to this session"));
             }
         }
@@ -831,6 +845,59 @@ mod tests {
     /// normal case, and exactly the one where reading the worker from the
     /// SESSION's context would silently skip the agent board. The worker is
     /// resolved from the task ROSTER instead, so the row lands either way.
+    /// A task bound to a LEGACY-shaped id must still be reportable.
+    ///
+    /// `canonical_session_id` rewrote session ids to drop their filename, but a
+    /// task dispatched before that kept whatever was typed — `s1/state.json`.
+    /// The runtime binds its own canonical id (`s1`), so comparing the two
+    /// literally rejected the very session that had been dispatched to: the
+    /// completion was refused with "task was not dispatched to this session",
+    /// the board never heard the outcome, and the task sat InProgress forever.
+    #[tokio::test]
+    async fn a_legacy_bound_task_is_still_reportable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("snippet.db")).unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+
+        let task = Task::dispatched_to(
+            "t-legacy".into(),
+            "s1/state.json".into(),
+            "do the thing".into(),
+            "scope".into(),
+            vec![],
+            HandoffMode::Resume,
+            "agent",
+            crate::mission_control::SESSION_ID,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        db.create_task(&task).unwrap();
+        db.update_task_in("t-legacy", "2026-01-01T00:00:00Z", |t| {
+            t.status = TaskStatus::InProgress;
+            // The legacy form, as a pre-canonicalisation dispatch stored it.
+            t.reporting_session = Some("s1/state.json".into());
+        })
+        .unwrap();
+
+        // The session, binding its CANONICAL id.
+        let ctx = ToolContext::mission_control(dir.path())
+            .unwrap()
+            .with_durable_session_id("s1")
+            .with_store_path(dir.path().join("snippet.db"));
+
+        ReportMissionTask
+            .execute(
+                &ctx,
+                json!({"task_id":"t-legacy","status":"done","summary":"finished"}),
+            )
+            .await
+            .expect("a legacy-bound task must still accept its own session's report");
+
+        assert_eq!(
+            db.get_task("t-legacy").unwrap().unwrap().status,
+            TaskStatus::Done
+        );
+    }
+
     #[tokio::test]
     async fn completion_reports_to_the_task_and_the_workers_own_board() {
         let dir = tempfile::tempdir().unwrap();
