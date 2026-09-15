@@ -93,6 +93,15 @@ pub fn snippet_home() -> PathBuf {
     home.join(".snippet")
 }
 
+/// The default config file: `~/.snippet/config.toml`.
+///
+/// Derived from [`snippet_home`] rather than re-reading `HOME` at each call site,
+/// so a tool that needs the profile list reads the same file the daemon does —
+/// including under a test's `HOME`.
+pub fn default_config_path() -> PathBuf {
+    snippet_home().join("config.toml")
+}
+
 /// Restrict a file to owner-only (0600) on Unix; no-op elsewhere.
 pub fn set_private(path: &Path) {
     #[cfg(unix)]

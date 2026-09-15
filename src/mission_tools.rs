@@ -48,6 +48,7 @@ fn task_view(task: &Task) -> Value {
         "result": task.result, "owned_paths": task.owned_paths,
         "notifications": task.notifications, "updated_at": task.updated_at,
         "dispatch_failures": task.dispatch_failures,
+        "profile": task.profile,
     })
 }
 
@@ -55,6 +56,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ListSessions);
     registry.insert(InspectSession);
     registry.insert(ListMissionTasks);
+    registry.insert(ListProfiles);
     registry.insert(CreateMissionSession);
     registry.insert(CreateMissionTask);
     registry.insert(CreateRecurringJob);
@@ -263,6 +265,52 @@ impl Tool for ListMissionTasks {
     }
 }
 
+/// The inference profiles a dispatch can name, and which one is the default.
+///
+/// Mission Control has to pick a model when it routes work, and it cannot invent
+/// a profile name: a name the config does not define is silently ignored at
+/// session start, so the task would run on the wrong model with nothing reported.
+/// This is how it learns the real names.
+pub struct ListProfiles;
+#[async_trait]
+impl Tool for ListProfiles {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "list_profiles".into(),
+            description: "The inference profiles available for `create_mission_task(profile=…)`, with the active default. Names are exact — an unknown one is silently ignored when the session starts, so dispatch only names a profile listed here. Use this before choosing a profile, not to change the default.".into(),
+            input_schema: schema(json!({}), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
+        let config = crate::config::SnippetConfig::load(crate::config::default_config_path())
+            .await
+            .map_err(|e| ToolError::msg(format!("read config: {e}")))?;
+        let active = config.active_setup.clone();
+        let profiles: Vec<Value> = config
+            .setups
+            .as_ref()
+            .map(|setups| {
+                setups
+                    .iter()
+                    .map(|(name, cfg)| {
+                        json!({
+                            "name": name,
+                            "model": cfg.model,
+                            "provider": cfg.provider,
+                            "default": active.as_deref() == Some(name.as_str()),
+                            "has_key": !cfg.api_key.trim().is_empty(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(ToolResult::success(json!({
+            "default": active,
+            "profiles": profiles,
+        })))
+    }
+}
+
 #[derive(Deserialize)]
 struct CreateSessionArgs {
     folder: String,
@@ -328,12 +376,18 @@ struct CreateTaskArgs {
     /// finished the work.
     #[serde(default)]
     agent_id: Option<String>,
+    /// Inference profile the target session should run on. Omitted leaves the
+    /// session's own model alone, which is the right default: a session already
+    /// pinned to a model should not be moved by an unrelated dispatch.
+    /// `list_profiles` gives the exact names.
+    #[serde(default)]
+    profile: Option<String>,
 }
 pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist exactly one ordinary project handoff to an existing durable session. Never use for direct user agent-build requests, [AGENT_BUILD_JOB] envelopes, worker reports, or build-status notifications. Use handoff_mode 'resume' when the target already has context and 'fresh' otherwise.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist exactly one ordinary project handoff to an existing durable session. Never use for direct user agent-build requests, [AGENT_BUILD_JOB] envelopes, worker reports, or build-status notifications. Use handoff_mode 'resume' when the target already has context and 'fresh' otherwise.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -373,6 +427,26 @@ impl Tool for CreateMissionTask {
                 "unknown agent `{agent_id}` — list_coordination_agents shows the directory"
             )));
         }
+        // Refuse a profile the config does not define. Applying an unknown name
+        // is a silent no-op at session start, so the task would quietly run on
+        // the wrong model — the failure would be invisible until someone
+        // noticed the bill or the output.
+        let profile = args
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        if let Some(name) = profile.as_deref() {
+            let config = crate::config::SnippetConfig::load(crate::config::default_config_path())
+                .await
+                .map_err(|e| ToolError::msg(format!("read config: {e}")))?;
+            if !config.profile_names().iter().any(|known| known == name) {
+                return Err(ToolError::msg(format!(
+                    "unknown profile `{name}` — list_profiles shows the available names"
+                )));
+            }
+        }
         if mission_control::get_session(&root, &args.session_id).is_err() {
             mission_control::create_session(
                 &root,
@@ -400,7 +474,7 @@ impl Tool for CreateMissionTask {
             .map_err(ToolError::msg)?;
         // A task created by Mission Control is attributed to it, so the board
         // shows who filed the work rather than an anonymous row.
-        let task = Task::dispatched_to(
+        let mut task = Task::dispatched_to(
             id,
             args.session_id.clone(),
             args.title.trim().to_string(),
@@ -411,6 +485,7 @@ impl Tool for CreateMissionTask {
             crate::mission_control::SESSION_ID,
             now_rfc3339(),
         );
+        task.profile = profile.clone();
         let now = now_rfc3339();
         store
             .create_task(&task)
@@ -427,7 +502,8 @@ impl Tool for CreateMissionTask {
             json!({
                 "task": task_view(&task),
                 "agent_id": agent_id,
-                "note": "Persisted as pending. The daemon will dispatch it when its workspace is available."
+                "profile": profile,
+                "note": "Persisted as pending. The daemon dispatches it, and restarts the target session on `profile` when one is given."
             }),
         ))
     }

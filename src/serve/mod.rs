@@ -387,6 +387,54 @@ impl Daemon {
         )
     }
 
+    /// Switch a session onto a named inference profile, restarting its loop.
+    ///
+    /// A model is bound when the loop STARTS (`build_model_for_session`), and
+    /// nothing switches it per turn. So changing the profile of a live session
+    /// means replacing the loop — that is why this is shared with
+    /// `POST /session/model` rather than applied in place.
+    ///
+    /// Stops the old loop first, so its in-flight turn is abandoned rather than
+    /// left generating on a model the caller just replaced.
+    async fn restart_session_on_profile(
+        &self,
+        session: &str,
+        profile: &str,
+    ) -> Result<(), String> {
+        self.reload_config().await; // a profile added in the TUI must be usable
+        let model_cfg = {
+            let c = self.config.lock().unwrap();
+            c.setups
+                .as_ref()
+                .and_then(|m| m.get(profile))
+                .cloned()
+                .ok_or_else(|| format!("no such profile `{profile}`"))?
+        };
+        let (sp, folder) =
+            load_session_workspace(session).map_err(|_| format!("unknown session `{session}`"))?;
+        let cfg = {
+            let c = self.config.lock().unwrap();
+            let mut w = c.for_workspace(folder);
+            w.model = model_cfg;
+            w.active_setup = Some(profile.to_string());
+            w
+        };
+        let mut sessions = self.sessions.lock().await;
+        if let Some(old) = sessions.remove(session) {
+            old.join.abort();
+        }
+        // Role-aware restart. Switching the model must NOT downgrade the
+        // session: a Mission Control or agent session keeps its prompt, tools,
+        // and lane limits, which a plain restart would silently drop.
+        let handle = self.start_role_aware(&cfg, sp.clone()).await;
+        write_session_profile(&sp, profile); // persist so it survives a restart
+        sessions.insert(
+            session.to_string(),
+            live_from_handle(handle, Some(profile.to_string())),
+        );
+        Ok(())
+    }
+
     /// The provider actually driving a session: its per-chat profile's provider
     /// when overridden, else the global active model's. Used to scope
     /// provider-specific extras (e.g. the ChatGPT usage overlay) on the wire.
@@ -3056,39 +3104,16 @@ async fn set_session_model(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    d.reload_config().await; // a profile just created in the TUI must be selectable
-    let model_cfg = {
-        let c = d.config.lock().unwrap();
-        match c.setups.as_ref().and_then(|m| m.get(&req.profile)).cloned() {
-            Some(m) => m,
-            None => return (StatusCode::NOT_FOUND, "no such profile").into_response(),
+    // One implementation, shared with dispatch: both need the same
+    // resolve → abort → restart-on-new-model sequence, and a second copy would
+    // be free to drift on the role-aware details.
+    match d.restart_session_on_profile(&req.session, &req.profile).await {
+        Ok(()) => {
+            Json(serde_json::json!({ "session": req.session, "profile": req.profile }))
+                .into_response()
         }
-    };
-    let (sp, folder) = match load_session_workspace(&req.session) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let cfg = {
-        let c = d.config.lock().unwrap();
-        let mut w = c.for_workspace(folder);
-        w.model = model_cfg;
-        w.active_setup = Some(req.profile.clone());
-        w
-    };
-    let mut sessions = d.sessions.lock().await;
-    if let Some(old) = sessions.remove(&req.session) {
-        old.join.abort();
+        Err(error) => (StatusCode::NOT_FOUND, error).into_response(),
     }
-    // Role-aware restart. Switching the model must NOT downgrade the session:
-    // a Mission Control or agent session keeps its prompt/tools/lane limits,
-    // which previously were lost here until the next daemon restart.
-    let handle = d.start_role_aware(&cfg, sp.clone()).await;
-    write_session_profile(&sp, &req.profile); // persist so it survives restart
-    sessions.insert(
-        req.session.clone(),
-        live_from_handle(handle, Some(req.profile.clone())),
-    );
-    Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
 }
 
 fn session_event_page(
@@ -4747,6 +4772,16 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String
         managed.workspace.display(),
         task.id,
     );
+    // Apply the profile BEFORE delivering, so the turn that picks up this
+    // envelope runs on the model the dispatcher chose. A failure here is a
+    // dispatch failure, not a silent downgrade: the task is released and
+    // retried rather than delivered onto the wrong model.
+    if let Some(profile) = task.profile.as_deref() {
+        if let Err(error) = d.restart_session_on_profile(&managed.id, profile).await {
+            release_failed_claim(d, &task, &error)?;
+            return Err(error);
+        }
+    }
     d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
     // Record that this went out, on Mission Control's transcript, WITHOUT waking
     // it: the work is already routed and reports back on its own. This is what

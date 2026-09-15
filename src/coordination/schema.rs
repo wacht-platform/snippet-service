@@ -100,7 +100,10 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              dispatch_failures INTEGER NOT NULL DEFAULT 0,
              result_json TEXT,
              notifications_json TEXT NOT NULL DEFAULT '[]',
-             owned_paths_json TEXT NOT NULL DEFAULT '[]'
+             owned_paths_json TEXT NOT NULL DEFAULT '[]',
+             -- Inference profile the target session should run on. Set by the
+             -- dispatcher; NULL leaves the session's own model alone.
+             profile TEXT
          );
          CREATE INDEX IF NOT EXISTS tasks_status_priority
              ON tasks(status, priority DESC, created_at);
@@ -176,5 +179,23 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              ON agent_board(agent_id, workspace);
 "#,
     )?;
+    add_missing_columns(connection)?;
+    Ok(())
+}
+
+/// Add columns that a database created by an earlier build will not have.
+///
+/// `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so a
+/// new column in the DDL reaches fresh databases only. Without this, the first
+/// write naming `tasks.profile` fails on every existing install.
+fn add_missing_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let existing: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(tasks)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if !existing.iter().any(|column| column == "profile") {
+        connection.execute("ALTER TABLE tasks ADD COLUMN profile TEXT", [])?;
+    }
     Ok(())
 }
