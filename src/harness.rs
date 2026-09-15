@@ -137,6 +137,31 @@ pub enum HarnessEvent {
     Note {
         entry: String,
     },
+    /// A direct message between this session and an agent.
+    ///
+    /// Recorded in BOTH directions so the transcript shows the exchange: what
+    /// this session sent out, and what came back. Without the outbound record a
+    /// reply would appear from nowhere with no indication of what was asked.
+    AgentMessage {
+        /// The agent on the other side.
+        agent_id: String,
+        body: String,
+        /// True when this session sent it; false when the agent replied.
+        outbound: bool,
+    },
+    /// Someone other than this session dispatched a task, recorded here so the
+    /// coordinator's transcript shows what was sent out on its behalf.
+    ///
+    /// A NOTICE, never a wake: the work is already routed to a worker, so waking
+    /// Mission Control would spend a turn on something that needs no decision.
+    TaskDispatched {
+        task_id: String,
+        title: String,
+        /// The session the work was routed to.
+        session_id: String,
+        /// Who dispatched it — `human` for a user filing work directly.
+        by: String,
+    },
     /// The agent presented a file to the user (an openable card in the UIs).
     FilePresented {
         path: String,
@@ -604,6 +629,13 @@ pub enum LoopInput {
     CancelGoal,
     /// Cancel the run.
     Interrupt,
+    /// Record an event WITHOUT starting a turn.
+    ///
+    /// For information addressed to the session that the session's agent must not
+    /// be made to act on: a reply from another agent, or the record of a message
+    /// this session sent out. `UserMessage` would wake the agent and spend a turn
+    /// on a notice — this records it and leaves the loop parked.
+    Notice(HarnessEvent),
     /// Rewind to a checkpoint — truncate events and checkpoints to that point.
     Rewind {
         checkpoint: String,
@@ -717,20 +749,11 @@ pub struct CodingHarness {
     config: HarnessConfig,
     tools: ToolRegistry,
     context: ToolContext,
-    /// Which store this session's history lives in. `Unknown` until the load
-    /// resolves it; `File` keeps a pre-existing session on its state file so the
-    /// migration to the database stays an explicit step, not a side effect of
-    /// running.
-    backing: std::sync::atomic::AtomicU8,
     /// Ordinals already durable, so a persist can append the tail instead of
     /// rewriting the transcript.
     written_messages: std::sync::atomic::AtomicUsize,
     written_events: std::sync::atomic::AtomicUsize,
 }
-
-const BACKING_UNKNOWN: u8 = 0;
-const BACKING_FILE: u8 = 1;
-const BACKING_DB: u8 = 2;
 
 impl CodingHarness {
     pub fn new(config: HarnessConfig, tools: ToolRegistry, context: ToolContext) -> Self {
@@ -738,7 +761,6 @@ impl CodingHarness {
             config,
             tools,
             context,
-            backing: std::sync::atomic::AtomicU8::new(BACKING_UNKNOWN),
             written_messages: std::sync::atomic::AtomicUsize::new(0),
             written_events: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -761,10 +783,6 @@ impl CodingHarness {
         crate::store::Store::open(path).ok()
     }
 
-    fn backing(&self) -> u8 {
-        self.backing.load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// Save the session to the database: scalar state plus the transcript tail.
     ///
     /// Appends only the messages and events that are not already durable, so the
@@ -785,6 +803,15 @@ impl CodingHarness {
         let status = crate::session::status_str(state.status);
         let scalar = scalar_json(state).map_err(ToolError::msg)?;
         let now = state.updated_at.clone();
+
+        // Read the status BEFORE overwriting it: the transition is the entire
+        // content of the event, and `save_session_scalar` below destroys it.
+        let prev_status = store
+            .get_session_row(&id)
+            .ok()
+            .flatten()
+            .map(|row| row.status)
+            .unwrap_or_default();
 
         let result = async {
             store
@@ -835,11 +862,9 @@ impl CodingHarness {
                     .store(state.messages.len(), std::sync::atomic::Ordering::Release);
                 self.written_events
                     .store(state.events.len(), std::sync::atomic::Ordering::Release);
-                // Keep the list-readable sidecar in step: the session list still
-                // reads it, and a DB session must be as visible as a file one.
-                if let Some(path) = &self.config.state_path {
-                    crate::session::write_session_meta(path, state);
-                }
+                // Park any work a dead session was doing. Done AFTER the write,
+                // so the parked state never contradicts what the store holds.
+                crate::session::park_failed_session_work(&id, &prev_status, state);
                 Ok(())
             }
             Err(error) => Err(ToolError::msg(format!("persist session: {error}"))),
@@ -1100,6 +1125,7 @@ impl CodingHarness {
                                     | LoopInput::SetGoal(_)
                                     | LoopInput::ResumeGoal
                                     | LoopInput::CancelGoal
+                                    | LoopInput::Notice(_)
                             ) {
                                 needs_persist = true;
                             }
@@ -1244,6 +1270,11 @@ impl CodingHarness {
                     state.events.truncate(evt_mark);
                     state.history_rewritten = true;
                     state.status = HarnessStatus::Interrupted;
+                    // A notice is NOT part of the in-flight turn, so the truncate
+                    // above must not take it with it: it records something the
+                    // sender already had accepted. This is the last chance to
+                    // fold one in — `pending_inputs` is dropped when we break.
+                    self.record_pending_notices(&mut state, &mut pending_inputs);
                     state.events.push(HarnessEvent::SystemDecision {
                         step: "interrupted".to_string(),
                         reasoning: "User interrupted the run.".to_string(),
@@ -1323,6 +1354,10 @@ impl CodingHarness {
                         match action {
                             None => {
                                 state.status = HarnessStatus::Interrupted;
+                                // Last chance for a buffered notice: breaking drops
+                                // `pending_inputs`, and an interrupted message must
+                                // still reach the transcript.
+                                self.record_pending_notices(&mut state, &mut pending_inputs);
                                 state.events.push(HarnessEvent::SystemDecision {
                                     step: "interrupted".to_string(),
                                     reasoning: "User interrupted the run.".to_string(),
@@ -1359,6 +1394,10 @@ impl CodingHarness {
                             }
                             self.accept_user_message(&mut state, &mut vars, text).await;
                             consecutive_errors = 0;
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::Notice(event)) => {
+                            self.record_notice(&mut state, event);
                             self.persist(&mut state, &lanes).await?;
                         }
                         Some(LoopInput::Compact) => {
@@ -1796,11 +1835,47 @@ impl CodingHarness {
         (interrupted, wants_compact)
     }
 
+    /// Record an event addressed to this session WITHOUT starting a turn.
+    ///
+    /// The event lands in the transcript and in the model's context, so the
+    /// session's agent knows the exchange happened when it next runs — but the
+    /// loop stays parked, because a notice is information, not a request.
+    fn record_notice(&self, state: &mut HarnessState, event: HarnessEvent) {
+        if let Some(text) = notice_text(&event) {
+            state.messages.push(HarnessMessage::User { content: text });
+        }
+        state.events.push(event);
+    }
+
+    /// Fold notices buffered during a step into the transcript.
+    ///
+    /// The interrupt paths discard the in-flight turn with a truncate, and a
+    /// notice is not part of that turn — it is a record of something that already
+    /// happened and that the store has already accepted. Dropping one would lose
+    /// the message from the transcript entirely. Anything else stays buffered.
+    fn record_pending_notices(
+        &self,
+        state: &mut HarnessState,
+        pending: &mut Vec<LoopInput>,
+    ) {
+        pending.retain(|input| match input {
+            LoopInput::Notice(event) => {
+                self.record_notice(state, event.clone());
+                false
+            }
+            _ => true,
+        });
+    }
+
     /// Apply one queued input while a run is active: a message/answer becomes a
     /// `[steer]`, an interrupt returns `true`. Shared by the between-iteration
     /// drain and the buffered-input drain.
     fn apply_input(&self, state: &mut HarnessState, input: LoopInput) -> bool {
         match input {
+            LoopInput::Notice(event) => {
+                self.record_notice(state, event);
+                false
+            }
             LoopInput::UserMessage(text) | LoopInput::Answer(text) => {
                 let text = text.trim().to_string();
                 if !text.is_empty() {
@@ -2744,33 +2819,6 @@ impl CodingHarness {
                 }
             }
 
-            // Turn fence: a session holding a coordination lease must still own the
-            // turn before it mutates shared work. A replaced/expired holder is
-            // refused here so it can never corrupt the successor's turn.
-            if MUTATING_TOOLS.contains(&tool_name.as_str())
-                && let Err(error) = crate::coordination_tools::enforce_turn_fence(&self.context)
-            {
-                let result = json!({
-                    "schema_version": 1,
-                    "status": "error",
-                    "error": {
-                        "code": "turn_lease_lost",
-                        "message": error.to_string(),
-                    }
-                });
-                state.events.push(HarnessEvent::ToolResult {
-                    tool_name: tool_name.clone(),
-                    result: result.clone(),
-                });
-                state.messages.push(HarnessMessage::ToolResult {
-                    tool_call_id: call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    content: result,
-                });
-                let _ = self.persist(state, lanes).await;
-                continue;
-            }
-
             // Surface the in-flight call before running it so a slow tool (bash,
             // web fetch) isn't a black box — the TUI shows this ToolCall with a
             // "running" indicator until its result lands.
@@ -3398,32 +3446,7 @@ impl CodingHarness {
         if self.config.resume
             && let Some(state) = self.load_from_store().await?
         {
-            // The store is authoritative for a session that has a row, so this
-            // is the only place `backing` becomes DB.
-            self.backing
-                .store(BACKING_DB, std::sync::atomic::Ordering::Release);
             return self.resume_loaded_state(state, seeded_system, initial_request).await;
-        }
-
-        if self.config.resume
-            && let Some(path) = &self.config.state_path
-            && tokio::fs::try_exists(path).await?
-        {
-            let bytes = tokio::fs::read(path).await?;
-            // A state file saved by an older build may be unreadable. Don't fail
-            // the run — fall through and start a fresh session, overwriting it.
-            match deserialize_state(&bytes) {
-                Ok(state) => {
-                    self.backing
-                        .store(BACKING_FILE, std::sync::atomic::Ordering::Release);
-                    return self
-                        .resume_loaded_state(state, seeded_system, initial_request)
-                        .await;
-                }
-                Err(err) => {
-                    self.debug_log(&format!("resume: ignoring unreadable state file: {err}"));
-                }
-            }
         }
 
         // Fresh session in this folder: keep snippet's `.snippet/` workspace scratch
@@ -3491,15 +3514,6 @@ impl CodingHarness {
             queued_inputs: Vec::new(),
             history_rewritten: false,
         };
-        // A NEW session is born in the store whenever one is available — that is
-        // what porting the harness means for anything started from now on.
-        // Sessions that already exist keep their state file until they are
-        // migrated, which stays an explicit step rather than a side effect of
-        // opening a session.
-        if self.store().is_some() {
-            self.backing
-                .store(BACKING_DB, std::sync::atomic::Ordering::Release);
-        }
         self.persist_state(&mut state).await?;
         if request.is_some() {
             self.bump_activity();
@@ -4397,41 +4411,47 @@ impl CodingHarness {
             return Ok(());
         }
         state.updated_at = Utc::now().to_rfc3339();
-        // A session's history lives in exactly one place. Which one is decided
-        // when it is loaded (DB if the store has a row, else its state file), so
-        // a persist never migrates a session by itself.
-        if self.backing() == BACKING_DB {
-            return self.persist_to_store(state).await;
-        }
-        self.persist_state_to_file(state).await
+        self.persist_to_store(state).await
     }
 
-    async fn persist_state_to_file(&self, state: &mut HarnessState) -> Result<(), ToolError> {
-        let Some(path) = &self.config.state_path else {
-            return Ok(());
-        };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        // Pin last_active to the pre-rewrite mtime so open/attach/compaction
-        // cannot jump the session list. User messages call bump_activity.
-        crate::session::freeze_session_activity(path);
-        let temp_path = temp_state_path(path);
-        let bytes = serialize_state(&state).map_err(ToolError::msg)?;
-        tokio::fs::write(&temp_path, bytes).await?;
-        tokio::fs::rename(&temp_path, path).await?;
-        // Tiny metadata sidecar so `list_device_sessions` can skip decompressing
-        // every conversation when enumerating (scales to thousands of sessions).
-        crate::session::write_session_meta(path, &state);
-        Ok(())
-    }
-
-    /// List sort uses the sidecar `last_active`, not state-file mtime — bump
-    /// only when the user actually sent a message (or a mid-run steer).
+    /// List sort uses the store's `last_active` — bump only when the user
+    /// actually sent a message (or a mid-run steer).
     fn bump_activity(&self) {
         if let Some(path) = &self.config.state_path {
             crate::session::bump_session_activity(path);
         }
+    }
+}
+
+/// The transcript line a recorded event contributes, if any.
+///
+/// A `Notice` is stored as BOTH an event and a message: the event is what the
+/// UIs render, the message is what the model sees next turn. Returning `None`
+/// means the event is UI-only and must not enter the model's context.
+///
+/// Public so a notice recorded into a DORMANT session (no running loop) produces
+/// exactly the same transcript entry as one delivered to a live loop.
+pub(crate) fn notice_text(event: &HarnessEvent) -> Option<String> {
+    match event {
+        HarnessEvent::AgentMessage {
+            agent_id,
+            body,
+            outbound,
+        } => Some(if *outbound {
+            format!("[sent to {agent_id}]\n{body}")
+        } else {
+            format!("[reply from {agent_id}]\n{body}")
+        }),
+        HarnessEvent::TaskDispatched {
+            task_id,
+            title,
+            session_id,
+            by,
+        } => Some(format!(
+            "[dispatched by {by}] {title}\ntask {task_id} → session {session_id}\n             Informational: this work is already routed to a worker and will report back on its own. \
+             Do not dispatch it again."
+        )),
+        _ => None,
     }
 }
 
@@ -5033,17 +5053,6 @@ fn in_git_work_tree(dir: &Path) -> bool {
         cur = d.parent();
     }
     false
-}
-
-fn temp_state_path(path: &Path) -> PathBuf {
-    let mut temp = path.to_path_buf();
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!("{value}.tmp"))
-        .unwrap_or_else(|| "tmp".to_string());
-    temp.set_extension(extension);
-    temp
 }
 
 fn normalize_tool_aliases(calls: &mut [GeneratedToolCall]) {
@@ -6049,6 +6058,85 @@ mod tool_prune_tests {
                 assert!(!tool_args_are_stub(&tool_calls[0].arguments));
             }
             _ => panic!("expected assistant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    fn harness() -> CodingHarness {
+        CodingHarness::new(
+            HarnessConfig::default(),
+            ToolRegistry::new(),
+            ToolContext::new(std::env::temp_dir()).expect("ctx"),
+        )
+    }
+
+    fn dispatched(body: &str) -> HarnessEvent {
+        HarnessEvent::TaskDispatched {
+            task_id: "t1".into(),
+            title: body.into(),
+            session_id: "s1".into(),
+            by: "You".into(),
+        }
+    }
+
+    /// A notice buffered during a step must survive an interrupt.
+    ///
+    /// The interrupt paths discard the in-flight turn with a truncate, and a
+    /// notice is not part of that turn — it records something the sender already
+    /// had accepted. `pending_inputs` is dropped when the loop breaks, so without
+    /// draining notices at the interrupt, a direct message sent to a session that
+    /// was mid-run disappeared from its transcript even though the send had
+    /// succeeded. That is the regression this pins.
+    #[test]
+    fn a_buffered_notice_survives_an_interrupt() {
+        let harness = harness();
+        let mut state = HarnessState::blank("/tmp", None);
+        let mut pending = vec![
+            LoopInput::Notice(dispatched("keep me")),
+            LoopInput::Interrupt,
+        ];
+
+        harness.record_pending_notices(&mut state, &mut pending);
+
+        assert!(
+            state.events.iter().any(|e| matches!(
+                e,
+                HarnessEvent::TaskDispatched { title, .. } if title == "keep me"
+            )),
+            "the notice must reach the transcript"
+        );
+        assert_eq!(pending.len(), 1, "only notices are consumed");
+        assert!(
+            matches!(pending[0], LoopInput::Interrupt),
+            "an interrupt is left for the loop to act on"
+        );
+    }
+
+    /// A notice also enters the model's context, so a resumed loop knows what
+    /// happened while it was not looking.
+    #[test]
+    fn a_recorded_notice_enters_the_transcript_and_the_context() {
+        let harness = harness();
+        let mut state = HarnessState::blank("/tmp", None);
+
+        harness.record_notice(&mut state, dispatched("do the thing"));
+
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.messages.len(), 1);
+        match &state.messages[0] {
+            HarnessMessage::User { content } => {
+                assert!(content.contains("dispatched by You"), "got {content:?}");
+                assert!(content.contains("do the thing"), "got {content:?}");
+                assert!(
+                    content.contains("Do not dispatch it again"),
+                    "a resumed loop must know not to re-dispatch: {content:?}"
+                );
+            }
+            other => panic!("expected a user notice, got {other:?}"),
         }
     }
 }

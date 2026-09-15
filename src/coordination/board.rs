@@ -1,15 +1,8 @@
 //! Per-agent coordination memory.
 //!
-//! Each agent keeps its OWN board of what it dispatched, what came back, and
-//! what it learned. This is memory, not status: the authoritative state of a
-//! dispatch lives in `assignments`, and the board records the narrative around
-//! it ("I sent this to session X", "X reported this"). Duplicating status here
-//! would create a second source of truth that drifts — the failure this
-//! codebase already hit twice (the JSON task store, and a migration that froze
-//! while the file kept growing).
-//!
-//! Rows are deliberately structured rather than prose so an agent can filter by
-//! workspace and search by text; a blob of narrative supports neither.
+//! One agent's record of what it sent out, what came back, and what it learned.
+//! Board rows are NARRATIVE; durable work lives in `tasks`, which owns dispatch
+//! and the task board. The board is how an agent recalls its own history.
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};

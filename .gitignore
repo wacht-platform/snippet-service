@@ -8,3 +8,7 @@
 # stray temp files
 tmp_edit_*.txt
 /examples/
+
+# Release artifacts — deliverables, not source. Keep them out of the repo;
+# a 28 MB binary in history is not something a later clone should pay for.
+*.apk

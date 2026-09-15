@@ -1,7 +1,7 @@
 //! SQLite-backed coordination control plane.
 //!
-//! This module is the agent-facing half of the store: agent directory, board,
-//! assignments, handoffs, and turn leases. The connection handle and schema live
+//! This module is the agent-facing half of the store: the agent directory,
+//! the board, tasks, and direct messages. The connection handle and schema live
 //! in [`crate::store`], which is the general-purpose database for the whole
 //! device — sessions and conversations use the same handle without being
 //! coordination concepts.
@@ -13,9 +13,7 @@ mod events;
 mod identity;
 pub mod schema;
 mod tasks;
-mod transfers;
 pub mod types;
-mod work;
 
 pub use crate::store::{Store, StoreError};
 pub use board::{
@@ -29,8 +27,6 @@ pub use tasks::{
     HandoffMode, NotificationMarker, Task, TaskAgent, TaskFilter, TaskHandoff, TaskLink,
     TaskLinkKind, TaskResult, TaskStatus,
 };
-pub use types::{Handoff, SessionAgent, SessionLease};
-pub use work::{Assignment, AssignmentFilter, AssignmentStatus};
 
 /// The built-in general coding agent. Mission Control dispatches to it unless a
 /// user names another agent, so the id is a fixed constant rather than something

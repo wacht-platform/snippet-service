@@ -65,16 +65,6 @@ fn content_hash(bytes: &[u8]) -> u64 {
 
 pub type BrowserSummaryProvider = Arc<dyn Fn() -> String + Send + Sync>;
 
-/// The turn lease a session currently holds. Set when the session accepts a
-/// coordination assignment, cleared when it releases or hands off. The harness
-/// checks this fence before any workspace mutation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeaseClaim {
-    pub session_id: String,
-    pub lease_id: String,
-    pub assignment_id: String,
-    pub fencing_token: u64,
-}
 
 #[derive(Clone)]
 pub struct ToolContext {
@@ -103,12 +93,9 @@ pub struct ToolContext {
     /// daemon-managed session so coordination tools reach the same database the
     /// daemon writes.
     store_path: Option<PathBuf>,
-    /// The directory agent id this session runs as (specialized sessions only).
-    /// Lease tools record it so turn ownership is attributed correctly.
+    /// The directory agent id this session runs as (specialized sessions only),
+    /// so board writes and direct messages are attributed to the agent.
     agent_id: Option<String>,
-    /// Fenced turn lease this session holds, if any. Interior-mutable because the
-    /// lease tools run against a shared `&ToolContext`.
-    lease_claim: Arc<Mutex<Option<LeaseClaim>>>,
 }
 
 impl ToolContext {
@@ -163,7 +150,6 @@ impl ToolContext {
             mission_control_root: None,
             store_path: None,
             agent_id: None,
-            lease_claim: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -228,15 +214,6 @@ impl ToolContext {
         self.agent_id.as_deref()
     }
 
-    /// Record the fenced turn lease this session now holds.
-    pub fn set_lease_claim(&self, claim: Option<LeaseClaim>) {
-        *self.lease_claim.lock().unwrap() = claim;
-    }
-
-    /// The turn lease this session holds, if any.
-    pub fn lease_claim(&self) -> Option<LeaseClaim> {
-        self.lease_claim.lock().unwrap().clone()
-    }
 
     /// Record a successful memory_write id for live-context [memory_updated].
     pub fn note_memory_write(&self, id: &str) {

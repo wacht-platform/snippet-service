@@ -26,7 +26,7 @@ use crate::config::{InferenceProfileConfig, SnippetConfig, save_config, workspac
 use crate::coordination::{
     HandoffMode, NotificationMarker, Task, TaskLink, TaskLinkKind, TaskResult, TaskStatus,
 };
-use crate::harness::{GoalStatus, LoopInput};
+use crate::harness::{GoalStatus, HarnessEvent, LoopInput};
 use crate::mission_control::{self, ManagedSession};
 use crate::recurring::{self, Schedule};
 use crate::session::{
@@ -79,7 +79,6 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
     };
-    let session_id = session_id_for_state_path(&handle.state_path);
     LiveSession {
         input_tx: handle.input_tx,
         join: handle.join,
@@ -88,7 +87,7 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
         stream: handle.stream.unwrap_or_else(|| {
             std::sync::Arc::new(std::sync::Mutex::new(crate::llm::StreamBuffer::default()))
         }),
-        terms: SessionTerms::new_for_session(cwd, session_id),
+        terms: SessionTerms::new(cwd),
     }
 }
 
@@ -200,20 +199,19 @@ impl Daemon {
             .is_some_and(|t| token_matches(t, &self.token))
     }
 
-    fn accept_nonce(&self, session_id: &str, nonce: &str, state_path: &Path) -> bool {
+    /// Claim a client request id, returning false when it is a replay.
+    ///
+    /// Two levels, both in-process or in the store: an in-memory map for the
+    /// current run, and `request_nonces` for anything that outlives it. There
+    /// used to be a third — a session's `.nonces.json` sidecar, read as a
+    /// compatibility fallback from when sessions lived in files. It is gone:
+    /// the files held nothing the store did not, the entries were provably
+    /// older than every stored one, and a missing file read returning `None`
+    /// meant the fallback could rot silently without failing a single test.
+    fn accept_nonce(&self, session_id: &str, nonce: &str) -> bool {
         let key = format!("{session_id}:{nonce}");
         let mut map = self.seen_nonces.lock().unwrap();
         if map.contains_key(&key) {
-            return false;
-        }
-        // Existing sidecars remain a read-only compatibility fallback. New
-        // nonces go only to SQLite; no legacy file is migrated or modified.
-        if std::fs::read_to_string(state_path.with_extension("nonces.json"))
-            .ok()
-            .and_then(|contents| serde_json::from_str::<Vec<String>>(&contents).ok())
-            .is_some_and(|nonces| nonces.iter().any(|saved| saved == nonce))
-        {
-            map.insert(key, std::time::Instant::now());
             return false;
         }
         let now = std::time::SystemTime::now()
@@ -477,12 +475,6 @@ impl Daemon {
         if !entries.contains(&item.id) {
             entries.push(item.id.clone());
             self.queue_revision.fetch_add(1, Ordering::Release);
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "queue",
-                "action": "hidden",
-                "session": id,
-                "queue_id": item.id,
-            }));
         }
     }
 
@@ -657,10 +649,6 @@ pub async fn run_serve(
     }
     {
         let d = daemon.clone();
-        tokio::spawn(async move { coordination_dispatch_loop(d).await });
-    }
-    {
-        let d = daemon.clone();
         tokio::spawn(async move { direct::direct_dispatch_loop(d).await });
     }
     {
@@ -705,33 +693,6 @@ pub async fn run_serve(
         .route(
             "/coordination/tasks/{task_id}/agents/{agent_id}",
             delete(coordination_remove_task_agent),
-        )
-        .route(
-            "/coordination/assignments",
-            get(coordination_list_assignments).post(coordination_create_assignment),
-        )
-        .route("/coordination/dispatch", post(coordination_dispatch))
-        .route("/coordination/leases", get(coordination_list_leases))
-        .route(
-            "/coordination/sessions/{session_id}/agents",
-            get(coordination_session_agents),
-        )
-        .route(
-            "/coordination/sessions/{session_id}/lease",
-            post(coordination_acquire_lease),
-        )
-        .route(
-            "/coordination/sessions/{session_id}/lease/{lease_id}",
-            delete(coordination_release_lease),
-        )
-        .route(
-            "/coordination/sessions/{session_id}/lease/{lease_id}/renew",
-            post(coordination_renew_lease),
-        )
-        .route("/coordination/handoffs", get(coordination_list_handoffs))
-        .route(
-            "/coordination/handoffs/{handoff_id}/acknowledge",
-            post(coordination_acknowledge_handoff),
         )
         .route(
             "/coordination/threads/{thread_id}/events",
@@ -1251,6 +1212,123 @@ async fn agent_board(
     }
 }
 
+/// Record one event in a session's transcript WITHOUT starting a turn.
+///
+/// The one place a notice is written, so a live loop and a dormant session
+/// produce identical transcripts. Prefers the LIVE loop when the session is
+/// running, so the entry lands in the loop's own state and cannot be clobbered
+/// by a later full rewrite. A dormant session has no loop to hold it, so it goes
+/// straight to the store — which is where a live loop reads from anyway.
+///
+/// `notice_text` decides whether the event also enters the model's context.
+async fn record_notice(d: &Daemon, session_id: &str, event: HarnessEvent) {
+    // Callers pass the id as it was recorded elsewhere — which is not always the
+    // stored key, since a model routinely drops the `/state.json` suffix.
+    // Recording under the bare form would match no session and be dropped below,
+    // silently losing the entry. Resolve to the canonical id first so both forms
+    // name the same conversation.
+    let canonical = crate::session::state_path_for_id(session_id)
+        .map(|path| crate::session::session_id_for_state_path(&path));
+    let session_id = canonical.as_deref().unwrap_or(session_id);
+    // A FINISHED loop is a dead entry: `send` into its closed channel reports
+    // success and the notice is gone. `deliver` guards on this; without the same
+    // guard here, a message sent to a session whose loop has stopped — after an
+    // interrupt, say — never reaches its transcript even though the daemon
+    // accepted it. Filtering finished loops falls through to the store write
+    // below, which is where a resumed loop reads from anyway.
+    let live = {
+        let sessions = d.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .filter(|s| !s.join.is_finished())
+            .map(|s| s.input_tx.clone())
+    };
+    if let Some(tx) = live {
+        // A notice, not a `UserMessage`: the loop records it and stays parked.
+        let _ = tx.send(LoopInput::Notice(event));
+        return;
+    }
+    // Dormant: no loop to deliver into. Write straight to the store, but only
+    // when the session actually has a row — `session_events` has a foreign key to
+    // `sessions`, so an insert for an unknown session would just fail.
+    if !d.store.has_conversation(session_id).unwrap_or(false) {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = d
+        .store
+        .append_conversation_events(session_id, std::slice::from_ref(&event), &now);
+    if let Some(text) = crate::harness::notice_text(&event) {
+        let _ = d.store.append_conversation_messages(
+            session_id,
+            &[crate::llm::HarnessMessage::User { content: text }],
+            &now,
+        );
+    }
+}
+
+/// Record a direct message in a session's transcript WITHOUT starting a turn.
+///
+/// Both directions use this: what a session sent out, and what came back. The
+/// event is for the UIs; the paired message is so the model sees the exchange
+/// next turn.
+///
+/// Private to `serve`; its child module `direct` reaches it via `super::`.
+async fn record_agent_message(
+    d: &Shared,
+    session_id: &str,
+    agent_id: &str,
+    body: &str,
+    outbound: bool,
+) {
+    record_notice(
+        d,
+        session_id,
+        HarnessEvent::AgentMessage {
+            agent_id: agent_id.to_string(),
+            body: body.to_string(),
+            outbound,
+        },
+    )
+    .await;
+}
+
+/// Note on Mission Control's transcript that work was dispatched on its behalf.
+///
+/// The user can file a task directly, which bypasses Mission Control entirely —
+/// so without this the coordinator's record would show the task appearing from
+/// nowhere. It is a NOTICE, never a wake: the work is already routed to a worker
+/// and will report back on its own, so waking Mission Control would spend a turn
+/// on something that needs no decision.
+async fn record_dispatch_notice(d: &Daemon, task: &crate::coordination::Task) {
+    // Mission Control dispatching through its own tool already has the tool call
+    // and result in its transcript. Recording a notice too would tell it twice,
+    // so this is for dispatches made AROUND it — the case where its record would
+    // otherwise show work appearing from nowhere.
+    if task.created_by_id == crate::mission_control::SESSION_ID {
+        return;
+    }
+    let target = crate::session::state_path_for_id(&task.session_id)
+        .map(|path| crate::session::session_id_for_state_path(&path))
+        .unwrap_or_else(|| task.session_id.clone());
+    let by = if task.created_by_kind == "human" {
+        "You".to_string()
+    } else {
+        format!("{}:{}", task.created_by_kind, task.created_by_id)
+    };
+    record_notice(
+        d,
+        crate::mission_control::SESSION_ID,
+        HarnessEvent::TaskDispatched {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            session_id: target,
+            by,
+        },
+    )
+    .await;
+}
+
 #[derive(Deserialize)]
 struct AgentReq {
     id: String,
@@ -1460,118 +1538,6 @@ async fn coordination_events_ws(
     })
 }
 
-#[derive(Deserialize)]
-struct CoordinationAssignmentReq {
-    id: String,
-    goal_id: String,
-    session_id: String,
-    agent_id: String,
-    scope: String,
-    definition_of_done: String,
-    /// Inference profile to run this dispatch with. Optional: omitting it leaves
-    /// the session's own profile in place.
-    #[serde(default)]
-    profile: Option<String>,
-    /// The agent dispatching this work, when one is.
-    #[serde(default)]
-    dispatched_by: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CoordinationAssignmentsQuery {
-    token: Option<String>,
-    /// Keyset cursor: the previous page's last `(created_at, id)`.
-    #[serde(default)]
-    after_created: Option<String>,
-    #[serde(default)]
-    after_id: Option<String>,
-    #[serde(default = "default_agent_page_limit")]
-    limit: u32,
-    /// Optional filter by agent, for "what is this agent working on".
-    #[serde(default)]
-    agent_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-}
-
-/// Assignments, newest page first by `(created_at, id)` keyset. Optionally
-/// filtered to one agent or one session, which is how the UI answers "who is
-/// working on what".
-async fn coordination_list_assignments(
-    State(d): State<Shared>,
-    Query(q): Query<CoordinationAssignmentsQuery>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    let after = match (q.after_created.as_deref(), q.after_id.as_deref()) {
-        (Some(created), Some(id)) => Some((created, id)),
-        (Some(_), None) | (None, Some(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "after_created and after_id must be provided together",
-            )
-                .into_response();
-        }
-        (None, None) => None,
-    };
-    let filter = crate::coordination::AssignmentFilter {
-        agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
-        session_id: q.session_id.as_deref().filter(|s| !s.trim().is_empty()),
-        status: None,
-    };
-    match d
-        .store
-        .list_assignments_page(&filter, after, q.limit.clamp(1, 500))
-    {
-        Ok(assignments) => Json(assignments).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list assignments: {error}"),
-        )
-            .into_response(),
-    }
-}
-
-/// Sessions that currently have an active turn holder: the live view of which
-/// agent is working in which session, and since when.
-async fn coordination_list_leases(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    match d.store.list_active_leases(&chrono::Utc::now().to_rfc3339()) {
-        Ok(leases) => Json(leases).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list leases: {error}"),
-        )
-            .into_response(),
-    }
-}
-
-/// Who is — and was — active in a session: the active holder first, then the
-/// history. This is what answers "when is an agent active in this session".
-async fn coordination_session_agents(
-    State(d): State<Shared>,
-    Query(q): Query<Auth>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    match d
-        .store
-        .list_session_agents(&session_id, &chrono::Utc::now().to_rfc3339())
-    {
-        Ok(agents) => Json(agents).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list session agents: {error}"),
-        )
-            .into_response(),
-    }
-}
-
 /// The task board's own columns are narrower than the assignment states — a task
 /// is what a HUMAN filed, so it carries Todo/InProgress/Blocked/Done/Cancelled
 /// and nothing about dispatch.
@@ -1607,6 +1573,10 @@ struct CoordinationTaskReq {
     title: String,
     #[serde(default)]
     description: String,
+    /// The session that should do the work. REQUIRED: a task with no target can
+    /// never be dispatched — the loop claims it, finds nowhere to deliver, and
+    /// parks it Blocked — so filing one would create dead weight.
+    session_id: String,
     #[serde(default)]
     priority: i64,
 }
@@ -1698,6 +1668,33 @@ async fn coordination_create_task(
     if title.is_empty() {
         return (StatusCode::BAD_REQUEST, "title is required").into_response();
     }
+    // The target must resolve, or the task would be filed against a session no
+    // dispatch could ever reach.
+    let session_id = req.session_id.trim();
+    let state = crate::session::state_path_for_id(session_id)
+        .and_then(|path| crate::session::read_session_state(&path));
+    let Some(state) = state else {
+        return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
+    };
+    // Dispatch delivers through the MANAGED session record, so a target that is
+    // not managed yet would be claimed, found undeliverable, and parked Blocked
+    // after the failure ceiling. Registering it here is what makes a task filed
+    // against any real session runnable — the same step Mission Control's own
+    // task tool performs.
+    if mission_control::get_session(&d.mission_control_root, session_id).is_err() {
+        if let Err(error) = mission_control::create_session(
+            &d.mission_control_root,
+            session_id,
+            state.title.as_deref().unwrap_or("Managed session"),
+            std::path::Path::new(&state.workspace),
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("register managed session: {error}"),
+            )
+                .into_response();
+        }
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let id = req
         .id
@@ -1708,6 +1705,7 @@ async fn coordination_create_task(
         id,
         title.to_string(),
         req.description.trim().to_string(),
+        session_id.to_string(),
         req.priority,
         now,
     );
@@ -2000,202 +1998,6 @@ async fn coordination_remove_task_agent(
     }
 }
 
-#[derive(Deserialize)]
-struct DispatchReq {
-    session_id: String,
-    /// Omitted means the default agent; naming one is how a specialist is chosen.
-    #[serde(default)]
-    agent_id: Option<String>,
-    scope: String,
-    definition_of_done: String,
-    /// Optional inference profile for THIS dispatch. Omitted leaves the
-    /// session's own profile in place.
-    #[serde(default)]
-    profile: Option<String>,
-    /// Groups related dispatches. Generated when omitted, so a standalone
-    /// "give this agent work" needs no goal to exist first.
-    #[serde(default)]
-    goal_id: Option<String>,
-}
-
-/// POST /coordination/dispatch — give an agent work in a session, in one call.
-///
-/// This exists because creating an assignment by hand requires ids a client
-/// cannot safely invent: the goal it belongs to, the assignment id, and the turn
-/// lease the runtime acquires. A UI that manufactures those would be guessing at
-/// server-owned state. Here the WORK is described and the daemon mints the rest,
-/// then lets the ordinary dispatch loop deliver it — so a dispatch made from the
-/// CLI, the TUI, the app, or Mission Control's tool all take the same path.
-async fn coordination_dispatch(
-    State(d): State<Shared>,
-    Query(q): Query<Auth>,
-    Json(req): Json<DispatchReq>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    if req.session_id.trim().is_empty()
-        || req.scope.trim().is_empty()
-        || req.definition_of_done.trim().is_empty()
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "session_id, scope, and definition_of_done are required",
-        )
-            .into_response();
-    }
-    let agent_id = req
-        .agent_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .unwrap_or(crate::coordination::SNIPPET_AGENT_ID)
-        .to_string();
-    match d.store.get_agent(&agent_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return (StatusCode::NOT_FOUND, "unknown agent").into_response(),
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("look up agent: {error}"),
-            )
-                .into_response();
-        }
-    }
-    // The target session must exist: an assignment pointing at an unknown
-    // session can never be delivered, and would sit in the queue forever.
-    if state_path_for_id(&req.session_id).is_none()
-        || crate::session::read_session_state(
-            &state_path_for_id(&req.session_id).expect("checked above"),
-        )
-        .is_none()
-    {
-        return (StatusCode::NOT_FOUND, "unknown session").into_response();
-    }
-    // A named profile that does not exist would silently fall back to the
-    // session's own model, so it is refused rather than ignored.
-    if let Some(profile) = req.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        let known = {
-            let c = d.config.lock().unwrap();
-            c.setups.as_ref().is_some_and(|setups| setups.contains_key(profile))
-        };
-        if !known {
-            return (StatusCode::NOT_FOUND, "no such profile").into_response();
-        }
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let assignment = crate::coordination::Assignment {
-        id: uuid::Uuid::new_v4().to_string(),
-        goal_id: req
-            .goal_id
-            .map(|g| g.trim().to_string())
-            .filter(|g| !g.is_empty())
-            .unwrap_or_else(|| format!("goal-{}", uuid::Uuid::new_v4())),
-        session_id: req.session_id.trim().to_string(),
-        agent_id,
-        status: crate::coordination::AssignmentStatus::Offered,
-        scope: req.scope.trim().to_string(),
-        definition_of_done: req.definition_of_done.trim().to_string(),
-        profile: req
-            .profile
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty()),
-        // Deliberately NOT taken from the request. This endpoint is how a human
-        // or client dispatches, and a client-supplied dispatcher would let a
-        // caller claim to be any agent — the same impersonation the direct-message
-        // route refuses. An agent dispatching from its own turn goes through
-        // `create_coordination_assignment`, which derives the dispatcher from the
-        // session's identity.
-        dispatched_by: None,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    match d.store.create_assignment(&assignment) {
-        Ok(()) => {
-            // The dispatcher's own memory records what it sent, so completion can
-            // report back to a board that knows about this dispatch.
-            if let Some(dispatcher) = assignment.dispatched_by.as_deref() {
-                let workspace = state_path_for_id(&assignment.session_id)
-                    .and_then(|path| read_session_state(&path))
-                    .map(|state| state.workspace);
-                let _ = d.store.record_board_entry(
-                    dispatcher,
-                    crate::coordination::BoardEntryKind::Dispatched,
-                    &crate::coordination::NewBoardEntry {
-                        session_id: Some(&assignment.session_id),
-                        workspace: workspace.as_deref().filter(|w| !w.is_empty()),
-                        summary: &format!(
-                            "dispatched to {}: {}",
-                            assignment.agent_id, assignment.scope
-                        ),
-                        correlation_id: Some(&assignment.id),
-                        created_at: &assignment.created_at,
-                    },
-                );
-            }
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "dispatch",
-                "session": assignment.session_id,
-                "agent": assignment.agent_id,
-                "assignment": assignment.id,
-                "profile": assignment.profile,
-            }));
-            (StatusCode::ACCEPTED, Json(assignment)).into_response()
-        }
-        Err(error) => (StatusCode::CONFLICT, format!("dispatch: {error}")).into_response(),
-    }
-}
-
-async fn coordination_create_assignment(
-    State(d): State<Shared>,
-    Query(q): Query<Auth>,
-    Json(req): Json<CoordinationAssignmentReq>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    if req.id.trim().is_empty()
-        || req.goal_id.trim().is_empty()
-        || req.session_id.trim().is_empty()
-        || req.agent_id.trim().is_empty()
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "id, goal_id, session_id, and agent_id are required",
-        )
-            .into_response();
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    let assignment = crate::coordination::Assignment {
-        id: req.id,
-        goal_id: req.goal_id,
-        session_id: req.session_id,
-        agent_id: req.agent_id,
-        status: crate::coordination::AssignmentStatus::Offered,
-        scope: req.scope,
-        definition_of_done: req.definition_of_done,
-        profile: req.profile.filter(|p| !p.trim().is_empty()),
-        dispatched_by: req
-            .dispatched_by
-            .map(|a| a.trim().to_string())
-            .filter(|a| !a.is_empty()),
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    match d.store.create_assignment(&assignment) {
-        Ok(()) => {
-            // Recording the offer is all this does. Delivery belongs to the
-            // dispatch loop, so an offer made here and one made by Mission
-            // Control's tool reach the worker through the same path — the
-            // previous shape delivered only on this route, so a tool-created
-            // offer sat undelivered forever.
-            (StatusCode::CREATED, Json(assignment)).into_response()
-        }
-        Err(error) => (StatusCode::CONFLICT, format!("create assignment: {error}")).into_response(),
-    }
-}
-
 /// Whether a board post should wake Mission Control. Posts authored by Mission
 /// Control itself are skipped, so a reply cannot re-wake the session that wrote
 /// it (which would loop).
@@ -2269,280 +2071,10 @@ fn board_message_envelope(
     )
 }
 
-/// The envelope handed to the worker session that owns `assignment`. States the
-/// boundary and the report contract without restating the session prompt.
-fn coordination_assignment_envelope(assignment: &crate::coordination::Assignment) -> String {
-    format!(
-        "[coordination_assignment]\nassignment_id: {}\ngoal_id: {}\nsession_id: {}\nagent_id: {}\nscope: {}\ndefinition_of_done: {}\nboard_thread: {}\n\
-         rules: accept this assignment to acquire the turn (accept_coordination_assignment), \
-         renew_coordination_lease while working, release_coordination_lease when done or handing off. \
-         Post progress to the board with post_coordination_message on board_thread — that is the thread the \
-         human reads, so a post anywhere else goes unseen. Read the room with \
-         read_coordination_thread when you need more history than the wake message included. \
-         Do not mutate the workspace until you hold the turn.\n\
-         [/coordination_assignment]",
-        assignment.id,
-        assignment.goal_id,
-        assignment.session_id,
-        assignment.agent_id,
-        assignment.scope,
-        assignment.definition_of_done,
-        COORDINATION_THREAD,
-    )
-}
 
-/// Start (or revive) the session that will execute `assignment`, running as the
-/// assigned agent's specialized identity, and deliver the assignment envelope.
-/// Writes the role sidecar first so a later resume keeps the agent identity.
-async fn ensure_agent_session(
-    d: &Shared,
-    assignment: &crate::coordination::Assignment,
-) -> Result<(), String> {
-    let sp = state_path_for_id(&assignment.session_id).ok_or_else(|| {
-        format!(
-            "assignment targets unknown durable session `{}`",
-            assignment.session_id
-        )
-    })?;
-    // The agent home must exist; otherwise the session would start with no identity.
-    let home = crate::coordination::AgentHome::new(
-        crate::coordination::agents_root(&d.mission_control_root),
-        &assignment.agent_id,
-    )
-    .map_err(|e| e.to_string())?;
-    if !home.identity_path().exists() {
-        return Err(format!(
-            "agent `{}` has no identity home at {}",
-            assignment.agent_id,
-            home.root().display()
-        ));
-    }
-    write_session_sidecar(
-        &sp,
-        &SessionSidecar {
-            // A session worked by an agent is still a STANDARD session; the
-            // agent is who is working it, not what it is.
-            role: SessionRole::Standard,
-            agent_id: Some(assignment.agent_id.clone()),
-        },
-    );
-    // Apply the dispatch's inference profile BEFORE the session starts, for the
-    // same reason the sidecar is written first: `ensure_live` returns an existing
-    // live session untouched, so a profile set afterwards would only take effect
-    // on the next restart. Omitting it leaves the session's own profile in place.
-    if let Some(profile) = assignment.profile.as_deref() {
-        write_session_profile(&sp, profile);
-        let mut sessions = d.sessions.lock().await;
-        if let Some(existing) = sessions.get(&assignment.session_id) {
-            // Only tear the loop down when the profile actually differs; a
-            // re-dispatch with the same profile must not interrupt work.
-            if existing.profile.as_deref() != Some(profile) {
-                if let Some(old) = sessions.remove(&assignment.session_id) {
-                    old.join.abort();
-                }
-            }
-        }
-    }
-    let Some((tx, _sp, _stream)) = d.ensure_live(&assignment.session_id).await else {
-        return Err(format!(
-            "could not start session `{}`",
-            assignment.session_id
-        ));
-    };
-    let _ = tx.send(LoopInput::UserMessage(coordination_assignment_envelope(
-        assignment,
-    )));
-    Ok(())
-}
 
-/// Deliver every assignment that has not yet been handed to its session.
-///
-/// This is the ONE delivery path, and it is a loop rather than a direct call so
-/// it does not matter who created the assignment: a Mission Control tool call and
-/// the REST route both just write a row, and both are delivered here. The
-/// `dispatched_at` marker is durable, which fixes the two ways the old
-/// route-only delivery failed — an offer created by a tool was never delivered
-/// at all, and a delivery lost to a restart was never retried.
-async fn coordination_dispatch_loop(daemon: Shared) {
-    loop {
-        // A read failure is reported rather than swallowed: silent non-delivery
-        // is the exact bug this loop exists to fix, so a broken read must not
-        // look like "nothing to do".
-        let pending = match daemon.store.list_undelivered_assignments() {
-            Ok(pending) => pending,
-            Err(error) => {
-                eprintln!("[coordination] could not list undelivered assignments: {error}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        for assignment in pending {
-            match ensure_agent_session(&daemon, &assignment).await {
-                Ok(()) => {
-                    // Mark only after the envelope is in the session's queue, so a
-                    // failure below retries on the next tick instead of stranding
-                    // the offer.
-                    let _ = daemon.store.mark_assignment_dispatched(
-                        &assignment.id,
-                        &chrono::Utc::now().to_rfc3339(),
-                    );
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[coordination] assignment {} not dispatched: {error}",
-                        assignment.id
-                    );
-                    // A failure that retrying cannot fix (a missing agent home,
-                    // an unknown session) must not spin the loop forever. Park it
-                    // as blocked at the ceiling, the same way the JSON dispatch
-                    // path parks an undeliverable task.
-                    const MAX_DISPATCH_FAILURES: u32 = 5;
-                    let failures = daemon
-                        .store
-                        .record_assignment_dispatch_failure(&assignment.id)
-                        .unwrap_or(0);
-                    if failures >= MAX_DISPATCH_FAILURES {
-                        let _ = daemon.store.transition_assignment(
-                            &assignment.id,
-                            crate::coordination::AssignmentStatus::Offered,
-                            crate::coordination::AssignmentStatus::Blocked,
-                            &chrono::Utc::now().to_rfc3339(),
-                        );
-                        eprintln!(
-                            "[coordination] assignment {} blocked after {failures} dispatch failures",
-                            assignment.id
-                        );
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
 
-#[derive(Deserialize)]
-struct CoordinationLeaseReq {
-    lease_id: String,
-    assignment_id: String,
-    agent_id: String,
-    expires_at: String,
-}
 
-async fn coordination_acquire_lease(
-    State(d): State<Shared>,
-    Query(q): Query<Auth>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
-    Json(req): Json<CoordinationLeaseReq>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    let lease = crate::coordination::types::SessionLease {
-        session_id,
-        lease_id: req.lease_id,
-        assignment_id: req.assignment_id,
-        agent_id: req.agent_id,
-        fencing_token: 0,
-        acquired_at: chrono::Utc::now().to_rfc3339(),
-        renewed_at: chrono::Utc::now().to_rfc3339(),
-        expires_at: req.expires_at,
-    };
-    match d.store.acquire_lease(&lease) {
-        Ok(Some(acquired)) => (StatusCode::CREATED, Json(acquired)).into_response(),
-        Ok(None) => (StatusCode::CONFLICT, "session already has an active lease").into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, format!("acquire lease: {error}")).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct CoordinationLeaseRenewReq {
-    fencing_token: u64,
-    expires_at: String,
-}
-
-async fn coordination_renew_lease(
-    State(d): State<Shared>,
-    Query(q): Query<Auth>,
-    axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>,
-    Json(req): Json<CoordinationLeaseRenewReq>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    let renewed_at = chrono::Utc::now().to_rfc3339();
-    match d.store.renew_lease(&lease_id, req.fencing_token, &renewed_at, &req.expires_at) {
-        Ok(true) => Json(serde_json::json!({"lease_id": lease_id, "fencing_token": req.fencing_token, "renewed_at": renewed_at, "expires_at": req.expires_at})).into_response(),
-        Ok(false) => (StatusCode::CONFLICT, "lease is stale, released, or fenced").into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, format!("renew lease: {error}")).into_response(),
-    }
-}
-
-async fn coordination_release_lease(
-    State(d): State<Shared>,
-    Query(q): Query<Auth>,
-    axum::extract::Path((_session_id, lease_id)): axum::extract::Path<(String, String)>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    match d.store.release_lease(
-        &lease_id,
-        &chrono::Utc::now().to_rfc3339(),
-        "released_by_client",
-    ) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (StatusCode::NOT_FOUND, "lease not active").into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, format!("release lease: {error}")).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct CoordinationHandoffAckReq {
-    acknowledged_at: Option<String>,
-}
-
-/// Pending (unacknowledged) handoffs, oldest first. Read-only; the ack is a
-/// separate POST.
-async fn coordination_list_handoffs(State(d): State<Shared>, Query(q): Query<Auth>) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    match d.store.list_pending_handoffs() {
-        Ok(handoffs) => Json(handoffs).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("list handoffs: {error}"),
-        )
-            .into_response(),
-    }
-}
-
-async fn coordination_acknowledge_handoff(
-    State(d): State<Shared>,
-    Query(q): Query<Auth>,
-    axum::extract::Path(handoff_id): axum::extract::Path<String>,
-    Json(req): Json<CoordinationHandoffAckReq>,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    let at = req
-        .acknowledged_at
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-    match d.store.acknowledge_handoff(&handoff_id, &at) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            "handoff not found or already acknowledged",
-        )
-            .into_response(),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            format!("acknowledge handoff: {error}"),
-        )
-            .into_response(),
-    }
-}
 
 #[derive(Deserialize)]
 struct NotificationReplayQuery {
@@ -2987,20 +2519,23 @@ async fn open_session(
     // `conversations/<uuid>.json` (started blank), so the folder's existing
     // session(s) are preserved and a new one appears in the list.
     let (sp, resume) = if req.new_conversation {
-        let name = uuid::Uuid::new_v4().to_string();
         let path = base_state
-            .parent()
-            .map(|p| p.join("conversations").join(format!("{name}.json")))
-            .unwrap_or_else(|| base_state.clone());
+            .join("conversations")
+            .join(uuid::Uuid::new_v4().to_string());
         (path, false)
     } else {
         (base_state.clone(), req.resume)
     };
-    let id = sp
-        .strip_prefix(workspaces_root())
-        .unwrap_or(&sp)
-        .display()
-        .to_string();
+    // Canonical (filename stripped) so this matches `session_id_for_state_path`
+    // and any row migrated from the old path-shaped ids.
+    let id = crate::conversations::canonical_session_id(
+        &sp
+            .strip_prefix(workspaces_root())
+            .unwrap_or(&sp)
+            .display()
+            .to_string(),
+    )
+    .0;
     // Effective model: a persisted per-conversation override is AUTHORITATIVE on
     // resume — the app re-sends a profile on plain navigation (foregrounding,
     // reopening the chat), and honoring it silently reverted the model the user
@@ -3207,10 +2742,6 @@ async fn put_profile(
     };
     match result {
         Ok(name) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "name": name,
-            }));
             Json(serde_json::json!({ "name": name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -3241,10 +2772,6 @@ async fn set_active(
     };
     match result {
         Ok(_) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "active": req.name,
-            }));
             Json(serde_json::json!({ "active": req.name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -3482,10 +3009,6 @@ async fn set_delegate(
     };
     match result {
         Ok(_) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "delegate": name,
-            }));
             Json(serde_json::json!({ "delegate": name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -3511,10 +3034,6 @@ async fn delete_profile(State(d): State<Shared>, Query(q): Query<DeleteProfileQu
     };
     match result {
         Ok(_) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "removed": q.name,
-            }));
             Json(serde_json::json!({ "removed": q.name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -3569,11 +3088,6 @@ async fn set_session_model(
         req.session.clone(),
         live_from_handle(handle, Some(req.profile.clone())),
     );
-    crate::session::emit_device_event(serde_json::json!({
-        "kind": "models",
-        "session": req.session,
-        "profile": req.profile,
-    }));
     Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
 }
 
@@ -4341,7 +3855,7 @@ async fn handle_ws(
                                     | "steer_queued"
                                     | "drop_queued"
                             );
-                            if idempotent && !daemon.accept_nonce(&session, nonce, &state_path) {
+                            if idempotent && !daemon.accept_nonce(&session, nonce) {
                                 continue; // duplicate — drop silently
                             }
                         }
@@ -4472,7 +3986,7 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
                 _ = harvest.tick() => {
                     let live = daemon.sessions.lock().await;
                     for sess in live.values() {
-                        let _ = sess.terms.harvest();
+                        sess.terms.pump();
                     }
                 }
             }
@@ -4532,21 +4046,50 @@ mod tests {
         );
     }
 
+    /// A nonce sidecar is ignored: the store is the only record now.
+    ///
+    /// Retirement guard. The fallback used to read a session's `.nonces.json`
+    /// and treat anything in it as already-sent. If that read ever came back,
+    /// a stale file would silently suppress a legitimate request — the failure
+    /// would look like "my message vanished", with nothing in the logs.
+    #[test]
+    fn a_legacy_nonces_file_is_ignored() {
+        let dir = tempdir().expect("temporary directory");
+        let session_id = "ws-2-def456";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("state.nonces.json"),
+            r#"["already-sent"]"#,
+        )
+        .unwrap();
+
+        let mut daemon = test_daemon();
+        daemon.store = crate::store::Store::open_in_memory().unwrap();
+
+        assert!(
+            daemon.accept_nonce(session_id, "already-sent"),
+            "a nonce present only in a legacy file must be ACCEPTED — the file is retired"
+        );
+        assert!(
+            !daemon.accept_nonce(session_id, "already-sent"),
+            "but the store still rejects a genuine replay within the same run"
+        );
+    }
+
     #[test]
     fn nonce_is_rejected_after_daemon_state_is_recreated() {
-        let dir = tempdir().expect("temporary directory");
-        let state_path = dir.path().join("state.json");
         let mut first = test_daemon();
         first.store = crate::store::Store::open_in_memory().unwrap();
         let store = first.store.clone();
 
-        assert!(first.accept_nonce("session", "nonce-1", &state_path));
-        assert!(!first.accept_nonce("session", "nonce-1", &state_path));
+        assert!(first.accept_nonce("session", "nonce-1"));
+        assert!(!first.accept_nonce("session", "nonce-1"));
 
         let mut restarted = test_daemon();
         restarted.store = store;
-        assert!(!restarted.accept_nonce("session", "nonce-1", &state_path));
-        assert!(restarted.accept_nonce("session", "nonce-2", &state_path));
+        assert!(!restarted.accept_nonce("session", "nonce-1"));
+        assert!(restarted.accept_nonce("session", "nonce-2"));
     }
 
     // -- Coordination route handlers -----------------------------------------
@@ -4833,152 +4376,10 @@ mod tests {
 
     // -- Coordination visibility routes -------------------------------------
 
-    fn assignments_query(token: Option<&str>, agent: Option<&str>) -> CoordinationAssignmentsQuery {
-        CoordinationAssignmentsQuery {
-            token: token.map(str::to_string),
-            after_created: None,
-            after_id: None,
-            limit: default_agent_page_limit(),
-            agent_id: agent.map(str::to_string),
-            session_id: None,
-        }
-    }
 
-    /// Register an agent so assignments satisfy the FK to agents(id).
-    fn seed_agent(d: &Shared, id: &str) {
-        d.store
-            .create_agent(&crate::coordination::types::Agent {
-                id: id.into(),
-                display_name: id.into(),
-                handle: id.into(),
-                kind: crate::coordination::types::AgentKind::Worker,
-                status: crate::coordination::types::AgentStatus::Active,
-                role: crate::coordination::types::AgentRole::Implementer,
-                capabilities: vec![],
-            })
-            .unwrap();
-    }
 
-    fn seed_assignment(d: &Shared, id: &str, agent: &str, created: &str) {
-        d.store
-            .create_assignment(&crate::coordination::Assignment {
-                id: id.into(),
-                goal_id: "g1".into(),
-                session_id: "s1".into(),
-                agent_id: agent.into(),
-                status: crate::coordination::AssignmentStatus::Offered,
-                scope: "src".into(),
-                definition_of_done: "tests".into(),
-                profile: None,
-                dispatched_by: None,
-                created_at: created.into(),
-                updated_at: created.into(),
-            })
-            .unwrap();
-    }
 
-    /// Read a response body as JSON, so tests assert on content rather than
-    /// just the status code.
-    async fn json_body(response: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        serde_json::from_slice(&bytes).expect("json body")
-    }
 
-    #[tokio::test]
-    async fn assignments_route_rejects_an_unauthenticated_request() {
-        let d = authed_daemon();
-        let response =
-            coordination_list_assignments(State(d), Query(assignments_query(None, None))).await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn assignments_route_lists_all_and_filters_by_agent() {
-        let d = authed_daemon();
-        seed_agent(&d, "w1");
-        seed_agent(&d, "w2");
-        seed_assignment(&d, "a1", "w1", "2020-01-01T00:00:01Z");
-        seed_assignment(&d, "a2", "w2", "2020-01-01T00:00:02Z");
-        seed_assignment(&d, "a3", "w1", "2020-01-01T00:00:03Z");
-
-        let all = coordination_list_assignments(
-            State(d.clone()),
-            Query(assignments_query(Some("test-token"), None)),
-        )
-        .await;
-        let all = json_body(all).await;
-        assert_eq!(all.as_array().unwrap().len(), 3);
-
-        // Filtering happens in SQL, so the page contains only this agent's work.
-        let filtered = coordination_list_assignments(
-            State(d.clone()),
-            Query(assignments_query(Some("test-token"), Some("w1"))),
-        )
-        .await;
-        let filtered = json_body(filtered).await;
-        let ids: Vec<&str> = filtered
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a["id"].as_str().unwrap())
-            .collect();
-        assert_eq!(ids, ["a1", "a3"]);
-    }
-
-    #[tokio::test]
-    async fn assignments_route_rejects_a_lone_cursor_half() {
-        let d = authed_daemon();
-        let mut q = assignments_query(Some("test-token"), None);
-        q.after_created = Some("2020-01-01T00:00:00Z".into());
-        let response = coordination_list_assignments(State(d), Query(q)).await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn leases_route_reports_who_holds_the_session() {
-        let d = authed_daemon();
-        seed_agent(&d, "w1");
-        seed_assignment(&d, "a1", "w1", "2020-01-01T00:00:00Z");
-        let now = chrono::Utc::now();
-        d.store
-            .acquire_lease(&crate::coordination::SessionLease {
-                session_id: "s1".into(),
-                lease_id: "l1".into(),
-                assignment_id: "a1".into(),
-                agent_id: "w1".into(),
-                fencing_token: 0,
-                acquired_at: now.to_rfc3339(),
-                renewed_at: now.to_rfc3339(),
-                expires_at: (now + chrono::Duration::seconds(90)).to_rfc3339(),
-            })
-            .unwrap();
-
-        let response = coordination_list_leases(State(d), Query(with_token())).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
-        let holders = body.as_array().unwrap();
-        assert_eq!(holders.len(), 1);
-        assert_eq!(holders[0]["agent_id"], "w1");
-        assert_eq!(holders[0]["session_id"], "s1");
-        assert_eq!(holders[0]["assignment_id"], "a1");
-    }
-
-    #[tokio::test]
-    async fn leases_route_is_empty_when_nothing_is_held() {
-        let d = authed_daemon();
-        let response = coordination_list_leases(State(d), Query(with_token())).await;
-        let body = json_body(response).await;
-        assert!(body.as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn leases_route_rejects_an_unauthenticated_request() {
-        let d = authed_daemon();
-        let response = coordination_list_leases(State(d), Query(Auth { token: None })).await;
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
 }
 
 #[derive(Deserialize)]
@@ -5347,6 +4748,11 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String
         task.id,
     );
     d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
+    // Record that this went out, on Mission Control's transcript, WITHOUT waking
+    // it: the work is already routed and reports back on its own. This is what
+    // keeps the coordinator's record complete when the user filed the task
+    // directly rather than through Mission Control.
+    record_dispatch_notice(d, &task).await;
     // Delivery succeeded — clear the retry counter so the ceiling stays
     // "consecutive failures" as documented.
     let task = d
@@ -5432,22 +4838,28 @@ async fn build_agent_from_prompt(
             "Build a specialized agent from this user brief:\n\n{}\n\n",
             "[AGENT_BUILD_JOB — not a project or workspace request]\n",
             "You are the agent builder. Do not create a project, do not create a new Mission Control session, do not ask the user to choose or confirm a folder, and do not route this request as ordinary work. Build the agent directly from the brief.\n",
-            "Build the shared specialized-session path first: every specialized agent receives the established session system prompt plus a researched, bounded identity.md overlay. Keep scheduling, turn-taking, handoffs, and state in shared runtime code; do not create per-agent role modules or runtime.json. Then create the durable agent home under ~/.snippet/agents/<agent-id>/ and write identity.md plus profile metadata. Tools are only narrow executable boundaries such as shell, third-party API, MCP, or vault-backed operations; do not emit workflow helpers as tools. Use web_search/web_read for research only when those schemas are present. Do not execute generated tools.\n",
+            "Build the shared specialized-session path first: every specialized agent receives the established session system prompt plus a researched, bounded identity.md overlay. Keep scheduling, turn-taking, handoffs, and state in shared runtime code; do not create per-agent role modules or runtime.json. Then create the durable agent home under ~/.snippet/agents/<agent-id>/ and write identity.md. That markdown is the agent's whole identity — there is no profile or identity JSON to write, and the directory entry is recorded by registration. Tools are only narrow executable boundaries such as shell, third-party API, MCP, or vault-backed operations; do not emit workflow helpers as tools. Use web_search/web_read for research only when those schemas are present. Do not execute generated tools.\n",
             "When finished, report the exact agent id, shared-session validation, files created, research sources, executable tool proposals, and blockers. Call report_mission_task with the final result. If the brief is insufficient, make sensible defaults rather than asking a workspace question."
         ),
         prompt
     );
-    let task = match mission_control::create_task(
-        root,
-        &task_id,
-        session_id,
-        title,
-        &description,
+    // The task lands in the SQLite store with the rest of coordination. It used
+    // to be written to the JSON store while the dispatch path claimed from
+    // SQLite, so this build could never actually dispatch.
+    let task = Task::dispatched_to(
+        task_id,
+        session_id.to_string(),
+        title.to_string(),
+        description,
         Vec::new(),
-    ) {
-        Ok(task) => task,
-        Err(error) => return mission_error(error),
-    };
+        HandoffMode::Resume,
+        "agent",
+        crate::mission_control::SESSION_ID,
+        chrono::Utc::now().to_rfc3339(),
+    );
+    if let Err(error) = d.store.create_task(&task) {
+        return mission_error(error.to_string());
+    }
     match dispatch_mission_task(&d, &task.id).await {
         Ok(task) => (
             StatusCode::ACCEPTED,
@@ -5538,9 +4950,13 @@ async fn mission_control_update_task(
     // Resolve the existing task up-front so owned-path updates can be
     // validated against the *effective* target session's workspace: the
     // session named in the request when retargeting, else the current one.
-    let existing = match mission_control::get_task(root, &id) {
-        Ok(task) => task,
-        Err(error) => return mission_error(error),
+    // Read the task from the SQLite store — the same store the dispatch path
+    // claims from. Reading the JSON store here meant an update could target a
+    // record the dispatcher never saw.
+    let existing = match d.store.get_task(&id) {
+        Ok(Some(task)) => task,
+        Ok(None) => return mission_error("unknown task".to_string()),
+        Err(error) => return mission_error(error.to_string()),
     };
     let effective_session_id = if req.session_id.trim().is_empty() {
         existing.session_id.clone()
@@ -6119,15 +5535,6 @@ struct RecurringUpdateReq {
     enabled: Option<bool>,
 }
 
-fn emit_recurring_event(action: &str, job_id: &str, session: Option<&str>) {
-    crate::session::emit_device_event(serde_json::json!({
-        "kind": "recurring",
-        "action": action,
-        "job_id": job_id,
-        "session": session.unwrap_or(""),
-    }));
-}
-
 async fn create_recurring(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -6157,7 +5564,6 @@ async fn create_recurring(
         delivery,
     ) {
         Ok(job) => {
-            emit_recurring_event("created", &job.id, Some(&job.session_id));
             Json(job).into_response()
         }
         Err(error) => mission_error(error),
@@ -6229,7 +5635,6 @@ async fn update_recurring(
         }
     }) {
         Ok(job) => {
-            emit_recurring_event("updated", &job.id, Some(&job.session_id));
             Json(job).into_response()
         }
         Err(error) => mission_error(error),
@@ -6246,7 +5651,6 @@ async fn delete_recurring(
     }
     match recurring::delete_job(&d.recurring_root, &id) {
         Ok(()) => {
-            emit_recurring_event("deleted", &id, None);
             Json(serde_json::json!({ "ok": true })).into_response()
         }
         Err(error) => mission_error(error),

@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::builtins::coding_tools;
 use crate::config::{InferenceProfileConfig, SnippetConfig, workspaces_root};
 use crate::coordination::{AgentHome, IdentityError};
-use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput, deserialize_state};
+use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
 use crate::prompts::{conversation_prompt, mission_control_system_prompt};
@@ -328,10 +328,10 @@ impl AgentRuntime {
 
         let mut tools = ToolRegistry::new();
         tools.insert(crate::builtins::BashTool);
+        tools.insert(crate::builtins::ReadFileTool);
         tools.insert(crate::builtins::ReadImageTool);
         crate::mission_tools::add_mission_control_tools(&mut tools);
         crate::coordination_tools::add_coordination_tools(&mut tools);
-        crate::coordination_tools::add_coordination_dispatch_tools(&mut tools);
 
         Ok(Self {
             factory: None,
@@ -355,7 +355,7 @@ impl AgentRuntime {
         }
         .with_durable_session_id_opt(i.durable_id.clone())
         // Every session's coordination tools open the same database the daemon
-        // owns, so board posts and assignments share one store.
+        // owns, so board posts and tasks share one store.
         .with_store_path(crate::store::default_db_path())
         // A specialized session acts as its directory agent, so lease tools can
         // attribute turn ownership to the right identity.
@@ -364,12 +364,10 @@ impl AgentRuntime {
         let mut tools = coding_tools(i.exa_api_key.clone(), i.memory);
         crate::mission_tools::add_worker_report_tool(&mut tools);
         tools.insert(crate::mission_tools::CreateRecurringJob);
-        // Workers discover peers, post to the board, and take/hold/release their
-        // own turn lease; they do not offer assignments — that is Mission
-        // Control's dispatch role.
+        // Workers discover peers, post to the board, and message Mission Control.
+        // They do NOT dispatch: creating and routing work is Mission Control's
+        // job, so a worker asks instead of acting.
         crate::coordination_tools::add_coordination_tools(&mut tools);
-        crate::coordination_tools::add_coordination_lease_tools(&mut tools);
-        crate::coordination_tools::add_coordination_handoff_tools(&mut tools);
 
         let prompt = match identity {
             Some((agent_id, body)) => crate::prompts::specialized_agent_system_prompt(
@@ -426,8 +424,6 @@ impl AgentRuntime {
         let mut tools = ToolRegistry::new();
         // Messaging, peer discovery, and the agent's own board.
         crate::coordination_tools::add_coordination_tools(&mut tools);
-        // Dispatching work is the other half of the job.
-        crate::coordination_tools::add_coordination_dispatch_tools(&mut tools);
         // Read-only view of what exists, so a dispatch targets a real session.
         crate::mission_tools::add_coordination_session_tools(&mut tools);
 
@@ -600,22 +596,29 @@ pub struct SessionInfo {
     pub status: String,
     /// Last-active time, unix seconds.
     pub last_active: i64,
+    /// The agent bound to this session, if any. Drives the "who is working in
+    /// this chat" indicator in the session list, so a client can show it from
+    /// the catalog alone instead of making a second coordination call per row.
+    pub agent_id: Option<String>,
 }
 
-/// The inbox session id for an agent: `inbox-<agent-id>/state.json`.
+/// The inbox session id for an agent: `inbox-<agent-id>`.
 ///
 /// A dedicated inbox per agent is what makes direct messaging predictable — a
 /// message never lands in whichever task session happens to be running. The
 /// `inbox-` prefix cannot collide with a workspace directory, because
 /// `config::workspace_dir_name` always appends `-<hex key>`.
 pub fn inbox_session_id(agent_id: &str) -> String {
-    format!("inbox-{agent_id}/state.json")
+    format!("inbox-{agent_id}")
 }
 
 /// Whether a session id names an agent inbox rather than a project session.
+///
+/// Accepts the pre-canonical `inbox-<agent>/state.json` form too, so a stored
+/// reference or a client cache from before the id rewrite still classifies.
 pub fn is_inbox_session_id(id: &str) -> bool {
     id.strip_prefix("inbox-")
-        .and_then(|rest| rest.strip_suffix("/state.json"))
+        .and_then(|rest| rest.strip_suffix("/state.json").or(Some(rest)))
         .is_some_and(|agent_id| {
             !agent_id.is_empty()
                 && agent_id
@@ -624,10 +627,9 @@ pub fn is_inbox_session_id(id: &str) -> bool {
         })
 }
 
-/// Resolve a session id (relative path under the workspaces root) to its state
-/// path, rejecting any id that escapes the root.
+/// Resolve a session id to its state path, rejecting any id that escapes the root.
 ///
-/// The path is only a KEY: a store-backed session has no `state.json`, so
+/// The path is only a KEY: a store-backed session has no file behind it, so
 /// requiring the filesystem to back it would make every session unresolvable.
 /// Traversal is rejected lexically for that reason — canonicalizing the parent
 /// returns `None` when the directory does not exist.
@@ -635,6 +637,14 @@ pub fn state_path_for_id(id: &str) -> Option<PathBuf> {
     if crate::mission_control::is_session_id(id) {
         return Some(crate::mission_control::session_state_path());
     }
+    resolve_session_path(&workspaces_root(), id)
+}
+
+/// Resolve a session id to its path under `root`.
+///
+/// Split out from [`state_path_for_id`] so the completion rule below can be
+/// tested against a tempdir instead of the caller's real workspaces.
+pub(crate) fn resolve_session_path(root: &Path, id: &str) -> Option<PathBuf> {
     let rel = Path::new(id);
     if rel.is_absolute()
         || rel
@@ -643,13 +653,17 @@ pub fn state_path_for_id(id: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    let root = workspaces_root();
+    // A session id IS the path, minus any filename it used to carry. Nothing is
+    // appended: the id names the session, and `session_id_for_state_path` walks
+    // the same path back, so the two are exact inverses. They used to disagree
+    // — the id carried `/state.json` while callers routinely dropped it — which
+    // is why a reply could be rejected for naming a session that plainly existed.
     let resolved = root.join(rel);
     // A symlink inside the root can still point out of it; the lexical check
     // above cannot see that.
     if let (Ok(real), Ok(canon_root)) = (
         std::fs::canonicalize(&resolved),
-        std::fs::canonicalize(&root),
+        std::fs::canonicalize(root),
     ) && !real.starts_with(&canon_root)
     {
         return None;
@@ -672,10 +686,6 @@ fn store_session_row(state_path: &Path) -> Option<crate::conversations::SessionR
 
 /// Sidecar file holding a session's per-conversation model override (the profile
 /// name), kept next to its state file so it survives daemon restarts.
-fn profile_sidecar(state_path: &std::path::Path) -> PathBuf {
-    PathBuf::from(format!("{}.profile", state_path.display()))
-}
-
 /// Read a session's persisted model override, if one was set.
 ///
 /// Store first: a migrated session has no `.profile`, so reading only the file
@@ -704,31 +714,13 @@ pub fn write_session_profile(state_path: &std::path::Path, profile: &str) {
 /// Store rows WIN on conflict: a migrated session's state file is frozen, so its
 /// title and last-active stop advancing, and letting the file's copy through would
 /// shadow the authoritative row.
-///
-/// Pulled out as a pure function because the bug this replaced was invisible from
-/// the outside — the caller pushed store rows AND recorded their ids in a "seen"
-/// set, then filtered `out` against that same set, deleting every row it had just
-/// added. Whole catalog gone, no error anywhere. A function that takes two lists
-/// and returns one is testable without touching HOME or the filesystem.
-fn merge_session_sources(
-    mut store_rows: Vec<SessionInfo>,
-    file_rows: Vec<SessionInfo>,
-) -> Vec<SessionInfo> {
-    let seen: std::collections::HashSet<String> = store_rows.iter().map(|s| s.id.clone()).collect();
-    store_rows.extend(file_rows.into_iter().filter(|s| !seen.contains(&s.id)));
-    store_rows
-}
-
 /// Enumerate every session persisted on the device (across all workspaces).
 ///
-/// The store is the inventory. It used to be a `read_dir` walk of the workspaces
-/// tree, which meant a session that lived only in the store was invisible — so
-/// the walk could never be retired while it was also the source of truth. Now the
-/// walk only fills in sessions not yet migrated, and disappears with them.
+/// The store IS the inventory. There is no filesystem walk: a session's row is
+/// the only thing that makes it a session, so a walk could only ever rediscover
+/// rows or resurrect sessions nothing owns.
 pub fn list_device_sessions() -> Vec<SessionInfo> {
-    let root = workspaces_root();
-
-    let store_rows: Vec<SessionInfo> = store_for_sessions()
+    let mut out: Vec<SessionInfo> = store_for_sessions()
         .and_then(|store| store.list_all_sessions().ok())
         .unwrap_or_default()
         .into_iter()
@@ -739,52 +731,17 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
             title: row.title.unwrap_or_default(),
             status: row.status,
             last_active: row.last_active.unwrap_or(0),
+            agent_id: row.agent_id,
         })
         .collect();
 
-    let mut file_rows: Vec<SessionInfo> = Vec::new();
-    if let Ok(workspaces) = std::fs::read_dir(&root) {
-        for ws in workspaces.flatten() {
-            let dir = ws.path();
-            if !dir.is_dir() {
-                continue;
-            }
-            read_session(&dir.join("state.json"), &root, "default", &mut file_rows);
-            if let Ok(convs) = std::fs::read_dir(dir.join("conversations")) {
-                for c in convs.flatten() {
-                    let p = c.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                        let name = p
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if !name.is_empty() {
-                            read_session(&p, &root, &name, &mut file_rows);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut out = merge_session_sources(store_rows, file_rows);
-
     out.sort_by(|a, b| b.last_active.cmp(&a.last_active));
     // Mission Control is always the first entry.
-    //
-    // Prefer whichever source produced it: once migrated it comes from the store,
-    // and synthesizing a second copy from its file would shadow the store's values
-    // with staler ones (the file is frozen after migration, so its title and
-    // last-active stop advancing). Only fall back to the file when the store has
-    // no row — the same dual-read rule the rest of the session layer uses.
     if let Some(idx) = out
         .iter()
         .position(|s| crate::mission_control::is_session_id(&s.id))
     {
         let mc = out.remove(idx);
-        out.insert(0, mc);
-    } else if let Some(mc) = mission_control_list_row() {
         out.insert(0, mc);
     }
     out
@@ -792,19 +749,20 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
 
 /// The conversation name a session id encodes.
 ///
-/// `…/state.json` is the workspace's default session; `…/conversations/x.json` is
-/// a saved one. Mission Control is also a `default`: it has exactly one
-/// conversation, and the disk path already reported it that way — so deriving it
-/// differently here would make the same session describe itself two ways
-/// depending on which store served it.
+/// A session that lives under `conversations/` is a SAVED conversation, and its
+/// name is that file's stem. Everything else is the workspace's single default
+/// session — the root directory, an agent inbox, Mission Control, or a
+/// pre-canonical id that still carries a `/state.json` suffix. Determining this
+/// from the presence of a `conversations/` component (rather than from a filename
+/// suffix) is what keeps it correct now that a canonical id has no filename: the
+/// root id would otherwise report the workspace directory as its conversation
+/// name, and the TUI picker would list a workspace as if it were a saved
+/// conversation.
 fn conversation_name_from_id(id: &str) -> &str {
-    if id.ends_with("/state.json") || crate::mission_control::is_session_id(id) {
-        return "default";
-    }
     if let Some(rest) = id.rsplit_once("/conversations/") {
         return rest.1.strip_suffix(".json").unwrap_or(rest.1);
     }
-    id.rsplit('/').next().unwrap_or(id)
+    "default"
 }
 
 /// Same catalog as [`list_device_sessions`], without Mission Control itself —
@@ -814,64 +772,6 @@ pub fn list_routable_sessions() -> Vec<SessionInfo> {
         .into_iter()
         .filter(|s| !crate::mission_control::is_session_id(&s.id))
         .collect()
-}
-
-fn mission_control_list_row() -> Option<SessionInfo> {
-    let path = crate::mission_control::session_state_path();
-    if !path.exists() {
-        return None;
-    }
-    let (folder, title, status, last_active) = if let Some(meta) = std::fs::read(meta_path(&path))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
-    {
-        (
-            meta.folder,
-            meta.title,
-            meta.status,
-            meta.last_active.unwrap_or_else(|| file_mtime_secs(&path)),
-        )
-    } else {
-        (
-            crate::mission_control::workspace_path()
-                .display()
-                .to_string(),
-            "Mission Control".to_string(),
-            "idle".to_string(),
-            file_mtime_secs(&path),
-        )
-    };
-    Some(SessionInfo {
-        id: crate::mission_control::SESSION_ID.to_string(),
-        folder,
-        conversation: "default".to_string(),
-        title: if title.trim().is_empty() {
-            "Mission Control".to_string()
-        } else {
-            title
-        },
-        status,
-        last_active,
-    })
-}
-
-/// Lightweight session metadata, written next to each state file so listing can
-/// skip decompressing/parsing the full conversation (the scaling path).
-#[derive(Serialize, Deserialize)]
-struct SessionMeta {
-    folder: String,
-    title: String,
-    status: String,
-    /// Unix seconds of the last *user* message. Opening, attaching, or
-    /// persisting agent work must not move this — otherwise the list jumps
-    /// whenever a native app opens a chat.
-    #[serde(default)]
-    last_active: Option<i64>,
-}
-
-/// `<conv>.json` → `<conv>.meta.json`.
-fn meta_path(state_path: &Path) -> PathBuf {
-    state_path.with_extension("meta.json")
 }
 
 /// The session-list label. New state stores this in `title`; the initial request
@@ -915,38 +815,6 @@ fn now_unix_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-fn file_mtime_secs(path: &Path) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-fn read_session_meta(state_path: &Path) -> Option<SessionMeta> {
-    if let Some(row) = store_session_row(state_path) {
-        return Some(SessionMeta {
-            folder: row.workspace,
-            title: row.title.unwrap_or_default(),
-            status: row.status,
-            last_active: row.last_active,
-        });
-    }
-    std::fs::read(meta_path(state_path))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-}
-
-fn meta_from_state(state: &HarnessState, last_active: Option<i64>) -> SessionMeta {
-    SessionMeta {
-        folder: state.workspace.clone(),
-        title: effective_title(state),
-        status: status_str(state.status),
-        last_active,
-    }
 }
 
 /// Set (or clear, if empty) a saved session's title override.
@@ -1251,56 +1119,30 @@ pub fn write_forked_conversation_in(
     })
 }
 
-/// Write the metadata sidecar for a state file (best-effort). Called on every
-/// persist so the sidecar tracks the latest title/folder/status. Preserves any
-/// existing `last_active` — open/attach/agent-persist must not invent a new
-/// stamp or the list jumps. Call [`freeze_session_activity`] *before* rewriting
-/// the state file so a missing stamp is pinned to the pre-rewrite mtime.
-/// Status transitions are pushed on `/events` here so the session list can
-/// update live. The firehose is idle until something actually happens.
-pub fn write_session_meta(state_path: &Path, state: &HarnessState) {
-    let prev_status = store_session_row(state_path)
-        .map(|row| row.status)
-        .unwrap_or_default();
-    let last_active = store_session_row(state_path).and_then(|row| row.last_active);
-    let next = meta_from_state(state, last_active);
-    if let Some(kind) = notify_kind(&prev_status, &next.status) {
-        emit_device_event(serde_json::json!({
-            "session": session_id_for_state_path(state_path),
-            "title": next.title,
-            "workspace": next.folder,
-            "kind": kind,
-            "status": next.status,
-        }));
+/// Park the work a dead worker session was doing.
+///
+/// A dispatched session that dies without calling `report_mission_task` leaves
+/// its task looking active forever, so this is the one place that notices.
+pub fn park_failed_session_work(id: &str, prev_status: &str, state: &HarnessState) {
+    let status = status_str(state.status);
+    if status != "failed" || prev_status == "failed" {
+        return;
     }
-    // A dispatched worker that dies without report_mission_task leaves MC
-    // unable to resume. Park the bound task and ping the MC conversation.
-    if next.status == "failed" && prev_status != "failed" {
-        let id = session_id_for_state_path(state_path);
-        let detail = state
-            .events
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                crate::harness::HarnessEvent::ModelError { message } => Some(message.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
-        crate::mission_control::notify_session_runtime_failure(&id, detail);
-    }
-}
-
-fn notify_kind(prev: &str, status: &str) -> Option<&'static str> {
-    if prev == status {
-        return None;
-    }
-    match status {
-        "running" => Some("running"),
-        "waiting_for_input" => Some("waiting"),
-        "failed" => Some("error"),
-        "completed" => Some("done"),
-        "idle" if prev == "running" => Some("idle"),
-        _ => None,
+    let detail = state
+        .events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            crate::harness::HarnessEvent::ModelError { message } => Some(message.as_str()),
+            _ => None,
+        })
+        .unwrap_or("");
+    if let Some(store) = store_for_sessions() {
+        let _ = store.block_tasks_for_failed_session(
+            id,
+            detail,
+            &chrono::Utc::now().to_rfc3339(),
+        );
     }
 }
 
@@ -1309,32 +1151,19 @@ pub fn session_id_for_state_path(state_path: &Path) -> String {
         return crate::mission_control::SESSION_ID.to_string();
     }
     let root = workspaces_root();
-    state_path
+    let relative = state_path
         .strip_prefix(&root)
         .unwrap_or(state_path)
         .display()
-        .to_string()
+        .to_string();
+    // The one place a path becomes an id, so a leftover filename is dropped here
+    // rather than at each of the ~27 callers. A path carrying `/state.json` (a
+    // value captured before ids were canonicalised) names the same session as
+    // the bare form.
+    crate::conversations::canonical_session_id(&relative).0
 }
 
-/// A real conversation state file: `<name>.json`, but NOT the `<name>.meta.json`
-/// or `<name>.nonces.json` sidecar (`Path::extension` of `foo.meta.json` is
-/// still `json`).
-///
-/// THE one predicate. Sidecars are written after every persist, so anything that
-/// enumerates sessions must exclude them — the TUI resume picker listed phantoms
-/// and the store migration wasted work trying to parse them as transcripts.
-pub fn is_conversation_json(path: &Path) -> bool {
-    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-        return false;
-    }
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    !stem.ends_with(".meta") && !stem.ends_with(".nonces")
-}
-
-/// Read a session's state from wherever it lives: the store if it has a row,
-/// else its state file.
+/// Read a session's state from the store.
 ///
 /// This is THE session reader. A session lives in the store; there is no file
 /// fallback, because no session has a state file any more.
@@ -1342,13 +1171,8 @@ pub fn read_session_state(state_path: &Path) -> Option<HarnessState> {
     read_session_state_from_store(state_path)
 }
 
-/// Read a session's state from its FILE only, never the store. Only the legacy
-/// migration uses this, to import pre-store sessions.
-pub fn read_session_file(state_path: &Path) -> Option<HarnessState> {
-    let bytes = std::fs::read(state_path).ok()?;
-    deserialize_state(&bytes).ok()
-}
-
+/// The store-backed read: resolve the id from the path, then load the scalar
+/// plus both logs.
 fn read_session_state_from_store(state_path: &Path) -> Option<HarnessState> {
     let id = session_id_for_state_path(state_path);
     let store = store_for_sessions()?;
@@ -1366,7 +1190,7 @@ pub(crate) fn store_for_sessions() -> Option<crate::store::Store> {
     crate::store::Store::open_cached(crate::store::default_db_path()).ok()
 }
 
-/// The workspace's default session id, `<dir>/state.json`, if the store holds ANY
+/// The workspace's default session id, `<dir>`, if the store holds ANY
 /// session for this workspace.
 ///
 /// Matched on the recorded `workspace` column, NOT on a freshly derived key: the
@@ -1375,8 +1199,7 @@ pub(crate) fn store_for_sessions() -> Option<crate::store::Store> {
 /// would start a blank session (and a new worktree) beside the real one.
 ///
 /// The directory prefix comes from whichever row exists, because most migrated
-/// workspaces have only `conversations/*` rows — their `state.json` was never
-/// written.
+/// workspaces have only conversation rows — they never had a default session.
 pub fn store_default_session_id(workspace: &Path) -> Option<String> {
     let canonical = workspace
         .canonicalize()
@@ -1387,8 +1210,10 @@ pub fn store_default_session_id(workspace: &Path) -> Option<String> {
         .ok()?
         .into_iter()
         .find(|row| row.workspace == want)
+        // A conversation id is `<dir>/conversations/<uuid>`; the workspace is the
+        // first component either way. Return the dir itself, which is the
+        // default session's canonical id.
         .and_then(|row| row.id.split('/').next().map(str::to_string))
-        .map(|dir| format!("{dir}/state.json"))
 }
 
 /// Write a session's state back to wherever it lives.
@@ -1437,138 +1262,10 @@ pub fn subscribe_device_events() -> broadcast::Receiver<serde_json::Value> {
     device_events().subscribe()
 }
 
-/// Push one compact notification frame. No-op when nobody is listening.
-pub fn emit_device_event(event: serde_json::Value) {
-    let enriched = append_notification_event(event);
-    let _ = device_events().send(enriched);
-}
-
-const NOTIFICATION_RETENTION_SECS: u64 = 24 * 60 * 60;
-
-fn notification_journal_path() -> PathBuf {
-    crate::config::snippet_home().join("notification-events.json")
-}
-
-fn notification_sequence_path() -> PathBuf {
-    crate::config::snippet_home().join("notification-events.seq")
-}
-
-fn next_notification_id(records: &[serde_json::Value]) -> u64 {
-    let persisted = std::fs::read_to_string(notification_sequence_path())
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    let current = records
-        .iter()
-        .filter_map(|e| e.get("event_id").and_then(|v| v.as_u64()))
-        .max()
-        .unwrap_or(0);
-    let next = persisted.max(current).saturating_add(1);
-    let _ = std::fs::create_dir_all(crate::config::snippet_home());
-    let _ = std::fs::write(notification_sequence_path(), next.to_string());
-    next
-}
-
-static NOTIFICATION_JOURNAL_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-
-fn append_notification_event(event: serde_json::Value) -> serde_json::Value {
-    let kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    if !matches!(kind, "waiting" | "done" | "error" | "idle" | "term") {
-        return event;
-    }
-    let _guard = NOTIFICATION_JOURNAL_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut records = read_notification_journal();
-    let next_id = next_notification_id(&records);
-    let mut record = event;
-    if let Some(obj) = record.as_object_mut() {
-        obj.insert("event_id".into(), serde_json::json!(next_id));
-        obj.insert("created_at".into(), serde_json::json!(now));
-    }
-    records.push(record.clone());
-    records.retain(|e| {
-        e.get("created_at")
-            .and_then(|v| v.as_u64())
-            .map(|t| now.saturating_sub(t) <= NOTIFICATION_RETENTION_SECS)
-            .unwrap_or(false)
-    });
-    let path = notification_journal_path();
-    let temp = path.with_extension("json.tmp");
-    if let Ok(bytes) = serde_json::to_vec(&records) {
-        if std::fs::write(&temp, bytes).is_ok() {
-            let _ = std::fs::rename(temp, path);
-        }
-    }
-    record
-}
-
-fn read_notification_journal() -> Vec<serde_json::Value> {
-    std::fs::read(notification_journal_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
 pub fn replay_notification_events(since: u64) -> Vec<serde_json::Value> {
-    read_notification_journal()
-        .into_iter()
-        .filter(|e| {
-            e.get("event_id")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|id| id > since)
-        })
-        .collect()
-}
-
-/// Title / folder / status for a live session id (sidecar only — no full state).
-pub fn session_notify_meta(id: &str) -> (String, String, String) {
-    let Some(path) = state_path_for_id(id) else {
-        return (String::new(), String::new(), String::new());
-    };
-    match read_session_meta(&path) {
-        Some(m) => (m.title, m.folder, m.status),
-        None => (String::new(), String::new(), String::new()),
-    }
-}
-
-/// If the sidecar has no `last_active` yet, pin it to the state file's current
-/// mtime *before* a rewrite. No-op when the stamp already exists, or when the
-/// file does not exist yet (brand-new chats get a stamp from
-/// [`bump_session_activity`] on the first user message, or on create).
-pub fn freeze_session_activity(state_path: &Path) {
-    if read_session_meta(state_path)
-        .and_then(|m| m.last_active)
-        .is_some()
-    {
-        return;
-    }
-    if !state_path.exists() {
-        return;
-    }
-    let secs = file_mtime_secs(state_path);
-    let meta_file = meta_path(state_path);
-    if let Some(mut meta) = read_session_meta(state_path) {
-        meta.last_active = Some(secs);
-        if let Ok(s) = serde_json::to_string(&meta) {
-            let _ = std::fs::write(&meta_file, s);
-        }
-        return;
-    }
-    let stub = SessionMeta {
-        folder: String::new(),
-        title: String::new(),
-        status: String::new(),
-        last_active: Some(secs),
-    };
-    if let Ok(s) = serde_json::to_string(&stub) {
-        let _ = std::fs::write(&meta_file, s);
-    }
+    store_for_sessions()
+        .and_then(|store| store.notification_events_since(since).ok())
+        .unwrap_or_default()
 }
 
 /// Last-active unix seconds for a state file: the store's stamp if the session
@@ -1727,21 +1424,23 @@ pub fn create_blank_session_in(
     }
     let base = crate::config::state_path_for_workspace(&folder);
     let dest = if new_conversation {
-        let parent = base
-            .parent()
-            .ok_or_else(|| "workspace state path has no parent".to_string())?;
-        parent
-            .join("conversations")
-            .join(format!("{}.json", uuid::Uuid::new_v4()))
+        base.join("conversations")
+            .join(uuid::Uuid::new_v4().to_string())
     } else {
         base
     };
-    // The path is only an ID now — nothing is written to it.
-    let id = dest
-        .strip_prefix(workspaces_root())
-        .unwrap_or(&dest)
-        .display()
-        .to_string();
+    // The path is only an ID now — nothing is written to it. Canonicalised, so a
+    // session created today has the same id shape as one migrated from the old
+    // path-shaped ids; otherwise `session_id_for_state_path` (which strips the
+    // filename) would not match what this function stored.
+    let id = crate::conversations::canonical_session_id(
+        &dest
+            .strip_prefix(workspaces_root())
+            .unwrap_or(&dest)
+            .display()
+            .to_string(),
+    )
+    .0;
     // Uniqueness is the STORE's question: a folder's default session is taken if a
     // row exists, whether or not any file was ever written for it.
     if !new_conversation && store.has_conversation(&id).unwrap_or(false) {
@@ -1779,6 +1478,9 @@ pub fn create_blank_session_in(
         title: effective_title(&state),
         status: status_str(state.status),
         last_active: extras.last_active.unwrap_or_else(now_unix_secs),
+        // No agent is bound at creation: an agent binds a session afterwards
+        // (an inbox by `ensure_agent_inbox`, a specialized session at start).
+        agent_id: None,
     })
 }
 
@@ -1807,21 +1509,9 @@ pub fn remove_session_files_with(store: Option<&crate::store::Store>, state_path
     if let Some(store) = store {
         let _ = store.delete_conversation(&id);
     }
-    let _ = std::fs::remove_file(state_path);
-    let _ = std::fs::remove_file(meta_path(state_path));
-    let _ = std::fs::remove_file(state_path.with_extension("nonces.json"));
-    let _ = std::fs::remove_file(profile_sidecar(state_path));
 }
 
 fn workspace_from_state_file(state_path: &Path) -> Option<PathBuf> {
-    if let Some(meta) = std::fs::read(meta_path(state_path))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<SessionMeta>(&b).ok())
-    {
-        if !meta.folder.trim().is_empty() {
-            return Some(PathBuf::from(meta.folder));
-        }
-    }
     let state = read_session_state(state_path)?;
     if state.workspace.trim().is_empty() {
         None
@@ -1898,53 +1588,6 @@ fn linked_worktree_root(folder: &Path) -> Option<PathBuf> {
             return None;
         }
     }
-}
-
-fn read_session(path: &Path, root: &Path, conversation: &str, out: &mut Vec<SessionInfo>) {
-    let mtime = file_mtime_secs(path);
-    let id = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string();
-    if crate::mission_control::is_session_id(&id) {
-        return;
-    }
-    // THE one parser. This used to hand-parse the sidecar with an inlined file
-    // suffix and a bare-string comparison, so it understood a different grammar
-    // than the daemon did — a role one recognised, the other silently did not.
-    if read_session_sidecar(path).map(|s| s.role) == Some(SessionRole::MissionControl) {
-        return;
-    }
-
-    // Fast path: read the tiny sidecar, no decompression.
-    if let Some(meta) = read_session_meta(path) {
-        out.push(SessionInfo {
-            id,
-            folder: meta.folder,
-            conversation: conversation.to_string(),
-            title: meta.title,
-            status: meta.status,
-            last_active: meta.last_active.unwrap_or(mtime),
-        });
-        return;
-    }
-
-    // Slow path (pre-sidecar sessions): read once, then backfill the sidecar.
-    let Some(state) = read_session_state(path) else {
-        return;
-    };
-    write_session_meta(path, &state);
-    out.push(SessionInfo {
-        id,
-        folder: state.workspace.clone(),
-        conversation: conversation.to_string(),
-        title: effective_title(&state),
-        status: status_str(state.status),
-        last_active: read_session_meta(path)
-            .and_then(|m| m.last_active)
-            .unwrap_or(mtime),
-    });
 }
 
 #[cfg(test)]
@@ -2086,59 +1729,6 @@ mod fork_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
-#[cfg(test)]
-mod merge_tests {
-    use super::*;
-
-    fn row(id: &str, title: &str) -> SessionInfo {
-        SessionInfo {
-            id: id.into(),
-            folder: "/code/thing".into(),
-            conversation: "default".into(),
-            title: title.into(),
-            status: "idle".into(),
-            last_active: 0,
-        }
-    }
-
-    #[test]
-    fn store_rows_survive_the_merge() {
-        // The bug this guards: store rows were pushed to the output AND their ids
-        // recorded in a "seen" set, then the output was filtered against that set
-        // — deleting every row just added. The catalog came back with only Mission
-        // Control and no error anywhere.
-        let merged = merge_session_sources(
-            vec![row("a/state.json", "A"), row("b/state.json", "B")],
-            vec![],
-        );
-        let ids: Vec<&str> = merged.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["a/state.json", "b/state.json"]);
-    }
-
-    #[test]
-    fn a_migrated_session_is_not_listed_twice() {
-        // Its file is frozen after migration, so letting the file's copy through
-        // would shadow the store's title with a stale one.
-        let merged = merge_session_sources(
-            vec![row("a/state.json", "from store")],
-            vec![row("a/state.json", "from file")],
-        );
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].title, "from store");
-    }
-
-    #[test]
-    fn unmigrated_file_sessions_are_kept_in_full() {
-        let merged = merge_session_sources(
-            vec![row("a/state.json", "A")],
-            vec![row("b/state.json", "B"), row("c/state.json", "C")],
-        );
-        let ids: Vec<&str> = merged.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["a/state.json", "b/state.json", "c/state.json"]);
-    }
-}
-
 #[cfg(test)]
 mod create_blank_tests {
     use super::*;
@@ -2330,45 +1920,119 @@ mod create_blank_tests {
         assert!(repo.exists(), "original clone must stay");
         let _ = fs::remove_dir_all(&repo);
     }
+}
 
+#[cfg(test)]
+mod resolve_session_path_tests {
+    use super::*;
+    use std::fs;
+
+    /// A model handed `session:<ws>/state.json` routinely sends the bare
+    /// The id IS the workspace directory — no filename. A caller that still
+    /// appends `/state.json` (a value captured before ids were canonicalised)
+    /// names the same session, and a bare name matches too: they all resolve to
+    /// the one path, which is what makes the three forms interchangeable instead
+    /// of three ways to be rejected.
     #[test]
-    fn freeze_pins_mtime_before_rewrite() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("snippet-freeze-{stamp}"));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        let state = HarnessState::blank(dir.display().to_string(), Some("Legacy".into()));
-        fs::write(&path, crate::harness::serialize_state(&state).unwrap()).unwrap();
-        let before = file_mtime_secs(&path);
-        assert!(before > 0);
+    fn a_workspace_directory_is_the_default_session() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws-1");
+        fs::create_dir_all(&ws).unwrap();
 
-        // No sidecar yet. Freeze, then rewrite the state file (which would
-        // otherwise jump mtime and, without a pin, the list).
-        freeze_session_activity(&path);
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        fs::write(&path, crate::harness::serialize_state(&state).unwrap()).unwrap();
-        write_session_meta(&path, &state);
-        let pinned = read_session_meta(&path)
-            .and_then(|m| m.last_active)
-            .unwrap();
-        assert_eq!(pinned, before);
-        assert!(file_mtime_secs(&path) >= before);
+        let bare = resolve_session_path(root.path(), "ws-1").expect("resolves");
+        assert_eq!(bare, ws, "got {}", bare.display());
 
-        let _ = fs::remove_dir_all(&dir);
+        // The pre-canonical form names the same session rather than failing.
+        assert_eq!(
+            crate::conversations::canonical_session_id("ws-1/state.json").0,
+            "ws-1"
+        );
+    }
+
+    /// The explicit form must keep working — it is what the envelope sends.
+    #[test]
+    fn the_full_id_resolves_to_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws-2");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("state.json"), b"{}").unwrap();
+
+        let resolved = resolve_session_path(root.path(), "ws-2/state.json").expect("resolves");
+        assert!(
+            resolved.ends_with("ws-2/state.json"),
+            "got {}",
+            resolved.display()
+        );
+    }
+
+    /// A saved conversation is not a directory, so the completion must not touch
+    /// it. Regression guard: completing every id would rewrite this path.
+    #[test]
+    fn a_saved_conversation_is_left_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let conv = root.path().join("ws-3/conversations");
+        fs::create_dir_all(&conv).unwrap();
+        let file = conv.join("abc.json");
+        fs::write(&file, b"{}").unwrap();
+
+        let resolved =
+            resolve_session_path(root.path(), "ws-3/conversations/abc.json").expect("resolves");
+        assert!(
+            resolved.ends_with("ws-3/conversations/abc.json"),
+            "got {}",
+            resolved.display()
+        );
     }
 
     #[test]
-    fn notify_kind_on_status_transitions() {
-        assert_eq!(notify_kind("idle", "running"), Some("running"));
-        assert_eq!(notify_kind("running", "waiting_for_input"), Some("waiting"));
-        assert_eq!(notify_kind("waiting_for_input", "waiting_for_input"), None);
-        assert_eq!(notify_kind("running", "idle"), Some("idle"));
-        assert_eq!(notify_kind("idle", "idle"), None);
-        assert_eq!(notify_kind("running", "running"), None);
-        assert_eq!(notify_kind("", "idle"), None);
-        assert_eq!(notify_kind("idle", "failed"), Some("error"));
+    fn traversal_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(resolve_session_path(root.path(), "../escape").is_none());
+        assert!(resolve_session_path(root.path(), "/abs/path").is_none());
+    }
+}
+
+#[cfg(test)]
+mod conversation_name_tests {
+    use super::conversation_name_from_id;
+
+    /// A session under `conversations/` is a saved conversation; its name is the
+    /// file stem.
+    #[test]
+    fn a_saved_conversation_is_named_by_its_file_stem() {
+        assert_eq!(
+            conversation_name_from_id("ws-1/conversations/41e5e18b-5478-4737-863f-750de39e025d"),
+            "41e5e18b-5478-4737-863f-750de39e025d"
+        );
+        // The pre-canonical form (with `.json`) named the same conversation.
+        assert_eq!(
+            conversation_name_from_id("ws-1/conversations/41e5e18b.json"),
+            "41e5e18b"
+        );
+    }
+
+    /// Everything else is the workspace's one default session.
+    ///
+    /// This is the regression: a canonical id is the workspace DIRECTORY, with no
+    /// `state.json` suffix. Deriving "default" from that suffix meant a root
+    /// session reported the directory name as its conversation, so the TUI picker
+    /// listed a workspace as though it were a saved conversation.
+    #[test]
+    fn a_root_session_is_the_default_conversation() {
+        assert_eq!(
+            conversation_name_from_id("snippet-service-61c2d836aee8dc5b"),
+            "default"
+        );
+        assert_eq!(conversation_name_from_id("inbox-snippet"), "default");
+        assert_eq!(conversation_name_from_id("mission-control"), "default");
+        // And a value captured before the id change still names the same session.
+        assert_eq!(
+            conversation_name_from_id("snippet-service-61c2d836aee8dc5b/state.json"),
+            "default"
+        );
+        assert_eq!(
+            conversation_name_from_id("inbox-snippet/state.json"),
+            "default"
+        );
     }
 }

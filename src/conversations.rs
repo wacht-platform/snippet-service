@@ -11,7 +11,6 @@
 //! genuinely mutate together; splitting them into columns would add schema
 //! churn for no read that needs it.
 
-use std::path::Path;
 
 use rusqlite::{OptionalExtension, params};
 
@@ -51,7 +50,16 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
              -- 'mission_control' | 'standard'. Was `.role`.
              role TEXT NOT NULL DEFAULT 'standard',
              -- The agent working this session, if any. Was `.role`'s agent_id.
-             agent_id TEXT
+             agent_id TEXT,
+             -- The path-shaped id this row had before ids became opaque
+             -- (e.g. `snipett-2a3f/state.json`). Kept so an in-flight reference,
+             -- a stored message payload, or a client holding the old id still
+             -- resolves — and so a rollback has something to map back to.
+             legacy_id TEXT,
+             -- What kind of session this is: 'default' | 'conversation' |
+             -- 'inbox' | 'mission_control'. This used to be parsed out of the
+             -- id's suffix, which is the coupling opaque ids remove.
+             kind TEXT NOT NULL DEFAULT 'conversation'
          );
          CREATE INDEX IF NOT EXISTS sessions_workspace
              ON sessions(workspace_key, updated_at DESC);
@@ -85,7 +93,336 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
              accepted_at INTEGER NOT NULL,
              PRIMARY KEY (session_id, nonce)
          );"#,
-    )
+    )?;
+    ensure_session_id_columns(connection)?;
+    rewrite_legacy_session_ids(connection)?;
+    Ok(())
+}
+
+/// Add `legacy_id` / `kind` to a database created before ids were opaque.
+///
+/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+/// the columns have to be added explicitly — otherwise a real database would
+/// keep the old shape and every insert would fail on the missing column.
+fn ensure_session_id_columns(connection: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    let existing: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(sessions)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if !existing.iter().any(|c| c == "legacy_id") {
+        connection.execute("ALTER TABLE sessions ADD COLUMN legacy_id TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "kind") {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'conversation'",
+            [],
+        )?;
+    }
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sessions_legacy_id ON sessions(legacy_id)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Rewrite every path-shaped session id to an opaque uuid, once.
+///
+/// The id used to BE a filesystem path, so it carried `/state.json` or
+/// `/conversations/<uuid>.json`. Those files stopped being read when the store
+/// took over, leaving a path-shaped string whose only surviving effect was to
+/// leak a filename into prompts, URLs and ids a model then mangled. This keeps
+/// the old value in `legacy_id` so an in-flight reference still resolves and a
+/// rollback has something to map back to.
+///
+/// Idempotent: a row whose id is already opaque is left alone, so this is safe
+/// on every open.
+fn rewrite_legacy_session_ids(connection: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    let rows: Vec<String> = {
+        let mut stmt = connection.prepare("SELECT id FROM sessions")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+
+    // Every table holding a session id as a plain string. `session_messages` and
+    // `session_events` have a real FK, so they move inside the deferred-FK
+    // transaction below; the rest cannot fail on a constraint.
+    const CHILD_COLUMNS: [(&str, &str); 7] = [
+        ("session_messages", "session_id"),
+        ("session_events", "session_id"),
+        ("request_nonces", "session_id"),
+        ("tasks", "session_id"),
+        ("tasks", "reporting_session"),
+        ("agent_board", "session_id"),
+        ("recurring_jobs", "session_id"),
+    ];
+    const JSON_COLUMNS: [(&str, &str, &str); 3] = [
+        ("notification_journal", "payload_json", "session_id"),
+        ("board_events", "payload_json", "origin_session"),
+        ("board_events", "payload_json", "recipient"),
+    ];
+
+    let plan: Vec<(String, String, String)> = rows
+        .into_iter()
+        .filter_map(|old| {
+            let (new, kind) = canonical_session_id(&old);
+            (new != old).then_some((old, new, kind))
+        })
+        .collect();
+    if plan.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "[store] canonicalising {} session id(s) (file suffix removed)",
+        plan.len()
+    );
+
+    // A table only exists once its subsystem has been opened, so the migration
+    // must not assume the full schema — a database created before coordination
+    // (or a test using `ensure_schema` alone) simply has fewer tables to move.
+    // Skipping an absent one is correct: there are no rows in it to fix.
+    let present: std::collections::HashSet<String> = {
+        let mut stmt =
+            connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        names.collect::<Result<_, _>>()?
+    };
+    let tables: Vec<(&str, &str)> = CHILD_COLUMNS
+        .into_iter()
+        .filter(|(t, _)| present.contains(*t))
+        .collect();
+    let json_tables: Vec<(&str, &str, &str)> = JSON_COLUMNS
+        .into_iter()
+        .filter(|(t, _, _)| present.contains(*t))
+        .collect();
+
+    // ONE transaction: `defer_foreign_keys` only applies inside one, and the
+    // child tables hold a real FK to `sessions.id`.
+    let tx = connection.unchecked_transaction()?;
+    let connection = &tx;
+    connection.execute("PRAGMA defer_foreign_keys = ON", [])?;
+    for (old, new, kind) in &plan {
+        // The canonical id may ALREADY have a row: a daemon running the previous
+        // build keeps writing the pre-migration id, so after an earlier rename it
+        // re-creates the old row and one session ends up with two. Renaming then
+        // would collide on the primary key of the transcript tables and abort the
+        // open — the store would not load at all. Merge instead.
+        let taken: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            rusqlite::params![new],
+            |r| r.get(0),
+        )?;
+        if taken {
+            merge_duplicate_session(connection, old, new)?;
+            continue;
+        }
+        for (table, col) in &tables {
+            connection.execute(
+                &format!("UPDATE {table} SET {col} = ?1 WHERE {col} = ?2"),
+                rusqlite::params![new, old],
+            )?;
+        }
+        for (table, col, key) in &json_tables {
+            let patched: Vec<(i64, String)> = {
+                let mut stmt =
+                    connection.prepare(&format!("SELECT rowid, {col} FROM {table} WHERE {col} LIKE ?1"))?;
+                let like = format!("%{old}%");
+                stmt.query_map(rusqlite::params![like], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?
+            };
+            for (rowid, raw) in patched {
+                let next = raw.replace(
+                    &format!("\"{key}\":\"{old}\""),
+                    &format!("\"{key}\":\"{new}\""),
+                );
+                if next != raw {
+                    connection.execute(
+                        &format!("UPDATE {table} SET {col} = ?1 WHERE rowid = ?2"),
+                        rusqlite::params![next, rowid],
+                    )?;
+                }
+            }
+        }
+        connection.execute(
+            "UPDATE sessions SET id = ?1, legacy_id = COALESCE(legacy_id, ?2), kind = ?3 WHERE id = ?2",
+            rusqlite::params![new, old, kind],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Fold a legacy-shaped row into the canonical row that already holds its id.
+///
+/// Both rows describe one session: the canonical one was renamed from the legacy
+/// id, and the legacy id was then re-created by a process still running the old
+/// build. The transcript tables key on `(session_id, ordinal)`, so a plain rename
+/// would collide.
+///
+/// For the two append-only logs the fuller row wins, because the rows are the
+/// SAME conversation: the shorter log is its prefix (the legacy row was written
+/// from the same history and then extended). Replacing the canonical copy with
+/// the legacy copy therefore keeps every message once, in order, with no
+/// duplication — where appending would repeat the whole shared prefix.
+///
+/// Every other table is keyed by its own id, so those rows simply move; a row
+/// that would collide with an existing canonical row is dropped as a duplicate.
+fn merge_duplicate_session(
+    connection: &rusqlite::Connection,
+    legacy: &str,
+    canonical: &str,
+) -> Result<(), rusqlite::Error> {
+    // Same reason as the rename: a table exists only once its subsystem has been
+    // opened, so a table that is absent has no rows to move.
+    let present: std::collections::HashSet<String> = {
+        let mut stmt =
+            connection.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        names.collect::<Result<_, _>>()?
+    };
+    // Transcripts are APPEND-ONLY and two colliding rows almost always share a
+    // prefix — the stale row is one the previous build kept appending to. Even
+    // so, take the UNION rather than the longer transcript: "longer" is only
+    // correct while one is a strict prefix of the other, and a deleted message
+    // is not recoverable. Rows unique to the shorter side are kept, renumbered
+    // past the base's last ordinal so they cannot collide on the primary key.
+    for (table, has_role) in [("session_messages", true), ("session_events", false)] {
+        if !present.contains(table) {
+            continue;
+        }
+        let count = |id: &str| -> Result<i64, rusqlite::Error> {
+            connection.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+        };
+        let (canonical_len, legacy_len) = (count(canonical)?, count(legacy)?);
+        // The longer side supplies the identity (and therefore the ordinals);
+        // the shorter side contributes only what it alone holds.
+        let (base, other) = if canonical_len >= legacy_len {
+            (canonical, legacy)
+        } else {
+            (legacy, canonical)
+        };
+
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = connection.prepare(&format!(
+                "SELECT ordinal || '|' || payload_json FROM {table} WHERE session_id = ?1"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![base], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut next: i64 = connection.query_row(
+            &format!("SELECT COALESCE(MAX(ordinal), -1) + 1 FROM {table} WHERE session_id = ?1"),
+            rusqlite::params![base],
+            |r| r.get(0),
+        )?;
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let role_col = if has_role { ", role" } else { ", NULL" };
+            let mut stmt = connection.prepare(&format!(
+                "SELECT ordinal, payload_json{role_col} FROM {table}
+                 WHERE session_id = ?1 ORDER BY ordinal"
+            ))?;
+            let out = stmt.query_map(rusqlite::params![other], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?))
+            })?;
+            out.collect::<Result<_, _>>()?
+        };
+        for (ordinal, payload, role) in rows {
+            if existing.contains(&format!("{ordinal}|{payload}")) {
+                continue; // the base already carries this exact row
+            }
+            match role {
+                Some(role) => connection.execute(
+                    &format!(
+                        "INSERT INTO {table} (session_id, ordinal, role, payload_json, created_at)
+                         SELECT ?1, ?2, ?3, payload_json, created_at FROM {table}
+                         WHERE session_id = ?4 AND ordinal = ?5"
+                    ),
+                    rusqlite::params![base, next, role, other, ordinal],
+                )?,
+                None => connection.execute(
+                    &format!(
+                        "INSERT INTO {table} (session_id, ordinal, payload_json, created_at)
+                         SELECT ?1, ?2, payload_json, created_at FROM {table}
+                         WHERE session_id = ?3 AND ordinal = ?4"
+                    ),
+                    rusqlite::params![base, next, other, ordinal],
+                )?,
+            };
+            next += 1;
+        }
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE session_id = ?1"),
+            rusqlite::params![other],
+        )?;
+        if base == legacy {
+            connection.execute(
+                &format!("UPDATE {table} SET session_id = ?1 WHERE session_id = ?2"),
+                rusqlite::params![canonical, legacy],
+            )?;
+        }
+    }
+    for (table, col) in [
+        ("request_nonces", "session_id"),
+        ("tasks", "session_id"),
+        ("tasks", "reporting_session"),
+        ("agent_board", "session_id"),
+        ("recurring_jobs", "session_id"),
+    ] {
+        if !present.contains(table) {
+            continue;
+        }
+        connection.execute(
+            &format!("UPDATE OR IGNORE {table} SET {col} = ?1 WHERE {col} = ?2"),
+            rusqlite::params![canonical, legacy],
+        )?;
+        connection.execute(
+            &format!("DELETE FROM {table} WHERE {col} = ?1"),
+            rusqlite::params![legacy],
+        )?;
+    }
+    connection.execute(
+        "DELETE FROM sessions WHERE id = ?1",
+        rusqlite::params![legacy],
+    )?;
+    eprintln!("[store] merged duplicate session row `{legacy}` into `{canonical}`");
+    Ok(())
+}
+
+/// The canonical id (and kind) a session id maps to: the path, minus the
+/// filename.
+///
+/// A session id used to BE a filesystem path — `…/state.json` for a workspace's
+/// default session, `…/conversations/<uuid>.json` for a saved one — even though
+/// those files stopped being read when the store took over. The path component
+/// is still a perfectly good KEY: it is unique, stable, and says which workspace
+/// the session belongs to. The FILENAME is the part with no business in an
+/// identifier, so that is what goes, along with the mangling it caused (a model
+/// handed `…/state.json` dropped the suffix and the reply was rejected).
+///
+/// Deterministic on purpose: running this twice yields the same id, so the
+/// rewrite is idempotent and needs no generated value to remember.
+pub fn canonical_session_id(old: &str) -> (String, String) {
+    if old == crate::mission_control::SESSION_ID {
+        return (old.to_string(), "mission_control".to_string());
+    }
+    if let Some(dir) = old.strip_suffix("/state.json") {
+        let kind = if dir.starts_with("inbox-") { "inbox" } else { "default" };
+        return (dir.to_string(), kind.to_string());
+    }
+    if old.ends_with(".json") {
+        return (old[..old.len() - ".json".len()].to_string(), "conversation".to_string());
+    }
+    let kind = if old.starts_with("inbox-") {
+        "inbox"
+    } else if old.contains("/conversations/") {
+        "conversation"
+    } else {
+        "default"
+    };
+    (old.to_string(), kind.to_string())
 }
 
 /// A conversation's row: identity plus the scalar state, without its messages.
@@ -112,6 +449,11 @@ pub struct SessionRow {
     pub role: String,
     /// The agent working this session. Was `.role`'s `agent_id`.
     pub agent_id: Option<String>,
+    /// The path-shaped id this row had before ids became opaque, if it ever had
+    /// one. The key an in-flight reference or a stored payload still names.
+    pub legacy_id: Option<String>,
+    /// `default` | `conversation` | `inbox` | `mission_control`.
+    pub kind: String,
 }
 
 /// Session metadata that used to live in sidecar files.
@@ -129,25 +471,6 @@ pub struct SessionExtras {
     pub role: Option<String>,
     /// The agent working this session. Was `.role`'s `agent_id`.
     pub agent_id: Option<String>,
-}
-
-impl SessionExtras {
-    /// Gather the sidecar metadata sitting beside a state file.
-    ///
-    /// The sidecars are the ONLY source for these values until the columns are
-    /// backfilled, so an import has to read them while they still exist — this is
-    /// the step that makes deleting them later safe rather than destructive.
-    pub fn from_sidecars(state_path: &Path) -> Self {
-        let sidecar = crate::session::read_session_sidecar(state_path);
-        Self {
-            last_active: Some(crate::session::session_last_active(state_path)),
-            profile: crate::session::read_session_profile(state_path),
-            role: sidecar
-                .as_ref()
-                .map(|s| crate::session::role_str(s.role).to_string()),
-            agent_id: sidecar.and_then(|s| s.agent_id),
-        }
-    }
 }
 
 /// A stored message, with its position so ordering survives a round trip.
@@ -282,10 +605,16 @@ impl Store {
     }
 
     /// Load a session's row, without its messages.
+    /// A session by its id — or by the path-shaped id it used to have.
+    ///
+    /// THE lookup. Every reader funnels here, so accepting both forms in one
+    /// place is what lets an id captured before the rewrite (in a message
+    /// payload, a client cache, a log) still resolve to its session instead of
+    /// silently matching nothing.
     pub fn get_session_row(&self, id: &str) -> Result<Option<SessionRow>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"
+                "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1 OR legacy_id = ?1"
             ))?;
             Ok(stmt.query_row(params![id], session_row_from).optional()?)
         })
@@ -528,7 +857,7 @@ impl Store {
 }
 
 const SESSION_COLUMNS: &str = "id, workspace_key, workspace, title, status, created_at, \
-     updated_at, last_active, profile, role, agent_id";
+     updated_at, last_active, profile, role, agent_id, legacy_id, kind";
 
 impl Store {
     /// Save a session's scalar state, creating the row on first write.
@@ -791,6 +1120,8 @@ fn session_row_from(row: &rusqlite::Row<'_>) -> Result<SessionRow, rusqlite::Err
         profile: row.get(8)?,
         role: row.get(9)?,
         agent_id: row.get(10)?,
+        legacy_id: row.get(11)?,
+        kind: row.get(12)?,
     })
 }
 
@@ -824,183 +1155,6 @@ fn insert_message(
     Ok(())
 }
 
-/// One session migration attempt, so a caller can report what happened per
-/// session rather than a bare count.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MigratedSession {
-    pub id: String,
-    pub workspace: String,
-    pub messages: usize,
-    pub events: usize,
-}
-
-/// Whether a file-backed session needs importing: no row yet, or the row is
-/// behind the file.
-///
-/// "Has a row" is NOT the same question as "the row is current". A session that
-/// keeps being used after it was migrated has a row AND newer content on disk, so
-/// skipping on row-presence silently freezes that session at its migration
-/// snapshot — the transcript keeps growing on disk while reads serve the stale
-/// copy. Comparing the file's own `updated_at` against the row's is what makes a
-/// re-run actually re-sync instead of reporting a no-op as success.
-///
-/// The comparison is on PARSED timestamps, not strings: lexicographic ordering of
-/// RFC3339 with variable fractional digits is wrong (`.9` sorts before `.10`
-/// although it is later), and a row that merely LOOKS newer would be skipped.
-/// The failure modes are asymmetric, so an unparseable timestamp imports: a
-/// redundant import is a harmless rewrite, while a wrong skip strands the session
-/// stale forever.
-///
-/// A row ALSO imports when it predates the metadata columns. Those sessions were
-/// imported by a build that had no `last_active`/`profile`/`role`, so their files
-/// have not changed since and the timestamp test would skip them forever —
-/// leaving every one of them with no activity stamp and no model override. Same
-/// shape of bug as the original: "has a row" is not "the row is complete".
-fn needs_import(store: &Store, id: &str, file_updated_at: &str) -> bool {
-    let row = match store.get_session_row(id) {
-        Ok(None) => return true,
-        // An unreadable store must not read as "already imported" — that would
-        // skip the session and lose the new content.
-        Err(_) => return true,
-        Ok(Some(row)) => row,
-    };
-    if row.last_active.is_none() {
-        return true;
-    }
-    let parsed = chrono::DateTime::parse_from_rfc3339(file_updated_at)
-        .ok()
-        .zip(chrono::DateTime::parse_from_rfc3339(&row.updated_at).ok());
-    match parsed {
-        Some((file, row)) => row < file,
-        None => true,
-    }
-}
-
-/// Report which file-backed sessions WOULD migrate, without writing anything.
-///
-/// Takes the store so a dry run applies the SAME staleness rule the real run
-/// does; otherwise it would list every session forever and the preview would
-/// misrepresent what is about to happen.
-pub fn scan_file_sessions(
-    store: &crate::store::Store,
-) -> std::io::Result<(Vec<MigratedSession>, Vec<(String, String)>)> {
-    let root = crate::config::workspaces_root();
-    let mut found = Vec::new();
-    let mut failed = Vec::new();
-    for (id, path) in workspace_state_paths(&root) {
-        match crate::session::read_session_file(&path) {
-            Some(state) => {
-                if needs_import(store, &id, &state.updated_at) {
-                    found.push(MigratedSession {
-                        id,
-                        workspace: state.workspace.clone(),
-                        messages: state.messages.len(),
-                        events: state.events.len(),
-                    });
-                }
-            }
-            None => failed.push((id, "state unreadable".to_string())),
-        }
-    }
-    Ok((found, failed))
-}
-
-/// Every session state file under the workspaces root, with its resolved id.
-///
-/// One walk, shared by the scan and the migration, so a dry run cannot disagree
-/// with the real run about which sessions exist.
-///
-/// Mission Control is included explicitly: its session lives under
-/// `mission-control/`, not the workspaces root, so a walk of that root could
-/// never see it — which is why it stayed file-backed while everything else moved.
-fn workspace_state_paths(root: &Path) -> Vec<(String, std::path::PathBuf)> {
-    let mut out = Vec::new();
-    let mc = crate::mission_control::session_state_path();
-    if mc.exists() {
-        out.push((crate::mission_control::SESSION_ID.to_string(), mc));
-    }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        // A workspace dir holds a default `state.json` plus one file per saved
-        // conversation. Both are sessions and both are migrated. Sidecars
-        // (`.meta.json`, `.nonces.json`) live in the same directory, so the
-        // shared predicate — not a bare `.json` check — decides what is one.
-        let mut state_paths = vec![dir.join("state.json")];
-        if let Ok(convs) = std::fs::read_dir(dir.join("conversations")) {
-            for conv in convs.flatten() {
-                let path = conv.path();
-                if crate::session::is_conversation_json(&path) {
-                    state_paths.push(path);
-                }
-            }
-        }
-        for state_path in state_paths {
-            if state_path.exists() {
-                let id = crate::session::session_id_for_state_path(&state_path);
-                out.push((id, state_path));
-            }
-        }
-    }
-    out
-}
-
-/// Copy every file-backed session into the store.
-///
-/// A READ-ONLY pass over the state files: nothing on disk is modified or
-/// deleted, so a migration can be re-run and the originals remain the fallback
-/// until the caller is satisfied. `import_session` replaces by id, which makes a
-/// re-run idempotent instead of duplicating every message.
-///
-/// Sessions already in the store are skipped, so this is cheap to re-run as new
-/// file-backed sessions appear.
-pub fn migrate_file_sessions(
-    store: &crate::store::Store,
-) -> std::io::Result<(Vec<MigratedSession>, Vec<(String, String)>)> {
-    let root = crate::config::workspaces_root();
-    let mut migrated = Vec::new();
-    let mut failed = Vec::new();
-    for (id, state_path) in workspace_state_paths(&root) {
-        // Read the FILE, not the store: the file is the source of truth for an
-        // import, and going through the dual reader would hand back the row we
-        // are trying to refresh.
-        let Some(state) = crate::session::read_session_file(&state_path) else {
-            failed.push((id, "state unreadable".to_string()));
-            continue;
-        };
-        if !needs_import(store, &id, &state.updated_at) {
-            continue;
-        }
-        let workspace = if state.workspace.trim().is_empty() {
-            // A pre-field state has no folder; fall back to the workspace dir so
-            // the row still carries a usable path rather than an empty string.
-            state_path
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        } else {
-            state.workspace.clone()
-        };
-        let key = crate::config::workspace_key(Path::new(&workspace));
-        let extras = SessionExtras::from_sidecars(&state_path);
-        match store.import_session(&id, &key, &state, &extras) {
-            Ok(()) => migrated.push(MigratedSession {
-                id,
-                workspace,
-                messages: state.messages.len(),
-                events: state.events.len(),
-            }),
-            Err(error) => failed.push((id, error.to_string())),
-        }
-    }
-    Ok((migrated, failed))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1022,6 +1176,8 @@ mod tests {
             profile: None,
             role: "standard".into(),
             agent_id: None,
+            legacy_id: None,
+            kind: "conversation".into(),
         }
     }
 
@@ -1181,5 +1337,182 @@ mod tests {
         db.import_session("s1", "wk1", &state, &SessionExtras::default())
             .unwrap();
         assert_eq!(db.conversation_message_count("s1").unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod session_id_migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn insert_session(conn: &Connection, id: &str, legacy: Option<&str>) {
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_key, workspace, status, created_at, updated_at, legacy_id)
+             VALUES (?1, 'wk', '/code/thing', 'idle', 't', 't', ?2)",
+            rusqlite::params![id, legacy],
+        )
+        .unwrap();
+    }
+
+    fn insert_message(conn: &Connection, sid: &str, ordinal: i64, body: &str) {
+        conn.execute(
+            "INSERT INTO session_messages (session_id, ordinal, role, payload_json, created_at)
+             VALUES (?1, ?2, 'user', ?3, 't')",
+            rusqlite::params![sid, ordinal, body],
+        )
+        .unwrap();
+    }
+
+    fn session_ids(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT id FROM sessions ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn messages(conn: &Connection, sid: &str) -> Vec<String> {
+        conn.prepare(
+            "SELECT ordinal || '|' || payload_json FROM session_messages
+             WHERE session_id = ?1 ORDER BY ordinal",
+        )
+        .unwrap()
+        .query_map(rusqlite::params![sid], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// A renamed session whose legacy id was re-created must MERGE, not fail.
+    ///
+    /// Renaming would collide on `(session_id, ordinal)` and abort the open, so
+    /// the store would not load at all. Observed live: a daemon on the previous
+    /// build kept writing the pre-migration id, so one session ended up with two
+    /// rows and the next start could not open the database.
+    #[test]
+    fn a_recreated_legacy_row_merges_instead_of_colliding() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        // The canonical row holds a stale PREFIX of the same conversation — the
+        // real shape: the stale copy shares ordinals and payloads with the row
+        // that kept being appended to.
+        insert_session(&conn, "ws-1", Some("ws-1/state.json"));
+        for i in 0..2 {
+            insert_message(&conn, "ws-1", i, &format!("same {i}"));
+        }
+        insert_session(&conn, "ws-1/state.json", None);
+        for i in 0..4 {
+            insert_message(&conn, "ws-1/state.json", i, &format!("same {i}"));
+        }
+
+        rewrite_legacy_session_ids(&conn).unwrap();
+
+        assert_eq!(session_ids(&conn), vec!["ws-1".to_string()]);
+        // One conversation, not two: 4 messages, because both rows carry the SAME
+        // two messages at ordinals 0 and 1 and the rest extends them.
+        assert_eq!(
+            messages(&conn, "ws-1"),
+            vec!["0|same 0", "1|same 1", "2|same 2", "3|same 3"]
+        );
+    }
+
+    /// Diverged rows keep BOTH transcripts.
+    ///
+    /// "Keep the longer one" is only correct while the shorter is a strict
+    /// prefix. When the two actually diverge — which the live database showed is
+    /// possible, since the stale row had unique request nonces only it held —
+    /// discarding the shorter side would silently delete messages nothing can
+    /// restore. The union renumbers the extra rows past the base's last ordinal
+    /// so they cannot collide on the primary key.
+    #[test]
+    fn diverged_duplicates_keep_both_transcripts() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+
+        insert_session(&conn, "ws-9", Some("ws-9/state.json"));
+        for i in 0..2 {
+            insert_message(&conn, "ws-9", i, &format!("shared {i}"));
+        }
+        insert_message(&conn, "ws-9", 2, "only-on-canonical");
+
+        insert_session(&conn, "ws-9/state.json", None);
+        for i in 0..2 {
+            insert_message(&conn, "ws-9/state.json", i, &format!("shared {i}"));
+        }
+        insert_message(&conn, "ws-9/state.json", 2, "only-on-legacy");
+        for i in 3..5 {
+            insert_message(&conn, "ws-9/state.json", i, &format!("tail {i}"));
+        }
+
+        rewrite_legacy_session_ids(&conn).unwrap();
+
+        assert_eq!(session_ids(&conn), vec!["ws-9".to_string()]);
+        let got = messages(&conn, "ws-9");
+        // Neither side's unique content is dropped. A row whose ordinal is
+        // already taken on the base side is RENUMBERED past the base's last
+        // ordinal, so match on the payload rather than the original position.
+        assert!(
+            got.iter().any(|m| m.ends_with("only-on-canonical")),
+            "the shorter side's unique message must survive: {got:?}"
+        );
+        assert!(
+            got.iter().any(|m| m.ends_with("only-on-legacy")),
+            "the longer side's message must survive: {got:?}"
+        );
+        assert_eq!(
+            got.len(),
+            6,
+            "2 shared + 4 unique all survive: {got:?}"
+        );
+        // The shared prefix is not repeated.
+        assert_eq!(
+            got.iter().filter(|m| m.ends_with("shared 0")).count(),
+            1,
+            "a shared row must not be duplicated: {got:?}"
+        );
+    }
+
+    /// The ordinary case: a lone legacy row is renamed, and its transcript moves
+    /// with it while `legacy_id` remembers the old value for rollback.
+    #[test]
+    fn a_lone_legacy_row_is_renamed_and_keeps_its_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        insert_session(&conn, "ws-2/state.json", None);
+        insert_message(&conn, "ws-2/state.json", 0, "hello");
+
+        rewrite_legacy_session_ids(&conn).unwrap();
+
+        assert_eq!(session_ids(&conn), vec!["ws-2".to_string()]);
+        let moved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id='ws-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 1, "the transcript moved with the id");
+        let legacy: Option<String> = conn
+            .query_row("SELECT legacy_id FROM sessions WHERE id='ws-2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy.as_deref(), Some("ws-2/state.json"));
+    }
+
+    /// Called on every open, so a second run must change nothing.
+    #[test]
+    fn the_rewrite_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema(&conn).unwrap();
+        insert_session(&conn, "ws-3/state.json", None);
+
+        rewrite_legacy_session_ids(&conn).unwrap();
+        let first = session_ids(&conn);
+        rewrite_legacy_session_ids(&conn).unwrap();
+
+        assert_eq!(first, session_ids(&conn));
     }
 }

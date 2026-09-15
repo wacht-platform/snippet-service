@@ -4,11 +4,13 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::coordination::{HandoffMode, NotificationMarker, Task, TaskResult, TaskStatus};
 use crate::llm::NativeToolDefinition;
-use crate::mission_control::{self, TaskResult, TaskStatus};
+use crate::mission_control;
 use crate::session::{
     create_blank_session, list_routable_sessions, read_session_state, state_path_for_id,
 };
+use crate::store::Store;
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
 fn schema(properties: Value, required: &[&str]) -> Value {
@@ -25,11 +27,24 @@ fn root(ctx: &ToolContext) -> Result<PathBuf, ToolError> {
         })
 }
 
-fn task_view(task: &mission_control::TaskRecord) -> Value {
+/// The task store. Tasks live in SQLite alongside the rest of coordination —
+/// the JSON store they used to live in is gone.
+fn db(ctx: &ToolContext) -> Result<Store, ToolError> {
+    let path = ctx
+        .store_path()
+        .unwrap_or_else(crate::store::default_db_path);
+    Store::open(path).map_err(|e| ToolError::msg(format!("open store: {e}")))
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn task_view(task: &Task) -> Value {
     json!({
         "id": task.id, "session_id": task.session_id, "title": task.title,
         "description": task.description, "status": task.status,
-        "dependencies": task.dependencies, "handoff": task.handoff,
+        "handoff": task.handoff,
         "result": task.result, "owned_paths": task.owned_paths,
         "notifications": task.notifications, "updated_at": task.updated_at,
         "dispatch_failures": task.dispatch_failures,
@@ -239,8 +254,9 @@ impl Tool for ListMissionTasks {
         NativeToolDefinition { name: "list_mission_tasks".into(), description: "List Mission Control's durable task board, including queued, active, blocked, failed, and completed work. Read status, result, notifications, and dispatch_failures — those are how you see errors and temporary failures to resume.".into(), input_schema: schema(json!({}), &[]) }
     }
     async fn execute(&self, ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
-        let root = root(ctx)?;
-        let tasks = mission_control::list_tasks(&root, None, None).map_err(ToolError::msg)?;
+        let tasks = db(ctx)?
+            .list_tasks(None, None)
+            .map_err(|e| ToolError::msg(format!("list tasks: {e}")))?;
         Ok(ToolResult::success(
             json!({"tasks": tasks.iter().map(task_view).collect::<Vec<_>>() }),
         ))
@@ -305,12 +321,19 @@ struct CreateTaskArgs {
     handoff_mode: Option<String>,
     #[serde(default)]
     owned_paths: Vec<String>,
+    /// The agent that will do the work. Omitted for ordinary work: the general
+    /// coding agent takes it. Recorded on the task roster, which is what makes
+    /// the completion able to report to that agent's OWN board — the target
+    /// session is not always agent-bound, so its context alone cannot say who
+    /// finished the work.
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist exactly one ordinary project handoff to an existing durable session. Never use for direct user agent-build requests, [AGENT_BUILD_JOB] envelopes, worker reports, or build-status notifications. Use handoff_mode 'resume' when the target already has context and 'fresh' otherwise.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist exactly one ordinary project handoff to an existing durable session. Never use for direct user agent-build requests, [AGENT_BUILD_JOB] envelopes, worker reports, or build-status notifications. Use handoff_mode 'resume' when the target already has context and 'fresh' otherwise.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -320,11 +343,36 @@ impl Tool for CreateMissionTask {
         if args.title.trim().is_empty() || args.description.trim().is_empty() {
             return Err(ToolError::msg("title and description must be non-empty"));
         }
+        let store = db(ctx)?;
         let root = root(ctx)?;
         let path = state_path_for_id(&args.session_id)
             .ok_or_else(|| ToolError::msg("unknown target session"))?;
         let state = read_session_state(&path)
             .ok_or_else(|| ToolError::msg("session state unreadable"))?;
+        // The worker, in order of specificity: what the caller named, then the
+        // agent the target session is already bound to, then the general coding
+        // agent. The session's own binding is the right default because that is
+        // who will actually run the work — and it is what makes completion report
+        // to the correct agent's board rather than to an assumed one.
+        let agent_id = args
+            .agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                crate::session::read_session_sidecar(&path).and_then(|sidecar| sidecar.agent_id)
+            })
+            .unwrap_or_else(|| crate::coordination::SNIPPET_AGENT_ID.to_string());
+        if store
+            .get_agent(&agent_id)
+            .map_err(|e| ToolError::msg(format!("look up agent: {e}")))?
+            .is_none()
+        {
+            return Err(ToolError::msg(format!(
+                "unknown agent `{agent_id}` — list_coordination_agents shows the directory"
+            )));
+        }
         if mission_control::get_session(&root, &args.session_id).is_err() {
             mission_control::create_session(
                 &root,
@@ -336,8 +384,8 @@ impl Tool for CreateMissionTask {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let handoff_mode = match args.handoff_mode.as_deref() {
-            None | Some("resume") => mission_control::HandoffMode::Resume,
-            Some("fresh") => mission_control::HandoffMode::Fresh,
+            None | Some("resume") => HandoffMode::Resume,
+            Some("fresh") => HandoffMode::Fresh,
             Some(other) => {
                 return Err(ToolError::msg(format!(
                     "handoff_mode must be 'resume' or 'fresh', got '{other}'"
@@ -350,18 +398,37 @@ impl Tool for CreateMissionTask {
         let workspace = std::path::PathBuf::from(&state.workspace);
         let owned_paths = crate::serve::validated_owned_paths(&args.owned_paths, &workspace)
             .map_err(ToolError::msg)?;
-        let task = mission_control::create_task_with_mode(
-            &root,
-            &id,
-            &args.session_id,
-            args.title.trim(),
-            args.description.trim(),
+        // A task created by Mission Control is attributed to it, so the board
+        // shows who filed the work rather than an anonymous row.
+        let task = Task::dispatched_to(
+            id,
+            args.session_id.clone(),
+            args.title.trim().to_string(),
+            args.description.trim().to_string(),
             owned_paths,
             handoff_mode,
-        )
-        .map_err(ToolError::msg)?;
+            "agent",
+            crate::mission_control::SESSION_ID,
+            now_rfc3339(),
+        );
+        let now = now_rfc3339();
+        store
+            .create_task(&task)
+            .map_err(|e| ToolError::msg(format!("create task: {e}")))?;
+        // The ROSTER is what carries the worker identity forward. The target
+        // session is not always agent-bound, so at completion the session's own
+        // context cannot say which agent did the work — this row is the only
+        // place that can, and it is what lets the report reach that agent's own
+        // board. Membership also grants the agent its room on the task thread.
+        store
+            .add_task_agent(&task.id, &agent_id, "implementer", &now)
+            .map_err(|e| ToolError::msg(format!("record task agent: {e}")))?;
         Ok(ToolResult::success(
-            json!({"task": task_view(&task), "note":"Persisted as pending. The daemon will dispatch it when its workspace is available."}),
+            json!({
+                "task": task_view(&task),
+                "agent_id": agent_id,
+                "note": "Persisted as pending. The daemon will dispatch it when its workspace is available."
+            }),
         ))
     }
 }
@@ -388,8 +455,9 @@ impl Tool for RetryMissionTask {
         if args.task_id.trim().is_empty() {
             return Err(ToolError::msg("task_id must be non-empty"));
         }
-        let task = mission_control::retry_task(&root(ctx)?, args.task_id.trim())
-            .map_err(ToolError::msg)?;
+        let task = db(ctx)?
+            .retry_task(args.task_id.trim(), &now_rfc3339())
+            .map_err(|e| ToolError::msg(format!("retry task: {e}")))?;
         Ok(ToolResult::success(json!({
             "task": task_view(&task),
             "note": "Re-queued as pending. The daemon will dispatch it again."
@@ -419,17 +487,18 @@ impl Tool for CancelMissionTask {
         if args.task_id.trim().is_empty() {
             return Err(ToolError::msg("task_id must be non-empty"));
         }
-        let task = mission_control::complete_task(
-            &root(ctx)?,
-            args.task_id.trim(),
-            TaskStatus::Cancelled,
-            TaskResult {
-                summary: "Cancelled by Mission Control.".into(),
-                authoritative: true,
-                ..Default::default()
-            },
-        )
-        .map_err(ToolError::msg)?;
+        let task = db(ctx)?
+            .complete_task(
+                args.task_id.trim(),
+                TaskStatus::Cancelled,
+                TaskResult {
+                    summary: "Cancelled by Mission Control.".into(),
+                    artifacts: Vec::new(),
+                    authoritative: true,
+                },
+                &now_rfc3339(),
+            )
+            .map_err(|e| ToolError::msg(format!("cancel task: {e}")))?;
         Ok(ToolResult::success(json!({
             "task": task_view(&task),
             "note": "Cancelled. Waiters on this task can now dispatch."
@@ -487,46 +556,82 @@ impl Tool for ReportMissionTask {
                 "this session is not bound to a Mission Control task; report_mission_task is only available to dispatched task sessions",
             ));
         };
-        let root = mission_control::MissionControlStore::default_root(None);
         let status = match args.status.as_str() {
             "done" => TaskStatus::Done,
             "blocked" => TaskStatus::Blocked,
             "failed" => TaskStatus::Failed,
             _ => return Err(ToolError::msg("status must be done, blocked, or failed")),
         };
+        let store = db(ctx)?;
         {
-            let bound = mission_control::get_task(&root, &args.task_id)
-                .map_err(|_| ToolError::msg("unknown task"))?;
+            let bound = store
+                .get_task(&args.task_id)
+                .map_err(|e| ToolError::msg(format!("load task: {e}")))?
+                .ok_or_else(|| ToolError::msg("unknown task"))?;
             if bound.reporting_session.as_deref() != Some(caller) {
                 return Err(ToolError::msg("task was not dispatched to this session"));
             }
         }
+        let now = now_rfc3339();
+        let summary_for_board = args.summary.trim().to_string();
+        let status_for_board = status.clone();
         let task = if status.is_terminal() {
-            mission_control::complete_task(
-                &root,
-                &args.task_id,
-                status,
-                TaskResult {
-                    summary: args.summary,
-                    artifacts: args.artifacts.into_iter().map(PathBuf::from).collect(),
-                    authoritative: true,
-                },
-            )
-            .map_err(ToolError::msg)?
+            store
+                .complete_task(
+                    &args.task_id,
+                    status,
+                    TaskResult {
+                        summary: args.summary,
+                        artifacts: args.artifacts.into_iter().map(PathBuf::from).collect(),
+                        authoritative: true,
+                    },
+                    &now,
+                )
+                .map_err(|e| ToolError::msg(format!("complete task: {e}")))?
         } else {
-            mission_control::update_task(&root, &args.task_id, |task| {
-                task.status = status;
-                task.owned_paths.clear(); // release ownership while blocked
-                task.notifications
-                    .push(mission_control::NotificationMarker {
+            store
+                .update_task_in(&args.task_id, &now, |task| {
+                    task.status = status;
+                    task.owned_paths.clear(); // release ownership while blocked
+                    task.notifications.push(NotificationMarker {
                         target: "mission_control".into(),
                         kind: "blocked".into(),
                         message: args.summary,
                         delivered: false,
                     });
-            })
-            .map_err(ToolError::msg)?
+                })
+                .map_err(|e| ToolError::msg(format!("update task: {e}")))?
         };
+        // The WORKER whose board this reports to. Taken from the task ROSTER, not
+        // from this session's context: the target session is not always
+        // agent-bound, so `ctx.agent_id()` is usually None here and the report
+        // would be silently skipped. The roster was written when Mission Control
+        // created the task, so it is the one record that knows who did the work.
+        let reporter = store
+            .list_task_agents(&task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|member| member.removed_at.is_none())
+            .map(|member| member.agent_id)
+            .or_else(|| ctx.agent_id().map(str::to_string));
+        if let Some(agent_id) = reporter {
+            let verb = match status_for_board {
+                TaskStatus::Done => "finished",
+                TaskStatus::Blocked => "blocked",
+                _ => "failed",
+            };
+            let _ = store.record_board_entry(
+                &agent_id,
+                crate::coordination::BoardEntryKind::Reported,
+                &crate::coordination::NewBoardEntry {
+                    session_id: Some(&task.session_id),
+                    workspace: None,
+                    summary: &format!("{} — {verb}: {summary_for_board}", task.id),
+                    correlation_id: Some(&task.id),
+                    created_at: &now,
+                },
+            );
+        }
         Ok(ToolResult::success(json!({"task": task_view(&task)})))
     }
 }
@@ -612,5 +717,118 @@ impl Tool for CreateRecurringJob {
             },
             "note": "Job file written. The daemon tick will SetGoal on that session when due; if it is already on a goal, this fire queues and starts immediately after complete_goal.",
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordination::types::{Agent, AgentKind, AgentRole, AgentStatus};
+
+    fn worker(id: &str) -> Agent {
+        Agent {
+            id: id.into(),
+            display_name: id.into(),
+            handle: id.into(),
+            kind: AgentKind::Worker,
+            status: AgentStatus::Active,
+            role: AgentRole::Implementer,
+            capabilities: vec![],
+        }
+    }
+
+    /// Completion must reach BOTH boards from a single call.
+    ///
+    /// The task target is a plain session with no agent bound — which is the
+    /// normal case, and exactly the one where reading the worker from the
+    /// SESSION's context would silently skip the agent board. The worker is
+    /// resolved from the task ROSTER instead, so the row lands either way.
+    #[tokio::test]
+    async fn completion_reports_to_the_task_and_the_workers_own_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("snippet.db")).unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+
+        let task = Task::dispatched_to(
+            "t1".into(),
+            "s1".into(),
+            "do the thing".into(),
+            "scope".into(),
+            vec![],
+            HandoffMode::Resume,
+            "agent",
+            crate::mission_control::SESSION_ID,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        db.create_task(&task).unwrap();
+        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
+            .unwrap();
+        // Dispatch binds the reporting session; without it the tool refuses.
+        db.update_task_in("t1", "2026-01-01T00:00:00Z", |t| {
+            t.status = TaskStatus::InProgress;
+            t.reporting_session = Some("s1".into());
+        })
+        .unwrap();
+
+        // A session with NO agent bound — the common case.
+        let ctx = ToolContext::mission_control(dir.path())
+            .unwrap()
+            .with_durable_session_id("s1")
+            .with_store_path(dir.path().join("snippet.db"));
+
+        ReportMissionTask
+            .execute(
+                &ctx,
+                json!({"task_id":"t1","status":"done","summary":"all green"}),
+            )
+            .await
+            .unwrap();
+
+        // The task board says it finished.
+        let stored = db.get_task("t1").unwrap().unwrap();
+        assert_eq!(stored.status, TaskStatus::Done);
+
+        // AND the worker's own board carries the report.
+        let rows = db
+            .read_board(
+                "snippet",
+                &crate::coordination::BoardQuery::default(),
+                10,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one entry on the worker's board");
+        assert_eq!(rows[0].kind, "reported");
+        assert!(rows[0].summary.contains("all green"));
+        assert_eq!(rows[0].correlation_id.as_deref(), Some("t1"));
+    }
+
+    /// A task is created against the agent the target session is bound to, so
+    /// completion reports to the right board rather than assuming the general
+    /// agent.
+    #[tokio::test]
+    async fn a_task_records_the_agent_that_will_do_the_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("snippet.db")).unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        db.create_agent(&worker("rust-pr-reviewer")).unwrap();
+
+        let task = Task::dispatched_to(
+            "t2".into(),
+            "s2".into(),
+            "review it".into(),
+            "scope".into(),
+            vec![],
+            HandoffMode::Resume,
+            "agent",
+            crate::mission_control::SESSION_ID,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        db.create_task(&task).unwrap();
+        db.add_task_agent("t2", "rust-pr-reviewer", "implementer", "2026-01-01")
+            .unwrap();
+
+        let roster = db.list_task_agents("t2").unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].agent_id, "rust-pr-reviewer");
     }
 }
