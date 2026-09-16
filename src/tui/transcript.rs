@@ -20,11 +20,7 @@ pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<L
     let title_style = Style::default()
         .fg(Color::Rgb(165, 180, 252))
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::Rgb(71, 85, 105));
 
-    lines.push(Line::from(""));
-    lines.push(center("t                                          T", dim));
-    lines.push(center("G                                           ", dim));
     lines.push(Line::from(""));
 
     let green = Style::default().fg(Color::Rgb(74, 222, 128));
@@ -71,9 +67,6 @@ pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<L
         title_style,
     ));
     lines.push(Line::from(""));
-
-    lines.push(center("g                                          g", dim));
-    lines.push(center("   t                                        ", dim));
 
     lines
 }

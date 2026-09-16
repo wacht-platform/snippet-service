@@ -7256,7 +7256,8 @@ mod tests {
     /// block of art is invisible to every other kind of test.
     #[test]
     fn empty_state_renders_its_artwork_and_status() {
-        let frame = frame_text(90, 24);
+        let rows = snapshot(90, 24);
+        let frame = rows.join("\n");
         for expected in [
             "(  o.o  )",          // the mascot's eyes
             "SNIPPET",            // the nameplate inside the mascot's box
@@ -7266,6 +7267,17 @@ mod tests {
             "gpt-4o",             // ...and the model
         ] {
             assert!(frame.contains(expected), "empty state is missing {expected:?}");
+        }
+        for stray in [
+            "t                                          T",
+            "G",
+            "g                                          g",
+            "t",
+        ] {
+            assert!(
+                rows.iter().all(|row| row.trim() != stray),
+                "empty state contains an orphan artwork row {stray:?}"
+            );
         }
     }
 
