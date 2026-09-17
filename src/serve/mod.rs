@@ -1202,7 +1202,34 @@ async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQuery>) -> R
         (None, None) => None,
     };
     match d.store.list_agents_page(after, q.limit.clamp(1, 500)) {
-        Ok(agents) => Json(agents).into_response(),
+        Ok(agents) => {
+            let sessions = list_device_sessions();
+            let agents = agents
+                .into_iter()
+                .map(|agent| {
+                    let mut value = serde_json::to_value(&agent).unwrap_or_default();
+                    let assigned: Vec<_> = sessions
+                        .iter()
+                        .filter(|session| {
+                            session.worker_agent_id.as_deref() == Some(agent.id.as_str())
+                                || session.agent_id.as_deref() == Some(agent.id.as_str())
+                        })
+                        .map(|session| {
+                            serde_json::json!({
+                                "id": session.id,
+                                "title": session.title,
+                                "conversation": session.conversation,
+                            })
+                        })
+                        .collect();
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("assigned_sessions".into(), serde_json::json!(assigned));
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(agents).into_response()
+        }
         Err(error) => {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {error}")).into_response()
         }
