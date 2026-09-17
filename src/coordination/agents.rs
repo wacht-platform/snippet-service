@@ -123,6 +123,30 @@ impl Store {
         Ok(self.list_agents()?.into_iter().find(|agent| agent.id == id))
     }
 
+    /// Active assignment summaries in one set-based query. The endpoint uses
+    /// this instead of walking tasks and querying each roster separately.
+    pub fn list_agent_assigned_sessions(
+        &self,
+    ) -> Result<Vec<(String, String, String, String)>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ta.agent_id, s.id, COALESCE(s.title, ''),
+                        COALESCE(json_extract(s.state_json, '$.conversation'), '')
+                 FROM task_agents ta
+                 JOIN tasks t ON t.id = ta.task_id
+                 JOIN sessions s ON s.id = t.session_id
+                 WHERE ta.removed_at IS NULL
+                   AND t.status NOT IN ('done', 'cancelled', 'failed')
+                   AND t.session_id <> ''
+                 ORDER BY ta.agent_id, s.updated_at DESC, s.id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            rows.collect()
+        })
+    }
+
     /// One keyset page of agents ordered by `(display_name, id)` — a stable,
     /// total order. Pass the previous page's last `(display_name, id)` as
     /// `after`; `None` starts from the beginning. Callers detect the end by a
