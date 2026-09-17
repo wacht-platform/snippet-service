@@ -1203,27 +1203,30 @@ async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQuery>) -> R
     };
     match d.store.list_agents_page(after, q.limit.clamp(1, 500)) {
         Ok(agents) => {
-            let sessions = list_device_sessions();
+            let assignments = match d.store.list_agent_assigned_sessions() {
+                Ok(rows) => rows,
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {error}"))
+                        .into_response();
+                }
+            };
+            let mut grouped: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+            for (agent_id, id, title, conversation) in assignments {
+                grouped.entry(agent_id).or_default().push(serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "conversation": conversation,
+                }));
+            }
             let agents = agents
                 .into_iter()
                 .map(|agent| {
                     let mut value = serde_json::to_value(&agent).unwrap_or_default();
-                    let assigned: Vec<_> = sessions
-                        .iter()
-                        .filter(|session| {
-                            session.worker_agent_id.as_deref() == Some(agent.id.as_str())
-                                || session.agent_id.as_deref() == Some(agent.id.as_str())
-                        })
-                        .map(|session| {
-                            serde_json::json!({
-                                "id": session.id,
-                                "title": session.title,
-                                "conversation": session.conversation,
-                            })
-                        })
-                        .collect();
                     if let Some(object) = value.as_object_mut() {
-                        object.insert("assigned_sessions".into(), serde_json::json!(assigned));
+                        object.insert(
+                            "assigned_sessions".into(),
+                            serde_json::Value::Array(grouped.remove(&agent.id).unwrap_or_default()),
+                        );
                     }
                     value
                 })
