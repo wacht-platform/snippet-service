@@ -1211,11 +1211,12 @@ async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQuery>) -> R
                 }
             };
             let mut grouped: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-            for (agent_id, id, title, conversation) in assignments {
+            for (agent_id, id, title, conversation, last_active) in assignments {
                 grouped.entry(agent_id).or_default().push(serde_json::json!({
                     "id": id,
                     "title": title,
                     "conversation": conversation,
+                    "last_active": last_active,
                 }));
             }
             let agents = agents
