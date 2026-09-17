@@ -127,22 +127,23 @@ impl Store {
     /// this instead of walking tasks and querying each roster separately.
     pub fn list_agent_assigned_sessions(
         &self,
-    ) -> Result<Vec<(String, String, String, String)>, StoreError> {
+    ) -> Result<Vec<(String, String, String, String, i64)>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT ta.agent_id, s.id, COALESCE(s.title, ''),
-                        COALESCE(json_extract(s.state_json, '$.conversation'), '')
+                        COALESCE(json_extract(s.state_json, '$.conversation'), ''),
+                        COALESCE(s.last_active, 0)
                  FROM task_agents ta
                  JOIN tasks t ON t.id = ta.task_id
                  JOIN sessions s ON s.id = t.session_id
                  WHERE ta.removed_at IS NULL
                    AND t.status NOT IN ('done', 'cancelled', 'failed')
                    AND t.session_id <> ''
-                 GROUP BY ta.agent_id, s.id, s.title, s.state_json
+                 GROUP BY ta.agent_id, s.id, s.title, s.state_json, s.last_active
                  ORDER BY ta.agent_id, MAX(s.updated_at) DESC, s.id",
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
             })?;
             rows.collect()
         })
