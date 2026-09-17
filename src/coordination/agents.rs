@@ -138,7 +138,8 @@ impl Store {
                  WHERE ta.removed_at IS NULL
                    AND t.status NOT IN ('done', 'cancelled', 'failed')
                    AND t.session_id <> ''
-                 ORDER BY ta.agent_id, s.updated_at DESC, s.id",
+                 GROUP BY ta.agent_id, s.id, s.title, s.state_json
+                 ORDER BY ta.agent_id, MAX(s.updated_at) DESC, s.id",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
