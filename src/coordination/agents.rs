@@ -123,24 +123,30 @@ impl Store {
         Ok(self.list_agents()?.into_iter().find(|agent| agent.id == id))
     }
 
-    /// Active assignment summaries in one set-based query. The endpoint uses
-    /// this instead of walking tasks and querying each roster separately.
+    /// Assignment summaries in one set-based query across tasks and direct
+    /// agent sessions, returning all sessions the agent worked on.
     pub fn list_agent_assigned_sessions(
         &self,
     ) -> Result<Vec<(String, String, String, String, i64)>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT ta.agent_id, s.id, COALESCE(s.title, ''),
-                        COALESCE(json_extract(s.state_json, '$.conversation'), ''),
-                        COALESCE(s.last_active, 0)
-                 FROM task_agents ta
-                 JOIN tasks t ON t.id = ta.task_id
-                 JOIN sessions s ON s.id = t.session_id
-                 WHERE ta.removed_at IS NULL
-                   AND t.status NOT IN ('done', 'cancelled', 'failed')
-                   AND t.session_id <> ''
-                 GROUP BY ta.agent_id, s.id, s.title, s.state_json, s.last_active
-                 ORDER BY ta.agent_id, MAX(s.updated_at) DESC, s.id",
+                "SELECT agent_id, id, COALESCE(title, ''),
+                        COALESCE(json_extract(state_json, '$.conversation'), ''),
+                        COALESCE(last_active, 0)
+                 FROM (
+                     SELECT ta.agent_id as agent_id, s.id as id, s.title as title, s.state_json as state_json, s.last_active as last_active, s.updated_at as updated_at
+                     FROM task_agents ta
+                     JOIN tasks t ON t.id = ta.task_id
+                     JOIN sessions s ON (s.id = t.session_id OR s.legacy_id = t.session_id OR s.id = REPLACE(t.session_id, '/state.json', ''))
+                     WHERE ta.removed_at IS NULL
+                       AND t.session_id <> ''
+                     UNION
+                     SELECT s.agent_id as agent_id, s.id as id, s.title as title, s.state_json as state_json, s.last_active as last_active, s.updated_at as updated_at
+                     FROM sessions s
+                     WHERE s.agent_id IS NOT NULL AND s.agent_id <> '' AND s.id NOT LIKE 'inbox-%'
+                 ) sub
+                 GROUP BY agent_id, id, title, state_json, last_active
+                 ORDER BY agent_id, MAX(COALESCE(last_active, 0)) DESC, MAX(updated_at) DESC, id",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
@@ -282,5 +288,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn list_agent_assigned_sessions_includes_completed_tasks_and_direct_sessions() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&agent("ag-1", "Agent One")).unwrap();
+
+        db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO sessions (id, workspace_key, workspace, title, status, created_at, updated_at, agent_id, last_active)
+                 VALUES ('sess-direct', 'w', '/w', 'Direct Session', 'idle', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 'ag-1', 100)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO sessions (id, workspace_key, workspace, title, status, created_at, updated_at, last_active)
+                 VALUES ('sess-task', 'w', '/w', 'Task Session', 'idle', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 200)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO tasks (id, session_id, title, description, status, created_by_kind, created_by_id, created_at, updated_at, thread_id)
+                 VALUES ('task-1', 'sess-task', 'Completed Task', 'desc', 'done', 'agent', 'ag-1', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', 'thread-1')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO task_agents (task_id, agent_id, role, added_at)
+                 VALUES ('task-1', 'ag-1', 'worker', '2026-09-01T00:00:00Z')",
+                [],
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let assigned = db.list_agent_assigned_sessions().unwrap();
+        assert_eq!(assigned.len(), 2);
+        assert_eq!(assigned[0].0, "ag-1");
+        assert_eq!(assigned[0].1, "sess-task");
+        assert_eq!(assigned[1].1, "sess-direct");
     }
 }
