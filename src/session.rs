@@ -330,6 +330,11 @@ impl AgentRuntime {
         tools.insert(crate::builtins::BashTool);
         tools.insert(crate::builtins::ReadFileTool);
         tools.insert(crate::builtins::ReadImageTool);
+        // Mission Control may research current docs and issues while routing work.
+        if let Some(key) = i.exa_api_key.clone().filter(|k| !k.trim().is_empty()) {
+            tools.insert(crate::builtins::WebSearchTool { api_key: key.clone() });
+            tools.insert(crate::builtins::WebReadTool { api_key: key });
+        }
         crate::mission_tools::add_mission_control_tools(&mut tools);
         crate::coordination_tools::add_coordination_tools(&mut tools);
 
