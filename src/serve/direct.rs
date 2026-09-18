@@ -403,10 +403,14 @@ pub(super) async fn direct_send_message(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let prepared_body = match super::transcribe::prepare_message(&d, req.body.trim().to_string()).await {
+        Ok(t) => t,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
     match d.store.send_direct_message_from(
         from,
         to,
-        req.body.trim(),
+        &prepared_body,
         &key,
         &now,
         origin,
@@ -417,7 +421,7 @@ pub(super) async fn direct_send_message(
             // attach to. Without it the answer would appear with no question
             // before it and the model could not tell what was asked.
             if let Some(origin) = origin {
-                super::record_agent_message(&d, origin, to.1, req.body.trim(), true).await;
+                super::record_agent_message(&d, origin, to.1, &prepared_body, true).await;
             }
             (StatusCode::ACCEPTED, Json(saved)).into_response()
         }
