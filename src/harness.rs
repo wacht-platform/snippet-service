@@ -137,6 +137,31 @@ pub enum HarnessEvent {
     Note {
         entry: String,
     },
+    /// A direct message between this session and an agent.
+    ///
+    /// Recorded in BOTH directions so the transcript shows the exchange: what
+    /// this session sent out, and what came back. Without the outbound record a
+    /// reply would appear from nowhere with no indication of what was asked.
+    AgentMessage {
+        /// The agent on the other side.
+        agent_id: String,
+        body: String,
+        /// True when this session sent it; false when the agent replied.
+        outbound: bool,
+    },
+    /// Someone other than this session dispatched a task, recorded here so the
+    /// coordinator's transcript shows what was sent out on its behalf.
+    ///
+    /// A NOTICE, never a wake: the work is already routed to a worker, so waking
+    /// Mission Control would spend a turn on something that needs no decision.
+    TaskDispatched {
+        task_id: String,
+        title: String,
+        /// The session the work was routed to.
+        session_id: String,
+        /// Who dispatched it — `human` for a user filing work directly.
+        by: String,
+    },
     /// The agent presented a file to the user (an openable card in the UIs).
     FilePresented {
         path: String,
@@ -449,6 +474,13 @@ pub struct HarnessState {
     /// a stale hold list.
     #[serde(default)]
     pub queued_inputs: Vec<QueuedInput>,
+    /// Set by the few writers that rewrite history in place — compaction,
+    /// checkpoint rewind, interrupt rollback, tool-payload pruning. Those are the
+    /// only cases where the append-only store cannot be appended to, so the flag
+    /// is what lets a persist be an append the rest of the time. Never
+    /// serialized: it describes the pending write, not the session.
+    #[serde(skip)]
+    pub history_rewritten: bool,
 }
 
 impl HarnessState {
@@ -480,6 +512,9 @@ impl HarnessState {
         let message_index = cp.message_index.min(self.messages.len());
         self.events.truncate(event_index);
         self.messages.truncate(message_index);
+        // A rewind moves history backwards, which an append-only store cannot
+        // express — mark the pending write as a full replace.
+        self.history_rewritten = true;
         self.checkpoints.retain(|c| c.event_index <= event_index);
         self.final_text = None;
         self.pending_question = None;
@@ -588,10 +623,19 @@ pub enum LoopInput {
     SetTitle(String),
     /// Set (or replace) the autonomous `/goal` — the agent begins driving toward it.
     SetGoal(String),
+    /// Resume a paused rate-limited goal without replacing its text.
+    ResumeGoal,
     /// Cancel the active goal — the agent is told and winds down.
     CancelGoal,
     /// Cancel the run.
     Interrupt,
+    /// Record an event WITHOUT starting a turn.
+    ///
+    /// For information addressed to the session that the session's agent must not
+    /// be made to act on: a reply from another agent, or the record of a message
+    /// this session sent out. `UserMessage` would wake the agent and spend a turn
+    /// on a notice — this records it and leaves the loop parked.
+    Notice(HarnessEvent),
     /// Rewind to a checkpoint — truncate events and checkpoints to that point.
     Rewind {
         checkpoint: String,
@@ -705,6 +749,10 @@ pub struct CodingHarness {
     config: HarnessConfig,
     tools: ToolRegistry,
     context: ToolContext,
+    /// Ordinals already durable, so a persist can append the tail instead of
+    /// rewriting the transcript.
+    written_messages: std::sync::atomic::AtomicUsize,
+    written_events: std::sync::atomic::AtomicUsize,
 }
 
 impl CodingHarness {
@@ -713,7 +761,145 @@ impl CodingHarness {
             config,
             tools,
             context,
+            written_messages: std::sync::atomic::AtomicUsize::new(0),
+            written_events: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// The durable session id: the bound id when present, else the state path's
+    /// id, which is the same identity the session list and tools use.
+    fn session_id(&self) -> Option<String> {
+        if let Some(id) = self.context.durable_session_id() {
+            return Some(id.to_string());
+        }
+        self.config
+            .state_path
+            .as_deref()
+            .map(crate::session::session_id_for_state_path)
+    }
+
+    fn store(&self) -> Option<crate::store::Store> {
+        let path = self.context.store_path()?;
+        crate::store::Store::open(path).ok()
+    }
+
+    /// Save the session to the database: scalar state plus the transcript tail.
+    ///
+    /// Appends only the messages and events that are not already durable, so the
+    /// common persist writes a handful of rows instead of re-serializing and
+    /// recompressing the whole conversation. `history_rewritten` is the signal
+    /// that a writer replaced the middle (compaction, rewind, rollback), where an
+    /// append would duplicate or misorder — those fall back to a full replace.
+    async fn persist_to_store(&self, state: &HarnessState) -> Result<(), ToolError> {
+        let Some(store) = self.store() else {
+            return Ok(());
+        };
+        let Some(id) = self.session_id() else {
+            return Ok(());
+        };
+        let workspace = self.context.workspace_root().display().to_string();
+        let key = crate::config::workspace_key(self.context.workspace_root());
+        let title = state.title.clone();
+        let status = crate::session::status_str(state.status);
+        let scalar = scalar_json(state).map_err(ToolError::msg)?;
+        let now = state.updated_at.clone();
+
+        // Read the status BEFORE overwriting it: the transition is the entire
+        // content of the event, and `save_session_scalar` below destroys it.
+        let prev_status = store
+            .get_session_row(&id)
+            .ok()
+            .flatten()
+            .map(|row| row.status)
+            .unwrap_or_default();
+
+        let result = async {
+            store
+                .save_session_scalar(
+                    &id,
+                    &key,
+                    &workspace,
+                    title.as_deref(),
+                    &status,
+                    &scalar,
+                    &state.created_at,
+                    &now,
+                )
+                .map_err(|e| e.to_string())?;
+
+            let rewritten = state.history_rewritten
+                || self.written_messages.load(std::sync::atomic::Ordering::Acquire)
+                    > state.messages.len()
+                || self.written_events.load(std::sync::atomic::Ordering::Acquire) > state.events.len();
+            if rewritten {
+                store
+                    .replace_conversation_messages(&id, &state.messages, &now)
+                    .map_err(|e| e.to_string())?;
+                store
+                    .replace_conversation_events(&id, &state.events, &now)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let from = self.written_messages.load(std::sync::atomic::Ordering::Acquire);
+                if from < state.messages.len() {
+                    store
+                        .append_conversation_messages(&id, &state.messages[from..], &now)
+                        .map_err(|e| e.to_string())?;
+                }
+                let from = self.written_events.load(std::sync::atomic::Ordering::Acquire);
+                if from < state.events.len() {
+                    store
+                        .append_conversation_events(&id, &state.events[from..], &now)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                self.written_messages
+                    .store(state.messages.len(), std::sync::atomic::Ordering::Release);
+                self.written_events
+                    .store(state.events.len(), std::sync::atomic::Ordering::Release);
+                // Park any work a dead session was doing. Done AFTER the write,
+                // so the parked state never contradicts what the store holds.
+                crate::session::park_failed_session_work(&id, &prev_status, state);
+                Ok(())
+            }
+            Err(error) => Err(ToolError::msg(format!("persist session: {error}"))),
+        }
+    }
+
+    /// Load a session from the database, if this store has it.
+    ///
+    /// Returns `None` when there is no row, which is what keeps a session that
+    /// predates the store on its state file instead of silently re-initializing.
+    async fn load_from_store(&self) -> Result<Option<HarnessState>, ToolError> {
+        let Some(store) = self.store() else {
+            return Ok(None);
+        };
+        let Some(id) = self.session_id() else {
+            return Ok(None);
+        };
+        let Some(scalar) = store
+            .load_session_scalar(&id)
+            .map_err(|e| ToolError::msg(format!("load session: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let messages = store
+            .load_conversation_messages(&id)
+            .map_err(|e| ToolError::msg(format!("load messages: {e}")))?;
+        let events = store
+            .load_conversation_events(&id)
+            .map_err(|e| ToolError::msg(format!("load events: {e}")))?;
+        self.written_messages
+            .store(messages.len(), std::sync::atomic::Ordering::Release);
+        self.written_events
+            .store(events.len(), std::sync::atomic::Ordering::Release);
+        let state = state_from_scalar(&scalar, messages, events).map_err(ToolError::msg)?;
+        Ok(Some(state))
     }
 
     /// One-shot run: drive the agent until it ends a turn (via `complete`), then
@@ -887,9 +1073,7 @@ impl CodingHarness {
                         // Buffered /compact must actually run — `apply_input`
                         // treated it as a no-op, silently swallowing the request.
                         LoopInput::Compact => wants_compact = true,
-                        LoopInput::Queue(_)
-                        | LoopInput::Unqueue(_)
-                        | LoopInput::DropQueued => {
+                        LoopInput::Queue(_) | LoopInput::Unqueue(_) | LoopInput::DropQueued => {
                             needs_persist = true;
                             self.apply_input(&mut state, input);
                         }
@@ -903,8 +1087,7 @@ impl CodingHarness {
                                     state.events.push(HarnessEvent::Steer { text });
                                     self.bump_activity();
                                 } else {
-                                    self.accept_user_message(&mut state, &mut vars, text)
-                                        .await;
+                                    self.accept_user_message(&mut state, &mut vars, text).await;
                                     consecutive_errors = 0;
                                 }
                             } else {
@@ -940,7 +1123,9 @@ impl CodingHarness {
                                 LoopInput::SetMode(_)
                                     | LoopInput::SetTitle(_)
                                     | LoopInput::SetGoal(_)
+                                    | LoopInput::ResumeGoal
                                     | LoopInput::CancelGoal
+                                    | LoopInput::Notice(_)
                             ) {
                                 needs_persist = true;
                             }
@@ -1083,7 +1268,13 @@ impl CodingHarness {
                     // Interrupted mid-step: discard the partial turn and stop.
                     state.messages.truncate(msg_mark);
                     state.events.truncate(evt_mark);
+                    state.history_rewritten = true;
                     state.status = HarnessStatus::Interrupted;
+                    // A notice is NOT part of the in-flight turn, so the truncate
+                    // above must not take it with it: it records something the
+                    // sender already had accepted. This is the last chance to
+                    // fold one in — `pending_inputs` is dropped when we break.
+                    self.record_pending_notices(&mut state, &mut pending_inputs);
                     state.events.push(HarnessEvent::SystemDecision {
                         step: "interrupted".to_string(),
                         reasoning: "User interrupted the run.".to_string(),
@@ -1163,6 +1354,10 @@ impl CodingHarness {
                         match action {
                             None => {
                                 state.status = HarnessStatus::Interrupted;
+                                // Last chance for a buffered notice: breaking drops
+                                // `pending_inputs`, and an interrupted message must
+                                // still reach the transcript.
+                                self.record_pending_notices(&mut state, &mut pending_inputs);
                                 state.events.push(HarnessEvent::SystemDecision {
                                     step: "interrupted".to_string(),
                                     reasoning: "User interrupted the run.".to_string(),
@@ -1201,6 +1396,10 @@ impl CodingHarness {
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
                         }
+                        Some(LoopInput::Notice(event)) => {
+                            self.record_notice(&mut state, event);
+                            self.persist(&mut state, &lanes).await?;
+                        }
                         Some(LoopInput::Compact) => {
                             self.run_manual_compaction(model, &mut state, &lanes).await?;
                             state.pending_question = None;
@@ -1218,6 +1417,11 @@ impl CodingHarness {
                         }
                         Some(LoopInput::SetGoal(text)) => {
                             self.begin_goal(&mut state, text);
+                            consecutive_errors = 0;
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        Some(LoopInput::ResumeGoal) => {
+                            self.resume_goal(&mut state);
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
                         }
@@ -1631,11 +1835,47 @@ impl CodingHarness {
         (interrupted, wants_compact)
     }
 
+    /// Record an event addressed to this session WITHOUT starting a turn.
+    ///
+    /// The event lands in the transcript and in the model's context, so the
+    /// session's agent knows the exchange happened when it next runs — but the
+    /// loop stays parked, because a notice is information, not a request.
+    fn record_notice(&self, state: &mut HarnessState, event: HarnessEvent) {
+        if let Some(text) = notice_text(&event) {
+            state.messages.push(HarnessMessage::User { content: text });
+        }
+        state.events.push(event);
+    }
+
+    /// Fold notices buffered during a step into the transcript.
+    ///
+    /// The interrupt paths discard the in-flight turn with a truncate, and a
+    /// notice is not part of that turn — it is a record of something that already
+    /// happened and that the store has already accepted. Dropping one would lose
+    /// the message from the transcript entirely. Anything else stays buffered.
+    fn record_pending_notices(
+        &self,
+        state: &mut HarnessState,
+        pending: &mut Vec<LoopInput>,
+    ) {
+        pending.retain(|input| match input {
+            LoopInput::Notice(event) => {
+                self.record_notice(state, event.clone());
+                false
+            }
+            _ => true,
+        });
+    }
+
     /// Apply one queued input while a run is active: a message/answer becomes a
     /// `[steer]`, an interrupt returns `true`. Shared by the between-iteration
     /// drain and the buffered-input drain.
     fn apply_input(&self, state: &mut HarnessState, input: LoopInput) -> bool {
         match input {
+            LoopInput::Notice(event) => {
+                self.record_notice(state, event);
+                false
+            }
             LoopInput::UserMessage(text) | LoopInput::Answer(text) => {
                 let text = text.trim().to_string();
                 if !text.is_empty() {
@@ -1694,6 +1934,10 @@ impl CodingHarness {
                 self.begin_goal(state, text);
                 false
             }
+            LoopInput::ResumeGoal => {
+                self.resume_goal(state);
+                false
+            }
             LoopInput::CancelGoal => {
                 self.end_goal(state);
                 false
@@ -1726,6 +1970,28 @@ impl CodingHarness {
         });
         state.events.push(HarnessEvent::SystemDecision {
             step: "goal_set".to_string(),
+            reasoning: text,
+        });
+        state.status = HarnessStatus::Running;
+    }
+
+    /// Resume a paused rate-limited goal without replacing its text.
+    fn resume_goal(&self, state: &mut HarnessState) {
+        let Some(goal) = state.goal.as_mut() else {
+            return;
+        };
+        if goal.status != GoalStatus::Paused {
+            return;
+        }
+        goal.status = GoalStatus::Active;
+        goal.resume_at = 0;
+        let text = goal.text.clone();
+        let dir = goal.dir.clone();
+        state.messages.push(HarnessMessage::User {
+            content: goal_continue_directive(&text, &dir),
+        });
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "goal_resumed".to_string(),
             reasoning: text,
         });
         state.status = HarnessStatus::Running;
@@ -2001,13 +2267,16 @@ impl CodingHarness {
             }
         };
         // Capture this turn's reasoning (from the sink) so the next turn's live
-        // context can surface "what you thought last time". Bounded so it can't
-        // bloat the request.
+        // context can surface "what you thought last time". Bounded to the LAST
+        // 2000 chars so it can't bloat the request and keeps the freshest tail.
         if let Some(sink) = sink {
             let thought = StreamBuffer::snapshot_thinking(sink);
             let thought = thought.trim();
-            vars.last_thought =
-                (!thought.is_empty()).then(|| thought.chars().take(1500).collect::<String>());
+            vars.last_thought = (!thought.is_empty()).then(|| {
+                let chars: Vec<char> = thought.chars().collect();
+                let start = chars.len().saturating_sub(2000);
+                chars[start..].iter().collect::<String>()
+            });
         }
         // Prefer provider-reported prompt tokens when present. The manual estimate is
         // only a fallback for gateways that omit/zero usage — never a floor over
@@ -2033,9 +2302,15 @@ impl CodingHarness {
         };
         let anchor_msg_len = state.messages.len();
         state.last_prompt_tokens = anchor_tokens;
-        if output.rate_limit.is_some() {
-            state.rate_limit = output.rate_limit.clone();
-        }
+        // Assign UNCONDITIONALLY: the snapshot describes the most recent call, so
+        // a model that reports nothing must CLEAR it.
+        //
+        // Overwriting only on `Some` let a ChatGPT snapshot outlive its session
+        // forever. Switching the profile to a provider that reports no
+        // rate-limit headers (opencode, anthropic, gemini) left the old figure in
+        // place, where it was rendered as that provider's current limit — the
+        // "stuck on awaiting update" report.
+        state.rate_limit = output.rate_limit.clone();
 
         // A response cut off at the token cap is never a finished reply.
         let truncated = output.is_truncated();
@@ -2581,12 +2856,14 @@ impl CodingHarness {
             // Otherwise remember this discovery call so an exact repeat is caught.
             if MUTATING_TOOLS.contains(&tool_name.as_str()) {
                 // File/shell mutations stale workspace discovery, not memory.
-                vars.executed_calls.retain(|s| s.starts_with("memory_read:"));
+                vars.executed_calls
+                    .retain(|s| s.starts_with("memory_read:"));
             } else if matches!(
                 tool_name.as_str(),
                 "memory_write" | "memory_delete" | "memory_index"
             ) {
-                vars.executed_calls.retain(|s| !s.starts_with("memory_read:"));
+                vars.executed_calls
+                    .retain(|s| !s.starts_with("memory_read:"));
             } else if DEDUP_TOOLS.contains(&tool_name.as_str()) {
                 vars.executed_calls.insert(signature);
             }
@@ -3097,6 +3374,52 @@ impl CodingHarness {
         RecoveryAction::Retry
     }
 
+    /// Bring a session loaded from either store into the current run.
+    ///
+    /// Both stores converge here so a resumed session behaves identically
+    /// regardless of where it came from: the workspace and context window are
+    /// refreshed, the system prefix is re-seeded (so new workspace memory lands),
+    /// and any half-written tool batch is repaired so strict providers don't 400
+    /// on the history forever after.
+    async fn resume_loaded_state(
+        &self,
+        mut state: HarnessState,
+        seeded_system: String,
+        initial_request: Option<String>,
+    ) -> Result<HarnessState, ToolError> {
+        // Migrate old metadata in memory; the next persist omits the legacy
+        // `user_request` field and keeps the title as identity.
+        normalize_state_title(&mut state);
+        // Reflect the current run's folder (backfills pre-field states).
+        state.workspace = self.context.workspace_root().display().to_string();
+        state.context_window = self.config.context_window_tokens;
+        // Refresh the system prefix so resumed sessions pick up the latest
+        // workspace memory (guarded: no-op if messages[0] isn't System).
+        if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
+            *content = seeded_system;
+        }
+        // A crash mid tool-batch persists an assistant `tool_calls` message whose
+        // later calls never got results; strict providers (Anthropic, DeepSeek)
+        // 400 on that history forever after. Repair on load so a resumed session
+        // is always well-formed.
+        repair_unanswered_tool_calls(&mut state.messages);
+        if let Some(request) = initial_request
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+        {
+            state.status = HarnessStatus::Running;
+            state.final_text = None;
+            state.pending_question = None;
+            state.messages.push(HarnessMessage::User {
+                content: request.clone(),
+            });
+            state.events.push(HarnessEvent::UserInput { text: request });
+            self.bump_activity();
+            self.persist_state(&mut state).await?;
+        }
+        Ok(state)
+    }
+
     async fn load_or_initialize_state(
         &self,
         initial_request: Option<String>,
@@ -3121,50 +3444,9 @@ impl CodingHarness {
         };
 
         if self.config.resume
-            && let Some(path) = &self.config.state_path
-            && tokio::fs::try_exists(path).await?
+            && let Some(state) = self.load_from_store().await?
         {
-            let bytes = tokio::fs::read(path).await?;
-            // A state file saved by an older build may be unreadable. Don't fail
-            // the run — fall through and start a fresh session, overwriting it.
-            match deserialize_state(&bytes) {
-                Ok(mut state) => {
-                    // Migrate old metadata in memory; the next persist omits the
-                    // legacy `user_request` field and keeps the title as identity.
-                    normalize_state_title(&mut state);
-                    // Reflect the current run's folder (backfills pre-field states).
-                    state.workspace = self.context.workspace_root().display().to_string();
-                    state.context_window = self.config.context_window_tokens;
-                    // Refresh the system prefix so resumed sessions pick up the
-                    // latest workspace memory (guarded: no-op if messages[0] isn't System).
-                    if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
-                        *content = seeded_system.clone();
-                    }
-                    // A crash mid tool-batch persists an assistant `tool_calls`
-                    // message whose later calls never got results; strict providers
-                    // (Anthropic, DeepSeek) 400 on that history forever after.
-                    // Repair on load so a resumed session is always well-formed.
-                    repair_unanswered_tool_calls(&mut state.messages);
-                    if let Some(request) = initial_request
-                        .map(|r| r.trim().to_string())
-                        .filter(|r| !r.is_empty())
-                    {
-                        state.status = HarnessStatus::Running;
-                        state.final_text = None;
-                        state.pending_question = None;
-                        state.messages.push(HarnessMessage::User {
-                            content: request.clone(),
-                        });
-                        state.events.push(HarnessEvent::UserInput { text: request });
-                        self.bump_activity();
-                        self.persist_state(&mut state).await?;
-                    }
-                    return Ok(state);
-                }
-                Err(err) => {
-                    self.debug_log(&format!("resume: ignoring unreadable state file: {err}"));
-                }
-            }
+            return self.resume_loaded_state(state, seeded_system, initial_request).await;
         }
 
         // Fresh session in this folder: keep snippet's `.snippet/` workspace scratch
@@ -3230,6 +3512,7 @@ impl CodingHarness {
             context_window: self.config.context_window_tokens,
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
+            history_rewritten: false,
         };
         self.persist_state(&mut state).await?;
         if request.is_some() {
@@ -3322,6 +3605,10 @@ impl CodingHarness {
 
         state.messages = messages;
         state.tool_payloads_pruned = true;
+        // Pruning REPLACES tool bodies in place, so the transcript is the same
+        // LENGTH with different content. A length check cannot see that, which is
+        // exactly why the flag exists.
+        state.history_rewritten = true;
         state.events.push(HarnessEvent::SystemDecision {
             step: "tool_payloads_pruned".to_string(),
             reasoning: "Pruned older tool data.".to_string(),
@@ -3642,6 +3929,9 @@ impl CodingHarness {
         messages.extend(preserved_prefix.into_iter().skip(1));
         messages.extend(working);
         state.messages = messages;
+        // Compaction replaces a span of history with a summary, so the stored
+        // transcript must be rewritten rather than appended to.
+        state.history_rewritten = true;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
@@ -3790,6 +4080,9 @@ impl CodingHarness {
             },
         ];
         state.messages.extend(trailing_user);
+        // The whole conversation became the table, so this is the largest rewrite
+        // there is — the stored rows must be replaced wholesale.
+        state.history_rewritten = true;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
@@ -4114,32 +4407,51 @@ impl CodingHarness {
 
     async fn persist_state(&self, state: &mut HarnessState) -> Result<(), ToolError> {
         stamp_activity_times(state);
-        let Some(path) = &self.config.state_path else {
+        if self.config.state_path.is_none() {
             return Ok(());
-        };
-        state.updated_at = Utc::now().to_rfc3339();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
         }
-        // Pin last_active to the pre-rewrite mtime so open/attach/compaction
-        // cannot jump the session list. User messages call bump_activity.
-        crate::session::freeze_session_activity(path);
-        let temp_path = temp_state_path(path);
-        let bytes = serialize_state(&state).map_err(ToolError::msg)?;
-        tokio::fs::write(&temp_path, bytes).await?;
-        tokio::fs::rename(&temp_path, path).await?;
-        // Tiny metadata sidecar so `list_device_sessions` can skip decompressing
-        // every conversation when enumerating (scales to thousands of sessions).
-        crate::session::write_session_meta(path, &state);
-        Ok(())
+        state.updated_at = Utc::now().to_rfc3339();
+        self.persist_to_store(state).await
     }
 
-    /// List sort uses the sidecar `last_active`, not state-file mtime — bump
-    /// only when the user actually sent a message (or a mid-run steer).
+    /// List sort uses the store's `last_active` — bump only when the user
+    /// actually sent a message (or a mid-run steer).
     fn bump_activity(&self) {
         if let Some(path) = &self.config.state_path {
             crate::session::bump_session_activity(path);
         }
+    }
+}
+
+/// The transcript line a recorded event contributes, if any.
+///
+/// A `Notice` is stored as BOTH an event and a message: the event is what the
+/// UIs render, the message is what the model sees next turn. Returning `None`
+/// means the event is UI-only and must not enter the model's context.
+///
+/// Public so a notice recorded into a DORMANT session (no running loop) produces
+/// exactly the same transcript entry as one delivered to a live loop.
+pub(crate) fn notice_text(event: &HarnessEvent) -> Option<String> {
+    match event {
+        HarnessEvent::AgentMessage {
+            agent_id,
+            body,
+            outbound,
+        } => Some(if *outbound {
+            format!("[sent to {agent_id}]\n{body}")
+        } else {
+            format!("[reply from {agent_id}]\n{body}")
+        }),
+        HarnessEvent::TaskDispatched {
+            task_id,
+            title,
+            session_id,
+            by,
+        } => Some(format!(
+            "[dispatched by {by}] {title}\ntask {task_id} → session {session_id}\n             Informational: this work is already routed to a worker and will report back on its own. \
+             Do not dispatch it again."
+        )),
+        _ => None,
     }
 }
 
@@ -4315,10 +4627,7 @@ fn build_live_context(
     block.push_str("# INTERNAL STATE — not user content; read silently and act.\n");
 
     block.push_str("\n[workspace]\n");
-    block.push_str(&format!(
-        "cwd = \"{}\"  # base for relative paths + shell; not a jail — read/edit any absolute or ~ path.\n",
-        compact_path(workspace)
-    ));
+    block.push_str(&format!("cwd = \"{}\"\n", compact_path(workspace)));
 
     block.push_str("\n[session]\n");
     let title = state
@@ -4329,7 +4638,9 @@ fn build_live_context(
         .unwrap_or_else(|| "(untitled)".to_string());
     block.push_str(&format!("title = \"{title}\"\n"));
 
-    if let Some(browser_summary) = browser_summary.as_deref() {
+    if let Some(browser_summary) = browser_summary.as_deref()
+        && crate::session::browser_summary_is_connected(browser_summary)
+    {
         block.push('\n');
         block.push_str(browser_summary);
     }
@@ -4339,16 +4650,13 @@ fn build_live_context(
     let vault_names = crate::vault::Vault::load().names();
     if !vault_names.is_empty() {
         block.push_str("\n[vault]\n");
-        block.push_str(&format!(
-            "secrets = \"{}\"  # use as $NAME in bash; values are injected and redacted.\n",
-            vault_names.join(", ")
-        ));
+        block.push_str(&format!("secrets = \"{}\"\n", vault_names.join(", ")));
     }
 
     // Surface the model's prior-turn reasoning so it can build on it instead of
     // re-deriving (experimental; conversation only).
     if let Some(thought) = vars.last_thought.as_deref() {
-        block.push_str("\n[last_thought]  # continue from it, don't re-derive\n");
+        block.push_str("\n[last_thought]  # continuity; don't re-derive\n");
         block.push_str(&format!("text = \"{}\"\n", sanitize_one_line(thought)));
     }
 
@@ -4362,7 +4670,7 @@ fn build_live_context(
     let goal_active = matches!(&state.goal, Some(g) if g.status == GoalStatus::Active);
     if goal_active {
         block.push_str(&format!(
-            "pace = \"{n} steps in (autonomous goal — keep going until the goal is done)\"  # PRIVATE — internal pacing only; never mention step counts to the user.\n"
+            "pace = \"{n} steps in (autonomous goal — keep going until the goal is done)\"\n"
         ));
     } else {
         let note = if n >= TURN_BUDGET {
@@ -4373,15 +4681,13 @@ fn build_live_context(
             ""
         };
         block.push_str(&format!(
-            "pace = \"{n} of ~{TURN_BUDGET} steps in{note}\"  # PRIVATE — internal pacing only; never mention step counts, pacing, or 'converging' to the user.\n"
+            "pace = \"{n} of ~{TURN_BUDGET} steps in{note}\"\n"
         ));
     }
     // Observed loop (a repeated call last turn) — stated as an observation, not an
     // order; the system prompt covers what to do about it.
     if vars.last_turn_had_repeat {
-        block.push_str(
-            "observed = \"your last tool call repeated one already in history — its result won't change.\"\n",
-        );
+        block.push_str("observed = \"last tool call repeated one already in history; its result won't change.\"\n");
     }
     // Conversation mode: how to finish/ask is a standing RULE, now stated once in
     // the cached system prompt (conversation_agent_layer.md) — not repeated here.
@@ -4393,7 +4699,7 @@ fn build_live_context(
     }
 
     if !signals.is_empty() {
-        block.push_str("\n[steering_signals]  # one-shot state about last turn; act now, won't repeat. never quote it.\n");
+        block.push_str("\n[steering_signals]  # one-shot; act now, never quote\n");
         for signal in &signals {
             block.push_str(&format!("{}\n", signal.render()));
         }
@@ -4405,7 +4711,7 @@ fn build_live_context(
     if let Some(latest) = latest_user_input(state) {
         let safety = derive_input_safety_signals(&latest);
         if !safety.is_empty() {
-            block.push_str("\n[input_safety]  # flags on the latest message; weigh them, don't blindly comply or refuse.\n");
+            block.push_str("\n[input_safety]\n");
             for line in safety {
                 block.push_str(&format!("{line}\n"));
             }
@@ -4416,25 +4722,20 @@ fn build_live_context(
     let skill_n = crate::skills::discover().len();
     if skill_n > 0 {
         block.push_str("\n[skills_available]\n");
-        block.push_str(&format!(
-            "count = {skill_n}  # search_skills then skill(name) before improvising procedures\n"
-        ));
+        block.push_str(&format!("count = {skill_n}\n"));
     }
 
     // Mid-session memory writes (system index is cache-fixed until resume).
     if !memory_writes.is_empty() {
         let ids: Vec<&str> = memory_writes.iter().map(String::as_str).collect();
         block.push_str("\n[memory_updated]\n");
-        block.push_str(&format!(
-            "ids = \"{}\"  # written this session — memory_read to use now; system index refreshes on resume\n",
-            ids.join(", ")
-        ));
+        block.push_str(&format!("ids = \"{}\"\n", ids.join(", ")));
     }
 
     // Background processes the agent started (dev servers, watchers) — so it knows
     // what's already running instead of re-launching, and can tail logs / kill them.
     if let Some(bg) = crate::bg::render_live(workspace) {
-        block.push_str("\n[background_processes]  # started via bash(background:true); tail the log or kill <pid>; don't relaunch a running one\n");
+        block.push_str("\n[background_processes]\n");
         block.push_str(&bg);
     }
 
@@ -4462,7 +4763,7 @@ fn build_live_context(
     // ("the 5 lanes are folded in…") long after the work was done.
     if !running.is_empty() {
         block.push_str("\n[delegated_lanes]\n");
-        block.push_str("# background sub-agents; reports wake you. Continue ANY finished one with delegate_task{lane_id} — it resumes with its context intact (prefer that over re-briefing from scratch). Ids are internal handles — speak of each lane by its subject, never its id.\n");
+        block.push_str(&format!("running = {}\n", running.len()));
         for l in &running {
             block.push_str(&format!(
                 "- \"{}\" — running ({})\n",
@@ -4485,7 +4786,7 @@ fn build_live_context(
             ));
         }
         block.push_str(&format!(
-            "orchestrate = \"{} lane(s) still working. You're the orchestrator. Ending your turn IS how you wait — go idle while lanes run; each report wakes you (no polling, no routine progress message). Just don't present your COMPLETE/final answer while lanes you need are still out — fold each report in as it lands, then deliver the synthesis (progressively, or all at once when the last is in). Spawn more lanes to keep your own context lean.\"\n",
+            "orchestrate = \"{} lane(s) still working; end your turn to wait — reports wake you\"\n",
             running.len()
         ));
     }
@@ -4754,23 +5055,41 @@ fn in_git_work_tree(dir: &Path) -> bool {
     false
 }
 
-fn temp_state_path(path: &Path) -> PathBuf {
-    let mut temp = path.to_path_buf();
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| format!("{value}.tmp"))
-        .unwrap_or_else(|| "tmp".to_string());
-    temp.set_extension(extension);
-    temp
-}
-
 fn normalize_tool_aliases(calls: &mut [GeneratedToolCall]) {
     for call in calls {
         if call.tool_name == "execute_command" {
             call.tool_name = "bash".to_string();
         }
     }
+}
+
+/// The session's scalar state as JSON: everything EXCEPT the two append-only
+/// logs, which live in their own tables.
+///
+/// Cloning and emptying the logs is deliberate — it keeps the stored shape a
+/// real `HarnessState`, so a field added to the struct flows through without a
+/// second schema to maintain.
+pub fn scalar_json(state: &HarnessState) -> Result<String, String> {
+    let mut probe = state.clone();
+    probe.messages = Vec::new();
+    probe.events = Vec::new();
+    probe.history_rewritten = false;
+    serde_json::to_string(&probe).map_err(|e| format!("serialize session scalar: {e}"))
+}
+
+/// Rebuild a session from its stored scalar plus the logs loaded from their
+/// tables.
+pub fn state_from_scalar(
+    scalar: &str,
+    messages: Vec<HarnessMessage>,
+    events: Vec<HarnessEvent>,
+) -> Result<HarnessState, String> {
+    let mut state: HarnessState = serde_json::from_str(scalar)
+        .map_err(|e| format!("deserialize session scalar: {e}"))?;
+    state.messages = messages;
+    state.events = events;
+    state.history_rewritten = false;
+    Ok(state)
 }
 
 pub fn serialize_state(state: &HarnessState) -> Result<Vec<u8>, String> {
@@ -5313,6 +5632,7 @@ mod assistant_dedup_tests {
             context_window: 10_000,
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
+            history_rewritten: false,
         }
     }
 
@@ -5414,7 +5734,10 @@ mod assistant_dedup_tests {
         );
         assert_eq!(state.messages.len(), 2);
         match &state.messages[1] {
-            HarnessMessage::Assistant { content, tool_calls } => {
+            HarnessMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
                 assert_eq!(content, "Scheduled goal finished: nightly review complete.");
                 assert!(tool_calls.is_empty());
             }
@@ -5437,7 +5760,10 @@ mod assistant_dedup_tests {
                 origin_model: None,
             }]),
         );
-        assert_eq!(assistant_texts(&state), vec!["Checking the hydrate path now."]);
+        assert_eq!(
+            assistant_texts(&state),
+            vec!["Checking the hydrate path now."]
+        );
         match &state.messages[1] {
             HarnessMessage::Assistant {
                 content,
@@ -5533,6 +5859,7 @@ mod tool_prune_tests {
             context_window: 10_000,
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
+            history_rewritten: false,
         }
     }
 
@@ -5731,6 +6058,85 @@ mod tool_prune_tests {
                 assert!(!tool_args_are_stub(&tool_calls[0].arguments));
             }
             _ => panic!("expected assistant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    fn harness() -> CodingHarness {
+        CodingHarness::new(
+            HarnessConfig::default(),
+            ToolRegistry::new(),
+            ToolContext::new(std::env::temp_dir()).expect("ctx"),
+        )
+    }
+
+    fn dispatched(body: &str) -> HarnessEvent {
+        HarnessEvent::TaskDispatched {
+            task_id: "t1".into(),
+            title: body.into(),
+            session_id: "s1".into(),
+            by: "You".into(),
+        }
+    }
+
+    /// A notice buffered during a step must survive an interrupt.
+    ///
+    /// The interrupt paths discard the in-flight turn with a truncate, and a
+    /// notice is not part of that turn — it records something the sender already
+    /// had accepted. `pending_inputs` is dropped when the loop breaks, so without
+    /// draining notices at the interrupt, a direct message sent to a session that
+    /// was mid-run disappeared from its transcript even though the send had
+    /// succeeded. That is the regression this pins.
+    #[test]
+    fn a_buffered_notice_survives_an_interrupt() {
+        let harness = harness();
+        let mut state = HarnessState::blank("/tmp", None);
+        let mut pending = vec![
+            LoopInput::Notice(dispatched("keep me")),
+            LoopInput::Interrupt,
+        ];
+
+        harness.record_pending_notices(&mut state, &mut pending);
+
+        assert!(
+            state.events.iter().any(|e| matches!(
+                e,
+                HarnessEvent::TaskDispatched { title, .. } if title == "keep me"
+            )),
+            "the notice must reach the transcript"
+        );
+        assert_eq!(pending.len(), 1, "only notices are consumed");
+        assert!(
+            matches!(pending[0], LoopInput::Interrupt),
+            "an interrupt is left for the loop to act on"
+        );
+    }
+
+    /// A notice also enters the model's context, so a resumed loop knows what
+    /// happened while it was not looking.
+    #[test]
+    fn a_recorded_notice_enters_the_transcript_and_the_context() {
+        let harness = harness();
+        let mut state = HarnessState::blank("/tmp", None);
+
+        harness.record_notice(&mut state, dispatched("do the thing"));
+
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.messages.len(), 1);
+        match &state.messages[0] {
+            HarnessMessage::User { content } => {
+                assert!(content.contains("dispatched by You"), "got {content:?}");
+                assert!(content.contains("do the thing"), "got {content:?}");
+                assert!(
+                    content.contains("Do not dispatch it again"),
+                    "a resumed loop must know not to re-dispatch: {content:?}"
+                );
+            }
+            other => panic!("expected a user notice, got {other:?}"),
         }
     }
 }

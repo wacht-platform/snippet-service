@@ -20,11 +20,7 @@ pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<L
     let title_style = Style::default()
         .fg(Color::Rgb(165, 180, 252))
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::Rgb(71, 85, 105));
 
-    lines.push(Line::from(""));
-    lines.push(center("t                                          T", dim));
-    lines.push(center("G                                           ", dim));
     lines.push(Line::from(""));
 
     let green = Style::default().fg(Color::Rgb(74, 222, 128));
@@ -71,9 +67,6 @@ pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<L
         title_style,
     ));
     lines.push(Line::from(""));
-
-    lines.push(center("g                                          g", dim));
-    lines.push(center("   t                                        ", dim));
 
     lines
 }
@@ -464,9 +457,39 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             }
             lines
         }
+        // A direct message to or from another agent. Both directions render, so
+        // the exchange reads as one conversation rather than a reply appearing
+        // with nothing before it.
+        HarnessEvent::AgentMessage {
+            agent_id,
+            body,
+            outbound,
+        } => marker_block(
+            if *outbound { "→" } else { "←" },
+            if *outbound { muted() } else { lane() },
+            &format!(
+                "{} {agent_id}: {body}",
+                if *outbound { "to" } else { "from" }
+            ),
+            width,
+        ),
         HarnessEvent::FilePresented { path, caption } => {
             present_file_lines(path, caption.as_deref(), width)
         }
+        // Work routed on this session's behalf by someone else (usually the
+        // user). A quiet aside: it is already dispatched, so it is a record of
+        // what went out, not a decision to make.
+        HarnessEvent::TaskDispatched {
+            task_id,
+            title,
+            session_id,
+            by,
+        } => marker_block(
+            "→",
+            muted(),
+            &format!("{by} dispatched: {title}\ntask {task_id} → {session_id}"),
+            width,
+        ),
         HarnessEvent::SystemDecision { step, reasoning } => {
             if step == "history_compaction_pass" {
                 // Keep the live banner only during the turn; the durable

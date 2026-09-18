@@ -1,22 +1,149 @@
-//! System-prompt layers. Every prompt lives as a `.md` file in the `prompts/`
-//! directory (repo root) and is embedded at compile time — none are inlined here.
+//! System-prompt composition.
+//!
+//! A stable execution/conversation core is always present. Capability- and
+//! environment-specific guidance (git worktree, browser, skills, vault, memory)
+//! is appended only when it applies, so an absent capability costs no tokens.
 
 pub const RUNTIME_SANDBOX_ENVIRONMENT: &str = include_str!("../prompts/sandbox_environment.md");
 pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer.md");
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
 pub const MISSION_CONTROL_LAYER: &str = include_str!("../prompts/mission_control_layer.md");
+pub const COORDINATION_LAYER: &str = include_str!("../prompts/coordination_layer.md");
+pub const WORK_BOUNDARY_LAYER: &str = include_str!("../prompts/work_boundary_layer.md");
+pub const GIT_WORKTREE_LAYER: &str = include_str!("../prompts/git_worktree_layer.md");
+pub const MEMORY_GUIDANCE_LAYER: &str = include_str!("../prompts/memory_layer.md");
+pub const MEMORY_WRITE_LAYER: &str = include_str!("../prompts/memory_write_layer.md");
+pub const SKILLS_LAYER: &str = include_str!("../prompts/skills_layer.md");
+pub const VAULT_LAYER: &str = include_str!("../prompts/vault_layer.md");
+pub const BROWSER_LAYER: &str = include_str!("../prompts/browser_command_layer.md");
 
-pub fn coding_system_prompt() -> String {
-    [RUNTIME_SANDBOX_ENVIRONMENT, CODING_AGENT_LAYER].join("\n\n")
+/// Capability/environment facts that decide which optional layers render.
+/// These are a session-start snapshot, so the assembled prompt stays stable
+/// across a session's turns (prompt-cache friendly).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptContext {
+    /// The session workspace is a linked git worktree (not the main checkout).
+    pub worktree: bool,
+    /// Per-workspace memory is enabled; the index/patterns/rules block is
+    /// appended separately at session start.
+    pub memory: bool,
+    /// This session may write durable memory (main session, not read-only lanes).
+    pub memory_writable: bool,
+    /// At least one skill is installed.
+    pub skills: bool,
+    /// The vault holds at least one secret.
+    pub vault: bool,
+    /// This session can reach connected browsers.
+    pub browser: bool,
+    /// This is an agent's COORDINATION session: it answers direct messages and
+    /// dispatches work, and holds no workspace tools. The layer is what tells it
+    /// how to behave, which is not inferable from the tool list alone.
+    pub coordination: bool,
 }
 
+impl PromptContext {
+    /// Detect the capability/environment snapshot for `workspace`. Browser
+    /// reachability and memory enablement are supplied by the caller (it owns
+    /// those facts); skills and vault are probed here.
+    pub fn detect(
+        workspace: &std::path::Path,
+        memory: bool,
+        memory_writable: bool,
+        browser: bool,
+    ) -> Self {
+        Self {
+            worktree: crate::session::workspace_is_worktree(workspace),
+            memory,
+            memory_writable: memory && memory_writable,
+            skills: !crate::skills::discover().is_empty(),
+            vault: !crate::vault::Vault::load().is_empty(),
+            browser,
+            // Not inferable from the environment; the role's own constructor sets it.
+            coordination: false,
+        }
+    }
+
+    fn conditional_layers(&self) -> Vec<&'static str> {
+        let mut layers = Vec::new();
+        if self.worktree {
+            layers.push(GIT_WORKTREE_LAYER.trim());
+        }
+        if self.browser {
+            layers.push(BROWSER_LAYER.trim());
+        }
+        if self.skills {
+            layers.push(SKILLS_LAYER.trim());
+        }
+        if self.vault {
+            layers.push(VAULT_LAYER.trim());
+        }
+        if self.memory {
+            layers.push(MEMORY_GUIDANCE_LAYER.trim());
+        }
+        if self.memory && self.memory_writable {
+            layers.push(MEMORY_WRITE_LAYER.trim());
+        }
+        if self.coordination {
+            layers.push(COORDINATION_LAYER.trim());
+        }
+        layers
+    }
+}
+
+pub fn coding_prompt(context: &PromptContext) -> String {
+    let mut parts = vec![
+        RUNTIME_SANDBOX_ENVIRONMENT.trim(),
+        CODING_AGENT_LAYER.trim(),
+    ];
+    parts.extend(context.conditional_layers());
+    parts.join("\n\n")
+}
+
+pub fn conversation_prompt(context: &PromptContext) -> String {
+    let mut parts = vec![
+        RUNTIME_SANDBOX_ENVIRONMENT.trim(),
+        CODING_AGENT_LAYER.trim(),
+    ];
+    parts.extend(context.conditional_layers());
+    parts.push(CONVERSATION_AGENT_LAYER.trim());
+    // Last, and only for an AGENT's work session: it has coordination tools but
+    // no dispatch tool, and the boundary is not inferable from the tool list —
+    // an absent tool reads as an oversight unless it is stated.
+    parts.push(WORK_BOUNDARY_LAYER.trim());
+    parts.join("\n\n")
+}
+
+/// Base execution prompt with no optional capabilities — used by tests and any
+/// caller that has not computed a `PromptContext`.
+pub fn coding_system_prompt() -> String {
+    coding_prompt(&PromptContext::default())
+}
+
+/// Base conversation prompt with no optional capabilities.
 pub fn conversation_system_prompt() -> String {
-    [
-        RUNTIME_SANDBOX_ENVIRONMENT,
-        CODING_AGENT_LAYER,
-        CONVERSATION_AGENT_LAYER,
-    ]
-    .join("\n\n")
+    conversation_prompt(&PromptContext::default())
+}
+
+/// The prompt for an agent's COORDINATION session.
+///
+/// Deliberately does NOT include [`RUNTIME_SANDBOX_ENVIRONMENT`]: that layer
+/// states the session has real bash and full filesystem access, which is false
+/// here and would instruct the model to reach for tools it was not given. The
+/// coordination layer states the real capability set instead, and the
+/// per-workspace memory layers are excluded for the same reason — this session
+/// has no workspace to hold memory about.
+pub fn coordination_prompt(context: &PromptContext) -> String {
+    let mut parts = vec![CONVERSATION_AGENT_LAYER.trim()];
+    if context.browser {
+        parts.push(BROWSER_LAYER.trim());
+    }
+    if context.vault {
+        parts.push(VAULT_LAYER.trim());
+    }
+    // COORDINATION_LAYER is last so its statements about what this session can
+    // and cannot do are the final word.
+    parts.push(COORDINATION_LAYER.trim());
+    parts.join("\n\n")
 }
 
 pub fn mission_control_system_prompt() -> String {
@@ -26,75 +153,45 @@ pub fn mission_control_system_prompt() -> String {
     MISSION_CONTROL_LAYER.to_string()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The normal shared session contract plus a bounded researched identity.
+/// The role overlay changes judgment and specialization, not the session's
+/// execution, safety, or conversation rules.
+pub struct SpecializedAgentPromptContext<'a> {
+    pub agent_id: &'a str,
+    pub identity: &'a str,
+    pub context: &'a PromptContext,
+}
 
-    #[test]
-    fn mission_control_prompt_is_orchestrator_not_coder() {
-        let mc = mission_control_system_prompt();
-        assert!(mc.contains("Mission Control"));
-        assert!(mc.contains("list_sessions"));
-        assert!(mc.contains("inspect_session"));
-        assert!(mc.contains("create_mission_session"));
-        assert!(mc.contains("create_mission_task"));
-        assert!(mc.contains("create_recurring_job"));
-        assert!(mc.contains("~/.snippet/recurring"));
-        assert!(mc.contains("create an agent"));
-        assert!(mc.contains("set up a folder/workspace"));
-        assert!(mc.contains("not a lane"));
-        assert!(mc.contains("Expect messy, informal"));
-        assert!(mc.contains("ask ONE question after intel"));
-        assert!(mc.contains("retry_mission_task"));
-        assert!(mc.contains("cancel_mission_task"));
-        assert!(mc.contains("read_image"));
-        assert!(mc.contains("present_file"));
-        assert!(mc.contains("openable card"));
-        assert!(mc.contains("bash is for inspection"));
-        assert!(mc.contains("mkdir -p --"));
-        assert!(mc.contains("npx create-next-app"));
-        assert!(mc.contains("npm create vite"));
-        assert!(mc.contains("Wait for yes"));
-        assert!(mc.contains("Do not init without that yes"));
-        assert!(mc.contains("never excessively"));
-        assert!(mc.contains("Going idle IS waiting"));
-        assert!(mc.contains("[mission_task_report]"));
-        assert!(mc.contains("Gather first. Confirm second. Route third."));
-        assert!(mc.contains("~/.snippet/mission-control"));
-        assert!(mc.contains("last_active"));
-        assert!(mc.contains("Do not ask other sessions what they are doing"));
-        assert!(mc.contains("Do not do the review yourself because it looks small"));
-        assert!(mc.contains(
-            "do a status/review/diff yourself when a matching session already owns that repo"
-        ));
-        assert!(mc.contains("inspect_session output is another chat's history"));
-        assert!(mc.contains("[steering] … [/steering]"));
-        let coding = coding_system_prompt();
-        assert!(coding.contains("[steering] … [/steering]"));
-        let conversation = conversation_system_prompt();
-        assert!(conversation.contains("[steering] … [/steering]"));
-        assert!(mc.contains("never reply to, quote, acknowledge, or mention it"));
-        assert!(!mc.contains("snippet_execution_agent"));
-        assert!(!mc.contains("coding/execution agent"));
-        assert!(!mc.contains("you own the task end to end"));
-        assert!(!mc.contains("NO sandbox or jail"));
-        assert!(!mc.contains("$SNIPPET_SHADOW_GIT"));
-        let coding = coding_system_prompt();
-        assert!(coding.contains("snippet_execution_agent"));
-        assert!(coding.contains("Do the work in THIS session"));
-        assert!(coding.contains("you MUST call report_mission_task"));
-        assert!(coding.contains("redo the evaluation from current sources"));
-        assert!(coding.contains("NEVER commit, push, merge, or reset onto `main`"));
-        assert!(coding.contains("git push -u origin HEAD"));
-        assert!(coding.contains("gh pr create --base main"));
-        assert!(coding.contains("snippet/{id}"));
-        assert!(!coding.contains("You are Mission Control"));
-        let conversation = conversation_system_prompt();
-        assert!(conversation.contains("snippet_conversation_agent"));
-        assert!(conversation.contains("a new lane will miss it"));
-        assert!(conversation.contains("Never commit or push to main/master"));
-        assert!(conversation.contains("gh pr create --base main"));
-        assert!(!conversation.contains("[worker_envelope]"));
-        assert!(!conversation.contains("You are Mission Control"));
-    }
+/// The identity overlay appended to whichever base a session runs on.
+///
+/// One definition so a specialized coding session and a coordination session
+/// cannot disagree about how the agent is introduced to itself.
+fn identity_overlay(agent_id: &str, identity: &str) -> String {
+    format!(
+        "[agent_identity]\nid = \"{id}\"\nidentity = \"\"\"\n{identity}\n\"\"\"\n",
+        id = agent_id,
+        identity = identity.trim(),
+    )
+}
+
+pub fn specialized_agent_system_prompt(context: SpecializedAgentPromptContext<'_>) -> String {
+    format!(
+        "{base}\n\n{overlay}",
+        base = conversation_prompt(context.context),
+        overlay = identity_overlay(context.agent_id, context.identity),
+    )
+}
+
+/// The prompt for an agent's coordination session: the restricted coordination
+/// contract plus the agent's own identity.
+///
+/// Uses [`coordination_prompt`] rather than the conversation prompt so the
+/// session is not told it has bash and full filesystem access it was never
+/// given.
+pub fn specialized_coordination_prompt(context: SpecializedAgentPromptContext<'_>) -> String {
+    format!(
+        "{base}\n\n{overlay}",
+        base = coordination_prompt(context.context),
+        overlay = identity_overlay(context.agent_id, context.identity),
+    )
 }

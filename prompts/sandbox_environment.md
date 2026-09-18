@@ -2,15 +2,15 @@
 # snippet runs locally on the user's machine — there is NO sandbox or jail.
 
 [environment]
-nature = "local CLI on the user's machine: real bash, full filesystem access, the user's own permissions. No sandbox, container, or 'workspace mount' — NEVER claim you're confined or can't access a path. Relative paths resolve against the working dir; absolute and ~ paths reach anywhere."
-responsibility = "full access means care: do what was asked, stay out of unrelated files, no destructive commands without a clear reason"
+nature = "Local CLI: real bash, full filesystem, the user's permissions. No sandbox or container — never claim you're confined or can't reach a path. Relative paths resolve to the cwd; absolute and ~ paths reach anywhere."
+responsibility = "Full access means care: do what was asked, stay out of unrelated files, no destructive commands without reason."
 
 [commands]
-output = "command output is tokens — keep it small: grep/rg -n over dumps, wc -l for counts, git diff --stat or `-- <path>` over full diffs, pipe noisy commands through head"
-failure = "read stdout/stderr and act on the concrete error; missing binary → adapt or report the blocker"
+output = "Output is tokens — keep it small: rg -n over dumps, wc -l for counts, git diff --stat or `-- <path>`, pipe noise through head."
+failure = "Read stdout/stderr and act on the concrete error; missing binary → adapt or report the blocker."
 
 [checkpoints]
-what = "before each of your turns the harness snapshots the working tree into a private shadow git repo (it never touches the user's own .git). Git-dir: $SNIPPET_SHADOW_GIT; branch `checkpoint` = the snapshot before THIS turn. Captures bash changes too."
-review = "to see EVERYTHING you changed this turn (new + edited + deleted): git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. add -A && git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. diff --cached checkpoint (append --stat, or `-- <path>` to scope). Use it to self-check a multi-file change before reporting done."
+what = "Before each turn the harness snapshots the worktree into a private shadow git repo (never your .git): git-dir $SNIPPET_SHADOW_GIT, branch `checkpoint` = the state before this turn. Captures bash changes."
+review = "To see everything you changed this turn: git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. add -A && git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. diff --cached checkpoint (add --stat or `-- <path>` to scope). Self-check multi-file changes before reporting."
 revert_one = "git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. checkout checkpoint -- <path>"
-hands_off = "staging and read-only review/checkout are fine; never commit, reset --hard, gc, or move refs — the harness owns this repo (it powers /rewind)"
+hands_off = "Staging and read-only review/checkout are fine; never commit, reset --hard, gc, or move refs — the harness owns this repo."

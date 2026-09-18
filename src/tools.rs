@@ -65,6 +65,7 @@ fn content_hash(bytes: &[u8]) -> u64 {
 
 pub type BrowserSummaryProvider = Arc<dyn Fn() -> String + Send + Sync>;
 
+
 #[derive(Clone)]
 pub struct ToolContext {
     workspace_root: PathBuf,
@@ -88,6 +89,13 @@ pub struct ToolContext {
     /// Same store the daemon dispatcher uses. Set for Mission Control so tools
     /// do not recompute the root from HOME independently.
     mission_control_root: Option<PathBuf>,
+    /// Absolute path to the SQLite store (`~/.snippet/snippet.db`). Set for every
+    /// daemon-managed session so coordination tools reach the same database the
+    /// daemon writes.
+    store_path: Option<PathBuf>,
+    /// The directory agent id this session runs as (specialized sessions only),
+    /// so board writes and direct messages are attributed to the agent.
+    agent_id: Option<String>,
 }
 
 impl ToolContext {
@@ -140,6 +148,8 @@ impl ToolContext {
             mission_control: false,
             durable_session_id: None,
             mission_control_root: None,
+            store_path: None,
+            agent_id: None,
         })
     }
 
@@ -162,6 +172,13 @@ impl ToolContext {
         self
     }
 
+    /// Bind a durable id that may be absent, so a caller wiring several kinds of
+    /// session can apply it uniformly rather than branching on `Option` itself.
+    pub fn with_durable_session_id_opt(mut self, id: Option<String>) -> Self {
+        self.durable_session_id = id;
+        self
+    }
+
     pub fn durable_session_id(&self) -> Option<&str> {
         self.durable_session_id.as_deref()
     }
@@ -169,6 +186,34 @@ impl ToolContext {
     pub fn mission_control_root(&self) -> Option<PathBuf> {
         self.mission_control_root.clone()
     }
+
+    /// Bind the store path for this session's tools.
+    pub fn with_store_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.store_path = Some(path.into());
+        self
+    }
+
+    pub fn store_path(&self) -> Option<PathBuf> {
+        self.store_path.clone()
+    }
+
+    /// Bind the directory agent id this session runs as.
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = Some(id.into());
+        self
+    }
+
+    /// Bind an optional agent id, so a caller wiring several kinds of session
+    /// applies it uniformly instead of branching on `Option` itself.
+    pub fn with_agent_id_opt(mut self, id: Option<String>) -> Self {
+        self.agent_id = id;
+        self
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
 
     /// Record a successful memory_write id for live-context [memory_updated].
     pub fn note_memory_write(&self, id: &str) {

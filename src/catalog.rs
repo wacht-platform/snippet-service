@@ -20,7 +20,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::ModelConfig;
+use crate::config::InferenceProfileConfig;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CatalogModel {
@@ -52,7 +52,7 @@ fn catalog_client() -> reqwest::Client {
 /// Fetch the provider's model list for a profile. Returns a normalized list
 /// (possibly empty for providers with no catalog endpoint) or a human-readable
 /// error. The API key never leaves this process.
-pub async fn fetch_models(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String> {
+pub async fn fetch_models(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogModel>, String> {
     match cfg.provider.as_str() {
         "anthropic" | "anthropic-compatible" => fetch_anthropic(cfg).await,
         "openai" | "openai-compatible" => fetch_openai_compatible(cfg).await,
@@ -116,7 +116,7 @@ fn anthropic_models_url(base_url: &str) -> String {
     format!("{}models?limit=1000", messages.trim_end_matches("messages"))
 }
 
-async fn fetch_anthropic(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String> {
+async fn fetch_anthropic(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogModel>, String> {
     let url = anthropic_models_url(&cfg.base_url);
     let response = catalog_client()
         .get(&url)
@@ -168,7 +168,7 @@ fn openai_models_url(base_url: &str) -> String {
     format!("{}models", chat.trim_end_matches("chat/completions"))
 }
 
-async fn fetch_openai_compatible(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String> {
+async fn fetch_openai_compatible(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogModel>, String> {
     let url = openai_models_url(&cfg.base_url);
     let is_openrouter = cfg.base_url.to_ascii_lowercase().contains("openrouter");
     let mut req = catalog_client().get(&url);
@@ -214,7 +214,7 @@ async fn fetch_openai_compatible(cfg: &ModelConfig) -> Result<Vec<CatalogModel>,
         .collect())
 }
 
-async fn fetch_gemini(cfg: &ModelConfig) -> Result<Vec<CatalogModel>, String> {
+async fn fetch_gemini(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogModel>, String> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key={}",
         cfg.api_key.trim()
