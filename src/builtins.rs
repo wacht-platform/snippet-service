@@ -983,6 +983,7 @@ impl Tool for BashTool {
             .arg("-lc")
             .arg(&args.command)
             .current_dir(ctx.workspace_root())
+            .kill_on_drop(true)
             // The shadow checkpoint repo's git-dir, so the agent can review its own
             // changes: `git --git-dir=$SNIPPET_SHADOW_GIT --work-tree=. diff checkpoint`.
             .env(
