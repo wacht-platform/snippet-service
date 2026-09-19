@@ -1222,9 +1222,10 @@ impl CodingHarness {
                 // notices the interrupt at the next iteration, after waiting out the
                 // whole HTTP request and its retry backoff. Non-interrupt messages
                 // that land mid-step are buffered and applied at the next loop top.
-                // The marks drop a half-written turn on interrupt so a later resume
-                // sees a clean boundary (never an unpaired assistant tool call).
-                let msg_mark = state.messages.len();
+                // Non-interrupt messages that land mid-step are buffered and applied at the
+                // next loop top. The marks anchor where this step began so we can identify
+                // events and tool calls produced by the in-flight turn on interrupt.
+                let _msg_mark = state.messages.len();
                 let evt_mark = state.events.len();
                 // Bridge approvals from the input channel to the in-flight step: while
                 // a mutating tool waits (manual mode), Approve/Deny arrive here and are
@@ -1265,13 +1266,17 @@ impl CodingHarness {
                 };
 
                 let Some(result) = outcome else {
-                    // Interrupted mid-step: discard the partial turn and stop.
-                    state.messages.truncate(msg_mark);
-                    state.events.truncate(evt_mark);
+                    // Interrupted mid-step: clear the live stream sink, then close any
+                    // unanswered tool calls with an interrupted result so assistant text
+                    // and tool invocation records are preserved without breaking message pairing.
+                    if let Some(sink) = sink.as_ref() {
+                        StreamBuffer::clear(sink);
+                    }
+                    repair_unanswered_tool_events(&mut state.events, evt_mark);
+                    repair_unanswered_tool_calls(&mut state.messages);
                     state.history_rewritten = true;
                     state.status = HarnessStatus::Interrupted;
-                    // A notice is NOT part of the in-flight turn, so the truncate
-                    // above must not take it with it: it records something the
+                    // A notice is NOT part of the in-flight turn: it records something the
                     // sender already had accepted. This is the last chance to
                     // fold one in — `pending_inputs` is dropped when we break.
                     self.record_pending_notices(&mut state, &mut pending_inputs);
@@ -3403,6 +3408,7 @@ impl CodingHarness {
         // 400 on that history forever after. Repair on load so a resumed session
         // is always well-formed.
         repair_unanswered_tool_calls(&mut state.messages);
+        repair_unanswered_tool_events(&mut state.events, 0);
         if let Some(request) = initial_request
             .map(|r| r.trim().to_string())
             .filter(|r| !r.is_empty())
@@ -4567,6 +4573,46 @@ fn repair_unanswered_tool_calls(messages: &mut Vec<HarnessMessage>) {
             );
         }
         i = j;
+    }
+}
+
+/// Insert synthetic error results for tool call events that never received one
+/// (e.g. interrupted mid-run or crashed). Every unanswered `ToolCall` gets a
+/// stub `ToolResult` appended to preserve the pairing and ensure the transcript
+/// record and failure reason remain visible in the UI.
+fn repair_unanswered_tool_events(events: &mut Vec<HarnessEvent>, from_index: usize) {
+    let from_index = from_index.min(events.len());
+    let mut pending_tools: Vec<String> = Vec::new();
+    for event in &events[from_index..] {
+        match event {
+            HarnessEvent::ToolCall { tool_name, .. } => {
+                pending_tools.push(tool_name.clone());
+            }
+            HarnessEvent::ToolResult { tool_name, .. } => {
+                if let Some(pos) = pending_tools.iter().rposition(|n| n == tool_name) {
+                    pending_tools.remove(pos);
+                }
+            }
+            HarnessEvent::InvalidToolCall { tool_name, .. } => {
+                if let Some(pos) = pending_tools.iter().rposition(|n| n == tool_name) {
+                    pending_tools.remove(pos);
+                }
+            }
+            _ => {}
+        }
+    }
+    for tool_name in pending_tools {
+        events.push(HarnessEvent::ToolResult {
+            tool_name,
+            result: json!({
+                "schema_version": 1,
+                "status": "error",
+                "error": {
+                    "code": "interrupted",
+                    "message": "This tool call was interrupted before it produced a result (the process stopped mid-run). Re-run it if the work is still needed.",
+                }
+            }),
+        });
     }
 }
 
@@ -6137,6 +6183,83 @@ mod notice_tests {
                 );
             }
             other => panic!("expected a user notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unanswered_tool_events_are_repaired_with_interrupted_status() {
+        let mut events = vec![
+            HarnessEvent::AssistantText {
+                text: "Running a shell command to check status".to_string(),
+            },
+            HarnessEvent::ToolCall {
+                tool_name: "bash".to_string(),
+                arguments: serde_json::json!({"command": "sleep 10"}),
+            },
+        ];
+
+        repair_unanswered_tool_events(&mut events, 0);
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            HarnessEvent::AssistantText { text } if text == "Running a shell command to check status"
+        ));
+        assert!(matches!(
+            &events[1],
+            HarnessEvent::ToolCall { tool_name, .. } if tool_name == "bash"
+        ));
+        match &events[2] {
+            HarnessEvent::ToolResult { tool_name, result } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("error"));
+                let err_code = result
+                    .get("error")
+                    .and_then(|e| e.get("code"))
+                    .and_then(|c| c.as_str());
+                assert_eq!(err_code, Some("interrupted"));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+
+        // Running repair again should be a no-op since it's now answered.
+        repair_unanswered_tool_events(&mut events, 0);
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn already_answered_tool_events_are_not_duplicated() {
+        let mut events = vec![
+            HarnessEvent::ToolCall {
+                tool_name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "file.txt"}),
+            },
+            HarnessEvent::ToolResult {
+                tool_name: "read_file".to_string(),
+                result: serde_json::json!({"status": "ok"}),
+            },
+            HarnessEvent::ToolCall {
+                tool_name: "bash".to_string(),
+                arguments: serde_json::json!({"command": "cargo test"}),
+            },
+        ];
+
+        repair_unanswered_tool_events(&mut events, 0);
+
+        // read_file was already answered; only bash should receive a synthetic result.
+        assert_eq!(events.len(), 4);
+        match &events[3] {
+            HarnessEvent::ToolResult { tool_name, result } => {
+                assert_eq!(tool_name, "bash");
+                assert_eq!(
+                    result
+                        .get("error")
+                        .and_then(|e| e.get("code"))
+                        .and_then(|c| c.as_str()),
+                    Some("interrupted")
+                );
+            }
+            other => panic!("expected ToolResult for bash, got {other:?}"),
         }
     }
 }
