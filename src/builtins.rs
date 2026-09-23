@@ -416,7 +416,7 @@ impl Tool for EditFileTool {
                     "new_string": {"type": "string"},
                     "replace_all": {"type": "boolean"}
                 }),
-                &["path", "old_string", "new_string"],
+                &["path", "old_string", "new_string", "replace_all"],
             ),
         }
     }

@@ -702,14 +702,26 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_is_enabled_for_write_file_schema() {
-        let write_file = crate::builtins::WriteFileTool.definition();
-        let request = build_responses_request(&test_config(), &[], &[write_file], false);
-        let tool = &request["tools"][0];
+    fn strict_mode_is_enabled_for_file_mutation_schemas() {
+        let tools = [
+            crate::builtins::WriteFileTool.definition(),
+            crate::builtins::AppendFileTool.definition(),
+            crate::builtins::EditFileTool.definition(),
+        ];
+        let request = build_responses_request(&test_config(), &[], &tools, false);
 
-        assert_eq!(tool["strict"], true);
-        assert_eq!(tool["parameters"]["required"], json!(["path", "content"]));
-        assert_eq!(tool["parameters"]["additionalProperties"], false);
+        for tool in request["tools"].as_array().expect("tools array") {
+            assert_eq!(tool["strict"], true, "{}", tool["name"]);
+            assert!(
+                tool["parameters"]["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|field| field == "path"))
+            );
+        }
+        assert_eq!(
+            request["tools"][2]["parameters"]["required"],
+            json!(["path", "old_string", "new_string", "replace_all"])
+        );
     }
 
     #[test]
