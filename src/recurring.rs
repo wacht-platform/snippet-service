@@ -1,20 +1,21 @@
 //! Durable recurring jobs that poke Mission Control or any conversation session.
 //!
-//! **Detection:** jobs are JSON files under `~/.snippet/recurring/<id>.json`.
-//! Creating/updating a file there *is* scheduling — the serve tick loop is the
-//! only reader. It claims due jobs and delivers `LoopInput::SetGoal` so the
-//! target session drives that piece of work to `complete_goal`. Optional
-//! `plan_path` is read from disk at fire time. If the target is mid-turn, has a
-//! running lane, or already has an active/paused goal, the fire is queued (one
-//! deep). Queued jobs are retried as soon as that goal completes (fast poll
-//! while anything is queued) — missed intervals are not backfilled.
+//! **Detection:** jobs live in the device SQLite database, alongside every other
+//! durable record. The serve tick loop is the only reader. It claims due jobs and
+//! delivers `LoopInput::SetGoal` so the target session drives that piece of work
+//! to `complete_goal`. Optional `plan_path` is read from disk at fire time. If
+//! the target is mid-turn, has a running lane, or already has an active/paused
+//! goal, the fire is queued (one deep). Queued jobs are retried as soon as that
+//! goal completes (fast poll while anything is queued) — missed intervals are not
+//! backfilled.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use crate::store::Store;
 
 fn epoch_secs() -> u64 {
     SystemTime::now()
@@ -23,46 +24,16 @@ fn epoch_secs() -> u64 {
         .as_secs()
 }
 
-static STORE_LOCK: Mutex<()> = Mutex::new(());
-
-fn store_lock() -> MutexGuard<'static, ()> {
-    STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Default on-disk root: `~/.snippet/recurring`.
+/// Default root for recurring jobs. Now only a KEY: the jobs themselves live in
+/// the device database, and this path resolves to it.
 pub fn default_root() -> PathBuf {
     crate::config::snippet_home().join("recurring")
 }
 
-fn job_path(root: &Path, id: &str) -> PathBuf {
-    root.join(format!("{id}.json"))
-}
-
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(value).map_err(|e| format!("serialise: {e}"))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-    }
-    let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let file = path
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("job");
-    let tmp = path.with_file_name(format!(".{file}.{pid}.{n}.tmp"));
-    fs::write(&tmp, &content).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("rename {}: {e}", path.display()));
-    }
-    Ok(())
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, String> {
-    let raw = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("deserialise {}: {e}", path.display()))
+/// The store these jobs live in. Any root inside `~/.snippet` resolves to the one
+/// device database; a test root gets its own file.
+fn store_for(root: &Path) -> Result<Store, String> {
+    Store::open_cached(crate::app_store::app_db_path(root)).map_err(|e| e.to_string())
 }
 
 /// Shortest repeating interval (5 minutes).
@@ -306,7 +277,12 @@ impl RecurringJob {
             body.push_str(prompt);
             body.push('\n');
         }
-        if let Some(path) = self.plan_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some(path) = self
+            .plan_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
             let contents = read_plan(path, workspace)?;
             if !prompt.is_empty() || !title.is_empty() {
                 body.push('\n');
@@ -386,9 +362,8 @@ fn read_plan(path: &str, workspace: Option<&Path>) -> Result<String, String> {
     let resolved = if given.is_absolute() {
         given
     } else {
-        let ws = workspace.ok_or_else(|| {
-            "plan path is relative but this session has no workspace".to_string()
-        })?;
+        let ws = workspace
+            .ok_or_else(|| "plan path is relative but this session has no workspace".to_string())?;
         let joined = ws.join(&given);
         let canon_ws = ws.canonicalize().unwrap_or_else(|_| ws.to_path_buf());
         match joined.canonicalize() {
@@ -403,48 +378,25 @@ fn read_plan(path: &str, workspace: Option<&Path>) -> Result<String, String> {
             }
         }
     };
-    let bytes = fs::read(&resolved)
-        .map_err(|e| format!("read plan {}: {e}", resolved.display()))?;
+    let bytes =
+        fs::read(&resolved).map_err(|e| format!("read plan {}: {e}", resolved.display()))?;
     if bytes.len() > PLAN_MAX_BYTES {
         return Err("plan file is larger than 64 KiB".into());
     }
     String::from_utf8(bytes).map_err(|_| "plan file is not UTF-8".into())
 }
 
-fn list_ids(root: &Path) -> Vec<String> {
-    let mut ids = Vec::new();
-    if let Ok(entries) = fs::read_dir(root) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    if !stem.starts_with('.') {
-                        ids.push(stem.to_string());
-                    }
-                }
-            }
-        }
-        ids.sort();
-    }
-    ids
-}
-
 pub fn list_jobs(root: &Path) -> Result<Vec<RecurringJob>, String> {
-    let _g = store_lock();
-    let mut jobs = Vec::new();
-    for id in list_ids(root) {
-        match read_json::<RecurringJob>(&job_path(root, &id)) {
-            Ok(job) => jobs.push(job),
-            Err(e) => return Err(e),
-        }
-    }
+    let mut jobs = store_for(root)?.list_recurring_jobs().map_err(|e| e.to_string())?;
     jobs.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at).then(a.id.cmp(&b.id)));
     Ok(jobs)
 }
 
 pub fn get_job(root: &Path, id: &str) -> Result<RecurringJob, String> {
-    let _g = store_lock();
-    read_json(&job_path(root, id))
+    store_for(root)?
+        .get_recurring_job(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no recurring job `{id}`"))
 }
 
 fn normalize_plan_path(raw: Option<&str>) -> Option<String> {
@@ -464,7 +416,15 @@ pub fn create_job(
     schedule: Schedule,
     plan_path: Option<&str>,
 ) -> Result<RecurringJob, String> {
-    create_job_with(root, title, session_id, prompt, schedule, plan_path, Delivery::Goal)
+    create_job_with(
+        root,
+        title,
+        session_id,
+        prompt,
+        schedule,
+        plan_path,
+        Delivery::Goal,
+    )
 }
 
 /// Same as [`create_job`] with an explicit delivery and immediate first run:
@@ -511,8 +471,9 @@ pub fn create_job_with(
         created_at: now,
         updated_at: now,
     };
-    let _g = store_lock();
-    write_json(&job_path(root, &job.id), &job)?;
+    store_for(root)?
+        .upsert_recurring_job(&job)
+        .map_err(|e| e.to_string())?;
     Ok(job)
 }
 
@@ -521,22 +482,28 @@ pub fn update_job(
     id: &str,
     f: impl FnOnce(&mut RecurringJob),
 ) -> Result<RecurringJob, String> {
-    let _g = store_lock();
-    let path = job_path(root, id);
-    let mut job: RecurringJob = read_json(&path)?;
+    let store = store_for(root)?;
+    let mut job = store
+        .get_recurring_job(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no recurring job `{id}`"))?;
     f(&mut job);
     job.updated_at = epoch_secs();
-    write_json(&path, &job)?;
+    store
+        .upsert_recurring_job(&job)
+        .map_err(|e| e.to_string())?;
     Ok(job)
 }
 
 pub fn delete_job(root: &Path, id: &str) -> Result<(), String> {
-    let _g = store_lock();
-    let path = job_path(root, id);
-    if !path.exists() {
-        return Err(format!("no recurring job `{id}`"));
+    if store_for(root)?
+        .delete_recurring_job(id)
+        .map_err(|e| e.to_string())?
+    {
+        Ok(())
+    } else {
+        Err(format!("no recurring job `{id}`"))
     }
-    fs::remove_file(&path).map_err(|e| format!("delete {}: {e}", path.display()))
 }
 
 pub fn set_enabled(root: &Path, id: &str, enabled: bool) -> Result<RecurringJob, String> {
@@ -715,10 +682,12 @@ mod tests {
         let fired = mark_fired(root.path(), &job.id, epoch_secs()).unwrap();
         assert!(!fired.enabled, "Once should disable after firing");
         // Due-filter ignores it now.
-        assert!(due_jobs(root.path(), epoch_secs())
-            .unwrap()
-            .iter()
-            .all(|j| j.id != job.id));
+        assert!(
+            due_jobs(root.path(), epoch_secs())
+                .unwrap()
+                .iter()
+                .all(|j| j.id != job.id)
+        );
     }
 
     #[test]
@@ -741,10 +710,7 @@ mod tests {
         })
         .unwrap();
         // Old on-disk jobs (no delivery field) must parse as Goal.
-        let without_delivery = raw.replace(
-            r#","delivery":"goal""#,
-            "",
-        );
+        let without_delivery = raw.replace(r#","delivery":"goal""#, "");
         let job: RecurringJob = serde_json::from_str(&without_delivery).unwrap();
         assert_eq!(job.delivery, Delivery::Goal);
     }

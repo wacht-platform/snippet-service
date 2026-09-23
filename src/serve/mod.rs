@@ -15,25 +15,31 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::config::{ModelConfig, SnippetConfig, save_config, workspaces_root};
-use crate::harness::{GoalStatus, LoopInput, deserialize_state, serialize_state};
-use crate::mission_control::{self, ManagedSession, NotificationMarker, TaskRecord, TaskStatus};
+use crate::config::{InferenceProfileConfig, SnippetConfig, save_config, workspaces_root};
+use crate::coordination::{
+    HandoffMode, NotificationMarker, Task, TaskLink, TaskLinkKind, TaskResult, TaskStatus,
+};
+use crate::harness::{GoalStatus, HarnessEvent, LoopInput};
+use crate::mission_control::{self, ManagedSession};
 use crate::recurring::{self, Schedule};
 use crate::session::{
-    list_device_sessions, prepare_new_session_workspace, read_session_profile,
-    session_id_for_state_path, start_mission_control_session,
-    start_session_with_browser_summary, state_path_for_id, status_str, subscribe_device_events,
-    write_session_profile, replay_notification_events,
+    SessionRole, SessionSidecar, all_device_sessions, list_device_sessions,
+    prepare_new_session_workspace,
+    read_session_profile, read_session_sidecar, read_session_state, replay_notification_events,
+    session_id_for_state_path, start_mission_control_session, start_session_with_browser_summary,
+    state_path_for_id, status_str, subscribe_device_events, write_session_profile,
+    write_session_sidecar,
 };
 
 mod browser;
+mod direct;
 mod fs;
 mod git;
 mod lifecycle;
@@ -66,26 +72,14 @@ struct LiveSession {
 }
 
 fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<String>) -> LiveSession {
-    let cwd = handle
-        .state_path
-        .parent()
-        .and_then(|p| {
-            deserialize_state(&std::fs::read(p.join("state.json")).unwrap_or_default())
-                .ok()
-                .map(|s| PathBuf::from(s.workspace))
-        })
-        .filter(|p| p.is_dir())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
     let cwd = {
-        let from_state = std::fs::read(&handle.state_path)
-            .ok()
-            .and_then(|b| deserialize_state(&b).ok())
+        let from_state = read_session_state(&handle.state_path)
             .map(|s| PathBuf::from(s.workspace))
             .filter(|p| p.is_dir());
-        from_state.unwrap_or(cwd)
+        from_state
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     };
-    let session_id = session_id_for_state_path(&handle.state_path);
     LiveSession {
         input_tx: handle.input_tx,
         join: handle.join,
@@ -94,7 +88,7 @@ fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<Strin
         stream: handle.stream.unwrap_or_else(|| {
             std::sync::Arc::new(std::sync::Mutex::new(crate::llm::StreamBuffer::default()))
         }),
-        terms: SessionTerms::new_for_session(cwd, session_id),
+        terms: SessionTerms::new(cwd),
     }
 }
 
@@ -115,11 +109,10 @@ fn load_session_workspace(session: &str) -> Result<(PathBuf, PathBuf), Response>
     let Some(sp) = state_path_for_id(session) else {
         return Err((StatusCode::NOT_FOUND, "no such session").into_response());
     };
-    let Ok(bytes) = std::fs::read(&sp) else {
+    // Store-or-file: a session ported to the database has no state file, so
+    // reading the file directly would 404 every migrated session.
+    let Some(state) = read_session_state(&sp) else {
         return Err((StatusCode::NOT_FOUND, "session state unreadable").into_response());
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "bad session state").into_response());
     };
     let folder = PathBuf::from(&state.workspace);
     if state.workspace.is_empty() || !folder.is_dir() {
@@ -134,6 +127,14 @@ struct Daemon {
     token: String,
     hostname: String,
     sessions: Mutex<HashMap<String, LiveSession>>,
+    /// Daemon-wide interactive shells, NOT tied to any session.
+    ///
+    /// A shell belongs to the machine: switching or closing a session must not
+    /// kill it. The pty machinery was already sessionless (`SessionTerms::new`);
+    /// only the transport was not, because `/attach` requires a live session.
+    /// `/shells` exposes the same `wire: term` frames over a socket that needs no
+    /// session at all.
+    shells: Arc<crate::term::SessionTerms>,
     /// Serializes git WRITE operations daemon-wide so a user's git action can't
     /// race the agent's edits (or another git write) on the same index.
     git_write: Mutex<()>,
@@ -149,6 +150,9 @@ struct Daemon {
     queue_hidden: std::sync::Mutex<HashMap<String, Vec<String>>>,
     queue_revision: AtomicU64,
     mission_control_root: PathBuf,
+    store: crate::store::Store,
+    coordination_events:
+        tokio::sync::broadcast::Sender<crate::coordination::types::CoordinationEvent>,
     recurring_root: PathBuf,
 }
 
@@ -165,6 +169,16 @@ fn machine_hostname() -> String {
 }
 
 type Shared = Arc<Daemon>;
+
+/// Working directory for daemon-wide shells.
+///
+/// Deliberately the daemon's own cwd (`~` when started by the service manager),
+/// NOT a session workspace: a global shell belongs to the machine, so it must
+/// not silently follow whichever session happened to be open. A session that
+/// wants its own workspace shell already gets one through its `wire: term`.
+fn global_shell_cwd() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
 
 /// Constant-time token check: hash both sides to a fixed 32-byte digest and compare
 /// without short-circuiting, so neither token length nor content leaks via timing.
@@ -186,49 +200,30 @@ impl Daemon {
             .is_some_and(|t| token_matches(t, &self.token))
     }
 
-    /// Returns true if this nonce is new. The ledger is persisted beside the
-    /// conversation state so a daemon restart cannot accept the same retry twice.
-    fn accept_nonce(&self, session_id: &str, nonce: &str, state_path: &Path) -> bool {
+    /// Claim a client request id, returning false when it is a replay.
+    ///
+    /// Two levels, both in-process or in the store: an in-memory map for the
+    /// current run, and `request_nonces` for anything that outlives it. There
+    /// used to be a third — a session's `.nonces.json` sidecar, read as a
+    /// compatibility fallback from when sessions lived in files. It is gone:
+    /// the files held nothing the store did not, the entries were provably
+    /// older than every stored one, and a missing file read returning `None`
+    /// meant the fallback could rot silently without failing a single test.
+    fn accept_nonce(&self, session_id: &str, nonce: &str) -> bool {
         let key = format!("{session_id}:{nonce}");
         let mut map = self.seen_nonces.lock().unwrap();
         if map.contains_key(&key) {
             return false;
         }
-
-        let ledger_path = state_path.with_extension("nonces.json");
-        let mut persisted = std::fs::read_to_string(&ledger_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-            .unwrap_or_default();
-        if persisted.iter().any(|n| n == nonce) {
-            map.insert(key, std::time::Instant::now());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let Ok(inserted) = self.store.claim_request_nonce(session_id, nonce, now) else {
             return false;
-        }
-
-        // Bound the durable ledger. Nonces are unique client request IDs, so
-        // retaining the most recent 512 is enough to cover reconnect retries
-        // without allowing an unbounded sidecar to grow.
-        persisted.push(nonce.to_string());
-        if persisted.len() > 512 {
-            let drop_count = persisted.len() - 512;
-            persisted.drain(..drop_count);
-        }
-        let persisted_bytes = match serde_json::to_vec(&persisted) {
-            Ok(bytes) => bytes,
-            Err(_) => return false,
         };
-        let tmp = ledger_path.with_extension("nonces.json.tmp");
-        let persisted_ok = (|| {
-            let mut file = std::fs::File::create(&tmp).ok()?;
-            use std::io::Write;
-            file.write_all(&persisted_bytes).ok()?;
-            file.sync_all().ok()?;
-            std::fs::rename(&tmp, &ledger_path).ok()?;
-            Some(())
-        })()
-        .is_some();
-        if !persisted_ok {
-            let _ = std::fs::remove_file(&tmp);
+        if !inserted {
+            map.insert(key, std::time::Instant::now());
             return false;
         }
         map.insert(key, std::time::Instant::now());
@@ -263,8 +258,10 @@ impl Daemon {
             return Some((s.input_tx.clone(), s.state_path.clone(), s.stream.clone()));
         }
         let sp = state_path_for_id(id)?;
-        let bytes = std::fs::read(&sp).ok()?;
-        let state = deserialize_state(&bytes).ok()?;
+        // Read through the store-or-file reader: a session ported to the
+        // database has no state file, and reading the file directly would make
+        // every such session unopenable.
+        let state = read_session_state(&sp)?;
         let folder = PathBuf::from(&state.workspace);
         if state.workspace.is_empty() || !folder.is_dir() {
             return None;
@@ -277,37 +274,182 @@ impl Daemon {
             apply_profile(&mut w, &profile);
             w
         };
-        // Role-aware resume: a session opened as Mission Control must come back
-        // with the MC prompt/tools/lane restrictions after a daemon restart,
-        // not silently downgrade to an ordinary conversation session.
-        let role = read_session_role(&sp);
-        let handle = match role.as_deref() {
-            Some("mission_control") => crate::session::start_mission_control_session(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-            _ => start_session_with_browser_summary(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-        };
+        // Role-aware resume. ONE place decides the role — see `start_role_aware`.
+        // A session opened as Mission Control must come back with the MC
+        // prompt/tools/lane restrictions, and an agent session with its
+        // specialized identity, rather than silently downgrading either.
+        let handle = self.start_role_aware(&cfg, sp.clone(), None).await;
         let tx = handle.input_tx.clone();
         let live = live_from_handle(handle, profile);
         let stream = live.stream.clone();
         sessions.insert(id.to_string(), live);
         Some((tx, sp, stream))
+    }
+
+    /// Start (or resume) a session with the ROLE it was created with.
+    ///
+    /// The single place that decides role. Two callers need it and previously
+    /// only one had it: `ensure_live` dispatched on the `.role` sidecar, while
+    /// `set_session_model` always started a plain session. Switching the model
+    /// mid-conversation therefore DOWNGRADED a Mission Control or agent session
+    /// to an ordinary one — losing the MC prompt/tools/lane restrictions until
+    /// the next daemon restart restored them from the sidecar.
+    ///
+    /// Falls back to a plain session whenever the role's home is unavailable, so
+    /// a missing identity can never wedge a session.
+    async fn start_role_aware(
+        &self,
+        cfg: &SnippetConfig,
+        sp: PathBuf,
+        initial: Option<String>,
+    ) -> crate::session::SessionHandle {
+        // Cloned per call: a `StreamHandle` is an `Arc<Mutex<StreamBuffer>>`, so
+        // cloning is a refcount bump, and each call site needs its own value
+        // because the match arms move it.
+        let stream = || {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::llm::StreamBuffer::default(),
+            )))
+        };
+        // One reader, one shape. The arms are on the enum rather than on a
+        // hand-parsed string, so a grammar this function does not know about is
+        // now impossible to write.
+        let sidecar = read_session_sidecar(&sp);
+        if let Some(sidecar) = sidecar.as_ref()
+            && sidecar.role == SessionRole::MissionControl
+        {
+            return crate::session::start_mission_control_session(
+                cfg,
+                sp,
+                initial,
+                true,
+                stream(),
+                Some(self.browser.summary_provider()),
+            );
+        }
+        if let Some(agent_id) = sidecar.as_ref().and_then(|s| s.agent_id.as_deref()) {
+            // Identity revision is re-read on every resume, so an agent whose
+            // identity was updated comes back with the new guidance.
+            match crate::coordination::AgentHome::new(
+                crate::coordination::agents_root(&self.mission_control_root),
+                agent_id,
+            ) {
+                // An agent's INBOX is its coordination session: it answers direct
+                // messages and dispatches work, with no workspace tools. The same
+                // agent runs the full coding runtime in a work session, so the
+                // choice is made on the session, not on the agent.
+                Ok(home)
+                    if crate::session::is_inbox_session_id(&session_id_for_state_path(&sp)) =>
+                {
+                    match crate::session::start_specialized_coordination_session(
+                        cfg,
+                        sp.clone(),
+                        initial.clone(),
+                        true,
+                        stream(),
+                        Some(self.browser.summary_provider()),
+                        home,
+                    ) {
+                        Ok(handle) => return handle,
+                        Err(error) => {
+                            eprintln!(
+                                "[coordination] agent `{agent_id}` coordination identity \
+                                 unavailable ({error}); running as an ordinary session"
+                            );
+                        }
+                    }
+                }
+                Ok(home) => match crate::session::start_specialized_agent_session(
+                    cfg,
+                    sp.clone(),
+                    initial.clone(),
+                    true,
+                    stream(),
+                    Some(self.browser.summary_provider()),
+                    home,
+                ) {
+                    Ok(handle) => return handle,
+                    Err(error) => {
+                        eprintln!(
+                            "[coordination] agent `{agent_id}` identity unavailable ({error}); \
+                             running as an ordinary session"
+                        );
+                    }
+                },
+                Err(_) => {}
+            }
+        }
+        start_session_with_browser_summary(
+            cfg,
+            sp,
+            initial,
+            true,
+            stream(),
+            Some(self.browser.summary_provider()),
+        )
+    }
+
+    /// Run a session on a named inference profile, restarting its loop.
+    ///
+    /// A model is bound when the loop STARTS (`build_model_for_session`), and
+    /// nothing switches it per turn. So changing the profile of a live session
+    /// means replacing the loop — that is why this is shared with
+    /// `POST /session/model` rather than applied in place.
+    ///
+    /// Stops the old loop first, so its in-flight turn is abandoned rather than
+    /// left generating on a model the caller just replaced.
+    ///
+    /// `persist` decides whether this becomes the session's own model or only
+    /// this run's. They are different questions:
+    ///
+    /// - `POST /session/model` — the user is pinning THIS chat to a model. The
+    ///   choice outlives the run, so it is written to `sessions.profile` and
+    ///   survives a daemon restart or a resume.
+    /// - A dispatch — Mission Control is choosing a model for ONE assignment.
+    ///   The next task may want a different one, and the session's own default
+    ///   is not the dispatcher's to overwrite. So the profile is in-memory only:
+    ///   it drives this run, and a later start falls back to whatever the
+    ///   session was already set to.
+    async fn run_session_on_profile(
+        &self,
+        session: &str,
+        profile: &str,
+        persist: bool,
+    ) -> Result<(), String> {
+        self.reload_config().await; // a profile added in the TUI must be usable
+        let model_cfg = {
+            let c = self.config.lock().unwrap();
+            c.setups
+                .as_ref()
+                .and_then(|m| m.get(profile))
+                .cloned()
+                .ok_or_else(|| format!("no such profile `{profile}`"))?
+        };
+        let (sp, folder) =
+            load_session_workspace(session).map_err(|_| format!("unknown session `{session}`"))?;
+        let cfg = {
+            let c = self.config.lock().unwrap();
+            let mut w = c.for_workspace(folder);
+            w.model = model_cfg;
+            w.active_setup = Some(profile.to_string());
+            w
+        };
+        let mut sessions = self.sessions.lock().await;
+        if let Some(old) = sessions.remove(session) {
+            old.join.abort();
+        }
+        // Role-aware restart. Switching the model must NOT downgrade the
+        // session: a Mission Control or agent session keeps its prompt, tools,
+        // and lane limits, which a plain restart would silently drop.
+        let handle = self.start_role_aware(&cfg, sp.clone(), None).await;
+        if persist {
+            write_session_profile(&sp, profile); // outlives this run
+        }
+        sessions.insert(
+            session.to_string(),
+            live_from_handle(handle, Some(profile.to_string())),
+        );
+        Ok(())
     }
 
     /// The provider actually driving a session: its per-chat profile's provider
@@ -342,10 +484,7 @@ impl Daemon {
         let profile = existing.profile.clone();
 
         // Don't restart mid-turn: only Idle / terminal states are safe.
-        let Ok(bytes) = std::fs::read(&sp) else {
-            return RebuildOutcome::Gone;
-        };
-        let Ok(state) = deserialize_state(&bytes) else {
+        let Some(state) = read_session_state(&sp) else {
             return RebuildOutcome::Gone;
         };
         use crate::harness::HarnessStatus::*;
@@ -365,29 +504,12 @@ impl Daemon {
         if let Some(old) = sessions.remove(id) {
             old.join.abort();
         }
-        let role = read_session_role(&sp);
-        let handle = match role.as_deref() {
-            Some("mission_control") => start_mission_control_session(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-            _ => start_session_with_browser_summary(
-                &cfg,
-                sp.clone(),
-                None,
-                true,
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::llm::StreamBuffer::default(),
-                ))),
-                Some(self.browser.summary_provider()),
-            ),
-        };
+        // ONE resolver for every role. This path used to handle only
+        // `mission_control`, so a config reload silently rebuilt a specialized
+        // agent as an ordinary session — losing its identity, prompt and tool
+        // set, with nothing logged. Routing both readers through
+        // `start_role_aware` makes that asymmetry unrepresentable.
+        let handle = self.start_role_aware(&cfg, sp.clone(), None).await;
         sessions.insert(id.to_string(), live_from_handle(handle, profile));
         RebuildOutcome::Rebuilt
     }
@@ -397,24 +519,27 @@ impl Daemon {
     /// receives the original control input and persists the durable mutation at
     /// the next safe boundary.
     async fn hide_queued(&self, id: &str, queue_id: &str) {
-        let path = self.sessions.lock().await.get(id)
+        let path = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
             .map(|s| s.state_path.clone())
             .or_else(|| state_path_for_id(id));
-        let Some(path) = path else { return; };
-        let Ok(bytes) = std::fs::read(path) else { return; };
-        let Ok(state) = deserialize_state(&bytes) else { return; };
-        let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else { return; };
+        let Some(path) = path else {
+            return;
+        };
+        let Some(state) = read_session_state(&path) else {
+            return;
+        };
+        let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else {
+            return;
+        };
         let mut hidden = self.queue_hidden.lock().unwrap();
         let entries = hidden.entry(id.to_string()).or_default();
         if !entries.contains(&item.id) {
             entries.push(item.id.clone());
             self.queue_revision.fetch_add(1, Ordering::Release);
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "queue",
-                "action": "hidden",
-                "session": id,
-                "queue_id": item.id,
-            }));
         }
     }
 
@@ -467,10 +592,7 @@ impl Daemon {
                 None => return,
             },
         };
-        let Ok(bytes) = std::fs::read(&sp) else {
-            return;
-        };
-        let Ok(state) = deserialize_state(&bytes) else {
+        let Some(state) = read_session_state(&sp) else {
             return;
         };
         let folder = PathBuf::from(&state.workspace);
@@ -484,16 +606,12 @@ impl Daemon {
             w
         };
         let forward = initial.is_none();
-        let handle = start_session_with_browser_summary(
-            &cfg,
-            sp.clone(),
-            initial,
-            true,
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                crate::llm::StreamBuffer::default(),
-            ))),
-            Some(self.browser.summary_provider()),
-        );
+        // ROLE-AWARE revive. This used to call the plain standard start, so any
+        // session revived by a delivery came back as an ordinary coding session —
+        // an agent's inbox got bash and workspace tools it must never have, and a
+        // specialized agent lost its identity. The role is a property of the
+        // session, and a delivery is not a reason to change it.
+        let handle = self.start_role_aware(&cfg, sp.clone(), initial).await;
         // Control inputs weren't consumed as the first turn — hand them to the
         // freshly-parked loop so it acts on them (idle-arm compaction, goal, etc.).
         if forward {
@@ -543,20 +661,28 @@ pub async fn run_serve(
     let token_for_print = token.clone();
     let mut config = config;
     config.ensure_setups();
+    let store = crate::store::Store::open(crate::store::default_db_path())
+        .map_err(|error| format!("open store: {error}"))?;
     let daemon: Shared = Arc::new(Daemon {
         config: std::sync::Mutex::new(config),
         config_path,
         token,
         hostname: machine_hostname(),
         sessions: Mutex::new(HashMap::new()),
+        shells: crate::term::SessionTerms::new(global_shell_cwd()),
         git_write: Mutex::new(()),
         browser: BrowserManager::default(),
         seen_nonces: std::sync::Mutex::new(HashMap::new()),
         queue_hidden: std::sync::Mutex::new(HashMap::new()),
         queue_revision: AtomicU64::new(0),
         mission_control_root: mission_control::MissionControlStore::default_root(None),
+        store,
+        coordination_events: tokio::sync::broadcast::channel(256).0,
         recurring_root: recurring::default_root(),
     });
+
+    // Register the built-in agents before anything can address them.
+    register_builtin_agents(&daemon);
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
@@ -584,6 +710,10 @@ pub async fn run_serve(
     }
     {
         let d = daemon.clone();
+        tokio::spawn(async move { direct::direct_dispatch_loop(d).await });
+    }
+    {
+        let d = daemon.clone();
         tokio::spawn(async move { recurring_tick_loop(d).await });
     }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
@@ -594,6 +724,52 @@ pub async fn run_serve(
     const UPLOAD_BODY_LIMIT: usize = MAX_UPLOAD_FILE_BYTES / 3 * 4 + 64 * 1024;
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/agents", get(list_agents).post(create_agent))
+        .route("/agents/build", post(build_agent_from_prompt))
+        .route("/agents/{agent_id}/board", get(agent_board))
+        .route(
+            "/coordination/tasks",
+            get(coordination_list_tasks).post(coordination_create_task),
+        )
+        .route(
+            "/coordination/tasks/{task_id}",
+            get(coordination_get_task).patch(coordination_update_task),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/status",
+            post(coordination_set_task_status),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/links",
+            get(coordination_task_links).post(coordination_link_tasks),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/links/{other_id}",
+            delete(coordination_unlink_tasks),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/agents",
+            get(coordination_task_agents).post(coordination_add_task_agent),
+        )
+        .route(
+            "/coordination/tasks/{task_id}/agents/{agent_id}",
+            delete(coordination_remove_task_agent),
+        )
+        .route(
+            "/coordination/threads/{thread_id}/events",
+            get(coordination_events),
+        )
+        .route(
+            "/coordination/threads/{thread_id}/messages",
+            post(coordination_post_message),
+        )
+        .route("/coordination/events", get(coordination_events_ws))
+        .route(
+            "/coordination/direct/messages",
+            get(direct::direct_list_messages).post(direct::direct_send_message),
+        )
+        .route("/coordination/direct/threads", get(direct::direct_list_threads))
+        .route("/coordination/direct/read", post(direct::direct_mark_read))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
         .route("/usage", get(usage_summary))
@@ -644,6 +820,7 @@ pub async fn run_serve(
         .route("/fs/delete", post(delete_fs_path))
         .route("/fs/download", get(download_fs_file))
         .route("/attach", get(attach_ws))
+        .route("/shells", get(shells_ws))
         .route("/events", get(events_ws))
         .route("/browser/ws", get(browser_ws))
         .route("/browsers", get(list_browsers))
@@ -944,12 +1121,10 @@ fn self_restart_process() {
 async fn any_session_busy(daemon: &Shared) -> bool {
     let sessions = daemon.sessions.lock().await;
     for s in sessions.values() {
-        if let Ok(bytes) = std::fs::read(&s.state_path) {
-            if let Ok(state) = deserialize_state(&bytes) {
-                if state.status == crate::harness::HarnessStatus::Running {
-                    return true;
-                }
-            }
+        if read_session_state(&s.state_path)
+            .is_some_and(|state| state.status == crate::harness::HarnessStatus::Running)
+        {
+            return true;
         }
     }
     false
@@ -990,10 +1165,1023 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Auth {
     token: Option<String>,
 }
+
+#[derive(Deserialize)]
+struct AgentsQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(display_name, id)`.
+    #[serde(default)]
+    after_name: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_agent_page_limit")]
+    limit: u32,
+}
+fn default_agent_page_limit() -> u32 {
+    200
+}
+
+async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let after = match (q.after_name.as_deref(), q.after_id.as_deref()) {
+        (Some(name), Some(id)) => Some((name, id)),
+        // A lone cursor half is a caller error, not a silent full listing.
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_name and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    match d.store.list_agents_page(after, q.limit.clamp(1, 500)) {
+        Ok(agents) => {
+            let assignments = match d.store.list_agent_assigned_sessions() {
+                Ok(rows) => rows,
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {error}"))
+                        .into_response();
+                }
+            };
+            let mut grouped: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+            for (agent_id, id, title, conversation, last_active) in assignments {
+                grouped.entry(agent_id).or_default().push(serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "conversation": conversation,
+                    "last_active": last_active,
+                }));
+            }
+            let agents = agents
+                .into_iter()
+                .map(|agent| {
+                    let mut value = serde_json::to_value(&agent).unwrap_or_default();
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "assigned_sessions".into(),
+                            serde_json::Value::Array(grouped.remove(&agent.id).unwrap_or_default()),
+                        );
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            Json(agents).into_response()
+        }
+        Err(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {error}")).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AgentBoardQuery {
+    token: Option<String>,
+    /// Only rows about this folder.
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Substring to find in the recorded summaries.
+    #[serde(default)]
+    contains: Option<String>,
+    /// `dispatched`, `reported`, or `noted`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default = "default_agent_page_limit")]
+    limit: u32,
+}
+
+/// GET /agents/{agent_id}/board — one agent's coordination memory.
+///
+/// Read-only: the board is written by the agent as it works, and by the
+/// dispatcher/report paths. This is what makes an agent's history inspectable
+/// rather than invisible — what it sent, what came back, what it concluded.
+async fn agent_board(
+    State(d): State<Shared>,
+    Query(q): Query<AgentBoardQuery>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let kind = match q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None => None,
+        Some(raw) => match crate::coordination::BoardEntryKind::parse(raw) {
+            Some(kind) => Some(kind),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown kind `{raw}` — use dispatched, reported, or noted"),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let query = crate::coordination::BoardQuery {
+        workspace: q.workspace.as_deref().filter(|w| !w.trim().is_empty()),
+        contains: q.contains.as_deref().filter(|c| !c.trim().is_empty()),
+        kind,
+    };
+    match d
+        .store
+        .read_board(&agent_id, &query, q.limit.clamp(1, 200))
+    {
+        Ok(entries) => Json(serde_json::json!({
+            "agent_id": agent_id,
+            "entries": entries,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read board: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Record one event in a session's transcript WITHOUT starting a turn.
+///
+/// The one place a notice is written, so a live loop and a dormant session
+/// produce identical transcripts. Prefers the LIVE loop when the session is
+/// running, so the entry lands in the loop's own state and cannot be clobbered
+/// by a later full rewrite. A dormant session has no loop to hold it, so it goes
+/// straight to the store — which is where a live loop reads from anyway.
+///
+/// `notice_text` decides whether the event also enters the model's context.
+async fn record_notice(d: &Daemon, session_id: &str, event: HarnessEvent) {
+    // Callers pass the id as it was recorded elsewhere — which is not always the
+    // stored key, since a model routinely drops the `/state.json` suffix.
+    // Recording under the bare form would match no session and be dropped below,
+    // silently losing the entry. Resolve to the canonical id first so both forms
+    // name the same conversation.
+    let canonical = crate::session::state_path_for_id(session_id)
+        .map(|path| crate::session::session_id_for_state_path(&path));
+    let session_id = canonical.as_deref().unwrap_or(session_id);
+    // A FINISHED loop is a dead entry: `send` into its closed channel reports
+    // success and the notice is gone. `deliver` guards on this; without the same
+    // guard here, a message sent to a session whose loop has stopped — after an
+    // interrupt, say — never reaches its transcript even though the daemon
+    // accepted it. Filtering finished loops falls through to the store write
+    // below, which is where a resumed loop reads from anyway.
+    let live = {
+        let sessions = d.sessions.lock().await;
+        sessions
+            .get(session_id)
+            .filter(|s| !s.join.is_finished())
+            .map(|s| s.input_tx.clone())
+    };
+    if let Some(tx) = live {
+        // A notice, not a `UserMessage`: the loop records it and stays parked.
+        let _ = tx.send(LoopInput::Notice(event));
+        return;
+    }
+    // Dormant: no loop to deliver into. Write straight to the store, but only
+    // when the session actually has a row — `session_events` has a foreign key to
+    // `sessions`, so an insert for an unknown session would just fail.
+    if !d.store.has_conversation(session_id).unwrap_or(false) {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = d
+        .store
+        .append_conversation_events(session_id, std::slice::from_ref(&event), &now);
+    if let Some(text) = crate::harness::notice_text(&event) {
+        let _ = d.store.append_conversation_messages(
+            session_id,
+            &[crate::llm::HarnessMessage::User { content: text }],
+            &now,
+        );
+    }
+}
+
+/// Record a direct message in a session's transcript WITHOUT starting a turn.
+///
+/// Both directions use this: what a session sent out, and what came back. The
+/// event is for the UIs; the paired message is so the model sees the exchange
+/// next turn.
+///
+/// Private to `serve`; its child module `direct` reaches it via `super::`.
+async fn record_agent_message(
+    d: &Shared,
+    session_id: &str,
+    agent_id: &str,
+    body: &str,
+    outbound: bool,
+) {
+    record_notice(
+        d,
+        session_id,
+        HarnessEvent::AgentMessage {
+            agent_id: agent_id.to_string(),
+            body: body.to_string(),
+            outbound,
+        },
+    )
+    .await;
+}
+
+/// Note on Mission Control's transcript that work was dispatched on its behalf.
+///
+/// The user can file a task directly, which bypasses Mission Control entirely —
+/// so without this the coordinator's record would show the task appearing from
+/// nowhere. It is a NOTICE, never a wake: the work is already routed to a worker
+/// and will report back on its own, so waking Mission Control would spend a turn
+/// on something that needs no decision.
+async fn record_dispatch_notice(d: &Daemon, task: &crate::coordination::Task) {
+    // Mission Control dispatching through its own tool already has the tool call
+    // and result in its transcript. Recording a notice too would tell it twice,
+    // so this is for dispatches made AROUND it — the case where its record would
+    // otherwise show work appearing from nowhere.
+    if task.created_by_id == crate::mission_control::SESSION_ID {
+        return;
+    }
+    let target = crate::session::state_path_for_id(&task.session_id)
+        .map(|path| crate::session::session_id_for_state_path(&path))
+        .unwrap_or_else(|| task.session_id.clone());
+    let by = if task.created_by_kind == "human" {
+        "You".to_string()
+    } else {
+        format!("{}:{}", task.created_by_kind, task.created_by_id)
+    };
+    record_notice(
+        d,
+        crate::mission_control::SESSION_ID,
+        HarnessEvent::TaskDispatched {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            session_id: target,
+            by,
+        },
+    )
+    .await;
+}
+
+#[derive(Deserialize)]
+struct AgentReq {
+    id: String,
+    display_name: String,
+    handle: String,
+    #[serde(default = "default_agent_kind")]
+    kind: crate::coordination::types::AgentKind,
+    #[serde(default = "default_agent_status")]
+    status: crate::coordination::types::AgentStatus,
+    #[serde(default = "default_agent_role")]
+    role: crate::coordination::types::AgentRole,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+fn default_agent_kind() -> crate::coordination::types::AgentKind {
+    crate::coordination::types::AgentKind::Worker
+}
+fn default_agent_status() -> crate::coordination::types::AgentStatus {
+    crate::coordination::types::AgentStatus::Active
+}
+fn default_agent_role() -> crate::coordination::types::AgentRole {
+    crate::coordination::types::AgentRole::Implementer
+}
+
+async fn create_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<AgentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.id.trim().is_empty() || req.handle.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "id and handle are required").into_response();
+    }
+    let agent = crate::coordination::types::Agent {
+        id: req.id,
+        display_name: req.display_name,
+        handle: req.handle,
+        kind: req.kind,
+        status: req.status,
+        role: req.role,
+        capabilities: req.capabilities,
+    };
+    let home = match crate::coordination::AgentHome::new(
+        crate::coordination::agents_root(&d.mission_control_root),
+        &agent.id,
+    ) {
+        Ok(home) => home,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let default_identity = format!(
+        "# {}\n\nAgent handle: @{}\n\nThis identity is awaiting its first build and research pass.\n",
+        agent.display_name, agent.handle
+    );
+    if let Err(error) = home.ensure_layout(&default_identity) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create agent home: {error}"),
+        )
+            .into_response();
+    }
+    match d.store.create_agent(&agent) {
+        Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(),
+        Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationEventsQuery {
+    token: Option<String>,
+    #[serde(default)]
+    after_sequence: u64,
+    #[serde(default = "default_coord_event_limit")]
+    limit: u32,
+}
+fn default_coord_event_limit() -> u32 {
+    100
+}
+
+async fn coordination_events(
+    State(d): State<Shared>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    Query(q): Query<CoordinationEventsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .store
+        .events_for_thread(&thread_id, q.after_sequence, q.limit.clamp(1, 500))
+    {
+        Ok(events) => Json(events).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read coordination events: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CoordinationMessageReq {
+    actor_kind: String,
+    actor_id: String,
+    body: String,
+    #[serde(default)]
+    idempotency_key: String,
+}
+
+async fn coordination_post_message(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(thread_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationMessageReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if req.body.trim().is_empty() || req.actor_id.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "actor_id and body are required").into_response();
+    }
+    let event = crate::coordination::types::CoordinationEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        thread_id: thread_id.clone(),
+        partition_key: format!("thread:{thread_id}"),
+        sequence: 0,
+        event_type: "message.posted".into(),
+        actor_kind: req.actor_kind,
+        actor_id: req.actor_id,
+        payload_version: 1,
+        payload: serde_json::json!({"body":req.body}),
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: if req.idempotency_key.is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            req.idempotency_key
+        },
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match d.store.append_event(&event) {
+        Ok(saved) => {
+            let _ = d.coordination_events.send(saved.clone());
+            // A board post is a message TO someone: wake Mission Control so it
+            // can respond. Without this the human just sees their own message
+            // and no agent ever participates. Skipped for Mission Control's own
+            // posts so a reply can't wake the session that wrote it.
+            if should_wake_mission_control(&saved.actor_id) {
+                let daemon = d.clone();
+                // Hand over a bounded slice of the room, excluding the message
+                // just posted (the envelope carries it separately as `body`), so
+                // the wake reads as a group chat rather than one isolated line.
+                let history: Vec<_> = d
+                    .store
+                    .recent_events_for_thread(
+                        &saved.thread_id,
+                        crate::coordination_tools::BOARD_HISTORY_ON_WAKE + 1,
+                    )
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|e| e.sequence < saved.sequence)
+                    .collect();
+                let envelope = board_message_envelope(&saved, &history);
+                tokio::spawn(async move {
+                    daemon
+                        .deliver(
+                            crate::mission_control::SESSION_ID,
+                            LoopInput::UserMessage(envelope),
+                        )
+                        .await;
+                });
+            }
+            Json(saved).into_response()
+        }
+        Err(error) => (
+            StatusCode::CONFLICT,
+            format!("post coordination message: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_events_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let mut rx = d.coordination_events.subscribe();
+    ws.on_upgrade(move |mut socket| async move {
+        while let Ok(event) = rx.recv().await {
+            if socket
+                .send(Message::Text(
+                    serde_json::json!({"wire":"coordination_event","event":event})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
+/// The task board's own columns are narrower than the assignment states — a task
+/// is what a HUMAN filed, so it carries Todo/InProgress/Blocked/Done/Cancelled
+/// and nothing about dispatch.
+#[derive(Deserialize)]
+struct CoordinationTasksQuery {
+    token: Option<String>,
+    /// Keyset cursor: the previous page's last `(created_at, id)`.
+    #[serde(default)]
+    after_created: Option<String>,
+    #[serde(default)]
+    after_id: Option<String>,
+    #[serde(default = "default_agent_page_limit")]
+    limit: u32,
+    /// Board column to show. Omitted returns every column.
+    #[serde(default)]
+    status: Option<String>,
+    /// "What is this agent on" — the roster filter.
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+fn parse_task_status(value: &str) -> Result<crate::coordination::TaskStatus, String> {
+    serde_json::from_str(&format!("\"{value}\""))
+        .map_err(|_| format!("unknown task status: {value}"))
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskReq {
+    /// Optional so a client can supply its own id (offline creation); the daemon
+    /// generates one otherwise.
+    #[serde(default)]
+    id: Option<String>,
+    title: String,
+    #[serde(default)]
+    description: String,
+    /// The session that should do the work. REQUIRED: a task with no target can
+    /// never be dispatched — the loop claims it, finds nowhere to deliver, and
+    /// parks it Blocked — so filing one would create dead weight.
+    session_id: String,
+    #[serde(default)]
+    priority: i64,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskPatch {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskStatusReq {
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskLinkReq {
+    to_task_id: String,
+    /// `blocks` (default) or `relates_to`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CoordinationTaskAgentReq {
+    agent_id: String,
+    #[serde(default)]
+    role: String,
+}
+
+/// Tasks on the board, newest priority first. The board is the human's view:
+/// creating and moving a task never touches the dispatch machinery, which is
+/// Mission Control's job once it picks the task up.
+async fn coordination_list_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<CoordinationTasksQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let after = match (q.after_created.as_deref(), q.after_id.as_deref()) {
+        (Some(created), Some(id)) => Some((created, id)),
+        (Some(_), None) | (None, Some(_)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "after_created and after_id must be provided together",
+            )
+                .into_response();
+        }
+        (None, None) => None,
+    };
+    let status = match q.status.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => match parse_task_status(raw) {
+            Ok(status) => Some(status),
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        },
+        None => None,
+    };
+    let filter = crate::coordination::TaskFilter {
+        status,
+        agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
+    };
+    match d
+        .store
+        .list_tasks_page(&filter, after, q.limit.clamp(1, 500))
+    {
+        Ok(tasks) => Json(tasks).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list tasks: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_create_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Json(req): Json<CoordinationTaskReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let title = req.title.trim();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, "title is required").into_response();
+    }
+    // An inbox is an agent's mailbox, not a place work runs: it holds the
+    // coordination runtime, which has no workspace tools and cannot report a
+    // task. Filing work there leaves it InProgress forever, so it is refused
+    // here for the same reason a nonexistent session is.
+    if crate::session::is_inbox_session_id(req.session_id.trim()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "session_id names an agent's inbox; route to a work session instead",
+        )
+            .into_response();
+    }
+    // The target must resolve, or the task would be filed against a session no
+    // dispatch could ever reach.
+    let Some(target_path) = crate::session::state_path_for_id(req.session_id.trim()) else {
+        return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
+    };
+    let Some(state) = crate::session::read_session_state(&target_path) else {
+        return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
+    };
+    // Canonical, so the task binds to the id the runtime will report with.
+    // Storing the id as typed let a task filed against `x/state.json` become
+    // unreportable by the session whose canonical id is `x`.
+    let session_id = crate::session::session_id_for_state_path(&target_path);
+    // Dispatch delivers through the MANAGED session record, so a target that is
+    // not managed yet would be claimed, found undeliverable, and parked Blocked
+    // after the failure ceiling. Registering it here is what makes a task filed
+    // against any real session runnable — the same step Mission Control's own
+    // task tool performs.
+    if mission_control::get_session(&d.mission_control_root, &session_id).is_err() {
+        if let Err(error) = mission_control::create_session(
+            &d.mission_control_root,
+            &session_id,
+            state.title.as_deref().unwrap_or("Managed session"),
+            std::path::Path::new(&state.workspace),
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("register managed session: {error}"),
+            )
+                .into_response();
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let id = req
+        .id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let task = crate::coordination::Task::filed_by_human(
+        id,
+        title.to_string(),
+        req.description.trim().to_string(),
+        session_id.clone(),
+        req.priority,
+        now,
+    );
+    match d.store.create_task(&task) {
+        Ok(()) => (StatusCode::CREATED, Json(task)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_get_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.store.get_task(&task_id) {
+        Ok(Some(task)) => Json(task).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("get task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_update_task(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskPatch>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let description = req.description.as_deref().map(str::trim);
+    match d
+        .store
+        .update_task(&task_id, title, description, req.priority, &now)
+    {
+        Ok(true) => match d.store.get_task(&task_id) {
+            Ok(Some(task)) => Json(task).into_response(),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("update task: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_set_task_status(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskStatusReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let status = match parse_task_status(req.status.trim()) {
+        Ok(status) => status,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    match d.store.set_task_status(&task_id, &status, &now) {
+        Ok(true) => match d.store.get_task(&task_id) {
+            Ok(Some(task)) => Json(task).into_response(),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "no such task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("set task status: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Every edge touching the task, both directions, plus the blockers resolved to
+/// ids. A reader needs the incoming edges as much as the outgoing ones — that is
+/// what makes a blocked task render as blocked.
+async fn coordination_task_links(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let links = match d.store.task_links(&task_id) {
+        Ok(links) => links,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task links: {error}"),
+            )
+                .into_response();
+        }
+    };
+    let blockers = match d.store.blockers_of(&task_id) {
+        Ok(blockers) => blockers,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task blockers: {error}"),
+            )
+                .into_response();
+        }
+    };
+    Json(serde_json::json!({ "links": links, "blocked_by": blockers })).into_response()
+}
+
+async fn coordination_link_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskLinkReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let to = req.to_task_id.trim();
+    if to.is_empty() {
+        return (StatusCode::BAD_REQUEST, "to_task_id is required").into_response();
+    }
+    if to == task_id {
+        return (StatusCode::BAD_REQUEST, "a task cannot link to itself").into_response();
+    }
+    let kind = match req.kind.as_deref().unwrap_or("blocks") {
+        "blocks" => crate::coordination::TaskLinkKind::Blocks,
+        "relates_to" => crate::coordination::TaskLinkKind::RelatesTo,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown link kind: {other}"),
+            )
+                .into_response();
+        }
+    };
+    // Both ends must exist, or the edge dangles and the board draws a blank node.
+    for id in [task_id.as_str(), to] {
+        match d.store.get_task(id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return (StatusCode::NOT_FOUND, format!("no such task: {id}")).into_response();
+            }
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("read task: {error}"),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let link = crate::coordination::TaskLink {
+        from_task_id: task_id,
+        to_task_id: to.to_string(),
+        kind,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match d.store.link_tasks(&link) {
+        Ok(()) => (StatusCode::CREATED, Json(link)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("link tasks: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_unlink_tasks(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((task_id, other_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    // Both directions are removed: the caller names the pair, and which end was
+    // stored as `from` is an implementation detail it should not have to know.
+    let mut removed = false;
+    for (from, to) in [
+        (task_id.as_str(), other_id.as_str()),
+        (other_id.as_str(), task_id.as_str()),
+    ] {
+        for kind in [
+            crate::coordination::TaskLinkKind::Blocks,
+            crate::coordination::TaskLinkKind::RelatesTo,
+        ] {
+            match d.store.unlink_tasks(from, to, &kind) {
+                Ok(true) => removed = true,
+                Ok(false) => {}
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("unlink tasks: {error}"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+    if removed {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such link").into_response()
+    }
+}
+
+async fn coordination_task_agents(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.store.list_task_agents(&task_id) {
+        Ok(agents) => Json(agents).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task agents: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_add_task_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    Json(req): Json<CoordinationTaskAgentReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let agent_id = req.agent_id.trim();
+    if agent_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "agent_id is required").into_response();
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    match d
+        .store
+        .add_task_agent(&task_id, agent_id, req.role.trim(), &now)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("add task agent: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn coordination_remove_task_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path((task_id, agent_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d
+        .store
+        .remove_task_agent(&task_id, &agent_id, &chrono::Utc::now().to_rfc3339())
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "agent is not on this task").into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("remove task agent: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Whether a board post should wake Mission Control. Posts authored by Mission
+/// Control itself are skipped, so a reply cannot re-wake the session that wrote
+/// it (which would loop).
+fn should_wake_mission_control(actor_id: &str) -> bool {
+    actor_id != crate::mission_control::SESSION_ID
+}
+
+/// The board thread every participant shares: the human app posts here, and the
+/// daemon routes assignments and worker posts to the same thread so nobody has
+/// to guess an id.
+pub const COORDINATION_THREAD: &str = "system";
+
+/// Collapse a message body to a single line for the history digest, so a
+/// multi-line message can't break the field-per-line layout.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The envelope handed to Mission Control when someone posts to the board — the
+/// shared room. Wraps the message so it is not mistaken for a direct chat turn,
+/// and carries a bounded slice of recent history so the room reads as a group
+/// chat rather than a single isolated line.
+///
+/// Field order matters: `body` is deliberately last, so a client can take
+/// everything up to the closing tag as the message — including newlines — and
+/// the internal `rules` and history never run into the sender's text.
+fn board_message_envelope(
+    event: &crate::coordination::types::CoordinationEvent,
+    history: &[crate::coordination::types::CoordinationEvent],
+) -> String {
+    let body = event
+        .payload
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let mut digest = String::new();
+    if history.is_empty() {
+        digest.push_str("history: (start of the room)\n");
+    } else {
+        digest.push_str(&format!(
+            "history: last {} message(s), oldest first\n",
+            history.len()
+        ));
+        for prior in history {
+            let prior_body = one_line(
+                prior
+                    .payload
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+            );
+            digest.push_str(&format!(
+                "  {} [{}] {}: {}\n",
+                prior.sequence, prior.actor_kind, prior.actor_id, prior_body
+            ));
+        }
+    }
+    format!(
+        "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n\
+         rules: board message, not an ordinary chat turn. This is a shared group room, not a direct \
+         message. Decide whether it needs a response, a handoff, or an assignment; reply on this same \
+         thread with post_coordination_message so everyone sees it. If no action is needed, say so on \
+         the thread rather than staying silent. Only the recent history is included — call \
+         read_coordination_thread to see more.\n{history}body: {body}\n\
+         [/coordination_board_message]",
+        event.thread_id,
+        event.actor_id,
+        event.actor_kind,
+        history = digest,
+        body = body,
+    )
+}
+
+
+
+
+
 
 #[derive(Deserialize)]
 struct NotificationReplayQuery {
@@ -1285,14 +2473,13 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
     let config = d.config.lock().unwrap().clone();
     let mut totals: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
-    for session in list_device_sessions() {
+    // The RAW catalog: an inbox runs a real model, so its tokens are real spend.
+    // Listing sessions to a person excludes it; accounting for cost must not.
+    for session in all_device_sessions() {
         let Some(path) = state_path_for_id(&session.id) else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(state) = deserialize_state(&bytes) else {
+        let Some(state) = read_session_state(&path) else {
             continue;
         };
         let profile_name = read_session_profile(&path);
@@ -1301,6 +2488,13 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             .and_then(|name| config.setups.as_ref()?.get(name))
             .unwrap_or(&config.model);
         let provider = model.provider.clone();
+        // Does this provider report rate-limit data AT ALL? Only ChatGPT parses
+        // the Codex headers; every other model hardcodes an empty snapshot, and
+        // opencode returns no such headers even in principle. So an empty list
+        // means two very different things — "cannot report" vs "hasn't reported
+        // yet" — and the UI must tell them apart instead of showing one generic
+        // empty state for both.
+        let reports_limits = crate::config::provider_reports_rate_limits(&provider);
         let entry = totals.entry(provider.clone()).or_insert_with(|| {
             serde_json::json!({
                 "provider": provider,
@@ -1311,10 +2505,13 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "cache_read_tokens": 0,
+                "rate_limits_supported": reports_limits,
                 "rate_limits": []
             })
         });
-        let Some(obj) = entry.as_object_mut() else { continue };
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
         obj.insert(
             "sessions".into(),
             serde_json::json!(obj["sessions"].as_u64().unwrap_or(0) + 1),
@@ -1328,18 +2525,15 @@ async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Respon
             let current = obj[key].as_u64().unwrap_or(0);
             obj.insert(key.into(), serde_json::json!(current.saturating_add(value)));
         }
-        if provider != "gemini" && provider != "xai" {
-            if let Some(rate) = state.rate_limit.filter(|rate| rate.is_reported()) {
-                let rates = obj
-                    .get_mut("rate_limits")
-                    .and_then(|v| v.as_array_mut())
-                    .expect("rate_limits array");
-                let value = serde_json::to_value(rate).unwrap_or_default();
-                if !rates.iter().any(|existing| existing == &value) {
-                    rates.push(value);
-                }
-            }
-        }
+        // NOTE: no per-session rate_limit is attributed to a provider here.
+        //
+        // `HarnessState.rate_limit` can only ever hold a CHATGPT snapshot —
+        // `chatgpt.rs` is the only model that parses rate-limit headers
+        // (`openai.rs` hardcodes `None`, as do anthropic/gemini/xai), and
+        // opencode's API returns no such headers at all. So reading it while
+        // iterating a session of ANY provider mis-attributed a ChatGPT figure to
+        // whatever that session ran: an `opencode-go` session displayed ChatGPT's
+        // numbers as its own. ChatGPT is handled once, globally, below.
     }
     // ChatGPT Codex limits are account-wide, not session-local. Include the same
     // reported snapshot used by the live chat Usage panel here as well.
@@ -1418,7 +2612,12 @@ async fn open_session(
         let c = d.config.lock().unwrap();
         c.for_workspace(folder.clone()).state_path
     };
-    if req.new_conversation || !original_state.exists() {
+    // A session lives in the store, so `state_path.exists()` alone reports
+    // "new" for every migrated workspace — which created a second worktree and
+    // a second session beside the real one.
+    let has_existing =
+        original_state.exists() || crate::session::store_default_session_id(&folder).is_some();
+    if req.new_conversation || !has_existing {
         folder = prepare_new_session_workspace(&folder);
     }
     let base_state = {
@@ -1429,20 +2628,23 @@ async fn open_session(
     // `conversations/<uuid>.json` (started blank), so the folder's existing
     // session(s) are preserved and a new one appears in the list.
     let (sp, resume) = if req.new_conversation {
-        let name = uuid::Uuid::new_v4().to_string();
         let path = base_state
-            .parent()
-            .map(|p| p.join("conversations").join(format!("{name}.json")))
-            .unwrap_or_else(|| base_state.clone());
+            .join("conversations")
+            .join(uuid::Uuid::new_v4().to_string());
         (path, false)
     } else {
         (base_state.clone(), req.resume)
     };
-    let id = sp
-        .strip_prefix(workspaces_root())
-        .unwrap_or(&sp)
-        .display()
-        .to_string();
+    // Canonical (filename stripped) so this matches `session_id_for_state_path`
+    // and any row migrated from the old path-shaped ids.
+    let id = crate::conversations::canonical_session_id(
+        &sp
+            .strip_prefix(workspaces_root())
+            .unwrap_or(&sp)
+            .display()
+            .to_string(),
+    )
+    .0;
     // Effective model: a persisted per-conversation override is AUTHORITATIVE on
     // resume — the app re-sends a profile on plain navigation (foregrounding,
     // reopening the chat), and honoring it silently reverted the model the user
@@ -1619,7 +2821,7 @@ async fn put_profile(
         if let Some(url) = req.base_url.clone().filter(|s| !s.trim().is_empty()) {
             mc.base_url = url;
         } else if mc.base_url.trim().is_empty() {
-            mc.base_url = ModelConfig::default().base_url;
+            mc.base_url = InferenceProfileConfig::default().base_url;
         }
         // An omitted/blank api_key keeps the existing one (editing doesn't wipe it).
         if let Some(key) = req.api_key.clone().filter(|s| !s.is_empty()) {
@@ -1649,10 +2851,6 @@ async fn put_profile(
     };
     match result {
         Ok(name) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "name": name,
-            }));
             Json(serde_json::json!({ "name": name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1683,10 +2881,6 @@ async fn set_active(
     };
     match result {
         Ok(_) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "active": req.name,
-            }));
             Json(serde_json::json!({ "active": req.name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1867,7 +3061,7 @@ async fn provider_models(
             .and_then(|n| c.setups.as_ref().and_then(|m| m.get(n)).cloned());
         match stored {
             Some(m) => m,
-            None if req.provider.is_some() => crate::config::ModelConfig {
+            None if req.provider.is_some() => crate::config::InferenceProfileConfig {
                 provider: req.provider.clone().unwrap_or_default(),
                 ..Default::default()
             },
@@ -1924,10 +3118,6 @@ async fn set_delegate(
     };
     match result {
         Ok(_) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "delegate": name,
-            }));
             Json(serde_json::json!({ "delegate": name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1953,10 +3143,6 @@ async fn delete_profile(State(d): State<Shared>, Query(q): Query<DeleteProfileQu
     };
     match result {
         Ok(_) => {
-            crate::session::emit_device_event(serde_json::json!({
-                "kind": "models",
-                "removed": q.name,
-            }));
             Json(serde_json::json!({ "removed": q.name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1969,8 +3155,9 @@ struct SessionModelReq {
     profile: String,
 }
 
-// POST /session/model {session, profile} — switch one conversation's model until
-// daemon restart: rebuild its loop on the chosen profile, resuming from disk.
+// POST /session/model {session, profile} — pin one conversation to a profile.
+// Rebuilds its loop on the chosen model, resuming from disk, and persists the
+// choice so it survives a daemon restart.
 async fn set_session_model(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -1979,50 +3166,20 @@ async fn set_session_model(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    d.reload_config().await; // a profile just created in the TUI must be selectable
-    let model_cfg = {
-        let c = d.config.lock().unwrap();
-        match c.setups.as_ref().and_then(|m| m.get(&req.profile)).cloned() {
-            Some(m) => m,
-            None => return (StatusCode::NOT_FOUND, "no such profile").into_response(),
+    // One implementation, shared with dispatch: both need the same
+    // resolve → abort → restart-on-new-model sequence, and a second copy would
+    // be free to drift on the role-aware details. The DIFFERENCE is persistence:
+    // this route is the user pinning the chat's model, so `true`.
+    match d
+        .run_session_on_profile(&req.session, &req.profile, true)
+        .await
+    {
+        Ok(()) => {
+            Json(serde_json::json!({ "session": req.session, "profile": req.profile }))
+                .into_response()
         }
-    };
-    let (sp, folder) = match load_session_workspace(&req.session) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-    let cfg = {
-        let c = d.config.lock().unwrap();
-        let mut w = c.for_workspace(folder);
-        w.model = model_cfg;
-        w.active_setup = Some(req.profile.clone());
-        w
-    };
-    let mut sessions = d.sessions.lock().await;
-    if let Some(old) = sessions.remove(&req.session) {
-        old.join.abort();
+        Err(error) => (StatusCode::NOT_FOUND, error).into_response(),
     }
-    let handle = start_session_with_browser_summary(
-        &cfg,
-        sp.clone(),
-        None,
-        true,
-        Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::llm::StreamBuffer::default(),
-        ))),
-        Some(d.browser.summary_provider()),
-    );
-    write_session_profile(&sp, &req.profile); // persist so it survives restart
-    sessions.insert(
-        req.session.clone(),
-        live_from_handle(handle, Some(req.profile.clone())),
-    );
-    crate::session::emit_device_event(serde_json::json!({
-        "kind": "models",
-        "session": req.session,
-        "profile": req.profile,
-    }));
-    Json(serde_json::json!({ "session": req.session, "profile": req.profile })).into_response()
 }
 
 fn session_event_page(
@@ -2060,18 +3217,11 @@ async fn rewind_session(
     };
     let checkpoint_id = req.checkpoint.clone();
 
-    // Load current state from disk (authoritative for history indices).
-    let Ok(bytes) = tokio::fs::read(&sp).await else {
+    // Load current state (store or file — authoritative for history indices).
+    let Some(mut state) = read_session_state(&sp) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to read session state",
-        )
-            .into_response();
-    };
-    let Ok(mut state) = deserialize_state(&bytes) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to parse session state",
         )
             .into_response();
     };
@@ -2082,19 +3232,15 @@ async fn rewind_session(
     };
 
     // Persist truncated history first so any client re-read sees the cut.
-    let Ok(updated_bytes) = serialize_state(&state) else {
+    // `write_session_state` targets whichever store holds the session, so a
+    // rewind does not silently write a file a DB session will never read.
+    if let Err(error) = crate::session::write_session_state(&sp, &state) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to serialize state",
+            format!("failed to write state: {error}"),
         )
             .into_response();
-    };
-    crate::session::freeze_session_activity(&sp);
-    if tokio::fs::write(&sp, &updated_bytes).await.is_err() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "failed to write state").into_response();
     }
-    crate::session::write_session_meta(&sp, &state);
-
     // Keep a live loop in sync (it may overwrite disk on its next persist otherwise).
     {
         let sessions = d.sessions.lock().await;
@@ -2249,14 +3395,31 @@ async fn bg_log(
         .into_response()
 }
 
+/// Change-detector for a session, from whichever store holds it: the store's
+/// row timestamp plus its log lengths, else the state file's bytes.
+///
+/// The attach stream re-checks on a timer, so this must stay cheap and must NOT
+/// load the transcript — not loading it is the whole point of having moved it
+/// into the database.
+fn session_state_fingerprint(store: &crate::store::Store, state_path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let id = session_id_for_state_path(state_path);
+    if let Ok(Some(fingerprint)) = store.conversation_fingerprint(&id) {
+        fingerprint.hash(&mut hasher);
+        return Some(hasher.finish());
+    }
+    let bytes = std::fs::read(state_path).ok()?;
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 fn resolve_session_dir(session: &str) -> Result<PathBuf, Response> {
     if let Some(sp) = state_path_for_id(session) {
-        if let Ok(bytes) = std::fs::read(&sp) {
-            if let Ok(state) = deserialize_state(&bytes) {
-                let dir = PathBuf::from(&state.workspace);
-                if !state.workspace.is_empty() && dir.is_dir() {
-                    return Ok(dir);
-                }
+        if let Some(state) = read_session_state(&sp) {
+            let dir = PathBuf::from(&state.workspace);
+            if !state.workspace.is_empty() && dir.is_dir() {
+                return Ok(dir);
             }
         }
     }
@@ -2367,74 +3530,27 @@ async fn fork_session(
         return (StatusCode::NOT_FOUND, "no such session").into_response();
     };
 
-    // Prefer live in-memory state when the session is running so the fork sees
-    // events that may not have flushed yet; fall back to the on-disk snapshot.
+    // Prefer the live session's own path when it is running, so the fork sees a
+    // turn that has not flushed yet. The reader resolves whichever store holds
+    // the session, so a database-backed session forks exactly like a file one.
+    // This used to be a nested if/else cascade that repeated the same read four
+    // times, which is how the file-only assumption got baked in four times over.
     let state = {
         let sessions = d.sessions.lock().await;
-        if let Some(live) = sessions.get(&req.session) {
-            if !live.join.is_finished() {
-                if let Ok(bytes) = std::fs::read(&live.state_path) {
-                    if let Ok(s) = deserialize_state(&bytes) {
-                        s
-                    } else {
-                        drop(sessions);
-                        match std::fs::read(&sp)
-                            .ok()
-                            .and_then(|b| deserialize_state(&b).ok())
-                        {
-                            Some(s) => s,
-                            None => {
-                                return (StatusCode::INTERNAL_SERVER_ERROR, "bad session state")
-                                    .into_response();
-                            }
-                        }
-                    }
-                } else {
-                    drop(sessions);
-                    match std::fs::read(&sp)
-                        .ok()
-                        .and_then(|b| deserialize_state(&b).ok())
-                    {
-                        Some(s) => s,
-                        None => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                "session state unreadable",
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-            } else {
-                drop(sessions);
-                match std::fs::read(&sp)
-                    .ok()
-                    .and_then(|b| deserialize_state(&b).ok())
-                {
-                    Some(s) => s,
-                    None => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "session state unreadable",
-                        )
-                            .into_response();
-                    }
-                }
-            }
-        } else {
-            drop(sessions);
-            match std::fs::read(&sp)
-                .ok()
-                .and_then(|b| deserialize_state(&b).ok())
-            {
-                Some(s) => s,
-                None => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "session state unreadable",
-                    )
-                        .into_response();
-                }
+        let path = sessions
+            .get(&req.session)
+            .filter(|live| !live.join.is_finished())
+            .map(|live| live.state_path.clone())
+            .unwrap_or_else(|| sp.clone());
+        drop(sessions);
+        match read_session_state(&path) {
+            Some(state) => state,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "session state unreadable",
+                )
+                    .into_response();
             }
         }
     };
@@ -2464,6 +3580,99 @@ async fn fork_session(
 struct AttachQuery {
     token: Option<String>,
     session: String,
+}
+
+#[derive(Deserialize)]
+struct ShellsQuery {
+    token: Option<String>,
+}
+
+// WS /shells — daemon-WIDE interactive shells, with no session at all.
+//
+// A shell belongs to the machine: switching or closing a session must not kill
+// it. `/attach` cannot serve this because it calls `ensure_live`, so a socket
+// with no live session gets a 404. This route carries the same `wire: term`
+// frames over a socket that requires no session.
+//
+// Lifecycle is still explicit: the client creates and closes shells through the
+// same `open`/`new`/`close` ops, so a dropped socket never destroys a pty.
+async fn shells_ws(
+    ws: WebSocketUpgrade,
+    State(d): State<Shared>,
+    Query(q): Query<ShellsQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let terms = d.shells.clone();
+    ws.on_upgrade(move |socket| handle_shells_ws(socket, terms))
+}
+
+async fn handle_shells_ws(socket: WebSocket, terms: Arc<crate::term::SessionTerms>) {
+    use base64::Engine;
+    let (mut sender, mut receiver) = socket.split();
+    let term_client = terms.subscribe();
+    let push_terms = terms.clone();
+    let mut term_seq: u64 = 0;
+
+    // Reconnect support: report what already exists, so a client that
+    // reattaches rebuilds its strip instead of showing nothing while the ptys
+    // keep running.
+    let existing: Vec<serde_json::Value> = terms
+        .list()
+        .into_iter()
+        .map(|(id, alive)| serde_json::json!({ "id": id, "alive": alive }))
+        .collect();
+    let hello = serde_json::json!({ "wire": "term", "op": "list", "shells": existing });
+    if let Ok(json) = serde_json::to_string(&hello) {
+        if sender.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    let push = tokio::spawn(async move {
+        loop {
+            // Drain the PTY so idle shells still fire BEL / OSC.
+            let _ = push_terms.take_snapshots();
+            for (id, chunk, cols, rows, alive) in push_terms.poll_client(&term_client) {
+                if chunk.is_empty() && alive {
+                    continue;
+                }
+                term_seq = term_seq.wrapping_add(1);
+                let frame = serde_json::json!({
+                    "wire": "term",
+                    "op": "out",
+                    "id": id,
+                    "seq": term_seq,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&chunk),
+                    "cols": cols,
+                    "rows": rows,
+                    "alive": alive,
+                });
+                if let Ok(json) = serde_json::to_string(&frame) {
+                    if sender.send(Message::Text(json.into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            Message::Text(t) => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
+                    if val.get("wire").and_then(|w| w.as_str()) == Some("term") {
+                        apply_term_client(&terms, &val);
+                    }
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    push.abort();
 }
 
 // WS /attach?session= — stream this session's HarnessState + receive LoopInput.
@@ -2500,8 +3709,7 @@ async fn handle_ws(
     terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (history_tx, history_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
     let history_request_tx = history_tx.clone();
 
     let push_daemon = daemon.clone();
@@ -2526,97 +3734,97 @@ async fn handle_ws(
         let mut term_seq: u64 = 0;
         loop {
             let queue_revision = daemon.queue_revision.load(Ordering::Acquire);
-            if let Ok(bytes) = tokio::fs::read(&state_path).await {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                bytes.hash(&mut hasher);
-                let fingerprint = hasher.finish();
+            if let Some(fingerprint) = session_state_fingerprint(&daemon.store, &state_path) {
                 if Some(fingerprint) != last_state_fingerprint
-                    || queue_revision != last_queue_revision {
-                    if let Ok(mut state) = deserialize_state(&bytes) {
-                                let hidden = {
-                                    let mut overlays = daemon.queue_hidden.lock().unwrap();
-                                    let entries = overlays.entry(session.clone()).or_default();
-                                    entries.retain(|id| state.queued_inputs.iter().any(|item| &item.id == id));
-                                    entries.clone()
-                                };
-                                if !hidden.is_empty() {
-                                    state.queued_inputs.retain(|item| !hidden.contains(&item.id));
+                    || queue_revision != last_queue_revision
+                {
+                    if let Some(mut state) = read_session_state(&state_path) {
+                        let hidden = {
+                            let mut overlays = daemon.queue_hidden.lock().unwrap();
+                            let entries = overlays.entry(session.clone()).or_default();
+                            entries
+                                .retain(|id| state.queued_inputs.iter().any(|item| &item.id == id));
+                            entries.clone()
+                        };
+                        if !hidden.is_empty() {
+                            state
+                                .queued_inputs
+                                .retain(|item| !hidden.contains(&item.id));
+                        }
+                        if let Ok(mut v) = serde_json::to_value(&state) {
+                            // `messages` (raw LLM history) is unused by the app — never wire it.
+                            if let Some(o) = v.as_object_mut() {
+                                o.remove("messages");
+                                // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
+                                // the account-wide overlay; every other provider gets NO
+                                // rate_limit — including scrubbing a stale snapshot persisted
+                                // before a model switch (it showed ChatGPT's monthly limits
+                                // on an anthropic-compatible chat).
+                                if daemon.session_provider(&session).await == "chatgpt" {
+                                    if let Some(g) = crate::chatgpt::read_global_usage() {
+                                        if let Ok(gv) = serde_json::to_value(&g) {
+                                            o.insert("rate_limit".into(), gv);
+                                        }
+                                    }
+                                } else {
+                                    o.remove("rate_limit");
                                 }
-                                if let Ok(mut v) = serde_json::to_value(&state) {
-                                    // `messages` (raw LLM history) is unused by the app — never wire it.
-                                    if let Some(o) = v.as_object_mut() {
-                                        o.remove("messages");
-                                        // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
-                                        // the account-wide overlay; every other provider gets NO
-                                        // rate_limit — including scrubbing a stale snapshot persisted
-                                        // before a model switch (it showed ChatGPT's monthly limits
-                                        // on an anthropic-compatible chat).
-                                        if daemon.session_provider(&session).await == "chatgpt" {
-                                            if let Some(g) = crate::chatgpt::read_global_usage() {
-                                                if let Ok(gv) = serde_json::to_value(&g) {
-                                                    o.insert("rate_limit".into(), gv);
-                                                }
-                                            }
-                                        } else {
-                                            o.remove("rate_limit");
-                                        }
-                                    }
-                                    let count = state.events.len();
-                                    let first_attach = last_events.is_empty();
-                                    let snapshot = if first_attach {
-                                        const INITIAL_ATTACH_EVENTS: usize = 160;
-                                        let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
-                                        last_event_offset = start;
-                                        last_events = state.events[start..].to_vec();
-                                        if let Some(o) = v.as_object_mut() {
-                                            o.insert(
-                                                "events".into(),
-                                                serde_json::to_value(&state.events[start..])
-                                                    .unwrap_or_default(),
-                                            );
-                                            o.insert("event_offset".into(), serde_json::json!(start));
-                                        }
-                                        true
-                                    } else {
-                                        count < last_event_offset
-                                            || count < last_event_offset + last_events.len()
-                                            || state.events[last_event_offset
-                                                ..last_event_offset + last_events.len()]
-                                                != last_events[..]
-                                    };
-                                    attach_revision = attach_revision.wrapping_add(1);
-                                    if let Some(o) = v.as_object_mut() {
-                                        o.insert("revision".into(), serde_json::json!(attach_revision));
-                                        if snapshot {
-                                            o.insert("wire".into(), serde_json::json!("snapshot"));
-                                        } else {
-                                            let start = last_event_offset + last_events.len();
-                                            let tail = serde_json::to_value(&state.events[start..])
-                                                .unwrap_or_default();
-                                            o.remove("events");
-                                            o.insert("wire".into(), serde_json::json!("delta"));
-                                            o.insert("new_events".into(), tail);
-                                            o.insert(
-                                                "event_count".into(),
-                                                serde_json::json!(count - last_event_offset),
-                                            );
-                                        }
-                                    }
-                                    if !first_attach {
-                                        last_events = state.events[last_event_offset..].to_vec();
-                                    }
-                                    last_queue_revision = queue_revision;
-                                    if let Ok(json) = serde_json::to_string(&v) {
-                                        if sender.send(Message::Text(json.into())).await.is_err() {
-                                            break;
-                                        }
-                                        last_state_fingerprint = Some(fingerprint);
-                                    }
+                            }
+                            let count = state.events.len();
+                            let first_attach = last_events.is_empty();
+                            let snapshot = if first_attach {
+                                const INITIAL_ATTACH_EVENTS: usize = 160;
+                                let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
+                                last_event_offset = start;
+                                last_events = state.events[start..].to_vec();
+                                if let Some(o) = v.as_object_mut() {
+                                    o.insert(
+                                        "events".into(),
+                                        serde_json::to_value(&state.events[start..])
+                                            .unwrap_or_default(),
+                                    );
+                                    o.insert("event_offset".into(), serde_json::json!(start));
                                 }
+                                true
+                            } else {
+                                count < last_event_offset
+                                    || count < last_event_offset + last_events.len()
+                                    || state.events
+                                        [last_event_offset..last_event_offset + last_events.len()]
+                                        != last_events[..]
+                            };
+                            attach_revision = attach_revision.wrapping_add(1);
+                            if let Some(o) = v.as_object_mut() {
+                                o.insert("revision".into(), serde_json::json!(attach_revision));
+                                if snapshot {
+                                    o.insert("wire".into(), serde_json::json!("snapshot"));
+                                } else {
+                                    let start = last_event_offset + last_events.len();
+                                    let tail = serde_json::to_value(&state.events[start..])
+                                        .unwrap_or_default();
+                                    o.remove("events");
+                                    o.insert("wire".into(), serde_json::json!("delta"));
+                                    o.insert("new_events".into(), tail);
+                                    o.insert(
+                                        "event_count".into(),
+                                        serde_json::json!(count - last_event_offset),
+                                    );
+                                }
+                            }
+                            if !first_attach {
+                                last_events = state.events[last_event_offset..].to_vec();
+                            }
+                            last_queue_revision = queue_revision;
+                            if let Ok(json) = serde_json::to_string(&v) {
+                                if sender.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                                last_state_fingerprint = Some(fingerprint);
                             }
                         }
                     }
+                }
+            }
             {
                 use std::hash::{Hash, Hasher};
                 let snap = crate::llm::StreamBuffer::snapshot(&stream);
@@ -2676,20 +3884,22 @@ async fn handle_ws(
                 }
             }
             if let Ok((before, limit)) = history_rx.try_recv() {
-                if let Ok(bytes) = tokio::fs::read(&state_path).await {
-                    if let Ok(state) = deserialize_state(&bytes) {
-                        let (start, end, has_older) =
-                            session_event_page(&state.events, Some(before), Some(limit));
-                        let frame = serde_json::json!({
-                            "wire": "history",
-                            "events": &state.events[start..end],
-                            "start": start,
-                            "end": end,
-                            "has_older": has_older,
-                        });
-                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
-                            break;
-                        }
+                if let Some(state) = read_session_state(&state_path) {
+                    let (start, end, has_older) =
+                        session_event_page(&state.events, Some(before), Some(limit));
+                    let frame = serde_json::json!({
+                        "wire": "history",
+                        "events": &state.events[start..end],
+                        "start": start,
+                        "end": end,
+                        "has_older": has_older,
+                    });
+                    if sender
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
@@ -2713,8 +3923,10 @@ async fn handle_ws(
                         continue;
                     }
                     if val.get("kind").and_then(|k| k.as_str()) == Some("history") {
-                        let before = val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let limit = val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
+                        let before =
+                            val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let limit =
+                            val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
                         let _ = history_request_tx.send((before, limit));
                         continue;
                     }
@@ -2734,7 +3946,7 @@ async fn handle_ws(
                                     | "steer_queued"
                                     | "drop_queued"
                             );
-                            if idempotent && !daemon.accept_nonce(&session, nonce, &state_path) {
+                            if idempotent && !daemon.accept_nonce(&session, nonce) {
                                 continue; // duplicate — drop silently
                             }
                         }
@@ -2865,7 +4077,7 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
                 _ = harvest.tick() => {
                     let live = daemon.sessions.lock().await;
                     for sess in live.values() {
-                        let _ = sess.terms.harvest();
+                        sess.terms.pump();
                     }
                 }
             }
@@ -2891,12 +4103,15 @@ mod tests {
             token: String::new(),
             hostname: String::from("test"),
             sessions: Mutex::new(HashMap::new()),
+            shells: crate::term::SessionTerms::new(global_shell_cwd()),
             git_write: Mutex::new(()),
             browser: BrowserManager::default(),
             seen_nonces: std::sync::Mutex::new(HashMap::new()),
             queue_hidden: std::sync::Mutex::new(HashMap::new()),
             queue_revision: AtomicU64::new(0),
             mission_control_root: tempfile::tempdir().expect("temporary directory").keep(),
+            store: crate::store::Store::open_in_memory().unwrap(),
+            coordination_events: tokio::sync::broadcast::channel(256).0,
             recurring_root: tempfile::tempdir().expect("temporary directory").keep(),
         }
     }
@@ -2906,27 +4121,356 @@ mod tests {
         let events = vec![
             crate::harness::HarnessEvent::UserInput { text: "one".into() },
             crate::harness::HarnessEvent::AssistantText { text: "two".into() },
-            crate::harness::HarnessEvent::UserInput { text: "three".into() },
+            crate::harness::HarnessEvent::UserInput {
+                text: "three".into(),
+            },
         ];
         assert_eq!(session_event_page(&events, None, None), (0, 3, false));
         assert_eq!(session_event_page(&events, Some(3), Some(2)), (1, 3, true));
-        assert_eq!(session_event_page(&events, Some(1), Some(50)), (0, 1, false));
-        assert_eq!(session_event_page(&events, Some(999), Some(0)), (2, 3, true));
+        assert_eq!(
+            session_event_page(&events, Some(1), Some(50)),
+            (0, 1, false)
+        );
+        assert_eq!(
+            session_event_page(&events, Some(999), Some(0)),
+            (2, 3, true)
+        );
+    }
+
+    /// A nonce sidecar is ignored: the store is the only record now.
+    ///
+    /// Retirement guard. The fallback used to read a session's `.nonces.json`
+    /// and treat anything in it as already-sent. If that read ever came back,
+    /// a stale file would silently suppress a legitimate request — the failure
+    /// would look like "my message vanished", with nothing in the logs.
+    #[test]
+    fn a_legacy_nonces_file_is_ignored() {
+        let dir = tempdir().expect("temporary directory");
+        let session_id = "ws-2-def456";
+        let session_dir = dir.path().join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("state.nonces.json"),
+            r#"["already-sent"]"#,
+        )
+        .unwrap();
+
+        let mut daemon = test_daemon();
+        daemon.store = crate::store::Store::open_in_memory().unwrap();
+
+        assert!(
+            daemon.accept_nonce(session_id, "already-sent"),
+            "a nonce present only in a legacy file must be ACCEPTED — the file is retired"
+        );
+        assert!(
+            !daemon.accept_nonce(session_id, "already-sent"),
+            "but the store still rejects a genuine replay within the same run"
+        );
     }
 
     #[test]
     fn nonce_is_rejected_after_daemon_state_is_recreated() {
-        let dir = tempdir().expect("temporary directory");
-        let state_path = dir.path().join("state.json");
-        let first = test_daemon();
+        let mut first = test_daemon();
+        first.store = crate::store::Store::open_in_memory().unwrap();
+        let store = first.store.clone();
 
-        assert!(first.accept_nonce("session", "nonce-1", &state_path));
-        assert!(!first.accept_nonce("session", "nonce-1", &state_path));
+        assert!(first.accept_nonce("session", "nonce-1"));
+        assert!(!first.accept_nonce("session", "nonce-1"));
 
-        let restarted = test_daemon();
-        assert!(!restarted.accept_nonce("session", "nonce-1", &state_path));
-        assert!(restarted.accept_nonce("session", "nonce-2", &state_path));
+        let mut restarted = test_daemon();
+        restarted.store = store;
+        assert!(!restarted.accept_nonce("session", "nonce-1"));
+        assert!(restarted.accept_nonce("session", "nonce-2"));
     }
+
+    // -- Coordination route handlers -----------------------------------------
+    // These drive the real axum handlers (with their extractors) so auth,
+    // validation, and store wiring are covered, not just the DB beneath them.
+
+    fn authed_daemon() -> Shared {
+        let mut daemon = test_daemon();
+        daemon.token = "test-token".into();
+        Arc::new(daemon)
+    }
+
+    fn with_token() -> Auth {
+        Auth {
+            token: Some("test-token".into()),
+        }
+    }
+
+    fn create_agent_req(id: &str) -> AgentReq {
+        AgentReq {
+            id: id.into(),
+            display_name: "Web Research Specialist".into(),
+            handle: format!("handle-{id}"),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Researcher,
+            capabilities: vec!["web_search".into()],
+        }
+    }
+
+    fn agents_query(token: Option<&str>) -> AgentsQuery {
+        AgentsQuery {
+            token: token.map(str::to_string),
+            after_name: None,
+            after_id: None,
+            limit: default_agent_page_limit(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_route_rejects_an_unauthenticated_request() {
+        let d = authed_daemon();
+        let response = list_agents(State(d), Query(agents_query(None))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn agents_route_requires_id_and_handle() {
+        let d = authed_daemon();
+        let mut req = create_agent_req("researcher");
+        req.handle = "  ".into();
+        let response = create_agent(State(d), Query(with_token()), Json(req)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn agents_route_creates_then_lists() {
+        let d = authed_daemon();
+        let created = create_agent(
+            State(d.clone()),
+            Query(with_token()),
+            Json(create_agent_req("researcher")),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        // A duplicate id is a conflict, not a silent overwrite.
+        let duplicate = create_agent(
+            State(d.clone()),
+            Query(with_token()),
+            Json(create_agent_req("researcher")),
+        )
+        .await;
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let listed = list_agents(State(d), Query(agents_query(Some("test-token")))).await;
+        assert_eq!(listed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn message_route_requires_a_body() {
+        let d = authed_daemon();
+        let response = coordination_post_message(
+            State(d),
+            Query(with_token()),
+            axum::extract::Path("t1".to_string()),
+            Json(CoordinationMessageReq {
+                actor_kind: "agent".into(),
+                actor_id: "mission-control".into(),
+                body: "   ".into(),
+                idempotency_key: String::new(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A human post must wake Mission Control (that is what makes the board
+    /// interactive); Mission Control's own reply must not, or it would loop.
+    #[test]
+    fn board_posts_wake_mission_control_except_its_own() {
+        assert!(should_wake_mission_control("human"));
+        assert!(should_wake_mission_control("rust-pr-reviewer"));
+        assert!(!should_wake_mission_control(
+            crate::mission_control::SESSION_ID
+        ));
+    }
+
+    #[test]
+    fn board_message_envelope_carries_sender_thread_and_reply_rule() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e1".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 7,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "please investigate X"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event, &[]);
+        assert!(envelope.starts_with("[coordination_board_message]"));
+        assert!(envelope.contains("thread_id: system"));
+        assert!(envelope.contains("from_id: human"));
+        assert!(envelope.contains("from_kind: human"));
+        assert!(envelope.contains("body: please investigate X"));
+        // The reply contract is what stops a silent no-op.
+        assert!(envelope.contains("post_coordination_message"));
+        assert!(envelope.contains("[/coordination_board_message]"));
+    }
+
+    /// The body is last so a client can read everything up to the closing tag as
+    /// the message; this pins that ordering so it can't silently regress.
+    #[test]
+    fn board_message_body_is_the_final_field_before_the_closing_tag() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e2".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 8,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "line one\nline two"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k2".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event, &[]);
+        let after_body = envelope.split_once("body: ").expect("body field present").1;
+        assert!(after_body.starts_with("line one\nline two"));
+        assert!(
+            after_body
+                .trim_end()
+                .ends_with("[/coordination_board_message]")
+        );
+    }
+
+    /// The wake must read as a group room: recent messages are included, and the
+    /// digest can't be confused with the new message or the field layout.
+    #[test]
+    fn board_message_envelope_includes_bounded_history() {
+        let prior =
+            |seq: u64, who: &str, body: &str| crate::coordination::types::CoordinationEvent {
+                event_id: format!("e{seq}"),
+                thread_id: COORDINATION_THREAD.into(),
+                partition_key: format!("thread:{COORDINATION_THREAD}"),
+                sequence: seq,
+                event_type: "message.posted".into(),
+                actor_kind: "agent".into(),
+                actor_id: who.into(),
+                payload_version: 1,
+                payload: serde_json::json!({"body": body}),
+                causation_id: None,
+                correlation_id: None,
+                idempotency_key: format!("k{seq}"),
+                created_at: "2020-01-01T00:00:00Z".into(),
+            };
+        let current = prior(5, "human", "what is the status?");
+        let history = [
+            prior(3, "mission-control", "started the review"),
+            prior(4, "reviewer", "found two issues"),
+        ];
+
+        let envelope = board_message_envelope(&current, &history);
+        // Both prior turns appear, attributed.
+        assert!(envelope.contains("mission-control: started the review"));
+        assert!(envelope.contains("reviewer: found two issues"));
+        assert!(envelope.contains("history: last 2 message(s)"));
+        // The new message is still the final body, and history precedes it.
+        let body_at = envelope.find("body: what is the status?").unwrap();
+        let history_at = envelope.find("history:").unwrap();
+        assert!(history_at < body_at);
+        // A multi-line prior body is collapsed so it can't break the layout.
+        let wrapped = board_message_envelope(&current, &[prior(1, "a", "line one\nline two")]);
+        assert!(wrapped.contains("a: line one line two"));
+    }
+
+    /// With no history the room is honestly reported as just starting.
+    #[test]
+    fn board_message_envelope_marks_an_empty_room() {
+        let event = crate::coordination::types::CoordinationEvent {
+            event_id: "e1".into(),
+            thread_id: COORDINATION_THREAD.into(),
+            partition_key: format!("thread:{COORDINATION_THREAD}"),
+            sequence: 1,
+            event_type: "message.posted".into(),
+            actor_kind: "human".into(),
+            actor_id: "human".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "first ever message"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let envelope = board_message_envelope(&event, &[]);
+        assert!(envelope.contains("history: (start of the room)"));
+    }
+
+    #[tokio::test]
+    async fn message_route_publishes_to_the_live_event_feed() {
+        let d = authed_daemon();
+        // The websocket handler forwards everything from this broadcast channel,
+        // so receiving here proves a posted event reaches live subscribers.
+        let mut feed = d.coordination_events.subscribe();
+
+        coordination_post_message(
+            State(d.clone()),
+            Query(with_token()),
+            axum::extract::Path("live".to_string()),
+            Json(CoordinationMessageReq {
+                actor_kind: "agent".into(),
+                actor_id: "mission-control".into(),
+                body: "hello live".into(),
+                idempotency_key: String::new(),
+            }),
+        )
+        .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), feed.recv())
+            .await
+            .expect("event delivered to live subscribers")
+            .expect("channel open");
+        assert_eq!(event.thread_id, "live");
+        assert_eq!(event.payload["body"], "hello live");
+    }
+
+    #[tokio::test]
+    async fn message_route_posts_and_replays_by_cursor() {
+        let d = authed_daemon();
+        for body in ["first", "second"] {
+            let posted = coordination_post_message(
+                State(d.clone()),
+                Query(with_token()),
+                axum::extract::Path("t1".to_string()),
+                Json(CoordinationMessageReq {
+                    actor_kind: "agent".into(),
+                    actor_id: "mission-control".into(),
+                    body: body.into(),
+                    idempotency_key: String::new(),
+                }),
+            )
+            .await;
+            assert_eq!(posted.status(), StatusCode::OK);
+        }
+
+        // Full replay returns both; a cursor past the first returns only the tail.
+        let all = d.store.events_for_thread("t1", 0, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].sequence, 1);
+        assert_eq!(all[1].sequence, 2);
+        let tail = d.store.events_for_thread("t1", 1, 10).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].sequence, 2);
+    }
+
+    // -- Coordination visibility routes -------------------------------------
+
+
+
+
+
 }
 
 #[derive(Deserialize)]
@@ -3027,7 +4571,9 @@ struct MissionSessionUpdate {
 
 fn task_status(raw: &str) -> Option<TaskStatus> {
     match raw {
-        "pending" => Some(TaskStatus::Pending),
+        // `pending` is what clients sent when `Todo` was named `Pending`; accept
+        // it permanently so a stored client config does not silently stop working.
+        "pending" | "todo" => Some(TaskStatus::Todo),
         "in_progress" => Some(TaskStatus::InProgress),
         "blocked" => Some(TaskStatus::Blocked),
         "done" | "completed" => Some(TaskStatus::Done),
@@ -3037,7 +4583,7 @@ fn task_status(raw: &str) -> Option<TaskStatus> {
     }
 }
 
-fn mission_task_view(task: &TaskRecord) -> serde_json::Value {
+fn mission_task_view(task: &Task) -> serde_json::Value {
     serde_json::json!({
         "id": task.id,
         "title": task.title,
@@ -3048,10 +4594,11 @@ fn mission_task_view(task: &TaskRecord) -> serde_json::Value {
         "updated_at": task.updated_at,
         "archived": task.status.is_terminal(),
         "owned_paths": task.owned_paths,
-        "dependencies": task.dependencies,
         "handoff": task.handoff,
+        "handoff_mode": task.handoff_mode,
         "result": task.result,
         "notifications": task.notifications,
+        "dispatch_failures": task.dispatch_failures,
     })
 }
 
@@ -3082,7 +4629,7 @@ async fn mission_control_overview(
         return unauthorized();
     }
     let root = &d.mission_control_root;
-    let Ok(tasks) = mission_control::list_tasks(root, None, None) else {
+    let Ok(tasks) = d.store.list_tasks(None, None) else {
         return mission_error("could not read Mission Control tasks".to_string());
     };
     let Ok(sessions) = mission_control::list_sessions(root, false) else {
@@ -3139,7 +4686,7 @@ async fn mission_control_tasks(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match mission_control::list_tasks(&d.mission_control_root, None, None) {
+    match d.store.list_tasks(None, None) {
         Ok(tasks) => Json(
             tasks
                 .iter()
@@ -3151,46 +4698,62 @@ async fn mission_control_tasks(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(error) => mission_error(error),
+        Err(error) => mission_error(error.to_string()),
     }
 }
 
-async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, String> {
+async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String> {
     let root = &d.mission_control_root;
-    // Atomic claim: Pending → InProgress exactly once. Concurrent dispatchers
+    let now = chrono::Utc::now().to_rfc3339();
+    // Atomic claim: Todo → InProgress exactly once. Concurrent dispatchers
     // (loop + REST paths) lose the race here and return without delivering.
-    let task = mission_control::claim_task_for_dispatch(root, task_id)?;
+    let task = d
+        .store
+        .claim_task_for_dispatch(task_id, &now)
+        .map_err(|error| error.to_string())?;
     if task.status != TaskStatus::InProgress || task.reporting_session.is_none() {
         // Not claimed by us (already in progress/terminal) — nothing to do.
         return Ok(task);
     }
     if task.session_id.trim().is_empty() {
-        release_failed_claim(root, &task, "task has no target session")?;
+        release_failed_claim(d, &task, "task has no target session")?;
         return Err("task has no target session".to_string());
     }
-    for dependency in &task.dependencies {
-        // A missing/unreadable dependency record must roll the claim back like
-        // every other failure path — otherwise the task strands InProgress.
-        let other = match mission_control::get_task(root, &dependency.task_id) {
-            Ok(other) => other,
-            Err(error) => {
-                release_failed_claim(root, &task, &error)?;
+    // Blocked-by edges live in task_links now, so a dependency is read as the
+    // reverse edge rather than an embedded field on the task row.
+    for blocker_id in d
+        .store
+        .blockers_of(task_id)
+        .map_err(|error| error.to_string())?
+    {
+        let other = match d.store.get_task(&blocker_id) {
+            Ok(Some(other)) => other,
+            Ok(None) => {
+                let error = format!("dependency {blocker_id} no longer exists");
+                release_failed_claim(d, &task, &error)?;
                 return Err(error);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                release_failed_claim(d, &task, &message)?;
+                return Err(message);
             }
         };
         if other.status != TaskStatus::Done {
-            let reason = format!("waiting on dependency {}", dependency.task_id);
-            let blocked = mission_control::update_task(root, task_id, |task| {
-                task.status = TaskStatus::Blocked;
-                task.reporting_session = None;
-                task.notifications
-                    .push(mission_control::NotificationMarker {
+            let reason = format!("waiting on dependency {blocker_id}");
+            let blocked = d
+                .store
+                .update_task_in(task_id, &now, |task| {
+                    task.status = TaskStatus::Blocked;
+                    task.reporting_session = None;
+                    task.notifications.push(NotificationMarker {
                         target: "mission_control".to_string(),
                         kind: "blocked".to_string(),
                         message: reason.clone(),
                         delivered: false,
                     });
-            })?;
+                })
+                .map_err(|error| error.to_string())?;
             // Report the stored (blocked) state, not the pre-update claim.
             return Ok(blocked);
         }
@@ -3198,51 +4761,55 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
     let managed = match mission_control::get_session(root, &task.session_id) {
         Ok(managed) => managed,
         Err(error) => {
-            release_failed_claim(root, &task, &error)?;
+            release_failed_claim(d, &task, &error)?;
             return Err(error);
         }
     };
     if managed.status != mission_control::SessionStatus::Active {
         let error = "target session is archived".to_string();
-        release_failed_claim(root, &task, &error)?;
+        release_failed_claim(d, &task, &error)?;
         return Err(error);
     }
-    let conflicts = mission_control::detect_conflicts(root, task_id, &task.owned_paths)?;
+    let conflicts = d
+        .store
+        .task_path_conflicts(task_id, &task.owned_paths)
+        .map_err(|error| error.to_string())?;
     if !conflicts.is_empty() {
         // Queue behind the current owner. This is waiting, not a dispatch
         // failure — do not burn the retry ceiling.
         let mut owners = Vec::new();
         for conflict in &conflicts {
-            if !owners.contains(&conflict.existing_task_id) {
-                owners.push(conflict.existing_task_id.clone());
+            if !owners.contains(&conflict.0) {
+                owners.push(conflict.0.clone());
             }
         }
-        let reason = format!(
-            "waiting on workspace owner(s): {}",
-            owners.join(", ")
-        );
-        let blocked = mission_control::update_task(root, task_id, |task| {
-            task.status = TaskStatus::Blocked;
-            task.reporting_session = None;
-            task.dispatch_failures = 0;
-            for owner in &owners {
-                if !task.dependencies.iter().any(|d| d.task_id == *owner) {
-                    task.dependencies.push(mission_control::Dependency {
-                        task_id: owner.clone(),
-                        reason: Some("workspace path already in use".into()),
-                    });
-                }
-            }
-            if !task.notifications.iter().any(|n| n.message == reason) {
-                task.notifications
-                    .push(mission_control::NotificationMarker {
+        let reason = format!("waiting on workspace owner(s): {}", owners.join(", "));
+        let blocked = d
+            .store
+            .update_task_in(task_id, &now, |task| {
+                task.status = TaskStatus::Blocked;
+                task.reporting_session = None;
+                task.dispatch_failures = 0;
+                if !task.notifications.iter().any(|n| n.message == reason) {
+                    task.notifications.push(NotificationMarker {
                         target: "mission_control".to_string(),
                         kind: "blocked".to_string(),
                         message: reason.clone(),
                         delivered: false,
                     });
-            }
-        })?;
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        // Record the ordering constraint so `unblock_ready_tasks` can requeue
+        // this once the owner finishes — the edge IS the dependency.
+        for owner in &owners {
+            let _ = d.store.link_tasks(&TaskLink {
+                from_task_id: owner.clone(),
+                to_task_id: task_id.to_string(),
+                kind: TaskLinkKind::Blocks,
+                created_at: now.clone(),
+            });
+        }
         return Ok(blocked);
     }
     let handoff = task
@@ -3253,10 +4820,10 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
     // Fresh-mode handoffs must be self-contained briefings; resume-mode ones
     // assume the session already holds the context.
     let mode_line = match task.handoff_mode {
-        mission_control::HandoffMode::Fresh => {
+        HandoffMode::Fresh => {
             "handoff_mode: fresh (self-contained briefing; the session has no prior context)\n"
         }
-        mission_control::HandoffMode::Resume => "",
+        HandoffMode::Resume => "",
     };
     let text = format!(
         "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nrules: do not confirm scope; begin immediately. If handoff_mode is fresh, this envelope is the complete briefing — do not ask for missing history. Stay in this session — it already has the context; do not spawn lanes unless the work is independently parallel. Stay in scope; do not manage other sessions. If a prior read-only report is gone, redo the evaluation from current sources and deliver it. You MUST call report_mission_task for task_id {} before you stop — even on a clean success with no errors. Status done if finished; blocked if you need a unique artifact or user decision; failed only for a hard stop. A silent finish leaves Mission Control unable to resume. Block only for a missing unique artifact or user decision, not compacted history.\n[/mission_control_task]",
@@ -3271,39 +4838,145 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<TaskRecord, 
         managed.workspace.display(),
         task.id,
     );
+    // Apply the profile BEFORE delivering, so the turn that picks up this
+    // envelope runs on the model the dispatcher chose. A failure here is a
+    // dispatch failure, not a silent downgrade: the task is released and
+    // retried rather than delivered onto the wrong model.
+    //
+    // `persist: false` — this is a model for ONE assignment, not the session's
+    // new default. Mission Control does not own the chat's model, and the next
+    // task may want a different one, so the choice drives this run only.
+    if let Some(profile) = task.profile.as_deref() {
+        if let Err(error) = d.run_session_on_profile(&managed.id, profile, false).await {
+            release_failed_claim(d, &task, &error)?;
+            return Err(error);
+        }
+    }
     d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
+    // Record that this went out, on Mission Control's transcript, WITHOUT waking
+    // it: the work is already routed and reports back on its own. This is what
+    // keeps the coordinator's record complete when the user filed the task
+    // directly rather than through Mission Control.
+    record_dispatch_notice(d, &task).await;
     // Delivery succeeded — clear the retry counter so the ceiling stays
     // "consecutive failures" as documented.
-    mission_control::update_task(root, task_id, |t| t.dispatch_failures = 0)?;
-    mission_control::get_task(root, task_id)
+    let task = d
+        .store
+        .update_task_in(task_id, &now, |t| t.dispatch_failures = 0)
+        .map_err(|error| error.to_string())?;
+    Ok(task)
 }
 
-/// Roll a claimed-but-undeliverable task back to Pending and record why, so
-/// the loop can retry later instead of silently spinning with a stale claim.
-/// After `MAX_DISPATCH_FAILURES` consecutive failures the task is parked as
-/// Blocked so it stops consuming the loop.
-fn release_failed_claim(
-    root: &std::path::Path,
-    task: &TaskRecord,
-    error: &str,
-) -> Result<(), String> {
+/// Roll a claimed-but-undeliverable task back to Todo and record why, so the
+/// loop can retry later instead of silently spinning with a stale claim. After
+/// `MAX_DISPATCH_FAILURES` consecutive failures the task parks as Blocked so it
+/// stops consuming the loop.
+fn release_failed_claim(d: &Daemon, task: &Task, error: &str) -> Result<(), String> {
     const MAX_DISPATCH_FAILURES: u32 = 5;
-    mission_control::update_task(root, &task.id, |t| {
-        t.dispatch_failures += 1;
-        t.reporting_session = None;
-        if t.dispatch_failures >= MAX_DISPATCH_FAILURES {
-            t.status = TaskStatus::Blocked;
-            t.notifications.push(NotificationMarker {
-                target: "mission_control".to_string(),
-                kind: "blocked".to_string(),
-                message: format!("dispatch failed {} times: {error}", t.dispatch_failures),
-                delivered: false,
-            });
-        } else {
-            t.status = TaskStatus::Pending;
+    let now = chrono::Utc::now().to_rfc3339();
+    d.store
+        .update_task_in(&task.id, &now, |t| {
+            t.dispatch_failures += 1;
+            t.reporting_session = None;
+            if t.dispatch_failures >= MAX_DISPATCH_FAILURES {
+                t.status = TaskStatus::Blocked;
+                t.notifications.push(NotificationMarker {
+                    target: "mission_control".to_string(),
+                    kind: "blocked".to_string(),
+                    message: format!("dispatch failed {} times: {error}", t.dispatch_failures),
+                    delivered: false,
+                });
+            } else {
+                t.status = TaskStatus::Todo;
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Deserialize)]
+struct AgentBuildReq {
+    prompt: String,
+}
+
+async fn build_agent_from_prompt(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<AgentBuildReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let prompt = req.prompt.trim();
+    if prompt.len() < 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "prompt must describe the desired agent",
+        )
+            .into_response();
+    }
+    let root = &d.mission_control_root;
+    // Agent builds are routed through the dedicated MC session. Ensure that
+    // session is materialized before creating the task, including on a fresh
+    // daemon where the user has not opened Mission Control yet.
+    let _ = mission_control_open(
+        State(d.clone()),
+        Query(a.clone()),
+        Json(MissionOpenReq { profile: None }),
+    )
+    .await;
+    if mission_control::get_session(root, crate::mission_control::SESSION_ID).is_err() {
+        if let Err(error) = mission_control::create_session(
+            root,
+            crate::mission_control::SESSION_ID,
+            "Mission Control",
+            &crate::mission_control::workspace_path(),
+        ) {
+            return mission_error(format!("initialize Mission Control session: {error}"));
         }
-    })
-    .map(|_| ())
+    }
+    let session_id = crate::mission_control::SESSION_ID;
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let title = "Build specialized agent";
+    let description = format!(
+        concat!(
+            "Build a specialized agent from this user brief:\n\n{}\n\n",
+            "[AGENT_BUILD_JOB — not a project or workspace request]\n",
+            "You are the agent builder. Do not create a project, do not create a new Mission Control session, do not ask the user to choose or confirm a folder, and do not route this request as ordinary work. Build the agent directly from the brief.\n",
+            "Build the shared specialized-session path first: every specialized agent receives the established session system prompt plus a researched, bounded identity.md overlay. Keep scheduling, turn-taking, handoffs, and state in shared runtime code; do not create per-agent role modules or runtime.json. Then create the durable agent home under ~/.snippet/agents/<agent-id>/ and write identity.md. That markdown is the agent's whole identity — there is no profile or identity JSON to write, and the directory entry is recorded by registration. Tools are only narrow executable boundaries such as shell, third-party API, MCP, or vault-backed operations; do not emit workflow helpers as tools. Use web_search/web_read for research only when those schemas are present. Do not execute generated tools.\n",
+            "When finished, report the exact agent id, shared-session validation, files created, research sources, executable tool proposals, and blockers. Call report_mission_task with the final result. If the brief is insufficient, make sensible defaults rather than asking a workspace question."
+        ),
+        prompt
+    );
+    // The task lands in the SQLite store with the rest of coordination. It used
+    // to be written to the JSON store while the dispatch path claimed from
+    // SQLite, so this build could never actually dispatch.
+    let task = Task::dispatched_to(
+        task_id,
+        session_id.to_string(),
+        title.to_string(),
+        description,
+        Vec::new(),
+        HandoffMode::Resume,
+        "agent",
+        crate::mission_control::SESSION_ID,
+        chrono::Utc::now().to_rfc3339(),
+    );
+    if let Err(error) = d.store.create_task(&task) {
+        return mission_error(error.to_string());
+    }
+    match dispatch_mission_task(&d, &task.id).await {
+        Ok(task) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "build_id": task.id,
+                "status": format!("{:?}", task.status).to_lowercase(),
+                "task_id": task.id,
+            })),
+        )
+            .into_response(),
+        Err(error) => mission_error(error),
+    }
 }
 
 async fn mission_control_create_task(
@@ -3329,36 +5002,41 @@ async fn mission_control_create_task(
         Err(error) => return mission_error(error),
     };
     let id = uuid::Uuid::new_v4().to_string();
-    let task = match mission_control::create_task(
-        root,
-        &id,
-        &req.session_id,
-        req.title.trim(),
-        req.description.trim(),
+    let task = crate::coordination::Task::dispatched_to(
+        id,
+        req.session_id.clone(),
+        req.title.trim().to_string(),
+        req.description.trim().to_string(),
         owned_paths,
-    ) {
-        Ok(task) => task,
-        Err(error) => return mission_error(error),
-    };
+        HandoffMode::Resume,
+        "mission-control",
+        "mission-control",
+        chrono::Utc::now().to_rfc3339(),
+    );
+    if let Err(error) = d.store.create_task(&task) {
+        return mission_error(error.to_string());
+    }
     let task = if req.status.as_deref() == Some("pending") {
         task
     } else {
         match dispatch_mission_task(&d, &task.id).await {
             Ok(task) => task,
-            Err(error) => match mission_control::update_task(root, &task.id, |task| {
-                task.status = TaskStatus::Blocked;
-                task.reporting_session = None;
-                task.notifications
-                    .push(mission_control::NotificationMarker {
+            Err(error) => {
+                let now = chrono::Utc::now().to_rfc3339();
+                match d.store.update_task_in(&task.id, &now, |task| {
+                    task.status = TaskStatus::Blocked;
+                    task.reporting_session = None;
+                    task.notifications.push(NotificationMarker {
                         target: "mission_control".to_string(),
                         kind: "blocked".to_string(),
                         message: error,
                         delivered: false,
                     });
-            }) {
-                Ok(task) => task,
-                Err(error) => return mission_error(error),
-            },
+                }) {
+                    Ok(task) => task,
+                    Err(error) => return mission_error(error.to_string()),
+                }
+            }
         }
     };
     Json(mission_task_view(&task)).into_response()
@@ -3377,9 +5055,13 @@ async fn mission_control_update_task(
     // Resolve the existing task up-front so owned-path updates can be
     // validated against the *effective* target session's workspace: the
     // session named in the request when retargeting, else the current one.
-    let existing = match mission_control::get_task(root, &id) {
-        Ok(task) => task,
-        Err(error) => return mission_error(error),
+    // Read the task from the SQLite store — the same store the dispatch path
+    // claims from. Reading the JSON store here meant an update could target a
+    // record the dispatcher never saw.
+    let existing = match d.store.get_task(&id) {
+        Ok(Some(task)) => task,
+        Ok(None) => return mission_error("unknown task".to_string()),
+        Err(error) => return mission_error(error.to_string()),
     };
     let effective_session_id = if req.session_id.trim().is_empty() {
         existing.session_id.clone()
@@ -3404,7 +5086,7 @@ async fn mission_control_update_task(
     let status = req.status.as_deref().and_then(task_status);
     let handoff_mode = match req.handoff_mode.as_deref() {
         None => None,
-        Some(mode_raw) => match mission_control::HandoffMode::parse(mode_raw) {
+        Some(mode_raw) => match HandoffMode::parse(mode_raw) {
             Some(mode) => Some(mode),
             None => {
                 return mission_error(format!(
@@ -3413,39 +5095,43 @@ async fn mission_control_update_task(
             }
         },
     };
-    let updated = mission_control::update_task(root, &id, |task| {
-        if !req.title.trim().is_empty() {
-            task.title = req.title.trim().to_string();
-        }
-        if !req.description.trim().is_empty() {
-            task.description = req.description.trim().to_string();
-        }
-        if !req.session_id.trim().is_empty() && req.session_id.trim() != existing.session_id {
-            task.session_id = req.session_id.trim().to_string();
-            task.reporting_session = None; // re-bind on retarget
-        }
-        if let Some(paths) = &validated_paths {
-            task.owned_paths = paths.clone();
-        }
-        if let Some(mode) = handoff_mode {
-            task.handoff_mode = mode;
-        }
-        if let Some(status) = status {
-            task.status = status;
-            if status.is_terminal() || status == TaskStatus::Blocked {
-                task.reporting_session = None;
+    let updated = d
+        .store
+        .update_task_in(&id, &chrono::Utc::now().to_rfc3339(), |task| {
+            if !req.title.trim().is_empty() {
+                task.title = req.title.trim().to_string();
             }
-        }
-    });
+            if !req.description.trim().is_empty() {
+                task.description = req.description.trim().to_string();
+            }
+            if !req.session_id.trim().is_empty() && req.session_id.trim() != existing.session_id {
+                task.session_id = req.session_id.trim().to_string();
+                task.reporting_session = None; // re-bind on retarget
+            }
+            if let Some(paths) = &validated_paths {
+                task.owned_paths = paths.clone();
+            }
+            if let Some(mode) = handoff_mode {
+                task.handoff_mode = mode;
+            }
+            if let Some(status) = status {
+                // Read the flags BEFORE the move: `task.status = status`
+                // consumes it, and `status.is_terminal()` would then borrow a
+                // moved value.
+                let clears_binding = status.is_terminal() || status == TaskStatus::Blocked;
+                task.status = status;
+                if clears_binding {
+                    task.reporting_session = None;
+                }
+            }
+        });
     match updated {
-        Ok(task) if task.status == TaskStatus::Pending => {
-            match dispatch_mission_task(&d, &id).await {
-                Ok(task) => Json(mission_task_view(&task)).into_response(),
-                Err(error) => mission_error(error),
-            }
-        }
+        Ok(task) if task.status == TaskStatus::Todo => match dispatch_mission_task(&d, &id).await {
+            Ok(task) => Json(mission_task_view(&task)).into_response(),
+            Err(error) => mission_error(error),
+        },
         Ok(task) => Json(mission_task_view(&task)).into_response(),
-        Err(error) => mission_error(error),
+        Err(error) => mission_error(error.to_string()),
     }
 }
 
@@ -3457,17 +5143,17 @@ async fn mission_control_archive_task(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    match mission_control::complete_task(
-        &d.mission_control_root,
+    match d.store.complete_task(
         &id,
         TaskStatus::Cancelled,
-        mission_control::TaskResult {
+        TaskResult {
             summary: "Archived by Mission Control.".to_string(),
             ..Default::default()
         },
+        &chrono::Utc::now().to_rfc3339(),
     ) {
         Ok(task) => Json(mission_task_view(&task)).into_response(),
-        Err(error) => mission_error(error),
+        Err(error) => mission_error(error.to_string()),
     }
 }
 
@@ -3479,7 +5165,7 @@ async fn mission_control_sessions(
         return unauthorized();
     }
     let root = &d.mission_control_root;
-    let tasks = mission_control::list_tasks(root, None, None).unwrap_or_default();
+    let tasks = d.store.list_tasks(None, None).unwrap_or_default();
     match mission_control::list_sessions(root, false) {
         Ok(sessions) => Json(
             sessions
@@ -3637,7 +5323,13 @@ async fn mission_control_open(
         .profile
         .clone()
         .or_else(|| read_session_profile(&state_path));
-    write_session_role(&state_path, "mission_control");
+    write_session_sidecar(
+        &state_path,
+        &SessionSidecar {
+            role: SessionRole::MissionControl,
+            agent_id: None,
+        },
+    );
     let cfg = {
         let config = d.config.lock().unwrap();
         let mut workspace = config.for_workspace(home.clone());
@@ -3671,28 +5363,95 @@ async fn mission_control_open(
     Json(serde_json::json!({ "id": id, "folder": home })).into_response()
 }
 
-/// Persist the MC session id next to the session's state file so a daemon
-/// restart can resume it with the Mission Control role (prompt + tools +
-/// lane restrictions) instead of silently downgrading it to an ordinary
-/// conversation session.
-const MC_ROLE_SIDECAR_SUFFIX: &str = ".role";
+// The session role sidecar lives in `session.rs`: it is written by the daemon
+// and READ by the session list, so it cannot belong to either one. This module
+// used to own it and hand-parse the grammar, which is how the reader here and
+// the reader in `session.rs` came to disagree.
 
-fn write_session_role(state_path: &std::path::Path, role: &str) {
-    let sidecar = PathBuf::from(format!("{}{MC_ROLE_SIDECAR_SUFFIX}", state_path.display()));
-    if let Some(parent) = sidecar.parent() {
-        let _ = std::fs::create_dir_all(parent);
+/// Give the built-in agents a directory row so a peer can ADDRESS them.
+///
+/// Both built-ins are registered here, and the distinction between them is the
+/// point: Mission Control is the coordinator that dispatches work; `snippet` is
+/// the general coding agent that work is dispatched TO by default. They are two
+/// identities, not one identity with a fallback.
+///
+/// A row alone is not enough for `snippet`: a turn is held by an agent identity,
+/// and `ensure_agent_session` refuses an agent with no identity home, so the home
+/// is materialized here too. Without it the default agent could be named and
+/// assigned to but never actually start.
+///
+/// Idempotent by construction — this runs on every boot, so it uses
+/// `upsert_agent` (a plain INSERT would fail the primary key on the second
+/// start) and `ensure_layout` (which only writes a home that is missing).
+fn register_builtin_agents(d: &Shared) {
+    let coordinator = crate::coordination::types::Agent {
+        id: crate::mission_control::SESSION_ID.to_string(),
+        display_name: "Mission Control".into(),
+        handle: "mission-control".into(),
+        kind: crate::coordination::types::AgentKind::MissionControl,
+        status: crate::coordination::types::AgentStatus::Active,
+        role: crate::coordination::types::AgentRole::Coordinator,
+        capabilities: vec![
+            "orchestration".into(),
+            "agent-directory".into(),
+            "task-dispatch".into(),
+        ],
+    };
+    let default_worker = crate::coordination::types::Agent {
+        id: crate::coordination::SNIPPET_AGENT_ID.to_string(),
+        display_name: "Snippet".into(),
+        handle: "snippet".into(),
+        kind: crate::coordination::types::AgentKind::Worker,
+        status: crate::coordination::types::AgentStatus::Active,
+        role: crate::coordination::types::AgentRole::Implementer,
+        capabilities: vec![
+            "coding".into(),
+            "bash".into(),
+            "files".into(),
+            "web-search".into(),
+        ],
+    };
+    for agent in [&coordinator, &default_worker] {
+        // The default worker needs a home before it can hold a turn; the
+        // coordinator works through the board and never takes one.
+        if agent.id == crate::coordination::SNIPPET_AGENT_ID {
+            let home = match crate::coordination::AgentHome::new(
+                crate::coordination::agents_root(&d.mission_control_root),
+                &agent.id,
+            ) {
+                Ok(home) => home,
+                Err(error) => {
+                    eprintln!(
+                        "[coordination] invalid built-in agent id `{}`: {error}",
+                        agent.id
+                    );
+                    continue;
+                }
+            };
+            let identity = "# Snippet\n\nYou are Snippet, the general coding agent. You own work \
+                            end to end: read the relevant code before you change it, make the \
+                            smallest change that achieves the goal, and verify it with the \
+                            narrowest check that proves it.\n\nThis identity is the default. \
+                            Mission Control dispatches work here unless a user names a more \
+                            specialized agent.\n";
+            if let Err(error) = home.ensure_layout(identity) {
+                eprintln!(
+                    "[coordination] could not create the home for agent `{}`: {error}",
+                    agent.id
+                );
+                continue;
+            }
+        }
+        if let Err(error) = d.store.upsert_agent(agent) {
+            // A failure here must not stop the daemon: the board and sessions work
+            // without the directory row. The agent just cannot be addressed until
+            // the next successful boot.
+            eprintln!(
+                "[coordination] could not register agent `{}`: {error}",
+                agent.id
+            );
+        }
     }
-    let _ = std::fs::write(sidecar, role);
-}
-
-pub fn read_session_role(state_path: &std::path::Path) -> Option<String> {
-    let raw = std::fs::read_to_string(PathBuf::from(format!(
-        "{}{MC_ROLE_SIDECAR_SUFFIX}",
-        state_path.display()
-    )))
-    .ok()?;
-    let role = raw.trim().to_string();
-    (!role.is_empty()).then_some(role)
 }
 
 /// Dispatch loop: claims and delivers every Pending task, then re-queues any
@@ -3700,10 +5459,12 @@ pub fn read_session_role(state_path: &std::path::Path) -> Option<String> {
 /// back with a retry counter; at the ceiling the task parks as Blocked.
 async fn mission_control_dispatch_loop(daemon: Shared) {
     loop {
-        let root = &daemon.mission_control_root;
-        let _ = mission_control::unblock_ready_tasks(root);
-        let tasks =
-            mission_control::list_tasks(root, None, Some(TaskStatus::Pending)).unwrap_or_default();
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = daemon.store.unblock_ready_tasks(&now);
+        let tasks = daemon
+            .store
+            .list_tasks(None, Some(&TaskStatus::Todo))
+            .unwrap_or_default();
         for task in tasks {
             if let Err(error) = dispatch_mission_task(&daemon, &task.id).await {
                 tracing_log_dispatch_failure(&task.id, &error);
@@ -3717,8 +5478,7 @@ async fn mission_control_dispatch_loop(daemon: Shared) {
 /// Worker `report_mission_task` only writes the JSON store. Push undelivered
 /// markers into the Mission Control conversation so the user sees the result.
 async fn deliver_mission_control_reports(daemon: &Daemon) {
-    let root = &daemon.mission_control_root;
-    let Ok(tasks) = mission_control::list_tasks(root, None, None) else {
+    let Ok(tasks) = daemon.store.list_tasks(None, None) else {
         return;
     };
     for task in tasks {
@@ -3728,18 +5488,18 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
             }
             let text = format!(
                 "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]",
-                task.id,
-                task.title,
-                marker.kind,
-                marker.message
+                task.id, task.title, marker.kind, marker.message
             );
             daemon
-                .deliver(
-                    mission_control::SESSION_ID,
-                    LoopInput::UserMessage(text),
-                )
+                .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))
                 .await;
-            let _ = mission_control::mark_notification_delivered(root, &task.id, index);
+            let _ = daemon
+                .store
+                .update_task_in(&task.id, &chrono::Utc::now().to_rfc3339(), |t| {
+                    if let Some(n) = t.notifications.get_mut(index) {
+                        n.delivered = true;
+                    }
+                });
         }
     }
 }
@@ -3781,10 +5541,7 @@ fn session_busy_for_recurring(id: &str) -> bool {
     let Some(sp) = state_path_for_id(id) else {
         return false;
     };
-    let Ok(bytes) = std::fs::read(&sp) else {
-        return false;
-    };
-    let Ok(state) = deserialize_state(&bytes) else {
+    let Some(state) = read_session_state(&sp) else {
         return false;
     };
     recurring::session_is_busy(&status_str(state.status))
@@ -3811,8 +5568,7 @@ async fn recurring_tick_loop(daemon: Shared) {
                 continue;
             }
             let workspace = state_path_for_id(&job.session_id)
-                .and_then(|sp| std::fs::read(&sp).ok())
-                .and_then(|bytes| deserialize_state(&bytes).ok())
+                .and_then(|sp| read_session_state(&sp))
                 .map(|s| PathBuf::from(s.workspace))
                 .filter(|p| p.is_dir());
             match job.render_goal(workspace.as_deref()) {
@@ -3884,15 +5640,6 @@ struct RecurringUpdateReq {
     enabled: Option<bool>,
 }
 
-fn emit_recurring_event(action: &str, job_id: &str, session: Option<&str>) {
-    crate::session::emit_device_event(serde_json::json!({
-        "kind": "recurring",
-        "action": action,
-        "job_id": job_id,
-        "session": session.unwrap_or(""),
-    }));
-}
-
 async fn create_recurring(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -3908,7 +5655,9 @@ async fn create_recurring(
     let delivery = match req.delivery.as_deref() {
         None | Some("") | Some("goal") => recurring::Delivery::Goal,
         Some("message") => recurring::Delivery::Message,
-        Some(other) => return mission_error(format!("delivery must be goal or message, got `{other}`")),
+        Some(other) => {
+            return mission_error(format!("delivery must be goal or message, got `{other}`"));
+        }
     };
     match recurring::create_job_with(
         &d.recurring_root,
@@ -3920,9 +5669,8 @@ async fn create_recurring(
         delivery,
     ) {
         Ok(job) => {
-            emit_recurring_event("created", &job.id, Some(&job.session_id));
             Json(job).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
@@ -3992,9 +5740,8 @@ async fn update_recurring(
         }
     }) {
         Ok(job) => {
-            emit_recurring_event("updated", &job.id, Some(&job.session_id));
             Json(job).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }
@@ -4009,9 +5756,8 @@ async fn delete_recurring(
     }
     match recurring::delete_job(&d.recurring_root, &id) {
         Ok(()) => {
-            emit_recurring_event("deleted", &id, None);
             Json(serde_json::json!({ "ok": true })).into_response()
-        },
+        }
         Err(error) => mission_error(error),
     }
 }

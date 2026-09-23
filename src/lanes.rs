@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::harness::{CodingHarness, HarnessConfig};
 use crate::lane_log::LaneLog;
 use crate::llm::AgentModel;
-use crate::prompts::coding_system_prompt;
+use crate::prompts::{PromptContext, coding_prompt};
 use crate::tools::ToolContext;
 use crate::tools::coding_tools;
 
@@ -626,7 +626,12 @@ async fn run_lane(
     }
     let harness = CodingHarness::new(
         HarnessConfig {
-            system_prompt: coding_system_prompt(),
+            system_prompt: coding_prompt(&PromptContext::detect(
+                &workspace_for_grounding,
+                true,
+                false,
+                false,
+            )),
             state_path: Some(state_path),
             resume,
             exa_api_key,

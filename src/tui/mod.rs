@@ -83,6 +83,20 @@ struct PendingSidecarAttach {
     resume: bool,
 }
 
+/// A session mutation the picker asked for, to be sent to the daemon on the next
+/// tick.
+///
+/// `handle_key` is synchronous and the daemon call is not, so the key handler
+/// records the intent here and the async tick performs it. The daemon owns every
+/// session, so routing delete/rename through it is what keeps the store row, its
+/// messages, and its events consistent — a file-only delete leaves a migrated
+/// conversation readable.
+#[derive(Debug, Clone)]
+enum PendingSessionOp {
+    Delete { session_id: String },
+    Rename { session_id: String, title: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiOptions {
     pub config_path: PathBuf,
@@ -154,24 +168,35 @@ impl ExitInfo {
     }
 }
 
-/// A real conversation state file: `<name>.json`, but NOT the `<name>.meta.json`
-/// sidecar (`Path::extension` of `foo.meta.json` is still `json`). Sidecars are
-/// written after every persist, so treating them as sessions made the resume
-/// picker list phantoms — and resuming one wrote real state over the sidecar.
-fn is_conversation_json(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("json")
-        && path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| !s.ends_with(".meta"))
-            .unwrap_or(false)
+/// "just now" / "5m ago" / "3h ago" / "2d ago" from a last-active stamp.
+///
+/// One definition: the disk walk and the daemon catalog both label entries with
+/// it, and two copies would drift on the boundary rounding.
+fn relative_age(last_active: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(last_active);
+    let secs = now.saturating_sub(last_active).max(0) as u64;
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
-fn unix_secs_to_system_time(secs: i64) -> std::time::SystemTime {
-    if secs <= 0 {
-        return std::time::SystemTime::UNIX_EPOCH;
+/// Clip a label to 40 chars with an ellipsis, so a long title cannot push the
+/// picker's layout around.
+fn shorten(desc: String) -> String {
+    if desc.chars().count() > 40 {
+        format!("{}...", desc.chars().take(37).collect::<String>())
+    } else {
+        desc
     }
-    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
 }
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -450,6 +475,15 @@ struct App {
     /// made the picker laggy at scale. Populated on picker open, refreshed after
     /// rename/delete, dropped on close.
     conv_cache: Option<Vec<(String, String)>>,
+    /// The daemon's session catalog for this workspace, refreshed periodically.
+    ///
+    /// The picker renders from this rather than walking the filesystem: the
+    /// daemon owns sessions, and a migrated conversation has no state file at
+    /// all, so a directory walk would leave it out of the list entirely.
+    daemon_sessions: Option<Vec<crate::serve::sidecar::SessionRow>>,
+    daemon_sessions_refresh:
+        Option<tokio::task::JoinHandle<Result<Vec<crate::serve::sidecar::SessionRow>, String>>>,
+    daemon_sessions_refreshed_at: Option<std::time::Instant>,
     /// Account-wide ChatGPT usage (read from the shared sidecar), shown globally
     /// whenever signed in — not tied to the active chat's own last request.
     global_usage: Option<crate::llm::RateLimitSnapshot>,
@@ -482,7 +516,10 @@ struct App {
         Option<tokio::task::JoinHandle<Result<crate::xai_auth::DeviceCodeInfo, String>>>,
     models_fetch_status: String,
     original_config: Option<crate::config::SnippetConfig>,
-    last_state_modified: Option<std::time::SystemTime>,
+    /// Change-detector for the active session's state, taken from the state
+    /// itself rather than the file's mtime — a session in the database has no
+    /// file to stat, so mtime would never change and the view would never update.
+    last_state_stamp: Option<(String, usize)>,
     /// When true, the compact inline model-connect form is shown and owns key
     /// input. It edits the shared `form_*` state.
     login_active: bool,
@@ -507,6 +544,9 @@ struct App {
     sidecar_attach: Option<crate::serve::sidecar::SidecarAttach>,
     /// Set by `spawn_loop` in sidecar mode; consumed by `ensure_sidecar_attached`.
     pending_sidecar_attach: Option<PendingSidecarAttach>,
+    /// A session mutation requested from the picker, performed on the next tick
+    /// (the key handler is sync; the daemon call is not).
+    pending_session_op: Option<PendingSessionOp>,
     /// Interactive session PTYs (daemon-owned). Rendered when `screen == Term`.
     term_panes: Vec<TermPane>,
     term_focus: usize,
@@ -592,6 +632,9 @@ impl App {
             sent_turn_pending: false,
             effective_model: (String::new(), String::new()),
             conv_cache: None,
+            daemon_sessions: None,
+            daemon_sessions_refresh: None,
+            daemon_sessions_refreshed_at: None,
             global_usage: None,
             was_busy: false,
             form_provider: String::new(),
@@ -616,7 +659,7 @@ impl App {
             models_fetch_status: String::new(),
             update_notice: std::sync::Arc::new(std::sync::Mutex::new(None)),
             original_config: None,
-            last_state_modified: None,
+            last_state_stamp: None,
             login_active: false,
             q_index: 0,
             q_sel: 0,
@@ -626,6 +669,7 @@ impl App {
             sidecar: None,
             sidecar_attach: None,
             pending_sidecar_attach: None,
+            pending_session_op: None,
             term_panes: Vec::new(),
             term_focus: 0,
             connecting_phase: Some("Looking for local serve…".to_string()),
@@ -875,154 +919,240 @@ impl App {
         dir
     }
 
-    fn find_last_active_conversation(&self) -> Option<String> {
-        let dir = self.conversations_dir();
-        let mut best_path: Option<PathBuf> = None;
-        let mut best_time: i64 = i64::MIN;
-
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if is_conversation_json(&path) {
-                    let t = crate::session::session_last_active(&path);
-                    if t > best_time {
-                        best_time = t;
-                        best_path = Some(path);
-                    }
-                }
-            }
+    /// The state path a picker entry names.
+    ///
+    /// `default` is the workspace-root state; anything else is a saved
+    /// conversation under `conversations/`. THE one mapping — `switch_conversation`
+    /// and the delete/rename paths all need it, and a drift between them would
+    /// mutate a different session than the one the user selected.
+    fn state_path_for_conversation(&self, name: &str) -> PathBuf {
+        if name == "default" {
+            self.options.config.state_path.clone()
+        } else {
+            self.conversations_dir().join(format!("{name}.json"))
         }
-
-        // Also check default state_path if it exists
-        let default_path = &self.options.config.state_path;
-        if default_path.exists() {
-            let t = crate::session::session_last_active(default_path);
-            if t > best_time {
-                best_path = Some(default_path.clone());
-            }
-        }
-
-        best_path.and_then(|p| {
-            if p == *default_path {
-                Some("default".to_string())
-            } else {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-            }
-        })
     }
 
-    /// Delete a saved conversation file + its metadata sidecar (resume picker `d`).
-    fn delete_conversation(&self, name: &str) {
-        let path = self.conversations_dir().join(format!("{name}.json"));
+    /// The conversation this workspace was last used in.
+    ///
+    /// Read from the store, which is the only inventory: a filesystem walk would
+    /// miss every session that has no state file, which is all of them.
+    fn find_last_active_conversation(&self) -> Option<String> {
+        let default_id = crate::session::session_id_for_state_path(
+            &self.options.config.state_path,
+        );
+        let folder = self.options.config.workspace.clone();
+        crate::session::list_device_sessions()
+            .into_iter()
+            .filter(|s| s.folder == folder)
+            .max_by_key(|s| s.last_active)
+            .map(|s| {
+                if s.id == default_id {
+                    "default".to_string()
+                } else {
+                    s.conversation
+                }
+            })
+    }
+
+    /// Delete a saved conversation (resume picker `d`).
+    ///
+    /// Queues the mutation for the next tick when a daemon is available: the
+    /// daemon owns every session, so routing through it keeps the store row and
+    /// its messages/events consistent — deleting files alone leaves a migrated
+    /// conversation readable. Falls back to the local delete with no daemon.
+    fn delete_conversation(&mut self, name: &str) {
+        if self.sidecar.is_some() {
+            let session_id = self.session_id_for(name);
+            // Drop it from the catalog now. The op is deferred to the next tick,
+            // so without this the entry the user just deleted keeps rendering
+            // until the daemon round-trip lands.
+            self.forget_session(&session_id);
+            self.pending_session_op = Some(PendingSessionOp::Delete { session_id });
+            return;
+        }
+        let path = self.state_path_for_conversation(name);
         crate::session::remove_session_files(&path);
     }
 
     /// Set a saved conversation's title override (resume picker `r`).
-    fn rename_conversation(&self, name: &str, title: &str) {
-        let path = self.conversations_dir().join(format!("{name}.json"));
+    fn rename_conversation(&mut self, name: &str, title: &str) {
+        if self.sidecar.is_some() {
+            let session_id = self.session_id_for(name);
+            if let Some(rows) = self.daemon_sessions.as_mut()
+                && let Some(row) = rows.iter_mut().find(|s| s.id == session_id)
+            {
+                row.title = title.to_string();
+            }
+            self.pending_session_op = Some(PendingSessionOp::Rename {
+                session_id,
+                title: title.to_string(),
+            });
+            return;
+        }
+        let path = self.state_path_for_conversation(name);
         let _ = crate::session::set_session_title(&path, title);
     }
 
+    /// Drop one session from the cached catalog, so a queued mutation renders
+    /// immediately instead of after the next daemon refresh.
+    fn forget_session(&mut self, session_id: &str) {
+        if let Some(rows) = self.daemon_sessions.as_mut() {
+            rows.retain(|s| s.id != session_id);
+        }
+    }
+
+    /// The daemon's session id for a picker entry.
+    ///
+    /// The picker speaks in conversation names; the API speaks in session ids
+    /// (path relative to the workspaces root). Derived from the same path helper
+    /// the picker uses, so the two can never disagree about which session it is.
+    fn session_id_for(&self, name: &str) -> String {
+        crate::session::session_id_for_state_path(&self.state_path_for_conversation(name))
+    }
+
+    /// Perform a picker mutation through the daemon.
+    ///
+    /// The key handler is synchronous and the daemon call is not, so the intent is
+    /// recorded there and run here. On success the catalog is re-fetched so the
+    /// picker reflects the change on its next frame instead of after the next
+    /// unrelated refresh.
+    async fn apply_pending_session_op(&mut self) {
+        let Some(op) = self.pending_session_op.take() else {
+            return;
+        };
+        let Some(info) = self.sidecar.clone() else {
+            return;
+        };
+        let result = match &op {
+            PendingSessionOp::Delete { session_id } => {
+                crate::serve::sidecar::delete_session(&info, session_id).await
+            }
+            PendingSessionOp::Rename { session_id, title } => {
+                crate::serve::sidecar::rename_session(&info, session_id, title).await
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.refresh_daemon_sessions(true).await;
+                // Drop the picker snapshot so it rebuilds from the fresh catalog.
+                self.conv_cache = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
     fn list_conversations(&self) -> Vec<(String, String)> {
-        let dir = self.conversations_dir();
-        let mut list = Vec::new();
-
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if is_conversation_json(&path) {
-                    let name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if name.is_empty() || name == "default" {
-                        continue;
+        // The daemon is the source of truth for the catalog. A migrated
+        // conversation has no state file, so walking the directory below would
+        // silently omit it — the picker would show a subset of what exists.
+        if let Some(rows) = self.daemon_sessions.as_ref() {
+            let mut list: Vec<(String, String, i64)> = rows
+                .iter()
+                .filter(|s| {
+                    if s.conversation.is_empty() {
+                        return false;
                     }
-
-                    let mut desc = "empty session".to_string();
-                    let mod_time =
-                        unix_secs_to_system_time(crate::session::session_last_active(&path));
-
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        if let Ok(state) = crate::harness::deserialize_state(&bytes) {
-                            if let Some(t) = state
-                                .title
-                                .as_deref()
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                            {
-                                desc = t.to_string();
-                            }
-                        }
-                    }
-
-                    let duration = std::time::SystemTime::now()
-                        .duration_since(mod_time)
-                        .unwrap_or_default();
-                    let relative = if duration.as_secs() < 60 {
-                        "just now".to_string()
-                    } else if duration.as_secs() < 3600 {
-                        format!("{}m ago", duration.as_secs() / 60)
-                    } else if duration.as_secs() < 86400 {
-                        format!("{}h ago", duration.as_secs() / 3600)
+                    // Every workspace has a root `default` state, but the disk
+                    // walk only surfaces it once it has content — otherwise a
+                    // fresh folder shows a phantom "default session" with
+                    // nothing to resume into. Match that: a titled root state
+                    // means someone has actually used it.
+                    s.conversation != "default" || !s.title.trim().is_empty()
+                })
+                .map(|s| {
+                    let desc = if s.title.trim().is_empty() {
+                        "empty session".to_string()
                     } else {
-                        format!("{}d ago", duration.as_secs() / 86400)
+                        s.title.trim().to_string()
                     };
-
-                    list.push((name, desc, mod_time, relative));
-                }
-            }
+                    (s.conversation.clone(), desc, s.last_active)
+                })
+                .collect();
+            list.sort_by(|a, b| b.2.cmp(&a.2));
+            return list
+                .into_iter()
+                .map(|(name, desc, last_active)| {
+                    (
+                        name,
+                        format!("({}) — {}", relative_age(last_active), shorten(desc)),
+                    )
+                })
+                .collect();
         }
-
-        let default_path = &self.options.config.state_path;
-        if default_path.exists() {
-            let mut desc = "default session".to_string();
-            let mod_time =
-                unix_secs_to_system_time(crate::session::session_last_active(default_path));
-            // Skip a contentless default state — a fresh install otherwise shows a
-            // phantom "default session" entry with nothing to resume into.
-            let mut has_content = false;
-            if let Ok(bytes) = std::fs::read(default_path) {
-                if let Ok(state) = crate::harness::deserialize_state(&bytes) {
-                    has_content = state.title.as_deref().is_some_and(|t| !t.trim().is_empty())
-                        || !state.events.is_empty();
-                    if let Some(title) = state.title.as_deref().filter(|t| !t.trim().is_empty()) {
-                        desc = title.to_string();
-                    }
+        // No daemon catalog yet: build the same list straight from the store, so
+        // the picker shows real sessions instead of an empty directory walk.
+        let mut list: Vec<(String, String, i64)> = crate::session::list_device_sessions()
+            .into_iter()
+            .filter(|s| {
+                if s.conversation.is_empty() {
+                    return false;
                 }
-            }
-            if has_content {
-                let duration = std::time::SystemTime::now()
-                    .duration_since(mod_time)
-                    .unwrap_or_default();
-                let relative = if duration.as_secs() < 60 {
-                    "just now".to_string()
-                } else if duration.as_secs() < 3600 {
-                    format!("{}m ago", duration.as_secs() / 60)
-                } else if duration.as_secs() < 86400 {
-                    format!("{}h ago", duration.as_secs() / 3600)
+                s.conversation != "default" || !s.title.trim().is_empty()
+            })
+            .map(|s| {
+                let desc = if s.title.trim().is_empty() {
+                    "empty session".to_string()
                 } else {
-                    format!("{}d ago", duration.as_secs() / 86400)
+                    s.title.trim().to_string()
                 };
-                list.push(("default".to_string(), desc, mod_time, relative));
-            }
-        }
-
+                (s.conversation, desc, s.last_active)
+            })
+            .collect();
         list.sort_by(|a, b| b.2.cmp(&a.2));
-
         list.into_iter()
-            .map(|(name, desc, _, relative)| {
-                let short_desc = if desc.chars().count() > 40 {
-                    format!("{}...", desc.chars().take(37).collect::<String>())
-                } else {
-                    desc
-                };
-                (name, format!("({}) — {}", relative, short_desc))
+            .map(|(name, desc, last_active)| {
+                (
+                    name,
+                    format!("({}) — {}", relative_age(last_active), shorten(desc)),
+                )
             })
             .collect()
+    }
+
+    /// Poll the daemon catalog without putting an HTTP round trip on the render
+    /// loop. A stalled local daemon must not make terminal input wait on a request.
+    async fn refresh_daemon_sessions(&mut self, force: bool) {
+        if self
+            .daemon_sessions_refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.is_finished())
+        {
+            let refresh = self
+                .daemon_sessions_refresh
+                .take()
+                .expect("checked is_some");
+            self.daemon_sessions_refreshed_at = Some(std::time::Instant::now());
+            if let Ok(Ok(rows)) = refresh.await {
+                self.daemon_sessions = Some(rows);
+            }
+        }
+
+        let Some(info) = self.sidecar.clone() else {
+            if let Some(refresh) = self.daemon_sessions_refresh.take() {
+                refresh.abort();
+            }
+            self.daemon_sessions = None;
+            self.daemon_sessions_refreshed_at = None;
+            return;
+        };
+
+        if force {
+            if let Some(refresh) = self.daemon_sessions_refresh.take() {
+                refresh.abort();
+            }
+        } else if self.daemon_sessions_refresh.is_some()
+            || self
+                .daemon_sessions_refreshed_at
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+
+        let folder = self.options.config.workspace.clone();
+        self.daemon_sessions_refresh = Some(tokio::spawn(async move {
+            crate::serve::sidecar::list_sessions(&info, Some(folder.as_path())).await
+        }));
     }
 
     fn open_checkpoint_picker(&mut self, action: CheckpointAction) {
@@ -1213,14 +1343,10 @@ impl App {
 
         // Update active_conversation and active_state_path
         self.active_conversation = name.to_string();
-        if name == "default" {
-            self.active_state_path = self.options.config.state_path.clone();
-        } else {
-            self.active_state_path = self.conversations_dir().join(format!("{}.json", name));
-        }
+        self.active_state_path = self.state_path_for_conversation(name);
 
         // Force a fresh state read for the new session's file.
-        self.last_state_modified = None;
+        self.last_state_stamp = None;
         self.state = None;
         self.scroll = 0;
         self.status = String::new();
@@ -1403,9 +1529,19 @@ impl App {
                     } else {
                         self.status = "No active goal.".to_string();
                     }
+                } else if rest.eq_ignore_ascii_case("resume")
+                    || rest.eq_ignore_ascii_case("continue")
+                {
+                    if self.agent_alive() {
+                        let _ = self.send_loop_input(LoopInput::ResumeGoal);
+                        self.status = "Resuming the paused goal…".to_string();
+                    } else {
+                        self.status = "No active session to resume the goal.".to_string();
+                    }
                 } else if rest.is_empty() {
                     self.status =
-                        "Usage: /goal <what to accomplish>   ·   /goal cancel".to_string();
+                        "Usage: /goal <what to accomplish>   ·   /goal resume   ·   /goal cancel"
+                            .to_string();
                 } else {
                     // The agent must be running to receive the goal; start it if idle.
                     if !self.agent_alive() {
@@ -3222,6 +3358,11 @@ impl App {
     async fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
         self.ensure_sidecar_attached().await;
+        // Keep the daemon's session catalog current. Without this the picker
+        // falls back to the disk walk, which cannot see a migrated conversation.
+        self.refresh_daemon_sessions(false).await;
+        // Then apply any picker mutation queued by a key handler.
+        self.apply_pending_session_op().await;
         // If the sidecar dropped, clear attachment so the next spawn can recover.
         if self
             .sidecar_attach
@@ -3501,51 +3642,36 @@ impl App {
             return;
         }
 
-        if let Ok(metadata) = tokio::fs::metadata(&self.active_state_path).await {
-            if let Ok(modified) = metadata.modified() {
-                if Some(modified) == self.last_state_modified {
-                    return;
-                }
-                self.last_state_modified = Some(modified);
-                // The persisted state has caught up with our optimistic send — from
-                // here the real status governs busy/idle (and the flush edge).
-                self.sent_turn_pending = false;
-                // A newer persisted state means the turn that was streaming has
-                // committed its text into events — drop the live buffer so the
-                // committed copy doesn't render twice.
-                crate::llm::StreamBuffer::clear(&self.stream);
-            }
-        } else {
+        // Fallback path: no live attach yet (daemon still coming up, or the
+        // attach failed). Read through the dual reader so a session in the
+        // database renders here too — reading the file directly would show a
+        // migrated conversation as empty.
+        //
+        // Change is detected from the state itself, not the file's mtime: a
+        // database-backed session has no file to stat, so mtime would never move
+        // and the view would freeze on its first paint.
+        let Some(state) = crate::session::read_session_state(&self.active_state_path) else {
             self.state = None;
-            self.last_state_modified = None;
+            self.last_state_stamp = None;
+            return;
+        };
+        let stamp = (
+            state.updated_at.clone(),
+            state.events.len() + state.messages.len(),
+        );
+        if Some(&stamp) == self.last_state_stamp.as_ref() {
             return;
         }
-
-        match tokio::fs::read(&self.active_state_path).await {
-            Ok(bytes) => match crate::harness::deserialize_state(&bytes) {
-                Ok(state) => {
-                    self.state = Some(state);
-                    self.prune_pending_steers();
-                }
-                // An unreadable file (e.g. saved by an older build) shouldn't pin a
-                // red error in the footer. Show the session empty; starting a new
-                // run overwrites it cleanly.
-                Err(_) => {
-                    self.state = None;
-                    self.status =
-                        "This session's saved state is unreadable — start a new task to replace it."
-                            .to_string();
-                }
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.state = None;
-                self.last_state_modified = None;
-            }
-            Err(error) => {
-                self.error = Some(format!("state read error: {error}"));
-                self.last_state_modified = None;
-            }
-        }
+        self.last_state_stamp = Some(stamp);
+        // The persisted state has caught up with our optimistic send — from
+        // here the real status governs busy/idle (and the flush edge).
+        self.sent_turn_pending = false;
+        // A newer persisted state means the turn that was streaming has
+        // committed its text into events — drop the live buffer so the
+        // committed copy doesn't render twice.
+        crate::llm::StreamBuffer::clear(&self.stream);
+        self.state = Some(state);
+        self.prune_pending_steers();
     }
 
     /// If a session attach is pending, open/attach it via the local serve daemon.
@@ -5056,7 +5182,7 @@ fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 /// One-line auth/endpoint status for a profile card.
-fn profile_status(cfg: &crate::config::ModelConfig) -> String {
+fn profile_status(cfg: &crate::config::InferenceProfileConfig) -> String {
     match cfg.provider.as_str() {
         "chatgpt" => {
             if crate::chatgpt_auth::is_signed_in() {
@@ -5646,11 +5772,6 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .unwrap_or(false);
 
     if !has_events {
-        let right_line = Line::from(vec![Span::styled("->9", Style::default().fg(faint()))]);
-        frame.render_widget(
-            Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
-            area,
-        );
         return;
     }
 
@@ -5662,18 +5783,10 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .filter(|title| !title.is_empty())
         .unwrap_or("snippet");
 
-    let left = vec![
-        Span::styled(
-            "☉ > ",
-            Style::default()
-                .fg(Color::Rgb(125, 207, 245))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            prompt_text,
-            Style::default().fg(text()).add_modifier(Modifier::BOLD),
-        ),
-    ];
+    let left = vec![Span::styled(
+        prompt_text,
+        Style::default().fg(text()).add_modifier(Modifier::BOLD),
+    )];
 
     let mut right: Vec<Span<'static>> = vec![Span::styled(
         format!("·  {model}"),
@@ -7074,4 +7187,181 @@ fn split_recur_prompt_and_plan(rest: &str) -> (String, Option<String>) {
         }
     }
     (rest.to_string(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// Build an `App` for rendering without a daemon.
+    ///
+    /// `App::new` is pure construction — no file, network or process IO — so it
+    /// is safe to call directly under `cargo test`. It does arm the connecting
+    /// overlay unconditionally and pick a random uuid conversation, so both are
+    /// normalised: the transcript is what a normal launch shows, and a fixed id
+    /// keeps the snapshot stable across runs.
+    fn tui_app() -> App {
+        let mut app = App::new(TuiOptions {
+            config_path: PathBuf::from("/nonexistent/config.toml"),
+            config: SnippetConfig::default(),
+            resume: None,
+        });
+        app.connecting_phase = None;
+        app.active_conversation = "tui-snapshot".to_string();
+        app
+    }
+
+    /// Render one frame and return it as rows of text.
+    ///
+    /// This is the TUI's equivalent of the Flutter golden harness: `TestBackend`
+    /// composites a real frame into a buffer, so the assertions below read what
+    /// the terminal would actually show rather than what the code intends.
+    fn snapshot(width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = tui_app();
+        terminal
+            .draw(|f| render(f, &mut app))
+            .expect("draw a frame");
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| {
+                        buf.cell((x, y))
+                            .map(|c| c.symbol())
+                            .unwrap_or(" ")
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The whole frame as one string, for "does it contain X" assertions.
+    fn frame_text(width: u16, height: u16) -> String {
+        snapshot(width, height).join("\n")
+    }
+
+    /// Print a frame so a human can read it: `cargo test -- --nocapture`.
+    #[test]
+    fn dump_frame_for_review() {
+        for row in snapshot(90, 24) {
+            println!("|{row}|");
+        }
+    }
+
+    /// The empty state is the first thing anyone sees, and it is composed almost
+    /// entirely of one long literal in `transcript.rs` — so a mangled or dropped
+    /// block of art is invisible to every other kind of test.
+    #[test]
+    fn empty_state_renders_its_artwork_and_status() {
+        let rows = snapshot(90, 24);
+        let frame = rows.join("\n");
+        for expected in [
+            "(  o.o  )",          // the mascot's eyes
+            "SNIPPET",            // the nameplate inside the mascot's box
+            "MATRIX PET",
+            "███████",            // the block-letter title
+            "workspace",          // the footer names the working folder
+            "gpt-4o",             // ...and the model
+        ] {
+            assert!(frame.contains(expected), "empty state is missing {expected:?}");
+        }
+        for stray in [
+            "t                                          T",
+            "G",
+            "g                                          g",
+            "t",
+        ] {
+            assert!(
+                rows.iter().all(|row| row.trim() != stray),
+                "empty state contains an orphan artwork row {stray:?}"
+            );
+        }
+    }
+
+    /// A model that is not connected is the one case the footer must not stay
+    /// quiet about: without it the screen is a silent prompt.
+    #[test]
+    fn the_disconnected_hint_is_shown() {
+        let frame = frame_text(90, 24);
+        assert!(
+            frame.contains("No model connected yet"),
+            "a disconnected TUI must say so; frame was:\n{frame}"
+        );
+    }
+
+    /// The header divider is what separates chrome from the transcript.
+    #[test]
+    fn the_header_divider_is_drawn() {
+        let rows = snapshot(90, 24);
+        assert!(
+            rows[1].contains('─'),
+            "row 2 should be the header rule, got {:?}",
+            rows[1]
+        );
+    }
+
+    /// Layout maths is where a TUI panics, and it panics only at the sizes nobody
+    /// runs by hand. Every one of these must render without unwinding.
+    #[test]
+    fn renders_at_many_sizes_without_panicking() {
+        for (w, h) in [
+            (40u16, 12u16),
+            (50, 20),
+            (80, 24),
+            (90, 30),
+            (120, 40),
+            (200, 60),
+        ] {
+            let rows = snapshot(w, h);
+            assert_eq!(rows.len(), h as usize, "height mismatch at {w}x{h}");
+            for row in &rows {
+                assert_eq!(
+                    row.chars().count(),
+                    w as usize,
+                    "width mismatch at {w}x{h}"
+                );
+            }
+        }
+    }
+
+    /// A resumed conversation renders the transcript instead of the welcome art,
+    /// so the two states are distinguishable by content.
+    #[test]
+    fn a_non_empty_conversation_drops_the_welcome_art() {
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::new(TuiOptions {
+            config_path: PathBuf::from("/nonexistent/config.toml"),
+            config: SnippetConfig::default(),
+            resume: Some("existing".to_string()),
+        });
+        app.connecting_phase = None;
+        // A real state with a message in it, so `empty` is false. Built by
+        // mutation, not struct-update syntax: `HarnessState` carries a private
+        // field, so `..Default::default()` is not allowed from out here.
+        let mut st = HarnessState::default();
+        st.events = vec![HarnessEvent::UserInput {
+            text: "hello from the snapshot test".to_string(),
+        }];
+        st.title = Some("Snapshot".to_string());
+        app.state = Some(st);
+        terminal.draw(|f| render(f, &mut app)).expect("draw");
+
+        let buf = terminal.backend().buffer();
+        let frame: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !frame.contains("MATRIX PET"),
+            "welcome art should not draw over a real conversation"
+        );
+    }
 }

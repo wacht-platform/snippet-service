@@ -4,6 +4,8 @@
 unsafe extern "C" {}
 
 pub mod anthropic;
+pub mod app_schema;
+pub mod app_store;
 pub mod bg;
 pub mod builtins;
 pub mod catalog;
@@ -11,6 +13,9 @@ pub mod chatgpt;
 pub mod chatgpt_auth;
 pub mod checkpoint;
 pub mod config;
+pub mod coordination;
+pub mod coordination_tools;
+pub mod conversations;
 pub mod gemini;
 pub mod harness;
 pub mod inline;
@@ -33,6 +38,7 @@ pub mod shell_guard;
 pub mod signals;
 pub mod skills;
 pub mod sse;
+pub mod store;
 pub mod term;
 pub mod tools;
 pub mod tui;
