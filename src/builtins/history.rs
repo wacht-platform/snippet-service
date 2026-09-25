@@ -10,7 +10,14 @@ pub struct RecallContextTool;
 
 #[derive(Debug, Deserialize)]
 struct RecallContextArgs {
-    archive_id: i64,
+    #[serde(default)]
+    archive_id: Option<i64>,
+    #[serde(default)]
+    archive_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    from_id: Option<i64>,
+    #[serde(default)]
+    to_id: Option<i64>,
 }
 
 #[async_trait]
@@ -18,16 +25,29 @@ impl Tool for RecallContextTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "recall_context".to_string(),
-            description: "Recall and hydrate the full, unabridged payload of a past turn from the archived history using its archive_id (from [archived_history] or search_history). Returns the complete raw tool output, error trace, file diff, or user prompt."
+            description: "Recall and hydrate the full, unabridged payload of past turns from the archived history. Pass a single `archive_id` (e.g. 12), a list of `archive_ids` (e.g. [12, 13, 14]), or a range using `from_id` and `to_id` (e.g. from_id: 10, to_id: 15). Returns the complete raw tool outputs, error traces, file diffs, or user prompts."
                 .to_string(),
             input_schema: object_schema(
                 json!({
                     "archive_id": {
                         "type": "integer",
-                        "description": "The numeric ID of the turn to hydrate (e.g. 42 for #42)."
+                        "description": "Numeric ID of a single turn to hydrate (e.g. 42 for #42)."
+                    },
+                    "archive_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of turn IDs to hydrate together as a group."
+                    },
+                    "from_id": {
+                        "type": "integer",
+                        "description": "Starting turn ID for a contiguous range query."
+                    },
+                    "to_id": {
+                        "type": "integer",
+                        "description": "Ending turn ID for a contiguous range query."
                     }
                 }),
-                &["archive_id"],
+                &[],
             ),
         }
     }
@@ -37,23 +57,43 @@ impl Tool for RecallContextTool {
         let store = ctx
             .store()
             .map_err(|e| ToolError::msg(format!("store unavailable: {e}")))?;
-        match crate::history_archive::recall_turn(&store, args.archive_id) {
-            Ok(Some(turn)) => Ok(ToolResult::success(json!({
-                "archive_id": turn.archive_id,
-                "role": turn.role,
-                "tool_name": turn.tool_name,
-                "summary": turn.summary,
-                "affected_paths": turn.affected_paths,
-                "status": turn.status,
-                "created_at": turn.created_at,
-                "payload": turn.payload,
-            }))),
-            Ok(None) => Err(ToolError::msg(format!(
-                "Turn #{} not found in archive.",
-                args.archive_id
-            ))),
-            Err(e) => Err(ToolError::msg(format!("Failed to recall turn #{}: {e}", args.archive_id))),
+        let session_id = ctx.durable_session_id().unwrap_or("default");
+
+        // 1. Contiguous range
+        if let (Some(from), Some(to)) = (args.from_id, args.to_id) {
+            let turns = crate::history_archive::recall_turn_range(&store, session_id, from, to, 20)
+                .map_err(|e| ToolError::msg(format!("Failed to recall turn range: {e}")))?;
+            return Ok(ToolResult::success(json!({
+                "from_id": from,
+                "to_id": to,
+                "count": turns.len(),
+                "turns": turns,
+            })));
         }
+
+        // 2. Batch list of IDs
+        if let Some(ids) = args.archive_ids.filter(|l| !l.is_empty()) {
+            let turns = crate::history_archive::recall_turns(&store, &ids)
+                .map_err(|e| ToolError::msg(format!("Failed to recall turns: {e}")))?;
+            return Ok(ToolResult::success(json!({
+                "requested_ids": ids,
+                "count": turns.len(),
+                "turns": turns,
+            })));
+        }
+
+        // 3. Single turn ID
+        if let Some(id) = args.archive_id {
+            match crate::history_archive::recall_turn(&store, id) {
+                Ok(Some(turn)) => return Ok(ToolResult::success(json!(turn))),
+                Ok(None) => return Err(ToolError::msg(format!("Turn #{id} not found in archive."))),
+                Err(e) => return Err(ToolError::msg(format!("Failed to recall turn #{id}: {e}"))),
+            }
+        }
+
+        Err(ToolError::msg(
+            "recall_context requires either `archive_id`, `archive_ids`, or `from_id` + `to_id`.",
+        ))
     }
 }
 
