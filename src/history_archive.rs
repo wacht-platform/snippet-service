@@ -396,7 +396,14 @@ fn extract_message_metadata(
             let summary = match tool_name.as_str() {
                 "bash" => {
                     let cmd = content.get("command").and_then(Value::as_str).unwrap_or("");
-                    let short_cmd = cmd.lines().next().unwrap_or("").chars().take(40).collect::<String>();
+                    let first = cmd.lines().next().unwrap_or("").trim();
+                    let short_cmd = if first.chars().count() > 45 {
+                        first.chars().take(45).collect::<String>() + "…"
+                    } else if cmd.lines().count() > 1 {
+                        format!("{first}…")
+                    } else {
+                        first.to_string()
+                    };
                     format!("bash: {short_cmd}")
                 }
                 "edit_file" => format!("edited {paths}"),
