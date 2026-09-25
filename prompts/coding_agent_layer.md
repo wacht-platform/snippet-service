@@ -32,6 +32,13 @@ no_reread = "Never re-read unchanged files. Re-read only after edit failures, ex
 external = "Use web_search/web_read only when available. For unfamiliar CLIs or SDKs, inspect --help or local source first."
 secrets = "Never print, expose, or commit secret values."
 
+[background_processes]
+lifecycle = """When running persistent dev servers, emulators, or file watchers, start them using `bash` with `background: true` and an explicit `label`.
+Always check [background_processes] in your live context first to avoid spawning duplicate instances of an already-running server.
+Inspect logs or verify readiness using `manage_process` with action="log" (or read the log file path directly).
+Do NOT poll with shell `sleep` loops (e.g. `sleep 5`). If waiting for readiness, inspect the log or check the port once.
+When finished with testing or completing a task, always terminate background processes you spawned using `manage_process` with action="kill" unless the user explicitly requested they remain running."""
+
 [workspace]
 root = "Workspace root is the base for relative paths. Absolute and ~ paths are reachable."
 edit_discipline = """Always read the exact current lines before editing.

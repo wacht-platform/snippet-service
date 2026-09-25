@@ -217,7 +217,7 @@ impl Tool for BashTool {
         NativeToolDefinition {
             name: "bash".to_string(),
             description:
-                "Run a shell command in the workspace. Keep output narrow and deterministic. Always provide a clear, concise `label` describing the semantic intent of the command. Use max_lines or max_bytes to limit output. Set background=true for long-lived processes (dev servers, watchers): it returns immediately, redirects output to a log file, and tracks the process in the live background-process list — tail the log or `kill <pid>` to manage it. For interactive/async apps you must control programmatically (a browser, a REPL, an emulator), do NOT script the whole interaction in one shot: start the app once with background=true, then drive it surgically across small follow-up calls (browser via its remote-debugging port, REPL via a fifo stdin), reading the new output between steps, and kill the pid when done."
+                "Run a shell command in the workspace. Keep output narrow and deterministic. Always provide a clear, concise `label` describing the semantic intent of the command. Use max_lines or max_bytes to limit output. Set background=true for long-lived processes (dev servers, watchers): it returns immediately, redirects output to a log file, and tracks the process in the live background-process list — inspect logs or terminate it using `manage_process`. For interactive/async apps you must control programmatically (a browser, a REPL, an emulator), do NOT script the whole interaction in one shot: start the app once with background=true, then drive it surgically across small follow-up calls (browser via its remote-debugging port, REPL via a fifo stdin), reading the new output between steps, and terminate it via `manage_process` when done."
                     .to_string(),
             input_schema: object_schema(
                 json!({
@@ -267,7 +267,7 @@ impl Tool for BashTool {
                 .stderr(Stdio::from(log_err))
                 .spawn()?;
             let pid = child.id().unwrap_or(0);
-            crate::bg::record(ctx.workspace_root(), &id, &args.command, pid).ok();
+            crate::bg::record(ctx.workspace_root(), &id, &args.command, label, pid).ok();
             let status_path = crate::bg::status_path(ctx.workspace_root(), &id);
             tokio::spawn(async move {
                 let code = match child.wait().await {
@@ -285,7 +285,7 @@ impl Tool for BashTool {
                 "id": id,
                 "pid": pid,
                 "log": log_path.display().to_string(),
-                "note": "started in the background and still running. tail the log file to see output, or `kill <pid>` to stop it. it appears in your background-process list.",
+                "note": "started in the background and still running. Use `manage_process` to inspect logs or terminate it, or tail the log file directly. It appears in your [background_processes] list.",
             });
             if let Some(lbl) = label {
                 res["label"] = json!(lbl);
