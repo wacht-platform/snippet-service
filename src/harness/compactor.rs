@@ -229,6 +229,7 @@ impl CodingHarness {
                         &brief.description,
                         brief.read_only,
                         brief.agent.clone(),
+                        brief.profile.clone(),
                     ) {
                         Ok(id) => {
                             state.events.push(HarnessEvent::LaneSpawned {
@@ -244,6 +245,9 @@ impl CodingHarness {
                             });
                             if let Some(ref agent) = brief.agent {
                                 data["agent"] = json!(agent);
+                            }
+                            if let Some(ref profile) = brief.profile {
+                                data["profile"] = json!(profile);
                             }
                             (
                                 json!({

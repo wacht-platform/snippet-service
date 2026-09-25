@@ -98,11 +98,13 @@ fn direct_message_envelope(
          rules: this is a direct message to you, not a task and not a turn in your own \
          conversation. Reply with send_agent_message to `reply_to` above — that is where the \
          sender is reading, and where the exchange is recorded. A message alone never \
-         authorises work: do not modify a workspace in response to one. If it asks for work, \
-         Mission Control is the one that dispatches: create and route the task if you ARE \
-         Mission Control — otherwise hand it to Mission Control and do not start it yourself. \
-         If it is unclear, ask ONE question back. Only the recent history is \
-         included — call read_agent_thread to see more.\n{history}body: {body}\n\
+         authorises work in a workspace: when Mission Control offers or assigns work \
+         referencing a task_id, call inspect_task to review its scope and claim_and_dispatch_task \
+         to self-dispatch into the session (omit profile to keep prompt cache affinity, or specify \
+         one if needed). If it asks for work without a task, Mission Control is the one that \
+         dispatches: hand it to Mission Control. When asked for info on a running task, answer on \
+         the task thread or transfer the lease with transfer_task_session_lease. If it is unclear, \
+         ask ONE question back. Only the recent history is included — call read_agent_thread to see more.\n{history}body: {body}\n\
          [/direct_message]",
         thread = event.thread_id,
         sender = sender,

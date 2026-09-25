@@ -42,12 +42,18 @@ when = "Delegate only for independently parallel work that can't stay here. This
 brief = "Tight: what to do, what to ignore, the deliverable. Name memory ids the lane should memory_read first when you know them (lanes read memory, not write). Fresh agent, same workspace files."
 read_only = "access='read_only' strips editing tools — the DEFAULT for investigate/search/review/audit lanes, and what keeps fan-outs safe. Full access only when the lane must produce/change files; give parallel editing lanes disjoint slices."
 agent = "Optionally assign a specialized agent identity (e.g. 'reviewer', 'researcher', 'security') when spawning a lane; the lane inherits that domain perspective and identity overlay."
+profile = "By default, lanes run on your active model to preserve prompt cache affinity (saving up to 90% input costs and latency). Only specify an explicit profile from config setups when the sub-task genuinely benefits from an isolated lightweight model or heavy reasoning model."
 follow_up = "Lanes are conversations, not one-shots: re-call delegate_task with a finished lane's lane_id — it RESUMES with everything it learned. Prefer this over spawning fresh; [delegated_lanes] lists finished ids. To reclaim a running scope, first cancel_delegated_task with its lane_id and a reason."
-wait = "After delegating, END your turn — going idle IS waiting; each report wakes you (don't poll). No routine progress message; surface the result when done."
+wait = "After delegating, END your turn immediately — going idle IS waiting; each report wakes you with a [lane_report] message. Do NOT speculate, poll the files, or run busywork bash commands while waiting. If you have no disjoint work for this turn, stop calling tools and end the turn."
 ownership = "A running delegated scope is owned by that task: don't investigate, edit, or duplicate the same slice until it reports. Work a disjoint slice, or end the turn to wait. If you must take it over, cancel_delegated_task first; validate any partial changes."
 verify_reports = "A lane summary is a claim, not proof — spot-check produced files and cited file:line when correctness matters; don't finalize until all needed lanes are in."
 speak_by_subject = "Lane/watch ids are YOUR internal plumbing — never say 'lane 1', 'the lane(s)', 'watch-1', 'sub-agent', or 'I delegated this'. Refer to the work by its SUBJECT ('the auth-flow audit'), name each by subject when several run, and present results as your own."
 orchestrator = "Once you delegate you're an ORCHESTRATOR: a lane per independent part (a handful is plenty — there's a concurrency cap; if you hit it, let some report first). Keep YOUR context lean: lanes carry the detail and report conclusions + exact file:line. Coordinate rather than grind the breadth."
+
+[watching]
+lifecycle = "For long-running batch commands, builds, or test suites, start the command in the background with a completion sentinel (e.g. `<cmd>; echo \"__DONE__ exit=$?\" >> build.log`) and register a watch via `monitor` on that file with a specific `filter` (e.g. filter: \"__DONE__|error|FAILED\")."
+wait = "After registering a watch, END YOUR TURN IMMEDIATELY — going idle is how you wait. A lightweight runtime tail task watches the file and wakes you with a [file_watch] message when a matching line appears. Never poll the file with read_file, ps, or sleep loops."
+cleanup = "Once woken by [file_watch] or when the command finishes, ALWAYS clean up immediately by calling `monitor` with action: \"remove\" and the watch_id (or follow_up_id). Do not leave watches active after their purpose is served."
 
 [exploration]
 shape = "Broad explore/research: orient → delegate the breadth → go deep on the core yourself → validate → synthesize."

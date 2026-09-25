@@ -301,7 +301,8 @@ struct RuntimeInputs {
     browser_summary: Option<BrowserSummaryProvider>,
     exa_api_key: Option<String>,
     memory: crate::memory::MemoryLimits,
-    delegate: InferenceProfileConfig,
+    base_model: InferenceProfileConfig,
+    setups: Option<std::collections::BTreeMap<String, InferenceProfileConfig>>,
 }
 
 /// A researched, versioned identity overlaid on the snippet runtime.
@@ -383,11 +384,26 @@ impl AgentRuntime {
             None => conversation_prompt(&prompt_ctx),
         };
 
-        let delegate = i.delegate;
+        let base_model = i.base_model;
+        let setups = i.setups;
         let lane_session_id = i.durable_id;
         Ok(Self {
-            factory: Some(Arc::new(move || {
-                delegate.build_model_for_session(lane_session_id.clone())
+            factory: Some(Arc::new(move |profile: Option<&str>| {
+                if let Some(name) = profile {
+                    if let Some(cfg) = setups.as_ref().and_then(|s| s.get(name)) {
+                        return Ok(cfg.build_model_for_session(lane_session_id.clone()));
+                    } else {
+                        let known = setups
+                            .as_ref()
+                            .map(|s| s.keys().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "unknown inference profile `{name}`. Available setups: [{}]",
+                            known.join(", ")
+                        ));
+                    }
+                }
+                Ok(base_model.build_model_for_session(lane_session_id.clone()))
             })),
             context,
             tools,
@@ -496,7 +512,7 @@ fn start_session_with_role(
     // the session task must be `'static`.
     let workspace = config.workspace.clone();
     let model_config = config.model.clone();
-    let delegate = config.delegate_profile();
+    let setups = config.setups.clone();
     let exa_api_key = config.exa_api_key.clone();
     let manual_approval = config.manual_approval;
     let context_window_tokens = model_config.context_window;
@@ -546,7 +562,8 @@ fn start_session_with_role(
                 browser_summary,
                 exa_api_key: exa_api_key.clone(),
                 memory,
-                delegate,
+                base_model: model_config,
+                setups,
             },
         )
         .map_err(|e| e.to_string())?;

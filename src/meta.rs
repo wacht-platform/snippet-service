@@ -345,6 +345,10 @@ fn delegate_task_tool() -> NativeToolDefinition {
                 "agent": {
                     "type": "string",
                     "description": "Optional specialized agent identity or role name for this lane (e.g. 'reviewer', 'researcher', 'security')."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Optional inference profile name from setups in config. Defaults to your active model to preserve prompt cache affinity and avoid cold-start latency."
                 }
             },
             "required": ["description"],
@@ -366,6 +370,8 @@ pub struct DelegateBrief {
     pub read_only: bool,
     /// Specialized agent identity or role name.
     pub agent: Option<String>,
+    /// Optional inference profile name.
+    pub profile: Option<String>,
 }
 
 /// Validate a `delegate_task` payload: the brief must state both a scope
@@ -381,6 +387,12 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         .map(str::to_string);
     let agent = arguments
         .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let profile = arguments
+        .get("profile")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -439,6 +451,7 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         lane_id,
         read_only,
         agent,
+        profile,
     })
 }
 
@@ -538,5 +551,17 @@ mod tests {
         assert_eq!(brief.title, "refactor handlers");
         assert_eq!(brief.read_only, false);
         assert_eq!(brief.agent, None);
+        assert_eq!(brief.profile, None);
+    }
+
+    #[test]
+    fn test_parse_delegate_brief_with_profile() {
+        let payload = json!({
+            "title": "explore dependencies",
+            "description": "Examine Cargo.toml and lockfile to map dependency tree versions and vulnerabilities.",
+            "profile": "claude-haiku"
+        });
+        let brief = parse_delegate_brief(&payload).expect("should parse");
+        assert_eq!(brief.profile.as_deref(), Some("claude-haiku"));
     }
 }

@@ -19,10 +19,10 @@ use crate::prompts::{PromptContext, coding_prompt};
 use crate::tools::ToolContext;
 use crate::tools::coding_tools;
 
-/// Builds a fresh model instance for a child lane run. The TUI supplies one that
-/// constructs an `OpenAiCompatibleModel` from config; one-shot library callers
-/// leave it `None`, which disables delegation.
-pub type ModelFactory = Arc<dyn Fn() -> Box<dyn AgentModel> + Send + Sync>;
+/// Builds a fresh model instance for a child lane run. Accepts an optional
+/// inference profile name; when None, it constructs the parent session's active model
+/// to preserve prompt cache affinity.
+pub type ModelFactory = Arc<dyn Fn(Option<&str>) -> Result<Box<dyn AgentModel>, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +82,9 @@ pub struct LaneRecord {
     /// Specialized agent identity or role name (e.g. 'reviewer', 'researcher').
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Inference profile name chosen for this lane (omitted when using active model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// Terminal report delivered back to the parent loop when a lane finishes.
@@ -197,6 +200,7 @@ impl LaneManager {
         brief: &str,
         read_only: bool,
         agent: Option<String>,
+        profile: Option<String>,
     ) -> Result<String, String> {
         if self.factory.is_none() {
             return Err(
@@ -228,8 +232,9 @@ impl LaneManager {
             activity_log: Vec::new(),
             read_only,
             agent: agent.clone(),
+            profile: profile.clone(),
         });
-        self.launch(&id, title, brief, false, read_only, agent);
+        self.launch(&id, title, brief, false, read_only, agent, profile);
         Ok(id)
     }
 
@@ -273,12 +278,13 @@ impl LaneManager {
         record.summary = None;
         record.report = None;
         record.error = None;
-        let (title, read_only, agent) = (
+        let (title, read_only, agent, profile) = (
             record.title.clone(),
             record.read_only,
             record.agent.clone(),
+            record.profile.clone(),
         );
-        self.launch(lane_id, &title, brief, true, read_only, agent);
+        self.launch(lane_id, &title, brief, true, read_only, agent, profile);
         Ok(title)
     }
 
@@ -329,6 +335,7 @@ impl LaneManager {
         resume: bool,
         read_only: bool,
         agent: Option<String>,
+        profile: Option<String>,
     ) {
         let factory = self.factory.clone().expect("checked by callers");
         let result_tx = self.result_tx.clone();
@@ -353,6 +360,7 @@ impl LaneManager {
                     resume,
                     read_only,
                     agent,
+                    profile,
                     progress_tx,
                 ),
             )
@@ -413,13 +421,13 @@ impl LaneManager {
 
     /// Relaunch lanes that were running when the parent process stopped.
     pub fn resume_interrupted(&mut self) {
-        let ids: Vec<(String, String, bool, Option<String>)> = self
+        let ids: Vec<(String, String, bool, Option<String>, Option<String>)> = self
             .records
             .iter()
             .filter(|r| r.status == LaneStatus::Running)
-            .map(|r| (r.id.clone(), r.title.clone(), r.read_only, r.agent.clone()))
+            .map(|r| (r.id.clone(), r.title.clone(), r.read_only, r.agent.clone(), r.profile.clone()))
             .collect();
-        for (id, title, read_only, agent) in ids {
+        for (id, title, read_only, agent, profile) in ids {
             self.record_progress(&LaneProgress {
                 id: id.clone(),
                 kind: "restart".to_string(),
@@ -433,7 +441,7 @@ impl LaneManager {
                 .unwrap_or_else(|| {
                     "Continue the delegated task from the saved lane state.".to_string()
                 });
-            self.launch(&id, &title, &handoff, true, read_only, agent);
+            self.launch(&id, &title, &handoff, true, read_only, agent, profile);
         }
     }
 
@@ -618,9 +626,10 @@ async fn run_lane(
     resume: bool,
     read_only: bool,
     agent: Option<String>,
+    profile: Option<String>,
     progress_tx: mpsc::UnboundedSender<LaneProgress>,
 ) -> Result<(String, String), String> {
-    let mut model = factory();
+    let mut model = factory(profile.as_deref())?;
     let mut log = LaneLog::open(&owner).ok();
     if let Some(log) = log.as_mut() {
         let _ = log.write_start(&owner, &brief, read_only);
@@ -939,6 +948,7 @@ mod tests {
             activity_log: Vec::new(),
             read_only: true,
             agent: None,
+            profile: None,
         }
     }
 
@@ -980,21 +990,26 @@ mod tests {
         object.remove("activity_log");
         object.remove("read_only");
         object.remove("agent");
+        object.remove("profile");
         let restored: LaneRecord = serde_json::from_value(value).unwrap();
         assert!(restored.activity.is_none());
         assert!(restored.activity_log.is_empty());
         assert!(!restored.read_only);
         assert!(restored.agent.is_none());
+        assert!(restored.profile.is_none());
     }
 
     #[test]
-    fn lane_record_serializes_and_deserializes_agent() {
+    fn lane_record_serializes_and_deserializes_agent_and_profile() {
         let mut record = test_record();
         record.agent = Some("reviewer".to_string());
+        record.profile = Some("claude-haiku".to_string());
         let val = serde_json::to_value(&record).unwrap();
         assert_eq!(val["agent"], "reviewer");
+        assert_eq!(val["profile"], "claude-haiku");
         let restored: LaneRecord = serde_json::from_value(val).unwrap();
         assert_eq!(restored.agent.as_deref(), Some("reviewer"));
+        assert_eq!(restored.profile.as_deref(), Some("claude-haiku"));
     }
 
     fn finished_record(id: &str, finished_at: &str) -> LaneRecord {

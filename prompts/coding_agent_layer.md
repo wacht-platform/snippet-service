@@ -37,7 +37,10 @@ lifecycle = """When running persistent dev servers, emulators, or file watchers,
 Always check [background_processes] in your live context first to avoid spawning duplicate instances of an already-running server.
 Inspect logs or verify readiness using `manage_process` with action="log" (or read the log file path directly).
 Do NOT poll with shell `sleep` loops (e.g. `sleep 5`). If waiting for readiness, inspect the log or check the port once.
-When finished with testing or completing a task, always terminate background processes you spawned using `manage_process` with action="kill" unless the user explicitly requested they remain running."""
+When finished with testing or completing a task, always terminate background processes you spawned using `manage_process` with action="kill" unless the user explicitly requested they remain running.
+For finite long-running commands (builds, tests, generators), pair background redirection with a completion sentinel (e.g. `<cmd>; echo "__DONE__ exit=$?" >> log`) and `monitor` with a filter rather than polling."""
+graceful_wait = "When waiting for a background job or delegated lane, STOP calling tools and end your turn immediately. Going idle is how you wait — background events ([file_watch] or [lane_report]) wake you automatically. Never run speculative commands or poll files while waiting."
+cleanup = "Always remove file watches via `monitor` (action: 'remove') once the event arrives or is no longer needed, and terminate temporary background processes via `manage_process` (action: 'kill')."
 
 [workspace]
 root = "Workspace root is the base for relative paths. Absolute and ~ paths are reachable."
