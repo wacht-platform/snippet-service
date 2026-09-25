@@ -2,11 +2,13 @@ pub mod fs;
 pub mod shell_search;
 pub mod web;
 pub mod memory;
+pub mod history;
 
 pub use fs::*;
 pub use shell_search::*;
 pub use web::*;
 pub use memory::*;
+pub use history::*;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -28,6 +30,8 @@ pub fn coding_tools(
     registry.insert(ViewOutlineTool);
     registry.insert(CodeMapTool);
     registry.insert(BashTool);
+    registry.insert(RecallContextTool);
+    registry.insert(SearchHistoryTool);
     // Skill tools only when the user actually has skills installed — otherwise they
     // are dead weight in every prompt's tool list.
     if !crate::skills::discover().is_empty() {
