@@ -33,10 +33,11 @@ const LARGE_TOOL_BATCH: usize = 10;
 const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
 /// Read-only tools whose exact-duplicate re-call within a request is wasteful
-/// spinning (the result is already in history). `read_file` is excluded —
-/// re-reading after an edit is legitimate. `memory_read` is included: recalling
-/// the same id again this turn cannot change the entry.
-const DEDUP_TOOLS: [&str; 5] = [
+/// spinning (the result is already in history). `read_file` is included:
+/// re-reading the exact same path and range before any file mutation is a duplicate;
+/// a successful mutation clears the set so post-edit reads work cleanly.
+const DEDUP_TOOLS: [&str; 6] = [
+    "read_file",
     "list_files",
     "search_content",
     "search_files",
@@ -712,6 +713,10 @@ struct LoopVars {
     /// Turns spent on the CURRENT request (a soft budget surfaced each turn so the
     /// agent converges instead of sprawling). Reset on a new user request.
     turns_this_request: u64,
+    /// Consecutive failed edits on the same file.
+    consecutive_failed_edits: usize,
+    /// Path of the file whose edit recently failed.
+    last_failed_edit_path: Option<String>,
 }
 
 /// What a single model step resolved to.

@@ -36,6 +36,8 @@ pub enum RuntimeSignal {
         /// report the blocker instead.
         can_ask_user: bool,
     },
+    /// Edits to a file have failed repeatedly (e.g. identical strings or not found).
+    StuckEdit { path: String, count: usize },
 }
 
 impl RuntimeSignal {
@@ -51,6 +53,7 @@ impl RuntimeSignal {
             Self::NoteLoop { .. } => "note_loop",
             Self::BatchBackpressure { .. } => "batch_backpressure",
             Self::StuckEscalation { .. } => "stuck_escalation",
+            Self::StuckEdit { .. } => "stuck_edit",
         }
     }
 
@@ -112,6 +115,9 @@ impl RuntimeSignal {
                      {escape}."
                 )
             }
+            Self::StuckEdit { path, count } => format!(
+                "your edits on `{path}` have failed {count} times consecutively. Do not repeat failed edit arguments or blind guesses. Read the narrow line range with `read_file` (using start_line/end_line), check if the file already contains your desired state, or ensure `old_string` and `new_string` are distinct and match the actual file lines."
+            ),
         }
     }
 

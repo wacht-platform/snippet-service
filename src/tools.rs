@@ -272,6 +272,17 @@ impl ToolContext {
         self.remember(path);
     }
 
+    /// Whether `path` is tracked in `seen` and matches its current bytes on disk.
+    pub fn is_file_unchanged(&self, path: &Path) -> bool {
+        let stored = self.seen.lock().unwrap().get(path).copied();
+        if let Some(stored) = stored {
+            if let Ok(current) = std::fs::read(path) {
+                return content_hash(&current) == stored;
+            }
+        }
+        false
+    }
+
     /// Record that this context just wrote `path`, so its own follow-up writes
     /// aren't flagged stale.
     pub fn record_change(&self, path: &Path) {

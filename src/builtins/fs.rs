@@ -341,13 +341,15 @@ impl Tool for EditFileTool {
         let args: EditFileArgs = expect_object("edit_file", arguments)?;
         if args.old_string == args.new_string {
             return Err(ToolError::msg(
-                "old_string and new_string are identical — this edit changes nothing. \
-                 Supply the actual replacement, or skip the edit."
+                "old_string and new_string are identical — this edit changes nothing.\n\
+                 - The file was NOT modified.\n\
+                 - DO NOT re-read the file: the file is unchanged.\n\
+                 - If the file already matches your desired state, skip this edit and proceed to the next step.\n\
+                 - If you intended to modify the code, ensure `new_string` actually contains the new replacement."
                     .to_string(),
             ));
         }
         let path = ctx.resolve_workspace_path(&args.path)?;
-        ctx.check_write(&path)?;
         let content = tokio::fs::read_to_string(&path).await?;
 
         // 1. Exact match — fast path.
@@ -411,11 +413,16 @@ impl Tool for EditFileTool {
         }
 
         // 3. No match — return a diagnostic with the file region so the model can fix
-        // its old_string instead of blindly retrying the same near-miss.
-        Err(ToolError::msg(edit_diagnostic(
-            &content,
-            &args.old_string,
-            &args.path,
+        // its old_string. If the file changed on disk since last read, note it.
+        let stale_note = if ctx.check_write(&path).is_err() {
+            format!("\n\nNote: `{}` was modified on disk since you last read it (e.g. by shell or external tool).", args.path)
+        } else {
+            String::new()
+        };
+
+        Err(ToolError::msg(format!(
+            "{}{stale_note}",
+            edit_diagnostic(&content, &args.old_string, &args.path)
         )))
     }
 }
@@ -689,6 +696,63 @@ mod edit_matching_tests {
             panic!("repeated normalized source should be ambiguous");
         };
         assert_eq!(lines, vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_rejects_identical_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(temp.path()).unwrap();
+        let tool = EditFileTool;
+        let file_path = temp.path().join("test.txt");
+        std::fs::write(&file_path, "hello world\n").unwrap();
+
+        let err = tool
+            .execute(
+                &ctx,
+                json!({
+                    "path": "test.txt",
+                    "old_string": "hello world",
+                    "new_string": "hello world",
+                    "replace_all": false,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("old_string and new_string are identical"));
+        assert!(err.to_string().contains("DO NOT re-read the file"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_succeeds_when_old_string_matches_after_external_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(temp.path()).unwrap();
+        let tool = EditFileTool;
+        let file_path = temp.path().join("script.py");
+        std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
+
+        // Mark read
+        ctx.mark_read(&file_path);
+
+        // Simulate external shell change to line 1
+        std::fs::write(&file_path, "line 1 modified by shell\nline 2\nline 3\n").unwrap();
+
+        // Editing line 2 should succeed because line 2 is uniquely present in current content
+        let res = tool
+            .execute(
+                &ctx,
+                json!({
+                    "path": "script.py",
+                    "old_string": "line 2",
+                    "new_string": "line 2 edited",
+                    "replace_all": false,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.value["data"]["edited"], true);
+
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "line 1 modified by shell\nline 2 edited\nline 3\n");
     }
 }
 

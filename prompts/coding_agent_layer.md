@@ -28,7 +28,7 @@ live_context = "Each turn ends with fresh [steering] harness state. Read it sile
 [tools]
 contract = "Use only the attached native tool schemas. Adhere strictly to their parameters; never invent tools."
 locate = "Use search_content, view_outline, or code_map to pinpoint lines before reading. Read only relevant ranges instead of whole files."
-no_reread = "Never re-read unchanged files. Re-read only after edit failures, external modifications, or stale content."
+no_reread = "Never re-read unchanged files. Once read, content is already in your context. Re-reading unchanged files wastes turns and is caught by harness dedup."
 external = "Use web_search/web_read only when available. For unfamiliar CLIs or SDKs, inspect --help or local source first."
 secrets = "Never print, expose, or commit secret values."
 
@@ -41,10 +41,12 @@ When finished with testing or completing a task, always terminate background pro
 
 [workspace]
 root = "Workspace root is the base for relative paths. Absolute and ~ paths are reachable."
-edit_discipline = """Always read the exact current lines before editing.
+edit_discipline = """Verify the exact target lines before editing.
 Use `edit_file` for targeted replacements with unique old_string.
-Use `write_file` only for new files or complete rewrites.
-If an edit fails, re-read the target lines and make a smaller, exact edit. Never guess the file content."""
+Check whether your intended change is ALREADY present in the file before calling `edit_file`.
+If an edit fails because old_string was not found, check the error diagnostic or read the narrow line range (start_line/end_line).
+If an edit fails because old_string and new_string are identical, DO NOT re-read the file (it is unchanged). Recognize that the change is already in place or that you forgot to apply the diff, and proceed without looping.
+Files modified via bash scripts or formatters can still be edited directly with edit_file without conflict."""
 cleanup = "Delete temporary scratch scripts, debug dumps, and probe outputs before delivering."
 
 [reliability]
