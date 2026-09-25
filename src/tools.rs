@@ -197,6 +197,11 @@ impl ToolContext {
         self.store_path.clone()
     }
 
+    pub fn store(&self) -> Result<crate::store::Store, crate::store::StoreError> {
+        let path = self.store_path.clone().unwrap_or_else(crate::store::default_db_path);
+        crate::store::Store::open_cached(path)
+    }
+
     /// Bind the directory agent id this session runs as.
     pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
         self.agent_id = Some(id.into());

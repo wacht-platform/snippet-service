@@ -940,10 +940,25 @@ impl CodingHarness {
             let (summary, recent, recent_len) = summarize_window(&older, original_request);
             preserved_recent_count = recent_len;
 
+            let store = self.context.store().ok();
+            let session_id = self.context.durable_session_id().unwrap_or("default");
+            let now = chrono::Utc::now().to_rfc3339();
+            let final_summary = if let Some(store) = &store {
+                match crate::history_archive::archive_messages(store, session_id, &older, 0, &now) {
+                    Ok(summaries) => {
+                        let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
+                        format!("{summary}\n\n{micro}")
+                    }
+                    Err(_) => summary,
+                }
+            } else {
+                summary
+            };
+
             let mut next = vec![
                 HarnessMessage::Summary {
                     kind: "compacted_window".to_string(),
-                    content: summary,
+                    content: final_summary,
                 },
                 HarnessMessage::Summary {
                     kind: "recent_activity".to_string(),
@@ -1106,6 +1121,26 @@ impl CodingHarness {
 
         // Keep a copy of the fresh table to feed the memory reflection pass below.
         let table_for_memory = table.clone();
+
+        // Archive older messages to SQLite & FTS5 and generate IBM-style micro-pointers
+        let store = self.context.store().ok();
+        let session_id = self.context.durable_session_id().unwrap_or("default");
+        let now = chrono::Utc::now().to_rfc3339();
+        let compacted_content = if let Some(store) = &store {
+            match crate::history_archive::archive_messages(store, session_id, &older, 0, &now) {
+                Ok(summaries) => {
+                    let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
+                    format!("{table}\n\n{micro}")
+                }
+                Err(e) => {
+                    self.debug_log(&format!("failed to archive messages: {e}"));
+                    table
+                }
+            }
+        } else {
+            table
+        };
+
         // A trailing user message hasn't been acted on yet (auto-compaction runs
         // between the push and the step) — keep it verbatim, or the request only
         // survives as well as the summarizer happened to capture it.
@@ -1127,7 +1162,7 @@ impl CodingHarness {
             },
             HarnessMessage::Summary {
                 kind: "compacted_window".to_string(),
-                content: table,
+                content: compacted_content,
             },
         ];
         state.messages.extend(trailing_user);

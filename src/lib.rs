@@ -18,6 +18,7 @@ pub mod coordination_tools;
 pub mod conversations;
 pub mod gemini;
 pub mod harness;
+pub mod history_archive;
 pub mod inline;
 mod lane_log;
 pub mod lanes;
