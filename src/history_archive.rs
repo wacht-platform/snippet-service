@@ -231,6 +231,97 @@ pub fn recall_turn(store: &Store, archive_id: i64) -> Result<Option<ArchivedTurn
     })
 }
 
+/// Retrieve and hydrate multiple turns by IDs.
+pub fn recall_turns(
+    store: &Store,
+    archive_ids: &[i64],
+) -> Result<Vec<ArchivedTurnDetail>, StoreError> {
+    let mut turns = Vec::with_capacity(archive_ids.len());
+    for &id in archive_ids {
+        if let Some(turn) = recall_turn(store, id)? {
+            turns.push(turn);
+        }
+    }
+    Ok(turns)
+}
+
+/// Retrieve and hydrate a contiguous range of turns [from_id..=to_id].
+pub fn recall_turn_range(
+    store: &Store,
+    session_id: &str,
+    from_id: i64,
+    to_id: i64,
+    limit: usize,
+) -> Result<Vec<ArchivedTurnDetail>, StoreError> {
+    store.with_connection(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT archive_id, session_id, ordinal, role, tool_name, summary, affected_paths, status, created_at, payload_compressed
+             FROM session_history_archive
+             WHERE session_id = ?1 AND archive_id >= ?2 AND archive_id <= ?3
+             ORDER BY archive_id ASC
+             LIMIT ?4",
+        )?;
+
+        let rows = stmt.query_map(params![session_id, from_id, to_id, limit as i64], |row| {
+            let archive_id: i64 = row.get(0)?;
+            let session_id: String = row.get(1)?;
+            let ordinal: i64 = row.get(2)?;
+            let role: String = row.get(3)?;
+            let tool_name: Option<String> = row.get(4)?;
+            let summary: String = row.get(5)?;
+            let affected_paths: String = row.get(6)?;
+            let status: String = row.get(7)?;
+            let created_at: String = row.get(8)?;
+            let compressed: Vec<u8> = row.get(9)?;
+            Ok((
+                archive_id,
+                session_id,
+                ordinal,
+                role,
+                tool_name,
+                summary,
+                affected_paths,
+                status,
+                created_at,
+                compressed,
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for r in rows {
+            let (
+                archive_id,
+                session_id,
+                ordinal,
+                role,
+                tool_name,
+                summary,
+                affected_paths,
+                status,
+                created_at,
+                compressed,
+            ) = r?;
+            let raw = decompress_payload(&compressed).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(e))
+            })?;
+            let payload: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            results.push(ArchivedTurnDetail {
+                archive_id,
+                session_id,
+                ordinal,
+                role,
+                tool_name,
+                summary,
+                affected_paths,
+                status,
+                created_at,
+                payload,
+            });
+        }
+        Ok(results)
+    })
+}
+
 /// Search conversation history using SQLite FTS5 (BM25 ranking).
 pub fn search_history(
     store: &Store,
@@ -488,5 +579,26 @@ mod tests {
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.archive_id == summaries[0].archive_id));
         assert!(results.iter().any(|r| r.archive_id == summaries[1].archive_id));
+
+        // Batch recall
+        let batch = recall_turns(&store, &[summaries[0].archive_id, summaries[2].archive_id])
+            .expect("batch recall");
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].archive_id, summaries[0].archive_id);
+        assert_eq!(batch[1].archive_id, summaries[2].archive_id);
+
+        // Range recall
+        let range = recall_turn_range(
+            &store,
+            "session-1",
+            summaries[0].archive_id,
+            summaries[2].archive_id,
+            10,
+        )
+        .expect("range recall");
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].archive_id, summaries[0].archive_id);
+        assert_eq!(range[1].archive_id, summaries[1].archive_id);
+        assert_eq!(range[2].archive_id, summaries[2].archive_id);
     }
 }
