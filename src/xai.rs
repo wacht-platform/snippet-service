@@ -377,29 +377,31 @@ fn build_responses_request(
     }
 
     // Never force x_search; required tool choice only applies to client tools.
-    let tool_choice = if force_tool && tools.iter().any(|t| !t.name.is_empty()) {
-        json!("required")
-    } else {
-        json!("auto")
-    };
-
     let mut body = json!({
         "model": config.inner.model,
         "input": input,
-        "tool_choice": tool_choice,
         "parallel_tool_calls": true,
         "store": false,
         "stream": false,
     });
     let obj = body.as_object_mut().expect("object");
+    if !tools_json.is_empty() {
+        let tool_choice = if force_tool && tools.iter().any(|t| !t.name.is_empty()) {
+            json!("required")
+        } else {
+            json!("auto")
+        };
+        obj.insert("tools".to_string(), json!(tools_json));
+        obj.insert("tool_choice".to_string(), tool_choice);
+    }
     if !instructions.is_empty() {
         obj.insert("instructions".to_string(), json!(instructions));
     }
-    if !tools_json.is_empty() {
-        obj.insert("tools".to_string(), json!(tools_json));
-    }
     if let Some(effort) = normalize_effort(config.inner.reasoning_effort.as_deref()) {
         obj.insert("reasoning".to_string(), json!({ "effort": effort }));
+    }
+    if let Some(temp) = config.inner.temperature {
+        obj.insert("temperature".to_string(), json!(temp));
     }
     body
 }
@@ -468,14 +470,29 @@ fn is_server_tool_item(item: &Value) -> bool {
 }
 
 fn is_client_function_item(item: &Value) -> bool {
+    if item.get("tool_calls").and_then(Value::as_array).is_some() {
+        return true;
+    }
     match item.get("type").and_then(Value::as_str) {
-        Some("function_call") | Some("function") => true,
+        Some("function_call") | Some("function") | Some("tool_call") | Some("custom_tool_call") => {
+            true
+        }
         _ => false,
     }
 }
 
 fn collect_client_call(item: &Value, calls: &mut Vec<GeneratedToolCall>) {
-    if !is_client_function_item(item) || is_server_tool_item(item) {
+    if is_server_tool_item(item) {
+        return;
+    }
+    // Handle embedded tool_calls array (e.g. inside a message item)
+    if let Some(sub_calls) = item.get("tool_calls").and_then(Value::as_array) {
+        for sub in sub_calls {
+            collect_client_call(sub, calls);
+        }
+        return;
+    }
+    if !is_client_function_item(item) {
         return;
     }
     let name = item
@@ -486,16 +503,30 @@ fn collect_client_call(item: &Value, calls: &mut Vec<GeneratedToolCall>) {
     if name.is_empty() || is_declared_server_tool_name(name) {
         return;
     }
-    let args_str = item
+    let arguments = if let Some(obj) = item.get("arguments").filter(|v| v.is_object()) {
+        obj.clone()
+    } else if let Some(obj) = item.pointer("/function/arguments").filter(|v| v.is_object()) {
+        obj.clone()
+    } else if let Some(obj) = item.get("parameters").filter(|v| v.is_object()) {
+        obj.clone()
+    } else if let Some(obj) = item.get("input").filter(|v| v.is_object()) {
+        obj.clone()
+    } else if let Some(args_str) = item
         .get("arguments")
         .or_else(|| item.pointer("/function/arguments"))
+        .or_else(|| item.get("parameters"))
+        .or_else(|| item.get("input"))
         .and_then(Value::as_str)
-        .unwrap_or("{}");
-    let arguments = serde_json::from_str::<Value>(args_str)
-        .unwrap_or_else(|_| Value::String(args_str.to_string()));
+    {
+        serde_json::from_str::<Value>(args_str)
+            .unwrap_or_else(|_| Value::String(args_str.to_string()))
+    } else {
+        Value::Object(Default::default())
+    };
     let id = item
         .get("call_id")
         .or_else(|| item.get("id"))
+        .or_else(|| item.pointer("/function/id"))
         .and_then(Value::as_str)
         .map(str::to_string);
     calls.push(GeneratedToolCall {
@@ -604,6 +635,11 @@ fn parse_responses_value(
                                 text.push_str(chunk);
                             }
                         }
+                    } else if let Some(chunk) = item.get("content").and_then(Value::as_str) {
+                        text.push_str(chunk);
+                    }
+                    if item.get("tool_calls").is_some() {
+                        collect_client_call(item, &mut calls);
                     }
                 }
                 "output_text" => {
@@ -611,15 +647,35 @@ fn parse_responses_value(
                         text.push_str(chunk);
                     }
                 }
-                "function_call" | "function" => collect_client_call(item, &mut calls),
+                "function_call" | "function" | "tool_call" | "custom_tool_call" => {
+                    collect_client_call(item, &mut calls)
+                }
                 "x_search" | "web_search" | "code_interpreter" | "reasoning" => {}
                 _ => collect_client_call(item, &mut calls),
+            }
+        }
+    }
+    // Fallback: standard OpenAI chat completions format if output was empty
+    if calls.is_empty() && text.is_empty() {
+        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+            for choice in choices {
+                if let Some(msg) = choice.get("message") {
+                    if let Some(content) = msg.get("content").and_then(Value::as_str) {
+                        text.push_str(content);
+                    }
+                    if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+                        for tc in tool_calls {
+                            collect_client_call(tc, &mut calls);
+                        }
+                    }
+                }
             }
         }
     }
     if text.is_empty() {
         if let Some(chunk) = value
             .get("output_text")
+            .or_else(|| value.pointer("/response/output_text"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
@@ -637,18 +693,35 @@ fn parse_responses_value(
         .or_else(|| value.pointer("/response/usage"))
         .filter(|u| u.is_object())
         .map(usage_from_value);
+
+    let is_incomplete = value
+        .get("status")
+        .or_else(|| value.pointer("/response/status"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| s == "incomplete")
+        || value
+            .pointer("/response/incomplete_details/reason")
+            .is_some()
+        || value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s == "length" || s == "max_output_tokens");
+
     Ok(ModelOutput {
         calls,
         content_text: (!text.is_empty()).then_some(text),
         usage,
-        finish_reason: value
-            .get("status")
-            .and_then(Value::as_str)
-            .filter(|s| *s == "incomplete")
-            .map(|_| "length".to_string()),
+        finish_reason: is_incomplete.then(|| "length".to_string()),
         rate_limit: None,
         used_server_tools,
     })
+}
+
+#[derive(Default)]
+struct InFlightCall {
+    call_id: Option<String>,
+    name: String,
+    arguments_buf: String,
 }
 
 async fn parse_responses_sse(
@@ -657,6 +730,8 @@ async fn parse_responses_sse(
 ) -> Result<ModelOutput, ToolError> {
     let mut text = String::new();
     let mut calls: Vec<GeneratedToolCall> = Vec::new();
+    let mut in_flight_calls: std::collections::HashMap<String, InFlightCall> =
+        std::collections::HashMap::new();
     let mut usage: Option<TokenUsage> = None;
     let mut failure: Option<String> = None;
     let mut incomplete = false;
@@ -670,6 +745,13 @@ async fn parse_responses_sse(
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             return;
         };
+
+        // Catch top-level error object (xAI error envelope)
+        if let Some(err) = chunk.pointer("/error/message").and_then(Value::as_str) {
+            failure = Some(err.to_string());
+            return;
+        }
+
         match chunk.get("type").and_then(Value::as_str).unwrap_or("") {
             "response.output_text.delta" => {
                 if let Some(delta) = chunk
@@ -694,20 +776,179 @@ async fn parse_responses_sse(
                     StreamBuffer::append_thinking(sink, delta);
                 }
             }
+            "response.output_item.added" => {
+                if let Some(item) = chunk.get("item") {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                    if item_type == "function_call"
+                        || item_type == "function"
+                        || item_type == "tool_call"
+                    {
+                        let item_id = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let call_id = item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let name = item
+                            .get("name")
+                            .or_else(|| item.pointer("/function/name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if !item_id.is_empty() {
+                            in_flight_calls.insert(
+                                item_id,
+                                InFlightCall {
+                                    call_id,
+                                    name,
+                                    arguments_buf: String::new(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let item_id = chunk
+                    .get("item_id")
+                    .or_else(|| chunk.get("call_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(delta) = chunk.get("delta").and_then(Value::as_str) {
+                    if let Some(inflight) = in_flight_calls.get_mut(item_id) {
+                        inflight.arguments_buf.push_str(delta);
+                    }
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let item_id = chunk
+                    .get("item_id")
+                    .or_else(|| chunk.get("call_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Some(args) = chunk.get("arguments").and_then(Value::as_str) {
+                    if let Some(inflight) = in_flight_calls.get_mut(item_id) {
+                        inflight.arguments_buf = args.to_string();
+                    }
+                }
+            }
             "response.output_item.done" => {
                 if let Some(item) = chunk.get("item") {
                     if is_server_tool_item(item) {
                         used_server_tools = true;
                     }
-                    collect_client_call(item, &mut calls);
+                    let mut item_clone = item.clone();
+                    let item_id = item
+                        .get("id")
+                        .or_else(|| item.get("call_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if let Some(inflight) = in_flight_calls.remove(item_id) {
+                        let has_args = item_clone
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false)
+                            || item_clone
+                                .get("arguments")
+                                .map(|v| v.is_object())
+                                .unwrap_or(false);
+                        if !has_args && !inflight.arguments_buf.is_empty() {
+                            if let Some(obj) = item_clone.as_object_mut() {
+                                obj.insert(
+                                    "arguments".into(),
+                                    Value::String(inflight.arguments_buf),
+                                );
+                            }
+                        }
+                        if item_clone.get("name").is_none() && !inflight.name.is_empty() {
+                            if let Some(obj) = item_clone.as_object_mut() {
+                                obj.insert("name".into(), Value::String(inflight.name));
+                            }
+                        }
+                        if item_clone.get("call_id").is_none() && inflight.call_id.is_some() {
+                            if let Some(obj) = item_clone.as_object_mut() {
+                                obj.insert(
+                                    "call_id".into(),
+                                    Value::String(inflight.call_id.unwrap()),
+                                );
+                            }
+                        }
+                    }
+                    collect_client_call(&item_clone, &mut calls);
                 }
             }
-            "response.completed" => {
-                if let Some(u) = chunk.pointer("/response/usage").filter(|u| u.is_object()) {
+            "response.done" | "response.completed" => {
+                if let Some(status) = chunk
+                    .pointer("/response/status")
+                    .and_then(Value::as_str)
+                {
+                    if status == "incomplete" {
+                        incomplete = true;
+                    }
+                }
+                if chunk
+                    .pointer("/response/incomplete_details/reason")
+                    .is_some()
+                {
+                    incomplete = true;
+                }
+                if let Some(u) = chunk
+                    .pointer("/response/usage")
+                    .filter(|u| u.is_object())
+                {
                     usage = Some(usage_from_value(u));
                 }
                 if let Some(c) = chunk.pointer("/response/citations") {
                     citations = Some(c.clone());
+                }
+                // Reconcile output items from the terminal response payload
+                if let Some(items) = chunk
+                    .pointer("/response/output")
+                    .and_then(Value::as_array)
+                {
+                    for item in items {
+                        if is_server_tool_item(item) {
+                            used_server_tools = true;
+                        }
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(Value::as_str);
+                        let name = item
+                            .get("name")
+                            .or_else(|| item.pointer("/function/name"))
+                            .and_then(Value::as_str);
+                        let already_collected = calls.iter().any(|c| {
+                            (call_id.is_some() && c.id.as_deref() == call_id)
+                                || (call_id.is_none()
+                                    && name.is_some()
+                                    && c.tool_name == name.unwrap())
+                        });
+                        if !already_collected {
+                            collect_client_call(item, &mut calls);
+                        }
+                        if text.is_empty() {
+                            if let Some(parts) =
+                                item.get("content").and_then(Value::as_array)
+                            {
+                                for part in parts {
+                                    if let Some(chunk) =
+                                        part.get("text").and_then(Value::as_str)
+                                    {
+                                        text.push_str(chunk);
+                                    }
+                                }
+                            } else if let Some(chunk) =
+                                item.get("content").and_then(Value::as_str)
+                            {
+                                text.push_str(chunk);
+                            }
+                        }
+                    }
                 }
             }
             "response.failed" | "response.incomplete" => {
@@ -720,11 +961,59 @@ async fn parse_responses_sse(
                     .map(str::to_string)
                     .or_else(|| Some("response failed".to_string()));
             }
-            _ => {}
+            _ => {
+                // Fallback for standard chat completions chunk format
+                if let Some(choices) = chunk.get("choices").and_then(Value::as_array) {
+                    for choice in choices {
+                        if let Some(delta) = choice.get("delta") {
+                            if let Some(c) = delta.get("content").and_then(Value::as_str) {
+                                text.push_str(c);
+                                if let Some(sink) = sink {
+                                    StreamBuffer::append(sink, c);
+                                }
+                            }
+                            if let Some(sub_calls) =
+                                delta.get("tool_calls").and_then(Value::as_array)
+                            {
+                                for tc in sub_calls {
+                                    collect_client_call(tc, &mut calls);
+                                }
+                            }
+                        }
+                        if let Some(finish) =
+                            choice.get("finish_reason").and_then(Value::as_str)
+                        {
+                            if finish == "length" {
+                                incomplete = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
     })
     .await
     .map_err(|e| ToolError::model_request(format!("xAI stream error: {e}"), true))?;
+
+    // Drain any remaining in-flight tool calls that never got output_item.done
+    for (_, inflight) in in_flight_calls.drain() {
+        if !inflight.name.is_empty() && !is_declared_server_tool_name(&inflight.name) {
+            let already_collected = calls.iter().any(|c| {
+                (inflight.call_id.is_some() && c.id == inflight.call_id)
+                    || (inflight.call_id.is_none() && c.tool_name == inflight.name)
+            });
+            if !already_collected {
+                let args = serde_json::from_str::<Value>(&inflight.arguments_buf)
+                    .unwrap_or_else(|_| Value::String(inflight.arguments_buf));
+                calls.push(GeneratedToolCall {
+                    tool_name: inflight.name,
+                    arguments: args,
+                    id: inflight.call_id,
+                    ..Default::default()
+                });
+            }
+        }
+    }
 
     if let Some(c) = citations.as_ref() {
         let mut wrapper = json!({});
@@ -928,5 +1217,60 @@ mod tests {
         let out = parse_responses_value(&value, None).expect("parse");
         assert!(out.calls.is_empty(), "x_search runs on xAI, not locally");
         assert!(out.used_server_tools);
+    }
+
+    #[test]
+    fn request_omits_tool_choice_when_tools_empty() {
+        let body = build_responses_request(
+            &cfg(false),
+            &[HarnessMessage::User {
+                content: "hi".into(),
+            }],
+            &[],
+            false,
+        );
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn parser_extracts_embedded_tool_calls_and_object_arguments() {
+        let value = json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "Working on it...",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "id": "call_embed",
+                                "arguments": { "command": "echo test" }
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+        let out = parse_responses_value(&value, None).expect("parse");
+        assert_eq!(out.calls.len(), 1);
+        assert_eq!(out.calls[0].tool_name, "bash");
+        assert_eq!(out.calls[0].arguments["command"], "echo test");
+        assert_eq!(out.content_text.as_deref(), Some("Working on it..."));
+    }
+
+    #[test]
+    fn parser_detects_incomplete_status_as_length_truncation() {
+        let value = json!({
+            "status": "incomplete",
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "partial text"}]}
+            ]
+        });
+        let out = parse_responses_value(&value, None).expect("parse");
+        assert_eq!(out.finish_reason.as_deref(), Some("length"));
+        assert!(out.is_truncated());
     }
 }
