@@ -645,6 +645,99 @@ mod notice_tests {
         );
     }
 
+    #[test]
+    fn a_queued_message_sent_immediately_survives_an_interrupt() {
+        let harness = harness();
+        let mut state = HarnessState::blank("/tmp", None);
+        // Message was in queue
+        state.queued_inputs.push(QueuedInput {
+            id: "q-test-1".to_string(),
+            text: "please also run clippy".to_string(),
+        });
+
+        // User sent immediately, and then interrupted
+        let mut pending = vec![
+            LoopInput::SteerQueued("q-test-1".to_string()),
+            LoopInput::Interrupt,
+        ];
+
+        harness.apply_interrupted_pending(&mut state, &mut pending);
+
+        // 1. Transcript must have the steer event
+        assert!(
+            state.events.iter().any(|e| matches!(
+                e,
+                HarnessEvent::Steer { text } if text == "please also run clippy"
+            )),
+            "steered queued message must reach state.events"
+        );
+
+        // 2. Messages must have the user steer message
+        assert!(
+            state.messages.iter().any(|m| matches!(
+                m,
+                HarnessMessage::User { content } if content.contains("please also run clippy")
+            )),
+            "steered queued message must reach state.messages"
+        );
+
+        // 3. The item must be consumed from queued_inputs
+        assert!(state.queued_inputs.is_empty());
+    }
+
+    #[test]
+    fn a_newly_queued_and_steered_message_survives_an_interrupt() {
+        let harness = harness();
+        let mut state = HarnessState::blank("/tmp", None);
+
+        // Message was queued and steered in the same in-flight batch
+        let mut pending = vec![
+            LoopInput::Queue(QueuedInput {
+                id: "q-test-2".to_string(),
+                text: "freshly queued instruction".to_string(),
+            }),
+            LoopInput::SteerQueued("q-test-2".to_string()),
+            LoopInput::Interrupt,
+        ];
+
+        harness.apply_interrupted_pending(&mut state, &mut pending);
+
+        assert!(
+            state.events.iter().any(|e| matches!(
+                e,
+                HarnessEvent::Steer { text } if text == "freshly queued instruction"
+            )),
+            "freshly queued and steered message must reach state.events"
+        );
+        assert!(
+            state.messages.iter().any(|m| matches!(
+                m,
+                HarnessMessage::User { content } if content.contains("freshly queued instruction")
+            )),
+            "freshly queued and steered message must reach state.messages"
+        );
+        assert!(state.queued_inputs.is_empty());
+    }
+
+    #[test]
+    fn unsteered_queued_inputs_are_preserved_on_interrupt() {
+        let harness = harness();
+        let mut state = HarnessState::blank("/tmp", None);
+
+        let mut pending = vec![
+            LoopInput::Queue(QueuedInput {
+                id: "q-test-3".to_string(),
+                text: "stay in queue".to_string(),
+            }),
+            LoopInput::Interrupt,
+        ];
+
+        harness.apply_interrupted_pending(&mut state, &mut pending);
+
+        assert_eq!(state.queued_inputs.len(), 1);
+        assert_eq!(state.queued_inputs[0].text, "stay in queue");
+    }
+
     /// A notice also enters the model's context, so a resumed loop knows what
     /// happened while it was not looking.
     #[test]

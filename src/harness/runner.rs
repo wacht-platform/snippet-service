@@ -511,6 +511,12 @@ impl CodingHarness {
                 };
 
                 let Some(result) = outcome else {
+                    // Drain any remaining inputs buffered right before/with the interrupt
+                    while let Ok(msg) = input_rx.try_recv() {
+                        if !matches!(msg, LoopInput::Interrupt) {
+                            pending_inputs.push(msg);
+                        }
+                    }
                     // Interrupted mid-step: clear the live stream sink, then close any
                     // unanswered tool calls with an interrupted result so assistant text
                     // and tool invocation records are preserved without breaking message pairing.
@@ -519,12 +525,11 @@ impl CodingHarness {
                     }
                     repair_unanswered_tool_events(&mut state.events, evt_mark);
                     repair_unanswered_tool_calls(&mut state.messages);
+                    // Apply any pending inputs (such as queued messages sent immediately via SteerQueued,
+                    // UserMessages, newly queued inputs, and notices) so they survive into the transcript.
+                    self.apply_interrupted_pending(&mut state, &mut pending_inputs);
                     state.history_rewritten = true;
                     state.status = HarnessStatus::Interrupted;
-                    // A notice is NOT part of the in-flight turn: it records something the
-                    // sender already had accepted. This is the last chance to
-                    // fold one in — `pending_inputs` is dropped when we break.
-                    self.record_pending_notices(&mut state, &mut pending_inputs);
                     state.events.push(HarnessEvent::SystemDecision {
                         step: "interrupted".to_string(),
                         reasoning: "User interrupted the run.".to_string(),
@@ -603,11 +608,13 @@ impl CodingHarness {
                         };
                         match action {
                             None => {
+                                while let Ok(msg) = input_rx.try_recv() {
+                                    if !matches!(msg, LoopInput::Interrupt) {
+                                        pending_inputs.push(msg);
+                                    }
+                                }
+                                self.apply_interrupted_pending(&mut state, &mut pending_inputs);
                                 state.status = HarnessStatus::Interrupted;
-                                // Last chance for a buffered notice: breaking drops
-                                // `pending_inputs`, and an interrupted message must
-                                // still reach the transcript.
-                                self.record_pending_notices(&mut state, &mut pending_inputs);
                                 state.events.push(HarnessEvent::SystemDecision {
                                     step: "interrupted".to_string(),
                                     reasoning: "User interrupted the run.".to_string(),
