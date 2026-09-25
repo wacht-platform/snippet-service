@@ -31,6 +31,7 @@ pub fn add_coordination_tools(registry: &mut ToolRegistry) {
     registry.insert(PostTaskCoordination);
     registry.insert(TransferTaskSessionLease);
     registry.insert(InspectTask);
+    registry.insert(ClaimAndDispatchTask);
 }
 
 
@@ -959,6 +960,7 @@ impl Tool for InspectTask {
             "description": task.description,
             "status": task.status,
             "plan": task.plan,
+            "profile": task.profile,
             "session_id": task.session_id,
             "owned_paths": task.owned_paths,
             "roster": roster,
@@ -966,6 +968,111 @@ impl Tool for InspectTask {
             "links": links,
             "thread_id": task.thread_id,
             "result": task.result,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct ClaimAndDispatchArgs {
+    task_id: String,
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+pub struct ClaimAndDispatchTask;
+#[async_trait]
+impl Tool for ClaimAndDispatchTask {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "claim_and_dispatch_task".into(),
+            description: "Claim an assigned or offered task and dispatch yourself into its target workspace session. Specify `profile` to select an inference profile from config setups, or omit it to preserve the session's active model for prompt cache hits.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string", "description": "The task ID to claim and dispatch into"},
+                    "profile": {"type": "string", "description": "Optional inference profile name. Omit to preserve prompt cache affinity."}
+                }),
+                &["task_id"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ClaimAndDispatchArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        if task_id.is_empty() {
+            return Err(ToolError::msg("task_id must not be empty"));
+        }
+        let db = db(ctx)?;
+        let task = db
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+
+        if task.status == crate::coordination::TaskStatus::Done || task.status == crate::coordination::TaskStatus::Failed {
+            return Err(ToolError::msg(format!("task `{task_id}` is already {:?}", task.status)));
+        }
+
+        let (actor_kind, actor_id) = actor(ctx)?;
+        let now = now_rfc3339();
+
+        let roster = db.list_task_agents(task_id).unwrap_or_default();
+        if !roster.iter().any(|m| m.agent_id == actor_id && m.removed_at.is_none()) {
+            db.add_task_agent_full(task_id, &actor_id, "implementer", None, "", "active", &now)
+                .map_err(|e| ToolError::msg(format!("add agent to roster: {e}")))?;
+        }
+
+        let profile_opt = args
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        let updated = db
+            .update_task_in(task_id, &now, |t| {
+                t.status = crate::coordination::TaskStatus::InProgress;
+                t.reporting_session = Some(t.session_id.clone());
+                if profile_opt.is_some() {
+                    t.profile = profile_opt.clone();
+                }
+            })
+            .map_err(|e| ToolError::msg(format!("claim task: {e}")))?;
+
+        if !task.session_id.trim().is_empty() {
+            let role = if actor_id == "snippet" { "standard" } else { "specialized" };
+            let agent_opt = if actor_id == "snippet" { None } else { Some(actor_id.as_str()) };
+            let _ = db.set_session_role(&task.session_id, role, agent_opt);
+        }
+
+        let event = CoordinationEvent {
+            event_id: Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "task.dispatched".into(),
+            actor_kind: actor_kind.to_string(),
+            actor_id: actor_id.clone(),
+            payload_version: 1,
+            payload: json!({
+                "task_id": task_id,
+                "agent_id": actor_id,
+                "profile": updated.profile,
+            }),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        let _ = db.append_event(&event);
+
+        Ok(ToolResult::success(json!({
+            "dispatched": true,
+            "task_id": task_id,
+            "session_id": task.session_id,
+            "profile": updated.profile,
+            "prompt_cache_preserved": args.profile.is_none(),
+            "active_agent": actor_id,
+            "note": "Claimed task and dispatched into session.",
         })))
     }
 }

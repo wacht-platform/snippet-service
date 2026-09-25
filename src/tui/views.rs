@@ -1078,6 +1078,9 @@ pub(crate) fn lane_lines(app: &App) -> Vec<Line<'static>> {
             if let Some(agent) = &l.agent {
                 spans.push(Span::styled(format!(" [{agent}]"), Style::default().fg(accent())));
             }
+            if let Some(profile) = &l.profile {
+                spans.push(Span::styled(format!(" [{profile}]"), Style::default().fg(faint())));
+            }
             spans.push(Span::styled(
                 format!(" — running {elapsed}"),
                 Style::default().fg(faint()),

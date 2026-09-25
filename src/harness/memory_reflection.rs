@@ -678,15 +678,17 @@ pub(super) fn build_live_context(
         block.push_str("\n[delegated_lanes]\n");
         block.push_str(&format!("running = {}\n", running.len()));
         for l in &running {
-            let agent_str = l
-                .agent
-                .as_ref()
-                .map(|a| format!(" [agent: {a}]"))
-                .unwrap_or_default();
+            let mut tags = String::new();
+            if let Some(ref a) = l.agent {
+                tags.push_str(&format!(" [agent: {a}]"));
+            }
+            if let Some(ref p) = l.profile {
+                tags.push_str(&format!(" [profile: {p}]"));
+            }
             block.push_str(&format!(
                 "- \"{}\"{} — running ({})\n",
                 clip(&l.title, 32),
-                agent_str,
+                tags,
                 l.id
             ));
         }
@@ -697,15 +699,17 @@ pub(super) fn build_live_context(
                 LaneStatus::Cancelled => "cancelled",
                 LaneStatus::Running => unreachable!("filtered above"),
             };
-            let agent_str = l
-                .agent
-                .as_ref()
-                .map(|a| format!(" [agent: {a}]"))
-                .unwrap_or_default();
+            let mut tags = String::new();
+            if let Some(ref a) = l.agent {
+                tags.push_str(&format!(" [agent: {a}]"));
+            }
+            if let Some(ref p) = l.profile {
+                tags.push_str(&format!(" [profile: {p}]"));
+            }
             block.push_str(&format!(
                 "- \"{}\"{} — {} ({})\n",
                 clip(&l.title, 32),
-                agent_str,
+                tags,
                 status,
                 l.id
             ));
@@ -714,6 +718,21 @@ pub(super) fn build_live_context(
             "orchestrate = \"{} lane(s) still working; end your turn to wait — reports wake you\"\n",
             running.len()
         ));
+    }
+
+    if !state.watches.is_empty() {
+        block.push_str("\n[active_watches]\n");
+        for w in &state.watches {
+            let filter = w.filter.as_deref().unwrap_or("none");
+            block.push_str(&format!(
+                "- \"{}\" on {} (filter: \"{}\", id: {})\n",
+                clip(&w.label, 32),
+                compact_path(std::path::Path::new(&w.path)),
+                filter,
+                w.id
+            ));
+        }
+        block.push_str("wait = \"watch is active; end your turn to wait — [file_watch] wakes you. Clean up with monitor action:\\\"remove\\\" once done.\"\n");
     }
 
     block
