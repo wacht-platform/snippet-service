@@ -443,7 +443,21 @@ fn extract_message_metadata(
                     .collect::<Vec<_>>()
                     .join(",");
                 let summary = if let Some(first_tc) = tool_calls.first() {
-                    if let Some(cmd) = first_tc.arguments.get("command").and_then(Value::as_str) {
+                    if first_tc.name == "bash" {
+                        if let Some(lbl) = first_tc.arguments.get("label").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                            let trimmed = lbl.trim();
+                            if trimmed.chars().count() > 80 {
+                                trimmed.chars().take(80).collect::<String>() + "…"
+                            } else {
+                                trimmed.to_string()
+                            }
+                        } else if let Some(cmd) = first_tc.arguments.get("command").and_then(Value::as_str) {
+                            let c = cmd.lines().next().unwrap_or("").chars().take(50).collect::<String>();
+                            format!("run: {c}")
+                        } else {
+                            "run bash".to_string()
+                        }
+                    } else if let Some(cmd) = first_tc.arguments.get("command").and_then(Value::as_str) {
                         let c = cmd.lines().next().unwrap_or("").chars().take(60).collect::<String>();
                         format!("run: {c}")
                     } else if let Some(p) = first_tc.arguments.get("path").and_then(Value::as_str) {
@@ -486,16 +500,26 @@ fn extract_message_metadata(
 
             let summary = match tool_name.as_str() {
                 "bash" => {
-                    let cmd = content.get("command").and_then(Value::as_str).unwrap_or("");
-                    let first = cmd.lines().next().unwrap_or("").trim();
-                    let short_cmd = if first.chars().count() > 45 {
-                        first.chars().take(45).collect::<String>() + "…"
-                    } else if cmd.lines().count() > 1 {
-                        format!("{first}…")
+                    if let Some(lbl) = content.get("label").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                        let trimmed = lbl.trim();
+                        if trimmed.chars().count() > 80 {
+                            trimmed.chars().take(80).collect::<String>() + "…"
+                        } else {
+                            trimmed.to_string()
+                        }
                     } else {
-                        first.to_string()
-                    };
-                    format!("bash: {short_cmd}")
+                        // Fallback for old cases where label was omitted
+                        let cmd = content.get("command").and_then(Value::as_str).unwrap_or("");
+                        let first = cmd.lines().next().unwrap_or("").trim();
+                        let short_cmd = if first.chars().count() > 45 {
+                            first.chars().take(45).collect::<String>() + "…"
+                        } else if cmd.lines().count() > 1 {
+                            format!("{first}…")
+                        } else {
+                            first.to_string()
+                        };
+                        format!("bash: {short_cmd}")
+                    }
                 }
                 "edit_file" => format!("edited {paths}"),
                 "read_file" => format!("read {paths}"),
@@ -553,18 +577,29 @@ mod tests {
                     "edited": true
                 }),
             },
+            HarnessMessage::ToolResult {
+                tool_call_id: "call_3".to_string(),
+                tool_name: "bash".to_string(),
+                content: json!({
+                    "command": "cargo test --test auth_tests",
+                    "label": "Run auth unit tests",
+                    "exit_code": 0,
+                    "stdout": "test result: ok."
+                }),
+            },
         ];
 
         let summaries = archive_messages(&store, "session-1", &messages, 0, "2026-09-25T16:00:00Z")
             .expect("archive messages");
-        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries.len(), 4);
 
-        // Verify micro-pointer output
+        // Verify micro-pointer output: old unlabeled bash falls back to command, labeled bash uses label
         let manifest = render_micro_pointers("Fix error E0308", &summaries);
         assert!(manifest.contains("[archived_history]"));
         assert!(manifest.contains("#1|user|Please fix compiler error E0308 in auth.rs||ok"));
         assert!(manifest.contains("#2|bash|bash: cargo check||exit 1"));
         assert!(manifest.contains("#3|edit_file|edited src/auth.rs|src/auth.rs|ok"));
+        assert!(manifest.contains("#4|bash|Run auth unit tests||ok"));
 
         // Recall turn 2
         let turn2 = recall_turn(&store, summaries[1].archive_id)
