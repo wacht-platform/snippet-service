@@ -185,7 +185,7 @@ pub(crate) async fn bg_kill(
         return (StatusCode::BAD_REQUEST, "id required").into_response();
     };
     match crate::bg::kill_by_id(&dir, id) {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(_) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => Json(serde_json::json!({"ok": false, "error": e.to_string()})).into_response(),
     }
 }

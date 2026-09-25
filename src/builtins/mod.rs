@@ -3,12 +3,14 @@ pub mod shell_search;
 pub mod web;
 pub mod memory;
 pub mod history;
+pub mod process;
 
 pub use fs::*;
 pub use shell_search::*;
 pub use web::*;
 pub use memory::*;
 pub use history::*;
+pub use process::*;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,6 +32,7 @@ pub fn coding_tools(
     registry.insert(ViewOutlineTool);
     registry.insert(CodeMapTool);
     registry.insert(BashTool);
+    registry.insert(ManageProcessTool);
     registry.insert(RecallContextTool);
     registry.insert(SearchHistoryTool);
     // Skill tools only when the user actually has skills installed — otherwise they
