@@ -552,9 +552,10 @@ impl App {
             if self.held_queue().is_empty() {
                 return;
             }
-            let id = self.held_queue().first().map(|item| item.id.clone());
-            if let Some(id) = id {
-                let _ = self.send_loop_input(LoopInput::SteerQueued(id));
+            let item = self.held_queue().first().cloned();
+            if let Some(item) = item {
+                self.pending_steers.push(item.text);
+                let _ = self.send_loop_input(LoopInput::SteerQueued(item.id));
             }
             self.input_clear();
             self.scroll = 0;
