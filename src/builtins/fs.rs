@@ -367,11 +367,17 @@ impl Tool for EditFileTool {
             } else {
                 content.replacen(&args.old_string, &args.new_string, 1)
             };
-            tokio::fs::write(&path, updated).await?;
+            tokio::fs::write(&path, &updated).await?;
             ctx.record_change(&path);
-            return Ok(ToolResult::success(
-                json!({"path": args.path, "edited": true}),
-            ));
+            let mut res = json!({"path": args.path, "edited": true});
+            if exact == 1 {
+                let start_offset = content.find(&args.old_string).unwrap_or(0);
+                let start_line = content[..start_offset].matches('\n').count() + 1;
+                res["diff"] = json!(format_diff_snippet(&args.old_string, &args.new_string, start_line));
+            } else {
+                res["replacements"] = json!(exact);
+            }
+            return Ok(ToolResult::success(res));
         }
 
         // 2. Whitespace-flexible fallback (single edit): normalize only insignificant
@@ -379,12 +385,14 @@ impl Tool for EditFileTool {
         // unchanged. Non-whitespace source tokens must still match exactly.
         if !args.replace_all {
             match flexible_replace(&content, &args.old_string, &args.new_string) {
-                Flex::Replaced(updated) => {
-                    tokio::fs::write(&path, updated).await?;
+                Flex::Replaced { updated, start_line, matched_text } => {
+                    tokio::fs::write(&path, &updated).await?;
                     ctx.record_change(&path);
+                    let diff = format_diff_snippet(&matched_text, &args.new_string, start_line);
                     return Ok(ToolResult::success(json!({
                         "path": args.path,
                         "edited": true,
+                        "diff": diff,
                         "note": "matched after whitespace normalization; replacement preserved unchanged",
                     })));
                 }
@@ -413,10 +421,31 @@ impl Tool for EditFileTool {
 }
 
 enum Flex {
-    Replaced(String),
+    Replaced {
+        updated: String,
+        start_line: usize,
+        matched_text: String,
+    },
     /// 1-based first line of each matching block.
     Ambiguous(Vec<usize>),
     NoMatch,
+}
+
+fn format_diff_snippet(old_s: &str, new_s: &str, start_line: usize) -> String {
+    let old_count = old_s.lines().count().max(1);
+    let new_count = new_s.lines().count().max(1);
+    let mut diff = format!("@@ -{start_line},{old_count} +{start_line},{new_count} @@\n");
+    for line in old_s.lines() {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in new_s.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
 }
 
 /// 1-based line number of each occurrence of `needle` in `content` (capped).
@@ -569,11 +598,17 @@ fn flexible_replace(content: &str, old: &str, new: &str) -> Flex {
     match hits.as_slice() {
         [] => Flex::NoMatch,
         &[(start, end)] => {
+            let matched_text = content[start..end].to_string();
+            let start_line = content[..start].matches('\n').count() + 1;
             let mut updated = String::with_capacity(content.len() + new.len());
             updated.push_str(&content[..start]);
             updated.push_str(new);
             updated.push_str(&content[end..]);
-            Flex::Replaced(updated)
+            Flex::Replaced {
+                updated,
+                start_line,
+                matched_text,
+            }
         }
         more => Flex::Ambiguous(
             more.iter()
@@ -628,7 +663,7 @@ mod edit_matching_tests {
         let old = "  const   value = build(first, second);  ";
         let replacement = "const value = replacement(first, second);";
 
-        let Flex::Replaced(updated) = flexible_replace(source, old, replacement) else {
+        let Flex::Replaced { updated, .. } = flexible_replace(source, old, replacement) else {
             panic!("whitespace-normalized source should match");
         };
         assert_eq!(updated, format!("{replacement}\n"));
