@@ -337,7 +337,7 @@ mod tests {
         assert!(is_session_id(SESSION_ID));
         assert!(is_session_id("mission-control/session.json"));
         assert!(!is_session_id("gmata-backend-abc/conversations/x.json"));
-        assert!(!is_session_id("foo/state.json"));
+        assert!(!is_session_id("foo/custom.json"));
         let home = workspace_path();
         assert_eq!(session_state_path(), home.join("session.json"));
         assert!(home.ends_with("mission-control"));

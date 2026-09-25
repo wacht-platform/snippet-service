@@ -103,7 +103,8 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              owned_paths_json TEXT NOT NULL DEFAULT '[]',
              -- Inference profile the target session should run on. Set by the
              -- dispatcher; NULL leaves the session's own model alone.
-             profile TEXT
+             profile TEXT,
+             plan TEXT NOT NULL DEFAULT ''
          );
          CREATE INDEX IF NOT EXISTS tasks_status_priority
              ON tasks(status, priority DESC, created_at);
@@ -130,6 +131,9 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
              agent_id TEXT NOT NULL REFERENCES agents(id),
              role TEXT NOT NULL DEFAULT '',
+             work_session_id TEXT,
+             scope TEXT NOT NULL DEFAULT '',
+             status TEXT NOT NULL DEFAULT 'pending',
              added_at TEXT NOT NULL,
              removed_at TEXT,
              PRIMARY KEY (task_id, agent_id)
@@ -196,6 +200,23 @@ fn add_missing_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
     };
     if !existing.iter().any(|column| column == "profile") {
         connection.execute("ALTER TABLE tasks ADD COLUMN profile TEXT", [])?;
+    }
+    if !existing.iter().any(|column| column == "plan") {
+        connection.execute("ALTER TABLE tasks ADD COLUMN plan TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    let task_agent_columns: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(task_agents)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (name, declaration) in [
+        ("work_session_id", "TEXT"),
+        ("scope", "TEXT NOT NULL DEFAULT ''"),
+        ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+    ] {
+        if !task_agent_columns.iter().any(|column| column == name) {
+            connection.execute(&format!("ALTER TABLE task_agents ADD COLUMN {name} {declaration}"), [])?;
+        }
     }
     Ok(())
 }

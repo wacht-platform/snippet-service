@@ -10,7 +10,4 @@ output = "Output is tokens — keep it small: rg -n over dumps, wc -l for counts
 failure = "Read stdout/stderr and act on the concrete error; missing binary → adapt or report the blocker."
 
 [checkpoints]
-what = "Before each turn the harness snapshots the worktree into a private shadow git repo (never your .git): git-dir $SNIPPET_SHADOW_GIT, branch `checkpoint` = the state before this turn. Captures bash changes."
-review = "To see everything you changed this turn: git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. add -A && git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. diff --cached checkpoint (add --stat or `-- <path>` to scope). Self-check multi-file changes before reporting."
-revert_one = "git --git-dir=\"$SNIPPET_SHADOW_GIT\" --work-tree=. checkout checkpoint -- <path>"
-hands_off = "Staging and read-only review/checkout are fine; never commit, reset --hard, gc, or move refs — the harness owns this repo."
+what = "The harness automatically snapshots the worktree before each turn in a private shadow repo ($SNIPPET_SHADOW_GIT) for recovery. Never commit, reset, or alter refs in the shadow repo; the harness manages it."

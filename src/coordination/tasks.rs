@@ -27,6 +27,23 @@ impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::InProgress => "in_progress",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// How two tasks relate. `Blocks` is an ordering constraint the scheduler must
@@ -45,6 +62,8 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub description: String,
+    #[serde(default)]
+    pub plan: String,
     pub status: TaskStatus,
     /// Higher sorts first within a status column. 0 is the default.
     pub priority: i64,
@@ -169,6 +188,7 @@ impl Task {
             id,
             title,
             description,
+            plan: String::new(),
             status: TaskStatus::Todo,
             priority,
             created_by_kind: "human".into(),
@@ -211,6 +231,7 @@ impl Task {
             id,
             title,
             description,
+            plan: String::new(),
             status: TaskStatus::Todo,
             priority: 0,
             created_by_kind: created_by_kind.to_string(),
@@ -246,9 +267,19 @@ pub struct TaskLink {
 pub struct TaskAgent {
     pub task_id: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub work_session_id: Option<String>,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default = "pending_task_agent_status")]
+    pub status: String,
     pub role: String,
     pub added_at: String,
     pub removed_at: Option<String>,
+}
+
+fn pending_task_agent_status() -> String {
+    "pending".into()
 }
 
 /// Optional narrowing for a task page. Applied in SQL, so a filtered page is
@@ -347,13 +378,14 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
         notifications: decode_json_vec(row.get(17)?, 17)?,
         owned_paths: decode_json_vec(row.get(18)?, 18)?,
         profile: row.get(19)?,
+        plan: row.get(20)?,
     })
 }
 
 const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
      created_by_id, created_at, updated_at, completed_at, thread_id, session_id,
      handoff_json, handoff_mode, reporting_session, dispatch_failures, result_json,
-     notifications_json, owned_paths_json, profile";
+     notifications_json, owned_paths_json, profile, plan";
 
 /// Persist every mutable column of a task. Takes the connection so it composes
 /// into the read-modify-write transaction in `update_task_in` — a separate
@@ -378,7 +410,8 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             result_json = ?13,
             notifications_json = ?14,
             owned_paths_json = ?15,
-            profile = ?16
+            profile = ?16,
+            plan = ?17
          WHERE id = ?1",
         params![
             task.id,
@@ -397,6 +430,7 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             serde_json::to_string(&task.notifications).unwrap_or_else(|_| "[]".into()),
             serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
             task.profile,
+            task.plan,
         ],
     )?;
     Ok(())
@@ -410,6 +444,14 @@ impl Store {
     /// `INSERT OR IGNORE` in `append_event` then no-ops on it, which is why that
     /// path needs no special case.
     pub fn create_task(&self, task: &Task) -> Result<(), StoreError> {
+        self.create_task_with_agents(task, &[])
+    }
+
+    pub fn create_task_with_agents(
+        &self,
+        task: &Task,
+        agents: &[TaskAgent],
+    ) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
             tx.execute(
@@ -417,8 +459,8 @@ impl Store {
                     created_by_kind, created_by_id, created_at, updated_at,
                     completed_at, thread_id, session_id, handoff_json, handoff_mode,
                     reporting_session, dispatch_failures, result_json,
-                    notifications_json, owned_paths_json, profile)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+                    notifications_json, owned_paths_json, profile, plan)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 params![
                     task.id,
                     task.title,
@@ -428,6 +470,7 @@ impl Store {
                     task.created_by_kind,
                     task.created_by_id,
                     task.created_at,
+                    task.updated_at,
                     task.completed_at,
                     task.thread_id,
                     task.session_id,
@@ -439,6 +482,7 @@ impl Store {
                     serde_json::to_string(&task.notifications).unwrap_or_else(|_| "[]".into()),
                     serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
                     task.profile,
+                    task.plan,
                 ],
             )?;
             tx.execute(
@@ -454,6 +498,28 @@ impl Store {
                  VALUES (?1, ?2, ?3)",
                 params![task.thread_id, task.created_by_id, task.created_by_kind],
             )?;
+            for agent in agents {
+                tx.execute(
+                    "INSERT INTO task_agents
+                     (task_id, agent_id, role, work_session_id, scope, status, added_at, removed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        task.id,
+                        agent.agent_id,
+                        agent.role,
+                        agent.work_session_id,
+                        agent.scope,
+                        agent.status,
+                        agent.added_at,
+                        agent.removed_at,
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO board_participants (thread_id, actor_id, actor_kind)
+                     VALUES (?1, ?2, 'agent')",
+                    params![task.thread_id, agent.agent_id],
+                )?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -750,15 +816,28 @@ impl Store {
         priority: Option<i64>,
         now: &str,
     ) -> Result<bool, StoreError> {
+        self.update_task_full(id, title, description, None, priority, now)
+    }
+
+    pub fn update_task_full(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        plan: Option<&str>,
+        priority: Option<i64>,
+        now: &str,
+    ) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             Ok(conn.execute(
                 "UPDATE tasks SET
                     title = COALESCE(?2, title),
                     description = COALESCE(?3, description),
-                    priority = COALESCE(?4, priority),
-                    updated_at = ?5
+                    plan = COALESCE(?4, plan),
+                    priority = COALESCE(?5, priority),
+                    updated_at = ?6
                  WHERE id = ?1",
-                params![id, title, description, priority, now],
+                params![id, title, description, plan, priority, now],
             )? == 1)
         })
     }
@@ -873,6 +952,19 @@ impl Store {
         role: &str,
         now: &str,
     ) -> Result<(), StoreError> {
+        self.add_task_agent_full(task_id, agent_id, role, None, "", "pending", now)
+    }
+
+    pub fn add_task_agent_full(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        role: &str,
+        work_session_id: Option<&str>,
+        scope: &str,
+        status: &str,
+        now: &str,
+    ) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
             let thread: Option<String> = tx
@@ -886,12 +978,15 @@ impl Store {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             };
             tx.execute(
-                "INSERT INTO task_agents (task_id, agent_id, role, added_at, removed_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL)
+                "INSERT INTO task_agents (task_id, agent_id, role, work_session_id, scope, status, added_at, removed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
                  ON CONFLICT(task_id, agent_id) DO UPDATE SET
                      role = excluded.role,
+                     work_session_id = COALESCE(excluded.work_session_id, task_agents.work_session_id),
+                     scope = CASE WHEN excluded.scope <> '' THEN excluded.scope ELSE task_agents.scope END,
+                     status = excluded.status,
                      removed_at = NULL",
-                params![task_id, agent_id, role, now],
+                params![task_id, agent_id, role, work_session_id, scope, status, now],
             )?;
             // Membership on the task IS membership in its room: an agent on the
             // task can always read and post to it.
@@ -902,6 +997,76 @@ impl Store {
             )?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    pub fn set_task_agent_status(
+        &self,
+        task_id: &str,
+        agent_id: &str,
+        status: &str,
+    ) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let count = conn.execute(
+                "UPDATE task_agents SET status = ?3
+                 WHERE task_id = ?1 AND agent_id = ?2 AND removed_at IS NULL",
+                params![task_id, agent_id, status],
+            )?;
+            Ok(count > 0)
+        })
+    }
+
+    /// Transfer the active work session lease on a task from one agent to another.
+    /// Exactly one agent is "active" on a session at a time; others are "waiting".
+    pub fn transfer_task_session_lease(
+        &self,
+        task_id: &str,
+        from_agent_id: &str,
+        to_agent_id: &str,
+    ) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "UPDATE task_agents SET status = 'waiting'
+                 WHERE task_id = ?1 AND agent_id = ?2 AND removed_at IS NULL",
+                params![task_id, from_agent_id],
+            )?;
+            let updated = tx.execute(
+                "UPDATE task_agents SET status = 'active'
+                 WHERE task_id = ?1 AND agent_id = ?2 AND removed_at IS NULL",
+                params![task_id, to_agent_id],
+            )?;
+            if updated == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn get_task_by_thread(&self, thread_id: &str) -> Result<Option<Task>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {TASK_COLUMNS} FROM tasks WHERE thread_id = ?1"
+            ))?;
+            Ok(stmt.query_row(params![thread_id], task_from_row).optional()?)
+        })
+    }
+
+    pub fn list_thread_participants(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT actor_id, actor_kind FROM board_participants
+                 WHERE thread_id = ?1
+                 ORDER BY actor_id",
+            )?;
+            let rows = stmt.query_map(params![thread_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            rows.collect()
         })
     }
 
@@ -927,7 +1092,7 @@ impl Store {
     pub fn list_task_agents(&self, task_id: &str) -> Result<Vec<TaskAgent>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT task_id, agent_id, role, added_at, removed_at
+                "SELECT task_id, agent_id, work_session_id, scope, status, role, added_at, removed_at
                  FROM task_agents
                  WHERE task_id = ?1
                  ORDER BY (removed_at IS NULL) DESC, added_at",
@@ -936,9 +1101,12 @@ impl Store {
                 Ok(TaskAgent {
                     task_id: row.get(0)?,
                     agent_id: row.get(1)?,
-                    role: row.get(2)?,
-                    added_at: row.get(3)?,
-                    removed_at: row.get(4)?,
+                    work_session_id: row.get(2)?,
+                    scope: row.get(3)?,
+                    status: row.get(4)?,
+                    role: row.get(5)?,
+                    added_at: row.get(6)?,
+                    removed_at: row.get(7)?,
                 })
             })?;
             rows.collect()
@@ -1224,5 +1392,70 @@ mod tests {
             .unwrap();
         assert_eq!(todos.len(), 3);
         assert!(todos.iter().all(|t| t.status == TaskStatus::Todo));
+    }
+
+    #[test]
+    fn task_session_lease_and_thread_participants() {
+        let db = db();
+        let t = task("t1");
+        db.create_task(&t).unwrap();
+        db.create_agent(&crate::coordination::types::Agent {
+            id: "a1".into(),
+            display_name: "Agent 1".into(),
+            handle: "agent1".into(),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Implementer,
+            capabilities: vec![],
+        })
+        .unwrap();
+        db.create_agent(&crate::coordination::types::Agent {
+            id: "a2".into(),
+            display_name: "Agent 2".into(),
+            handle: "agent2".into(),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Reviewer,
+            capabilities: vec![],
+        })
+        .unwrap();
+
+        db.add_task_agent_full(
+            "t1",
+            "a1",
+            "implementer",
+            Some("session-1"),
+            "backend migration",
+            "active",
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+
+        db.add_task_agent_full(
+            "t1",
+            "a2",
+            "reviewer",
+            Some("session-1"),
+            "code review",
+            "waiting",
+            "2026-01-01T00:00:01Z",
+        )
+        .unwrap();
+
+        let participants = db.list_thread_participants(&t.thread_id).unwrap();
+        assert!(participants.iter().any(|(id, kind)| id == "a1" && kind == "agent"));
+        assert!(participants.iter().any(|(id, kind)| id == "a2" && kind == "agent"));
+
+        let found_task = db.get_task_by_thread(&t.thread_id).unwrap().unwrap();
+        assert_eq!(found_task.id, "t1");
+
+        // Transfer lease from a1 to a2
+        db.transfer_task_session_lease("t1", "a1", "a2").unwrap();
+
+        let roster = db.list_task_agents("t1").unwrap();
+        let a1 = roster.iter().find(|a| a.agent_id == "a1").unwrap();
+        let a2 = roster.iter().find(|a| a.agent_id == "a2").unwrap();
+        assert_eq!(a1.status, "waiting");
+        assert_eq!(a2.status, "active");
     }
 }

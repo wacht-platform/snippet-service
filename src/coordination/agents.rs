@@ -137,7 +137,7 @@ impl Store {
                      SELECT ta.agent_id as agent_id, s.id as id, s.title as title, s.state_json as state_json, s.last_active as last_active, s.updated_at as updated_at
                      FROM task_agents ta
                      JOIN tasks t ON t.id = ta.task_id
-                     JOIN sessions s ON (s.id = t.session_id OR s.legacy_id = t.session_id OR s.id = REPLACE(t.session_id, '/state.json', ''))
+                     JOIN sessions s ON (s.id = t.session_id OR s.legacy_id = t.session_id)
                      WHERE ta.removed_at IS NULL
                        AND t.session_id <> ''
                      UNION

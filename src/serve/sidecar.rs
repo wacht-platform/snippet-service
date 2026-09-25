@@ -1,6 +1,4 @@
-//! Local sidecar client — the TUI talks to a running `snippet serve` daemon
-//! over its **local** HTTP/WS API so the daemon is the sole owner of every
-//! `run_interactive` loop and every `state.json` write.
+//! `run_interactive` loop and every session state write.
 //!
 //! Discovery:
 //!   `~/.snippet/serve.json` → `{ api_url, token, … }`
