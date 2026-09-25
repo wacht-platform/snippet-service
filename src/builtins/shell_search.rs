@@ -310,78 +310,108 @@ impl Tool for BashTool {
         let stdout_str = String::from_utf8_lossy(&output.stdout);
         let stderr_str = String::from_utf8_lossy(&output.stderr);
 
-        // Apply line limit before byte limit if specified
-        let (stdout_truncated, stderr_truncated) = if let Some(max_lines) = args.max_lines {
-            (
-                truncate_lines(&stdout_str, max_lines),
-                truncate_lines(&stderr_str, max_lines),
-            )
-        } else {
-            (
-                truncate_bytes(&stdout_str, args.max_bytes / 2),
-                truncate_bytes(&stderr_str, args.max_bytes / 2),
-            )
-        };
+        // Always save the full, unabridged execution log to disk
+        let logs_dir = ctx.workspace_root().join(".snippet").join("logs");
+        let _ = std::fs::create_dir_all(&logs_dir);
+        let file_name = format!(
+            "bash_{}_{}.log",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S"),
+            &uuid::Uuid::new_v4().to_string()[..8]
+        );
+        let log_path = logs_dir.join(&file_name);
+        let full_raw = format!(
+            "=== COMMAND ===\n{}\n\n=== EXIT CODE: {} (success: {}) ===\n\n=== STDOUT ===\n{}\n\n=== STDERR ===\n{}",
+            args.command,
+            output.status.code().unwrap_or(-1),
+            output.status.success(),
+            stdout_str,
+            stderr_str,
+        );
+        let _ = std::fs::write(&log_path, &full_raw);
+        let rel_log_path = format!(".snippet/logs/{file_name}");
+        let abs_log_path = log_path.display().to_string();
 
-        let value = json!({
+        let total_stdout_lines = stdout_str.lines().count();
+        let total_stderr_lines = stderr_str.lines().count();
+        let total_lines = total_stdout_lines + total_stderr_lines;
+        let total_bytes = stdout_str.len() + stderr_str.len();
+
+        let byte_budget = (args.max_bytes / 2).max(4000);
+        let (stdout_display, stdout_truncated) = format_output_preview(
+            &stdout_str,
+            args.max_lines,
+            byte_budget,
+            &rel_log_path,
+        );
+        let (stderr_display, stderr_truncated) = format_output_preview(
+            &stderr_str,
+            args.max_lines,
+            byte_budget,
+            &rel_log_path,
+        );
+        let is_truncated = stdout_truncated || stderr_truncated;
+
+        let mut value = json!({
             "command": args.command,
             "exit_code": output.status.code(),
             "success": output.status.success(),
-            "stdout": stdout_truncated,
-            "stderr": stderr_truncated,
+            "stdout": stdout_display,
+            "stderr": stderr_display,
+            "saved_output_path": rel_log_path,
+            "log_path": abs_log_path,
+            "total_lines": total_lines,
+            "total_bytes": total_bytes,
         });
 
-        // Final byte cap check
-        let rendered = serde_json::to_string_pretty(&value).unwrap_or_default();
-        if rendered.chars().count() > args.max_bytes {
-            truncate_output_to(value, args.max_bytes)
-        } else {
-            Ok(ToolResult::success(value))
+        if is_truncated {
+            value["truncated"] = json!(true);
+            value["hint"] = json!(format!(
+                "Output exceeded display limit; full output ({total_lines} lines, {total_bytes} bytes) saved to `{rel_log_path}`. Inspect it using read_file, grep, head, or tail."
+            ));
         }
+
+        Ok(ToolResult::success(value))
     }
 }
 
-fn truncate_lines(text: &str, max: usize) -> String {
+fn format_output_preview(
+    text: &str,
+    max_lines: Option<usize>,
+    max_bytes: usize,
+    log_ref: &str,
+) -> (String, bool) {
     let lines: Vec<&str> = text.lines().collect();
-    let mut result: String = lines[..lines.len().min(max)].join("\n");
-    if lines.len() > max {
-        result.push_str(&format!("\n… +{} more lines", lines.len() - max));
-    }
-    result
-}
+    let total_lines = lines.len();
+    let total_bytes = text.len();
 
-fn truncate_bytes(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
+    let line_ceiling = max_lines.unwrap_or(100);
+    if total_lines <= line_ceiling && total_bytes <= max_bytes {
+        return (text.to_string(), false);
     }
-    // Back off to the nearest char boundary at or below the byte limit.
-    let mut end = max_bytes.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut result = text[..end].to_string();
-    result.push_str(&format!(
-        "\n… truncated ({} of {} bytes shown)",
-        end,
-        text.len()
-    ));
-    result
-}
 
-fn truncate_output_to(value: Value, max_bytes: usize) -> Result<ToolResult, ToolError> {
-    let rendered = serde_json::to_string_pretty(&value).unwrap_or_default();
-    let truncated_len = max_bytes.min(4000);
-    let preview: String = rendered.chars().take(truncated_len).collect();
-    Ok(ToolResult::success(json!({
-        "truncated": true,
-        "data_omitted": true,
-        "preview": preview,
-        "original_stats": {
-            "char_count": rendered.chars().count(),
-            "size_bytes": rendered.len(),
-        },
-        "hint": "Output exceeded the inline limit; rerun with a narrower command or read a smaller slice.",
-    })))
+    // Keep head and tail lines so start of command and ending errors are both visible
+    let half = (line_ceiling / 2).max(10);
+    let head_count = half.min(total_lines);
+    let tail_count = half.min(total_lines.saturating_sub(head_count));
+    let omitted = total_lines.saturating_sub(head_count + tail_count);
+
+    let head = &lines[..head_count];
+    let tail = &lines[total_lines.saturating_sub(tail_count)..];
+
+    let mut result = String::new();
+    result.push_str(&head.join("\n"));
+    if omitted > 0 {
+        result.push_str(&format!(
+            "\n\n… <truncated {omitted} lines; full output ({total_lines} lines, {total_bytes} bytes) saved to {log_ref}> …\n\n"
+        ));
+    } else {
+        result.push_str(&format!(
+            "\n\n… <truncated to size limit; full output saved to {log_ref}> …\n\n"
+        ));
+    }
+    result.push_str(&tail.join("\n"));
+
+    (result, true)
 }
 
 pub struct SearchContentTool;
