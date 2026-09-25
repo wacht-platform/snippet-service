@@ -1119,6 +1119,11 @@ pub(super) fn tool_call_preview(
             }
         }
         "bash" => {
+            let label = arg("label");
+            if !label.is_empty() {
+                items.push((format!("→ {label}"), path_style));
+                items.push(("".to_string(), subtle()));
+            }
             let cmd = arg("command");
             let total = cmd.lines().count().max(1);
             items.push(("command".to_string(), path_style));

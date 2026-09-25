@@ -110,10 +110,10 @@ pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, St
         "web_read" => ("Fetch".into(), arg("url")),
         "read_image" => ("Read".into(), arg("path")),
         "bash" => {
-            // Commands can be long or multi-line; show a compact single line (first
-            // line, whitespace-collapsed, capped) with an ellipsis when elided.
+            let label = arg("label");
             let cmd = arg("command");
-            ("Bash".into(), ellipsize_one_line(&cmd, 90))
+            let text = if !label.is_empty() { label } else { cmd };
+            ("Bash".into(), ellipsize_one_line(&text, 90))
         }
         "memory_write" => ("MemoryWrite".into(), {
             let id = arg("id");

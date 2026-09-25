@@ -194,6 +194,8 @@ pub struct BashTool;
 struct BashArgs {
     command: String,
     #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
     timeout_seconds: Option<u64>,
     #[serde(default)]
     max_lines: Option<usize>,
@@ -215,17 +217,18 @@ impl Tool for BashTool {
         NativeToolDefinition {
             name: "bash".to_string(),
             description:
-                "Run a shell command in the workspace. Keep output narrow and deterministic. Use max_lines or max_bytes to limit output. Set background=true for long-lived processes (dev servers, watchers): it returns immediately, redirects output to a log file, and tracks the process in the live background-process list — tail the log or `kill <pid>` to manage it. For interactive/async apps you must control programmatically (a browser, a REPL, an emulator), do NOT script the whole interaction in one shot: start the app once with background=true, then drive it surgically across small follow-up calls (browser via its remote-debugging port, REPL via a fifo stdin), reading the new output between steps, and kill the pid when done."
+                "Run a shell command in the workspace. Keep output narrow and deterministic. Always provide a clear, concise `label` describing the semantic intent of the command. Use max_lines or max_bytes to limit output. Set background=true for long-lived processes (dev servers, watchers): it returns immediately, redirects output to a log file, and tracks the process in the live background-process list — tail the log or `kill <pid>` to manage it. For interactive/async apps you must control programmatically (a browser, a REPL, an emulator), do NOT script the whole interaction in one shot: start the app once with background=true, then drive it surgically across small follow-up calls (browser via its remote-debugging port, REPL via a fifo stdin), reading the new output between steps, and kill the pid when done."
                     .to_string(),
             input_schema: object_schema(
                 json!({
-                    "command": {"type": "string"},
+                    "command": {"type": "string", "description": "The exact shell command line string to execute."},
+                    "label": {"type": "string", "description": "A concise description of what this command does (typically under 10 words, e.g. 'Run test suite', 'Check git status', 'Install dependencies', 'Build backend'). Required."},
                     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800},
                     "max_lines": {"type": "integer", "minimum": 1, "description": "Limit stdout/stderr output to this many lines. If omitted, uses max_bytes."},
                     "max_bytes": {"type": "integer", "minimum": 1, "default": 20000, "description": "Hard limit on output size in bytes."},
                     "background": {"type": "boolean", "default": false, "description": "Run detached and return immediately; for servers/watchers that should keep running. Output goes to a log file; the process shows up in the background-process list."}
                 }),
-                &["command"],
+                &["command", "label"],
             ),
         }
     }
@@ -236,6 +239,8 @@ impl Tool for BashTool {
         // the command string and the result never carry values (results are also
         // scrubbed at the harness choke point).
         let vault_env = crate::vault::Vault::load().env_for_command(&args.command);
+
+        let label = args.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
         if args.background {
             let id = crate::bg::new_id();
@@ -274,14 +279,18 @@ impl Tool for BashTool {
                 };
                 let _ = std::fs::write(status_path, code);
             });
-            return Ok(ToolResult::success(json!({
+            let mut res = json!({
                 "command": args.command,
                 "background": true,
                 "id": id,
                 "pid": pid,
                 "log": log_path.display().to_string(),
                 "note": "started in the background and still running. tail the log file to see output, or `kill <pid>` to stop it. it appears in your background-process list.",
-            })));
+            });
+            if let Some(lbl) = label {
+                res["label"] = json!(lbl);
+            }
+            return Ok(ToolResult::success(res));
         }
 
         let child = Command::new("sh")
@@ -320,7 +329,8 @@ impl Tool for BashTool {
         );
         let log_path = logs_dir.join(&file_name);
         let full_raw = format!(
-            "=== COMMAND ===\n{}\n\n=== EXIT CODE: {} (success: {}) ===\n\n=== STDOUT ===\n{}\n\n=== STDERR ===\n{}",
+            "=== LABEL ===\n{}\n\n=== COMMAND ===\n{}\n\n=== EXIT CODE: {} (success: {}) ===\n\n=== STDOUT ===\n{}\n\n=== STDERR ===\n{}",
+            label.unwrap_or(""),
             args.command,
             output.status.code().unwrap_or(-1),
             output.status.success(),
@@ -362,6 +372,9 @@ impl Tool for BashTool {
             "total_lines": total_lines,
             "total_bytes": total_bytes,
         });
+        if let Some(lbl) = label {
+            value["label"] = json!(lbl);
+        }
 
         if is_truncated {
             value["truncated"] = json!(true);
