@@ -224,23 +224,32 @@ impl CodingHarness {
                             Err(error) => (tool_error(error), MetaControl::Continue),
                         };
                     }
-                    match lanes.spawn(&brief.title, &brief.description, brief.read_only) {
+                    match lanes.spawn(
+                        &brief.title,
+                        &brief.description,
+                        brief.read_only,
+                        brief.agent.clone(),
+                    ) {
                         Ok(id) => {
                             state.events.push(HarnessEvent::LaneSpawned {
                                 id: id.clone(),
                                 title: brief.title.clone(),
                             });
+                            let mut data = json!({
+                                "delegated": true,
+                                "lane_id": id,
+                                "title": brief.title,
+                                "access": if brief.read_only { "read_only" } else { "full" },
+                                "note": "Lane runs in the background; its report will arrive as a [lane_report] message. Follow up later by re-calling delegate_task with this lane_id.",
+                            });
+                            if let Some(ref agent) = brief.agent {
+                                data["agent"] = json!(agent);
+                            }
                             (
                                 json!({
                                     "schema_version": 1,
                                     "status": "success",
-                                    "data": {
-                                        "delegated": true,
-                                        "lane_id": id,
-                                        "title": brief.title,
-                                        "access": if brief.read_only { "read_only" } else { "full" },
-                                        "note": "Lane runs in the background; its report will arrive as a [lane_report] message. Follow up later by re-calling delegate_task with this lane_id.",
-                                    }
+                                    "data": data,
                                 }),
                                 MetaControl::Continue,
                             )

@@ -678,9 +678,15 @@ pub(super) fn build_live_context(
         block.push_str("\n[delegated_lanes]\n");
         block.push_str(&format!("running = {}\n", running.len()));
         for l in &running {
+            let agent_str = l
+                .agent
+                .as_ref()
+                .map(|a| format!(" [agent: {a}]"))
+                .unwrap_or_default();
             block.push_str(&format!(
-                "- \"{}\" — running ({})\n",
+                "- \"{}\"{} — running ({})\n",
                 clip(&l.title, 32),
+                agent_str,
                 l.id
             ));
         }
@@ -691,9 +697,15 @@ pub(super) fn build_live_context(
                 LaneStatus::Cancelled => "cancelled",
                 LaneStatus::Running => unreachable!("filtered above"),
             };
+            let agent_str = l
+                .agent
+                .as_ref()
+                .map(|a| format!(" [agent: {a}]"))
+                .unwrap_or_default();
             block.push_str(&format!(
-                "- \"{}\" — {} ({})\n",
+                "- \"{}\"{} — {} ({})\n",
                 clip(&l.title, 32),
+                agent_str,
                 status,
                 l.id
             ));

@@ -341,6 +341,10 @@ fn delegate_task_tool() -> NativeToolDefinition {
                     "type": "string",
                     "enum": ["full", "read_only"],
                     "description": "read_only removes the lane's file-editing tools (investigation/review lanes). Default full."
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional specialized agent identity or role name for this lane (e.g. 'reviewer', 'researcher', 'security')."
                 }
             },
             "required": ["description"],
@@ -360,6 +364,8 @@ pub struct DelegateBrief {
     pub lane_id: Option<String>,
     /// Strip the lane's file-mutation tools (investigation lanes).
     pub read_only: bool,
+    /// Specialized agent identity or role name.
+    pub agent: Option<String>,
 }
 
 /// Validate a `delegate_task` payload: the brief must state both a scope
@@ -369,6 +375,12 @@ pub struct DelegateBrief {
 pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> {
     let lane_id = arguments
         .get("lane_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let agent = arguments
+        .get("agent")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -426,6 +438,7 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         description,
         lane_id,
         read_only,
+        agent,
     })
 }
 
@@ -494,4 +507,36 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
         "questions": out,
         "context": arguments.get("context").cloned().unwrap_or(Value::Null),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_delegate_brief_with_agent() {
+        let payload = json!({
+            "title": "security audit",
+            "description": "Inspect all authentication endpoints and verify timing-safe token comparison is applied.",
+            "access": "read_only",
+            "agent": "security"
+        });
+        let brief = parse_delegate_brief(&payload).expect("should parse");
+        assert_eq!(brief.title, "security audit");
+        assert_eq!(brief.read_only, true);
+        assert_eq!(brief.agent.as_deref(), Some("security"));
+        assert!(brief.lane_id.is_none());
+    }
+
+    #[test]
+    fn test_parse_delegate_brief_without_agent() {
+        let payload = json!({
+            "title": "refactor handlers",
+            "description": "Refactor route handlers to use the shared error type and return structured responses."
+        });
+        let brief = parse_delegate_brief(&payload).expect("should parse");
+        assert_eq!(brief.title, "refactor handlers");
+        assert_eq!(brief.read_only, false);
+        assert_eq!(brief.agent, None);
+    }
 }

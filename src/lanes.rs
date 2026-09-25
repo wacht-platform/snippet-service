@@ -79,6 +79,9 @@ pub struct LaneRecord {
     /// Investigation lane: file-mutation tools removed. Sticky across follow-ups.
     #[serde(default)]
     pub read_only: bool,
+    /// Specialized agent identity or role name (e.g. 'reviewer', 'researcher').
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// Terminal report delivered back to the parent loop when a lane finishes.
@@ -188,7 +191,13 @@ impl LaneManager {
 
     /// Spawn a lane. Returns the new lane id, or an error string (fed back to the
     /// model as a tool error) when delegation is unavailable.
-    pub fn spawn(&mut self, title: &str, brief: &str, read_only: bool) -> Result<String, String> {
+    pub fn spawn(
+        &mut self,
+        title: &str,
+        brief: &str,
+        read_only: bool,
+        agent: Option<String>,
+    ) -> Result<String, String> {
         if self.factory.is_none() {
             return Err(
                 "delegate_task is unavailable in this run (no model factory; interactive mode only)."
@@ -218,8 +227,9 @@ impl LaneManager {
             activity_at: None,
             activity_log: Vec::new(),
             read_only,
+            agent: agent.clone(),
         });
-        self.launch(&id, title, brief, false, read_only);
+        self.launch(&id, title, brief, false, read_only, agent);
         Ok(id)
     }
 
@@ -263,8 +273,12 @@ impl LaneManager {
         record.summary = None;
         record.report = None;
         record.error = None;
-        let (title, read_only) = (record.title.clone(), record.read_only);
-        self.launch(lane_id, &title, brief, true, read_only);
+        let (title, read_only, agent) = (
+            record.title.clone(),
+            record.read_only,
+            record.agent.clone(),
+        );
+        self.launch(lane_id, &title, brief, true, read_only, agent);
         Ok(title)
     }
 
@@ -307,7 +321,15 @@ impl LaneManager {
     }
 
     /// Shared spawn: run the lane on a tokio task and report back over the channel.
-    fn launch(&mut self, id: &str, title: &str, brief: &str, resume: bool, read_only: bool) {
+    fn launch(
+        &mut self,
+        id: &str,
+        title: &str,
+        brief: &str,
+        resume: bool,
+        read_only: bool,
+        agent: Option<String>,
+    ) {
         let factory = self.factory.clone().expect("checked by callers");
         let result_tx = self.result_tx.clone();
         let progress_tx = self.progress_tx.clone();
@@ -330,6 +352,7 @@ impl LaneManager {
                     exa_api_key,
                     resume,
                     read_only,
+                    agent,
                     progress_tx,
                 ),
             )
@@ -390,13 +413,13 @@ impl LaneManager {
 
     /// Relaunch lanes that were running when the parent process stopped.
     pub fn resume_interrupted(&mut self) {
-        let ids: Vec<(String, String, bool)> = self
+        let ids: Vec<(String, String, bool, Option<String>)> = self
             .records
             .iter()
             .filter(|r| r.status == LaneStatus::Running)
-            .map(|r| (r.id.clone(), r.title.clone(), r.read_only))
+            .map(|r| (r.id.clone(), r.title.clone(), r.read_only, r.agent.clone()))
             .collect();
-        for (id, title, read_only) in ids {
+        for (id, title, read_only, agent) in ids {
             self.record_progress(&LaneProgress {
                 id: id.clone(),
                 kind: "restart".to_string(),
@@ -410,7 +433,7 @@ impl LaneManager {
                 .unwrap_or_else(|| {
                     "Continue the delegated task from the saved lane state.".to_string()
                 });
-            self.launch(&id, &title, &handoff, true, read_only);
+            self.launch(&id, &title, &handoff, true, read_only, agent);
         }
     }
 
@@ -594,6 +617,7 @@ async fn run_lane(
     exa_api_key: Option<String>,
     resume: bool,
     read_only: bool,
+    agent: Option<String>,
     progress_tx: mpsc::UnboundedSender<LaneProgress>,
 ) -> Result<(String, String), String> {
     let mut model = factory();
@@ -649,8 +673,27 @@ async fn run_lane(
     } else {
         ""
     };
+    let agent_overlay = if let Some(agent_name) = agent.as_deref() {
+        let home_identity = crate::coordination::AgentHome::new(
+            crate::coordination::agents_root(&crate::config::snippet_home().join("mission-control")),
+            agent_name,
+        )
+        .ok()
+        .and_then(|home| home.read_identity().ok())
+        .filter(|text| !text.trim().is_empty());
+
+        if let Some(id_text) = home_identity {
+            format!("[agent_identity: {agent_name}]\n{}\n\n", id_text.trim())
+        } else {
+            format!(
+                "[agent_identity: {agent_name}]\nYou are operating as specialized agent '{agent_name}'. Apply this domain focus, perspective, and specialization to your work.\n\n"
+            )
+        }
+    } else {
+        String::new()
+    };
     let brief = format!(
-        "{brief}\n\n[lane_reporting]\n{role}You are a delegated lane reporting back to an orchestrator agent. \
+        "{agent_overlay}{brief}\n\n[lane_reporting]\n{role}You are a delegated lane reporting back to an orchestrator agent. \
          In your final terminate_loop summary, cite EXACT file:line references (e.g. `src/foo.rs:42`) \
          for every location, symbol, definition, or finding you identify — report WHERE things are, not \
          just that they exist, so the orchestrator can navigate straight to them without re-searching."
@@ -895,6 +938,7 @@ mod tests {
             activity_at: None,
             activity_log: Vec::new(),
             read_only: true,
+            agent: None,
         }
     }
 
@@ -935,10 +979,22 @@ mod tests {
         object.remove("activity_at");
         object.remove("activity_log");
         object.remove("read_only");
+        object.remove("agent");
         let restored: LaneRecord = serde_json::from_value(value).unwrap();
         assert!(restored.activity.is_none());
         assert!(restored.activity_log.is_empty());
         assert!(!restored.read_only);
+        assert!(restored.agent.is_none());
+    }
+
+    #[test]
+    fn lane_record_serializes_and_deserializes_agent() {
+        let mut record = test_record();
+        record.agent = Some("reviewer".to_string());
+        let val = serde_json::to_value(&record).unwrap();
+        assert_eq!(val["agent"], "reviewer");
+        let restored: LaneRecord = serde_json::from_value(val).unwrap();
+        assert_eq!(restored.agent.as_deref(), Some("reviewer"));
     }
 
     fn finished_record(id: &str, finished_at: &str) -> LaneRecord {
