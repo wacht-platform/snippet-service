@@ -1,10 +1,10 @@
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use serde_json::Value;
 
-use crate::harness::{HarnessEvent, HarnessStatus, LoopInput};
+use crate::harness::{HarnessEvent, HarnessStatus};
 use super::app::*;
 use super::settings::*;
 use super::theme::*;

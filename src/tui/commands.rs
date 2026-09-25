@@ -1,12 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::config::SnippetConfig;
-use crate::harness::{HarnessEvent, HarnessState, HarnessStatus, LoopInput};
+use crate::harness::LoopInput;
 use super::app::*;
-use super::render::*;
 use super::settings::*;
-use super::views::*;
 use super::*;
 
 impl App {

@@ -1,7 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::app::*;
-use super::*;
 
 pub(crate) struct TermPane {
     pub(crate) id: String,

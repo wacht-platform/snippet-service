@@ -1,8 +1,6 @@
-use std::path::Path;
 
-use crate::harness::{HarnessEvent, HarnessState, HarnessStatus, LoopInput};
+use crate::harness::{HarnessStatus, LoopInput};
 use super::app::*;
-use super::*;
 
 impl App {
     pub(crate) fn input_clear(&mut self) {

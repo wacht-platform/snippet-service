@@ -12,14 +12,12 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
 use serde_json::Value;
 
 use crate::config::SnippetConfig;
-use crate::harness::{HarnessEvent, HarnessState, HarnessStatus, LoopInput};
+use crate::harness::{HarnessEvent, HarnessStatus};
 use crate::lanes::LaneStatus;
 
 pub mod mascot;
@@ -40,11 +38,7 @@ mod views;
 mod tests;
 
 pub(crate) use app::*;
-pub(crate) use commands::*;
-pub(crate) use input::*;
-pub(crate) use keybindings::*;
 pub(crate) use render::*;
-pub(crate) use settings::*;
 pub(crate) use term_pane::*;
 pub(crate) use views::*;
 
