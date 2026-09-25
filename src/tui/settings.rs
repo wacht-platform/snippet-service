@@ -1,10 +1,5 @@
-use std::path::PathBuf;
-use std::time::Duration;
 
-use crate::config::SnippetConfig;
-use crate::harness::LoopInput;
 use super::app::*;
-use super::*;
 
 /// Providers offered by the login form, in display order.
 pub(crate) const LOGIN_PROVIDERS: &[&str] = &[

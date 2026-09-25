@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod fork_tests {
     use crate::session::*;
-    use super::*;
+    
     use crate::harness::{HarnessEvent, HarnessState, HarnessStatus};
     use crate::llm::HarnessMessage;
 
@@ -335,7 +335,7 @@ mod create_blank_tests {
 #[cfg(test)]
 mod resolve_session_path_tests {
     use crate::session::*;
-    use super::*;
+    
     use std::fs;
 
     #[test]

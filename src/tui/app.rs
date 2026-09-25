@@ -4,22 +4,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseEventKind,
 };
 use crossterm::execute;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
-use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use crate::config::SnippetConfig;
 use crate::harness::{HarnessEvent, HarnessState, HarnessStatus, LoopInput};
 use super::keybindings::*;
 use super::render::*;
-use super::settings::*;
 use super::term_pane::*;
 use super::views::*;
 use super::*;
