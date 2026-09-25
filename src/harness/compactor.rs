@@ -842,24 +842,44 @@ impl CodingHarness {
                 ));
             }
 
-            let section = |title: &str, items: &[String]| -> String {
-                if items.is_empty() {
-                    format!("{title} = \"\"\n")
-                } else {
-                    format!("{title} = \"\"\"\n{}\n\"\"\"\n", items.join("\n"))
-                }
-            };
-
-            // Order sections by importance (objective → decisions → open errors →
-            // outcomes → actions) so the budget trim drops the least-critical detail.
+            let now = Utc::now().to_rfc3339();
             let mut summary = format!(
-                "[compacted_window]\n{}{}{}{}{}",
-                section("objective", &objective),
-                section("decisions", &decisions),
-                section("errors_open", &errors_open),
-                section("outcomes", &outcomes),
-                section("actions", &actions),
+                "<CONTEXT_SUMMARY>\n\
+                 The following is a summary of the conversation history that has been truncated to fit within the context window:\n\n\
+                 This summary was generated at {now}.\n\n"
             );
+
+            let user_reqs = extract_user_requests("", messages, original_request);
+            if !user_reqs.is_empty() {
+                summary.push_str("# User Requests\n");
+                summary.push_str("The following were the most recent user requests in chronological order:\n");
+                for (i, req) in user_reqs.iter().enumerate() {
+                    summary.push_str(&format!("{}. {}\n", i + 1, req));
+                }
+                summary.push('\n');
+            }
+
+            summary.push_str("# Previous Session Summary:\n<summary>\n");
+            let mut section_idx = 1;
+            if !objective.is_empty() {
+                summary.push_str(&format!("### {section_idx}. Task Overview\n{}\n\n", objective.join("\n")));
+                section_idx += 1;
+            }
+            if !outcomes.is_empty() {
+                summary.push_str(&format!("### {section_idx}. Progress\n{}\n\n", outcomes.join("\n")));
+                section_idx += 1;
+            }
+            if !decisions.is_empty() || !errors_open.is_empty() {
+                let mut tech = decisions.clone();
+                tech.extend(errors_open.clone());
+                summary.push_str(&format!("### {section_idx}. Key Findings & Technical Decisions\n{}\n\n", tech.join("\n")));
+                section_idx += 1;
+            }
+            if !actions.is_empty() {
+                summary.push_str(&format!("### {section_idx}. Next Steps\n{}\n\n", actions.join("\n")));
+            }
+            summary.push_str("</summary>\n</CONTEXT_SUMMARY>");
+
             // The compacted window targets ~6k tokens so it stays cheap to carry
             // forward. Approximate at ~3.5 chars/token and trim the tail if over.
             const COMPACTION_BUDGET_CHARS: usize = 21_000;
