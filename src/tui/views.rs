@@ -1070,15 +1070,19 @@ pub(crate) fn lane_lines(app: &App) -> Vec<Line<'static>> {
             if l.title.chars().count() > 48 {
                 title.push('…');
             }
-            Line::from(vec![
+            let mut spans = vec![
                 rail.clone(),
                 Span::styled("◆ ", Style::default().fg(lane())),
                 Span::styled(title, Style::default().fg(muted())),
-                Span::styled(
-                    format!(" — running {elapsed}"),
-                    Style::default().fg(faint()),
-                ),
-            ])
+            ];
+            if let Some(agent) = &l.agent {
+                spans.push(Span::styled(format!(" [{agent}]"), Style::default().fg(accent())));
+            }
+            spans.push(Span::styled(
+                format!(" — running {elapsed}"),
+                Style::default().fg(faint()),
+            ));
+            Line::from(spans)
         })
         .collect()
 }
