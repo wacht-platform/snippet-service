@@ -500,6 +500,73 @@ mod tool_prune_tests {
         assert!(state.events.iter().any(
             |event| matches!(event, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted")
         ));
+        let summary_msg = state.messages.iter().find(|m| matches!(m, HarnessMessage::Summary { kind, .. } if kind == "compacted_window"));
+        assert!(summary_msg.is_some());
+        if let Some(HarnessMessage::Summary { content, .. }) = summary_msg {
+            assert!(content.contains("<CONTEXT_SUMMARY>"));
+            assert!(content.contains("# User Requests"));
+            assert!(content.contains("### 1. Task Overview"));
+        }
+    }
+
+    #[test]
+    fn extract_user_requests_preserves_chronological_order() {
+        let prior = r#"<CONTEXT_SUMMARY>
+# User Requests
+The following were the most recent user requests in chronological order:
+1. create a web server
+2. add a health route
+
+# Previous Session Summary:
+<summary>
+### 1. Task Overview
+Goal: web server
+</summary>
+</CONTEXT_SUMMARY>"#;
+
+        let messages = vec![
+            HarnessMessage::User {
+                content: "fix the compiler error in server.rs".to_string(),
+            },
+            HarnessMessage::Assistant {
+                content: "Fixed the error.".to_string(),
+                tool_calls: vec![],
+            },
+            HarnessMessage::User {
+                content: "now add rate limiting".to_string(),
+            },
+        ];
+
+        let reqs = extract_user_requests(prior, &messages, "");
+        assert_eq!(
+            reqs,
+            vec![
+                "create a web server",
+                "add a health route",
+                "fix the compiler error in server.rs",
+                "now add rate limiting",
+            ]
+        );
+    }
+
+    #[test]
+    fn assemble_sections_generates_antigravity_context_summary() {
+        let mut sections = BTreeMap::new();
+        sections.insert("user_requests", "1. Initial goal\n2. Add test".to_string());
+        sections.insert("task_overview", "Core goal and constraints".to_string());
+        sections.insert("progress", "Implemented feature; all tests passing".to_string());
+        sections.insert("technical_decisions", "Used SQLite FTS5 for search".to_string());
+        sections.insert("next_steps", "1. Deploy to staging".to_string());
+
+        let assembled = assemble_sections(&sections);
+        assert!(assembled.starts_with("<CONTEXT_SUMMARY>\n"));
+        assert!(assembled.contains("# User Requests\nThe following were the most recent user requests in chronological order:\n1. Initial goal\n2. Add test\n\n"));
+        assert!(assembled.contains("# Previous Session Summary:\n<summary>\n"));
+        assert!(assembled.contains("### 1. Task Overview\nCore goal and constraints\n\n"));
+        assert!(assembled.contains("### 2. Progress\nImplemented feature; all tests passing\n\n"));
+        assert!(assembled.contains("### 3. Key Findings & Technical Decisions\nUsed SQLite FTS5 for search\n\n"));
+        assert!(assembled.contains("### 4. Next Steps\n1. Deploy to staging\n\n"));
+        assert!(assembled.ends_with("</summary>\n</CONTEXT_SUMMARY>"));
     }
 
     #[test]

@@ -5,36 +5,40 @@ use super::*;
 /// (name, description, required) — the sections the summarizer maintains.
 pub(super) const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
     (
-        "objective",
-        "what the user ultimately wants, and for whom",
+        "user_requests",
+        "Chronological numbered list (1., 2., 3., ...) of ALL user requests, instructions, preferences, and bug reports across the entire conversation history. Retain every single past user request so the original intent is never lost.",
         true,
     ),
     (
-        "state",
-        "where things stand now: files changed, what works/doesn't, plus exact paths/IDs/values worth keeping verbatim",
+        "task_overview",
+        "Task Overview: Core user goals, constraints, success criteria, and what the user ultimately wants.",
         true,
     ),
     (
-        "task_progress",
-        "for every task described as started, in progress, or underway: state what is completed, what remains, and a measurable amount or percentage when available; never say only that it started",
+        "progress",
+        "Progress: Completed tasks, files created/modified, passing tests/builds, and tasks currently in progress (with measurable completion amounts; never say only that a task started).",
         true,
     ),
     (
-        "actions",
-        "what was actually done, in order — the condensed trail; include completion status for each started task",
+        "technical_decisions",
+        "Key Findings & Technical Decisions: Architectural choices, discovered constraints, root causes, resolved bugs, and exact verbatim error strings or symbols.",
         false,
     ),
     (
-        "decisions",
-        "key decisions and user corrections, verbatim where wording matters",
+        "active_context",
+        "Active Context: Workspace state, active git branch, modified files, key paths, and active background tasks/monitors.",
         false,
     ),
     (
-        "open_issues",
-        "exact error strings and genuinely unresolved/open work",
+        "next_steps",
+        "Next Steps: Prioritized, ordered list of immediate actions to resume execution seamlessly.",
+        true,
+    ),
+    (
+        "commitments_and_constraints",
+        "Commitments & Constraints: Hard invariants, user guidelines, formatting rules, line count limits (<= 1,500 lines), and non-negotiables.",
         false,
     ),
-    ("next_steps", "what to do next", false),
 ];
 
 pub(super) const MEMORY_REFLECTOR_SYSTEM: &str = r#"# memory_reflector
@@ -122,26 +126,27 @@ pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> 
 
 pub(super) const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer
 [identity]
-role = "you compress a coding agent's whole conversation into ONE dense context table that REPLACES the raw history"
-stakes = "the raw messages are then discarded — this table is all that survives. Anything you leave out is lost forever; anything you pad is re-sent on every future turn and wastes tokens. Maximize signal per token."
+role = "you compress a coding agent's whole conversation into ONE dense Antigravity-style <CONTEXT_SUMMARY> that REPLACES the raw history"
+stakes = "the raw messages are then archived and discarded — this context summary is all that survives in active working memory. Anything you leave out is lost from immediate working memory; anything you pad is re-sent on every future turn and wastes tokens. Maximize signal per token."
+
+[user_requests]  # CRITICAL: chronological timeline of user intent
+timeline = "maintain the 'user_requests' section as a strictly numbered list (1., 2., 3., ...) in chronological order. Carry forward all user requests from the PRIOR SUMMARY if present, and append any new user prompts from the conversation. Never lose a past user request, instruction, correction, or preference."
 
 [preserve]  # carry these forward — verbatim where the exact value/wording matters
-goal = "the user's actual objective and any hard constraints or preferences they stated"
-state = "the CURRENT state: which files were created/changed, what works, what's broken or unverified"
-specifics = "every exact path, identifier, function/type/symbol name, command, config value, URL, version, and error string — copy these literally, never paraphrase them"
-decisions = "key decisions and the user's corrections in their OWN words"
-open = "genuinely unresolved problems and in-flight work"
+task_overview = "core user objective, hard constraints, and success criteria"
 progress = "for EVERY task you mention as started, underway, or in progress, explicitly record: completed scope, remaining scope, and a measurable amount/percentage/count when available; if the amount is unknown, say that plainly. Never leave a task as merely 'started'."
-next = "the immediate next step, so the agent resumes without re-deriving it"
-recent_bias = "spend MORE detail on the most recent activity than on old activity — precise current state + what was mid-flight + the next action; that is what lets the agent continue seamlessly"
+technical_decisions = "key architectural findings, discovered root causes, technical decisions, and exact verbatim error strings, symbol names, and IDs"
+active_context = "current workspace state: which files were created/changed, what works, what's broken or unverified, git branch, and active background tasks"
+next_steps = "prioritized, ordered next actions so the agent can resume immediately without re-deriving"
+commitments_and_constraints = "invariants, user rules, line limits (e.g. <= 1,500 lines per file), formatting preferences"
 
-[drop]  # do NOT carry these — they are the bulk of the tokens and add nothing
-noise = "resolved intermediate steps, superseded/abandoned attempts, verbose tool output (keep the CONCLUSION, not the dump), acknowledgements and chit-chat, restated instructions, and anything trivially re-readable from the code itself"
+[drop]  # do NOT carry these — they are the bulk of tokens and add nothing
+noise = "assistant chit-chat, conversational pleasantries, intermediate tool dumps (keep the CONCLUSION, not the raw output), restated instructions, and anything trivially re-readable from the code itself. Raw tool payloads are archived in SQLite and retrievable via recall_context/search_history."
 
 [method]
-fold = "if a PRIOR TABLE is present, update it in place — keep what's still true, add what's new, delete what's stale or superseded; do not just append"
-dense = "terse markdown bullets, not prose. Facts and values, not sentences. No preamble, no narration of this process, no filler adjectives. For each task described as started or in progress, include completed scope, remaining scope, and measurable progress when available."
-budget = "the whole table must fit ~6k tokens. If told it is OVER BUDGET, compress the largest/oldest sections first (drop the lowest-value detail) while keeping every exact value and the recent thread — never re-expand."
+fold = "if a PRIOR SUMMARY is present, update it in place — preserve all past user requests, update the engineering sections, add what's new, delete what's stale or superseded; do not just blindly append"
+dense = "terse markdown bullets under each section heading. Facts and values, not verbose prose. No preamble, no narration of this process, no filler adjectives."
+budget = "the whole summary must fit ~6k tokens. If told it is OVER BUDGET, compress the largest/oldest sections first (drop the lowest-value detail) while keeping every exact value, the full user_requests list, and the recent thread — never re-expand."
 
 [how]
 one_call = "call write_table ONCE, filling every section from the entire conversation. That single call is the whole job. You are asked again only if you left a required section empty or the table is over budget — otherwise you are done in one shot.""#;
@@ -164,8 +169,8 @@ pub(super) fn summarizer_tools() -> Vec<crate::llm::NativeToolDefinition> {
     }
     vec![crate::llm::NativeToolDefinition {
         name: "write_table".to_string(),
-        description: "Write the ENTIRE context table in one call — fill every section with dense \
-            markdown bullets. This table replaces the raw history, so anything you omit is lost. \
+        description: "Write the ENTIRE context summary in one call — fill every section with dense \
+            markdown bullets and maintain the chronological numbered user_requests list. This summary replaces the raw history, so anything you omit is lost from active context. \
             You are only asked again to fill a required section you left empty or to compress to fit \
             the budget."
             .to_string(),
@@ -176,10 +181,6 @@ pub(super) fn summarizer_tools() -> Vec<crate::llm::NativeToolDefinition> {
             "additionalProperties": false
         }),
     }]
-}
-
-pub(super) fn toml_block(body: &str) -> String {
-    format!("\"\"\"\n{}\n\"\"\"", body.replace("\"\"\"", "'''"))
 }
 
 pub(super) fn required_missing(sections: &BTreeMap<&'static str, String>) -> Vec<&'static str> {
@@ -196,18 +197,50 @@ pub(super) fn required_missing(sections: &BTreeMap<&'static str, String>) -> Vec
 }
 
 pub(super) fn assemble_sections(sections: &BTreeMap<&'static str, String>) -> String {
-    let body = SUMMARY_SECTIONS
-        .iter()
-        .filter_map(|(name, ..)| {
-            sections
-                .get(name)
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|b| format!("{name} = {}", toml_block(b)))
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("[compacted_window]\n{body}")
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut out = String::new();
+    out.push_str("<CONTEXT_SUMMARY>\n");
+    out.push_str("The following is a summary of the conversation history that has been truncated to fit within the context window:\n\n");
+    out.push_str(&format!("This summary was generated at {now}.\n\n"));
+
+    if let Some(user_reqs) = sections
+        .get("user_requests")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str("# User Requests\n");
+        out.push_str("The following were the most recent user requests in chronological order:\n");
+        out.push_str(user_reqs);
+        out.push_str("\n\n");
+    }
+
+    out.push_str("# Previous Session Summary:\n<summary>\n");
+
+    let mut section_idx = 1;
+    let engineering_sections: &[(&str, &str)] = &[
+        ("task_overview", "Task Overview"),
+        ("progress", "Progress"),
+        ("technical_decisions", "Key Findings & Technical Decisions"),
+        ("active_context", "Active Context"),
+        ("next_steps", "Next Steps"),
+        ("commitments_and_constraints", "Commitments & Constraints"),
+    ];
+
+    for (key, title) in engineering_sections {
+        if let Some(content) = sections
+            .get(key)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            out.push_str(&format!("### {section_idx}. {title}\n"));
+            out.push_str(content);
+            out.push_str("\n\n");
+            section_idx += 1;
+        }
+    }
+
+    out.push_str("</summary>\n</CONTEXT_SUMMARY>");
+    out
 }
 
 /// Rough token estimate of a request we're about to send — ~4 chars/token over
@@ -304,6 +337,75 @@ pub(super) fn approval_summary(tool_name: &str, args: &Value) -> String {
     }
 }
 
+/// Extract chronological user requests from prior summary and new messages.
+pub(super) fn extract_user_requests(
+    prior_summary: &str,
+    messages: &[HarnessMessage],
+    original_request: &str,
+) -> Vec<String> {
+    let mut requests = Vec::new();
+
+    // 1. Extract from prior summary if present
+    if !prior_summary.trim().is_empty() {
+        let mut in_user_requests = false;
+        for line in prior_summary.lines() {
+            let trimmed = line.trim();
+            if trimmed == "# User Requests" {
+                in_user_requests = true;
+                continue;
+            }
+            if in_user_requests {
+                if trimmed.starts_with('#') || trimmed.starts_with("<summary>") {
+                    break;
+                }
+                if trimmed.starts_with("The following were") || trimmed.is_empty() {
+                    continue;
+                }
+                // Line like "1. do something" or "- do something"
+                let clean = if let Some(pos) = trimmed.find(". ") {
+                    let prefix = &trimmed[..pos];
+                    if prefix.chars().all(|c| c.is_ascii_digit()) {
+                        trimmed[pos + 2..].trim().to_string()
+                    } else {
+                        trimmed.trim_start_matches('-').trim().to_string()
+                    }
+                } else {
+                    trimmed.trim_start_matches('-').trim().to_string()
+                };
+                if !clean.is_empty() && !requests.iter().any(|r| r == &clean) {
+                    requests.push(clean);
+                }
+            }
+        }
+    }
+
+    // 2. If no prior requests found and original_request is given, add it
+    if requests.is_empty() && !original_request.trim().is_empty() {
+        requests.push(original_request.trim().to_string());
+    }
+
+    // 3. Extract new user messages from the window
+    for m in messages {
+        if let HarnessMessage::User { content } = m {
+            let text = content.trim();
+            // Skip internal summary envelopes or system orientation blocks
+            if text.is_empty()
+                || text.starts_with("[summary:")
+                || text.starts_with("[Recent activity")
+                || text.starts_with("<CONTEXT_SUMMARY>")
+            {
+                continue;
+            }
+            let clean = clip(text, 500);
+            if !requests.iter().any(|r| r == &clean) {
+                requests.push(clean);
+            }
+        }
+    }
+
+    requests
+}
+
 pub(super) fn render_window(
     prior_table: &str,
     older: &[HarnessMessage],
@@ -311,8 +413,17 @@ pub(super) fn render_window(
     recent_focus: usize,
 ) -> String {
     let mut out = String::new();
+    let user_requests = extract_user_requests(prior_table, older, original_request);
+    if !user_requests.is_empty() {
+        out.push_str("CHRONOLOGICAL USER REQUESTS TO PRESERVE (maintain this exact numbered list in 'user_requests'):\n");
+        for (i, req) in user_requests.iter().enumerate() {
+            out.push_str(&format!("{}. {}\n", i + 1, req));
+        }
+        out.push('\n');
+    }
+
     if !prior_table.trim().is_empty() {
-        out.push_str("PRIOR TABLE (update this in place):\n");
+        out.push_str("PRIOR CONTEXT SUMMARY (update this in place):\n");
         out.push_str(prior_table.trim());
         out.push_str("\n\n");
     } else if !original_request.trim().is_empty() {

@@ -25,14 +25,14 @@ impl CodingHarness {
             // the whole cost we're avoiding. Every other turn sends the window.
             let user = if let Some(table) = &over_budget_table {
                 format!(
-                    "Compress this context table to fit the ~6k-token budget. Drop the lowest-value \
+                    "Compress this context summary to fit the ~6k-token budget. Drop the lowest-value \
                      detail from the largest/oldest sections; keep every exact path, id, error string, \
-                     decision, and the recent thread. Return the FULL table via write_table.\n\n\
-                     CURRENT TABLE:\n{table}\n\n{feedback}"
+                     decision, the complete user_requests list, and the recent thread. Return the FULL summary via write_table.\n\n\
+                     CURRENT SUMMARY:\n{table}\n\n{feedback}"
                 )
             } else {
                 format!(
-                    "CONVERSATION TO COMPACT — fold ALL of it into one table:\n{window_text}\n\n\
+                    "CONVERSATION TO COMPACT — fold ALL of it into one Antigravity-style <CONTEXT_SUMMARY>:\n{window_text}\n\n\
                      Call write_table ONCE with every section filled.{}",
                     if feedback.is_empty() {
                         String::new()
@@ -68,6 +68,25 @@ impl CodingHarness {
                     .filter(|s| !s.is_empty())
                 {
                     sections.insert(name, v.to_string());
+                }
+            }
+
+            // Fallback: if user_requests was omitted by the model, restore the pre-extracted list
+            if sections
+                .get("user_requests")
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                if let Some(pos) = window_text.find("CHRONOLOGICAL USER REQUESTS TO PRESERVE") {
+                    let rest = &window_text[pos..];
+                    if let Some(start) = rest.find('\n') {
+                        let candidate = &rest[start + 1..];
+                        let end = candidate.find("\n\n").unwrap_or(candidate.len());
+                        let req_text = candidate[..end].trim();
+                        if !req_text.is_empty() {
+                            sections.insert("user_requests", req_text.to_string());
+                        }
+                    }
                 }
             }
 
