@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::coordination::{Store, types::CoordinationEvent};
+use crate::coordination::{NotificationMarker, Store, types::CoordinationEvent};
 use crate::llm::NativeToolDefinition;
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
@@ -26,6 +26,11 @@ pub fn add_coordination_tools(registry: &mut ToolRegistry) {
     // worth keeping.
     registry.insert(ReadCoordinationBoard);
     registry.insert(RecordCoordinationNote);
+    // Task-based coordination and session lease handoff
+    registry.insert(MessageMissionControl);
+    registry.insert(PostTaskCoordination);
+    registry.insert(TransferTaskSessionLease);
+    registry.insert(InspectTask);
 }
 
 
@@ -48,11 +53,23 @@ fn actor(ctx: &ToolContext) -> Result<(&'static str, String), ToolError> {
     if let Some(agent_id) = ctx.agent_id() {
         return Ok(("agent", agent_id.to_string()));
     }
-    ctx.durable_session_id()
-        .map(|id| ("session", id.to_string()))
-        .ok_or_else(|| {
-            ToolError::msg("posting to the coordination board requires a session identity")
-        })
+    if let Some(session_id) = ctx.durable_session_id() {
+        if let Ok(db) = db(ctx) {
+            if let Ok(tasks) = db.list_tasks(Some(session_id), Some(&crate::coordination::TaskStatus::InProgress)) {
+                for task in tasks {
+                    if let Ok(roster) = db.list_task_agents(&task.id) {
+                        if let Some(active) = roster.iter().find(|m| m.status == "active" && m.removed_at.is_none()) {
+                            if active.agent_id != "snippet" {
+                                return Ok(("agent", active.agent_id.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(("session", session_id.to_string()));
+    }
+    Err(ToolError::msg("posting to the coordination board requires a session identity"))
 }
 
 
@@ -132,6 +149,11 @@ impl Tool for PostCoordinationMessage {
         let saved = db(ctx)?
             .append_event(&event)
             .map_err(|e| ToolError::msg(format!("post message: {e}")))?;
+        crate::session::emit_device_event(json!({
+            "kind": "coordination_event",
+            "event": saved.clone(),
+        }));
+        crate::serve::queue_coordination_wake(saved.clone());
         Ok(ToolResult::success(json!({"event": saved})))
     }
 }
@@ -352,7 +374,7 @@ impl Tool for SendAgentMessage {
                 .unwrap_or(false);
             if !resolves {
                 return Err(ToolError::msg(format!(
-                    "unknown session `{to_id}`. Use the `reply_to` value from the envelope EXACTLY as written, including any `/state.json` or `/conversations/<id>.json` suffix — do not shorten it. That value names the session the sender is reading."
+                    "unknown session `{to_id}`. Use the `reply_to` value from the envelope EXACTLY as written — do not shorten it. That value names the session the sender is reading."
                 )));
             }
         }
@@ -375,6 +397,10 @@ impl Tool for SendAgentMessage {
                 origin.as_deref(),
             )
             .map_err(|e| ToolError::msg(format!("send message: {e}")))?;
+        crate::session::emit_device_event(json!({
+            "kind": "coordination_event",
+            "event": saved,
+        }));
         Ok(ToolResult::success(json!({
             "thread_id": saved.thread_id,
             "sequence": saved.sequence,
@@ -616,13 +642,333 @@ impl Tool for RecordCoordinationNote {
 /// this is the same rule the turn lease uses, and for the same reason: a session
 /// is not an agent.
 fn board_agent_id(ctx: &ToolContext) -> Result<String, ToolError> {
+    if let Ok((kind, id)) = actor(ctx) {
+        if kind == "agent" {
+            return Ok(id);
+        }
+    }
     ctx.agent_id().map(str::to_string).ok_or_else(|| {
         ToolError::msg(
             "this session is not working as an agent — coordination memory requires an agent identity",
         )
     })
 }
+#[derive(Deserialize)]
+struct MessageMissionControlArgs {
+    task_id: String,
+    message: String,
+}
 
+pub struct MessageMissionControl;
+#[async_trait]
+impl Tool for MessageMissionControl {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "message_mission_control".into(),
+            description: "Message Mission Control using the active task board item you are working on. This posts to the task thread, notifies Mission Control, and records the update on the task board so your progress or question is linked to the task.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string", "description": "The task ID you are working on"},
+                    "message": {"type": "string", "description": "Message, question, or status update for Mission Control"}
+                }),
+                &["task_id", "message"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: MessageMissionControlArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        let message = args.message.trim();
+        if task_id.is_empty() || message.is_empty() {
+            return Err(ToolError::msg("task_id and message must not be empty"));
+        }
+        let db = db(ctx)?;
+        let task = db
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        let (actor_kind, actor_id) = actor(ctx)?;
+        let now = now_rfc3339();
+        let event = CoordinationEvent {
+            event_id: Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "task.message".into(),
+            actor_kind: actor_kind.to_string(),
+            actor_id: actor_id.clone(),
+            payload_version: 1,
+            payload: json!({
+                "body": message,
+                "task_id": task_id,
+                "to": "mission_control",
+            }),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: Uuid::new_v4().to_string(),
+            created_at: now.clone(),
+        };
+        let saved = db
+            .append_event(&event)
+            .map_err(|e| ToolError::msg(format!("post message: {e}")))?;
+        let _ = db.update_task_in(task_id, &now, |t| {
+            t.notifications.push(NotificationMarker {
+                target: "mission_control".into(),
+                kind: "message".into(),
+                message: format!("{actor_id}: {message}"),
+                delivered: false,
+            });
+        });
+        crate::session::emit_device_event(json!({
+            "kind": "coordination_event",
+            "event": saved.clone(),
+        }));
+        crate::serve::queue_coordination_wake(saved.clone());
+        Ok(ToolResult::success(json!({
+            "sent": true,
+            "task_id": task_id,
+            "event": saved,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct PostTaskCoordinationArgs {
+    task_id: String,
+    body: String,
+}
+
+pub struct PostTaskCoordination;
+#[async_trait]
+impl Tool for PostTaskCoordination {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "post_task_coordination".into(),
+            description: "Coordinate with fellow agents assigned to this task board item. Posts context, plan proposals, or status to the task thread. All assigned agents and Mission Control receive notification of board changes. If no action or response is needed from an agent when reading, they can choose to NO-OP.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string", "description": "The task ID on the task board"},
+                    "body": {"type": "string", "description": "The coordination message or update"}
+                }),
+                &["task_id", "body"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: PostTaskCoordinationArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        let body = args.body.trim();
+        if task_id.is_empty() || body.is_empty() {
+            return Err(ToolError::msg("task_id and body must not be empty"));
+        }
+        let db = db(ctx)?;
+        let task = db
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        let (actor_kind, actor_id) = actor(ctx)?;
+        let now = now_rfc3339();
+        let event = CoordinationEvent {
+            event_id: Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "message.posted".into(),
+            actor_kind: actor_kind.to_string(),
+            actor_id,
+            payload_version: 1,
+            payload: json!({"body": body, "task_id": task_id}),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        let saved = db
+            .append_event(&event)
+            .map_err(|e| ToolError::msg(format!("post message: {e}")))?;
+        crate::session::emit_device_event(json!({
+            "kind": "coordination_event",
+            "event": saved.clone(),
+        }));
+        crate::serve::queue_coordination_wake(saved.clone());
+        Ok(ToolResult::success(json!({"event": saved})))
+    }
+}
+
+#[derive(Deserialize)]
+struct TransferTaskSessionLeaseArgs {
+    task_id: String,
+    to_agent_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    handoff_context: Option<String>,
+    #[serde(default)]
+    artifacts: Vec<String>,
+}
+
+pub struct TransferTaskSessionLease;
+#[async_trait]
+impl Tool for TransferTaskSessionLease {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "transfer_task_session_lease".into(),
+            description: "Transfer the active workspace session lease for a task to another assigned agent (or back to snippet). Only ONE agent can work in the project session at a time; the others are waiting. Provide reason, handoff_context, and artifacts to give the next agent complete context of what you did and what they should do.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string"},
+                    "to_agent_id": {"type": "string", "description": "Agent to hand lease to, e.g. an assigned agent or 'snippet'"},
+                    "reason": {"type": "string", "description": "High-level reason for the handoff / phase transition"},
+                    "handoff_context": {"type": "string", "description": "Detailed briefing and guidance for the incoming agent"},
+                    "artifacts": {"type": "array", "items": {"type": "string"}, "description": "List of files or paths modified or created in this phase"}
+                }),
+                &["task_id", "to_agent_id"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: TransferTaskSessionLeaseArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        let to_agent = args.to_agent_id.trim();
+        if task_id.is_empty() || to_agent.is_empty() {
+            return Err(ToolError::msg("task_id and to_agent_id must not be empty"));
+        }
+        let db = db(ctx)?;
+        let task = db
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        let (_, actor_id) = actor(ctx)?;
+        let now = now_rfc3339();
+
+        let roster = db.list_task_agents(task_id).unwrap_or_default();
+        let current_active = roster
+            .iter()
+            .find(|m| m.status == "active" && m.removed_at.is_none())
+            .map(|m| m.agent_id.as_str())
+            .unwrap_or(&actor_id);
+
+        if !roster.iter().any(|m| m.agent_id == to_agent && m.removed_at.is_none()) {
+            db.add_task_agent_full(task_id, to_agent, "collaborator", None, "", "waiting", &now)
+                .map_err(|e| ToolError::msg(format!("add agent to roster: {e}")))?;
+        }
+
+        db.transfer_task_session_lease(task_id, current_active, to_agent)
+            .map_err(|e| ToolError::msg(format!("transfer lease: {e}")))?;
+
+        if !task.session_id.trim().is_empty() {
+            let role = if to_agent == "snippet" { "standard" } else { "specialized" };
+            let agent_opt = if to_agent == "snippet" { None } else { Some(to_agent) };
+            let _ = db.set_session_role(&task.session_id, role, agent_opt);
+        }
+
+        let reason_str = args.reason.as_deref().unwrap_or("Handoff to next agent");
+        let mut body = format!("Session lease transferred from {current_active} to {to_agent}: {reason_str}");
+        if let Some(ref h_ctx) = args.handoff_context {
+            if !h_ctx.trim().is_empty() {
+                body.push_str(&format!("\nHandoff Briefing:\n{}", h_ctx.trim()));
+            }
+        }
+        if !args.artifacts.is_empty() {
+            body.push_str(&format!("\nArtifacts / Modified Files:\n{}", args.artifacts.join(", ")));
+        }
+
+        let event = CoordinationEvent {
+            event_id: Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "task.lease_transferred".into(),
+            actor_kind: "agent".into(),
+            actor_id: actor_id.clone(),
+            payload_version: 1,
+            payload: json!({
+                "body": body,
+                "task_id": task_id,
+                "from_agent_id": current_active,
+                "to_agent_id": to_agent,
+                "reason": reason_str,
+                "handoff_context": args.handoff_context,
+                "artifacts": args.artifacts,
+            }),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        let saved = db
+            .append_event(&event)
+            .map_err(|e| ToolError::msg(format!("record event: {e}")))?;
+        crate::session::emit_device_event(json!({
+            "kind": "coordination_event",
+            "event": saved.clone(),
+        }));
+        crate::serve::queue_coordination_wake(saved.clone());
+        Ok(ToolResult::success(json!({
+            "transferred": true,
+            "task_id": task_id,
+            "active_agent": to_agent,
+            "event": saved,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct InspectTaskArgs {
+    task_id: String,
+}
+
+pub struct InspectTask;
+#[async_trait]
+impl Tool for InspectTask {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "inspect_task".into(),
+            description: "Inspect the full details of a task: its plan, description, roster of assigned agents with active lease holder, linked blockers, owned paths, and result. Use this whenever you need full visibility and context for a task.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string", "description": "The task ID to inspect"}
+                }),
+                &["task_id"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: InspectTaskArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        if task_id.is_empty() {
+            return Err(ToolError::msg("task_id must not be empty"));
+        }
+        let db = db(ctx)?;
+        let task = db
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        let roster = db.list_task_agents(task_id).unwrap_or_default();
+        let blockers = db.blockers_of(task_id).unwrap_or_default();
+        let links = db.task_links(task_id).unwrap_or_default();
+
+        Ok(ToolResult::success(json!({
+            "task_id": task.id,
+            "title": task.title,
+            "description": task.description,
+            "status": task.status,
+            "plan": task.plan,
+            "session_id": task.session_id,
+            "owned_paths": task.owned_paths,
+            "roster": roster,
+            "blockers": blockers,
+            "links": links,
+            "thread_id": task.thread_id,
+            "result": task.result,
+        })))
+    }
+}
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -876,13 +1222,12 @@ mod tests {
         // The agent's own earlier reply sits between the two questions; it must
         // not be mistaken for the question being answered now.
         let events = vec![
-            direct_event("human", Some("ws-a/state.json")),
+            direct_event("human", Some("ws-a")),
             direct_event("agent", None),
-            direct_event("human", Some("ws-b/state.json")),
+            direct_event("human", Some("ws-b")),
         ];
-        assert_eq!(latest_human_origin(&events), Some("ws-b/state.json"));
+        assert_eq!(latest_human_origin(&events), Some("ws-b"));
     }
-
 
     #[test]
     fn a_human_message_without_a_session_does_not_redirect() {
@@ -890,14 +1235,13 @@ mod tests {
         assert_eq!(latest_human_origin(&events), None);
     }
 
-
     #[tokio::test]
     async fn a_reply_to_the_human_is_routed_to_the_session_that_asked() {
         let dir = tempfile::tempdir().unwrap();
         let db = migrate(dir.path());
         let state = crate::harness::HarnessState::blank("/tmp/ws", Some("asking".into()));
         db.import_session(
-            "ws-a/state.json",
+            "ws-a",
             "key",
             &state,
             &crate::conversations::SessionExtras::default(),
@@ -909,17 +1253,16 @@ mod tests {
             "did the dispatch land?",
             "k1",
             "2026-01-01T00:00:00Z",
-            Some("ws-a/state.json"),
+            Some("ws-a"),
         )
         .unwrap();
 
         assert_eq!(
             reply_session_for_agent(&db, "snippet", "local").as_deref(),
-            Some("ws-a/state.json"),
+            Some("ws-a"),
             "a reply addressed to the person belongs in the session that asked"
         );
     }
-
 
     #[tokio::test]
     async fn a_reply_is_not_routed_to_a_session_the_store_does_not_have() {
@@ -932,11 +1275,106 @@ mod tests {
             "hello",
             "k1",
             "2026-01-01T00:00:00Z",
-            Some("gone/state.json"),
+            Some("gone"),
         )
         .unwrap();
 
         assert_eq!(reply_session_for_agent(&db, "snippet", "local"), None);
     }
 
+    #[tokio::test]
+    async fn task_coordination_and_lease_handoff_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrate(dir.path());
+        db.create_agent(&Agent {
+            id: "agent-a".into(),
+            display_name: "Agent A".into(),
+            handle: "agent_a".into(),
+            kind: AgentKind::Worker,
+            status: AgentStatus::Active,
+            role: AgentRole::Implementer,
+            capabilities: vec![],
+        })
+        .unwrap();
+        db.create_agent(&Agent {
+            id: "agent-b".into(),
+            display_name: "Agent B".into(),
+            handle: "agent_b".into(),
+            kind: AgentKind::Worker,
+            status: AgentStatus::Active,
+            role: AgentRole::Reviewer,
+            capabilities: vec![],
+        })
+        .unwrap();
+
+        let task = crate::coordination::Task::filed_by_human(
+            "t1".into(),
+            "Title".into(),
+            "Desc".into(),
+            "sess-1".into(),
+            0,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        db.create_task(&task).unwrap();
+        db.add_task_agent_full("t1", "agent-a", "implementer", None, "", "active", "2026-01-01T00:00:00Z").unwrap();
+        db.add_task_agent_full("t1", "agent-b", "reviewer", None, "", "waiting", "2026-01-01T00:00:00Z").unwrap();
+
+        let ctx_a = ToolContext::new(dir.path())
+            .unwrap()
+            .with_store_path(dir.path().join("snippet.db"))
+            .with_durable_session_id("sess-1")
+            .with_agent_id("agent-a");
+
+        let res = MessageMissionControl
+            .execute(&ctx_a, json!({"task_id": "t1", "message": "Need clarification on auth"}))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let t = db.get_task("t1").unwrap().unwrap();
+        assert_eq!(t.notifications.len(), 1);
+        assert_eq!(t.notifications[0].target, "mission_control");
+        assert!(t.notifications[0].message.contains("Need clarification on auth"));
+
+        let res = PostTaskCoordination
+            .execute(&ctx_a, json!({"task_id": "t1", "body": "Auth implementation ready for review"}))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let res = TransferTaskSessionLease
+            .execute(&ctx_a, json!({
+                "task_id": "t1",
+                "to_agent_id": "agent-b",
+                "reason": "Ready for PR review",
+                "handoff_context": "Implemented OAuth2 token refresh in src/auth.rs",
+                "artifacts": ["src/auth.rs", "tests/auth_test.rs"]
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let agents = db.list_task_agents("t1").unwrap();
+        let a = agents.iter().find(|m| m.agent_id == "agent-a").unwrap();
+        let b = agents.iter().find(|m| m.agent_id == "agent-b").unwrap();
+        assert_eq!(a.status, "waiting");
+        assert_eq!(b.status, "active");
+
+        // Verify InspectTask provides maximum visibility
+        let ctx_b = ToolContext::new(dir.path())
+            .unwrap()
+            .with_store_path(dir.path().join("snippet.db"))
+            .with_durable_session_id("sess-1")
+            .with_agent_id("agent-b");
+
+        let inspect_res = InspectTask
+            .execute(&ctx_b, json!({"task_id": "t1"}))
+            .await
+            .unwrap();
+        assert_eq!(inspect_res.value["status"], "success");
+        let val = &inspect_res.value["data"];
+        assert_eq!(val["task_id"], "t1");
+        assert_eq!(val["title"], "Title");
+        assert_eq!(val["roster"].as_array().unwrap().len(), 2);
+    }
 }

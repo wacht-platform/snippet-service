@@ -122,7 +122,7 @@ fn direct_message_envelope(
 ///
 /// The row is written once; the sidecar is re-written every time because it is
 /// what makes a resume come back as this agent rather than as a plain session.
-async fn ensure_agent_inbox(d: &Shared, agent_id: &str) -> Result<(), String> {
+pub(super) async fn ensure_agent_inbox(d: &Shared, agent_id: &str) -> Result<(), String> {
     let session_id = crate::session::inbox_session_id(agent_id);
     let path = state_path_for_id(&session_id)
         .ok_or_else(|| format!("invalid inbox session id `{session_id}`"))?;
@@ -173,12 +173,6 @@ async fn ensure_agent_inbox(d: &Shared, agent_id: &str) -> Result<(), String> {
 }
 
 /// The canonical session id a stored delivery recipient names.
-///
-/// A reply is addressed with the id the sender was handed, which is not always
-/// the stored key: a model routinely drops the `/state.json` suffix, and the
-/// message is then recorded against an id no session has — where
-/// `record_agent_message` silently drops it. Resolving through the state path
-/// first puts both forms in the same session.
 fn canonical_session_id(id: &str) -> Option<String> {
     let path = state_path_for_id(id)?;
     Some(crate::session::session_id_for_state_path(&path))
@@ -417,6 +411,10 @@ pub(super) async fn direct_send_message(
     ) {
         Ok(saved) => {
             let _ = d.coordination_events.send(saved.clone());
+            crate::session::emit_device_event(serde_json::json!({
+                "kind": "coordination_event",
+                "event": saved.clone(),
+            }));
             // Record what this session SENT, so a later reply has something to
             // attach to. Without it the answer would appear with no question
             // before it and the model could not tell what was asked.
@@ -592,7 +590,7 @@ mod tests {
             &crate::session::inbox_session_id("researcher")
         ));
         assert!(!crate::session::is_inbox_session_id(
-            "snippet-service-61c2d836/state.json"
+            "snippet-service-61c2d836"
         ));
         assert!(!crate::session::is_inbox_session_id(
             "thing-2a3f/conversations/x.json"

@@ -34,10 +34,8 @@ pub fn workspace_dir_name(workspace: &Path) -> String {
 /// The default session's path for a workspace:
 /// `~/.snippet/workspaces/{name}-{key}`.
 ///
-/// The DIRECTORY, not a file in it. A session id is this path, so appending
-/// `state.json` would put a filename back into an identifier — the thing ids
-/// were cleaned of, because a model handed it drops the suffix and the reply is
-/// rejected. Nothing is written here any more; it is a key.
+/// The DIRECTORY, not a file in it. A session id is this path.
+/// Nothing is written here any more; it is a key.
 pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
     snippet_home()
         .join("workspaces")
@@ -627,11 +625,7 @@ fn default_workspace() -> PathBuf {
 /// The placeholder for `state_path` before a workspace is resolved.
 ///
 /// Derived rather than hardcoded: the field is `#[serde(skip)]` and every real
-/// path goes through `resolve_state_path_for_workspace`, so this value is only
-/// ever read by code that built a config and did not resolve one. Returning the
-/// default workspace's actual session directory keeps that fallback meaningful,
-/// where the previous `.snippet/state.json` named a file that no longer exists
-/// in any shape.
+/// path goes through `resolve_state_path_for_workspace`.
 fn default_state_path() -> PathBuf {
     state_path_for_workspace(&default_workspace())
 }

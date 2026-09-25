@@ -51,10 +51,9 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
              role TEXT NOT NULL DEFAULT 'standard',
              -- The agent working this session, if any. Was `.role`'s agent_id.
              agent_id TEXT,
-             -- The path-shaped id this row had before ids became opaque
-             -- (e.g. `snipett-2a3f/state.json`). Kept so an in-flight reference,
-             -- a stored message payload, or a client holding the old id still
-             -- resolves — and so a rollback has something to map back to.
+             -- The legacy path-shaped id this row had before ids became opaque.
+             -- Kept so an in-flight reference, a stored message payload, or a
+             -- client holding the old id still resolves.
              legacy_id TEXT,
              -- What kind of session this is: 'default' | 'conversation' |
              -- 'inbox' | 'mission_control'. This used to be parsed out of the
@@ -127,13 +126,6 @@ fn ensure_session_id_columns(connection: &rusqlite::Connection) -> Result<(), ru
 }
 
 /// Rewrite every path-shaped session id to an opaque uuid, once.
-///
-/// The id used to BE a filesystem path, so it carried `/state.json` or
-/// `/conversations/<uuid>.json`. Those files stopped being read when the store
-/// took over, leaving a path-shaped string whose only surviving effect was to
-/// leak a filename into prompts, URLs and ids a model then mangled. This keeps
-/// the old value in `legacy_id` so an in-flight reference still resolves and a
-/// rollback has something to map back to.
 ///
 /// Idempotent: a row whose id is already opaque is left alone, so this is safe
 /// on every open.
@@ -391,26 +383,10 @@ fn merge_duplicate_session(
     Ok(())
 }
 
-/// The canonical id (and kind) a session id maps to: the path, minus the
-/// filename.
-///
-/// A session id used to BE a filesystem path — `…/state.json` for a workspace's
-/// default session, `…/conversations/<uuid>.json` for a saved one — even though
-/// those files stopped being read when the store took over. The path component
-/// is still a perfectly good KEY: it is unique, stable, and says which workspace
-/// the session belongs to. The FILENAME is the part with no business in an
-/// identifier, so that is what goes, along with the mangling it caused (a model
-/// handed `…/state.json` dropped the suffix and the reply was rejected).
-///
-/// Deterministic on purpose: running this twice yields the same id, so the
-/// rewrite is idempotent and needs no generated value to remember.
+/// The canonical id (and kind) a session id maps to.
 pub fn canonical_session_id(old: &str) -> (String, String) {
     if old == crate::mission_control::SESSION_ID {
         return (old.to_string(), "mission_control".to_string());
-    }
-    if let Some(dir) = old.strip_suffix("/state.json") {
-        let kind = if dir.starts_with("inbox-") { "inbox" } else { "default" };
-        return (dir.to_string(), kind.to_string());
     }
     if old.ends_with(".json") {
         return (old[..old.len() - ".json".len()].to_string(), "conversation".to_string());
@@ -1398,13 +1374,13 @@ mod session_id_migration_tests {
         // The canonical row holds a stale PREFIX of the same conversation — the
         // real shape: the stale copy shares ordinals and payloads with the row
         // that kept being appended to.
-        insert_session(&conn, "ws-1", Some("ws-1/state.json"));
+        insert_session(&conn, "ws-1", Some("ws-1.json"));
         for i in 0..2 {
             insert_message(&conn, "ws-1", i, &format!("same {i}"));
         }
-        insert_session(&conn, "ws-1/state.json", None);
+        insert_session(&conn, "ws-1.json", None);
         for i in 0..4 {
-            insert_message(&conn, "ws-1/state.json", i, &format!("same {i}"));
+            insert_message(&conn, "ws-1.json", i, &format!("same {i}"));
         }
 
         rewrite_legacy_session_ids(&conn).unwrap();
@@ -1431,19 +1407,19 @@ mod session_id_migration_tests {
         let conn = Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
 
-        insert_session(&conn, "ws-9", Some("ws-9/state.json"));
+        insert_session(&conn, "ws-9", Some("ws-9.json"));
         for i in 0..2 {
             insert_message(&conn, "ws-9", i, &format!("shared {i}"));
         }
         insert_message(&conn, "ws-9", 2, "only-on-canonical");
 
-        insert_session(&conn, "ws-9/state.json", None);
+        insert_session(&conn, "ws-9.json", None);
         for i in 0..2 {
-            insert_message(&conn, "ws-9/state.json", i, &format!("shared {i}"));
+            insert_message(&conn, "ws-9.json", i, &format!("shared {i}"));
         }
-        insert_message(&conn, "ws-9/state.json", 2, "only-on-legacy");
+        insert_message(&conn, "ws-9.json", 2, "only-on-legacy");
         for i in 3..5 {
-            insert_message(&conn, "ws-9/state.json", i, &format!("tail {i}"));
+            insert_message(&conn, "ws-9.json", i, &format!("tail {i}"));
         }
 
         rewrite_legacy_session_ids(&conn).unwrap();
@@ -1480,8 +1456,8 @@ mod session_id_migration_tests {
     fn a_lone_legacy_row_is_renamed_and_keeps_its_history() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
-        insert_session(&conn, "ws-2/state.json", None);
-        insert_message(&conn, "ws-2/state.json", 0, "hello");
+        insert_session(&conn, "ws-2.json", None);
+        insert_message(&conn, "ws-2.json", 0, "hello");
 
         rewrite_legacy_session_ids(&conn).unwrap();
 
@@ -1499,7 +1475,7 @@ mod session_id_migration_tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(legacy.as_deref(), Some("ws-2/state.json"));
+        assert_eq!(legacy.as_deref(), Some("ws-2.json"));
     }
 
     /// Called on every open, so a second run must change nothing.
@@ -1507,7 +1483,7 @@ mod session_id_migration_tests {
     fn the_rewrite_is_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_schema(&conn).unwrap();
-        insert_session(&conn, "ws-3/state.json", None);
+        insert_session(&conn, "ws-3.json", None);
 
         rewrite_legacy_session_ids(&conn).unwrap();
         let first = session_ids(&conn);

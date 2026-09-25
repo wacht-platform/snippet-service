@@ -4,7 +4,6 @@
 //! (and, optionally, a live `StreamHandle`). Shared by the TUI and headless `serve`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -369,20 +368,19 @@ impl AgentRuntime {
         let mut tools = coding_tools(i.exa_api_key.clone(), i.memory);
         crate::mission_tools::add_worker_report_tool(&mut tools);
         tools.insert(crate::mission_tools::CreateRecurringJob);
-        // Workers discover peers, post to the board, and message Mission Control.
-        // They do NOT dispatch: creating and routing work is Mission Control's
-        // job, so a worker asks instead of acting.
         crate::coordination_tools::add_coordination_tools(&mut tools);
 
+        let mut prompt_ctx = i.prompt_ctx;
+        prompt_ctx.agent_work = identity.is_some();
         let prompt = match identity {
             Some((agent_id, body)) => crate::prompts::specialized_agent_system_prompt(
                 crate::prompts::SpecializedAgentPromptContext {
                     agent_id,
                     identity: body,
-                    context: &i.prompt_ctx,
+                    context: &prompt_ctx,
                 },
             ),
-            None => conversation_prompt(&i.prompt_ctx),
+            None => conversation_prompt(&prompt_ctx),
         };
 
         let delegate = i.delegate;
@@ -533,6 +531,7 @@ fn start_session_with_role(
                 .as_ref()
                 .map(|provider| browser_summary_is_connected(&provider()))
                 .unwrap_or(false),
+            agent_work: false,
             // Set by the role, once it is known: only a coordination runtime
             // wants that layer, and it is the reason the environment layer is
             // dropped from its prompt.
@@ -589,8 +588,6 @@ fn start_session_with_role(
 /// One session as seen on disk, for the serve daemon's device-wide list.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
-    /// Stable id = the state file's path relative to the workspaces root
-    /// (e.g. `snipett-2a3f/state.json`). Used to resolve the session for /attach.
     pub id: String,
     /// Absolute workspace folder.
     pub folder: String,
@@ -624,12 +621,8 @@ pub fn inbox_session_id(agent_id: &str) -> String {
 }
 
 /// Whether a session id names an agent inbox rather than a project session.
-///
-/// Accepts the pre-canonical `inbox-<agent>/state.json` form too, so a stored
-/// reference or a client cache from before the id rewrite still classifies.
 pub fn is_inbox_session_id(id: &str) -> bool {
     id.strip_prefix("inbox-")
-        .and_then(|rest| rest.strip_suffix("/state.json").or(Some(rest)))
         .is_some_and(|agent_id| {
             !agent_id.is_empty()
                 && agent_id
@@ -664,11 +657,6 @@ pub(crate) fn resolve_session_path(root: &Path, id: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    // A session id IS the path, minus any filename it used to carry. Nothing is
-    // appended: the id names the session, and `session_id_for_state_path` walks
-    // the same path back, so the two are exact inverses. They used to disagree
-    // — the id carried `/state.json` while callers routinely dropped it — which
-    // is why a reply could be rejected for naming a session that plainly existed.
     let resolved = root.join(rel);
     // A symlink inside the root can still point out of it; the lexical check
     // above cannot see that.
@@ -760,19 +748,16 @@ fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<S
         if task.session_id.trim().is_empty() {
             continue;
         }
-        // Canonical, so the key matches the id this catalog stores: a task may
-        // carry the pre-canonicalisation form (`x/state.json`).
         let session = crate::conversations::canonical_session_id(&task.session_id).0;
         let Ok(members) = store.list_task_agents(&task.id) else {
             continue;
         };
         if let Some(agent) = members
-            .into_iter()
-            .find(|member| member.removed_at.is_none())
-            .map(|member| member.agent_id)
+            .iter()
+            .find(|member| member.removed_at.is_none() && member.status == "active")
+            .or_else(|| members.iter().find(|member| member.removed_at.is_none()))
+            .map(|member| member.agent_id.clone())
         {
-            // Newest wins: `list_tasks` returns newest first, and the most
-            // recent dispatch is the one actually working.
             out.entry(session).or_insert(agent);
         }
     }
@@ -833,16 +818,6 @@ pub fn list_device_sessions() -> Vec<SessionInfo> {
 }
 
 /// The conversation name a session id encodes.
-///
-/// A session that lives under `conversations/` is a SAVED conversation, and its
-/// name is that file's stem. Everything else is the workspace's single default
-/// session — the root directory, an agent inbox, Mission Control, or a
-/// pre-canonical id that still carries a `/state.json` suffix. Determining this
-/// from the presence of a `conversations/` component (rather than from a filename
-/// suffix) is what keeps it correct now that a canonical id has no filename: the
-/// root id would otherwise report the workspace directory as its conversation
-/// name, and the TUI picker would list a workspace as if it were a saved
-/// conversation.
 fn conversation_name_from_id(id: &str) -> &str {
     if let Some(rest) = id.rsplit_once("/conversations/") {
         return rest.1.strip_suffix(".json").unwrap_or(rest.1);
@@ -936,288 +911,9 @@ pub fn set_session_title(state_path: &Path, title: &str) -> Result<(), String> {
     write_session_state(state_path, &state)
 }
 
-/// Where a fork cuts the source conversation. Both ends are exclusive lengths
-/// (`events[..event_end]`, `messages[..message_end]`).
-#[derive(Debug, Clone, Copy)]
-pub struct ForkPoint {
-    pub event_end: usize,
-    pub message_end: usize,
-}
 
-/// Resolve a fork cut from a checkpoint id and/or event index.
-///
-/// - **checkpoint**: same boundary as `/rewind` (state *before* that turn).
-/// - **event_index**: keep through that event (inclusive), then snap back to a
-///   provider-safe boundary (no orphan tool_call / tool_result pairs).
-/// - both: checkpoint wins for the cut; event_index is ignored.
-pub fn resolve_fork_point(
-    state: &HarnessState,
-    checkpoint: Option<&str>,
-    event_index: Option<usize>,
-) -> Result<ForkPoint, String> {
-    if let Some(id) = checkpoint.map(str::trim).filter(|s| !s.is_empty()) {
-        let cp = state
-            .checkpoints
-            .iter()
-            .rev()
-            .find(|c| c.id == id || c.id.starts_with(id))
-            .ok_or_else(|| format!("no checkpoint matching `{id}`"))?;
-        return Ok(ForkPoint {
-            event_end: cp.event_index.min(state.events.len()),
-            message_end: cp.message_index.min(state.messages.len()),
-        });
-    }
-    let Some(idx) = event_index else {
-        return Err("fork requires `checkpoint` or `event_index`".into());
-    };
-    if state.events.is_empty() {
-        return Err("nothing to fork — session has no events".into());
-    }
-    if idx >= state.events.len() {
-        return Err(format!(
-            "event_index {idx} out of range (0..{})",
-            state.events.len().saturating_sub(1)
-        ));
-    }
-    // Keep through idx (inclusive), then walk back to a safe tool-pairing boundary.
-    let mut event_end = idx + 1;
-    event_end = snap_event_end_safe(&state.events, event_end);
-    let message_end = message_end_for_events(state, event_end);
-    Ok(ForkPoint {
-        event_end,
-        message_end,
-    })
-}
-
-/// Walk exclusive `event_end` backward so we don't strand a tool_call without its
-/// result (or a trailing tool_result without its call) — providers 400 on that.
-fn snap_event_end_safe(events: &[crate::harness::HarnessEvent], mut end: usize) -> usize {
-    use crate::harness::HarnessEvent;
-    end = end.min(events.len());
-    while end > 0 {
-        match &events[end - 1] {
-            HarnessEvent::ToolResult { .. } => {
-                // Ensure a ToolCall exists earlier in the kept prefix for pairing
-                // at the tail; if the tail is ToolResult after ToolCall we're fine.
-                break;
-            }
-            HarnessEvent::ToolCall { .. } => {
-                // Orphan call at end — drop it.
-                end -= 1;
-            }
-            HarnessEvent::ApprovalRequest { .. } | HarnessEvent::InvalidToolCall { .. } => {
-                end -= 1;
-            }
-            _ => break,
-        }
-    }
-    end
-}
-
-/// Best-effort message length matching a kept event prefix.
-/// Prefer a checkpoint on the same boundary; otherwise count user/assistant/tool
-/// events and consume messages in order until those counts are met.
-fn message_end_for_events(state: &HarnessState, event_end: usize) -> usize {
-    use crate::harness::HarnessEvent;
-    use crate::llm::HarnessMessage;
-
-    if let Some(cp) = state
-        .checkpoints
-        .iter()
-        .filter(|c| c.event_index == event_end)
-        .last()
-    {
-        return cp.message_index.min(state.messages.len());
-    }
-    // Nearest checkpoint at or before the cut — start counts from there.
-    let (mut base_event, mut base_msg) = state
-        .checkpoints
-        .iter()
-        .filter(|c| c.event_index <= event_end)
-        .max_by_key(|c| c.event_index)
-        .map(|c| (c.event_index, c.message_index))
-        .unwrap_or((0, 0));
-    base_event = base_event.min(event_end);
-    base_msg = base_msg.min(state.messages.len());
-
-    let mut need_user = 0usize;
-    let mut need_assistant = 0usize;
-    let mut need_tool = 0usize;
-    for ev in state
-        .events
-        .get(base_event..event_end)
-        .into_iter()
-        .flatten()
-    {
-        match ev {
-            HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. } => need_user += 1,
-            HarnessEvent::AssistantText { .. } => need_assistant += 1,
-            HarnessEvent::ToolCall { .. } | HarnessEvent::ToolResult { .. } => need_tool += 1,
-            _ => {}
-        }
-    }
-
-    let mut i = base_msg;
-    let mut got_user = 0usize;
-    let mut got_assistant = 0usize;
-    let mut got_tool = 0usize;
-    while i < state.messages.len() {
-        if got_user >= need_user && got_assistant >= need_assistant && got_tool >= need_tool {
-            break;
-        }
-        match &state.messages[i] {
-            HarnessMessage::User { .. } => {
-                if got_user >= need_user {
-                    break;
-                }
-                got_user += 1;
-            }
-            HarnessMessage::Assistant { .. } => {
-                if got_assistant >= need_assistant && got_tool >= need_tool && got_user >= need_user
-                {
-                    // Extra assistant after targets met — stop before it.
-                    break;
-                }
-                got_assistant += 1;
-            }
-            HarnessMessage::ToolResult { .. } => {
-                got_tool += 1;
-            }
-            HarnessMessage::System { .. } | HarnessMessage::Summary { .. } => {}
-        }
-        i += 1;
-    }
-    i
-}
-
-/// Build a forked [`HarnessState`]: history truncated to `point`, idle, no live
-/// lanes/watches/questions. Workspace path is unchanged (shared files on disk).
-pub fn build_forked_state(source: &HarnessState, point: ForkPoint) -> HarnessState {
-    use crate::harness::{ApprovalMode, HarnessStatus};
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let event_end = point.event_end.min(source.events.len());
-    let message_end = point.message_end.min(source.messages.len());
-
-    let mut forked = source.clone();
-    forked.events.truncate(event_end);
-    forked.messages.truncate(message_end);
-    forked
-        .checkpoints
-        .retain(|c| c.event_index <= event_end && c.message_index <= message_end);
-    forked.lanes.clear();
-    forked.watches.clear();
-    forked.pending_question = None;
-    forked.goal = None;
-    forked.compacting = false;
-    forked.compacting_started_at = None;
-    forked.turn_started_at = None;
-    forked.final_text = None;
-    forked.status = HarnessStatus::Idle;
-    forked.approval_mode = ApprovalMode::Auto;
-    // Fresh usage accounting for the branch (history is what matters).
-    forked.total_tokens = 0;
-    forked.prompt_tokens = 0;
-    forked.completion_tokens = 0;
-    forked.cache_read_tokens = 0;
-    forked.tool_payloads_pruned = false;
-    forked.queued_inputs.clear();
-    // Keep last_prompt_tokens / context_window as hints; model will refresh.
-    forked.created_at = now.clone();
-    forked.updated_at = now;
-    forked.iterations = 0;
-
-    let base_title = source
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("fork");
-    let short: String = base_title.chars().take(60).collect();
-    forked.title = Some(format!("fork · {short}"));
-    forked
-}
-
-/// Result of writing a forked conversation next to the source session.
-#[derive(Debug, Clone)]
-pub struct ForkedConversation {
-    /// Session id relative to the workspaces root (same form as `/sessions`).
-    pub id: String,
-    pub state_path: PathBuf,
-    pub title: String,
-    pub event_end: usize,
-    pub message_end: usize,
-}
-
-/// Fork `source_state_path` at `point` into a new `conversations/<uuid>.json`.
-/// Copies the model-profile sidecar when present. Does **not** start a live loop.
-pub fn write_forked_conversation(
-    source_state_path: &Path,
-    source: &HarnessState,
-    point: ForkPoint,
-) -> Result<ForkedConversation, String> {
-    let store =
-        store_for_sessions().ok_or_else(|| "the session store is unavailable".to_string())?;
-    write_forked_conversation_in(&store, source_state_path, source, point)
-}
-
-/// [`write_forked_conversation`] against an explicit store, so tests use an
-/// in-memory one instead of writing into the real database.
-pub fn write_forked_conversation_in(
-    store: &crate::store::Store,
-    source_state_path: &Path,
-    source: &HarnessState,
-    point: ForkPoint,
-) -> Result<ForkedConversation, String> {
-    let forked = build_forked_state(source, point);
-    let title = forked.title.clone().unwrap_or_else(|| "fork".to_string());
-
-    let parent = source_state_path
-        .parent()
-        .ok_or_else(|| "source state path has no parent".to_string())?;
-    // Source may be `state.json` or `conversations/<id>.json` — forks always land
-    // in `conversations/` beside the workspace state root.
-    let conv_dir = if parent.file_name().and_then(|s| s.to_str()) == Some("conversations") {
-        parent.to_path_buf()
-    } else {
-        parent.join("conversations")
-    };
-
-    let name = uuid::Uuid::new_v4().to_string();
-    let dest = conv_dir.join(format!("{name}.json"));
-    let root = workspaces_root();
-    let id = dest
-        .strip_prefix(&root)
-        .unwrap_or(&dest)
-        .display()
-        .to_string();
-
-    // The branch is a store row, like every other session — writing only a file
-    // would make it unopenable, since reads are store-only.
-    let extras = crate::conversations::SessionExtras {
-        // Creating a branch is a user action: put it at the top of the list.
-        last_active: Some(now_unix_secs()),
-        // Carry the per-conversation model override onto the branch.
-        profile: read_session_profile(source_state_path),
-        ..Default::default()
-    };
-    store
-        .import_session(
-            &id,
-            &crate::config::workspace_key(Path::new(&forked.workspace)),
-            &forked,
-            &extras,
-        )
-        .map_err(|e| format!("write fork: {e}"))?;
-
-    Ok(ForkedConversation {
-        id,
-        state_path: dest,
-        title,
-        event_end: point.event_end.min(source.events.len()),
-        message_end: point.message_end.min(source.messages.len()),
-    })
-}
+pub mod fork;
+pub use fork::*;
 
 /// Park the work a dead worker session was doing.
 ///
@@ -1256,10 +952,6 @@ pub fn session_id_for_state_path(state_path: &Path) -> String {
         .unwrap_or(state_path)
         .display()
         .to_string();
-    // The one place a path becomes an id, so a leftover filename is dropped here
-    // rather than at each of the ~27 callers. A path carrying `/state.json` (a
-    // value captured before ids were canonicalised) names the same session as
-    // the bare form.
     crate::conversations::canonical_session_id(&relative).0
 }
 
@@ -1362,6 +1054,10 @@ pub fn subscribe_device_events() -> broadcast::Receiver<serde_json::Value> {
     device_events().subscribe()
 }
 
+pub fn emit_device_event(event: serde_json::Value) {
+    let _ = device_events().send(event);
+}
+
 pub fn replay_notification_events(since: u64) -> Vec<serde_json::Value> {
     store_for_sessions()
         .and_then(|store| store.notification_events_since(since).ok())
@@ -1402,90 +1098,13 @@ pub fn bump_session_activity(state_path: &Path) {
 /// `~/.snippet/worktrees/{repo}/{id}` and return that path (preserving a
 /// subfolder relative to the repo root). Non-git folders, nested worktrees
 /// already under that root, and any git failure fall back to `folder`.
-pub fn prepare_new_session_workspace(folder: &Path) -> PathBuf {
-    try_session_worktree(folder).unwrap_or_else(|| folder.to_path_buf())
-}
 
-fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
-}
+pub mod worktree;
+pub use worktree::*;
 
-fn sanitize_repo_name(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if s.is_empty() { "repo".into() } else { s }
-}
+#[cfg(test)]
+mod tests;
 
-fn unique_worktree_path(parent: &Path) -> Option<PathBuf> {
-    for _ in 0..8 {
-        let id = uuid::Uuid::new_v4().to_string();
-        let dest = parent.join(&id[..8]);
-        if !dest.exists() {
-            return Some(dest);
-        }
-    }
-    Some(parent.join(uuid::Uuid::new_v4().to_string()))
-}
-
-fn try_session_worktree(folder: &Path) -> Option<PathBuf> {
-    let inside = git_stdout(folder, &["rev-parse", "--is-inside-work-tree"])?;
-    if inside != "true" {
-        return None;
-    }
-    let toplevel = PathBuf::from(git_stdout(folder, &["rev-parse", "--show-toplevel"])?);
-    let root = crate::config::worktrees_root();
-    if folder.starts_with(&root) || toplevel.starts_with(&root) {
-        return None;
-    }
-    let repo = sanitize_repo_name(toplevel.file_name()?.to_str()?);
-    let parent = root.join(&repo);
-    std::fs::create_dir_all(&parent).ok()?;
-    // Unique per session so one repo can host many parallel worktrees.
-    // Named branch (not --detach) so the agent can commit/push without
-    // fighting detached HEAD, and never lands on main.
-    let dest = unique_worktree_path(&parent)?;
-    let branch = dest
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|id| format!("snippet/{id}"))
-        .unwrap_or_else(|| "snippet/session".into());
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(&toplevel)
-        .args(["worktree", "add", "-b", &branch])
-        .arg(&dest)
-        .status()
-        .ok()?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&dest);
-        return None;
-    }
-    let workspace = match folder.strip_prefix(&toplevel) {
-        Ok(rel) if !rel.as_os_str().is_empty() => dest.join(rel),
-        _ => dest,
-    };
-    Some(workspace)
-}
-
-/// Persist a brand-new idle conversation in `folder` so Mission Control can
 /// dispatch to it. `new_conversation=false` uses the folder's default session id
 /// (refuses if one already exists). `true` always mints a fresh
 /// `conversations/<uuid>.json` id. Git repos always get an isolated worktree;
@@ -1622,16 +1241,6 @@ fn workspace_from_state_file(state_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// True when `folder` sits inside an isolated linked git worktree (created for
-/// this session) rather than the user's main checkout. Drives whether the
-/// worktree-specific prompt layer renders.
-pub(crate) fn workspace_is_worktree(folder: &Path) -> bool {
-    let folder = folder
-        .canonicalize()
-        .unwrap_or_else(|_| folder.to_path_buf());
-    linked_worktree_root(&folder).is_some()
-}
-
 /// Parse the `connected = N` count out of a rendered browser summary. Drives both
 /// the conditional browser prompt layer (session start) and whether the live
 /// context shows the [browsers] section at all.
@@ -1641,655 +1250,4 @@ pub(crate) fn browser_summary_is_connected(summary: &str) -> bool {
         .find_map(|line| line.strip_prefix("connected = "))
         .and_then(|value| value.trim().parse::<usize>().ok())
         .is_some_and(|count| count > 0)
-}
-
-/// Best-effort: drop a linked git worktree created for this session.
-/// A linked worktree has a `.git` *file* (not a directory). Never touches
-/// the original clone.
-fn drop_session_worktree(folder: &Path) {
-    let folder = folder
-        .canonicalize()
-        .unwrap_or_else(|_| folder.to_path_buf());
-    let Some(worktree) = linked_worktree_root(&folder) else {
-        return;
-    };
-    if let Some(common) = git_stdout(&worktree, &["rev-parse", "--git-common-dir"]) {
-        let common_path = PathBuf::from(&common);
-        let common_path = if common_path.is_absolute() {
-            common_path
-        } else {
-            worktree.join(common_path)
-        };
-        if let Some(main) = common_path.parent() {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(main)
-                .args(["worktree", "remove", "--force"])
-                .arg(&worktree)
-                .status();
-        }
-    }
-    if worktree.exists() {
-        let _ = std::fs::remove_dir_all(&worktree);
-    }
-}
-
-/// Walk up from `folder` until we find a `.git` file — the linked-worktree
-/// marker. A `.git` directory is the original clone and is left alone.
-fn linked_worktree_root(folder: &Path) -> Option<PathBuf> {
-    let mut cur = folder.to_path_buf();
-    loop {
-        let git = cur.join(".git");
-        if git.is_file() {
-            return Some(cur);
-        }
-        if git.is_dir() {
-            return None;
-        }
-        if !cur.pop() {
-            return None;
-        }
-    }
-}
-
-#[cfg(test)]
-mod fork_tests {
-    use super::*;
-    use crate::harness::{HarnessEvent, HarnessState, HarnessStatus};
-    use crate::llm::HarnessMessage;
-
-    fn sample_state() -> HarnessState {
-        // Build via JSON so private migration fields stay internal.
-        let mut s: HarnessState = serde_json::from_value(serde_json::json!({
-            "version": 1,
-            "status": "idle",
-            "created_at": "t0",
-            "updated_at": "t0",
-            "workspace": "/tmp/ws",
-            "title": "original title",
-            "messages": [],
-            "events": [],
-            "iterations": 3,
-            "total_tokens": 100,
-            "prompt_tokens": 80,
-            "completion_tokens": 20,
-            "last_prompt_tokens": 50,
-            "context_window": 128000
-        }))
-        .expect("sample state");
-        s.messages = vec![
-            HarnessMessage::User {
-                content: "hi".into(),
-            },
-            HarnessMessage::Assistant {
-                content: "hello".into(),
-                tool_calls: Vec::new(),
-            },
-            HarnessMessage::User {
-                content: "again".into(),
-            },
-        ];
-        s.events = vec![
-            HarnessEvent::UserInput { text: "hi".into() },
-            HarnessEvent::AssistantText {
-                text: "hello".into(),
-            },
-            HarnessEvent::UserInput {
-                text: "again".into(),
-            },
-        ];
-        s.checkpoints = vec![crate::harness::CheckpointRecord {
-            id: "abc12345deadbeef".into(),
-            label: "hi".into(),
-            created_at: "t0".into(),
-            event_index: 0,
-            message_index: 0,
-        }];
-        s
-    }
-
-    #[test]
-    fn resolve_checkpoint_cut() {
-        let s = sample_state();
-        let p = resolve_fork_point(&s, Some("abc12345"), None).unwrap();
-        assert_eq!(p.event_end, 0);
-        assert_eq!(p.message_end, 0);
-    }
-
-    #[test]
-    fn resolve_event_index_inclusive() {
-        let s = sample_state();
-        let p = resolve_fork_point(&s, None, Some(1)).unwrap();
-        assert_eq!(p.event_end, 2); // keep through index 1
-    }
-
-    #[test]
-    fn build_fork_truncates_and_idles() {
-        let s = sample_state();
-        let p = ForkPoint {
-            event_end: 2,
-            message_end: 2,
-        };
-        let f = build_forked_state(&s, p);
-        assert_eq!(f.events.len(), 2);
-        assert_eq!(f.messages.len(), 2);
-        assert_eq!(f.status, HarnessStatus::Idle);
-        assert!(f.lanes.is_empty());
-        assert!(f.title.as_deref().unwrap_or("").starts_with("fork ·"));
-        assert_eq!(f.total_tokens, 0);
-        assert!(!f.tool_payloads_pruned);
-    }
-
-    #[test]
-    fn snaps_orphan_tool_call_at_end() {
-        let mut s = sample_state();
-        s.events.push(HarnessEvent::ToolCall {
-            tool_name: "bash".into(),
-            arguments: serde_json::json!({"command": "ls"}),
-        });
-        s.messages.push(HarnessMessage::Assistant {
-            content: String::new(),
-            tool_calls: Vec::new(),
-        });
-        let last = s.events.len() - 1;
-        let p = resolve_fork_point(&s, None, Some(last)).unwrap();
-        // Exclusive end must not leave a trailing ToolCall.
-        if p.event_end > 0 {
-            assert!(!matches!(
-                s.events[p.event_end - 1],
-                HarnessEvent::ToolCall { .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn a_fork_is_written_to_the_store() {
-        // The bug this guards: fork wrote only a file, so the branch got no store
-        // row — invisible in the list and unopenable, since reads are store-only.
-        use crate::store::Store;
-        let store = Store::open_in_memory().unwrap();
-        let s = sample_state();
-        let p = ForkPoint {
-            event_end: 2,
-            message_end: 2,
-        };
-        let dir = std::env::temp_dir().join(format!("snippet-fork-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("conversations")).unwrap();
-        let source = dir.join("conversations").join("source.json");
-
-        let fork = write_forked_conversation_in(&store, &source, &s, p).unwrap();
-
-        let row = store
-            .get_session_row(&fork.id)
-            .unwrap()
-            .expect("the branch must have a store row");
-        assert_eq!(row.title.as_deref(), Some(fork.title.as_str()));
-        assert!(row.last_active.is_some(), "a new branch sorts to the top");
-        // The truncated transcript, not the whole conversation.
-        assert_eq!(store.conversation_message_count(&fork.id).unwrap(), 2);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-#[cfg(test)]
-mod create_blank_tests {
-    use super::*;
-    use crate::store::Store;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_folder(stamp: u128, suffix: &str) -> PathBuf {
-        let folder = std::env::temp_dir().join(format!("snippet-mc-{suffix}-{stamp}"));
-        fs::create_dir_all(&folder).unwrap();
-        folder
-    }
-
-    #[test]
-    fn create_blank_session_writes_a_store_row() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let folder = temp_folder(stamp, "blank");
-        let store = Store::open_in_memory().unwrap();
-
-        let info = create_blank_session_in(&store, &folder, "Odd request", true).unwrap();
-        assert_eq!(info.title, "Odd request");
-        assert_eq!(info.status, "idle");
-        assert_eq!(
-            info.folder,
-            folder.canonicalize().unwrap().display().to_string()
-        );
-
-        // No state file: the row IS the session.
-        assert!(!state_path_for_id(&info.id).unwrap().exists());
-        let row = store
-            .get_session_row(&info.id)
-            .unwrap()
-            .expect("row exists");
-        assert_eq!(row.title.as_deref(), Some("Odd request"));
-        assert_eq!(row.status, "idle");
-        assert!(row.last_active.is_some(), "a new chat sorts to the top");
-
-        let _ = fs::remove_dir_all(&folder);
-    }
-
-    #[test]
-    fn a_second_default_session_in_the_same_folder_is_refused() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let folder = temp_folder(stamp, "dup");
-        let store = Store::open_in_memory().unwrap();
-
-        create_blank_session_in(&store, &folder, "first", false).unwrap();
-        let second = create_blank_session_in(&store, &folder, "second", false);
-        assert!(second.is_err(), "uniqueness is the store's question now");
-
-        let _ = fs::remove_dir_all(&folder);
-    }
-
-    fn git_ok(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed in {}", dir.display());
-    }
-
-    fn init_repo(stamp: u128, suffix: &str) -> PathBuf {
-        let repo = std::env::temp_dir().join(format!("snippet-wt-{suffix}-{stamp}"));
-        fs::create_dir_all(&repo).unwrap();
-        git_ok(&repo, &["init", "-q"]);
-        git_ok(&repo, &["config", "user.email", "snippet@test"]);
-        git_ok(&repo, &["config", "user.name", "snippet"]);
-        fs::write(repo.join("README"), "hi\n").unwrap();
-        git_ok(&repo, &["add", "README"]);
-        git_ok(&repo, &["commit", "-qm", "init"]);
-        repo.canonicalize().unwrap()
-    }
-
-    fn drop_worktree(repo: &Path, workspace: &Path) {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(workspace)
-            .status();
-        if workspace.exists() {
-            let _ = fs::remove_dir_all(workspace);
-        }
-    }
-
-    #[test]
-    fn new_session_in_git_repo_uses_isolated_worktree() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let repo = init_repo(stamp, "repo");
-        let workspace = prepare_new_session_workspace(&repo);
-        let root = crate::config::worktrees_root();
-        assert_ne!(workspace, repo);
-        assert!(workspace.starts_with(&root));
-        assert!(workspace.join(".git").is_file());
-        assert!(workspace.join("README").exists());
-        let branch = git_stdout(&workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
-        assert!(
-            branch.starts_with("snippet/"),
-            "session worktree should be on snippet/{{id}}, got {branch}"
-        );
-        assert_ne!(branch, "HEAD", "must not be detached");
-        drop_worktree(&repo, &workspace);
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn non_git_folder_stays_put() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let folder = std::env::temp_dir().join(format!("snippet-wt-plain-{stamp}"));
-        fs::create_dir_all(&folder).unwrap();
-        let got = prepare_new_session_workspace(&folder);
-        assert_eq!(got, folder);
-        let _ = fs::remove_dir_all(&folder);
-    }
-
-    #[test]
-    fn parallel_sessions_get_unique_worktrees() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let repo = init_repo(stamp, "parallel");
-        let a = prepare_new_session_workspace(&repo);
-        let b = prepare_new_session_workspace(&repo);
-        let root = crate::config::worktrees_root();
-        assert_ne!(a, b);
-        assert!(a.starts_with(&root) && b.starts_with(&root));
-        assert!(a.join("README").exists() && b.join("README").exists());
-        drop_worktree(&repo, &a);
-        drop_worktree(&repo, &b);
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn blank_session_in_git_repo_always_gets_a_worktree() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let repo = init_repo(stamp, "mc-blank");
-        let store = Store::open_in_memory().unwrap();
-        // Mission Control often creates with new_conversation=false.
-        let info = create_blank_session_in(&store, &repo, "from mc", false).unwrap();
-        let root = crate::config::worktrees_root();
-        let folder = PathBuf::from(&info.folder);
-        assert_ne!(folder, repo);
-        assert!(
-            folder.starts_with(&root),
-            "expected isolated worktree, got {}",
-            folder.display()
-        );
-        assert!(folder.join(".git").is_file());
-        let path = state_path_for_id(&info.id).expect("created session is resolvable");
-        remove_session_files_with(Some(&store), &path);
-        assert!(!folder.exists(), "isolated worktree should be gone");
-        assert!(store.get_session_row(&info.id).unwrap().is_none());
-        assert!(repo.exists(), "original clone must stay");
-        let _ = fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn deleting_a_session_drops_its_worktree() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let repo = init_repo(stamp, "drop");
-        let workspace = prepare_new_session_workspace(&repo);
-        assert!(workspace.exists());
-        let store = Store::open_in_memory().unwrap();
-        let info = create_blank_session_in(&store, &workspace, "wt-drop", false).unwrap();
-        let path = state_path_for_id(&info.id).expect("created session is resolvable");
-        remove_session_files_with(Some(&store), &path);
-        assert!(!workspace.exists(), "isolated worktree should be gone");
-        assert!(repo.exists(), "original clone must stay");
-        let _ = fs::remove_dir_all(&repo);
-    }
-}
-
-#[cfg(test)]
-mod resolve_session_path_tests {
-    use super::*;
-    use std::fs;
-
-    /// A model handed `session:<ws>/state.json` routinely sends the bare
-    /// The id IS the workspace directory — no filename. A caller that still
-    /// appends `/state.json` (a value captured before ids were canonicalised)
-    /// names the same session, and a bare name matches too: they all resolve to
-    /// the one path, which is what makes the three forms interchangeable instead
-    /// of three ways to be rejected.
-    #[test]
-    fn a_workspace_directory_is_the_default_session() {
-        let root = tempfile::tempdir().unwrap();
-        let ws = root.path().join("ws-1");
-        fs::create_dir_all(&ws).unwrap();
-
-        let bare = resolve_session_path(root.path(), "ws-1").expect("resolves");
-        assert_eq!(bare, ws, "got {}", bare.display());
-
-        // The pre-canonical form names the same session rather than failing.
-        assert_eq!(
-            crate::conversations::canonical_session_id("ws-1/state.json").0,
-            "ws-1"
-        );
-    }
-
-    /// The explicit form must keep working — it is what the envelope sends.
-    #[test]
-    fn the_full_id_resolves_to_itself() {
-        let root = tempfile::tempdir().unwrap();
-        let ws = root.path().join("ws-2");
-        fs::create_dir_all(&ws).unwrap();
-        fs::write(ws.join("state.json"), b"{}").unwrap();
-
-        let resolved = resolve_session_path(root.path(), "ws-2/state.json").expect("resolves");
-        assert!(
-            resolved.ends_with("ws-2/state.json"),
-            "got {}",
-            resolved.display()
-        );
-    }
-
-    /// A saved conversation is not a directory, so the completion must not touch
-    /// it. Regression guard: completing every id would rewrite this path.
-    #[test]
-    fn a_saved_conversation_is_left_alone() {
-        let root = tempfile::tempdir().unwrap();
-        let conv = root.path().join("ws-3/conversations");
-        fs::create_dir_all(&conv).unwrap();
-        let file = conv.join("abc.json");
-        fs::write(&file, b"{}").unwrap();
-
-        let resolved =
-            resolve_session_path(root.path(), "ws-3/conversations/abc.json").expect("resolves");
-        assert!(
-            resolved.ends_with("ws-3/conversations/abc.json"),
-            "got {}",
-            resolved.display()
-        );
-    }
-
-    #[test]
-    fn traversal_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        assert!(resolve_session_path(root.path(), "../escape").is_none());
-        assert!(resolve_session_path(root.path(), "/abs/path").is_none());
-    }
-}
-
-#[cfg(test)]
-mod conversation_name_tests {
-    use super::conversation_name_from_id;
-
-    /// A session under `conversations/` is a saved conversation; its name is the
-    /// file stem.
-    #[test]
-    fn a_saved_conversation_is_named_by_its_file_stem() {
-        assert_eq!(
-            conversation_name_from_id("ws-1/conversations/41e5e18b-5478-4737-863f-750de39e025d"),
-            "41e5e18b-5478-4737-863f-750de39e025d"
-        );
-        // The pre-canonical form (with `.json`) named the same conversation.
-        assert_eq!(
-            conversation_name_from_id("ws-1/conversations/41e5e18b.json"),
-            "41e5e18b"
-        );
-    }
-
-    /// Everything else is the workspace's one default session.
-    ///
-    /// This is the regression: a canonical id is the workspace DIRECTORY, with no
-    /// `state.json` suffix. Deriving "default" from that suffix meant a root
-    /// session reported the directory name as its conversation, so the TUI picker
-    /// listed a workspace as though it were a saved conversation.
-    #[test]
-    fn a_root_session_is_the_default_conversation() {
-        assert_eq!(
-            conversation_name_from_id("snippet-service-61c2d836aee8dc5b"),
-            "default"
-        );
-        assert_eq!(conversation_name_from_id("inbox-snippet"), "default");
-        assert_eq!(conversation_name_from_id("mission-control"), "default");
-        // And a value captured before the id change still names the same session.
-        assert_eq!(
-            conversation_name_from_id("snippet-service-61c2d836aee8dc5b/state.json"),
-            "default"
-        );
-        assert_eq!(
-            conversation_name_from_id("inbox-snippet/state.json"),
-            "default"
-        );
-    }
-}
-
-#[cfg(test)]
-mod routable_target_tests {
-    use super::is_routable_target;
-
-    /// An ordinary project session is the only thing work routes to.
-    #[test]
-    fn a_project_session_is_routable() {
-        assert!(is_routable_target("snippet-service-61c2d836aee8dc5b"));
-        assert!(is_routable_target(
-            "wacht-480461c289235d72/conversations/e000736e-da39-4bd0-a307-52f52fc71241"
-        ));
-        // A pre-canonical id names the same session and must stay routable.
-        assert!(is_routable_target("snippet-service-61c2d836aee8dc5b/state.json"));
-    }
-
-    /// The bug this predicate exists for: MC routed a real task into an agent's
-    /// inbox, which runs the coordination runtime. It has no workspace tools and
-    /// no `report_mission_task`, so the task could be neither done nor reported
-    /// and sat InProgress forever while the inbox spun on it.
-    #[test]
-    fn an_agent_inbox_is_not_routable() {
-        assert!(!is_routable_target("inbox-snippet"));
-        assert!(!is_routable_target("inbox-snippet/state.json"));
-        assert!(!is_routable_target("inbox-rust-pr-reviewer"));
-    }
-
-    /// Mission Control coordinates; routing work to itself is a loop.
-    #[test]
-    fn mission_control_is_not_routable() {
-        assert!(!is_routable_target("mission-control"));
-        assert!(!is_routable_target("mission-control/session.json"));
-    }
-
-    /// The two exclusions must not swallow a workspace that merely starts with
-    /// the same letters — `inboxing-app-1234` is a real project folder.
-    #[test]
-    fn a_folder_named_like_an_inbox_stays_routable() {
-        assert!(is_routable_target("inboxing-app-1234abcd"));
-        assert!(is_routable_target("mission-control-ui-5678ef90"));
-    }
-}
-
-#[cfg(test)]
-mod working_agents_tests {
-    use super::working_agents_in;
-    use crate::coordination::{HandoffMode, Task, TaskStatus};
-    use crate::store::Store;
-
-    /// The roster row has a real FK to `agents(id)`, so the agent must exist.
-    fn worker(id: &str) -> crate::coordination::types::Agent {
-        crate::coordination::types::Agent {
-            id: id.into(),
-            display_name: id.into(),
-            handle: id.into(),
-            kind: crate::coordination::types::AgentKind::Worker,
-            status: crate::coordination::types::AgentStatus::Active,
-            role: crate::coordination::types::AgentRole::Implementer,
-            capabilities: vec![],
-        }
-    }
-
-    fn dispatched(id: &str, session: &str, now: &str) -> Task {
-        let mut task = Task::dispatched_to(
-            id.into(),
-            session.into(),
-            format!("task {id}"),
-            "scope".into(),
-            vec![],
-            HandoffMode::Resume,
-            "agent",
-            crate::mission_control::SESSION_ID,
-            now.into(),
-        );
-        task.profile = None;
-        task
-    }
-
-    /// A plain project session is nobody's — `sessions.agent_id` is NULL — yet an
-    /// agent dispatched into it is exactly who the session list must name. This
-    /// is the case the badge missed: it read the session's own binding, which
-    /// dispatch never writes.
-    #[test]
-    fn a_dispatched_agent_is_reported_for_its_target_session() {
-        let db = Store::open_in_memory().unwrap();
-        db.create_agent(&worker("snippet")).unwrap();
-        let task = dispatched("t1", "proj-1", "2026-01-01T00:00:00Z");
-        db.create_task(&task).unwrap();
-        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
-            .unwrap();
-
-        let map = working_agents_in(&db);
-        assert_eq!(
-            map.get("proj-1").map(String::as_str),
-            Some("snippet"),
-            "the dispatched agent must be reported for the target session"
-        );
-    }
-
-    /// Finished work is not someone working. A terminal task must drop out, or
-    /// every session an agent ever touched would keep claiming a worker.
-    #[test]
-    fn a_finished_task_stops_reporting_a_worker() {
-        let db = Store::open_in_memory().unwrap();
-        db.create_agent(&worker("snippet")).unwrap();
-        let task = dispatched("t1", "proj-1", "2026-01-01T00:00:00Z");
-        db.create_task(&task).unwrap();
-        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
-            .unwrap();
-        assert!(working_agents_in(&db).contains_key("proj-1"));
-
-        for terminal in [TaskStatus::Done, TaskStatus::Failed, TaskStatus::Cancelled] {
-            db.update_task_in("t1", "2026-01-02T00:00:00Z", |t| {
-                t.status = terminal.clone()
-            })
-            .unwrap();
-            assert!(
-                !working_agents_in(&db).contains_key("proj-1"),
-                "a {terminal:?} task must not report a worker"
-            );
-        }
-    }
-
-    /// The task row may carry the pre-canonicalisation id (`x/state.json`) while
-    /// the catalog keys on `x`. Without canonicalising the key the lookup misses
-    /// and the badge silently disappears for those sessions.
-    #[test]
-    fn a_legacy_shaped_target_still_matches_its_session() {
-        let db = Store::open_in_memory().unwrap();
-        db.create_agent(&worker("snippet")).unwrap();
-        let task = dispatched("t1", "proj-1/state.json", "2026-01-01T00:00:00Z");
-        db.create_task(&task).unwrap();
-        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
-            .unwrap();
-
-        assert_eq!(
-            working_agents_in(&db).get("proj-1").map(String::as_str),
-            Some("snippet"),
-            "a legacy-shaped target must key to the canonical session id"
-        );
-    }
-
-    /// A task with no target cannot be delivered, so it must not claim a worker.
-    #[test]
-    fn a_targetless_task_reports_nothing() {
-        let db = Store::open_in_memory().unwrap();
-        db.create_agent(&worker("snippet")).unwrap();
-        let task = dispatched("t1", "", "2026-01-01T00:00:00Z");
-        db.create_task(&task).unwrap();
-        db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
-            .unwrap();
-
-        assert!(working_agents_in(&db).is_empty());
-    }
 }

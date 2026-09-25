@@ -35,6 +35,8 @@ pub struct PromptContext {
     pub vault: bool,
     /// This session can reach connected browsers.
     pub browser: bool,
+    /// An agent is working in this session (not just an ordinary session).
+    pub agent_work: bool,
     /// This is an agent's COORDINATION session: it answers direct messages and
     /// dispatches work, and holds no workspace tools. The layer is what tells it
     /// how to behave, which is not inferable from the tool list alone.
@@ -58,6 +60,7 @@ impl PromptContext {
             skills: !crate::skills::discover().is_empty(),
             vault: !crate::vault::Vault::load().is_empty(),
             browser,
+            agent_work: false,
             // Not inferable from the environment; the role's own constructor sets it.
             coordination: false,
         }
@@ -106,10 +109,11 @@ pub fn conversation_prompt(context: &PromptContext) -> String {
     ];
     parts.extend(context.conditional_layers());
     parts.push(CONVERSATION_AGENT_LAYER.trim());
-    // Last, and only for an AGENT's work session: it has coordination tools but
-    // no dispatch tool, and the boundary is not inferable from the tool list —
-    // an absent tool reads as an oversight unless it is stated.
-    parts.push(WORK_BOUNDARY_LAYER.trim());
+    // Last, only for an agent's work session: it may ask Mission Control to
+    // dispatch work. A plain session has no agent messaging capability.
+    if context.agent_work {
+        parts.push(WORK_BOUNDARY_LAYER.trim());
+    }
     parts.join("\n\n")
 }
 
@@ -194,4 +198,21 @@ pub fn specialized_coordination_prompt(context: SpecializedAgentPromptContext<'_
         base = coordination_prompt(context.context),
         overlay = identity_overlay(context.agent_id, context.identity),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_boundary_is_only_in_agent_work_sessions() {
+        let plain = conversation_prompt(&PromptContext::default());
+        assert!(!plain.contains("[delegation_boundary]"));
+
+        let agent = conversation_prompt(&PromptContext {
+            agent_work: true,
+            ..PromptContext::default()
+        });
+        assert!(agent.contains("[delegation_boundary]"));
+    }
 }

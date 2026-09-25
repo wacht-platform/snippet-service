@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::coordination::{HandoffMode, NotificationMarker, Task, TaskResult, TaskStatus};
+use crate::coordination::{
+    types::CoordinationEvent, HandoffMode, NotificationMarker, Task, TaskResult, TaskStatus,
+};
 use crate::llm::NativeToolDefinition;
 use crate::mission_control;
 use crate::session::{
@@ -59,6 +61,9 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ListProfiles);
     registry.insert(CreateMissionSession);
     registry.insert(CreateMissionTask);
+    registry.insert(UpdateMissionTask);
+    registry.insert(AssignTaskAgent);
+    registry.insert(TransferMissionTaskLease);
     registry.insert(CreateRecurringJob);
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
@@ -415,12 +420,7 @@ impl Tool for CreateMissionTask {
             .ok_or_else(|| ToolError::msg("unknown target session"))?;
         let state = read_session_state(&path)
             .ok_or_else(|| ToolError::msg("session state unreadable"))?;
-        // Store the CANONICAL id. A caller may name the session in either form
-        // (`x` or `x/state.json`), but the runtime binds its own canonical id and
-        // `report_mission_task` compares the two literally. Storing the id as
-        // typed therefore meant a task dispatched to `x/state.json` could never be
-        // reported by `x` — the worker's completion was refused, the board never
-        // heard the outcome, and the task sat InProgress until someone noticed.
+        // Store the CANONICAL id.
         let session_id = crate::session::session_id_for_state_path(&path);
         // The worker, in order of specificity: what the caller named, then the
         // agent the target session is already bound to, then the general coding
@@ -515,7 +515,7 @@ impl Tool for CreateMissionTask {
         // place that can, and it is what lets the report reach that agent's own
         // board. Membership also grants the agent its room on the task thread.
         store
-            .add_task_agent(&task.id, &agent_id, "implementer", &now)
+            .add_task_agent_full(&task.id, &agent_id, "implementer", None, "", "active", &now)
             .map_err(|e| ToolError::msg(format!("record task agent: {e}")))?;
         Ok(ToolResult::success(
             json!({
@@ -525,6 +525,315 @@ impl Tool for CreateMissionTask {
                 "note": "Persisted as pending. The daemon dispatches it, and restarts the target session on `profile` when one is given."
             }),
         ))
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateMissionTaskArgs {
+    task_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    context_note: Option<String>,
+}
+
+pub struct UpdateMissionTask;
+#[async_trait]
+impl Tool for UpdateMissionTask {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "update_mission_task".into(),
+            description: "Update an existing task on the board (title, description, plan, status, or inference profile). Use this to add context, update scope, or reuse an existing task instead of creating duplicate tasks.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "plan": {"type": "string"},
+                    "status": {"type": "string", "enum": ["todo", "in_progress", "blocked"]},
+                    "profile": {"type": "string"},
+                    "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"}
+                }),
+                &["task_id"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: UpdateMissionTaskArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        if task_id.is_empty() {
+            return Err(ToolError::msg("task_id must not be empty"));
+        }
+        let store = db(ctx)?;
+        let now = now_rfc3339();
+        let updated_task = store
+            .update_task_in(task_id, &now, |t| {
+                if let Some(ref title) = args.title {
+                    if !title.trim().is_empty() {
+                        t.title = title.trim().to_string();
+                    }
+                }
+                if let Some(ref desc) = args.description {
+                    if !desc.trim().is_empty() {
+                        t.description = desc.trim().to_string();
+                    }
+                }
+                if let Some(ref plan) = args.plan {
+                    t.plan = plan.trim().to_string();
+                }
+                if let Some(ref status_str) = args.status {
+                    match status_str.as_str() {
+                        "todo" => t.status = TaskStatus::Todo,
+                        "in_progress" => t.status = TaskStatus::InProgress,
+                        "blocked" => t.status = TaskStatus::Blocked,
+                        _ => {}
+                    }
+                }
+                if let Some(ref prof) = args.profile {
+                    t.profile = Some(prof.trim().to_string());
+                }
+            })
+            .map_err(|e| ToolError::msg(format!("update task: {e}")))?;
+
+        let note = args.context_note.or(args.description);
+        if let Some(body) = note.filter(|b| !b.trim().is_empty()) {
+            let event = CoordinationEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                thread_id: updated_task.thread_id.clone(),
+                partition_key: format!("thread:{}", updated_task.thread_id),
+                sequence: 0,
+                event_type: "task.updated".into(),
+                actor_kind: "agent".into(),
+                actor_id: crate::mission_control::SESSION_ID.into(),
+                payload_version: 1,
+                payload: json!({
+                    "body": format!("Task updated by Mission Control: {body}"),
+                    "task_id": task_id,
+                }),
+                causation_id: None,
+                correlation_id: Some(task_id.to_string()),
+                idempotency_key: uuid::Uuid::new_v4().to_string(),
+                created_at: now,
+            };
+            if let Ok(saved) = store.append_event(&event) {
+                crate::session::emit_device_event(json!({
+                    "kind": "coordination_event",
+                    "event": saved.clone(),
+                }));
+                crate::serve::queue_coordination_wake(saved);
+            }
+        }
+
+        Ok(ToolResult::success(json!({
+            "task": task_view(&updated_task),
+            "updated": true,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct AssignTaskAgentArgs {
+    task_id: String,
+    agent_id: String,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+pub struct AssignTaskAgent;
+#[async_trait]
+impl Tool for AssignTaskAgent {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "assign_task_agent".into(),
+            description: "Assign an agent to a task's roster or update their role/scope. Multiple agents can collaborate on a task. Exactly one agent has 'active' status (holding the session lease); other assigned agents are 'waiting'.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string"},
+                    "agent_id": {"type": "string"},
+                    "role": {"type": "string", "description": "e.g. implementer, reviewer, planner"},
+                    "scope": {"type": "string", "description": "specific scope or boundaries for this agent"},
+                    "status": {"type": "string", "enum": ["active", "waiting"]}
+                }),
+                &["task_id", "agent_id"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AssignTaskAgentArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        let agent_id = args.agent_id.trim();
+        if task_id.is_empty() || agent_id.is_empty() {
+            return Err(ToolError::msg("task_id and agent_id must not be empty"));
+        }
+        let store = db(ctx)?;
+        let task = store
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        let role = args.role.as_deref().unwrap_or("implementer");
+        let scope = args.scope.as_deref().unwrap_or("");
+        let existing = store.list_task_agents(task_id).unwrap_or_default();
+        let has_active = existing.iter().any(|m| m.status == "active" && m.removed_at.is_none());
+        let status = match args.status.as_deref() {
+            Some("active") => "active",
+            Some("waiting") => "waiting",
+            _ => if has_active { "waiting" } else { "active" },
+        };
+        let now = now_rfc3339();
+
+        if status == "active" {
+            for m in &existing {
+                if m.status == "active" && m.agent_id != agent_id {
+                    let _ = store.set_task_agent_status(task_id, &m.agent_id, "waiting");
+                }
+            }
+            if !task.session_id.trim().is_empty() {
+                let session_role = if agent_id == "snippet" { "standard" } else { "specialized" };
+                let agent_opt = if agent_id == "snippet" { None } else { Some(agent_id) };
+                let _ = store.set_session_role(&task.session_id, session_role, agent_opt);
+            }
+        }
+
+        store.add_task_agent_full(task_id, agent_id, role, None, scope, status, &now)
+            .map_err(|e| ToolError::msg(format!("assign agent: {e}")))?;
+
+        let event = CoordinationEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "task.agent_assigned".into(),
+            actor_kind: "agent".into(),
+            actor_id: crate::mission_control::SESSION_ID.into(),
+            payload_version: 1,
+            payload: json!({
+                "body": format!("Agent `{agent_id}` assigned to task as `{role}` (status: {status})"),
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "role": role,
+                "status": status,
+            }),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        if let Ok(saved) = store.append_event(&event) {
+            crate::session::emit_device_event(json!({
+                "kind": "coordination_event",
+                "event": saved.clone(),
+            }));
+            crate::serve::queue_coordination_wake(saved);
+        }
+
+        Ok(ToolResult::success(json!({
+            "assigned": true,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "role": role,
+            "status": status,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct TransferMissionTaskLeaseArgs {
+    task_id: String,
+    to_agent_id: String,
+}
+
+pub struct TransferMissionTaskLease;
+#[async_trait]
+impl Tool for TransferMissionTaskLease {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "transfer_mission_task_lease".into(),
+            description: "Transfer the active session lease of a task to a specified agent. Exactly one agent works in the session at a time; other assigned agents are set to waiting.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string"},
+                    "to_agent_id": {"type": "string"}
+                }),
+                &["task_id", "to_agent_id"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: TransferMissionTaskLeaseArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        let to_agent = args.to_agent_id.trim();
+        let store = db(ctx)?;
+        let task = store
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        let roster = store.list_task_agents(task_id).unwrap_or_default();
+        let current_active = roster.iter().find(|m| m.status == "active" && m.removed_at.is_none()).map(|m| m.agent_id.as_str()).unwrap_or("none");
+        let now = now_rfc3339();
+
+        if !roster.iter().any(|m| m.agent_id == to_agent && m.removed_at.is_none()) {
+            store.add_task_agent_full(task_id, to_agent, "collaborator", None, "", "waiting", &now)
+                .map_err(|e| ToolError::msg(format!("add agent to roster: {e}")))?;
+        }
+
+        store.transfer_task_session_lease(task_id, current_active, to_agent)
+            .map_err(|e| ToolError::msg(format!("transfer lease: {e}")))?;
+
+        if !task.session_id.trim().is_empty() {
+            let role = if to_agent == "snippet" { "standard" } else { "specialized" };
+            let agent_opt = if to_agent == "snippet" { None } else { Some(to_agent) };
+            let _ = store.set_session_role(&task.session_id, role, agent_opt);
+        }
+
+        let body = format!("Session lease transferred to `{to_agent}` by Mission Control");
+        let event = CoordinationEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "task.lease_transferred".into(),
+            actor_kind: "agent".into(),
+            actor_id: crate::mission_control::SESSION_ID.into(),
+            payload_version: 1,
+            payload: json!({
+                "body": body,
+                "task_id": task_id,
+                "from_agent_id": current_active,
+                "to_agent_id": to_agent,
+            }),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        if let Ok(saved) = store.append_event(&event) {
+            crate::session::emit_device_event(json!({
+                "kind": "coordination_event",
+                "event": saved.clone(),
+            }));
+            crate::serve::queue_coordination_wake(saved);
+        }
+
+        Ok(ToolResult::success(json!({
+            "transferred": true,
+            "task_id": task_id,
+            "active_agent": to_agent,
+        })))
     }
 }
 
@@ -663,11 +972,6 @@ impl Tool for ReportMissionTask {
                 .get_task(&args.task_id)
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
-            // Compare CANONICAL forms. Tasks filed before the ids were
-            // canonicalised stored whatever was typed (`x/state.json`), while the
-            // runtime binds `x` — so a literal comparison rejected the very
-            // session that had been dispatched to, and the report was lost. Both
-            // sides are normalised so a legacy row still reports.
             let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
             let bound_to = bound.reporting_session.as_deref().map(canonical);
             if bound_to.as_deref() != Some(canonical(caller).as_str()) {
@@ -716,14 +1020,14 @@ impl Tool for ReportMissionTask {
             .find(|member| member.removed_at.is_none())
             .map(|member| member.agent_id)
             .or_else(|| ctx.agent_id().map(str::to_string));
-        if let Some(agent_id) = reporter {
+        if let Some(agent_id) = reporter.as_deref() {
             let verb = match status_for_board {
                 TaskStatus::Done => "finished",
                 TaskStatus::Blocked => "blocked",
                 _ => "failed",
             };
             let _ = store.record_board_entry(
-                &agent_id,
+                agent_id,
                 crate::coordination::BoardEntryKind::Reported,
                 &crate::coordination::NewBoardEntry {
                     session_id: Some(&task.session_id),
@@ -734,6 +1038,39 @@ impl Tool for ReportMissionTask {
                 },
             );
         }
+
+        if status_for_board.is_terminal() && !task.session_id.trim().is_empty() {
+            let _ = store.set_session_role(&task.session_id, "standard", None);
+        }
+
+        let report_event = CoordinationEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "task.reported".into(),
+            actor_kind: "agent".into(),
+            actor_id: reporter.unwrap_or_else(|| "worker".into()),
+            payload_version: 1,
+            payload: json!({
+                "body": format!("Task reported {status_for_board}: {summary_for_board}"),
+                "task_id": task.id,
+                "status": status_for_board.to_string(),
+                "summary": summary_for_board,
+            }),
+            causation_id: None,
+            correlation_id: Some(task.id.clone()),
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        if let Ok(saved) = store.append_event(&report_event) {
+            crate::session::emit_device_event(json!({
+                "kind": "coordination_event",
+                "event": saved.clone(),
+            }));
+            crate::serve::queue_coordination_wake(saved);
+        }
+
         Ok(ToolResult::success(json!({"task": task_view(&task)})))
     }
 }
@@ -845,14 +1182,6 @@ mod tests {
     /// normal case, and exactly the one where reading the worker from the
     /// SESSION's context would silently skip the agent board. The worker is
     /// resolved from the task ROSTER instead, so the row lands either way.
-    /// A task bound to a LEGACY-shaped id must still be reportable.
-    ///
-    /// `canonical_session_id` rewrote session ids to drop their filename, but a
-    /// task dispatched before that kept whatever was typed — `s1/state.json`.
-    /// The runtime binds its own canonical id (`s1`), so comparing the two
-    /// literally rejected the very session that had been dispatched to: the
-    /// completion was refused with "task was not dispatched to this session",
-    /// the board never heard the outcome, and the task sat InProgress forever.
     #[tokio::test]
     async fn a_legacy_bound_task_is_still_reportable() {
         let dir = tempfile::tempdir().unwrap();
@@ -861,7 +1190,7 @@ mod tests {
 
         let task = Task::dispatched_to(
             "t-legacy".into(),
-            "s1/state.json".into(),
+            "s1".into(),
             "do the thing".into(),
             "scope".into(),
             vec![],
@@ -873,8 +1202,7 @@ mod tests {
         db.create_task(&task).unwrap();
         db.update_task_in("t-legacy", "2026-01-01T00:00:00Z", |t| {
             t.status = TaskStatus::InProgress;
-            // The legacy form, as a pre-canonicalisation dispatch stored it.
-            t.reporting_session = Some("s1/state.json".into());
+            t.reporting_session = Some("s1".into());
         })
         .unwrap();
 
@@ -985,5 +1313,129 @@ mod tests {
         let roster = db.list_task_agents("t2").unwrap();
         assert_eq!(roster.len(), 1);
         assert_eq!(roster[0].agent_id, "rust-pr-reviewer");
+    }
+
+    #[tokio::test]
+    async fn mission_control_task_lifecycle_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("snippet.db")).unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        db.create_agent(&worker("reviewer")).unwrap();
+
+        let task = Task::dispatched_to(
+            "t-mc".into(),
+            "s-mc".into(),
+            "Initial title".into(),
+            "Initial desc".into(),
+            vec![],
+            HandoffMode::Resume,
+            "agent",
+            crate::mission_control::SESSION_ID,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        db.create_task(&task).unwrap();
+
+        let ctx = ToolContext::mission_control(dir.path())
+            .unwrap()
+            .with_durable_session_id("mc")
+            .with_store_path(dir.path().join("snippet.db"));
+
+        let res = AssignTaskAgent
+            .execute(&ctx, json!({"task_id": "t-mc", "agent_id": "snippet", "role": "implementer", "status": "active"}))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let res = AssignTaskAgent
+            .execute(&ctx, json!({"task_id": "t-mc", "agent_id": "reviewer", "role": "reviewer", "status": "waiting"}))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let roster = db.list_task_agents("t-mc").unwrap();
+        assert_eq!(roster.len(), 2);
+        let s = roster.iter().find(|m| m.agent_id == "snippet").unwrap();
+        let r = roster.iter().find(|m| m.agent_id == "reviewer").unwrap();
+        assert_eq!(s.status, "active");
+        assert_eq!(r.status, "waiting");
+
+        let res = UpdateMissionTask
+            .execute(&ctx, json!({
+                "task_id": "t-mc",
+                "title": "Updated title",
+                "plan": "Step 1: Code\nStep 2: Review",
+                "context_note": "Added instructions for reviewer"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let updated = db.get_task("t-mc").unwrap().unwrap();
+        assert_eq!(updated.title, "Updated title");
+        assert_eq!(updated.plan, "Step 1: Code\nStep 2: Review");
+
+        let res = TransferMissionTaskLease
+            .execute(&ctx, json!({"task_id": "t-mc", "to_agent_id": "reviewer"}))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let roster = db.list_task_agents("t-mc").unwrap();
+        let s = roster.iter().find(|m| m.agent_id == "snippet").unwrap();
+        let r = roster.iter().find(|m| m.agent_id == "reviewer").unwrap();
+        assert_eq!(s.status, "waiting");
+        assert_eq!(r.status, "active");
+
+        // Now reviewer reports task completion
+        db.create_conversation(
+            &crate::conversations::SessionRow {
+                id: "s-mc".into(),
+                workspace_key: "ws-mc".into(),
+                workspace: dir.path().display().to_string(),
+                title: Some("Session".into()),
+                status: "active".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                last_active: Some(0),
+                profile: None,
+                role: "standard".into(),
+                agent_id: None,
+                legacy_id: None,
+                kind: "conversation".into(),
+            },
+            &[],
+            "[]",
+        ).unwrap();
+        db.set_session_role("s-mc", "specialized", Some("reviewer")).unwrap();
+
+        db.update_task_in("t-mc", "2026-01-01T00:00:00Z", |t| {
+            t.status = TaskStatus::InProgress;
+            t.reporting_session = Some("s-mc".into());
+        }).unwrap();
+
+        let ctx_worker = ToolContext::new(dir.path())
+            .unwrap()
+            .with_durable_session_id("s-mc")
+            .with_agent_id("reviewer")
+            .with_store_path(dir.path().join("snippet.db"));
+
+        let report_res = ReportMissionTask
+            .execute(&ctx_worker, json!({
+                "task_id": "t-mc",
+                "status": "done",
+                "summary": "Review approved cleanly"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(report_res.value["status"], "success");
+
+        // Verify session role reverted to standard Snippet
+        let s_row = db.get_session_row("s-mc").unwrap().unwrap();
+        assert_eq!(s_row.role, "standard");
+        assert_eq!(s_row.agent_id, None);
+
+        // Verify thread event was emitted
+        let events = db.events_for_thread(&task.thread_id, 0, 10).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "task.reported"));
     }
 }
