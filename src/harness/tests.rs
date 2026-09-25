@@ -679,3 +679,51 @@ mod notice_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod dedup_and_stuck_edit_tests {
+    use super::*;
+
+    #[test]
+    fn test_dedup_tools_includes_read_file() {
+        assert!(DEDUP_TOOLS.contains(&"read_file"));
+        assert!(DEDUP_TOOLS.contains(&"search_content"));
+        assert!(MUTATING_TOOLS.contains(&"edit_file"));
+        assert!(MUTATING_TOOLS.contains(&"bash"));
+    }
+
+    #[test]
+    fn test_stuck_edit_signal_rendering() {
+        let signal = RuntimeSignal::StuckEdit {
+            path: "src/main.rs".to_string(),
+            count: 2,
+        };
+        let rendered = signal.render();
+        assert!(rendered.starts_with("stuck_edit = \""));
+        assert!(rendered.contains("your edits on `src/main.rs` have failed 2 times consecutively"));
+        assert!(rendered.contains("read_file"));
+    }
+
+    #[test]
+    fn test_tool_context_is_file_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = ToolContext::new(temp.path()).unwrap();
+        let file_path = temp.path().join("code.rs");
+
+        // Untracked file
+        std::fs::write(&file_path, "fn main() {}\n").unwrap();
+        assert!(!ctx.is_file_unchanged(&file_path));
+
+        // Marked read
+        ctx.mark_read(&file_path);
+        assert!(ctx.is_file_unchanged(&file_path));
+
+        // Modified externally / by shell
+        std::fs::write(&file_path, "fn main() { println!(\"modified\"); }\n").unwrap();
+        assert!(!ctx.is_file_unchanged(&file_path));
+
+        // Marked change
+        ctx.record_change(&file_path);
+        assert!(ctx.is_file_unchanged(&file_path));
+    }
+}

@@ -514,22 +514,42 @@ impl CodingHarness {
                 continue;
             }
 
-            // Dedup: re-calling a read-only discovery tool with identical args this
-            // request is the classic spinning loop — its result is already in
-            // history. Short-circuit with a notice instead of re-running. (A
-            // mutation below clears the set, so re-discovery after a change still
-            // works; read_file/bash are excluded — re-reads after edits are legit.)
+            // Dedup: re-calling a read-only tool with identical args this request is
+            // the classic spinning loop — its result is already in history. Short-circuit
+            // with a notice instead of re-running. For read_file, if the file actually changed
+            // on disk, allow re-reading; otherwise reuse earlier content.
             let signature = format!("{}:{}", tool_name, call.arguments);
-            if DEDUP_TOOLS.contains(&tool_name.as_str()) && vars.executed_calls.contains(&signature)
+            let is_duplicate = if DEDUP_TOOLS.contains(&tool_name.as_str())
+                && vars.executed_calls.contains(&signature)
             {
-                // Already ran this exact discovery call; skip re-running it. But we
-                // must STILL answer the call_id: an assistant tool_calls message with
-                // any unanswered tool_call_id makes strict providers (DeepSeek) 400
+                if tool_name == "read_file" {
+                    if let Some(path_str) = call.arguments.get("path").and_then(Value::as_str) {
+                        if let Ok(full_path) = self.context.resolve_workspace_path(path_str) {
+                            self.context.is_file_unchanged(&full_path)
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+
+            if is_duplicate {
+                // Already ran this exact call; skip re-running it. But we must STILL
+                // answer the call_id: an assistant tool_calls message with any
+                // unanswered tool_call_id makes strict providers (DeepSeek) 400
                 // ("insufficient tool messages"), and the broken turn poisons every
                 // later request until compaction.
                 dedup_hits += 1;
                 let skipped = if tool_name == "memory_read" {
                     "Identical memory_read already ran this turn — reuse that result. Don't recall the same id again."
+                } else if tool_name == "read_file" {
+                    "Identical read_file already ran with these arguments and the file is unchanged. Reference the content already in your context above instead of re-reading."
                 } else {
                     "Identical discovery call already ran this turn — reuse the earlier result instead of repeating it."
                 };
@@ -686,6 +706,12 @@ impl CodingHarness {
             // "running" indicator until its result lands.
             let _ = self.persist(state, lanes).await;
 
+            let edit_path = if tool_name == "edit_file" {
+                call.arguments.get("path").and_then(Value::as_str).map(str::to_string)
+            } else {
+                None
+            };
+
             let mut result = match self
                 .tools
                 .execute(&self.context, &tool_name, call.arguments)
@@ -710,20 +736,47 @@ impl CodingHarness {
                     vault.scrub_value(&mut result);
                 }
             }
-            if result.get("status").and_then(Value::as_str) == Some("error") {
+            let is_err = result.get("status").and_then(Value::as_str) == Some("error");
+            if is_err {
                 failed_results += 1;
             }
+
+            // Track consecutive failed edits on the same file
+            if tool_name == "edit_file" {
+                if is_err {
+                    if let Some(path) = edit_path {
+                        if vars.last_failed_edit_path.as_deref() == Some(&path) {
+                            vars.consecutive_failed_edits += 1;
+                        } else {
+                            vars.last_failed_edit_path = Some(path.clone());
+                            vars.consecutive_failed_edits = 1;
+                        }
+                        if vars.consecutive_failed_edits >= 2 {
+                            vars.pending_signals.push(RuntimeSignal::StuckEdit {
+                                path,
+                                count: vars.consecutive_failed_edits,
+                            });
+                        }
+                    }
+                } else {
+                    vars.consecutive_failed_edits = 0;
+                    vars.last_failed_edit_path = None;
+                }
+            }
+
             // A mutation may have changed the workspace, so prior discovery results
-            // are stale — re-discovery is legitimate again; clear the dedup set.
-            // Otherwise remember this discovery call so an exact repeat is caught.
-            if MUTATING_TOOLS.contains(&tool_name.as_str()) {
+            // are stale — re-discovery is legitimate again; clear the dedup set ONLY
+            // on successful mutation!
+            if !is_err && MUTATING_TOOLS.contains(&tool_name.as_str()) {
                 // File/shell mutations stale workspace discovery, not memory.
                 vars.executed_calls
                     .retain(|s| s.starts_with("memory_read:"));
-            } else if matches!(
-                tool_name.as_str(),
-                "memory_write" | "memory_delete" | "memory_index"
-            ) {
+            } else if !is_err
+                && matches!(
+                    tool_name.as_str(),
+                    "memory_write" | "memory_delete" | "memory_index"
+                )
+            {
                 vars.executed_calls
                     .retain(|s| !s.starts_with("memory_read:"));
             } else if DEDUP_TOOLS.contains(&tool_name.as_str()) {
