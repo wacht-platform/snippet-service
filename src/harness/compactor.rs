@@ -977,7 +977,7 @@ impl CodingHarness {
             let session_id = self.context.durable_session_id().unwrap_or("default");
             let now = chrono::Utc::now().to_rfc3339();
             let final_summary = if let Some(store) = &store {
-                match crate::history_archive::archive_messages(store, session_id, &older, 0, &now) {
+                match crate::history_archive::archive_messages(store, session_id, &older, &now) {
                     Ok(summaries) => {
                         let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
                         format!("{summary}\n\n{micro}")
@@ -1042,13 +1042,6 @@ impl CodingHarness {
                 preserved_recent_count
             ),
         });
-        // Prune events to this compaction boundary. Tool rows are
-        // reconstructible noise — they'd only bloat every persist.
-        if let Some(i) = state.events.iter().rposition(
-            |e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"),
-        ) {
-            state.events.drain(..i);
-        }
         // Reset ONLY the current-context gauge — the cumulative session counters
         // (prompt/completion/total) reflect everything sent and are unaffected by
         // compaction. The gauge repopulates from the next response's usage.
@@ -1160,7 +1153,7 @@ impl CodingHarness {
         let session_id = self.context.durable_session_id().unwrap_or("default");
         let now = chrono::Utc::now().to_rfc3339();
         let compacted_content = if let Some(store) = &store {
-            match crate::history_archive::archive_messages(store, session_id, &older, 0, &now) {
+            match crate::history_archive::archive_messages(store, session_id, &older, &now) {
                 Ok(summaries) => {
                     let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
                     format!("{table}\n\n{micro}")
@@ -1209,13 +1202,6 @@ impl CodingHarness {
                 state.last_prompt_tokens, window, self.config.compact_at_pct
             ),
         });
-        // Prune events to this compaction boundary. Tool rows are
-        // reconstructible noise — they'd only bloat every persist.
-        if let Some(i) = state.events.iter().rposition(
-            |e| matches!(e, HarnessEvent::SystemDecision { step, .. } if step == "history_compacted"),
-        ) {
-            state.events.drain(..i);
-        }
         // Learning pass: distill durable facts/playbooks from the just-compacted
         // session into per-workspace memory. Main session only (lanes are read-only,
         // avoids concurrent index writers). Non-fatal — never abort compaction.
