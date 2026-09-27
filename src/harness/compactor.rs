@@ -465,7 +465,11 @@ impl CodingHarness {
         // later calls never got results; strict providers (Anthropic, DeepSeek)
         // 400 on that history forever after. Repair on load so a resumed session
         // is always well-formed.
+        let loaded_messages = state.messages.len();
         repair_unanswered_tool_calls(&mut state.messages);
+        if state.messages.len() != loaded_messages {
+            state.history_rewritten = true;
+        }
         repair_unanswered_tool_events(&mut state.events, 0);
         if let Some(request) = initial_request
             .map(|r| r.trim().to_string())
@@ -577,6 +581,7 @@ impl CodingHarness {
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
             history_rewritten: false,
+            events_rewritten: false,
         };
         self.persist_state(&mut state).await?;
         if request.is_some() {
@@ -688,7 +693,7 @@ impl CodingHarness {
         const RECENT_DETAIL_KEEP: usize = 12;
         const MIN_COMPACTABLE_MESSAGES: usize = 18;
         const MAX_SECTION_ITEMS: usize = 18;
-        const MAX_COMPACTION_PASSES: usize = 4;
+        const MAX_COMPACTION_PASSES: usize = 1;
 
         let window = self.config.context_window_tokens.max(1);
         let threshold =
@@ -974,9 +979,9 @@ impl CodingHarness {
             preserved_recent_count = recent_len;
 
             let store = self.context.store().ok();
-            let session_id = self.context.durable_session_id().unwrap_or("default");
+            let session_id = self.context.durable_session_id();
             let now = chrono::Utc::now().to_rfc3339();
-            let final_summary = if let Some(store) = &store {
+            let final_summary = if let (Some(store), Some(session_id)) = (&store, session_id) {
                 match crate::history_archive::archive_messages(store, session_id, &older, &now) {
                     Ok(summaries) => {
                         let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
@@ -1150,10 +1155,16 @@ impl CodingHarness {
 
         // Archive older messages to SQLite & FTS5 and generate IBM-style micro-pointers
         let store = self.context.store().ok();
-        let session_id = self.context.durable_session_id().unwrap_or("default");
+        let session_id = self.context.durable_session_id();
         let now = chrono::Utc::now().to_rfc3339();
-        let compacted_content = if let Some(store) = &store {
-            match crate::history_archive::archive_messages(store, session_id, &older, &now) {
+        let pending_users = older
+            .iter()
+            .rev()
+            .take_while(|m| matches!(m, HarnessMessage::User { .. }))
+            .count();
+        let to_archive = &older[..older.len() - pending_users];
+        let compacted_content = if let (Some(store), Some(session_id)) = (&store, session_id) {
+            match crate::history_archive::archive_messages(store, session_id, to_archive, &now) {
                 Ok(summaries) => {
                     let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
                     format!("{table}\n\n{micro}")

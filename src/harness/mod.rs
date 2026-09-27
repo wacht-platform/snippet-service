@@ -482,6 +482,11 @@ pub struct HarnessState {
     /// serialized: it describes the pending write, not the session.
     #[serde(skip)]
     pub history_rewritten: bool,
+    /// Set only when existing events change or disappear (checkpoint rewind).
+    /// Compaction and interrupt repair leave earlier events intact, so they
+    /// must not force a full rewrite of the event log.
+    #[serde(skip)]
+    pub events_rewritten: bool,
 }
 
 impl HarnessState {
@@ -516,6 +521,7 @@ impl HarnessState {
         // A rewind moves history backwards, which an append-only store cannot
         // express — mark the pending write as a full replace.
         self.history_rewritten = true;
+        self.events_rewritten = true;
         self.checkpoints.retain(|c| c.event_index <= event_index);
         self.final_text = None;
         self.pending_question = None;

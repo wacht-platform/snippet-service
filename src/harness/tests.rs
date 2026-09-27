@@ -95,6 +95,7 @@ mod assistant_dedup_tests {
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
             history_rewritten: false,
+            events_rewritten: false,
         }
     }
 
@@ -322,6 +323,7 @@ mod tool_prune_tests {
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
             history_rewritten: false,
+            events_rewritten: false,
         }
     }
 

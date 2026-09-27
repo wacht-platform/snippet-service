@@ -57,7 +57,11 @@ impl Tool for RecallContextTool {
         let store = ctx
             .store()
             .map_err(|e| ToolError::msg(format!("store unavailable: {e}")))?;
-        let session_id = ctx.durable_session_id().unwrap_or("default");
+        let Some(session_id) = ctx.durable_session_id() else {
+            return Err(ToolError::msg(
+                "History archive is unavailable here: this run has no durable session.",
+            ));
+        };
 
         // 1. Contiguous range
         if let (Some(from), Some(to)) = (args.from_id, args.to_id) {
@@ -73,7 +77,7 @@ impl Tool for RecallContextTool {
 
         // 2. Batch list of IDs
         if let Some(ids) = args.archive_ids.filter(|l| !l.is_empty()) {
-            let turns = crate::history_archive::recall_turns(&store, &ids)
+            let turns = crate::history_archive::recall_turns(&store, session_id, &ids)
                 .map_err(|e| ToolError::msg(format!("Failed to recall turns: {e}")))?;
             return Ok(ToolResult::success(json!({
                 "requested_ids": ids,
@@ -84,7 +88,7 @@ impl Tool for RecallContextTool {
 
         // 3. Single turn ID
         if let Some(id) = args.archive_id {
-            match crate::history_archive::recall_turn(&store, id) {
+            match crate::history_archive::recall_turn(&store, session_id, id) {
                 Ok(Some(turn)) => return Ok(ToolResult::success(json!(turn))),
                 Ok(None) => return Err(ToolError::msg(format!("Turn #{id} not found in archive."))),
                 Err(e) => return Err(ToolError::msg(format!("Failed to recall turn #{id}: {e}"))),
@@ -137,7 +141,11 @@ impl Tool for SearchHistoryTool {
         let store = ctx
             .store()
             .map_err(|e| ToolError::msg(format!("store unavailable: {e}")))?;
-        let session_id = ctx.durable_session_id().unwrap_or("default");
+        let Some(session_id) = ctx.durable_session_id() else {
+            return Err(ToolError::msg(
+                "History archive is unavailable here: this run has no durable session.",
+            ));
+        };
         let limit = args.limit.unwrap_or(5).clamp(1, 20);
 
         let matches = crate::history_archive::search_history(&store, session_id, &args.query, limit)
