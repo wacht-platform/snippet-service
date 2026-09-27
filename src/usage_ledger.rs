@@ -8,16 +8,10 @@ use crate::llm::{
 use crate::store::{Store, StoreError};
 use crate::tools::ToolError;
 
-pub const LEGACY_PROVIDER: &str = "legacy";
 const BUCKET_SECS: i64 = 900;
 const LEDGER_RETENTION_SECS: i64 = 90 * 24 * 3600;
 
 pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let existed: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'usage_rollup'",
-        [],
-        |row| row.get(0),
-    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,50 +45,6 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRIMARY KEY (bucket, provider, session_id)
         );",
     )?;
-    if existed == 0 {
-        backfill_legacy(conn)?;
-    }
-    Ok(())
-}
-
-fn backfill_legacy(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let has_sessions: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_sessions == 0 {
-        return Ok(());
-    }
-    let mut stmt = conn.prepare(
-        "SELECT id,
-                CAST(COALESCE(strftime('%s', updated_at), strftime('%s', 'now')) AS INTEGER),
-                COALESCE(json_extract(state_json, '$.prompt_tokens'), 0),
-                COALESCE(json_extract(state_json, '$.completion_tokens'), 0),
-                COALESCE(json_extract(state_json, '$.cache_read_tokens'), 0),
-                COALESCE(json_extract(state_json, '$.total_tokens'), 0)
-         FROM sessions
-         WHERE json_valid(state_json)
-           AND COALESCE(json_extract(state_json, '$.total_tokens'), 0) > 0",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                TokenUsage {
-                    prompt_tokens: row.get::<_, i64>(2)? as u64,
-                    completion_tokens: row.get::<_, i64>(3)? as u64,
-                    cache_read_tokens: row.get::<_, i64>(4)? as u64,
-                    cache_creation_tokens: 0,
-                    total_tokens: row.get::<_, i64>(5)? as u64,
-                },
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (session_id, at, usage) in rows {
-        add_to_rollup(conn, at, &session_id, LEGACY_PROVIDER, "", &usage, 0)?;
-    }
     Ok(())
 }
 
@@ -205,12 +155,12 @@ impl Store {
                         SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(total_tokens),
                         MIN(bucket), MAX(bucket)
                  FROM usage_rollup
-                 WHERE bucket >= ?1 AND (?2 OR provider != ?3)
+                 WHERE bucket >= ?1
                  GROUP BY provider, model
                  ORDER BY SUM(total_tokens) DESC",
             )?;
             let rows = stmt.query_map(
-                params![bucket_floor(since), since.is_none(), LEGACY_PROVIDER],
+                params![bucket_floor(since)],
                 |row| {
                     Ok(UsageTotals {
                         provider: row.get(0)?,
@@ -237,11 +187,11 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT provider, COUNT(DISTINCT session_id) FROM usage_rollup_sessions
-                 WHERE bucket >= ?1 AND (?2 OR provider != ?3)
+                 WHERE bucket >= ?1
                  GROUP BY provider",
             )?;
             let rows = stmt.query_map(
-                params![bucket_floor(since), since.is_none(), LEGACY_PROVIDER],
+                params![bucket_floor(since)],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)),
             )?;
             rows.collect()
