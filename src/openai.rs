@@ -826,7 +826,7 @@ fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<Cha
         } => {
             let (cleaned, image) = crate::llm::split_inlined_image(content);
             let body =
-                serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                crate::llm::render_tool_result(&cleaned);
             if tool_call_id.is_empty() {
                 // Legacy state written before native function calling — render as
                 // a text block so old sessions still load.

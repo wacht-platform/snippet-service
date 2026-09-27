@@ -653,9 +653,7 @@ async fn run_lane(
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.
         // The shell remains for inspection — the brief tells the lane its role.
-        for tool in ["write_file", "edit_file", "append_file"] {
-            tools.remove(tool);
-        }
+        tools.remove("change_files");
     }
     let harness = CodingHarness::new(
         HarnessConfig {
@@ -833,11 +831,14 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
                 arguments,
             } => {
                 // Track files the lane actually operated on — the concrete results.
-                if matches!(
-                    tool_name.as_str(),
-                    "write_file" | "edit_file" | "append_file"
-                ) {
-                    if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+                if tool_name == "change_files" {
+                    let paths = arguments
+                        .get("changes")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c.get("path").and_then(|v| v.as_str()));
+                    for path in paths {
                         if !changed.iter().any(|p| p == path) {
                             changed.push(path.to_string());
                         }
@@ -902,9 +903,12 @@ fn action_label(tool_name: &str, args: &serde_json::Value) -> String {
     let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
     let detail = match tool_name {
         "bash" => arg("command"),
-        "read_file" | "read_image" | "write_file" | "append_file" | "edit_file"
-        | "view_outline" | "list_files" => arg("path"),
-        "search_content" | "search_files" | "web_search" => arg("query"),
+        "view_image" => arg("path"),
+        "change_files" => args
+            .pointer("/changes/0/path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "web_search" => arg("query"),
         "web_read" => arg("url"),
         "delegate_task" => arg("title"),
         _ => "",

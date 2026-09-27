@@ -325,8 +325,29 @@ pub(super) fn clip(s: &str, n: usize) -> String {
 /// A short one-line summary of a mutating tool call for the approval prompt:
 /// the shell command for `bash`, otherwise the target path.
 pub(super) fn approval_summary(tool_name: &str, args: &Value) -> String {
+    let owned;
     let raw = match tool_name {
         "bash" => args.get("command").and_then(Value::as_str).unwrap_or(""),
+        "change_files" => {
+            owned = args
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "{} {}",
+                                c.get("action").and_then(Value::as_str).unwrap_or("change"),
+                                c.get("path").and_then(Value::as_str).unwrap_or("?")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            owned.as_str()
+        }
         _ => args.get("path").and_then(Value::as_str).unwrap_or(""),
     };
     let s = raw.split_whitespace().collect::<Vec<_>>().join(" ");

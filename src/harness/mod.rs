@@ -33,21 +33,12 @@ const LARGE_TOOL_BATCH: usize = 10;
 const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
 /// Read-only tools whose exact-duplicate re-call within a request is wasteful
-/// spinning (the result is already in history). `read_file` is included:
-/// re-reading the exact same path and range before any file mutation is a duplicate;
-/// a successful mutation clears the set so post-edit reads work cleanly.
-const DEDUP_TOOLS: [&str; 6] = [
-    "read_file",
-    "list_files",
-    "search_content",
-    "search_files",
-    "view_outline",
-    "memory_read",
-];
+/// spinning (the result is already in history). A write to memory clears it.
+const DEDUP_TOOLS: [&str; 1] = ["memory_read"];
 
-/// Tools that change the workspace; running one invalidates the dedup set so
-/// re-discovery afterward is allowed.
-const MUTATING_TOOLS: [&str; 4] = ["write_file", "edit_file", "append_file", "bash"];
+/// Tools that change the workspace: manual approval gates them, and a
+/// successful one invalidates the dedup set.
+const MUTATING_TOOLS: [&str; 2] = ["change_files", "bash"];
 
 #[derive(Debug, Clone)]
 pub struct HarnessConfig {

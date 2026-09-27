@@ -87,8 +87,8 @@ impl RuntimeSignal {
             Self::ShellDiscipline { message } => message.clone(),
             Self::ShellDisciplineEscalated { count } => format!(
                 "you have reached for the shell to do file work {count} times now despite the \
-                 nudge. Stop and switch: use `read_file`/`write_file`/`edit_file`/`append_file` for \
-                 file content; keep the shell for inspection (grep, pipes, find)."
+                 nudge. Stop and switch: change files only with `change_files`; keep the shell for \
+                 reading, searching and running things."
             ),
             Self::NoteLoop { count } => format!(
                 "you have written {count} notes in a row without doing any work. Notes do not make \
@@ -116,7 +116,7 @@ impl RuntimeSignal {
                 )
             }
             Self::StuckEdit { path, count } => format!(
-                "your edits on `{path}` have failed {count} times consecutively. Do not repeat failed edit arguments or blind guesses. Read the narrow line range with `read_file` (using start_line/end_line), check if the file already contains your desired state, or ensure `old_string` and `new_string` are distinct and match the actual file lines."
+                "your changes to `{path}` have failed {count} times in a row. Stop guessing: look at the current text with `rg -n` or `sed -n` in bash, then copy a small, exact, unique `find` snippet from that output (without the line numbers). If the file already has what you want, move on."
             ),
         }
     }

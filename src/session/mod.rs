@@ -328,8 +328,7 @@ impl AgentRuntime {
 
         let mut tools = ToolRegistry::new();
         tools.insert(crate::builtins::BashTool);
-        tools.insert(crate::builtins::ReadFileTool);
-        tools.insert(crate::builtins::ReadImageTool);
+        tools.insert(crate::builtins::ViewImageTool);
         // Mission Control may research current docs and issues while routing work.
         if let Some(key) = i.exa_api_key.clone().filter(|k| !k.trim().is_empty()) {
             tools.insert(crate::builtins::WebSearchTool { api_key: key.clone() });

@@ -449,8 +449,12 @@ fn extract_message_metadata(
                     .join(",");
                 let paths = tool_calls
                     .iter()
-                    .filter_map(|tc| {
-                        tc.arguments.get("path").and_then(Value::as_str)
+                    .flat_map(|tc| {
+                        let mut found: Vec<&str> = tc.arguments.get("path").and_then(Value::as_str).into_iter().collect();
+                        if let Some(changes) = tc.arguments.get("changes").and_then(Value::as_array) {
+                            found.extend(changes.iter().filter_map(|c| c.get("path").and_then(Value::as_str)));
+                        }
+                        found
                     })
                     .collect::<Vec<_>>()
                     .join(",");
@@ -495,10 +499,17 @@ fn extract_message_metadata(
             content,
             ..
         } => {
+            let data = content.get("data").unwrap_or(content);
             let mut paths = String::new();
-            if let Some(p) = content.get("path").and_then(Value::as_str) {
+            if let Some(p) = data.get("path").and_then(Value::as_str) {
                 paths = p.to_string();
-            } else if let Some(p) = content.get("saved_output_path").and_then(Value::as_str) {
+            } else if let Some(files) = data.get("files").and_then(Value::as_array) {
+                paths = files
+                    .iter()
+                    .filter_map(|f| f.get("path").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(",");
+            } else if let Some(p) = data.get("saved_output_path").and_then(Value::as_str) {
                 paths = p.to_string();
             }
 
@@ -533,6 +544,8 @@ fn extract_message_metadata(
                         format!("bash: {short_cmd}")
                     }
                 }
+                "change_files" => format!("changed {paths}"),
+                "view_image" => format!("viewed {paths}"),
                 "edit_file" => format!("edited {paths}"),
                 "read_file" => format!("read {paths}"),
                 "write_file" => format!("wrote {paths}"),

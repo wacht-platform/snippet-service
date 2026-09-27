@@ -294,7 +294,7 @@ fn build_responses_request(
             } => {
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
                 let output =
-                    serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                    crate::llm::render_tool_result(&cleaned);
                 if tool_call_id.is_empty() {
                     input.push(message_item(
                         "user",

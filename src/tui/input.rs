@@ -357,7 +357,7 @@ impl App {
                 out.push('\n');
             }
             out.push_str(&if *is_img {
-                format!("[attached image — call read_image on this exact path to view it: {path}]")
+                format!("[attached image — call view_image on this exact path to view it: {path}]")
             } else {
                 format!("[attached file — read it at this exact path: {path}]")
             });

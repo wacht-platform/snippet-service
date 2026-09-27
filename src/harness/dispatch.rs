@@ -4,18 +4,7 @@ use super::*;
 /// run of them can execute concurrently. Results are still recorded in call
 /// order, one ToolCall/ToolResult pair at a time, which is what the clients pair
 /// on.
-const PARALLEL_SAFE_TOOLS: [&str; 10] = [
-    "read_file",
-    "read_image",
-    "list_files",
-    "search_content",
-    "search_files",
-    "view_outline",
-    "code_map",
-    "web_search",
-    "web_read",
-    "memory_read",
-];
+const PARALLEL_SAFE_TOOLS: [&str; 4] = ["view_image", "web_search", "web_read", "memory_read"];
 
 fn scrub_vault(result: &mut Value) {
     let vault = crate::vault::Vault::load();
@@ -57,8 +46,6 @@ fn answer_call(state: &mut HarnessState, tool_name: &str, call_id: &str, result:
 fn duplicate_notice(tool_name: &str) -> Value {
     let skipped = if tool_name == "memory_read" {
         "Identical memory_read already ran this turn — reuse that result. Don't recall the same id again."
-    } else if tool_name == "read_file" {
-        "Identical read_file already ran with these arguments and the file is unchanged. Reference the content already in your context above instead of re-reading."
     } else {
         "Identical discovery call already ran this turn — reuse the earlier result instead of repeating it."
     };
@@ -152,21 +139,7 @@ impl CodingHarness {
     /// unchanged result (for `read_file`: the file is unchanged on disk).
     fn is_duplicate_read(&self, vars: &LoopVars, call: &GeneratedToolCall) -> bool {
         let signature = format!("{}:{}", call.tool_name, call.arguments);
-        if !DEDUP_TOOLS.contains(&call.tool_name.as_str())
-            || !vars.executed_calls.contains(&signature)
-        {
-            return false;
-        }
-        if call.tool_name != "read_file" {
-            return true;
-        }
-        match call.arguments.get("path").and_then(Value::as_str) {
-            Some(path) => match self.context.resolve_workspace_path(path) {
-                Ok(full) => self.context.is_file_unchanged(&full),
-                Err(_) => true,
-            },
-            None => true,
-        }
+        DEDUP_TOOLS.contains(&call.tool_name.as_str()) && vars.executed_calls.contains(&signature)
     }
 
     /// A run of read-only calls: duplicates are answered from history, the rest
@@ -498,7 +471,7 @@ impl CodingHarness {
         if is_err {
             stats.failed += 1;
         }
-        if tool_name == "edit_file" {
+        if tool_name == "change_files" {
             note_edit_result(vars, edit_path, is_err);
         }
         note_discovery(vars, &tool_name, signature, is_err);

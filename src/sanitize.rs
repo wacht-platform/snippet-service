@@ -81,8 +81,10 @@ fn is_time_unit_token(s: &str) -> bool {
 /// The model narrated tool calls as prose (`+ bash:`, `Action:`, repeated
 /// blocks) instead of emitting real calls.
 fn looks_like_hallucinated_tool_render(text: &str) -> bool {
-    const PSEUDO_CALL_MARKERS: [&str; 13] = [
+    const PSEUDO_CALL_MARKERS: [&str; 15] = [
         "+ bash:",
+        "+ change_files:",
+        "+ view_image:",
         "+ read_file:",
         "+ write_file:",
         "+ edit_file:",

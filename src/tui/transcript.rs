@@ -1056,6 +1056,42 @@ pub(super) fn tool_call_preview(
     let mut items: Vec<(String, Style)> = Vec::new();
 
     match tool_name {
+        "change_files" => {
+            let changes = arguments
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (i, change) in changes.iter().enumerate() {
+                let field = |key: &str| change.get(key).and_then(Value::as_str).unwrap_or("");
+                if i > 0 {
+                    items.push(("".to_string(), subtle()));
+                }
+                let action = field("action");
+                let target = match action {
+                    "move" => format!("→ move {} → {}", field("path"), field("to")),
+                    _ => format!("→ {action} {}", field("path")),
+                };
+                items.push((target, path_style));
+                let mut push_lines = |text: &str, style: Style| {
+                    let total = text.lines().count();
+                    for line in text.lines().take(MAX) {
+                        items.push((format!("  {line}"), style));
+                    }
+                    if total > MAX {
+                        items.push((format!("  … +{} more", total - MAX), subtle()));
+                    }
+                };
+                match action {
+                    "replace" => {
+                        push_lines(field("find"), red);
+                        push_lines(field("with"), green);
+                    }
+                    "create" => push_lines(field("content"), green),
+                    _ => {}
+                }
+            }
+        }
         "write_file" => {
             let content = arg("content");
             let total = content.lines().count();
