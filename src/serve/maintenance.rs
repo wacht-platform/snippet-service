@@ -198,7 +198,7 @@ fn self_restart_process() {
 async fn any_session_busy(daemon: &Shared) -> bool {
     let sessions = daemon.sessions.lock().await;
     for s in sessions.values() {
-        if read_session_state(&s.state_path)
+        if read_session_meta(&s.state_path)
             .is_some_and(|state| state.status == crate::harness::HarnessStatus::Running)
         {
             return true;

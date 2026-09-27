@@ -1080,7 +1080,8 @@ impl Store {
                 "SELECT payload_json FROM session_events
                  WHERE session_id = ?1 ORDER BY ordinal LIMIT -1 OFFSET ?2",
             )?;
-            let rows = stmt.query_map(params![session_id, from as i64], |row| {
+            let offset = i64::try_from(from).unwrap_or(i64::MAX);
+            let rows = stmt.query_map(params![session_id, offset], |row| {
                 let raw: String = row.get(0)?;
                 serde_json::from_str(&raw).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(

@@ -994,6 +994,19 @@ fn read_session_state_from_store(state_path: &Path) -> Option<HarnessState> {
     crate::harness::state_from_scalar(&scalar, messages, events).ok()
 }
 
+/// A session's scalar state (status, workspace, queue, lanes, …) without its
+/// message and event logs — for callers that only need metadata.
+pub fn read_session_meta(state_path: &Path) -> Option<HarnessState> {
+    let id = session_id_for_state_path(state_path);
+    if let Some(store) = store_for_sessions() {
+        if store.has_conversation(&id).ok()? {
+            let scalar = store.load_session_scalar(&id).ok()??;
+            return crate::harness::state_from_scalar(&scalar, Vec::new(), Vec::new()).ok();
+        }
+    }
+    read_session_state(state_path)
+}
+
 pub fn read_session_state_tail(state_path: &Path, from: usize) -> Option<(HarnessState, usize)> {
     let id = session_id_for_state_path(state_path);
     let Some(store) = store_for_sessions() else {

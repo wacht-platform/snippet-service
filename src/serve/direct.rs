@@ -365,7 +365,7 @@ pub(super) async fn direct_send_message(
         // so a dispatch from inside a chat is answerable in that chat.
         "session" => {
             if crate::session::state_path_for_id(to.1).is_none()
-                || crate::session::read_session_state(
+                || crate::session::read_session_meta(
                     &crate::session::state_path_for_id(to.1).expect("checked above"),
                 )
                 .is_none()

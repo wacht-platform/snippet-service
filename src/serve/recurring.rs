@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::harness::{GoalStatus, LoopInput};
 use crate::recurring::{self, Schedule};
-use crate::session::{read_session_state, state_path_for_id, status_str};
+use crate::session::{read_session_meta, state_path_for_id, status_str};
 use super::{mission_error, unauthorized, Auth, Shared};
 
 pub fn router() -> Router<Shared> {
@@ -25,7 +25,7 @@ fn session_busy_for_recurring(id: &str) -> bool {
     let Some(sp) = state_path_for_id(id) else {
         return false;
     };
-    let Some(state) = read_session_state(&sp) else {
+    let Some(state) = read_session_meta(&sp) else {
         return false;
     };
     recurring::session_is_busy(&status_str(state.status))
@@ -52,7 +52,7 @@ pub async fn tick_loop(daemon: Shared) {
                 continue;
             }
             let workspace = state_path_for_id(&job.session_id)
-                .and_then(|sp| read_session_state(&sp))
+                .and_then(|sp| read_session_meta(&sp))
                 .map(|s| PathBuf::from(s.workspace))
                 .filter(|p| p.is_dir());
             match job.render_goal(workspace.as_deref()) {

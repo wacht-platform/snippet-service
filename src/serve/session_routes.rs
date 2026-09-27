@@ -337,7 +337,7 @@ pub(crate) fn session_state_fingerprint(store: &crate::store::Store, state_path:
 
 pub(crate) fn resolve_session_dir(session: &str) -> Result<PathBuf, Response> {
     if let Some(sp) = state_path_for_id(session) {
-        if let Some(state) = read_session_state(&sp) {
+        if let Some(state) = read_session_meta(&sp) {
             let dir = PathBuf::from(&state.workspace);
             if !state.workspace.is_empty() && dir.is_dir() {
                 return Ok(dir);
