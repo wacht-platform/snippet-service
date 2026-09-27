@@ -475,6 +475,10 @@ pub struct HarnessState {
     /// a stale hold list.
     #[serde(default)]
     pub queued_inputs: Vec<QueuedInput>,
+    /// Completed history compactions. Checkpoints record it so a rewind can
+    /// tell whether their message position still exists.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compactions: u64,
     /// Set by the few writers that rewrite history in place — compaction,
     /// checkpoint rewind, interrupt rollback, tool-payload pruning. Those are the
     /// only cases where the append-only store cannot be appended to, so the flag
@@ -515,9 +519,21 @@ impl HarnessState {
             .cloned()
             .ok_or_else(|| format!("checkpoint not found: {checkpoint_id}"))?;
         let event_index = cp.event_index.min(self.events.len());
-        let message_index = cp.message_index.min(self.messages.len());
         self.events.truncate(event_index);
-        self.messages.truncate(message_index);
+        if cp.compactions == self.compactions {
+            let message_index = cp.message_index.min(self.messages.len());
+            self.messages.truncate(message_index);
+        } else {
+            self.messages.push(HarnessMessage::System {
+                content: format!(
+                    "[rewind] The user rewound this session to before their message \"{}\". \
+                     Everything after that point was undone, including file changes. Your \
+                     context summary still describes some of that later work: treat it as \
+                     not having happened.",
+                    cp.label
+                ),
+            });
+        }
         // A rewind moves history backwards, which an append-only store cannot
         // express — mark the pending write as a full replace.
         self.history_rewritten = true;
@@ -597,6 +613,13 @@ pub struct CheckpointRecord {
     /// Message count when checkpoint was taken — for truncating conversation on rewind.
     #[serde(default)]
     pub message_index: usize,
+    /// `HarnessState::compactions` when the checkpoint was taken.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub compactions: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Inputs the interactive driver receives from its UI (or, headless, over the

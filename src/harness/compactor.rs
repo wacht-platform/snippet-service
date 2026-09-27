@@ -582,6 +582,7 @@ impl CodingHarness {
             queued_inputs: Vec::new(),
             history_rewritten: false,
             events_rewritten: false,
+            compactions: 0,
         };
         self.persist_state(&mut state).await?;
         if request.is_some() {
@@ -1036,6 +1037,7 @@ impl CodingHarness {
         // Compaction replaces a span of history with a summary, so the stored
         // transcript must be rewritten rather than appended to.
         state.history_rewritten = true;
+        state.compactions += 1;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
@@ -1206,6 +1208,7 @@ impl CodingHarness {
         // The whole conversation became the table, so this is the largest rewrite
         // there is — the stored rows must be replaced wholesale.
         state.history_rewritten = true;
+        state.compactions += 1;
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(

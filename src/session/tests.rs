@@ -51,6 +51,7 @@ mod fork_tests {
             created_at: "t0".into(),
             event_index: 0,
             message_index: 0,
+            compactions: 0,
         }];
         s
     }

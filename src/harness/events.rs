@@ -246,6 +246,7 @@ impl CodingHarness {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 event_index: state.events.len(),
                 message_index: state.messages.len(),
+                compactions: state.compactions,
             });
             // Cap retained records so a long session doesn't bloat persisted state.
             const MAX_CHECKPOINTS: usize = 8;
