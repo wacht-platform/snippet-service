@@ -90,24 +90,7 @@ impl CodingHarness {
         // Safety cap across the inlined set so one batch can't balloon a request.
         const MAX_TOTAL_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 
-        /// Vision envelope: read_image always; read_file when it sniffed an image.
-        fn is_vision_result(tool_name: &str, content: &Value) -> bool {
-            match tool_name {
-                "read_image" => true,
-                "read_file" => {
-                    content
-                        .pointer("/data/mime")
-                        .and_then(Value::as_str)
-                        .is_some()
-                        && content
-                            .pointer("/data/path")
-                            .and_then(Value::as_str)
-                            .is_some()
-                        && content.pointer("/data/content").is_none()
-                }
-                _ => false,
-            }
-        }
+        let is_vision_result = |tool_name: &str| tool_name == "view_image";
 
         let mut assistant_turns = 0usize;
         let mut cutoff = 0usize;
@@ -131,7 +114,7 @@ impl CodingHarness {
             else {
                 continue;
             };
-            if !is_vision_result(tool_name, content) || index < cutoff {
+            if !is_vision_result(tool_name) || index < cutoff {
                 continue;
             }
             let Some(path) = content.pointer("/data/path").and_then(Value::as_str) else {
@@ -156,7 +139,7 @@ impl CodingHarness {
             else {
                 continue;
             };
-            if !is_vision_result(tool_name, content) {
+            if !is_vision_result(tool_name) {
                 continue;
             }
             let Some(path) = content
@@ -186,7 +169,7 @@ impl CodingHarness {
                     data.insert(
                         "image_note".to_string(),
                         Value::String(format!(
-                            "[image at {path} was shown in an earlier turn — call read_file or read_image again if you need to see it now]"
+                            "[image at {path} was shown in an earlier turn — call view_image again if you need to see it now]"
                         )),
                     );
                 }

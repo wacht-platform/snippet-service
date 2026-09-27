@@ -10,6 +10,10 @@ const AGENT: usize = 3;
 pub(super) fn tool_is_expandable(tool_name: &str, arguments: &Value, result: Option<&Value>) -> bool {
     let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
     match tool_name {
+        "change_files" => arguments
+            .get("changes")
+            .and_then(Value::as_array)
+            .is_some_and(|c| !c.is_empty()),
         "write_file" | "append_file" => !arg("content").trim().is_empty(),
         "edit_file" => !arg("old_string").is_empty() || !arg("new_string").is_empty(),
         "bash" => {
@@ -68,6 +72,25 @@ pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, St
             .to_string()
     };
     match tool_name {
+        "change_files" => {
+            let changes = arguments
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let first = changes
+                .first()
+                .and_then(|c| c.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let shown = match changes.len() {
+                0 | 1 => first,
+                n => format!("{first} (+{} more)", n - 1),
+            };
+            ("Change".into(), shown)
+        }
+        "view_image" => ("View".into(), arg("path")),
         "read_file" => ("Read".into(), arg("path")),
         "write_file" => ("Write".into(), arg("path")),
         "edit_file" => ("Edit".into(), arg("path")),

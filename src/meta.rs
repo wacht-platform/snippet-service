@@ -115,7 +115,7 @@ fn monitor_tool() -> NativeToolDefinition {
             to wait on output you don't control (a build log, test output, a long process's log, \
             a file another program writes). Register the watch, then END YOUR TURN: going idle is \
             how you wait; each append arrives later as a [file_watch] message carrying the new \
-            text. Do NOT poll the file with read_file in a loop. \
+            text. Do NOT poll the file in a loop. \
             ALWAYS set a `filter` regex — a bare watch wakes you on EVERY line the process writes \
             and each wake costs a full model turn, so watching a chatty build/test log without a \
             filter burns tokens fast. Filter for only the lines you actually need to act on: the \

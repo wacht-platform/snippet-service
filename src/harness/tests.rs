@@ -849,10 +849,9 @@ mod dedup_and_stuck_edit_tests {
     use super::*;
 
     #[test]
-    fn test_dedup_tools_includes_read_file() {
-        assert!(DEDUP_TOOLS.contains(&"read_file"));
-        assert!(DEDUP_TOOLS.contains(&"search_content"));
-        assert!(MUTATING_TOOLS.contains(&"edit_file"));
+    fn test_dedup_and_mutating_tool_sets() {
+        assert!(DEDUP_TOOLS.contains(&"memory_read"));
+        assert!(MUTATING_TOOLS.contains(&"change_files"));
         assert!(MUTATING_TOOLS.contains(&"bash"));
     }
 
@@ -864,8 +863,8 @@ mod dedup_and_stuck_edit_tests {
         };
         let rendered = signal.render();
         assert!(rendered.starts_with("stuck_edit = \""));
-        assert!(rendered.contains("your edits on `src/main.rs` have failed 2 times consecutively"));
-        assert!(rendered.contains("read_file"));
+        assert!(rendered.contains("your changes to `src/main.rs` have failed 2 times in a row"));
+        assert!(rendered.contains("rg -n"));
     }
 
     #[test]

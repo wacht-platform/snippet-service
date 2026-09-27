@@ -1,251 +1,566 @@
 use super::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+
 use crate::llm::NativeToolDefinition;
 use crate::tools::{Tool, ToolContext, ToolError, ToolResult};
-const MAX_INLINE_CHARS: usize = 40_000;
 
-pub struct ReadFileTool;
+/// Lines of context shown around each change in the result.
+const PREVIEW_CONTEXT: usize = 2;
+/// Cap on preview lines per change so a large replacement can't flood context.
+const PREVIEW_MAX_LINES: usize = 40;
+
+pub struct ViewImageTool;
 
 #[derive(Debug, Deserialize)]
-struct ReadFileArgs {
+struct ViewImageArgs {
     path: String,
-    #[serde(default)]
-    start_line: Option<usize>,
-    #[serde(default)]
-    end_line: Option<usize>,
-    #[serde(default)]
-    start_char: Option<usize>,
-    #[serde(default)]
-    end_char: Option<usize>,
 }
 
 #[async_trait]
-impl Tool for ReadFileTool {
+impl Tool for ViewImageTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
-            name: "read_file".to_string(),
-            description:
-                "Read a file from the workspace. Text: UTF-8 with optional line/char paging \
-                (start_line/end_line or start_char/end_char). Images (png/jpg/webp/gif/bmp/svg): \
-                auto-routes to vision — same as read_image — so you SEE the pixels; no need to \
-                pick the other tool. Returns total_lines/total_chars/slice_hash for text, or \
-                mime/size_bytes for images."
-                    .to_string(),
+            name: "view_image".to_string(),
+            description: "Look at an image file (png, jpg, gif, webp): the picture is attached \
+                to your context so you can see it. Use this for screenshots, diagrams and generated \
+                images. For text files use bash (cat -n, sed -n, rg -n)."
+                .to_string(),
             input_schema: object_schema(
-                json!({
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1},
-                    "start_char": {"type": "integer", "minimum": 1},
-                    "end_char": {"type": "integer", "minimum": 1}
-                }),
+                json!({"path": {"type": "string", "description": "Path to the image, relative to the current directory or absolute."}}),
                 &["path"],
             ),
         }
     }
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: ReadFileArgs = expect_object("read_file", arguments)?;
+        let args: ViewImageArgs = expect_object("view_image", arguments)?;
         let path = ctx.resolve_workspace_path(&args.path)?;
-        if crate::vault::is_protected_path(&path) {
-            return Err(ToolError::msg(
-                "the vault file is off-limits — secret VALUES are never readable. Use a secret as $NAME in bash; its value is injected into the process and redacted from output.",
-            ));
-        }
-        let head = {
-            use tokio::io::AsyncReadExt;
-            let mut f = tokio::fs::File::open(&path).await?;
-            let mut buf = vec![0u8; 512];
-            let n = f.read(&mut buf).await?;
-            buf.truncate(n);
-            buf
+        let bytes = tokio::fs::read(&path).await?;
+        let Some(mime) = sniff_image_mime(&bytes) else {
+            return Err(ToolError::msg(format!(
+                "`{}` is not a png, jpg, gif or webp image ({} bytes). For text files use bash.",
+                args.path,
+                bytes.len()
+            )));
         };
-        if let Some(mime) = sniff_image_mime(&head) {
-            let bytes = tokio::fs::read(&path).await?;
-            ctx.mark_read(&path);
-            return Ok(ToolResult::success(json!({
-                "path": args.path,
-                "mime": mime,
-                "size_bytes": bytes.len(),
-                "via": "read_file",
-            })));
+        Ok(ToolResult::success(json!({
+            "path": args.path,
+            "mime": mime,
+            "size_bytes": bytes.len(),
+        })))
+    }
+}
+
+pub struct ChangeFilesTool;
+
+#[derive(Debug, Deserialize)]
+struct ChangeFilesArgs {
+    changes: Vec<Change>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum Change {
+    Create {
+        path: String,
+        #[serde(alias = "text")]
+        content: String,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    Replace {
+        path: String,
+        #[serde(alias = "old_string", alias = "old", alias = "search")]
+        find: String,
+        #[serde(alias = "new_string", alias = "new", alias = "replace", alias = "replacement")]
+        with: String,
+        #[serde(default, alias = "replace_all")]
+        all: bool,
+    },
+    Delete {
+        path: String,
+    },
+    #[serde(alias = "rename")]
+    Move {
+        path: String,
+        #[serde(alias = "new_path", alias = "destination")]
+        to: String,
+    },
+}
+
+impl Change {
+    fn label(&self) -> (&'static str, String) {
+        match self {
+            Change::Create { path, .. } => ("create", path.clone()),
+            Change::Replace { path, .. } => ("replace", path.clone()),
+            Change::Delete { path } => ("delete", path.clone()),
+            Change::Move { path, .. } => ("move", path.clone()),
         }
-        let content = match tokio::fs::read_to_string(&path).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-                return Err(ToolError::msg(format!(
-                    "not a UTF-8 text file ({e}). For images use read_image (or read_file on png/jpg/webp/gif/bmp/svg — those auto-route to vision)."
-                )));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        ctx.mark_read(&path);
+    }
+}
 
-        let total_lines = content.lines().count();
-        let total_chars = content.chars().count();
+/// A file's state while a batch is staged: what was on disk before the batch and
+/// what it will be after. `None` means the file does not exist.
+struct Staged {
+    display: String,
+    before: Option<String>,
+    after: Option<String>,
+}
 
-        // A char window takes precedence over a line range when both are given.
-        let (selected, mut range_meta) = if args.start_char.is_some() || args.end_char.is_some() {
-            let chars: Vec<char> = content.chars().collect();
-            let start = args.start_char.unwrap_or(1).max(1);
-            let end = args
-                .end_char
-                .unwrap_or(total_chars)
-                .min(total_chars)
-                .max(start);
-            let slice: String = if start <= total_chars {
-                chars[start - 1..end].iter().collect()
+/// What one change did, for the result.
+struct Applied {
+    action: &'static str,
+    path: String,
+    added: usize,
+    removed: usize,
+    /// For a single replace: the file, and the first line and line count of the
+    /// new text, so the result can show the changed region.
+    touched: Option<(PathBuf, usize, usize)>,
+    note: Option<String>,
+}
+
+#[async_trait]
+impl Tool for ChangeFilesTool {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "change_files".to_string(),
+            description: "Create, edit, delete or move files. This is the only way to change \
+                files; read and search them with bash. Pass a list of changes; they are applied \
+                in order and all-or-nothing: if any change fails, no file is touched and the error \
+                names the failing change.\n\n\
+                Actions:\n\
+                - replace: swap `find` for `with` in an existing file. `find` must be copied \
+                exactly from the current file (whitespace differences are tolerated) and must match \
+                exactly once; include a neighbouring line to make it unique, or set \"all\": true to \
+                replace every match. Keep `find` small: just the lines you change plus enough to be \
+                unique. Several replaces in the same file are fine; each sees the result of the ones \
+                before it.\n\
+                - create: write a new file with `content` (parent folders are created). Fails if the \
+                file exists unless \"overwrite\": true; prefer replace for edits.\n\
+                - delete: remove a file.\n\
+                - move: rename `path` to `to`.\n\n\
+                The result shows the changed lines with their line numbers, so there is no need to \
+                re-read a file just to check an edit."
+                .to_string(),
+            input_schema: object_schema(
+                json!({
+                    "changes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string", "enum": ["create", "replace", "delete", "move"]},
+                                "path": {"type": "string", "description": "File path, relative to the current directory or absolute."},
+                                "find": {"type": "string", "description": "replace: the exact existing text to change."},
+                                "with": {"type": "string", "description": "replace: the new text."},
+                                "all": {"type": "boolean", "description": "replace: change every match instead of requiring exactly one."},
+                                "content": {"type": "string", "description": "create: the full file content."},
+                                "overwrite": {"type": "boolean", "description": "create: allow replacing an existing file."},
+                                "to": {"type": "string", "description": "move: the new path."}
+                            },
+                            "required": ["action", "path"]
+                        }
+                    }
+                }),
+                &["changes"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ChangeFilesArgs = expect_object("change_files", arguments)?;
+        if args.changes.is_empty() {
+            return Err(ToolError::msg("`changes` is empty: pass at least one change."));
+        }
+        let mut staged: HashMap<PathBuf, Staged> = HashMap::new();
+        let mut order: Vec<PathBuf> = Vec::new();
+        let mut applied: Vec<Applied> = Vec::new();
+        let total = args.changes.len();
+        for (index, change) in args.changes.into_iter().enumerate() {
+            let (action, path) = change.label();
+            let prefix = if total > 1 {
+                format!("change {} of {total} ({action} `{path}`): ", index + 1)
             } else {
                 String::new()
             };
-            (slice, json!({"start_char": start, "end_char": end}))
-        } else if args.start_line.is_some() || args.end_line.is_some() {
-            let start = args.start_line.unwrap_or(1).max(1);
-            let end = args.end_line.unwrap_or(usize::MAX);
-            let slice = content
-                .lines()
-                .enumerate()
-                .filter_map(|(idx, line)| {
-                    let line_no = idx + 1;
-                    (line_no >= start && line_no <= end).then_some(line)
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            (slice, json!({"start_line": start, "end_line": end}))
-        } else {
-            (content, json!({}))
-        };
-
-        let hash = slice_hash(&selected);
-        let truncated = selected.chars().count() > MAX_INLINE_CHARS;
-        let content_field: String = if truncated {
-            selected.chars().take(6000).collect()
-        } else {
-            selected
-        };
-
-        let mut out = json!({
-            "path": args.path,
-            "content": content_field,
-            "total_lines": total_lines,
-            "total_chars": total_chars,
-            "slice_hash": hash,
-            "truncated": truncated,
-        });
-        if let (Value::Object(o), Value::Object(r)) = (&mut out, range_meta.take()) {
-            o.extend(r);
+            match stage_change(ctx, &mut staged, &mut order, change) {
+                Ok(done) => applied.push(done),
+                Err(message) => {
+                    return Err(ToolError::msg(format!(
+                        "{prefix}{message}\n\nNo files were changed."
+                    )));
+                }
+            }
         }
-        if truncated {
-            out["hint"] = json!(
-                "slice exceeds the inline limit; narrow it with start_char/end_char (or a smaller \
-                 line range) to page through the file"
-            );
+        commit(ctx, &staged, &order).await?;
+
+        let notes: Vec<String> = applied
+            .iter()
+            .filter_map(|a| a.note.as_ref().map(|n| format!("{}: {n}", a.path)))
+            .collect();
+        // One preview per edited file, from its final content, spanning every
+        // region this batch changed in it.
+        let mut regions: Vec<(PathBuf, String, usize, usize)> = Vec::new();
+        for a in &applied {
+            let Some((path, first, lines)) = &a.touched else {
+                continue;
+            };
+            let end = first + lines.max(&1) - 1;
+            match regions.iter_mut().find(|r| &r.0 == path) {
+                Some(r) => {
+                    r.2 = r.2.min(*first);
+                    r.3 = r.3.max(end);
+                }
+                None => regions.push((path.clone(), a.path.clone(), *first, end)),
+            }
+        }
+        let preview = regions
+            .iter()
+            .filter_map(|(path, display, first, end)| {
+                let content = staged.get(path)?.after.as_deref()?;
+                Some(format!(
+                    "{display}\n{}",
+                    numbered_preview(content, *first, end + 1 - first)
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let summary = applied
+            .iter()
+            .map(|a| match a.action {
+                "delete" => format!("deleted {}", a.path),
+                "move" => format!("moved {}", a.path),
+                "create" => format!("created {} ({} lines)", a.path, a.added),
+                _ => format!("edited {} (+{} -{})", a.path, a.added, a.removed),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut out = json!({ "summary": summary });
+        if !notes.is_empty() {
+            out["notes"] = json!(notes.join("; "));
+        }
+        if !preview.is_empty() {
+            out["changed_lines"] = json!(preview);
         }
         Ok(ToolResult::success(out))
     }
 }
 
-pub struct WriteFileTool;
-
-#[derive(Debug, Deserialize)]
-struct WriteFileArgs {
-    path: String,
-    content: String,
+fn load<'a>(
+    ctx: &ToolContext,
+    staged: &'a mut HashMap<PathBuf, Staged>,
+    order: &mut Vec<PathBuf>,
+    display: &str,
+) -> Result<&'a mut Staged, String> {
+    let path = ctx
+        .resolve_workspace_path(display)
+        .map_err(|e| e.to_string())?;
+    if crate::vault::is_protected_path(&path) {
+        return Err("the vault file cannot be changed with this tool.".to_string());
+    }
+    if !staged.contains_key(&path) {
+        let before = if path.is_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(format!(
+                        "`{display}` is not a UTF-8 text file; use bash for binary files."
+                    ));
+                }
+                Err(e) => return Err(format!("cannot read `{display}`: {e}")),
+            }
+        } else if path.exists() {
+            return Err(format!("`{display}` is a directory, not a file."));
+        } else {
+            None
+        };
+        staged.insert(
+            path.clone(),
+            Staged {
+                display: display.to_string(),
+                after: before.clone(),
+                before,
+            },
+        );
+        order.push(path.clone());
+    }
+    Ok(staged.get_mut(&path).expect("inserted above"))
 }
 
-#[async_trait]
-impl Tool for WriteFileTool {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "write_file".to_string(),
-            description: "Create or replace a UTF-8 file in the workspace.".to_string(),
-            input_schema: object_schema(
-                json!({
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                }),
-                &["path", "content"],
-            ),
-        }
-    }
+fn line_count(text: &str) -> usize {
+    if text.is_empty() { 0 } else { text.lines().count() }
+}
 
-    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: WriteFileArgs = expect_object("write_file", arguments)?;
-        let path = ctx.resolve_workspace_path(&args.path)?;
-        ctx.check_write(&path)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+/// Numbered view of the lines a change touched, plus a little context.
+fn numbered_preview(content: &str, first_line: usize, changed_lines: usize) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = first_line.saturating_sub(1 + PREVIEW_CONTEXT).min(lines.len());
+    let end = (first_line.saturating_sub(1) + changed_lines.max(1) + PREVIEW_CONTEXT).min(lines.len());
+    let mut out = Vec::new();
+    for (i, line) in lines[start..end].iter().enumerate() {
+        if out.len() >= PREVIEW_MAX_LINES {
+            out.push(format!("… ({} more lines)", end - start - PREVIEW_MAX_LINES));
+            break;
         }
-        tokio::fs::write(&path, args.content).await?;
-        ctx.record_change(&path);
-        Ok(ToolResult::success(
-            json!({"path": args.path, "written": true}),
-        ))
+        out.push(format!("{:>6}\t{line}", start + i + 1));
+    }
+    out.join("\n")
+}
+
+/// Length of a `cat -n` / `rg -n` style line-number prefix on `line`, if any.
+fn line_number_prefix(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let sep = trimmed[digits..].chars().next()?;
+    if !matches!(sep, '\t' | ':' | '│' | '|') {
+        return None;
+    }
+    Some(line.len() - trimmed.len() + digits + sep.len_utf8())
+}
+
+/// A weak model sometimes pastes lines copied from numbered output. When every
+/// non-empty line carries a line-number prefix, strip them.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines
+        .iter()
+        .any(|l| !l.trim().is_empty() && line_number_prefix(l).is_none())
+    {
+        return None;
+    }
+    if !lines.iter().any(|l| line_number_prefix(l).is_some()) {
+        return None;
+    }
+    Some(
+        lines
+            .iter()
+            .map(|l| line_number_prefix(l).map(|n| &l[n..]).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn stage_change(
+    ctx: &ToolContext,
+    staged: &mut HashMap<PathBuf, Staged>,
+    order: &mut Vec<PathBuf>,
+    change: Change,
+) -> Result<Applied, String> {
+    match change {
+        Change::Create {
+            path,
+            content,
+            overwrite,
+        } => {
+            let entry = load(ctx, staged, order, &path)?;
+            let existed = entry.after.is_some();
+            if existed && !overwrite {
+                return Err(format!(
+                    "`{path}` already exists. Use replace to edit it, or set \"overwrite\": true to \
+                     replace the whole file."
+                ));
+            }
+            let removed = entry.after.as_deref().map(line_count).unwrap_or(0);
+            let added = line_count(&content);
+            entry.after = Some(content);
+            Ok(Applied {
+                action: "create",
+                path,
+                added,
+                removed,
+                touched: None,
+                note: existed.then(|| "replaced the existing file".to_string()),
+            })
+        }
+        Change::Replace {
+            path,
+            find,
+            with,
+            all,
+        } => {
+            let entry = load(ctx, staged, order, &path)?;
+            let Some(current) = entry.after.clone() else {
+                return Err(format!("`{path}` does not exist. Use create for a new file."));
+            };
+            if find.is_empty() {
+                return Err("`find` is empty: copy the exact text to change.".to_string());
+            }
+            if find == with {
+                return Err(
+                    "`find` and `with` are identical, so this change does nothing. If the file \
+                     already has the text you want, skip this change."
+                        .to_string(),
+                );
+            }
+            let mut note = None;
+            let (find, with) = if current.contains(&find) {
+                (find, with)
+            } else {
+                match strip_line_numbers(&find) {
+                    Some(stripped) if current.contains(&stripped) => {
+                        note = Some("line-number prefixes in `find` were ignored".to_string());
+                        let with = strip_line_numbers(&with).unwrap_or(with);
+                        (stripped, with)
+                    }
+                    _ => (find, with),
+                }
+            };
+            let exact = current.matches(&find).count();
+            let (updated, first_line, matched, replacements) = if exact > 0 {
+                if exact > 1 && !all {
+                    return Err(ambiguous_diagnostic(
+                        &current,
+                        match_lines(&current, &find),
+                        exact,
+                        &path,
+                        "",
+                    ));
+                }
+                let offset = current.find(&find).unwrap_or(0);
+                let first_line = current[..offset].matches('\n').count() + 1;
+                let updated = if all {
+                    current.replace(&find, &with)
+                } else {
+                    current.replacen(&find, &with, 1)
+                };
+                (updated, first_line, find.clone(), exact)
+            } else if all {
+                return Err(edit_diagnostic(&current, &find, &path));
+            } else {
+                match flexible_replace(&current, &find, &with) {
+                    Flex::Replaced {
+                        updated,
+                        start_line,
+                        matched_text,
+                    } => {
+                        note.get_or_insert_with(|| {
+                            "matched after ignoring whitespace differences".to_string()
+                        });
+                        (updated, start_line, matched_text, 1)
+                    }
+                    Flex::Ambiguous(starts) => {
+                        let n = starts.len();
+                        return Err(ambiguous_diagnostic(
+                            &current,
+                            starts,
+                            n,
+                            &path,
+                            " once whitespace is ignored",
+                        ));
+                    }
+                    Flex::NoMatch => return Err(edit_diagnostic(&current, &find, &path)),
+                }
+            };
+            let removed = line_count(&matched) * replacements;
+            let added = line_count(&with) * replacements;
+            let touched = if replacements == 1 {
+                let resolved = ctx.resolve_workspace_path(&path).map_err(|e| e.to_string())?;
+                Some((resolved, first_line, line_count(&with)))
+            } else {
+                note = Some(format!("replaced {replacements} occurrences"));
+                None
+            };
+            entry.after = Some(updated);
+            Ok(Applied {
+                action: "replace",
+                path,
+                added,
+                removed,
+                touched,
+                note,
+            })
+        }
+        Change::Delete { path } => {
+            let entry = load(ctx, staged, order, &path)?;
+            let Some(current) = entry.after.take() else {
+                return Err(format!("`{path}` does not exist."));
+            };
+            Ok(Applied {
+                action: "delete",
+                path,
+                added: 0,
+                removed: line_count(&current),
+                touched: None,
+                note: None,
+            })
+        }
+        Change::Move { path, to } => {
+            let Some(content) = load(ctx, staged, order, &path)?.after.clone() else {
+                return Err(format!("`{path}` does not exist."));
+            };
+            let target = load(ctx, staged, order, &to)?;
+            if target.after.is_some() {
+                return Err(format!("`{to}` already exists; move will not overwrite it."));
+            }
+            target.after = Some(content);
+            load(ctx, staged, order, &path)?.after = None;
+            Ok(Applied {
+                action: "move",
+                path: format!("{path} → {to}"),
+                added: 0,
+                removed: 0,
+                touched: None,
+                note: None,
+            })
+        }
     }
 }
 
-pub struct AppendFileTool;
-
-#[derive(Debug, Deserialize)]
-struct AppendFileArgs {
-    path: String,
-    content: String,
-}
-
-#[async_trait]
-impl Tool for AppendFileTool {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "append_file".to_string(),
-            description: "Append content to the end of a UTF-8 file (creating it if absent), \
-                inserting a newline separator when the file doesn't already end with one. Use this \
-                instead of a shell `>>` redirect."
-                .to_string(),
-            input_schema: object_schema(
-                json!({
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                }),
-                &["path", "content"],
-            ),
+/// Write every staged file. If a write fails part-way, files already written are
+/// restored to their original contents so the batch stays all-or-nothing.
+async fn commit(
+    ctx: &ToolContext,
+    staged: &HashMap<PathBuf, Staged>,
+    order: &[PathBuf],
+) -> Result<(), ToolError> {
+    let mut done: Vec<&PathBuf> = Vec::new();
+    for path in order {
+        let entry = &staged[path];
+        if entry.before == entry.after {
+            continue;
         }
+        let result = match &entry.after {
+            Some(text) => {
+                let parent_ok = match path.parent() {
+                    Some(parent) => tokio::fs::create_dir_all(parent).await,
+                    None => Ok(()),
+                };
+                match parent_ok {
+                    Ok(()) => tokio::fs::write(path, text).await,
+                    Err(e) => Err(e),
+                }
+            }
+            None => tokio::fs::remove_file(path).await,
+        };
+        if let Err(error) = result {
+            for written in done.iter().rev() {
+                let original = &staged[*written];
+                let _ = match &original.before {
+                    Some(text) => tokio::fs::write(written, text).await,
+                    None => tokio::fs::remove_file(written).await,
+                };
+            }
+            return Err(ToolError::msg(format!(
+                "writing `{}` failed: {error}. Earlier files in this batch were restored; no \
+                 files were changed.",
+                entry.display
+            )));
+        }
+        done.push(path);
     }
-
-    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        use tokio::io::AsyncWriteExt;
-        let args: AppendFileArgs = expect_object("append_file", arguments)?;
-        let path = ctx.resolve_workspace_path(&args.path)?;
-        ctx.check_write(&path)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        let mut payload = String::new();
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            payload.push('\n');
-        }
-        payload.push_str(&args.content);
-
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
-        file.write_all(payload.as_bytes()).await?;
-        ctx.record_change(&path);
-
-        let lines_written = args.content.lines().count();
-        let total_lines = existing.lines().count() + lines_written;
-        Ok(ToolResult::success(json!({
-            "path": args.path,
-            "appended": true,
-            "lines_written": lines_written,
-            "total_lines": total_lines,
-        })))
+    for path in done {
+        ctx.record_change(path);
     }
+    Ok(())
 }
 
 /// Sniff an image MIME type from the leading magic bytes.
@@ -263,170 +578,6 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-pub struct ReadImageTool;
-
-#[derive(Debug, Deserialize)]
-struct ReadImageArgs {
-    path: String,
-}
-
-#[async_trait]
-impl Tool for ReadImageTool {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "read_image".to_string(),
-            description: "Load an image file (png/jpg/webp/gif/bmp/svg) so you can SEE it — the \
-                image is attached to your context. Prefer this when you know the path is an image; \
-                read_file on the same path also auto-routes to vision. Call once per image."
-                .to_string(),
-            input_schema: object_schema(json!({"path": {"type": "string"}}), &["path"]),
-        }
-    }
-
-    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: ReadImageArgs = expect_object("read_image", arguments)?;
-        let path = ctx.resolve_workspace_path(&args.path)?;
-        let bytes = tokio::fs::read(&path).await?;
-        ctx.mark_read(&path);
-        let mime = sniff_image_mime(&bytes);
-        let mime_str = mime.unwrap_or("application/octet-stream");
-        if mime.is_none() || bytes.len() < 8 {
-            return Err(ToolError::msg(&format!(
-                "Invalid or empty image file at '{}'. Size: {} bytes, detected MIME: {}. \
-                 The file may be corrupted, empty, or not a valid image format.",
-                args.path,
-                bytes.len(),
-                mime_str
-            )));
-        }
-        Ok(ToolResult::success(json!({
-            "path": args.path,
-            "mime": mime_str,
-            "size_bytes": bytes.len(),
-        })))
-    }
-}
-
-pub struct EditFileTool;
-
-#[derive(Debug, Deserialize)]
-struct EditFileArgs {
-    path: String,
-    old_string: String,
-    new_string: String,
-    #[serde(default)]
-    replace_all: bool,
-}
-
-#[async_trait]
-impl Tool for EditFileTool {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "edit_file".to_string(),
-            description: "Replace exact text in a UTF-8 file. Fails if the match is missing."
-                .to_string(),
-            input_schema: object_schema(
-                json!({
-                    "path": {"type": "string"},
-                    "old_string": {"type": "string"},
-                    "new_string": {"type": "string"},
-                    "replace_all": {"type": "boolean"}
-                }),
-                &["path", "old_string", "new_string", "replace_all"],
-            ),
-        }
-    }
-
-    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: EditFileArgs = expect_object("edit_file", arguments)?;
-        if args.old_string == args.new_string {
-            return Err(ToolError::msg(
-                "old_string and new_string are identical — this edit changes nothing.\n\
-                 - The file was NOT modified.\n\
-                 - DO NOT re-read the file: the file is unchanged.\n\
-                 - If the file already matches your desired state, skip this edit and proceed to the next step.\n\
-                 - If you intended to modify the code, ensure `new_string` actually contains the new replacement."
-                    .to_string(),
-            ));
-        }
-        let path = ctx.resolve_workspace_path(&args.path)?;
-        let content = tokio::fs::read_to_string(&path).await?;
-
-        // 1. Exact match — fast path.
-        let exact = content.matches(&args.old_string).count();
-        if exact > 0 {
-            if exact > 1 && !args.replace_all {
-                return Err(ToolError::msg(ambiguous_diagnostic(
-                    &content,
-                    match_lines(&content, &args.old_string),
-                    exact,
-                    &args.path,
-                    "",
-                )));
-            }
-            let updated = if args.replace_all {
-                content.replace(&args.old_string, &args.new_string)
-            } else {
-                content.replacen(&args.old_string, &args.new_string, 1)
-            };
-            tokio::fs::write(&path, &updated).await?;
-            ctx.record_change(&path);
-            let mut res = json!({"path": args.path, "edited": true});
-            if exact == 1 {
-                let start_offset = content.find(&args.old_string).unwrap_or(0);
-                let start_line = content[..start_offset].matches('\n').count() + 1;
-                res["diff"] = json!(format_diff_snippet(&args.old_string, &args.new_string, start_line));
-            } else {
-                res["replacements"] = json!(exact);
-            }
-            return Ok(ToolResult::success(res));
-        }
-
-        // 2. Whitespace-flexible fallback (single edit): normalize only insignificant
-        // source whitespace, preserve the exact source span, and insert new_string
-        // unchanged. Non-whitespace source tokens must still match exactly.
-        if !args.replace_all {
-            match flexible_replace(&content, &args.old_string, &args.new_string) {
-                Flex::Replaced { updated, start_line, matched_text } => {
-                    tokio::fs::write(&path, &updated).await?;
-                    ctx.record_change(&path);
-                    let diff = format_diff_snippet(&matched_text, &args.new_string, start_line);
-                    return Ok(ToolResult::success(json!({
-                        "path": args.path,
-                        "edited": true,
-                        "diff": diff,
-                        "note": "matched after whitespace normalization; replacement preserved unchanged",
-                    })));
-                }
-                Flex::Ambiguous(starts) => {
-                    let n = starts.len();
-                    return Err(ToolError::msg(ambiguous_diagnostic(
-                        &content,
-                        starts,
-                        n,
-                        &args.path,
-                        " once indentation is ignored",
-                    )));
-                }
-                Flex::NoMatch => {}
-            }
-        }
-
-        // 3. No match — return a diagnostic with the file region so the model can fix
-        // its old_string. If the file changed on disk since last read, note it.
-        let stale_note = if ctx.check_write(&path).is_err() {
-            format!("\n\nNote: `{}` was modified on disk since you last read it (e.g. by shell or external tool).", args.path)
-        } else {
-            String::new()
-        };
-
-        Err(ToolError::msg(format!(
-            "{}{stale_note}",
-            edit_diagnostic(&content, &args.old_string, &args.path)
-        )))
-    }
-}
-
 enum Flex {
     Replaced {
         updated: String,
@@ -436,23 +587,6 @@ enum Flex {
     /// 1-based first line of each matching block.
     Ambiguous(Vec<usize>),
     NoMatch,
-}
-
-fn format_diff_snippet(old_s: &str, new_s: &str, start_line: usize) -> String {
-    let old_count = old_s.lines().count().max(1);
-    let new_count = new_s.lines().count().max(1);
-    let mut diff = format!("@@ -{start_line},{old_count} +{start_line},{new_count} @@\n");
-    for line in old_s.lines() {
-        diff.push('-');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    for line in new_s.lines() {
-        diff.push('+');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    diff
 }
 
 /// 1-based line number of each occurrence of `needle` in `content` (capped).
@@ -483,9 +617,8 @@ fn ambiguous_diagnostic(
 ) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut msg = format!(
-        "old_string matches {n} places in `{path}`{qualifier} — the text is identical at each. \
-         Either pass replace_all:true to change every occurrence, or make old_string unique by \
-         prepending the line ABOVE the one match you want:"
+        "`find` matches {n} places in `{path}`{qualifier}. Either set \"all\": true to change \
+         every occurrence, or make `find` unique by adding the line ABOVE the one match you want:"
     );
     for start in starts.iter().take(5) {
         let above = start
@@ -644,7 +777,7 @@ fn edit_diagnostic(content: &str, old: &str, path: &str) -> String {
         .flatten();
 
     let mut msg = format!(
-        "old_string not found in `{path}` — source matching ignores only whitespace (indentation, line breaks, and repeated spaces). Copy the exact non-whitespace text from read_file, keep it small and unique, and do not resend the same near-match."
+        "`find` text not found in `{path}`. Matching ignores only whitespace (indentation, line breaks, repeated spaces); every other character must be exact. Look at the current text (sed -n or rg -n in bash), copy a small unique snippet exactly, and do not resend the same near-match."
     );
     if let Some(idx) = near {
         let lo = idx.saturating_sub(1);
@@ -697,63 +830,4 @@ mod edit_matching_tests {
         };
         assert_eq!(lines, vec![1, 3]);
     }
-
-    #[tokio::test]
-    async fn test_edit_file_rejects_identical_strings() {
-        let temp = tempfile::tempdir().unwrap();
-        let ctx = ToolContext::new(temp.path()).unwrap();
-        let tool = EditFileTool;
-        let file_path = temp.path().join("test.txt");
-        std::fs::write(&file_path, "hello world\n").unwrap();
-
-        let err = tool
-            .execute(
-                &ctx,
-                json!({
-                    "path": "test.txt",
-                    "old_string": "hello world",
-                    "new_string": "hello world",
-                    "replace_all": false,
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("old_string and new_string are identical"));
-        assert!(err.to_string().contains("DO NOT re-read the file"));
-    }
-
-    #[tokio::test]
-    async fn test_edit_file_succeeds_when_old_string_matches_after_external_change() {
-        let temp = tempfile::tempdir().unwrap();
-        let ctx = ToolContext::new(temp.path()).unwrap();
-        let tool = EditFileTool;
-        let file_path = temp.path().join("script.py");
-        std::fs::write(&file_path, "line 1\nline 2\nline 3\n").unwrap();
-
-        // Mark read
-        ctx.mark_read(&file_path);
-
-        // Simulate external shell change to line 1
-        std::fs::write(&file_path, "line 1 modified by shell\nline 2\nline 3\n").unwrap();
-
-        // Editing line 2 should succeed because line 2 is uniquely present in current content
-        let res = tool
-            .execute(
-                &ctx,
-                json!({
-                    "path": "script.py",
-                    "old_string": "line 2",
-                    "new_string": "line 2 edited",
-                    "replace_all": false,
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.value["data"]["edited"], true);
-
-        let updated = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(updated, "line 1 modified by shell\nline 2 edited\nline 3\n");
-    }
 }
-
-

@@ -172,6 +172,7 @@ impl CodingHarness {
                 vars,
                 conversation_mode,
                 self.context.workspace_root(),
+                &self.context.current_dir(),
                 self.context.browser_summary(),
                 &self.context.memory_writes_snapshot(),
             ),

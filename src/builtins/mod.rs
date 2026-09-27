@@ -21,17 +21,9 @@ pub fn coding_tools(
     memory: crate::memory::MemoryLimits,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.insert(ReadFileTool);
-    registry.insert(ReadImageTool);
-    registry.insert(WriteFileTool);
-    registry.insert(AppendFileTool);
-    registry.insert(EditFileTool);
-    registry.insert(ListFilesTool);
-    registry.insert(SearchFilesTool);
-    registry.insert(SearchContentTool);
-    registry.insert(ViewOutlineTool);
-    registry.insert(CodeMapTool);
     registry.insert(BashTool);
+    registry.insert(ChangeFilesTool);
+    registry.insert(ViewImageTool);
     registry.insert(ManageProcessTool);
     registry.insert(RecallContextTool);
     registry.insert(SearchHistoryTool);
@@ -89,10 +81,4 @@ where
     Ok(serde_json::from_value(arguments)?)
 }
 
-pub(crate) fn slice_hash(text: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
 

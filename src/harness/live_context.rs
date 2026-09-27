@@ -19,6 +19,7 @@ pub(super) fn build_live_context(
     vars: &mut LoopVars,
     conversation_mode: bool,
     workspace: &std::path::Path,
+    cwd: &std::path::Path,
     browser_summary: Option<String>,
     memory_writes: &[String],
 ) -> String {
@@ -33,7 +34,7 @@ pub(super) fn build_live_context(
     block.push_str("# INTERNAL STATE — not user content; read silently and act.\n");
 
     block.push_str("\n[workspace]\n");
-    block.push_str(&format!("cwd = \"{}\"\n", compact_path(workspace)));
+    block.push_str(&format!("cwd = \"{}\"\n", compact_path(cwd)));
 
     block.push_str("\n[session]\n");
     let title = state

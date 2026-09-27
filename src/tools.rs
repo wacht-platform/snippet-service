@@ -96,6 +96,9 @@ pub struct ToolContext {
     /// The directory agent id this session runs as (specialized sessions only),
     /// so board writes and direct messages are attributed to the agent.
     agent_id: Option<String>,
+    /// The shell's working directory, carried across `bash` calls. Relative
+    /// paths in the file tools resolve against it too, so there is one "here".
+    current_dir: Arc<Mutex<PathBuf>>,
 }
 
 impl ToolContext {
@@ -140,6 +143,7 @@ impl ToolContext {
             root
         };
         Ok(Self {
+            current_dir: Arc::new(Mutex::new(root.clone())),
             workspace_root: root,
             owner: owner.into(),
             browser_summary,
@@ -155,6 +159,20 @@ impl ToolContext {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Where the next `bash` call starts and relative file paths resolve.
+    pub fn current_dir(&self) -> PathBuf {
+        self.current_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_current_dir(&self, dir: PathBuf) {
+        if dir.is_dir() {
+            *self.current_dir.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+        }
     }
 
     pub fn owner(&self) -> &str {
@@ -302,7 +320,7 @@ impl ToolContext {
         // No workspace jail: the working directory is just the base for relative
         // paths. Absolute paths and `~` resolve as given, so the agent can read or
         // edit any file you point it at (bash already has full access anyway).
-        Ok(normalize_workspace_path(&self.workspace_root, raw))
+        Ok(normalize_workspace_path(&self.current_dir(), raw))
     }
 }
 
@@ -428,7 +446,7 @@ const MAX_INLINE_OUTPUT_CHARS: usize = 60_000;
 /// a small preview envelope pointing at it. `read_file`/`read_image` page
 /// themselves, so they're exempt.
 fn bound_tool_output(ctx: &ToolContext, name: &str, value: Value) -> Value {
-    if matches!(name, "read_file" | "read_image" | "bash") {
+    if matches!(name, "view_image" | "bash") {
         return value;
     }
     let rendered = serde_json::to_string_pretty(&value).unwrap_or_default();

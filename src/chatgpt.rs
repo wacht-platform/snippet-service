@@ -427,7 +427,7 @@ fn build_responses_request(
             } => {
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
                 let output =
-                    serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                    crate::llm::render_tool_result(&cleaned);
                 if tool_call_id.is_empty() {
                     // Legacy state with no native call id — render as user text.
                     input.push(message_item(
@@ -702,26 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_is_enabled_for_file_mutation_schemas() {
-        let tools = [
-            crate::builtins::WriteFileTool.definition(),
-            crate::builtins::AppendFileTool.definition(),
-            crate::builtins::EditFileTool.definition(),
-        ];
+    fn change_files_schema_is_sent_without_strict_mode() {
+        let tools = [crate::builtins::ChangeFilesTool.definition()];
         let request = build_responses_request(&test_config(), &[], &tools, false);
-
-        for tool in request["tools"].as_array().expect("tools array") {
-            assert_eq!(tool["strict"], true, "{}", tool["name"]);
-            assert!(
-                tool["parameters"]["required"]
-                    .as_array()
-                    .is_some_and(|required| required.iter().any(|field| field == "path"))
-            );
-        }
-        assert_eq!(
-            request["tools"][2]["parameters"]["required"],
-            json!(["path", "old_string", "new_string", "replace_all"])
-        );
+        assert_eq!(request["tools"][0]["name"], "change_files");
+        assert_eq!(request["tools"][0]["strict"], false);
     }
 
     #[test]

@@ -817,7 +817,7 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                 // a giant base64 string in the text.
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
                 let body =
-                    serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                    crate::llm::render_tool_result(&cleaned);
                 if tool_call_id.is_empty() {
                     // Legacy state (pre native function calling) — render as text.
                     let text = format!(
