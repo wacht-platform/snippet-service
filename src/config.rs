@@ -485,6 +485,20 @@ impl InferenceProfileConfig {
     }
 
     fn build_model_with_session(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
+        let model = if self.model.trim().is_empty() {
+            "default".to_string()
+        } else {
+            self.model.clone()
+        };
+        Box::new(crate::usage_ledger::MeteredModel::new(
+            self.build_adapter(session_id.clone()),
+            self.provider.clone(),
+            model,
+            session_id,
+        ))
+    }
+
+    fn build_adapter(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
         match self.provider.as_str() {
             "openai" => {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
