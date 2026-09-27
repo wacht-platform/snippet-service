@@ -721,6 +721,7 @@ pub async fn run_serve(
     {
         let d = daemon.clone();
         tokio::spawn(async move { direct::direct_dispatch_loop(d).await });
+        tokio::spawn(crate::bg::watch_loop());
     }
     {
         let d = daemon.clone();

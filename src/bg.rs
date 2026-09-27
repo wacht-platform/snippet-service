@@ -3,7 +3,9 @@
 //! its output redirected to a sibling `<id>.log`. The live list is surfaced to the
 //! agent every turn (see `harness::build_live_context`) so it knows what's running.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +64,64 @@ pub fn record(
     std::fs::write(
         dir.join(format!("{id}.json")),
         serde_json::to_string_pretty(&entry).unwrap_or_default(),
-    )
+    )?;
+    watch(workspace);
+    Ok(())
+}
+
+fn watched() -> &'static Mutex<HashMap<PathBuf, String>> {
+    static WATCHED: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+    WATCHED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fingerprint(procs: &[BgStatus]) -> String {
+    procs
+        .iter()
+        .map(|p| format!("{}:{}", p.id, p.running))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn notify_changed(workspace: &Path) {
+    crate::session::emit_device_event(serde_json::json!({
+        "kind": "process",
+        "workspace": workspace.display().to_string(),
+    }));
+}
+
+fn watch(workspace: &Path) {
+    let print = fingerprint(&list(workspace));
+    watched()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(workspace.to_path_buf(), print);
+    notify_changed(workspace);
+}
+
+pub async fn watch_loop() {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let snapshot: Vec<(PathBuf, String)> = watched()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (workspace, before) in snapshot {
+            let procs = list(&workspace);
+            let after = fingerprint(&procs);
+            let any_running = procs.iter().any(|p| p.running);
+            let mut map = watched().lock().unwrap_or_else(|e| e.into_inner());
+            if after != before {
+                notify_changed(&workspace);
+            }
+            if any_running {
+                map.insert(workspace, after);
+            } else {
+                map.remove(&workspace);
+            }
+        }
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -210,6 +269,7 @@ pub fn kill_by_id(workspace: &Path, id: &str) -> std::io::Result<bool> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+        watch(workspace);
         Ok(true)
     } else {
         Ok(false)
