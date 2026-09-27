@@ -56,11 +56,11 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
          );
 
          -- The device event journal, read back by `/notifications/replay`.
-         --
-         -- Nothing populates this at present: the emit path was removed pending
-         -- a replacement, so the reader currently returns nothing. The table is
-         -- kept so the replay endpoint and its clients stay in place and the
-         -- incoming writer has somewhere to land.
+         -- `emit_device_event` appends status / done / error frames here.
+         CREATE TABLE IF NOT EXISTS notification_sequence (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             next_id INTEGER NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS notification_journal (
              event_id INTEGER PRIMARY KEY NOT NULL,
              kind TEXT NOT NULL,

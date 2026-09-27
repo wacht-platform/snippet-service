@@ -474,6 +474,7 @@ pub fn create_job_with(
     store_for(root)?
         .upsert_recurring_job(&job)
         .map_err(|e| e.to_string())?;
+    notify_changed(&job.id);
     Ok(job)
 }
 
@@ -492,7 +493,12 @@ pub fn update_job(
     store
         .upsert_recurring_job(&job)
         .map_err(|e| e.to_string())?;
+    notify_changed(&job.id);
     Ok(job)
+}
+
+fn notify_changed(id: &str) {
+    crate::session::emit_device_event(serde_json::json!({ "kind": "recurring", "id": id }));
 }
 
 pub fn delete_job(root: &Path, id: &str) -> Result<(), String> {
@@ -500,6 +506,7 @@ pub fn delete_job(root: &Path, id: &str) -> Result<(), String> {
         .delete_recurring_job(id)
         .map_err(|e| e.to_string())?
     {
+        notify_changed(id);
         Ok(())
     } else {
         Err(format!("no recurring job `{id}`"))

@@ -1095,8 +1095,57 @@ pub fn subscribe_device_events() -> broadcast::Receiver<serde_json::Value> {
     device_events().subscribe()
 }
 
+const NOTIFICATION_RETENTION_SECS: i64 = 24 * 60 * 60;
+
 pub fn emit_device_event(event: serde_json::Value) {
+    let journaled = matches!(
+        event.get("kind").and_then(|k| k.as_str()),
+        Some("waiting" | "done" | "error" | "idle" | "term")
+    );
+    let event = if journaled {
+        store_for_sessions()
+            .and_then(|store| {
+                store
+                    .append_notification_event(event.clone(), NOTIFICATION_RETENTION_SECS)
+                    .ok()
+            })
+            .unwrap_or(event)
+    } else {
+        event
+    };
     let _ = device_events().send(event);
+}
+
+fn notify_kind(prev: &str, status: &str) -> Option<&'static str> {
+    if prev == status {
+        return None;
+    }
+    match status {
+        "running" => Some("running"),
+        "waiting_for_input" => Some("waiting"),
+        "failed" => Some("error"),
+        "completed" => Some("done"),
+        "idle" if prev == "running" => Some("idle"),
+        _ => None,
+    }
+}
+
+pub fn emit_status_transition(
+    session_id: &str,
+    prev_status: &str,
+    status: &str,
+    title: Option<&str>,
+    workspace: &str,
+) {
+    if let Some(kind) = notify_kind(prev_status, status) {
+        emit_device_event(serde_json::json!({
+            "session": session_id,
+            "title": title.unwrap_or_default(),
+            "workspace": workspace,
+            "kind": kind,
+            "status": status,
+        }));
+    }
 }
 
 pub fn replay_notification_events(since: u64) -> Vec<serde_json::Value> {

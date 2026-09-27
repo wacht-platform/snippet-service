@@ -110,6 +110,13 @@ impl CodingHarness {
                 // Park any work a dead session was doing. Done AFTER the write,
                 // so the parked state never contradicts what the store holds.
                 crate::session::park_failed_session_work(&id, &prev_status, state);
+                crate::session::emit_status_transition(
+                    &id,
+                    &prev_status,
+                    &status,
+                    title.as_deref(),
+                    &workspace,
+                );
                 Ok(())
             }
             Err(error) => Err(ToolError::msg(format!("persist session: {error}"))),
