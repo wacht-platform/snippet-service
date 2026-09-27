@@ -93,15 +93,19 @@ pub fn archive_messages(
     store: &Store,
     session_id: &str,
     messages: &[HarnessMessage],
-    start_ordinal: usize,
     now: &str,
 ) -> Result<Vec<ArchivedTurnSummary>, StoreError> {
     store.with_connection(|conn| {
         let tx = conn.unchecked_transaction()?;
+        let start_ordinal: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM session_history_archive WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
         let mut summaries = Vec::with_capacity(messages.len());
 
         for (idx, msg) in messages.iter().enumerate() {
-            let ordinal = (start_ordinal + idx) as i64;
+            let ordinal = start_ordinal + idx as i64;
             let (role, tool_name, summary, affected_paths, status, searchable_text) =
                 extract_message_metadata(msg);
 
@@ -589,7 +593,7 @@ mod tests {
             },
         ];
 
-        let summaries = archive_messages(&store, "session-1", &messages, 0, "2026-09-25T16:00:00Z")
+        let summaries = archive_messages(&store, "session-1", &messages, "2026-09-25T16:00:00Z")
             .expect("archive messages");
         assert_eq!(summaries.len(), 4);
 
