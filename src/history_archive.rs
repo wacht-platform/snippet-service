@@ -104,7 +104,10 @@ pub fn archive_messages(
         )?;
         let mut summaries = Vec::with_capacity(messages.len());
 
-        for (idx, msg) in messages.iter().enumerate() {
+        let archivable = messages.iter().filter(|m| {
+            !matches!(m, HarnessMessage::System { .. } | HarnessMessage::Summary { .. })
+        });
+        for (idx, msg) in archivable.enumerate() {
             let ordinal = start_ordinal + idx as i64;
             let (role, tool_name, summary, affected_paths, status, searchable_text) =
                 extract_message_metadata(msg);
@@ -167,15 +170,19 @@ pub fn archive_messages(
 }
 
 /// Retrieve and hydrate the unabridged turn payload by archive_id.
-pub fn recall_turn(store: &Store, archive_id: i64) -> Result<Option<ArchivedTurnDetail>, StoreError> {
+pub fn recall_turn(
+    store: &Store,
+    session_id: &str,
+    archive_id: i64,
+) -> Result<Option<ArchivedTurnDetail>, StoreError> {
     store.with_connection(|conn| {
         let mut stmt = conn.prepare(
             "SELECT archive_id, session_id, ordinal, role, tool_name, summary, affected_paths, status, created_at, payload_compressed
              FROM session_history_archive
-             WHERE archive_id = ?1",
+             WHERE archive_id = ?1 AND session_id = ?2",
         )?;
 
-        let row = stmt.query_row(params![archive_id], |row| {
+        let row = stmt.query_row(params![archive_id, session_id], |row| {
             let archive_id: i64 = row.get(0)?;
             let session_id: String = row.get(1)?;
             let ordinal: i64 = row.get(2)?;
@@ -238,11 +245,12 @@ pub fn recall_turn(store: &Store, archive_id: i64) -> Result<Option<ArchivedTurn
 /// Retrieve and hydrate multiple turns by IDs.
 pub fn recall_turns(
     store: &Store,
+    session_id: &str,
     archive_ids: &[i64],
 ) -> Result<Vec<ArchivedTurnDetail>, StoreError> {
     let mut turns = Vec::with_capacity(archive_ids.len());
     for &id in archive_ids {
-        if let Some(turn) = recall_turn(store, id)? {
+        if let Some(turn) = recall_turn(store, session_id, id)? {
             turns.push(turn);
         }
     }
@@ -606,7 +614,7 @@ mod tests {
         assert!(manifest.contains("#4|bash|Run auth unit tests||ok"));
 
         // Recall turn 2
-        let turn2 = recall_turn(&store, summaries[1].archive_id)
+        let turn2 = recall_turn(&store, "session-1", summaries[1].archive_id)
             .expect("recall")
             .expect("found turn 2");
         assert_eq!(turn2.tool_name.as_deref(), Some("bash"));
@@ -620,7 +628,7 @@ mod tests {
         assert!(results.iter().any(|r| r.archive_id == summaries[1].archive_id));
 
         // Batch recall
-        let batch = recall_turns(&store, &[summaries[0].archive_id, summaries[2].archive_id])
+        let batch = recall_turns(&store, "session-1", &[summaries[0].archive_id, summaries[2].archive_id])
             .expect("batch recall");
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].archive_id, summaries[0].archive_id);

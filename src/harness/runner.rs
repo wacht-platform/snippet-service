@@ -35,7 +35,7 @@ impl CodingHarness {
     /// recompressing the whole conversation. `history_rewritten` is the signal
     /// that a writer replaced the middle (compaction, rewind, rollback), where an
     /// append would duplicate or misorder — those fall back to a full replace.
-    pub(super) async fn persist_to_store(&self, state: &HarnessState) -> Result<(), ToolError> {
+    pub(super) async fn persist_to_store(&self, state: &mut HarnessState) -> Result<(), ToolError> {
         let Some(store) = self.store() else {
             return Ok(());
         };
@@ -46,7 +46,7 @@ impl CodingHarness {
         let key = crate::config::workspace_key(self.context.workspace_root());
         let title = state.title.clone();
         let status = crate::session::status_str(state.status);
-        let scalar = scalar_json(state).map_err(ToolError::msg)?;
+        let scalar = scalar_json_in_place(state).map_err(ToolError::msg)?;
         let now = state.updated_at.clone();
 
         // Read the status BEFORE overwriting it: the transition is the entire
@@ -72,16 +72,14 @@ impl CodingHarness {
                 )
                 .map_err(|e| e.to_string())?;
 
-            let rewritten = state.history_rewritten
+            let messages_rewritten = state.history_rewritten
                 || self.written_messages.load(std::sync::atomic::Ordering::Acquire)
-                    > state.messages.len()
+                    > state.messages.len();
+            let events_rewritten = state.events_rewritten
                 || self.written_events.load(std::sync::atomic::Ordering::Acquire) > state.events.len();
-            if rewritten {
+            if messages_rewritten {
                 store
                     .replace_conversation_messages(&id, &state.messages, &now)
-                    .map_err(|e| e.to_string())?;
-                store
-                    .replace_conversation_events(&id, &state.events, &now)
                     .map_err(|e| e.to_string())?;
             } else {
                 let from = self.written_messages.load(std::sync::atomic::Ordering::Acquire);
@@ -90,6 +88,12 @@ impl CodingHarness {
                         .append_conversation_messages(&id, &state.messages[from..], &now)
                         .map_err(|e| e.to_string())?;
                 }
+            }
+            if events_rewritten {
+                store
+                    .replace_conversation_events(&id, &state.events, &now)
+                    .map_err(|e| e.to_string())?;
+            } else {
                 let from = self.written_events.load(std::sync::atomic::Ordering::Acquire);
                 if from < state.events.len() {
                     store
@@ -117,6 +121,8 @@ impl CodingHarness {
                     .store(state.messages.len(), std::sync::atomic::Ordering::Release);
                 self.written_events
                     .store(state.events.len(), std::sync::atomic::Ordering::Release);
+                state.history_rewritten = false;
+                state.events_rewritten = false;
                 // Park any work a dead session was doing. Done AFTER the write,
                 // so the parked state never contradicts what the store holds.
                 crate::session::park_failed_session_work(&id, &prev_status, state);

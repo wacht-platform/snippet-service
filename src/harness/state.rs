@@ -4,8 +4,16 @@ pub fn scalar_json(state: &HarnessState) -> Result<String, String> {
     let mut probe = state.clone();
     probe.messages = Vec::new();
     probe.events = Vec::new();
-    probe.history_rewritten = false;
     serde_json::to_string(&probe).map_err(|e| format!("serialize session scalar: {e}"))
+}
+
+pub fn scalar_json_in_place(state: &mut HarnessState) -> Result<String, String> {
+    let messages = std::mem::take(&mut state.messages);
+    let events = std::mem::take(&mut state.events);
+    let encoded = serde_json::to_string(&*state);
+    state.messages = messages;
+    state.events = events;
+    encoded.map_err(|e| format!("serialize session scalar: {e}"))
 }
 
 /// Rebuild a session from its stored scalar plus the logs loaded from their

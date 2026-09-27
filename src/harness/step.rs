@@ -23,6 +23,12 @@ impl CodingHarness {
         // spinning.
         if vars.unproductive_turns >= MAX_UNPRODUCTIVE_TURNS {
             vars.unproductive_turns = 0;
+            state.events.push(HarnessEvent::SystemDecision {
+                step: "stopped_unproductive".to_string(),
+                reasoning: format!(
+                    "Stopped after {MAX_UNPRODUCTIVE_TURNS} turns in a row that did no real work."
+                ),
+            });
             return StepResult::TurnEnded {
                 kind: TurnEndKind::Complete,
                 final_text: None,
