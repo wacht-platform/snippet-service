@@ -10,6 +10,7 @@ use axum::Router;
 use serde::Deserialize;
 
 use crate::config::workspaces_root;
+use crate::serve::task_summary;
 use crate::coordination::{
     HandoffMode, NotificationMarker, Task, TaskLink, TaskLinkKind, TaskResult, TaskStatus,
 };
@@ -30,7 +31,7 @@ pub fn router() -> Router<Shared> {
         .route("/mission-control/settings", get(settings).put(update_settings))
         .route("/mission-control/open", post(open))
         .route("/mission-control/tasks", get(tasks).post(create_task))
-        .route("/mission-control/tasks/{id}", put(update_task))
+        .route("/mission-control/tasks/{id}", get(task).put(update_task))
         .route("/mission-control/tasks/{id}/archive", post(archive_task))
         .route("/mission-control/sessions", get(sessions).post(create_session))
         .route("/mission-control/sessions/{id}", put(update_session))
@@ -41,6 +42,12 @@ pub fn router() -> Router<Shared> {
 struct MissionListQuery {
     token: Option<String>,
     archived: Option<bool>,
+    #[serde(default)]
+    view: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -258,6 +265,7 @@ async fn overview(
         .rev()
         .take(12)
         .map(mission_task_view)
+        .map(task_summary)
         .collect::<Vec<_>>();
     let recent_sessions = sessions
         .iter()
@@ -292,6 +300,7 @@ async fn tasks(
     if !d.authed(&q.token) {
         return unauthorized();
     }
+    let summary = q.view.as_deref() == Some("summary");
     match d.store.list_tasks(None, None) {
         Ok(tasks) => Json(
             tasks
@@ -300,10 +309,28 @@ async fn tasks(
                     q.archived
                         .is_none_or(|archived| archived == task.status.is_terminal())
                 })
+                .skip(q.offset.unwrap_or(0))
+                .take(q.limit.unwrap_or(usize::MAX))
                 .map(mission_task_view)
+                .map(|view| if summary { task_summary(view) } else { view })
                 .collect::<Vec<_>>(),
         )
         .into_response(),
+        Err(error) => mission_error(error.to_string()),
+    }
+}
+
+async fn task(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match d.store.get_task(&id) {
+        Ok(Some(task)) => Json(mission_task_view(&task)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such task").into_response(),
         Err(error) => mission_error(error.to_string()),
     }
 }

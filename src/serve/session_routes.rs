@@ -36,10 +36,10 @@ fn turn_page_start(events: &[crate::harness::HarnessEvent]) -> usize {
 const WIRE_STRING_LIMIT: usize = 500;
 const WIRE_ARRAY_LIMIT: usize = 30;
 
-fn clip_value(value: &mut serde_json::Value) -> bool {
+pub(crate) fn clip_json(value: &mut serde_json::Value, string_limit: usize, array_limit: usize) -> bool {
     match value {
-        serde_json::Value::String(text) if text.len() > WIRE_STRING_LIMIT => {
-            let mut cut = WIRE_STRING_LIMIT;
+        serde_json::Value::String(text) if text.len() > string_limit => {
+            let mut cut = string_limit;
             while !text.is_char_boundary(cut) {
                 cut -= 1;
             }
@@ -47,17 +47,17 @@ fn clip_value(value: &mut serde_json::Value) -> bool {
             true
         }
         serde_json::Value::Array(items) => {
-            let mut clipped = items.len() > WIRE_ARRAY_LIMIT;
-            items.truncate(WIRE_ARRAY_LIMIT);
+            let mut clipped = items.len() > array_limit;
+            items.truncate(array_limit);
             for item in items.iter_mut() {
-                clipped |= clip_value(item);
+                clipped |= clip_json(item, string_limit, array_limit);
             }
             clipped
         }
         serde_json::Value::Object(map) => {
             let mut clipped = false;
             for item in map.values_mut() {
-                clipped |= clip_value(item);
+                clipped |= clip_json(item, string_limit, array_limit);
             }
             clipped
         }
@@ -77,7 +77,7 @@ pub(crate) fn wire_events(events: &[crate::harness::HarnessEvent], compact: bool
                 if let crate::harness::HarnessEvent::ToolResult { .. } = event {
                     if let Some(o) = v.as_object_mut() {
                         if let Some(result) = o.get_mut("result") {
-                            if clip_value(result) {
+                            if clip_json(result, WIRE_STRING_LIMIT, WIRE_ARRAY_LIMIT) {
                                 o.insert("result_clipped".into(), serde_json::json!(true));
                             }
                         }
@@ -87,6 +87,31 @@ pub(crate) fn wire_events(events: &[crate::harness::HarnessEvent], compact: bool
             })
             .collect(),
     )
+}
+
+const TASK_SUMMARY_TEXT_LIMIT: usize = 280;
+
+pub(crate) fn task_summary(mut task: serde_json::Value) -> serde_json::Value {
+    let Some(o) = task.as_object_mut() else {
+        return task;
+    };
+    let mut clipped = false;
+    for key in ["description", "plan", "result", "handoff"] {
+        if let Some(field) = o.get_mut(key) {
+            clipped |= clip_json(field, TASK_SUMMARY_TEXT_LIMIT, 8);
+        }
+    }
+    if let Some(serde_json::Value::Array(markers)) = o.get_mut("notifications") {
+        let total = markers.len();
+        markers.retain(|m| m.get("delivered").and_then(|d| d.as_bool()) != Some(true));
+        for marker in markers.iter_mut() {
+            clip_json(marker, TASK_SUMMARY_TEXT_LIMIT, 8);
+        }
+        clipped |= markers.len() != total;
+        o.insert("notification_count".into(), serde_json::json!(total));
+    }
+    o.insert("summary".into(), serde_json::json!(clipped));
+    task
 }
 
 #[derive(Deserialize)]

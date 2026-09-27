@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::coordination::{Task, TaskFilter, TaskLink, TaskLinkKind, TaskStatus};
 use crate::coordination::types::CoordinationEvent;
 use crate::mission_control;
+use crate::serve::task_summary;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
@@ -58,6 +59,8 @@ pub struct CoordinationTasksQuery {
     pub status: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub view: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -174,7 +177,15 @@ async fn list_tasks(
         status,
         agent_id: q.agent_id.as_deref().filter(|s| !s.trim().is_empty()),
     };
+    let summary = q.view.as_deref() == Some("summary");
     match d.store.list_tasks_page(&filter, after, q.limit.clamp(1, 500)) {
+        Ok(tasks) if summary => Json(
+            tasks
+                .iter()
+                .map(|task| task_summary(serde_json::to_value(task).unwrap_or_default()))
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
         Ok(tasks) => Json(tasks).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
