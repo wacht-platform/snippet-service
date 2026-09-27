@@ -1047,7 +1047,6 @@ pub(super) fn tool_call_preview(
     width: usize,
 ) -> Vec<Line<'static>> {
     let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
-    let path = arg("path");
     let path_style = Style::default().fg(code()).add_modifier(Modifier::ITALIC);
     let green = Style::default().fg(success());
     let red = Style::default().fg(danger());
@@ -1090,68 +1089,6 @@ pub(super) fn tool_call_preview(
                     "create" => push_lines(field("content"), green),
                     _ => {}
                 }
-            }
-        }
-        "write_file" => {
-            let content = arg("content");
-            let total = content.lines().count();
-
-            // Header with file path
-            items.push((format!("→ {}", path), path_style));
-            items.push(("".to_string(), subtle()));
-
-            // Content preview
-            for line in content.lines().take(MAX) {
-                items.push((format!("  {}", line), green));
-            }
-            if total > MAX {
-                items.push(("".to_string(), subtle()));
-                items.push((format!("  … +{} more lines", total - MAX), subtle()));
-            }
-        }
-        "edit_file" => {
-            let old = arg("old_string");
-            let new = arg("new_string");
-            let old_total = old.lines().count();
-            let new_total = new.lines().count();
-
-            // Header with file path
-            items.push((format!("→ {}", path), path_style));
-            items.push(("".to_string(), subtle()));
-
-            // Old content (removed)
-            if old_total > 0 {
-                for line in old.lines().take(MAX) {
-                    items.push((format!("  {}", line), red));
-                }
-                if old_total > MAX {
-                    items.push((format!("  … +{} more", old_total - MAX), subtle()));
-                }
-                items.push(("".to_string(), subtle()));
-            }
-
-            // New content (added)
-            if new_total > 0 {
-                for line in new.lines().take(MAX) {
-                    items.push((format!("  {}", line), green));
-                }
-                if new_total > MAX {
-                    items.push((format!("  … +{} more", new_total - MAX), subtle()));
-                }
-            }
-        }
-        "append_file" => {
-            let content = arg("content");
-            let total = content.lines().count();
-
-            items.push((format!("→ {}", path), path_style));
-            items.push(("".to_string(), subtle()));
-            for line in content.lines().take(MAX) {
-                items.push((format!("  {}", line), green));
-            }
-            if total > MAX {
-                items.push(("".to_string(), subtle()));
-                items.push((format!("  … +{} more lines", total - MAX), subtle()));
             }
         }
         "bash" => {

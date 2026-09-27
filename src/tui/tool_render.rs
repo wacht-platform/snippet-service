@@ -14,8 +14,6 @@ pub(super) fn tool_is_expandable(tool_name: &str, arguments: &Value, result: Opt
             .get("changes")
             .and_then(Value::as_array)
             .is_some_and(|c| !c.is_empty()),
-        "write_file" | "append_file" => !arg("content").trim().is_empty(),
-        "edit_file" => !arg("old_string").is_empty() || !arg("new_string").is_empty(),
         "bash" => {
             let cmd = arg("command");
             cmd.lines().count() > 1
@@ -25,8 +23,7 @@ pub(super) fn tool_is_expandable(tool_name: &str, arguments: &Value, result: Opt
         "memory_write" | "memory_rule" | "memory_pattern" | "memory_index" => {
             !arg("content").trim().is_empty()
         }
-        "read_file" | "search_content" | "list_files" | "web_read" | "view_outline"
-        | "code_map" => result.map(result_has_body).unwrap_or(false),
+        "web_read" => result.map(result_has_body).unwrap_or(false),
         _ => {
             // Any tool whose header arg was truncated, or result has a body.
             let (_, shown) = tool_call_parts(tool_name, arguments);
@@ -91,47 +88,8 @@ pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, St
             ("Change".into(), shown)
         }
         "view_image" => ("View".into(), arg("path")),
-        "read_file" => ("Read".into(), arg("path")),
-        "write_file" => ("Write".into(), arg("path")),
-        "edit_file" => ("Edit".into(), arg("path")),
-        "list_files" => (
-            "List".into(),
-            arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(".")
-                .to_string(),
-        ),
-        "search_content" => ("Search".into(), arg("query")),
-        "search_files" => {
-            let pattern = arg("pattern");
-            (
-                "Search".into(),
-                if pattern.is_empty() {
-                    arg("query")
-                } else {
-                    pattern
-                },
-            )
-        }
-        "view_outline" => ("Outline".into(), arg("path")),
-        "code_map" => {
-            let q = arg("query");
-            let path = arg("path");
-            let detail = if !q.is_empty() && !path.is_empty() {
-                format!("{path} · {q}")
-            } else if !q.is_empty() {
-                q
-            } else if !path.is_empty() {
-                path
-            } else {
-                ".".into()
-            };
-            ("Map".into(), detail)
-        }
         "web_search" => ("Web".into(), arg("query")),
         "web_read" => ("Fetch".into(), arg("url")),
-        "read_image" => ("Read".into(), arg("path")),
         "bash" => {
             let label = arg("label");
             let cmd = arg("command");
@@ -177,7 +135,6 @@ pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, St
                 },
             )
         }
-        "append_file" => ("Append".into(), arg("path")),
         _ => {
             let pretty = tool_name
                 .split('_')
@@ -269,30 +226,7 @@ pub(super) fn tool_result_lines(
 
     let str_field = |key: &str| data.get(key).and_then(Value::as_str).unwrap_or("");
     let items: Vec<(String, Style)> = match tool_name {
-        "read_file" => {
-            let lines = str_field("content").lines().count();
-            vec![(format!("Read {lines} lines"), subtle())]
-        }
-        "write_file" => vec![(format!("Wrote {}", str_field("path")), subtle())],
-        "edit_file" => vec![(format!("Updated {}", str_field("path")), subtle())],
-        "list_files" => {
-            let entries = data.get("entries").and_then(Value::as_array);
-            let count = entries.map(|e| e.len()).unwrap_or(0);
-            let names = entries
-                .map(|e| {
-                    e.iter()
-                        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
-                        .take(12)
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                })
-                .unwrap_or_default();
-            vec![(format!("{count} entries"), subtle()), (names, subtle())]
-        }
-        "search_content" => {
-            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
-            vec![(format!("Found {count} content matches"), subtle())]
-        }
+        "change_files" => vec![(str_field("summary").to_string(), subtle())],
         "web_search" => {
             let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
             vec![(format!("{count} web results"), subtle())]
@@ -304,24 +238,6 @@ pub(super) fn tool_result_lines(
                 .map(|t| t.chars().count())
                 .unwrap_or(0);
             vec![(format!("Read {chars} chars"), subtle())]
-        }
-        "view_outline" => {
-            if data
-                .get("is_directory")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                let count = data
-                    .get("entries")
-                    .and_then(Value::as_array)
-                    .map(|e| e.len())
-                    .unwrap_or(0);
-                vec![(format!("Directory — {count} entries"), subtle())]
-            } else {
-                let outline = data.get("outline").and_then(Value::as_array);
-                let count = outline.map(|o| o.len()).unwrap_or(0);
-                vec![(format!("Outline has {count} code declarations"), subtle())]
-            }
         }
         "bash" => bash_result_items(data),
         _ => vec![(status.to_string(), subtle())],
@@ -338,10 +254,7 @@ pub(super) fn tool_result_lines(
 }
 
 pub(super) fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
-    let success = data
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let success = data.get("exit_code").and_then(Value::as_i64) == Some(0);
     let exit = data
         .get("exit_code")
         .map(|v| v.to_string())
@@ -402,47 +315,6 @@ pub(super) fn tool_result_lines_expanded(
         "bash" => {
             items.extend(bash_result_items_expanded(data, MAX));
         }
-        "read_file" => {
-            let content = str_field("content");
-            let total = content.lines().count();
-            items.push((format!("{total} lines"), body));
-            for line in content.lines().take(MAX) {
-                items.push((line.to_string(), body));
-            }
-            if total > MAX {
-                items.push((format!("… +{} more lines", total - MAX), more));
-            }
-        }
-        "search_content" => {
-            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
-            items.push((format!("{count} matches"), body));
-            if let Some(arr) = data.get("matches").and_then(Value::as_array) {
-                for m in arr.iter().take(MAX) {
-                    let line = m
-                        .get("line")
-                        .or_else(|| m.get("text"))
-                        .or_else(|| m.get("content"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let path = m.get("path").and_then(Value::as_str).unwrap_or("");
-                    let ln = m.get("line_number").or_else(|| m.get("line_no"));
-                    let head = match (path.is_empty(), ln.and_then(Value::as_u64)) {
-                        (false, Some(n)) => format!("{path}:{n}: {line}"),
-                        (false, None) => format!("{path}: {line}"),
-                        _ => line.to_string(),
-                    };
-                    if !head.is_empty() {
-                        items.push((head, body));
-                    }
-                }
-                if arr.len() > MAX {
-                    items.push((format!("… +{} more", arr.len() - MAX), more));
-                }
-            }
-        }
-        "list_files" => {
-            return tool_result_lines(tool_name, result, width);
-        }
         "web_read" => {
             let text = str_field("text");
             let total = text.lines().count();
@@ -484,7 +356,7 @@ pub(super) fn tool_result_lines_expanded(
     if items.is_empty() {
         return tool_result_lines(tool_name, result, width);
     }
-    if tool_name == "bash" || tool_name == "read_file" {
+    if tool_name == "bash" {
         result_block_verbatim(items, width)
     } else {
         result_block(items, width)
@@ -492,10 +364,7 @@ pub(super) fn tool_result_lines_expanded(
 }
 
 fn bash_result_items_expanded(data: &Value, max: usize) -> Vec<(String, Style)> {
-    let success = data
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let success = data.get("exit_code").and_then(Value::as_i64) == Some(0);
     let exit = data
         .get("exit_code")
         .map(|v| v.to_string())
