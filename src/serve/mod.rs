@@ -1169,7 +1169,6 @@ async fn usage_summary(State(d): State<Shared>, Query(q): Query<UsageQuery>) -> 
             };
             serde_json::json!({
                 "provider": row.provider,
-                "legacy": row.provider == crate::usage_ledger::LEGACY_PROVIDER,
                 "model": row.model,
                 "sessions": sessions.get(&row.provider).copied().unwrap_or(0),
                 "calls": 0,
@@ -1201,11 +1200,10 @@ async fn usage_summary(State(d): State<Shared>, Query(q): Query<UsageQuery>) -> 
             models.push(serde_json::to_value(&row).unwrap_or_default());
         }
     }
-    let mut list: Vec<serde_json::Value> = order
+    let list: Vec<serde_json::Value> = order
         .into_iter()
         .filter_map(|p| providers.remove(&p))
         .collect();
-    list.sort_by_key(|p| p["legacy"].as_bool().unwrap_or(false));
     Json(serde_json::json!({ "providers": list, "since": q.since })).into_response()
 }
 
