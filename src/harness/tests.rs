@@ -96,6 +96,7 @@ mod assistant_dedup_tests {
             queued_inputs: Vec::new(),
             history_rewritten: false,
             events_rewritten: false,
+            compactions: 0,
         }
     }
 
@@ -324,6 +325,7 @@ mod tool_prune_tests {
             queued_inputs: Vec::new(),
             history_rewritten: false,
             events_rewritten: false,
+            compactions: 0,
         }
     }
 
