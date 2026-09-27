@@ -109,8 +109,12 @@ pub(crate) async fn attach_ws(
             };
             let daemon = d.clone();
             let session = q.session.clone();
+            let compact = q
+                .compact
+                .as_deref()
+                .is_some_and(|v| v != "0" && v != "false");
             ws.on_upgrade(move |socket| {
-                handle_ws(socket, daemon, session, state_path, stream, terms)
+                handle_ws(socket, daemon, session, state_path, stream, terms, compact)
             })
         }
         None => (StatusCode::NOT_FOUND, "no such session").into_response(),
@@ -124,10 +128,12 @@ async fn handle_ws(
     state_path: PathBuf,
     stream: crate::llm::StreamHandle,
     terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
+    compact: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Option<usize>)>();
     let history_request_tx = history_tx.clone();
+    let (event_request_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
 
     let push_daemon = daemon.clone();
     let push_session = session.clone();
@@ -145,6 +151,7 @@ async fn handle_ws(
         let mut last_state_fingerprint = None;
         let mut last_events: Vec<crate::harness::HarnessEvent> = Vec::new();
         let mut last_event_offset = 0usize;
+        let mut last_lanes_json: Option<String> = None;
         let mut last_stream_fp: u64 = 0;
         let mut last_queue_revision = 0;
         let mut attach_revision: u64 = 0;
@@ -155,7 +162,19 @@ async fn handle_ws(
                 if Some(fingerprint) != last_state_fingerprint
                     || queue_revision != last_queue_revision
                 {
-                    if let Some(mut state) = read_session_state(&state_path) {
+                    let resume = !last_events.is_empty();
+                    let from = if resume { last_event_offset } else { 0 };
+                    let loaded = read_session_state_tail(&state_path, from).and_then(|(state, _)| {
+                        let continuous = resume
+                            && state.events.len() >= last_events.len()
+                            && state.events[..last_events.len()] == last_events[..];
+                        if resume && !continuous {
+                            read_session_state_tail(&state_path, 0).map(|(s, _)| (s, false))
+                        } else {
+                            Some((state, continuous))
+                        }
+                    });
+                    if let Some((mut state, continuous)) = loaded {
                         let hidden = {
                             let mut overlays = daemon.queue_hidden.lock().unwrap();
                             let entries = overlays.entry(session.clone()).or_default();
@@ -168,8 +187,8 @@ async fn handle_ws(
                                 .queued_inputs
                                 .retain(|item| !hidden.contains(&item.id));
                         }
+                        let events = std::mem::take(&mut state.events);
                         if let Ok(mut v) = serde_json::to_value(&state) {
-                            // `messages` (raw LLM history) is unused by the app — never wire it.
                             if let Some(o) = v.as_object_mut() {
                                 o.remove("messages");
                                 // Rate limits are PROVIDER-scoped. Only ChatGPT sessions get
@@ -187,50 +206,34 @@ async fn handle_ws(
                                     o.remove("rate_limit");
                                 }
                             }
-                            let count = state.events.len();
-                            let first_attach = last_events.is_empty();
-                            let snapshot = if first_attach {
-                                const INITIAL_ATTACH_EVENTS: usize = 160;
-                                let start = count.saturating_sub(INITIAL_ATTACH_EVENTS);
-                                last_event_offset = start;
-                                last_events = state.events[start..].to_vec();
-                                if let Some(o) = v.as_object_mut() {
-                                    o.insert(
-                                        "events".into(),
-                                        serde_json::to_value(&state.events[start..])
-                                            .unwrap_or_default(),
-                                    );
-                                    o.insert("event_offset".into(), serde_json::json!(start));
-                                }
-                                true
-                            } else {
-                                count < last_event_offset
-                                    || count < last_event_offset + last_events.len()
-                                    || state.events
-                                        [last_event_offset..last_event_offset + last_events.len()]
-                                        != last_events[..]
-                            };
+                            let lanes_json = v
+                                .get("lanes")
+                                .map(|l| l.to_string())
+                                .unwrap_or_else(|| "[]".to_string());
                             attach_revision = attach_revision.wrapping_add(1);
                             if let Some(o) = v.as_object_mut() {
                                 o.insert("revision".into(), serde_json::json!(attach_revision));
-                                if snapshot {
-                                    o.insert("wire".into(), serde_json::json!("snapshot"));
-                                } else {
-                                    let start = last_event_offset + last_events.len();
-                                    let tail = serde_json::to_value(&state.events[start..])
-                                        .unwrap_or_default();
-                                    o.remove("events");
+                                if continuous {
+                                    let tail = &events[last_events.len()..];
                                     o.insert("wire".into(), serde_json::json!("delta"));
-                                    o.insert("new_events".into(), tail);
-                                    o.insert(
-                                        "event_count".into(),
-                                        serde_json::json!(count - last_event_offset),
-                                    );
+                                    o.insert("new_events".into(), wire_events(tail, compact));
+                                    o.insert("event_count".into(), serde_json::json!(events.len()));
+                                    if last_lanes_json.as_deref() == Some(lanes_json.as_str()) {
+                                        o.remove("lanes");
+                                    } else if !o.contains_key("lanes") {
+                                        o.insert("lanes".into(), serde_json::json!([]));
+                                    }
+                                    last_events = events;
+                                } else {
+                                    let (start, _, _) = session_event_page(&events, None, None);
+                                    last_event_offset = start;
+                                    o.insert("wire".into(), serde_json::json!("snapshot"));
+                                    o.insert("events".into(), wire_events(&events[start..], compact));
+                                    o.insert("event_offset".into(), serde_json::json!(start));
+                                    last_events = events[start..].to_vec();
                                 }
                             }
-                            if !first_attach {
-                                last_events = state.events[last_event_offset..].to_vec();
-                            }
+                            last_lanes_json = Some(lanes_json);
                             last_queue_revision = queue_revision;
                             if let Ok(json) = serde_json::to_string(&v) {
                                 if sender.send(Message::Text(json.into())).await.is_err() {
@@ -300,13 +303,29 @@ async fn handle_ws(
                     }
                 }
             }
+            if let Ok(index) = event_rx.try_recv() {
+                if let Some((state, _)) = read_session_state_tail(&state_path, index) {
+                    let frame = serde_json::json!({
+                        "wire": "event",
+                        "index": index,
+                        "event": state.events.first(),
+                    });
+                    if sender
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
             if let Ok((before, limit)) = history_rx.try_recv() {
-                if let Some(state) = read_session_state(&state_path) {
+                if let Some((state, _)) = read_session_state_tail(&state_path, 0) {
                     let (start, end, has_older) =
-                        session_event_page(&state.events, Some(before), Some(limit));
+                        session_event_page(&state.events, Some(before), limit);
                     let frame = serde_json::json!({
                         "wire": "history",
-                        "events": &state.events[start..end],
+                        "events": wire_events(&state.events[start..end], compact),
                         "start": start,
                         "end": end,
                         "has_older": has_older,
@@ -342,9 +361,14 @@ async fn handle_ws(
                     if val.get("kind").and_then(|k| k.as_str()) == Some("history") {
                         let before =
                             val.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let limit =
-                            val.get("limit").and_then(|v| v.as_u64()).unwrap_or(160) as usize;
+                        let limit = val.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
                         let _ = history_request_tx.send((before, limit));
+                        continue;
+                    }
+                    if val.get("kind").and_then(|k| k.as_str()) == Some("event") {
+                        if let Some(index) = val.get("index").and_then(|v| v.as_u64()) {
+                            let _ = event_request_tx.send(index as usize);
+                        }
                         continue;
                     }
                     if let Some(nonce) = val.get("nonce").and_then(|n| n.as_str()) {

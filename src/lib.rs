@@ -44,6 +44,7 @@ pub mod term;
 pub mod tools;
 pub mod tui;
 pub mod update;
+pub mod usage_ledger;
 pub mod vault;
 pub mod watches;
 pub mod xai;

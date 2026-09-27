@@ -541,7 +541,9 @@ fn apply_wire_frame(
                         acc.checkpoints = partial.checkpoints;
                     }
                     acc.goal = partial.goal;
-                    acc.lanes = partial.lanes;
+                    if v.get("lanes").is_some() {
+                        acc.lanes = partial.lanes;
+                    }
                     acc.watches = partial.watches;
                     acc.compacting = partial.compacting;
                     acc.turn_started_at = partial.turn_started_at;

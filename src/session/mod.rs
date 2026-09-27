@@ -994,6 +994,30 @@ fn read_session_state_from_store(state_path: &Path) -> Option<HarnessState> {
     crate::harness::state_from_scalar(&scalar, messages, events).ok()
 }
 
+pub fn read_session_state_tail(state_path: &Path, from: usize) -> Option<(HarnessState, usize)> {
+    let id = session_id_for_state_path(state_path);
+    let Some(store) = store_for_sessions() else {
+        return read_session_state(state_path).map(|mut s| {
+            let count = s.events.len();
+            s.messages.clear();
+            s.events.drain(..from.min(count));
+            (s, count)
+        });
+    };
+    if !store.has_conversation(&id).ok()? {
+        return read_session_state(state_path).map(|mut s| {
+            let count = s.events.len();
+            s.messages.clear();
+            s.events.drain(..from.min(count));
+            (s, count)
+        });
+    }
+    let scalar = store.load_session_scalar(&id).ok()??;
+    let (events, count) = store.load_conversation_events_from(&id, from).ok()?;
+    let state = crate::harness::state_from_scalar(&scalar, Vec::new(), events).ok()?;
+    Some((state, count))
+}
+
 /// Open the session store, if one exists at the canonical path.
 pub(crate) fn store_for_sessions() -> Option<crate::store::Store> {
     crate::store::Store::open_cached(crate::store::default_db_path()).ok()

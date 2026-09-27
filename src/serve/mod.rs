@@ -26,8 +26,8 @@ use crate::config::{InferenceProfileConfig, SnippetConfig, save_config, workspac
 use crate::harness::{HarnessEvent, LoopInput};
 use crate::mission_control as mc;
 use crate::session::{
-    all_device_sessions, list_device_sessions, prepare_new_session_workspace,
-    read_session_profile, read_session_sidecar, read_session_state, replay_notification_events,
+    list_device_sessions, prepare_new_session_workspace,
+    read_session_profile, read_session_sidecar, read_session_state, read_session_state_tail, replay_notification_events,
     session_id_for_state_path, start_session_with_browser_summary,
     state_path_for_id, subscribe_device_events, write_session_profile,
     SessionRole,
@@ -1135,98 +1135,77 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
     Json(out).into_response()
 }
 
-async fn usage_summary(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) {
+#[derive(Deserialize)]
+struct UsageQuery {
+    token: Option<String>,
+    #[serde(default)]
+    since: Option<i64>,
+}
+
+async fn usage_summary(State(d): State<Shared>, Query(q): Query<UsageQuery>) -> Response {
+    if !d.authed(&q.token) {
         return unauthorized();
     }
-    d.reload_config().await;
-    let config = d.config.lock().unwrap().clone();
-    let mut totals: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
-    // The RAW catalog: an inbox runs a real model, so its tokens are real spend.
-    // Listing sessions to a person excludes it; accounting for cost must not.
-    for session in all_device_sessions() {
-        let Some(path) = state_path_for_id(&session.id) else {
-            continue;
-        };
-        let Some(state) = read_session_state(&path) else {
-            continue;
-        };
-        let profile_name = read_session_profile(&path);
-        let model = profile_name
-            .as_ref()
-            .and_then(|name| config.setups.as_ref()?.get(name))
-            .unwrap_or(&config.model);
-        let provider = model.provider.clone();
-        // Does this provider report rate-limit data AT ALL? Only ChatGPT parses
-        // the Codex headers; every other model hardcodes an empty snapshot, and
-        // opencode returns no such headers even in principle. So an empty list
-        // means two very different things — "cannot report" vs "hasn't reported
-        // yet" — and the UI must tell them apart instead of showing one generic
-        // empty state for both.
-        let reports_limits = crate::config::provider_reports_rate_limits(&provider);
-        let entry = totals.entry(provider.clone()).or_insert_with(|| {
+    let totals = match d.store.usage_totals(q.since) {
+        Ok(rows) => rows,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let sessions: HashMap<String, u64> = d
+        .store
+        .usage_sessions_by_provider(q.since)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let chatgpt_rate = crate::chatgpt::read_global_usage().filter(|rate| rate.is_reported());
+    let mut order: Vec<String> = Vec::new();
+    let mut providers: HashMap<String, serde_json::Value> = HashMap::new();
+    for row in totals {
+        let entry = providers.entry(row.provider.clone()).or_insert_with(|| {
+            order.push(row.provider.clone());
+            let rate_limits = match (&chatgpt_rate, row.provider.as_str()) {
+                (Some(rate), "chatgpt") => vec![serde_json::to_value(rate).unwrap_or_default()],
+                _ => Vec::new(),
+            };
             serde_json::json!({
-                "provider": provider,
-                "profile": profile_name,
-                "model": model.model,
-                "sessions": 0,
+                "provider": row.provider,
+                "legacy": row.provider == crate::usage_ledger::LEGACY_PROVIDER,
+                "model": row.model,
+                "sessions": sessions.get(&row.provider).copied().unwrap_or(0),
+                "calls": 0,
                 "total_tokens": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "cache_read_tokens": 0,
-                "rate_limits_supported": reports_limits,
-                "rate_limits": []
+                "cache_creation_tokens": 0,
+                "rate_limits_supported": crate::config::provider_reports_rate_limits(&row.provider),
+                "rate_limits": rate_limits,
+                "models": [],
             })
         });
         let Some(obj) = entry.as_object_mut() else {
             continue;
         };
-        obj.insert(
-            "sessions".into(),
-            serde_json::json!(obj["sessions"].as_u64().unwrap_or(0) + 1),
-        );
         for (key, value) in [
-            ("total_tokens", state.total_tokens),
-            ("prompt_tokens", state.prompt_tokens),
-            ("completion_tokens", state.completion_tokens),
-            ("cache_read_tokens", state.cache_read_tokens),
+            ("calls", row.calls),
+            ("total_tokens", row.total_tokens),
+            ("prompt_tokens", row.prompt_tokens),
+            ("completion_tokens", row.completion_tokens),
+            ("cache_read_tokens", row.cache_read_tokens),
+            ("cache_creation_tokens", row.cache_creation_tokens),
         ] {
             let current = obj[key].as_u64().unwrap_or(0);
             obj.insert(key.into(), serde_json::json!(current.saturating_add(value)));
         }
-        // NOTE: no per-session rate_limit is attributed to a provider here.
-        //
-        // `HarnessState.rate_limit` can only ever hold a CHATGPT snapshot —
-        // `chatgpt.rs` is the only model that parses rate-limit headers
-        // (`openai.rs` hardcodes `None`, as do anthropic/gemini/xai), and
-        // opencode's API returns no such headers at all. So reading it while
-        // iterating a session of ANY provider mis-attributed a ChatGPT figure to
-        // whatever that session ran: an `opencode-go` session displayed ChatGPT's
-        // numbers as its own. ChatGPT is handled once, globally, below.
-    }
-    // ChatGPT Codex limits are account-wide, not session-local. Include the same
-    // reported snapshot used by the live chat Usage panel here as well.
-    if let Some(rate) = crate::chatgpt::read_global_usage().filter(|rate| rate.is_reported()) {
-        if let Some(entry) = totals.get_mut("chatgpt") {
-            if let Some(obj) = entry.as_object_mut() {
-                let rates = obj
-                    .get_mut("rate_limits")
-                    .and_then(|v| v.as_array_mut())
-                    .expect("rate_limits array");
-                // ChatGPT limits are account-wide. Replace session-local/history
-                // entries with the freshest global snapshot, rather than exposing
-                // stale duplicate windows in the provider Usage screen.
-                rates.clear();
-                let value = serde_json::to_value(rate).unwrap_or_default();
-                rates.push(value);
-            }
+        if let Some(models) = obj.get_mut("models").and_then(|m| m.as_array_mut()) {
+            models.push(serde_json::to_value(&row).unwrap_or_default());
         }
     }
-    Json(serde_json::json!({
-        "providers": totals.into_values().collect::<Vec<_>>()
-    }))
-    .into_response()
+    let mut list: Vec<serde_json::Value> = order
+        .into_iter()
+        .filter_map(|p| providers.remove(&p))
+        .collect();
+    list.sort_by_key(|p| p["legacy"].as_bool().unwrap_or(false));
+    Json(serde_json::json!({ "providers": list, "since": q.since })).into_response()
 }
 
 // GET /sessions/counts — {folder: count} across all sessions (cheap, from

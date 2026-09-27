@@ -6,9 +6,87 @@ pub(crate) fn session_event_page(
     limit: Option<usize>,
 ) -> (usize, usize, bool) {
     let end = before.unwrap_or(events.len()).min(events.len());
-    let size = limit.unwrap_or(160).clamp(1, 500);
-    let start = end.saturating_sub(size);
+    let start = match limit {
+        Some(size) => end.saturating_sub(size.clamp(1, 500)),
+        None => turn_page_start(&events[..end]),
+    };
     (start, end, start > 0)
+}
+
+fn turn_page_start(events: &[crate::harness::HarnessEvent]) -> usize {
+    const MAX_EVENTS: usize = 600;
+    const MIN_EVENTS: usize = 40;
+    const TURNS: usize = 2;
+    let len = events.len();
+    let floor = len.saturating_sub(MAX_EVENTS);
+    let mut seen = 0;
+    let mut start = floor;
+    for i in (floor..len).rev() {
+        if matches!(events[i], crate::harness::HarnessEvent::UserInput { .. }) {
+            seen += 1;
+            if seen == TURNS {
+                start = i;
+                break;
+            }
+        }
+    }
+    start.min(len.saturating_sub(MIN_EVENTS))
+}
+
+const WIRE_STRING_LIMIT: usize = 500;
+const WIRE_ARRAY_LIMIT: usize = 30;
+
+fn clip_value(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) if text.len() > WIRE_STRING_LIMIT => {
+            let mut cut = WIRE_STRING_LIMIT;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            true
+        }
+        serde_json::Value::Array(items) => {
+            let mut clipped = items.len() > WIRE_ARRAY_LIMIT;
+            items.truncate(WIRE_ARRAY_LIMIT);
+            for item in items.iter_mut() {
+                clipped |= clip_value(item);
+            }
+            clipped
+        }
+        serde_json::Value::Object(map) => {
+            let mut clipped = false;
+            for item in map.values_mut() {
+                clipped |= clip_value(item);
+            }
+            clipped
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn wire_events(events: &[crate::harness::HarnessEvent], compact: bool) -> serde_json::Value {
+    if !compact {
+        return serde_json::to_value(events).unwrap_or_default();
+    }
+    serde_json::Value::Array(
+        events
+            .iter()
+            .map(|event| {
+                let mut v = serde_json::to_value(event).unwrap_or_default();
+                if let crate::harness::HarnessEvent::ToolResult { .. } = event {
+                    if let Some(o) = v.as_object_mut() {
+                        if let Some(result) = o.get_mut("result") {
+                            if clip_value(result) {
+                                o.insert("result_clipped".into(), serde_json::json!(true));
+                            }
+                        }
+                    }
+                }
+                v
+            })
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -398,5 +476,7 @@ pub(crate) async fn fork_session(
 pub(crate) struct AttachQuery {
     pub(crate) token: Option<String>,
     pub(crate) session: String,
+    #[serde(default)]
+    pub(crate) compact: Option<String>,
 }
 

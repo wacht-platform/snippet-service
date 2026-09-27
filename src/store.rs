@@ -207,6 +207,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
     crate::conversations::ensure_schema(connection)?;
     crate::app_schema::ensure(connection)?;
     crate::history_archive::ensure_schema(connection)?;
+    crate::usage_ledger::ensure_schema(connection)?;
     Ok(())
 }
 
