@@ -371,7 +371,7 @@ impl Tool for SendAgentMessage {
             // `human`, so the asker's session never saw one. Point back at the
             // value it was given — that is the correct target — and nothing else.
             let resolves = crate::session::state_path_for_id(to_id)
-                .map(|path| crate::session::read_session_state(&path).is_some())
+                .map(|path| crate::session::read_session_meta(&path).is_some())
                 .unwrap_or(false);
             if !resolves {
                 return Err(ToolError::msg(format!(

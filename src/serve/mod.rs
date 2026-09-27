@@ -27,7 +27,7 @@ use crate::harness::{HarnessEvent, LoopInput};
 use crate::mission_control as mc;
 use crate::session::{
     list_device_sessions, prepare_new_session_workspace,
-    read_session_profile, read_session_sidecar, read_session_state, read_session_state_tail, replay_notification_events,
+    read_session_profile, read_session_sidecar, read_session_meta, read_session_state, read_session_state_tail, replay_notification_events,
     session_id_for_state_path, start_session_with_browser_summary,
     state_path_for_id, subscribe_device_events, write_session_profile,
     SessionRole,
@@ -83,7 +83,7 @@ pub(crate) struct LiveSession {
 
 pub(crate) fn live_from_handle(handle: crate::session::SessionHandle, profile: Option<String>) -> LiveSession {
     let cwd = {
-        let from_state = read_session_state(&handle.state_path)
+        let from_state = read_session_meta(&handle.state_path)
             .map(|s| PathBuf::from(s.workspace))
             .filter(|p| p.is_dir());
         from_state
@@ -121,7 +121,7 @@ fn load_session_workspace(session: &str) -> Result<(PathBuf, PathBuf), Response>
     };
     // Store-or-file: a session ported to the database has no state file, so
     // reading the file directly would 404 every migrated session.
-    let Some(state) = read_session_state(&sp) else {
+    let Some(state) = read_session_meta(&sp) else {
         return Err((StatusCode::NOT_FOUND, "session state unreadable").into_response());
     };
     let folder = PathBuf::from(&state.workspace);
@@ -271,7 +271,7 @@ impl Daemon {
         // Read through the store-or-file reader: a session ported to the
         // database has no state file, and reading the file directly would make
         // every such session unopenable.
-        let state = read_session_state(&sp)?;
+        let state = read_session_meta(&sp)?;
         let folder = PathBuf::from(&state.workspace);
         if state.workspace.is_empty() || !folder.is_dir() {
             return None;
@@ -494,7 +494,7 @@ impl Daemon {
         let profile = existing.profile.clone();
 
         // Don't restart mid-turn: only Idle / terminal states are safe.
-        let Some(state) = read_session_state(&sp) else {
+        let Some(state) = read_session_meta(&sp) else {
             return RebuildOutcome::Gone;
         };
         use crate::harness::HarnessStatus::*;
@@ -539,7 +539,7 @@ impl Daemon {
         let Some(path) = path else {
             return;
         };
-        let Some(state) = read_session_state(&path) else {
+        let Some(state) = read_session_meta(&path) else {
             return;
         };
         let Some(item) = state.queued_inputs.iter().find(|item| item.id == queue_id) else {
@@ -602,7 +602,7 @@ impl Daemon {
                 None => return,
             },
         };
-        let Some(state) = read_session_state(&sp) else {
+        let Some(state) = read_session_meta(&sp) else {
             return;
         };
         let folder = PathBuf::from(&state.workspace);

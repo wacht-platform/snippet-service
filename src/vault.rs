@@ -153,24 +153,21 @@ impl Vault {
     /// Load the vault; missing or unreadable file → empty vault (never an error
     /// on the hot path).
     pub fn load() -> Self {
-        type Cached = Option<(PathBuf, Option<(std::time::SystemTime, u64)>, Vault)>;
-        static CACHE: std::sync::Mutex<Cached> = std::sync::Mutex::new(None);
-        let path = vault_path();
-        let stamp = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| Some((m.modified().ok()?, m.len())));
+        // Keyed on the file's bytes, not its mtime: a secret changed to a
+        // same-length value within one timestamp tick must never be served
+        // stale, or scrubbing would miss the new value. The file is small, so
+        // reading it is cheap; only the parse is skipped.
+        static CACHE: std::sync::Mutex<Option<(Vec<u8>, Vault)>> = std::sync::Mutex::new(None);
+        let bytes = std::fs::read(vault_path()).unwrap_or_default();
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached_path, cached_stamp, vault)) = cache.as_ref() {
-            if *cached_path == path && *cached_stamp == stamp && stamp.is_some() {
+        if let Some((cached, vault)) = cache.as_ref() {
+            if *cached == bytes {
                 return vault.clone();
             }
         }
-        let secrets = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let secrets = serde_json::from_slice(&bytes).unwrap_or_default();
         let vault = Self { secrets };
-        *cache = Some((path, stamp, vault.clone()));
+        *cache = Some((bytes, vault.clone()));
         vault
     }
 
