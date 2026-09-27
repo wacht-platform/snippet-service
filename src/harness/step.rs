@@ -134,6 +134,9 @@ impl CodingHarness {
                 }
             }
         };
+        // The request's workspace snapshot overlapped the model call; it must be
+        // on disk before any tool can touch a file.
+        self.finish_checkpoint(state, vars).await;
         // Capture this turn's reasoning (from the sink) so the next turn's live
         // context can surface "what you thought last time". Bounded to the LAST
         // 2000 chars so it can't bloat the request and keeps the freshest tail.

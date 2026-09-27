@@ -23,7 +23,8 @@ impl CodingHarness {
             {
                 state.title = Some(text.clone());
             }
-            self.checkpoint(state, &text).await;
+            self.finish_checkpoint(state, vars).await;
+            self.begin_checkpoint(state, vars, &text);
             // Fresh request: re-discovery is legitimate again, and prior-turn
             // loop/thought/failure state belongs to the past run.
             vars.executed_calls.clear();
@@ -209,67 +210,71 @@ impl CodingHarness {
 
     /// Snapshot the workspace before a turn so the user can `/rewind` to it.
     /// Best-effort — a failure (no git, etc.) is skipped, never blocking the turn.
-    pub(super) async fn checkpoint(&self, state: &mut HarnessState, prompt: &str) {
+    pub(super) fn begin_checkpoint(&self, state: &HarnessState, vars: &mut LoopVars, prompt: &str) {
         let label: String = prompt.chars().take(80).collect();
         let workspace = self.context.workspace_root().to_path_buf();
-        let workspace_for_log = workspace.clone();
         let snap_label = label.clone();
-        // `git add -A` + commit-tree can take a while on a large workspace — run it
-        // off the async runtime so it never stalls streaming or other lanes.
-        let result = tokio::task::spawn_blocking(move || {
+        let snapshot = tokio::task::spawn_blocking(move || {
             crate::checkpoint::snapshot_diagnostic(&workspace, &snap_label)
-        })
-        .await;
-        let id = match result {
-            Ok(Ok(id)) => Some(id),
+        });
+        vars.pending_checkpoint = Some(PendingCheckpoint {
+            snapshot,
+            label,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            event_index: state.events.len(),
+            message_index: state.messages.len(),
+            compactions: state.compactions,
+        });
+    }
+
+    pub(super) async fn finish_checkpoint(&self, state: &mut HarnessState, vars: &mut LoopVars) {
+        let Some(pending) = vars.pending_checkpoint.take() else {
+            return;
+        };
+        let workspace = self.context.workspace_root().to_path_buf();
+        let id = match pending.snapshot.await {
+            Ok(Ok(id)) => id,
             Ok(Err(error)) => {
                 self.debug_log(&format!(
                     "checkpoint skipped: workspace={} label={:?} error={error}",
-                    workspace_for_log.display(),
-                    label
+                    workspace.display(),
+                    pending.label
                 ));
-                None
+                return;
             }
             Err(error) => {
                 self.debug_log(&format!(
                     "checkpoint skipped: workspace={} label={:?} snapshot task failed: {error}",
-                    workspace_for_log.display(),
-                    label
+                    workspace.display(),
+                    pending.label
                 ));
-                None
+                return;
             }
         };
-        if let Some(id) = id {
-            state.checkpoints.push(CheckpointRecord {
-                id,
-                label,
-                created_at: chrono::Utc::now().to_rfc3339(),
-                event_index: state.events.len(),
-                message_index: state.messages.len(),
-                compactions: state.compactions,
-            });
-            // Cap retained records so a long session doesn't bloat persisted state.
-            const MAX_CHECKPOINTS: usize = 8;
-            let len = state.checkpoints.len();
-            let dropped: Vec<String> = if len > MAX_CHECKPOINTS {
-                state
-                    .checkpoints
-                    .drain(..len - MAX_CHECKPOINTS)
-                    .map(|c| c.id)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            // Drop ONLY this session's aged-out snapshots from the shadow repo and
-            // gc so disk stays bounded (off the async runtime — gc can be slow).
-            // The shadow is shared by all sessions in the workspace, so pruning by
-            // "everything not in my keep list" destroyed sibling sessions' rewinds.
-            let keep: Vec<String> = state.checkpoints.iter().map(|c| c.id.clone()).collect();
-            let ws = self.context.workspace_root().to_path_buf();
-            let _ =
-                tokio::task::spawn_blocking(move || crate::checkpoint::prune(&ws, &keep, &dropped))
-                    .await;
+        state.checkpoints.push(CheckpointRecord {
+            id,
+            label: pending.label,
+            created_at: pending.created_at,
+            event_index: pending.event_index,
+            message_index: pending.message_index,
+            compactions: pending.compactions,
+        });
+        // Cap retained records so a long session doesn't bloat persisted state.
+        const MAX_CHECKPOINTS: usize = 8;
+        let len = state.checkpoints.len();
+        if len <= MAX_CHECKPOINTS {
+            return;
         }
+        let dropped: Vec<String> = state
+            .checkpoints
+            .drain(..len - MAX_CHECKPOINTS)
+            .map(|c| c.id)
+            .collect();
+        // Drop ONLY this session's aged-out snapshots: the shadow repo is shared
+        // by every session in the workspace. Runs in the background; the shadow
+        // lock keeps it from overlapping the next snapshot.
+        let keep: Vec<String> = state.checkpoints.iter().map(|c| c.id.clone()).collect();
+        tokio::task::spawn_blocking(move || crate::checkpoint::prune(&workspace, &keep, &dropped));
     }
 
     pub(super) fn new_lane_manager(

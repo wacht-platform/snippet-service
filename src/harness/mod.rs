@@ -746,6 +746,19 @@ struct LoopVars {
     consecutive_failed_edits: usize,
     /// Path of the file whose edit recently failed.
     last_failed_edit_path: Option<String>,
+    /// Workspace snapshot for the current request, still being taken off the
+    /// runtime. Finished before any tool runs so a rewind restores the files
+    /// exactly as they were when the request arrived.
+    pending_checkpoint: Option<PendingCheckpoint>,
+}
+
+struct PendingCheckpoint {
+    snapshot: tokio::task::JoinHandle<Result<String, String>>,
+    label: String,
+    created_at: String,
+    event_index: usize,
+    message_index: usize,
+    compactions: u64,
 }
 
 /// What a single model step resolved to.
