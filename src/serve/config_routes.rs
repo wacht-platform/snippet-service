@@ -102,6 +102,7 @@ pub(crate) async fn put_profile(
     };
     match result {
         Ok(name) => {
+            notify_models(None);
             Json(serde_json::json!({ "name": name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -132,6 +133,7 @@ pub(crate) async fn set_active(
     };
     match result {
         Ok(_) => {
+            notify_models(None);
             Json(serde_json::json!({ "active": req.name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -369,6 +371,7 @@ pub(crate) async fn set_delegate(
     };
     match result {
         Ok(_) => {
+            notify_models(None);
             Json(serde_json::json!({ "delegate": name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -394,6 +397,7 @@ pub(crate) async fn delete_profile(State(d): State<Shared>, Query(q): Query<Dele
     };
     match result {
         Ok(_) => {
+            notify_models(None);
             Json(serde_json::json!({ "removed": q.name })).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -426,6 +430,7 @@ pub(crate) async fn set_session_model(
         .await
     {
         Ok(()) => {
+            notify_models(Some(&req.session));
             Json(serde_json::json!({ "session": req.session, "profile": req.profile }))
                 .into_response()
         }
@@ -434,3 +439,10 @@ pub(crate) async fn set_session_model(
 }
 
 
+
+fn notify_models(session: Option<&str>) {
+    crate::session::emit_device_event(match session {
+        Some(id) => serde_json::json!({ "kind": "models", "session": id }),
+        None => serde_json::json!({ "kind": "models" }),
+    });
+}

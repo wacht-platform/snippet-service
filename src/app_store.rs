@@ -245,6 +245,56 @@ impl Store {
 
     // ---- notification journal ---------------------------------------------
 
+    pub fn append_notification_event(
+        &self,
+        mut event: serde_json::Value,
+        retention_secs: i64,
+    ) -> Result<serde_json::Value, StoreError> {
+        let kind = event
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let now = chrono::Utc::now().timestamp();
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let floor: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(event_id), 0) + 1 FROM notification_journal",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO notification_sequence (id, next_id) VALUES (1, ?1)
+                 ON CONFLICT (id) DO UPDATE SET next_id = MAX(next_id, ?1)",
+                params![floor],
+            )?;
+            let id: i64 = tx.query_row(
+                "SELECT next_id FROM notification_sequence WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE notification_sequence SET next_id = ?1 WHERE id = 1",
+                params![id + 1],
+            )?;
+            if let Some(obj) = event.as_object_mut() {
+                obj.insert("event_id".into(), serde_json::json!(id));
+                obj.insert("created_at".into(), serde_json::json!(now));
+            }
+            tx.execute(
+                "INSERT INTO notification_journal (event_id, kind, created_at, payload_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![id, kind, now, event.to_string()],
+            )?;
+            tx.execute(
+                "DELETE FROM notification_journal WHERE created_at < ?1",
+                params![now - retention_secs],
+            )?;
+            tx.commit()?;
+            Ok(event)
+        })
+    }
+
     pub fn notification_events_since(
         &self,
         since: u64,
@@ -252,7 +302,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, created_at, payload_json FROM notification_journal
-                 WHERE event_id > ?1 ORDER BY event_id",
+                 WHERE event_id > ?1 ORDER BY event_id LIMIT 500",
             )?;
             let rows = stmt.query_map(params![since as i64], |row| {
                 Ok((
