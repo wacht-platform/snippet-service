@@ -806,17 +806,22 @@ pub struct CodingHarness {
 
 mod compactor;
 mod events;
+mod live_context;
 mod memory_reflection;
+mod meta_tools;
+mod persistence;
 mod prompts;
 mod runner;
 pub mod state;
 mod step;
+mod transcript;
 
-use memory_reflection::*;
+use live_context::*;
 use prompts::*;
 pub use state::*;
+use transcript::*;
 
-pub(crate) use memory_reflection::notice_text;
+pub(crate) use transcript::notice_text;
 
 #[cfg(test)]
 mod tests;

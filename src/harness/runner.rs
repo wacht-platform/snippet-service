@@ -11,165 +11,6 @@ impl CodingHarness {
         }
     }
 
-    /// The durable session id: the bound id when present, else the state path's
-    /// id, which is the same identity the session list and tools use.
-    pub(super) fn session_id(&self) -> Option<String> {
-        if let Some(id) = self.context.durable_session_id() {
-            return Some(id.to_string());
-        }
-        self.config
-            .state_path
-            .as_deref()
-            .map(crate::session::session_id_for_state_path)
-    }
-
-    pub(super) fn store(&self) -> Option<crate::store::Store> {
-        let path = self.context.store_path()?;
-        crate::store::Store::open(path).ok()
-    }
-
-    /// Save the session to the database: scalar state plus the transcript tail.
-    ///
-    /// Appends only the messages and events that are not already durable, so the
-    /// common persist writes a handful of rows instead of re-serializing and
-    /// recompressing the whole conversation. `history_rewritten` is the signal
-    /// that a writer replaced the middle (compaction, rewind, rollback), where an
-    /// append would duplicate or misorder — those fall back to a full replace.
-    pub(super) async fn persist_to_store(&self, state: &mut HarnessState) -> Result<(), ToolError> {
-        let Some(store) = self.store() else {
-            return Ok(());
-        };
-        let Some(id) = self.session_id() else {
-            return Ok(());
-        };
-        let workspace = self.context.workspace_root().display().to_string();
-        let key = crate::config::workspace_key(self.context.workspace_root());
-        let title = state.title.clone();
-        let status = crate::session::status_str(state.status);
-        let scalar = scalar_json_in_place(state).map_err(ToolError::msg)?;
-        let now = state.updated_at.clone();
-
-        // Read the status BEFORE overwriting it: the transition is the entire
-        // content of the event, and `save_session_scalar` below destroys it.
-        let prev_status = store
-            .get_session_row(&id)
-            .ok()
-            .flatten()
-            .map(|row| row.status)
-            .unwrap_or_default();
-
-        let result = async {
-            store
-                .save_session_scalar(
-                    &id,
-                    &key,
-                    &workspace,
-                    title.as_deref(),
-                    &status,
-                    &scalar,
-                    &state.created_at,
-                    &now,
-                )
-                .map_err(|e| e.to_string())?;
-
-            let messages_rewritten = state.history_rewritten
-                || self.written_messages.load(std::sync::atomic::Ordering::Acquire)
-                    > state.messages.len();
-            let events_rewritten = state.events_rewritten
-                || self.written_events.load(std::sync::atomic::Ordering::Acquire) > state.events.len();
-            if messages_rewritten {
-                store
-                    .replace_conversation_messages(&id, &state.messages, &now)
-                    .map_err(|e| e.to_string())?;
-            } else {
-                let from = self.written_messages.load(std::sync::atomic::Ordering::Acquire);
-                if from < state.messages.len() {
-                    store
-                        .append_conversation_messages(&id, &state.messages[from..], &now)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            if events_rewritten {
-                store
-                    .replace_conversation_events(&id, &state.events, &now)
-                    .map_err(|e| e.to_string())?;
-            } else {
-                let from = self.written_events.load(std::sync::atomic::Ordering::Acquire);
-                if from < state.events.len() {
-                    store
-                        .append_conversation_events(&id, &state.events[from..], &now)
-                        .map_err(|e| e.to_string())?;
-                    if state.events[from..]
-                        .iter()
-                        .any(|e| matches!(e, HarnessEvent::ToolResult { .. }))
-                    {
-                        crate::session::emit_device_event(serde_json::json!({
-                            "kind": "activity",
-                            "session": id,
-                            "workspace": workspace,
-                        }));
-                    }
-                }
-            }
-            Ok::<(), String>(())
-        }
-        .await;
-
-        match result {
-            Ok(()) => {
-                self.written_messages
-                    .store(state.messages.len(), std::sync::atomic::Ordering::Release);
-                self.written_events
-                    .store(state.events.len(), std::sync::atomic::Ordering::Release);
-                state.history_rewritten = false;
-                state.events_rewritten = false;
-                // Park any work a dead session was doing. Done AFTER the write,
-                // so the parked state never contradicts what the store holds.
-                crate::session::park_failed_session_work(&id, &prev_status, state);
-                crate::session::emit_status_transition(
-                    &id,
-                    &prev_status,
-                    &status,
-                    title.as_deref(),
-                    &workspace,
-                );
-                Ok(())
-            }
-            Err(error) => Err(ToolError::msg(format!("persist session: {error}"))),
-        }
-    }
-
-    /// Load a session from the database, if this store has it.
-    ///
-    /// Returns `None` when there is no row, which is what keeps a session that
-    /// predates the store on its state file instead of silently re-initializing.
-    pub(super) async fn load_from_store(&self) -> Result<Option<HarnessState>, ToolError> {
-        let Some(store) = self.store() else {
-            return Ok(None);
-        };
-        let Some(id) = self.session_id() else {
-            return Ok(None);
-        };
-        let Some(scalar) = store
-            .load_session_scalar(&id)
-            .map_err(|e| ToolError::msg(format!("load session: {e}")))?
-        else {
-            return Ok(None);
-        };
-        let messages = store
-            .load_conversation_messages(&id)
-            .map_err(|e| ToolError::msg(format!("load messages: {e}")))?;
-        let events = store
-            .load_conversation_events(&id)
-            .map_err(|e| ToolError::msg(format!("load events: {e}")))?;
-        self.written_messages
-            .store(messages.len(), std::sync::atomic::Ordering::Release);
-        self.written_events
-            .store(events.len(), std::sync::atomic::Ordering::Release);
-        let state = state_from_scalar(&scalar, messages, events).map_err(ToolError::msg)?;
-        Ok(Some(state))
-    }
-
     /// One-shot run: drive the agent until it ends a turn (via `complete`), then
     /// return the outcome. Delegation is disabled (no model factory). Used by the
     /// library, by tests, and by each background lane.
@@ -782,3 +623,76 @@ impl CodingHarness {
     }
 }
 
+impl CodingHarness {
+    pub(super) async fn recover(
+        &self,
+        state: &mut HarnessState,
+        consecutive_errors: &mut usize,
+    ) -> RecoveryAction {
+        *consecutive_errors += 1;
+        let max = self.config.max_consecutive_recovery;
+        if *consecutive_errors > max {
+            return RecoveryAction::GiveUp;
+        }
+        if max > 0 && *consecutive_errors == max {
+            // Last chance: inject a runtime correction, then let the loop retry.
+            let correction = RuntimeCorrectionKind::LlmRequestFailed;
+            state.events.push(HarnessEvent::SystemDecision {
+                step: correction.step().to_string(),
+                reasoning: correction.reasoning().to_string(),
+            });
+            state.messages.push(HarnessMessage::System {
+                content: correction.reasoning().to_string(),
+            });
+            return RecoveryAction::Retry;
+        }
+        sleep(backoff_delay(
+            *consecutive_errors,
+            self.config.recovery_base_ms,
+            self.config.recovery_max_ms,
+        ))
+        .await;
+        RecoveryAction::Retry
+    }
+
+    /// Append a line to `<state_dir>/debug.log` for tracing model/loop behaviour.
+    /// No-op when no state path is configured.
+    pub(super) fn lane_progress(&self, kind: &str, text: impl Into<String>) {
+        let (Some(tx), Some(id)) = (&self.config.progress_tx, &self.config.progress_id) else {
+            return;
+        };
+        let _ = tx.send(crate::lanes::LaneProgress {
+            id: id.clone(),
+            kind: kind.to_string(),
+            text: text.into(),
+        });
+    }
+
+    pub(super) fn debug_log(&self, line: &str) {
+        let Some(path) = self.config.state_path.as_ref() else {
+            return;
+        };
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        let log_path = dir.join("debug.log");
+        let stamp = Utc::now().format("%H:%M:%S%.3f");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{stamp} {line}");
+        }
+    }
+}
+
+pub(super) fn backoff_delay(attempt: usize, base_ms: u64, max_ms: u64) -> Duration {
+    let shift = (attempt.saturating_sub(1)).min(7) as u32;
+    let delay = base_ms
+        .max(1)
+        .saturating_mul(1u64 << shift)
+        .min(max_ms.max(1));
+    Duration::from_millis(delay)
+}
