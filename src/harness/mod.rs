@@ -805,7 +805,9 @@ pub struct CodingHarness {
 
 
 mod compactor;
+mod dispatch;
 mod events;
+mod guards;
 mod live_context;
 mod memory_reflection;
 mod meta_tools;
@@ -816,6 +818,7 @@ pub mod state;
 mod step;
 mod transcript;
 
+use guards::*;
 use live_context::*;
 use prompts::*;
 pub use state::*;
