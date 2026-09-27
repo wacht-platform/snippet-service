@@ -1,605 +1,6 @@
 use super::*;
 
 impl CodingHarness {
-    pub(super) fn dispatch_meta(
-        &self,
-        state: &mut HarnessState,
-        lanes: &mut LaneManager,
-        watches: &mut WatchManager,
-        tool_name: &str,
-        arguments: &Value,
-    ) -> (Value, MetaControl) {
-        match tool_name {
-            "cancel_delegated_task" => {
-                let lane_id = arguments
-                    .get("lane_id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty());
-                let reason = arguments
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|reason| !reason.is_empty());
-                match (lane_id, reason) {
-                    (Some(lane_id), Some(reason)) => match lanes.cancel(lane_id, reason) {
-                        Ok(title) => {
-                            state.events.push(HarnessEvent::LaneCancelled {
-                                id: lane_id.to_string(),
-                                title: title.clone(),
-                                reason: reason.to_string(),
-                            });
-                            (
-                                json!({"schema_version": 1, "status": "success", "data": {
-                                    "cancelled": true,
-                                    "lane_id": lane_id,
-                                    "title": title,
-                                    "note": "The delegated scope is now yours. Partial workspace changes were preserved; inspect and validate them before continuing."
-                                }}),
-                                MetaControl::Continue,
-                            )
-                        }
-                        Err(error) => (tool_error(error), MetaControl::Continue),
-                    },
-                    _ => (
-                        tool_error(
-                            "cancel_delegated_task requires non-empty `lane_id` and `reason`.",
-                        ),
-                        MetaControl::Continue,
-                    ),
-                }
-            }
-            "note" => {
-                let entry = arguments
-                    .get("entry")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let Some(entry) = entry else {
-                    return (
-                        tool_error("note requires a non-empty `entry`."),
-                        MetaControl::Continue,
-                    );
-                };
-                state.events.push(HarnessEvent::Note {
-                    entry: entry.to_string(),
-                });
-                (
-                    json!({"schema_version": 1, "status": "success", "data": {"noted": true}}),
-                    MetaControl::Continue,
-                )
-            }
-            "set_session_title" => {
-                let title = arguments
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::trim);
-                let Some(title) = title else {
-                    return (
-                        tool_error("set_session_title requires a `title` string."),
-                        MetaControl::Continue,
-                    );
-                };
-                state.title = (!title.is_empty()).then(|| title.to_string());
-                (
-                    json!({"schema_version": 1, "status": "success", "data": {
-                        "renamed": true,
-                        "title": state.title,
-                    }}),
-                    MetaControl::Continue,
-                )
-            }
-            "present_file" => {
-                let path = arguments
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let Some(path) = path else {
-                    return (
-                        tool_error("present_file requires a `path`."),
-                        MetaControl::Continue,
-                    );
-                };
-                let resolved = if std::path::Path::new(path).is_absolute() {
-                    std::path::PathBuf::from(path)
-                } else {
-                    self.context.workspace_root().join(path)
-                };
-                // Only real files get presented — a hallucinated or not-yet-written
-                // path fails loudly so the agent writes the file first.
-                if !resolved.is_file() {
-                    return (
-                        tool_error(format!(
-                            "present_file: `{path}` does not exist — write the file before presenting it."
-                        )),
-                        MetaControl::Continue,
-                    );
-                }
-                let caption = arguments
-                    .get("caption")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
-                let shown = resolved.display().to_string();
-                state.events.push(HarnessEvent::FilePresented {
-                    path: shown.clone(),
-                    caption,
-                });
-                (
-                    json!({"schema_version": 1, "status": "success", "data": {
-                        "presented": shown,
-                        "note": "shown to the user as an openable file card; continue your turn as usual",
-                    }}),
-                    MetaControl::Continue,
-                )
-            }
-            "complete_goal" => {
-                let summary = arguments
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                match state.goal.as_mut() {
-                    Some(goal) if goal.status == GoalStatus::Active => {
-                        goal.status = GoalStatus::Complete;
-                        let text = goal.text.clone();
-                        state.events.push(HarnessEvent::SystemDecision {
-                            step: "goal_completed".to_string(),
-                            reasoning: if summary.is_empty() {
-                                text
-                            } else {
-                                summary.clone()
-                            },
-                        });
-                        (
-                            json!({"schema_version": 1, "status": "success", "data": {"completed": true}}),
-                            MetaControl::EndTurn {
-                                kind: TurnEndKind::Complete,
-                                final_text: Some(if summary.is_empty() {
-                                    "Goal complete.".to_string()
-                                } else {
-                                    summary
-                                }),
-                            },
-                        )
-                    }
-                    _ => (
-                        tool_error("complete_goal: there is no active goal to complete."),
-                        MetaControl::Continue,
-                    ),
-                }
-            }
-            "ask_user" => match parse_ask_user(arguments) {
-                Ok(rendered) => {
-                    let prompt_text = first_question_text(&rendered)
-                        .or_else(|| {
-                            rendered
-                                .get("context")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_else(|| "Waiting for your input.".to_string());
-                    state.events.push(HarnessEvent::UserQuestion {
-                        questions: rendered.clone(),
-                    });
-                    state.pending_question = Some(rendered);
-                    (
-                        json!({"schema_version": 1, "status": "success", "data": {"asked": true}}),
-                        MetaControl::EndTurn {
-                            kind: TurnEndKind::Ask,
-                            final_text: Some(prompt_text),
-                        },
-                    )
-                }
-                Err(error) => (tool_error(error), MetaControl::Continue),
-            },
-            "delegate_task" => match parse_delegate_brief(arguments) {
-                Ok(brief) => {
-                    // Follow-up to an existing lane: resume it with the new brief,
-                    // context intact.
-                    if let Some(lane_id) = brief.lane_id.as_deref() {
-                        return match lanes.follow_up(lane_id, &brief.description) {
-                            Ok(title) => {
-                                state.events.push(HarnessEvent::LaneSpawned {
-                                    id: lane_id.to_string(),
-                                    title: title.clone(),
-                                });
-                                (
-                                    json!({
-                                        "schema_version": 1,
-                                        "status": "success",
-                                        "data": {
-                                            "continued": true,
-                                            "lane_id": lane_id,
-                                            "title": title,
-                                            "note": "Lane resumed with its prior context; its report will arrive as a [lane_report] message.",
-                                        }
-                                    }),
-                                    MetaControl::Continue,
-                                )
-                            }
-                            Err(error) => (tool_error(error), MetaControl::Continue),
-                        };
-                    }
-                    match lanes.spawn(
-                        &brief.title,
-                        &brief.description,
-                        brief.read_only,
-                        brief.agent.clone(),
-                        brief.profile.clone(),
-                    ) {
-                        Ok(id) => {
-                            state.events.push(HarnessEvent::LaneSpawned {
-                                id: id.clone(),
-                                title: brief.title.clone(),
-                            });
-                            let mut data = json!({
-                                "delegated": true,
-                                "lane_id": id,
-                                "title": brief.title,
-                                "access": if brief.read_only { "read_only" } else { "full" },
-                                "note": "Lane runs in the background; its report will arrive as a [lane_report] message. Follow up later by re-calling delegate_task with this lane_id.",
-                            });
-                            if let Some(ref agent) = brief.agent {
-                                data["agent"] = json!(agent);
-                            }
-                            if let Some(ref profile) = brief.profile {
-                                data["profile"] = json!(profile);
-                            }
-                            (
-                                json!({
-                                    "schema_version": 1,
-                                    "status": "success",
-                                    "data": data,
-                                }),
-                                MetaControl::Continue,
-                            )
-                        }
-                        Err(error) => (tool_error(error), MetaControl::Continue),
-                    }
-                }
-                Err(error) => (tool_error(error), MetaControl::Continue),
-            },
-            "monitor" => {
-                let action = arguments
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .unwrap_or("add");
-                match action {
-                    "add" => {
-                        let Some(path) = arguments
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                        else {
-                            return (
-                                tool_error("monitor add requires a `path`."),
-                                MetaControl::Continue,
-                            );
-                        };
-                        let label = arguments
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(path);
-                        let filter = arguments
-                            .get("filter")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty());
-                        match watches.add(path, label, filter) {
-                            Ok(record) => {
-                                state.watches = watches.records().to_vec();
-                                state.events.push(HarnessEvent::SystemDecision {
-                                    step: "watch_added".to_string(),
-                                    reasoning: format!(
-                                        "watching \"{}\" ({})",
-                                        record.label, record.path
-                                    ),
-                                });
-                                (
-                                    json!({
-                                        "schema_version": 1,
-                                        "status": "success",
-                                        "data": {
-                                            "watching": true,
-                                            "watch_id": record.id,
-                                            "label": record.label,
-                                            "path": record.path,
-                                            "note": "Tailing from the current end of file. Appended text arrives as a [file_watch] message (debounced per burst); ending your turn is how you wait for it.",
-                                        }
-                                    }),
-                                    MetaControl::Continue,
-                                )
-                            }
-                            Err(error) => (tool_error(error), MetaControl::Continue),
-                        }
-                    }
-                    "remove" => {
-                        let key = arguments
-                            .get("watch_id")
-                            .or_else(|| arguments.get("path"))
-                            .or_else(|| arguments.get("label"))
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty());
-                        let Some(key) = key else {
-                            return (
-                                tool_error(
-                                    "monitor remove needs a `watch_id`, `path`, or `label`.",
-                                ),
-                                MetaControl::Continue,
-                            );
-                        };
-                        match watches.remove(key) {
-                            Ok(label) => {
-                                state.watches = watches.records().to_vec();
-                                state.events.push(HarnessEvent::SystemDecision {
-                                    step: "watch_removed".to_string(),
-                                    reasoning: format!("stopped watching \"{label}\""),
-                                });
-                                (
-                                    json!({
-                                        "schema_version": 1,
-                                        "status": "success",
-                                        "data": { "removed": true, "label": label }
-                                    }),
-                                    MetaControl::Continue,
-                                )
-                            }
-                            Err(error) => (tool_error(error), MetaControl::Continue),
-                        }
-                    }
-                    "list" => (
-                        json!({
-                            "schema_version": 1,
-                            "status": "success",
-                            "data": {
-                                "watches": watches.records().iter().map(|r| json!({
-                                    "watch_id": r.id,
-                                    "label": r.label,
-                                    "path": r.path,
-                                    "filter": r.filter,
-                                })).collect::<Vec<_>>(),
-                            }
-                        }),
-                        MetaControl::Continue,
-                    ),
-                    other => (
-                        tool_error(format!(
-                            "monitor action must be add | remove | list, got `{other}`."
-                        )),
-                        MetaControl::Continue,
-                    ),
-                }
-            }
-            other => (
-                tool_error(format!("`{other}` is not a recognized meta tool.")),
-                MetaControl::Continue,
-            ),
-        }
-    }
-
-    pub(super) fn definitions_for(
-        &self,
-        conversation_mode: bool,
-        goal_active: bool,
-    ) -> Vec<crate::llm::NativeToolDefinition> {
-        let mut definitions = self.tools.definitions();
-        if conversation_mode {
-            // User-facing: meta tools (note/ask_user/delegate); no terminate tool —
-            // a plain reply ends the turn. `complete_goal` is added only while a goal runs.
-            definitions.extend(meta::conversation_meta_definitions_for(
-                goal_active,
-                self.config.allow_lane_control,
-            ));
-        } else {
-            // Headless (lanes / one-shot run): an explicit terminate_loop carries a
-            // structured summary back to the caller.
-            definitions.push(meta::terminate_loop_tool());
-        }
-        definitions
-    }
-
-    pub(super) async fn recover(
-        &self,
-        state: &mut HarnessState,
-        consecutive_errors: &mut usize,
-    ) -> RecoveryAction {
-        *consecutive_errors += 1;
-        let max = self.config.max_consecutive_recovery;
-        if *consecutive_errors > max {
-            return RecoveryAction::GiveUp;
-        }
-        if max > 0 && *consecutive_errors == max {
-            // Last chance: inject a runtime correction, then let the loop retry.
-            let correction = RuntimeCorrectionKind::LlmRequestFailed;
-            state.events.push(HarnessEvent::SystemDecision {
-                step: correction.step().to_string(),
-                reasoning: correction.reasoning().to_string(),
-            });
-            state.messages.push(HarnessMessage::System {
-                content: correction.reasoning().to_string(),
-            });
-            return RecoveryAction::Retry;
-        }
-        sleep(backoff_delay(
-            *consecutive_errors,
-            self.config.recovery_base_ms,
-            self.config.recovery_max_ms,
-        ))
-        .await;
-        RecoveryAction::Retry
-    }
-
-    /// Bring a session loaded from either store into the current run.
-    ///
-    /// Both stores converge here so a resumed session behaves identically
-    /// regardless of where it came from: the workspace and context window are
-    /// refreshed, the system prefix is re-seeded (so new workspace memory lands),
-    /// and any half-written tool batch is repaired so strict providers don't 400
-    /// on the history forever after.
-    pub(super) async fn resume_loaded_state(
-        &self,
-        mut state: HarnessState,
-        seeded_system: String,
-        initial_request: Option<String>,
-    ) -> Result<HarnessState, ToolError> {
-        // Migrate old metadata in memory; the next persist omits the legacy
-        // `user_request` field and keeps the title as identity.
-        normalize_state_title(&mut state);
-        // Reflect the current run's folder (backfills pre-field states).
-        state.workspace = self.context.workspace_root().display().to_string();
-        state.context_window = self.config.context_window_tokens;
-        // Refresh the system prefix so resumed sessions pick up the latest
-        // workspace memory (guarded: no-op if messages[0] isn't System).
-        if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
-            *content = seeded_system;
-        }
-        // A crash mid tool-batch persists an assistant `tool_calls` message whose
-        // later calls never got results; strict providers (Anthropic, DeepSeek)
-        // 400 on that history forever after. Repair on load so a resumed session
-        // is always well-formed.
-        let loaded_messages = state.messages.len();
-        repair_unanswered_tool_calls(&mut state.messages);
-        if state.messages.len() != loaded_messages {
-            state.history_rewritten = true;
-        }
-        repair_unanswered_tool_events(&mut state.events, 0);
-        if let Some(request) = initial_request
-            .map(|r| r.trim().to_string())
-            .filter(|r| !r.is_empty())
-        {
-            state.status = HarnessStatus::Running;
-            state.final_text = None;
-            state.pending_question = None;
-            state.messages.push(HarnessMessage::User {
-                content: request.clone(),
-            });
-            state.events.push(HarnessEvent::UserInput { text: request });
-            self.bump_activity();
-            self.persist_state(&mut state).await?;
-        }
-        Ok(state)
-    }
-
-    pub(super) async fn load_or_initialize_state(
-        &self,
-        initial_request: Option<String>,
-    ) -> Result<HarnessState, ToolError> {
-        // Build the per-workspace memory block once and fold it into the system
-        // prefix, so it rides in the cached prompt and refreshes every session
-        // (including resume). Within a session it stays fixed; mid-session writes
-        // are visible to the agent only on the next start (cache-stable by design).
-        let seeded_system = {
-            let block = if self.config.memory_enabled {
-                crate::memory::render_session_memory(
-                    self.context.workspace_root(),
-                    self.config.memory_index_budget_chars,
-                )
-            } else {
-                None
-            };
-            match block {
-                Some(b) => format!("{}\n\n{}", self.config.system_prompt, b),
-                None => self.config.system_prompt.clone(),
-            }
-        };
-
-        if self.config.resume
-            && let Some(state) = self.load_from_store().await?
-        {
-            return self.resume_loaded_state(state, seeded_system, initial_request).await;
-        }
-
-        // Fresh session in this folder: keep snippet's `.snippet/` workspace scratch
-        // (bg processes, lanes) out of the user's git history. Main agent only —
-        // lanes share the workspace and would just race on the same file.
-        if self.context.owner() == "main" {
-            ensure_snippet_gitignored(self.context.workspace_root());
-        }
-
-        let now = Utc::now().to_rfc3339();
-        let request = initial_request
-            .map(|r| r.trim().to_string())
-            .filter(|r| !r.is_empty());
-        let mut messages = vec![HarnessMessage::System {
-            content: seeded_system,
-        }];
-        let mut events = Vec::new();
-        let (status, title) = match request.as_ref() {
-            Some(text) => {
-                messages.push(HarnessMessage::User {
-                    content: text.clone(),
-                });
-                events.push(HarnessEvent::UserInput { text: text.clone() });
-                (HarnessStatus::Running, Some(text.clone()))
-            }
-            None => (HarnessStatus::Idle, None),
-        };
-        let mut state = HarnessState {
-            version: 1,
-            status,
-            created_at: now.clone(),
-            updated_at: now.clone(),
-            workspace: self.context.workspace_root().display().to_string(),
-            title,
-            legacy_request: String::new(),
-            goal: None,
-            compacting: false,
-            turn_started_at: if matches!(status, HarnessStatus::Running) {
-                Some(now.clone())
-            } else {
-                None
-            },
-            compacting_started_at: None,
-            watches: Vec::new(),
-            messages,
-            events,
-            iterations: 0,
-            final_text: None,
-            lanes: Vec::new(),
-            pending_question: None,
-            approval_mode: if self.config.manual_approval {
-                ApprovalMode::Manual
-            } else {
-                ApprovalMode::Auto
-            },
-            total_tokens: 0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            last_prompt_tokens: 0,
-            cache_read_tokens: 0,
-            checkpoints: Vec::new(),
-            rate_limit: None,
-            context_window: self.config.context_window_tokens,
-            tool_payloads_pruned: false,
-            queued_inputs: Vec::new(),
-            history_rewritten: false,
-            events_rewritten: false,
-            compactions: 0,
-        };
-        self.persist_state(&mut state).await?;
-        if request.is_some() {
-            self.bump_activity();
-        }
-        Ok(state)
-    }
-
-    pub(super) async fn persist(
-        &self,
-        state: &mut HarnessState,
-        lanes: &LaneManager,
-    ) -> Result<(), ToolError> {
-        state.lanes = lanes.records().to_vec();
-        self.persist_state(state).await
-    }
-
     pub(super) async fn compact_history_if_needed(
         &self,
         model: &mut dyn AgentModel,
@@ -858,7 +259,9 @@ impl CodingHarness {
             let user_reqs = extract_user_requests("", messages, original_request);
             if !user_reqs.is_empty() {
                 summary.push_str("# User Requests\n");
-                summary.push_str("The following were the most recent user requests in chronological order:\n");
+                summary.push_str(
+                    "The following were the most recent user requests in chronological order:\n",
+                );
                 for (i, req) in user_reqs.iter().enumerate() {
                     summary.push_str(&format!("{}. {}\n", i + 1, req));
                 }
@@ -868,21 +271,33 @@ impl CodingHarness {
             summary.push_str("# Previous Session Summary:\n<summary>\n");
             let mut section_idx = 1;
             if !objective.is_empty() {
-                summary.push_str(&format!("### {section_idx}. Task Overview\n{}\n\n", objective.join("\n")));
+                summary.push_str(&format!(
+                    "### {section_idx}. Task Overview\n{}\n\n",
+                    objective.join("\n")
+                ));
                 section_idx += 1;
             }
             if !outcomes.is_empty() {
-                summary.push_str(&format!("### {section_idx}. Progress\n{}\n\n", outcomes.join("\n")));
+                summary.push_str(&format!(
+                    "### {section_idx}. Progress\n{}\n\n",
+                    outcomes.join("\n")
+                ));
                 section_idx += 1;
             }
             if !decisions.is_empty() || !errors_open.is_empty() {
                 let mut tech = decisions.clone();
                 tech.extend(errors_open.clone());
-                summary.push_str(&format!("### {section_idx}. Key Findings & Technical Decisions\n{}\n\n", tech.join("\n")));
+                summary.push_str(&format!(
+                    "### {section_idx}. Key Findings & Technical Decisions\n{}\n\n",
+                    tech.join("\n")
+                ));
                 section_idx += 1;
             }
             if !actions.is_empty() {
-                summary.push_str(&format!("### {section_idx}. Next Steps\n{}\n\n", actions.join("\n")));
+                summary.push_str(&format!(
+                    "### {section_idx}. Next Steps\n{}\n\n",
+                    actions.join("\n")
+                ));
             }
             summary.push_str("</summary>\n</CONTEXT_SUMMARY>");
 
@@ -985,7 +400,10 @@ impl CodingHarness {
             let final_summary = if let (Some(store), Some(session_id)) = (&store, session_id) {
                 match crate::history_archive::archive_messages(store, session_id, &older, &now) {
                     Ok(summaries) => {
-                        let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
+                        let micro = crate::history_archive::render_micro_pointers(
+                            original_request,
+                            &summaries,
+                        );
                         format!("{summary}\n\n{micro}")
                     }
                     Err(_) => summary,
@@ -1168,7 +586,8 @@ impl CodingHarness {
         let compacted_content = if let (Some(store), Some(session_id)) = (&store, session_id) {
             match crate::history_archive::archive_messages(store, session_id, to_archive, &now) {
                 Ok(summaries) => {
-                    let micro = crate::history_archive::render_micro_pointers(original_request, &summaries);
+                    let micro =
+                        crate::history_archive::render_micro_pointers(original_request, &summaries);
                     format!("{table}\n\n{micro}")
                 }
                 Err(e) => {
@@ -1243,4 +662,3 @@ impl CodingHarness {
         Ok(())
     }
 }
-
