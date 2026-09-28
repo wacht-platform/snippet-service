@@ -8,7 +8,7 @@
 //! Progressive disclosure: skills are NOT preloaded into context — the agent
 //! finds them on demand with `search_skills` (level 1: name + description),
 //! loads a body with `skill(name)` (level 2), and reads/runs bundled files with
-//! the normal read_file / bash tools (level 3).
+//! bash (level 3).
 
 use std::path::{Path, PathBuf};
 
@@ -261,7 +261,7 @@ fn bundled_files(dir: &Path) -> Vec<String> {
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             } else if p.file_name().map(|n| n != "SKILL.md").unwrap_or(true) {
-                // Absolute paths, so the agent can read_file / bash them directly.
+                // Absolute paths, so the agent can read or run them from bash directly.
                 files.push(p.display().to_string());
             }
         }

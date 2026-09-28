@@ -58,8 +58,8 @@ impl CodingHarness {
     ) -> Result<HarnessState, ToolError> {
         // Build the memory block once and fold it into the system prefix, so it
         // rides in the cached prompt and refreshes every session (including
-        // resume). Within a session it stays fixed; `snippet memory toc` shows
-        // the live state.
+        // resume). Within a session it stays fixed; the files show the live
+        // state.
         let seeded_system = if self.config.memory_enabled {
             format!(
                 "{}\n\n{}",

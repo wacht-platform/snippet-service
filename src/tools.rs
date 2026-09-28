@@ -411,13 +411,13 @@ impl ToolRegistry {
 }
 
 /// Inline ceiling before a tool result is spilled to a scratch file the agent
-/// pages with `read_file`. Ported from wacht's `apply_output_postprocess`.
+/// reads with the shell. Ported from wacht's `apply_output_postprocess`.
 const MAX_INLINE_OUTPUT_CHARS: usize = 60_000;
 
 /// Keep tool output bounded: when a result renders larger than the inline
 /// ceiling, write the full payload to `<workspace>/.snippet/scratch/` and return
-/// a small preview envelope pointing at it. `read_file`/`read_image` page
-/// themselves, so they're exempt.
+/// a small preview envelope pointing at it. `bash` truncates and saves its own
+/// output and `view_image` carries an image, so they're exempt.
 fn bound_tool_output(ctx: &ToolContext, name: &str, value: Value) -> Value {
     if matches!(name, "view_image" | "bash") {
         return value;
@@ -455,8 +455,8 @@ fn bound_tool_output(ctx: &ToolContext, name: &str, value: Value) -> Value {
                 "original_stats": stats,
                 "hint": format!(
                     "Output exceeded the inline limit; the full result was saved to `{rel}`. \
-                     Page it with read_file using start_char/end_char windows, or rerun with a \
-                     narrower command."
+                     Read the part you need with `sed -n`, `head` or `rg` in bash, or rerun \
+                     with a narrower command."
                 ),
             })
         }

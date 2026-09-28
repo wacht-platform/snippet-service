@@ -72,8 +72,7 @@ impl CodingHarness {
     }
 
     /// Stamp base64 image bytes onto vision tool results so the model can SEE the
-    /// image. Covers `read_image` and `read_file` when it auto-routed an image
-    /// (envelope has `/data/mime` + path, no text `content`). Done per-turn on
+    /// image (`view_image` results, which carry `/data/mime` and a path). Done per-turn on
     /// the cloned request only (never persisted).
     pub(super) fn inline_images(&self, messages: &mut [HarnessMessage], supports_images: bool) {
         use base64::{Engine, engine::general_purpose::STANDARD};

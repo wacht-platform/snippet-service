@@ -221,7 +221,7 @@ impl Tool for BashTool {
             value["total_lines"] = json!(total_lines);
             value["total_bytes"] = json!(total_bytes);
             value["hint"] = json!(format!(
-                "Output exceeded display limit; full output ({total_lines} lines, {total_bytes} bytes) saved to `{rel_log_path}`. Inspect it using read_file, grep, head, or tail."
+                "Output exceeded display limit; full output ({total_lines} lines, {total_bytes} bytes) saved to `{rel_log_path}`. Read the part you need with `sed -n`, `rg`, `head` or `tail`."
             ));
         }
 

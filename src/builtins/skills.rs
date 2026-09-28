@@ -63,7 +63,7 @@ impl Tool for SkillTool {
         NativeToolDefinition {
             name: "skill".to_string(),
             description:
-                "Load an Agent Skill by name (find one first with search_skills) — returns its full instructions (SKILL.md) plus the absolute paths of its bundled files. After loading, follow the instructions; read referenced files with read_file and run bundled scripts with bash (their contents stay out of context until you do)."
+                "Load an Agent Skill by name (find one first with search_skills) — returns its full instructions (SKILL.md) plus the absolute paths of its bundled files. After loading, follow the instructions; read referenced files and run bundled scripts with bash (their contents stay out of context until you do)."
                     .to_string(),
             input_schema: object_schema(
                 json!({
