@@ -440,6 +440,9 @@ impl CodingHarness {
         let bash_command = (tool_name == "bash")
             .then(|| call.arguments.get("command").and_then(Value::as_str).map(str::to_string))
             .flatten();
+        let background = call.arguments.get("background").and_then(Value::as_bool) == Some(true);
+        let change_args = (tool_name == "change_files").then(|| call.arguments.clone());
+        let cwd_before = self.context.current_dir();
         let mut result = match self
             .tools
             .execute(&self.context, &tool_name, call.arguments)
@@ -457,10 +460,15 @@ impl CodingHarness {
         }
         if tool_name == "change_files" {
             note_edit_result(vars, edit_path, is_err);
+            if let Some(arguments) = change_args.as_ref().filter(|_| !is_err) {
+                note_file_change(vars, arguments);
+            }
         }
         if let Some(command) = bash_command
             && !is_err
+            && !background
         {
+            note_bash_command(vars, &command, &cwd_before);
             collapse_repeated_output(vars, command, &mut result);
         }
         if !is_err && !markdown_read.is_empty() {

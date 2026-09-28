@@ -17,6 +17,14 @@ pub enum RuntimeSignal {
     ShellDiscipline { message: String },
     /// The same shell-discipline nudge fired again — escalate to reflect-and-switch.
     ShellDisciplineEscalated { count: usize },
+    /// The same unchanged file was read several times this request.
+    RepeatedRead { path: String, count: usize },
+    /// The same file was rewritten from scratch several times this request.
+    Rewrite { path: String, count: usize },
+    /// Several tool-call turns in a row without a word to the user.
+    SilentRun { turns: usize },
+    /// Several file-change batches with nothing run to check them.
+    UnverifiedEdits { count: usize },
     /// Several plan-only turns in a row with no real work.
     PlanOnly { count: usize },
     /// The plan has unfinished steps but hasn't been updated in a while.
@@ -60,6 +68,25 @@ impl RuntimeSignal {
                 "You have used the shell to change files {count} times despite the earlier \
                  note. Stop and switch: change files only with `change_files`; keep the shell for \
                  reading, searching and running things."
+            ),
+            Self::RepeatedRead { path, count } => format!(
+                "You have read `{path}` {count} times this task and it hasn't changed; its \
+                 content is already in your context above. Work from what you read."
+            ),
+            Self::Rewrite { path, count } => format!(
+                "You have rewritten `{path}` from scratch {count} times. Rewriting a whole \
+                 script and rerunning it blind is not converging. Keep the system you are \
+                 driving running, take one small step at a time with a short command or \
+                 script, and look at the result before the next step."
+            ),
+            Self::SilentRun { turns } => format!(
+                "You have made {turns} rounds of tool calls without saying anything. Before the \
+                 next call, write one or two sentences: what you have found so far and what you \
+                 are doing next."
+            ),
+            Self::UnverifiedEdits { count } => format!(
+                "You have changed files {count} times without running anything to check them. \
+                 Build or run the narrowest test now, before changing more."
             ),
             Self::PlanOnly { count } => format!(
                 "You have updated the plan {count} times in a row without doing any work. Act \

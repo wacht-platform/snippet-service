@@ -1,3 +1,3 @@
-[vault]
-# Rendered when the vault holds at least one secret.
-rule = "Use listed secrets only as `$NAME` in bash — the value is injected and REDACTED (you see only [vault:NAME]). Never print, reveal, or persist a secret. Any command referencing a secret pauses for explicit user approval, so don't batch it with unrelated work; a delegated lane can't get that approval, so do the secret step yourself on the main session. For a missing secret, ask the user to add it (`snippet vault set NAME`), never to paste it in chat."
+## Vault
+
+Use the vault secrets you're told about only as `$NAME` in bash: the value is injected into the command and redacted from what you see (`[vault:NAME]`). Never print, reveal or persist a secret. A command that references a secret pauses for the user's approval, so don't batch it with unrelated work, and do secret steps yourself rather than in a delegated lane, which can't get approval. If a secret is missing, ask the user to add it with `snippet vault set NAME`; never ask them to paste it into the chat.

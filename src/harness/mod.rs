@@ -28,6 +28,14 @@ const PLAN_LOOP_AT: usize = 3;
 /// Tool-call turns without a plan update, while steps are unfinished, before a
 /// reminder to bring the plan up to date.
 const PLAN_STALE_AFTER: u64 = 10;
+/// Reads of the same unchanged file in one request before a reminder.
+const REPEATED_READ_AT: usize = 3;
+/// Consecutive tool-call turns without a word before asking for a progress note.
+const SILENT_RUN_AT: usize = 5;
+/// File-change calls with nothing run in between before asking for a check.
+const UNVERIFIED_EDITS_AT: usize = 4;
+/// Whole-file rewrites of the same path in one request before a reminder.
+const REWRITE_AT: usize = 3;
 
 /// A single-turn tool batch this large raises `BatchBackpressure`.
 const LARGE_TOOL_BATCH: usize = 10;
@@ -733,6 +741,15 @@ struct LoopVars {
     consecutive_plan_count: usize,
     /// Tool-call turns since the plan was last updated.
     turns_since_plan: u64,
+    /// Files read this request: content fingerprint and how many times it was
+    /// read unchanged, to catch re-reading the same file.
+    file_reads: std::collections::HashMap<std::path::PathBuf, (u64, usize)>,
+    /// Consecutive tool-call turns without any text from the model.
+    silent_turns: usize,
+    /// Whole-file rewrites (`create` with `overwrite`) per path this request.
+    rewrites: std::collections::HashMap<String, usize>,
+    /// Successful file-change calls since the last command that wasn't a read.
+    edits_since_check: usize,
     /// Consecutive tool-call turns that did no real work (plan-only / unknown tools).
     unproductive_turns: usize,
     /// Consecutive turns in which EVERY executed tool call failed — the approach
