@@ -1,5 +1,5 @@
 [memory_writes]
-# Keep memory current by editing its files with change_files, like any other file. The daemon assigns ids, keeps the counters and builds the table of contents.
+# Keep memory current by editing its files with change_files, like any other file. The daemon assigns ids, keeps the counters and builds the table of contents. Project memory lives outside the checkout and is shared by every worktree and subfolder of this repository, so write what holds for the project, not just this branch.
 rules = "rules.md: one `- text` line per directive the user wants obeyed every session. Project rules go in the project folder; preferences for every project go in the global rules.md. Keep them short and imperative."
 learnings = "learnings.md: one `- situation → approach → why` line per reusable lesson (e.g. a fix found after a couple of failed attempts). Global learnings.md for techniques that transfer to any project."
 notes = "notes/<section>/<id>.md: one topic per note (where things live, how to build/test/deploy, architecture, conventions). Start it with a header of two lines between `---` markers: `title: …` and `summary: …` — the summary is what the table of contents shows, so make it answer 'should I open this?'. Sections are kebab-case folders (build, architecture/harness); _section.md in a folder holds its one-line summary."
