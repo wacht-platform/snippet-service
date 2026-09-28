@@ -295,29 +295,31 @@ impl App {
     }
 
     /// Expand any paste chips in the current input back to their real content.
-    /// A paste bigger than this goes to a scratch FILE and is sent as an
-    /// attachment path instead of inline text — the agent greps/reads it
-    /// surgically, and the conversation doesn't carry the whole wall forever.
-    pub(crate) const PASTE_ATTACH_CHARS: usize = 4000;
-    pub(crate) const PASTE_ATTACH_LINES: usize = 60;
+    /// A short paste goes inline as plain text; a longer one travels between
+    /// `[pasted text — N lines]` markers (the same block the app sends, which the
+    /// transcript collapses into a card); only a paste too big for the agent's
+    /// context goes to a scratch file it reads selectively.
+    pub(crate) const PASTE_BLOCK_CHARS: usize = 600;
+    pub(crate) const PASTE_BLOCK_LINES: usize = 8;
+    pub(crate) const PASTE_FILE_CHARS: usize = 30_000;
 
     pub(crate) fn expand_input(&self) -> String {
         let mut out = self.input.clone();
         for (marker, content) in &self.pasted_blocks {
-            let lines = content.lines().count();
-            let big = content.chars().count() > Self::PASTE_ATTACH_CHARS
-                || lines > Self::PASTE_ATTACH_LINES;
-            let replacement = if big {
-                match self.write_paste_file(content) {
+            let body = content.trim_end();
+            let lines = body.lines().count().max(1);
+            let chars = body.chars().count();
+            let replacement = if chars > Self::PASTE_FILE_CHARS {
+                match self.write_paste_file(body) {
                     Ok(path) => format!(
                         "[attached file — pasted text ({lines} lines); read it at this exact path: {path}]"
                     ),
-                    // Couldn't write the scratch file — fall back to inline so
-                    // the message still carries the content.
-                    Err(_) => content.clone(),
+                    Err(_) => pasted_block(body, lines),
                 }
+            } else if lines >= Self::PASTE_BLOCK_LINES || chars >= Self::PASTE_BLOCK_CHARS {
+                pasted_block(body, lines)
             } else {
-                content.clone()
+                body.to_string()
             };
             out = out.replace(marker, &replacement);
         }
@@ -613,4 +615,8 @@ impl App {
     }
 
 
+}
+
+fn pasted_block(body: &str, lines: usize) -> String {
+    format!("\n[pasted text — {lines} lines]\n{body}\n[/pasted text]\n")
 }
