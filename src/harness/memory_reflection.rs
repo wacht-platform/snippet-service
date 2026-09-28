@@ -120,58 +120,43 @@ impl CodingHarness {
         Err(ToolError::msg("summarizer did not produce a valid table"))
     }
 
-    /// Learning pass run after compaction: a bounded worker that curates the
-    /// per-workspace memory (facts, pointers, how-to playbooks) from the freshly
-    /// compacted session table. Mirrors `run_agentic_summary`'s tool-loop shape.
-    /// Best-effort: errors are surfaced to the caller, which treats them as non-fatal.
-    pub(super) async fn run_memory_reflection(
+    /// ACE-style curation after a request that did real work: the model sees
+    /// the memory, the ids the agent read and the request's transcript, and
+    /// answers with one delta that `Memory` merges deterministically. A delta
+    /// with rejected operations gets one retry carrying only the errors.
+    pub(super) async fn reflect_on_request(
         &self,
         model: &mut dyn AgentModel,
-        summary_table: &str,
+        state: &HarnessState,
     ) -> Result<(), ToolError> {
-        // Tight cap — each turn is a full model round-trip and this runs after
-        // every main-session compaction (was 8, then 5). Reflection should converge
-        // in 1–2 writes; a higher cap just let the model re-save the same entry
-        // over and over until it timed out on the cap.
-        const MAX_TURNS: usize = 4;
+        const MIN_TOOL_RESULTS: usize = 3;
+        const MAX_TURNS: usize = 2;
+        const MEMORY_CHARS: usize = 20_000;
 
-        let store = crate::memory::MemoryStore::for_workspace(self.context.workspace_root());
-        let global = crate::memory::MemoryStore::global();
-        let index_budget = self.config.memory_index_budget_chars;
-        let entry_budget = self.config.memory_entry_budget_chars;
-        let max_entries = self.config.memory_max_entries;
+        let window = request_window(state);
+        let tool_results = window
+            .iter()
+            .filter(|m| matches!(m, HarnessMessage::ToolResult { .. }))
+            .count();
+        if tool_results < MIN_TOOL_RESULTS {
+            return Ok(());
+        }
+        let memory = crate::memory::Memory::open(self.context.workspace_root());
+        let read = memory.note_ids(&note_paths_read(window, self.context.workspace_root()));
+        let transcript = render_reflection_window(window);
         let tools = memory_reflector_tools();
-        let ws = self.context.workspace_root().display().to_string();
-        let mut feedback = "(review the current index/entries, then extract the reusable procedure(s) and key facts)".to_string();
-        let mut writes = 0usize;
-        self.debug_log(&format!(
-            "memory reflection: start (existing entries={}, index={}b)",
-            store.list_entries().len(),
-            store.read_index().len()
-        ));
+        let mut feedback = String::new();
+        let prev_effort = model.swap_reasoning_effort(Some("off".to_string()));
 
-        for turn in 1..=MAX_TURNS {
-            let index = store.read_index();
-            let entries = store.list_entries();
-            let patterns = global.read_patterns();
+        for _ in 0..MAX_TURNS {
             let user = format!(
-                "WORKSPACE: {ws}\n\nWHAT JUST HAPPENED (compacted session table):\n{summary_table}\n\nCURRENT MEMORY INDEX:\n{index}\n\nEXISTING ENTRIES: {entries}\n\nCURRENT REUSABLE PATTERNS (global):\n{patterns}\n\nLAST RESULT: {feedback}\n\nTurn {turn}/{MAX_TURNS} · {writes} write(s) so far. Make exactly one tool call. Capture what helps a FUTURE session: (a) workspace FACTS/pointers and how-to PLAYBOOK(s) for THIS project via memory_write; (b) any GENERALIZABLE PATTERN this session demonstrated — a reusable technique (situation → approach → why) that would help in ANY project — via memory_pattern (include the existing patterns plus the new/refined one). Write each distinct thing ONCE; NEVER re-save or 'polish' something you already wrote this pass. Once the durable value is captured (usually 1–2 writes) and the index points to workspace entries, call finalize. Only finalize with nothing written if the session was genuinely trivial.",
-                index = if index.trim().is_empty() {
-                    "(empty)".to_string()
-                } else {
-                    index
-                },
-                entries = if entries.is_empty() {
+                "CURRENT MEMORY:\n{}\n\nNOTES THE AGENT READ THIS TASK (mark each helpful or harmful if it mattered; mark rules and learnings that clearly shaped the work too): {}\n\nTASK TRANSCRIPT:\n{transcript}{feedback}\n\nCall apply_memory_delta once.",
+                clip(&memory.full_listing(), MEMORY_CHARS),
+                if read.is_empty() {
                     "(none)".to_string()
                 } else {
-                    entries.join(", ")
+                    read.join(", ")
                 },
-                patterns = if patterns.trim().is_empty() {
-                    "(none yet)".to_string()
-                } else {
-                    patterns
-                },
-                writes = writes,
             );
             let messages = vec![
                 HarnessMessage::System {
@@ -179,89 +164,195 @@ impl CodingHarness {
                 },
                 HarnessMessage::User { content: user },
             ];
-            let output = model.generate(&messages, &tools, true, None).await?;
-            let Some(call) = output.calls.first() else {
-                feedback = "no tool call received — call exactly one tool".to_string();
+            let output = match model.generate(&messages, &tools, true, None).await {
+                Ok(output) => output,
+                Err(e) => {
+                    model.swap_reasoning_effort(prev_effort);
+                    return Err(e);
+                }
+            };
+            let Some(call) = output
+                .calls
+                .first()
+                .filter(|c| c.tool_name == "apply_memory_delta")
+            else {
+                feedback = "\n\nLAST ATTEMPT: no apply_memory_delta call was made.".to_string();
                 continue;
             };
-            let arg_str = |k: &str| {
-                call.arguments
-                    .get(k)
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            };
-            match call.tool_name.as_str() {
-                "finalize" => {
-                    self.debug_log(&format!(
-                        "memory reflection: finalized after {writes} write(s)"
-                    ));
-                    return Ok(());
-                }
-                "memory_read" => {
-                    let id = arg_str("id");
-                    feedback = match store.read_entry(&id) {
-                        Ok(c) => format!("entry `{id}`:\n{c}"),
-                        Err(e) => e,
-                    };
-                }
-                "memory_write" => {
-                    let id = arg_str("id");
-                    let content = arg_str("content");
-                    feedback = match store.write_entry(&id, &content, entry_budget, max_entries) {
-                        Ok(()) => {
-                            writes += 1;
-                            self.debug_log(&format!(
-                                "memory reflection: wrote entry `{id}` ({}b)",
-                                content.len()
-                            ));
-                            format!(
-                                "entry `{id}` saved. Do NOT re-write or 'polish' it. If the index needs it, call memory_index once — then finalize."
-                            )
-                        }
-                        Err(e) => e,
-                    };
-                }
-                "memory_index" => {
-                    let content = arg_str("content");
-                    feedback = match store.write_index(&content, index_budget) {
-                        Ok(()) => {
-                            writes += 1;
-                            self.debug_log("memory reflection: updated index");
-                            "index updated".to_string()
-                        }
-                        Err(e) => e,
-                    };
-                }
-                "memory_delete" => {
-                    let id = arg_str("id");
-                    feedback = match store.delete_entry(&id) {
-                        Ok(()) => format!("entry `{id}` deleted"),
-                        Err(e) => e,
-                    };
-                }
-                "memory_pattern" => {
-                    let content = arg_str("content");
-                    feedback = match global.add_pattern(&content, crate::memory::patterns_budget())
-                    {
-                        Ok(true) => {
-                            writes += 1;
-                            self.debug_log("memory reflection: added global pattern");
-                            "pattern added. If nothing else remains, finalize.".to_string()
-                        }
-                        Ok(false) => {
-                            "identical pattern already stored — don't re-add it; finalize if done."
-                                .to_string()
-                        }
-                        Err(e) => e,
-                    };
-                }
-                other => feedback = format!("unknown tool `{other}`"),
+            let (applied, errors) = apply_delta(&memory, &call.arguments);
+            for line in &applied {
+                self.debug_log(&format!("memory reflection: {line}"));
             }
+            if errors.is_empty() {
+                break;
+            }
+            feedback = format!(
+                "\n\nALREADY APPLIED (do not resend):\n{}\n\nREJECTED — fix these and resend only them, or send an empty delta to drop them:\n{}",
+                if applied.is_empty() { "(nothing)".to_string() } else { applied.join("\n") },
+                errors.join("\n")
+            );
         }
-        self.debug_log(&format!(
-            "memory reflection: hit turn cap after {writes} write(s)"
-        ));
+        model.swap_reasoning_effort(prev_effort);
         Ok(())
     }
+}
+
+/// The messages of the request that just ended: from its checkpoint when one
+/// was taken since the last compaction, else from the last user message.
+fn request_window(state: &HarnessState) -> &[HarnessMessage] {
+    let start = state
+        .checkpoints
+        .last()
+        .filter(|c| c.compactions == state.compactions && c.message_index <= state.messages.len())
+        .map(|c| c.message_index)
+        .or_else(|| {
+            state
+                .messages
+                .iter()
+                .rposition(|m| matches!(m, HarnessMessage::User { .. }))
+        })
+        .unwrap_or(0);
+    &state.messages[start..]
+}
+
+/// Markdown files the agent's shell commands named during the request.
+fn note_paths_read(window: &[HarnessMessage], workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    for message in window {
+        let HarnessMessage::Assistant { tool_calls, .. } = message else {
+            continue;
+        };
+        for call in tool_calls.iter().filter(|c| c.name == "bash") {
+            let command = call.arguments.get("command").and_then(Value::as_str).unwrap_or("");
+            for path in crate::memory::markdown_paths_in_command(command, workspace) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn render_reflection_window(window: &[HarnessMessage]) -> String {
+    const BUDGET_CHARS: usize = 60_000;
+    let mut lines: Vec<String> = window
+        .iter()
+        .filter_map(|m| {
+            let line = match m {
+                HarnessMessage::User { content } => format!("USER: {}", clip(content, 1_500)),
+                HarnessMessage::Assistant { content, tool_calls } => {
+                    let mut s = String::new();
+                    if !content.trim().is_empty() {
+                        s.push_str(&format!("ASSISTANT: {}", clip(content, 1_500)));
+                    }
+                    for c in tool_calls {
+                        s.push_str(&format!("\nCALL {}({})", c.name, clip(&c.arguments.to_string(), 500)));
+                    }
+                    s
+                }
+                HarnessMessage::ToolResult { tool_name, content, .. } => {
+                    format!("RESULT {tool_name}: {}", clip(&crate::llm::render_tool_result(content), 800))
+                }
+                HarnessMessage::Summary { content, .. } => format!("EARLIER (summary): {}", clip(content, 4_000)),
+                HarnessMessage::System { .. } => String::new(),
+            };
+            (!line.trim().is_empty()).then_some(line)
+        })
+        .collect();
+    let mut total: usize = lines.iter().map(|l| l.chars().count() + 1).sum();
+    let mut dropped = 0;
+    while total > BUDGET_CHARS && lines.len() > 1 {
+        total -= lines.remove(0).chars().count() + 1;
+        dropped += 1;
+    }
+    let mut out = String::new();
+    if dropped > 0 {
+        out.push_str(&format!("[…{dropped} earliest messages omitted]\n"));
+    }
+    out.push_str(&lines.join("\n"));
+    out
+}
+
+/// Merge one reflector delta through the same operations the CLI uses.
+/// Returns what was applied and what was rejected, one line each.
+fn apply_delta(memory: &crate::memory::Memory, delta: &Value) -> (Vec<String>, Vec<String>) {
+    use crate::memory::{Kind, NoteEdit};
+    let mut applied = Vec::new();
+    let mut errors = Vec::new();
+    let items = |key: &str| delta.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
+    let mut record = |what: String, result: Result<String, String>| match result {
+        Ok(msg) => applied.push(msg),
+        Err(e) => errors.push(format!("{what}: {e}")),
+    };
+
+    for section in items("sections") {
+        let name = text(&section, "section").unwrap_or_default();
+        let summary = text(&section, "summary").unwrap_or_default();
+        record(format!("section {name}"), memory.set_section(&name, &summary));
+    }
+    for note in items("notes") {
+        let id = text(&note, "id").unwrap_or_default();
+        let result = match text(&note, "op").as_deref() {
+            Some("add") => memory.add_note(
+                &text(&note, "section").unwrap_or_default(),
+                &id,
+                &text(&note, "title").unwrap_or_default(),
+                &text(&note, "summary").unwrap_or_default(),
+                &text(&note, "body").unwrap_or_default(),
+            ),
+            Some("update") => memory.update_note(
+                &id,
+                NoteEdit {
+                    title: text(&note, "title"),
+                    summary: text(&note, "summary"),
+                    body: text(&note, "body"),
+                    section: text(&note, "section"),
+                },
+            ),
+            _ => Err("op must be add or update".to_string()),
+        };
+        record(format!("note {id}"), result);
+    }
+    for bullet in items("bullets") {
+        let result = match text(&bullet, "op").as_deref() {
+            Some("add") => {
+                let kind = match text(&bullet, "kind").as_deref() {
+                    Some("rule") => Some(Kind::Rule),
+                    Some("learning") => Some(Kind::Learning),
+                    _ => None,
+                };
+                match kind {
+                    Some(kind) => memory.add_bullet(
+                        kind,
+                        bullet.get("global").and_then(Value::as_bool).unwrap_or(false),
+                        &text(&bullet, "section").unwrap_or_default(),
+                        &text(&bullet, "text").unwrap_or_default(),
+                    ),
+                    None => Err("kind must be rule or learning".to_string()),
+                }
+            }
+            Some("update") => memory.update_bullet(
+                &text(&bullet, "id").unwrap_or_default(),
+                text(&bullet, "text").as_deref(),
+                text(&bullet, "section").as_deref(),
+            ),
+            _ => Err("op must be add or update".to_string()),
+        };
+        let what = text(&bullet, "id")
+            .or_else(|| text(&bullet, "text"))
+            .unwrap_or_default();
+        record(format!("bullet {}", clip(&what, 60)), result);
+    }
+    for mark in items("marks") {
+        let id = text(&mark, "id").unwrap_or_default();
+        let helpful = text(&mark, "verdict").as_deref() != Some("harmful");
+        record(format!("mark {id}"), memory.mark(&id, helpful));
+    }
+    for id in items("remove") {
+        let id = id.as_str().unwrap_or_default().to_string();
+        record(format!("remove {id}"), memory.remove(&id));
+    }
+    (applied, errors)
 }

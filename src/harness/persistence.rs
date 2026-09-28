@@ -56,23 +56,18 @@ impl CodingHarness {
         &self,
         initial_request: Option<String>,
     ) -> Result<HarnessState, ToolError> {
-        // Build the per-workspace memory block once and fold it into the system
-        // prefix, so it rides in the cached prompt and refreshes every session
-        // (including resume). Within a session it stays fixed; mid-session writes
-        // are visible to the agent only on the next start (cache-stable by design).
-        let seeded_system = {
-            let block = if self.config.memory_enabled {
-                crate::memory::render_session_memory(
-                    self.context.workspace_root(),
-                    self.config.memory_index_budget_chars,
-                )
-            } else {
-                None
-            };
-            match block {
-                Some(b) => format!("{}\n\n{}", self.config.system_prompt, b),
-                None => self.config.system_prompt.clone(),
-            }
+        // Build the memory block once and fold it into the system prefix, so it
+        // rides in the cached prompt and refreshes every session (including
+        // resume). Within a session it stays fixed; `snippet memory toc` shows
+        // the live state.
+        let seeded_system = if self.config.memory_enabled {
+            format!(
+                "{}\n\n{}",
+                self.config.system_prompt,
+                crate::memory::Memory::open(self.context.workspace_root()).render_prompt()
+            )
+        } else {
+            self.config.system_prompt.clone()
         };
 
         if self.config.resume

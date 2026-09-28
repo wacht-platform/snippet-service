@@ -67,14 +67,11 @@ pub struct HarnessConfig {
     pub tool_prune_prefix_pct: u8,
     /// Start fresh runs in manual approval mode (bash + file edits wait for y/n).
     pub manual_approval: bool,
-    /// Per-workspace memory: inject the `[workspace_memory]` index into the system
-    /// prefix each session and offer the memory tools.
+    /// Inject the `[memory]` block (rules, learnings, notes table of contents)
+    /// into the system prefix each session.
     pub memory_enabled: bool,
-    pub memory_index_budget_chars: usize,
-    pub memory_entry_budget_chars: usize,
-    pub memory_max_entries: usize,
-    /// Run a bounded learning/reflection pass during compaction (main session only).
-    pub memory_reflect_on_compaction: bool,
+    /// Run the reflection pass after a request that did real work (main session only).
+    pub memory_reflect: bool,
     /// Optional live progress sink used by delegated lanes. Progress is operational
     /// status only (tool names/paths, never prompts) and is not user-addressable.
     pub progress_tx: Option<mpsc::UnboundedSender<crate::lanes::LaneProgress>>,
@@ -100,10 +97,7 @@ impl Default for HarnessConfig {
             tool_prune_prefix_pct: 40,
             manual_approval: false,
             memory_enabled: true,
-            memory_index_budget_chars: 5_000,
-            memory_entry_budget_chars: 12_000,
-            memory_max_entries: 128,
-            memory_reflect_on_compaction: true,
+            memory_reflect: true,
             progress_tx: None,
             progress_id: None,
             allow_lane_control: true,
