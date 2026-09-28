@@ -94,6 +94,7 @@ impl CodingHarness {
         }
 
         track_call_repeats(vars, &calls);
+        note_turn_text(vars, progress_text.as_deref().is_some_and(|t| !t.trim().is_empty()));
         if let Some(end) = repeat_stop(state, vars) {
             return end;
         }

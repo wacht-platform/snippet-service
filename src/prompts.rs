@@ -4,7 +4,6 @@
 //! environment-specific guidance (git worktree, browser, skills, vault, memory)
 //! is appended only when it applies, so an absent capability costs no tokens.
 
-pub const RUNTIME_SANDBOX_ENVIRONMENT: &str = include_str!("../prompts/sandbox_environment.md");
 pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer.md");
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
 pub const MISSION_CONTROL_LAYER: &str = include_str!("../prompts/mission_control_layer.md");
@@ -94,19 +93,13 @@ impl PromptContext {
 }
 
 pub fn coding_prompt(context: &PromptContext) -> String {
-    let mut parts = vec![
-        RUNTIME_SANDBOX_ENVIRONMENT.trim(),
-        CODING_AGENT_LAYER.trim(),
-    ];
+    let mut parts = vec![CODING_AGENT_LAYER.trim()];
     parts.extend(context.conditional_layers());
     parts.join("\n\n")
 }
 
 pub fn conversation_prompt(context: &PromptContext) -> String {
-    let mut parts = vec![
-        RUNTIME_SANDBOX_ENVIRONMENT.trim(),
-        CODING_AGENT_LAYER.trim(),
-    ];
+    let mut parts = vec![CODING_AGENT_LAYER.trim()];
     parts.extend(context.conditional_layers());
     parts.push(CONVERSATION_AGENT_LAYER.trim());
     // Last, only for an agent's work session: it may ask Mission Control to
@@ -130,9 +123,9 @@ pub fn conversation_system_prompt() -> String {
 
 /// The prompt for an agent's COORDINATION session.
 ///
-/// Deliberately does NOT include [`RUNTIME_SANDBOX_ENVIRONMENT`]: that layer
-/// states the session has real bash and full filesystem access, which is false
-/// here and would instruct the model to reach for tools it was not given. The
+/// Deliberately does NOT include [`CODING_AGENT_LAYER`]: that layer states the
+/// session has real bash and full filesystem access, which is false here and
+/// would instruct the model to reach for tools it was not given. The
 /// coordination layer states the real capability set instead, and the
 /// per-workspace memory layers are excluded for the same reason — this session
 /// has no workspace to hold memory about.
@@ -151,7 +144,7 @@ pub fn coordination_prompt(context: &PromptContext) -> String {
 }
 
 pub fn mission_control_system_prompt() -> String {
-    // Orchestrator only. Do not stack sandbox or CODING_AGENT_LAYER — those
+    // Orchestrator only. Do not stack CODING_AGENT_LAYER — its
     // identities ("full filesystem", "own the task end to end") made Mission
     // Control advertise as a general engineer and skip list_sessions.
     MISSION_CONTROL_LAYER.to_string()

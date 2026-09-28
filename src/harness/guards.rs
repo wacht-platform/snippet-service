@@ -122,6 +122,129 @@ pub(super) fn note_shell_command(vars: &mut LoopVars, command: &str) -> bool {
     true
 }
 
+/// Commands that only look at files, as opposed to building or running
+/// something that checks them.
+const LOOK_COMMANDS: [&str; 20] = [
+    "cat", "head", "tail", "nl", "less", "more", "bat", "sed", "rg", "grep", "ls", "find", "fd",
+    "wc", "tree", "stat", "file", "echo", "pwd", "git",
+];
+const READ_COMMANDS: [&str; 8] = ["cat", "head", "tail", "nl", "less", "more", "bat", "sed"];
+
+/// After a bash command ran: count files it read (re-reading an unchanged file
+/// raises `RepeatedRead`), and treat anything that isn't a look as checking
+/// the edits made so far.
+pub(super) fn note_bash_command(vars: &mut LoopVars, command: &str, cwd: &std::path::Path) {
+    let mut checked = false;
+    for segment in command.split(['\n', ';', '|', '&']) {
+        let words: Vec<&str> = segment
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| c == '\'' || c == '"'))
+            .collect();
+        let Some(program) = words.first().map(|w| w.rsplit('/').next().unwrap_or(w)) else {
+            continue;
+        };
+        if program.is_empty() || program == "cd" {
+            continue;
+        }
+        if !LOOK_COMMANDS.contains(&program) {
+            checked = true;
+            continue;
+        }
+        let is_read = READ_COMMANDS.contains(&program)
+            && (program != "sed"
+                || (words.contains(&"-n") && !words.iter().any(|w| w.starts_with("-i"))));
+        if !is_read {
+            continue;
+        }
+        for arg in words[1..].iter().filter(|w| !w.starts_with('-') && !w.is_empty()) {
+            note_file_read(vars, arg, cwd);
+        }
+    }
+    if checked {
+        vars.edits_since_check = 0;
+    }
+}
+
+fn note_file_read(vars: &mut LoopVars, arg: &str, cwd: &std::path::Path) {
+    use std::hash::{Hash, Hasher};
+    const MAX_BYTES: u64 = 4 * 1024 * 1024;
+    let expanded = match arg.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(rest),
+        None => std::path::PathBuf::from(arg),
+    };
+    let path = if expanded.is_absolute() { expanded } else { cwd.join(expanded) };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
+    if !meta.is_file() || meta.len() > MAX_BYTES {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let fingerprint = hasher.finish();
+    let entry = vars.file_reads.entry(path.clone()).or_insert((fingerprint, 0));
+    if entry.0 == fingerprint {
+        entry.1 += 1;
+    } else {
+        *entry = (fingerprint, 1);
+    }
+    if entry.1 == REPEATED_READ_AT {
+        let shown = path.strip_prefix(cwd).unwrap_or(&path).display().to_string();
+        vars.pending_signals.push(RuntimeSignal::RepeatedRead {
+            path: shown,
+            count: REPEATED_READ_AT,
+        });
+    }
+}
+
+/// A successful `change_files` call; several with nothing run in between
+/// raise `UnverifiedEdits`, and rewriting one file from scratch again and
+/// again raises `Rewrite`.
+pub(super) fn note_file_change(vars: &mut LoopVars, arguments: &Value) {
+    let changes = arguments.get("changes").and_then(Value::as_array);
+    for change in changes.into_iter().flatten() {
+        let rewrite = change.get("action").and_then(Value::as_str) == Some("create")
+            && change.get("overwrite").and_then(Value::as_bool) == Some(true);
+        let Some(path) = change.get("path").and_then(Value::as_str).filter(|_| rewrite) else {
+            continue;
+        };
+        let count = vars.rewrites.entry(path.to_string()).or_insert(0);
+        *count += 1;
+        if *count == REWRITE_AT {
+            vars.pending_signals.push(RuntimeSignal::Rewrite {
+                path: path.to_string(),
+                count: REWRITE_AT,
+            });
+        }
+    }
+    vars.edits_since_check += 1;
+    if vars.edits_since_check == UNVERIFIED_EDITS_AT {
+        vars.pending_signals.push(RuntimeSignal::UnverifiedEdits {
+            count: vars.edits_since_check,
+        });
+    }
+}
+
+/// A tool-call turn: several in a row without any text raise `SilentRun`.
+pub(super) fn note_turn_text(vars: &mut LoopVars, said_something: bool) {
+    if said_something {
+        vars.silent_turns = 0;
+        return;
+    }
+    vars.silent_turns += 1;
+    if vars.silent_turns == SILENT_RUN_AT {
+        vars.pending_signals.push(RuntimeSignal::SilentRun {
+            turns: vars.silent_turns,
+        });
+    }
+}
+
 /// Consecutive failed edits on the same file raise a `StuckEdit` nudge.
 pub(super) fn note_edit_result(vars: &mut LoopVars, path: Option<String>, is_err: bool) {
     if !is_err {

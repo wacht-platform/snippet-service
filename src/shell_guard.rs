@@ -175,7 +175,7 @@ fn is_tee_to_tracked(toks: &[String]) -> bool {
         .any(|t| is_tracked_write_target(t))
 }
 
-const NUDGE_WRITE_MSG: &str = "you wrote file content through the shell. Change files with `change_files` \
+const NUDGE_WRITE_MSG: &str = "You wrote file content through the shell. Change files with `change_files` \
 (create, replace, delete, move): it is exact, all-or-nothing, and shows the changed lines. Keep the shell for \
 reading, searching and running things.";
 

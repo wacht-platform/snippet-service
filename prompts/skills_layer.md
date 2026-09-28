@@ -1,3 +1,3 @@
-[skills]
-# Rendered when at least one skill is installed.
-rule = "Skills are on-demand playbooks (deploy, browser, release, migrate, integrations), NOT preloaded. For non-trivial procedures: search_skills, then load the matching skill(name) BEFORE improvising. No match → proceed."
+## Skills
+
+Skills are on-demand playbooks (deploy, browser, release, migrate, integrations); none are preloaded. Before improvising a non-trivial procedure, `search_skills` and load the matching `skill(name)`. If nothing matches, carry on.

@@ -29,6 +29,10 @@ impl CodingHarness {
             // and the first step restates the current state.
             vars.bash_outputs.clear();
             vars.reminded.clear();
+            vars.file_reads.clear();
+            vars.silent_turns = 0;
+            vars.edits_since_check = 0;
+            vars.rewrites.clear();
             vars.turns_this_request = 0;
             vars.consecutive_failed_turns = 0;
         }
