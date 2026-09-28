@@ -87,11 +87,14 @@ pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, St
         "view_image" => ("View".into(), arg("path")),
         "web_search" => ("Web".into(), arg("query")),
         "web_read" => ("Fetch".into(), arg("url")),
+        // A labelled command reads as its label; a bare one as Bash(command).
         "bash" => {
             let label = arg("label");
-            let cmd = arg("command");
-            let text = if !label.is_empty() { label } else { cmd };
-            ("Bash".into(), ellipsize_one_line(&text, 90))
+            if label.trim().is_empty() {
+                ("Bash".into(), ellipsize_one_line(&arg("command"), 90))
+            } else {
+                (ellipsize_one_line(label.trim(), 90), String::new())
+            }
         }
         _ => {
             let pretty = tool_name

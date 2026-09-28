@@ -687,7 +687,7 @@ fn audio_block_lines(name: &str, body: &str, width: usize) -> Vec<Line<'static>>
 }
 
 pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    let cleaned = strip_attachment_markers(text);
+    let cleaned = strip_attachment_markers(&strip_pasted_blocks(text));
     let (prose, audio) = split_audio_sections(&cleaned);
     let body = Style::default()
         .fg(self::text())
@@ -700,16 +700,7 @@ pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         }
         lines.extend(audio_block_lines(name, transcript, width));
     }
-    let (imgs, files) = count_attachments(text);
-    if imgs + files > 0 {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(SPINE)),
-            Span::styled(
-                attachment_summary(imgs, files),
-                Style::default().fg(muted()),
-            ),
-        ]));
-    }
+    lines.extend(attachment_lines(text, width));
     if lines.is_empty() {
         // Pure attachment / empty after strip — keep a single blank body so the
         // speaker tag still has a row.
@@ -720,7 +711,7 @@ pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 
 /// Mid-run steer: same column as user text, quiet label, no enter-arrow glyph.
 fn steer_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    let cleaned = strip_attachment_markers(text);
+    let cleaned = strip_attachment_markers(&strip_pasted_blocks(text));
     let (prose, audio) = split_audio_sections(&cleaned);
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
@@ -738,16 +729,7 @@ fn steer_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         }
         lines.extend(audio_block_lines(name, transcript, width));
     }
-    let (imgs, files) = count_attachments(text);
-    if imgs + files > 0 {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(SPINE)),
-            Span::styled(
-                attachment_summary(imgs, files),
-                Style::default().fg(muted()),
-            ),
-        ]));
-    }
+    lines.extend(attachment_lines(text, width));
     lines
 }
 
@@ -823,32 +805,70 @@ fn push_tagged(
 }
 
 /// Count `[attached image — …]` / `[attached file — …]` markers by kind.
-fn count_attachments(text: &str) -> (usize, usize) {
-    let (mut imgs, mut files) = (0usize, 0usize);
-    for line in text.lines() {
-        let t = line.trim_start();
-        if !t.ends_with(']') {
-            continue;
-        }
-        if t.starts_with("[attached image —") {
-            imgs += 1;
-        } else if t.starts_with("[attached file —") {
-            files += 1;
-        }
-    }
-    (imgs, files)
+static PASTED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\[pasted text — \d+ lines?\]\n([\s\S]*?)\n\[/pasted text\]")
+        .expect("valid regex")
+});
+static ATTACHED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\[attached (image|file) — ([^\]/]*)(/[^\]]+)\]").expect("valid regex")
+});
+
+fn strip_pasted_blocks(text: &str) -> String {
+    PASTED_RE.replace_all(text, "").into_owned()
 }
 
-/// "📎 2 images · 1 file" from the per-kind counts.
-fn attachment_summary(imgs: usize, files: usize) -> String {
-    let mut parts = Vec::new();
-    if imgs > 0 {
-        parts.push(format!("{imgs} image{}", if imgs == 1 { "" } else { "s" }));
+/// One row per attachment (its kind and file name) and one per pasted block
+/// (its size and first line), in the content column under the message.
+fn attachment_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let label = Style::default().fg(muted());
+    let name = Style::default().fg(self::text());
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for caps in ATTACHED_RE.captures_iter(text) {
+        let path = caps[3].trim();
+        let file = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let lower = file.to_lowercase();
+        let kind = if &caps[1] == "image" {
+            "image"
+        } else if caps[2].contains("pasted text") {
+            "pasted"
+        } else if [".m4a", ".mp3", ".wav", ".ogg", ".opus", ".webm", ".aac", ".flac"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+        {
+            "audio"
+        } else {
+            "file"
+        };
+        rows.push((kind.to_string(), file));
     }
-    if files > 0 {
-        parts.push(format!("{files} file{}", if files == 1 { "" } else { "s" }));
+    for caps in PASTED_RE.captures_iter(text) {
+        let body = &caps[1];
+        let count = body.lines().count().max(1);
+        let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        rows.push((
+            "pasted".to_string(),
+            format!("{count} line{} · {first}", if count == 1 { "" } else { "s" }),
+        ));
     }
-    format!("📎 {}", parts.join(" · "))
+    let room = width.saturating_sub(SPINE + 8).max(8);
+    rows.into_iter()
+        .map(|(kind, text)| {
+            let shown: String = if text.chars().count() > room {
+                text.chars().take(room.saturating_sub(1)).collect::<String>() + "…"
+            } else {
+                text
+            };
+            Line::from(vec![
+                Span::raw(" ".repeat(SPINE)),
+                Span::styled(format!("{kind:<7} "), label),
+                Span::styled(shown, name),
+            ])
+        })
+        .collect()
 }
 
 /// A leading glyph + optional label, then wrapped body text in one color.
