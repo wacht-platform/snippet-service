@@ -75,12 +75,6 @@ enum Command {
         #[command(subcommand)]
         action: VaultAction,
     },
-    /// Create and inspect the snippet database (~/.snippet/snippet.db) — the
-    /// general-purpose store for coordination and conversations.
-    Db {
-        #[command(subcommand)]
-        action: DbAction,
-    },
     /// Search and read the archived history of an agent session — the messages
     /// compaction moved out of its context. Scoped to $SNIPPET_SESSION_ID (set in
     /// the agent's shell) unless --session is given.
@@ -173,15 +167,6 @@ enum HistoryAction {
         #[arg(long)]
         session: Option<String>,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum DbAction {
-    /// Create the database and its tables if absent, then report what exists.
-    /// Idempotent: running it against an existing store only migrates.
-    Init,
-    /// Show the store's path, integrity, and per-table row counts.
-    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -423,27 +408,6 @@ fn history_cli(action: HistoryAction) -> Result<(), Box<dyn std::error::Error>> 
             for turn in turns {
                 println!("{}", render_turn(&turn));
             }
-        }
-    }
-    Ok(())
-}
-
-fn db_cli(action: DbAction) -> Result<(), Box<dyn std::error::Error>> {
-    let path = snippet::store::default_db_path();
-    let existed = path.exists();
-    let store = snippet::store::Store::open(&path)?;
-    match action {
-        DbAction::Init => {
-            println!(
-                "{} {}",
-                if existed { "ready" } else { "created" },
-                path.display()
-            );
-            report_store(&store)?;
-        }
-        DbAction::Status => {
-            println!("path: {}", store.path().display());
-            report_store(&store)?;
         }
     }
     Ok(())
@@ -707,18 +671,6 @@ async fn agent_cli(action: AgentAction) -> Result<(), Box<dyn std::error::Error>
             Ok(())
         }
     }
-}
-
-fn report_store(
-    store: &snippet::store::Store,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("integrity: {}", if store.integrity_check()? { "ok" } else { "FAILED" });
-    let tables = store.table_names()?;
-    println!("tables ({}):", tables.len());
-    for table in tables {
-        println!("  {table:<20} {:>6} rows", store.table_row_count(&table)?);
-    }
-    Ok(())
 }
 
 /// Read a line from the TTY with echo disabled (crossterm raw mode) — no extra
@@ -1231,7 +1183,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(Command::Vault { action }) => return vault_cli(action),
-        Some(Command::Db { action }) => return db_cli(action),
         Some(Command::History { action }) => return history_cli(action),
         Some(Command::Agent { action }) => return runtime()?.block_on(agent_cli(action)),
         Some(Command::Browser { action }) => return runtime()?.block_on(browser_cli(action)),

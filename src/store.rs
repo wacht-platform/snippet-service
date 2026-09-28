@@ -22,8 +22,6 @@ pub enum StoreError {
     NotTerminal(String),
     #[error("could not encode session state: {0}")]
     ScalarEncode(String),
-    #[error("no such table in this store: {0}")]
-    UnknownTable(String),
     #[error("stored record is malformed: {0}")]
     AppDecode(String),
 }
@@ -69,9 +67,6 @@ fn cached_stores() -> &'static Mutex<HashMap<PathBuf, Store>> {
 #[derive(Clone)]
 pub struct Store {
     connection: Arc<Mutex<Connection>>,
-    /// The file this store opened, or `:memory:` for a test store. Kept so a CLI
-    /// can report where the data actually landed rather than re-deriving it.
-    path: PathBuf,
 }
 
 impl Store {
@@ -111,7 +106,6 @@ impl Store {
         migrate(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
-            path: path.to_path_buf(),
         })
     }
 
@@ -121,7 +115,6 @@ impl Store {
         migrate(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
-            path: PathBuf::from(":memory:"),
         })
     }
 
@@ -136,51 +129,6 @@ impl Store {
         Ok(f(&connection)?)
     }
 
-    pub fn integrity_check(&self) -> Result<bool, StoreError> {
-        self.with_connection(|connection| {
-            let result: String =
-                connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-            Ok(result == "ok")
-        })
-    }
-
-    /// Every table this store defines, alphabetical.
-    ///
-    /// `sqlite_%` internal tables are excluded: `sqlite_sequence` is an
-    /// autoincrement bookkeeping row, not schema, and listing it as a table would
-    /// misrepresent the shape.
-    pub fn table_names(&self) -> Result<Vec<String>, StoreError> {
-        self.with_connection(|connection| {
-            let mut stmt = connection.prepare(
-                "SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                 ORDER BY name",
-            )?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.collect()
-        })
-    }
-
-    /// Row count for one table. The name is validated against the real schema
-    /// rather than interpolated on trust, so this cannot become an injection
-    /// point when a caller passes a user-supplied name.
-    pub fn table_row_count(&self, table: &str) -> Result<i64, StoreError> {
-        if !self.table_names()?.iter().any(|name| name == table) {
-            return Err(StoreError::UnknownTable(table.to_string()));
-        }
-        self.with_connection(|connection| {
-            Ok(
-                connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })?,
-            )
-        })
-    }
-
-    /// Where this store's file lives, for a CLI that has to report it.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {
@@ -226,9 +174,8 @@ mod tests {
     }
 
     #[test]
-    fn initializes_schema_and_integrity() {
+    fn initializes_schema() {
         let db = Store::open_in_memory().unwrap();
-        assert!(db.integrity_check().unwrap());
         db.with_connection(|connection| {
             let foreign_keys: i64 =
                 connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
