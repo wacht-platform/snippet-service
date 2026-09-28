@@ -257,10 +257,9 @@ fn build_responses_request(
                 }
             }
             HarnessMessage::System { content } => {
-                input.push(message_item(
-                    "user",
-                    &format!("[steering]\n{content}\n[/steering]"),
-                ));
+                crate::llm::attach_reminder_to_items(&mut input, content, |text| {
+                    message_item("user", text)
+                });
             }
             HarnessMessage::User { content } => {
                 input.push(message_item("user", content));

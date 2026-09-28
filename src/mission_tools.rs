@@ -116,21 +116,27 @@ fn default_limit() -> usize {
     30
 }
 
-/// Strip harness envelopes so another session's `[steering]` / system text
-/// cannot be mistaken for instructions to Mission Control.
-fn strip_harness_markup(mut text: &str) -> String {
-    let mut out = String::new();
-    while let Some(start) = text.find("[steering]") {
-        out.push_str(&text[..start]);
-        if let Some(end) = text[start..].find("[/steering]") {
-            text = &text[start + end + "[/steering]".len()..];
-        } else {
-            text = "";
-            break;
+/// Strip harness envelopes so another session's `<system-reminder>` (or older
+/// `[steering]`) text cannot be mistaken for instructions to Mission Control.
+fn strip_harness_markup(text: &str) -> String {
+    let mut text = text.to_string();
+    for (open, close) in [("[steering]", "[/steering]"), ("<system-reminder>", "</system-reminder>")] {
+        let mut out = String::new();
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find(open) {
+            out.push_str(&rest[..start]);
+            match rest[start..].find(close) {
+                Some(end) => rest = &rest[start + end + close.len()..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
         }
+        out.push_str(rest);
+        text = out;
     }
-    out.push_str(text);
-    out.lines()
+    text.lines()
         .filter(|line| {
             let t = line.trim_start();
             !(t.starts_with("[input_safety]")

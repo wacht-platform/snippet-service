@@ -38,11 +38,7 @@ impl CodingHarness {
         // running (the orchestrator must know what it's waiting on).
         state.lanes = lanes.records().to_vec();
 
-        // `build_live_context` drains the pending signals into this request; if
-        // the request FAILS they must survive to the retry — losing a
-        // loop-breaking nudge exactly when the model is looping made things worse.
-        let signals_backup = vars.pending_signals.clone();
-        let request_messages = self.build_request(state, vars, model, conversation_mode);
+        let request_messages = self.build_request(state, vars, model).await;
 
         self.lane_progress(
             "model",
@@ -62,27 +58,12 @@ impl CodingHarness {
             .await
         {
             Ok(output) => output,
-            Err(error) => {
-                vars.pending_signals = signals_backup;
-                return error;
-            }
+            Err(error) => return error,
         };
 
         // The request's workspace snapshot overlapped the model call; it must be
         // on disk before any tool can touch a file.
         self.finish_checkpoint(state, vars).await;
-
-        // Capture this turn's reasoning so the next turn's live context can
-        // surface "what you thought last time". Bounded to the last 2000 chars.
-        if let Some(sink) = sink {
-            let thought = StreamBuffer::snapshot_thinking(sink);
-            let thought = thought.trim();
-            vars.last_thought = (!thought.is_empty()).then(|| {
-                let chars: Vec<char> = thought.chars().collect();
-                let start = chars.len().saturating_sub(2000);
-                chars[start..].iter().collect::<String>()
-            });
-        }
 
         let anchor_tokens = record_usage(state, &output, &request_messages, &definitions);
         let anchor_msg_len = state.messages.len();
@@ -113,6 +94,9 @@ impl CodingHarness {
         }
 
         track_call_repeats(vars, &calls);
+        if let Some(end) = repeat_stop(state, vars) {
+            return end;
+        }
         self.record_assistant_turn(state, lanes, sink, &mut calls, progress_text.clone())
             .await;
 
@@ -152,30 +136,28 @@ impl CodingHarness {
         StepResult::Continue
     }
 
-    /// Durable history plus a fresh live-context block. The block is sent but
-    /// never persisted, so signals re-ground the model each turn instead of
-    /// accumulating as stale nudges. It goes as System, not User: adapters wrap a
-    /// mid-history System turn in a `[steering]` envelope, so the model reads it
-    /// as runtime state rather than the user speaking.
-    fn build_request(
+    /// The history the model sees this step. A harness note about what changed
+    /// since the model was last told is appended to the history first (as a
+    /// System message, which every adapter renders as a `<system-reminder>`
+    /// attached to the message before it), so it is sent once and stays put.
+    async fn build_request(
         &self,
-        state: &HarnessState,
+        state: &mut HarnessState,
         vars: &mut LoopVars,
         model: &dyn AgentModel,
-        conversation_mode: bool,
     ) -> Vec<HarnessMessage> {
+        self.expand_attachments(state).await;
+        if let Some(reminder) = build_reminder(
+            state,
+            vars,
+            self.context.workspace_root(),
+            &self.context.current_dir(),
+            self.context.browser_summary(),
+        ) {
+            state.messages.push(HarnessMessage::System { content: reminder });
+        }
         let mut request_messages = state.messages.clone();
         self.inline_images(&mut request_messages, model.supports_images());
-        request_messages.push(HarnessMessage::System {
-            content: build_live_context(
-                state,
-                vars,
-                conversation_mode,
-                self.context.workspace_root(),
-                &self.context.current_dir(),
-                self.context.browser_summary(),
-            ),
-        });
         request_messages
     }
 

@@ -595,7 +595,7 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
             HarnessMessage::System { content } => push_content(
                 &mut contents,
                 "user",
-                vec![json!({ "text": format!("[steering]\n{content}\n[/steering]") })],
+                vec![json!({ "text": crate::llm::system_reminder(content) })],
             ),
             HarnessMessage::User { content } => {
                 push_content(&mut contents, "user", vec![json!({ "text": content })])

@@ -13,6 +13,42 @@ fn scrub_vault(result: &mut Value) {
     }
 }
 
+/// Rerunning a command that prints exactly what it printed earlier in this
+/// request tells the model nothing new, so it gets a short notice instead of the
+/// same output again. Short outputs are left alone: they cost little and a
+/// notice there would read oddly.
+fn collapse_repeated_output(vars: &mut LoopVars, command: String, result: &mut Value) {
+    use std::hash::{Hash, Hasher};
+    const MIN_CHARS: usize = 300;
+    let Some(data) = result.get_mut("data").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let log_path = data.get("saved_output_path").and_then(Value::as_str).unwrap_or("").to_string();
+    let text = |key: &str| {
+        let text = data.get(key).and_then(Value::as_str).unwrap_or("");
+        if log_path.is_empty() { text.to_string() } else { text.replace(&log_path, "") }
+    };
+    let (stdout, stderr) = (text("stdout"), text("stderr"));
+    if stdout.len() + stderr.len() < MIN_CHARS {
+        return;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (&stdout, &stderr, data.get("exit_code").map(Value::to_string)).hash(&mut hasher);
+    let fingerprint = hasher.finish();
+    if vars.bash_outputs.insert(command, fingerprint) == Some(fingerprint) {
+        for key in ["stdout", "stderr", "hint", "truncated", "total_lines", "total_bytes"] {
+            data.remove(key);
+        }
+        data.insert(
+            "note".to_string(),
+            Value::String(
+                "Identical to the output of this exact command earlier in this task; nothing changed. Use that result instead of rerunning it."
+                    .to_string(),
+            ),
+        );
+    }
+}
+
 fn is_error_result(result: &Value) -> bool {
     result.get("status").and_then(Value::as_str) == Some("error")
 }
@@ -399,6 +435,9 @@ impl CodingHarness {
             }
             _ => Vec::new(),
         };
+        let bash_command = (tool_name == "bash")
+            .then(|| call.arguments.get("command").and_then(Value::as_str).map(str::to_string))
+            .flatten();
         let mut result = match self
             .tools
             .execute(&self.context, &tool_name, call.arguments)
@@ -416,6 +455,11 @@ impl CodingHarness {
         }
         if tool_name == "change_files" {
             note_edit_result(vars, edit_path, is_err);
+        }
+        if let Some(command) = bash_command
+            && !is_err
+        {
+            collapse_repeated_output(vars, command, &mut result);
         }
         if !is_err && !markdown_read.is_empty() {
             crate::memory::Memory::open(self.context.workspace_root()).record_reads(&markdown_read);

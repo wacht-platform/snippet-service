@@ -152,7 +152,7 @@ pub(crate) struct App {
     /// cleared once the persisted state catches up. `self.state` is read from the
     /// mtime-gated state file, so it lags the live loop: without this, a message
     /// sent in that window sees a stale `Idle`, gets delivered mid-run, and the
-    /// harness folds it into a `[steer]` instead of a new turn — it "disappears".
+    /// harness hands it to the running turn instead of starting a new one — it "disappears".
     /// Treating the agent as busy here makes the follow-up queue instead.
     pub(crate) sent_turn_pending: bool,
     /// The (provider, model) actually driving THIS chat — the per-chat profile
