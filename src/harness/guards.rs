@@ -4,7 +4,7 @@ use super::*;
 pub(super) struct TurnStats {
     pub real_work: usize,
     pub failed: usize,
-    pub had_note: bool,
+    pub had_plan: bool,
     pub shell_nudged: bool,
     /// Every call this turn was `delegate_task` (and none failed).
     pub only_delegations: bool,
@@ -16,7 +16,7 @@ impl Default for TurnStats {
         Self {
             real_work: 0,
             failed: 0,
-            had_note: false,
+            had_plan: false,
             shell_nudged: false,
             only_delegations: true,
             delegations_ok: 0,
@@ -147,7 +147,12 @@ pub(super) fn note_edit_result(vars: &mut LoopVars, path: Option<String>, is_err
 }
 
 /// Post-turn signals from how the batch went.
-pub(super) fn apply_turn_guards(vars: &mut LoopVars, stats: &TurnStats, conversation_mode: bool) {
+pub(super) fn apply_turn_guards(
+    vars: &mut LoopVars,
+    stats: &TurnStats,
+    conversation_mode: bool,
+    plan_open: bool,
+) {
     // A turn with no shell nudge breaks the escalation streak.
     if !stats.shell_nudged {
         vars.shell_nudge_count = 0;
@@ -175,20 +180,31 @@ pub(super) fn apply_turn_guards(vars: &mut LoopVars, stats: &TurnStats, conversa
     }
 
     // Productivity accounting: real work resets the streaks; a turn that only
-    // took notes (or only hit unknown tools) is unproductive and is nudged
+    // updated the plan (or only hit unknown tools) is unproductive and is nudged
     // toward action, then wrapped up by the top-of-step backstop.
     if stats.real_work > 0 {
         vars.unproductive_turns = 0;
-        vars.consecutive_note_count = 0;
+        vars.consecutive_plan_count = 0;
     } else {
         vars.unproductive_turns += 1;
-        if stats.had_note {
-            vars.consecutive_note_count += 1;
-            if vars.consecutive_note_count >= NOTE_LOOP_AT {
-                vars.pending_signals.push(RuntimeSignal::NoteLoop {
-                    count: vars.consecutive_note_count,
+        if stats.had_plan {
+            vars.consecutive_plan_count += 1;
+            if vars.consecutive_plan_count >= PLAN_LOOP_AT {
+                vars.pending_signals.push(RuntimeSignal::PlanOnly {
+                    count: vars.consecutive_plan_count,
                 });
             }
+        }
+    }
+
+    // A plan with unfinished steps that hasn't been touched in a while has
+    // probably drifted from the work; one reminder to bring it up to date.
+    if plan_open && !stats.had_plan {
+        vars.turns_since_plan += 1;
+        if vars.turns_since_plan == PLAN_STALE_AFTER {
+            vars.pending_signals.push(RuntimeSignal::PlanStale {
+                turns: vars.turns_since_plan,
+            });
         }
     }
 }

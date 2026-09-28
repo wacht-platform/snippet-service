@@ -11,7 +11,7 @@ use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
 pub const META_TOOL_NAMES: [&str; 8] = [
-    "note",
+    "update_plan",
     "ask_user",
     "delegate_task",
     "cancel_delegated_task",
@@ -38,7 +38,7 @@ pub fn conversation_meta_definitions_for(
     allow_lane_control: bool,
 ) -> Vec<NativeToolDefinition> {
     let mut tools = vec![
-        note_tool(),
+        update_plan_tool(),
         ask_user_tool(),
         monitor_tool(),
         present_file_tool(),
@@ -207,27 +207,39 @@ pub fn terminate_loop_tool() -> NativeToolDefinition {
     }
 }
 
-fn note_tool() -> NativeToolDefinition {
+fn update_plan_tool() -> NativeToolDefinition {
     NativeToolDefinition {
-        name: "note".to_string(),
-        description: "Write a private note to yourself, recorded in history so you can read it \
-            back on a later turn. Use it ONLY to plan a genuinely multi-step sequence, record an \
-            observation from a tool result, or anchor a decision during real work. Do NOT use it on \
-            a conversational turn — an acknowledgement, a preference the user stated, a simple \
-            question, or small talk have nothing to plan, so a note there is noise and (since it's \
-            a tool call) forces a needless extra reply. On those, just reply in plain text and stop. \
-            Notes do NOT execute work, are NOT shown to the user, and do NOT end the turn. After a \
-            note, act on the next turn — do not take notes repeatedly without making progress."
+        name: "update_plan".to_string(),
+        description: "Keep a short, visible plan for work with several distinct steps; the user \
+            sees it as a checklist. Send the whole list every time: short concrete steps, each \
+            `pending`, `in_progress` or `done`, with exactly one `in_progress` while you work. Mark \
+            a step done as soon as it is, and reshape the list when you learn something that \
+            changes the work (say why in `explanation`). Skip it for small tasks. Updating the \
+            plan is not progress by itself: after updating it, do the work."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "entry": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": { "type": "string", "description": "A short, concrete step." },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "done"] }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                },
+                "explanation": {
                     "type": "string",
-                    "description": "The note content. Specific and grounded in what you just observed."
+                    "description": "Optional: why the plan changed."
                 }
             },
-            "required": ["entry"],
+            "required": ["steps"],
             "additionalProperties": false,
         }),
     }

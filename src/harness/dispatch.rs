@@ -274,11 +274,13 @@ impl CodingHarness {
                     "delegate_task" | "cancel_delegated_task"
                 ));
         if is_meta {
-            if tool_name == "note" {
-                stats.had_note = true;
-            }
             let (result, control) =
                 self.dispatch_meta(state, lanes, watches, &tool_name, &call.arguments);
+            if tool_name == "update_plan" && !is_error_result(&result) {
+                stats.had_plan = true;
+                vars.turns_since_plan = 0;
+                vars.reminded.insert("plan", render_plan(&state.plan));
+            }
             if tool_name == "delegate_task" {
                 if result.get("status").and_then(Value::as_str) == Some("success") {
                     stats.delegations_ok += 1;

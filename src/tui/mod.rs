@@ -17,7 +17,7 @@ use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use crate::config::SnippetConfig;
-use crate::harness::{HarnessEvent, HarnessStatus};
+use crate::harness::{HarnessEvent, HarnessStatus, PlanStatus};
 use crate::lanes::LaneStatus;
 
 pub mod mascot;
@@ -49,7 +49,7 @@ use transcript::*;
 /// avoid duplication.
 const HIDDEN_TOOL_ROWS: [&str; 9] = [
     "terminate_loop",
-    "note",
+    "update_plan",
     "notify_user",
     "ask_user",
     "delegate_task",

@@ -141,6 +141,7 @@ impl CodingHarness {
             context_window: self.config.context_window_tokens,
             tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
+            plan: Vec::new(),
             history_rewritten: false,
             events_rewritten: false,
             compactions: 0,
