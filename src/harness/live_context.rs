@@ -130,6 +130,8 @@ fn sections(
         Some("No background processes are running now."),
     ));
 
+    out.push(("plan", render_plan(&state.plan), None));
+
     out.push(("lanes", render_lanes(state), Some("All delegated work has reported back.")));
 
     let watches = if state.watches.is_empty() {
@@ -151,6 +153,24 @@ fn sections(
     };
     out.push(("watches", watches, Some("No file watches are active now.")));
     out
+}
+
+/// The plan as the model is reminded of it (after compaction or at the start
+/// of a request); empty when there is none.
+pub(super) fn render_plan(plan: &[PlanStep]) -> String {
+    if plan.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("Your current plan (keep it current with update_plan):");
+    for step in plan {
+        let mark = match step.status {
+            PlanStatus::Done => "[x]",
+            PlanStatus::InProgress => "[>]",
+            PlanStatus::Pending => "[ ]",
+        };
+        text.push_str(&format!("\n{mark} {}", step.step));
+    }
+    text
 }
 
 fn render_lanes(state: &HarnessState) -> String {

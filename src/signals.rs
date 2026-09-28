@@ -17,8 +17,10 @@ pub enum RuntimeSignal {
     ShellDiscipline { message: String },
     /// The same shell-discipline nudge fired again — escalate to reflect-and-switch.
     ShellDisciplineEscalated { count: usize },
-    /// Several note-only turns in a row with no real work.
-    NoteLoop { count: usize },
+    /// Several plan-only turns in a row with no real work.
+    PlanOnly { count: usize },
+    /// The plan has unfinished steps but hasn't been updated in a while.
+    PlanStale { turns: u64 },
     /// A very large batch of tool calls was issued in one turn.
     BatchBackpressure { batch_size: usize },
     /// Several consecutive turns of failing tool calls (or near the unproductive
@@ -59,10 +61,14 @@ impl RuntimeSignal {
                  note. Stop and switch: change files only with `change_files`; keep the shell for \
                  reading, searching and running things."
             ),
-            Self::NoteLoop { count } => format!(
-                "You have written {count} notes in a row without doing any work. Notes do not make \
-                 progress. Act now with a real tool call, or finish the turn and deliver your \
-                 conclusion."
+            Self::PlanOnly { count } => format!(
+                "You have updated the plan {count} times in a row without doing any work. Act \
+                 now with a real tool call, or finish and deliver your conclusion."
+            ),
+            Self::PlanStale { turns } => format!(
+                "Your plan has unfinished steps and hasn't been updated in {turns} steps. Mark \
+                 what's done and adjust it to the work as it stands, or drop steps that no \
+                 longer apply."
             ),
             Self::BatchBackpressure { batch_size } => format!(
                 "You issued {batch_size} tool calls in one turn. Large fan-outs are hard to verify \

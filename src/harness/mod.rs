@@ -23,8 +23,11 @@ use crate::watches::{WatchEvent, WatchManager, WatchRecord};
 /// Consecutive tool-call turns with no real work before the run is wrapped up.
 const MAX_UNPRODUCTIVE_TURNS: usize = 4;
 
-/// Consecutive note-only turns before raising a `NoteLoop` nudge.
-const NOTE_LOOP_AT: usize = 3;
+/// Consecutive plan-only turns before raising a `PlanOnly` nudge.
+const PLAN_LOOP_AT: usize = 3;
+/// Tool-call turns without a plan update, while steps are unfinished, before a
+/// reminder to bring the plan up to date.
+const PLAN_STALE_AFTER: u64 = 10;
 
 /// A single-turn tool batch this large raises `BatchBackpressure`.
 const LARGE_TOOL_BATCH: usize = 10;
@@ -118,9 +121,11 @@ pub enum HarnessEvent {
     AssistantText {
         text: String,
     },
-    /// A private note-to-self the agent recorded.
-    Note {
-        entry: String,
+    /// The agent replaced its visible plan.
+    PlanUpdated {
+        steps: Vec<PlanStep>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        explanation: Option<String>,
     },
     /// A direct message between this session and an agent.
     ///
@@ -201,6 +206,25 @@ pub enum HarnessEvent {
         tool_name: String,
         error: String,
     },
+    /// An event kind this build no longer produces (e.g. the retired `note`),
+    /// read from an older session and ignored.
+    #[serde(other)]
+    Retired,
+}
+
+/// One step of the agent's visible plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlanStep {
+    pub step: String,
+    pub status: PlanStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -305,9 +329,9 @@ you'll be re-prompted each turn to keep going.\n\n\
 GOAL: {text}\n\n\
 Do this now:\n\
 1. Set up a GOAL WORKSPACE — create a new folder (or reuse a relevant existing one) under \
-`.snippet/goals/`, and record its path in a `note`. This is durable scratch space that \
-SURVIVES compaction: keep your plan, todos, findings, decisions, and any artifacts there.\n\
-2. Write an initial PLAN + TODO list into that folder.\n\
+`.snippet/goals/`. This is durable scratch space that SURVIVES compaction: keep your \
+findings, decisions, and any artifacts there.\n\
+2. Lay out the work with `update_plan`, and write its path and the plan into that folder too.\n\
 3. Start executing toward 100% completion.\n\n\
 Rules: keep going on your own; do NOT stop to ask for confirmation on ordinary steps. When the \
 goal is genuinely 100% complete, call `complete_goal` with a short summary. If you hit a hard \
@@ -459,6 +483,10 @@ pub struct HarnessState {
     /// a stale hold list.
     #[serde(default)]
     pub queued_inputs: Vec<QueuedInput>,
+    /// The agent's current plan, kept with `update_plan` and shown to the user
+    /// as a checklist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan: Vec<PlanStep>,
     /// Completed history compactions. Checkpoints record it so a rewind can
     /// tell whether their message position still exists.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -701,9 +729,11 @@ struct LoopVars {
     recent_tool_signatures: std::collections::VecDeque<String>,
     /// Consecutive shell-discipline nudges, for escalation.
     shell_nudge_count: usize,
-    /// Consecutive note-only turns (notes with no real work).
-    consecutive_note_count: usize,
-    /// Consecutive tool-call turns that did no real work (notes / unknown tools).
+    /// Consecutive plan-only turns (plan updates with no real work).
+    consecutive_plan_count: usize,
+    /// Tool-call turns since the plan was last updated.
+    turns_since_plan: u64,
+    /// Consecutive tool-call turns that did no real work (plan-only / unknown tools).
     unproductive_turns: usize,
     /// Consecutive turns in which EVERY executed tool call failed — the approach
     /// isn't working; escalates to a re-think-or-ask-for-help nudge.
@@ -717,7 +747,7 @@ struct LoopVars {
     /// Output fingerprint of each bash command run during this request, so an
     /// identical rerun returns a short notice instead of the same output again.
     bash_outputs: std::collections::HashMap<String, u64>,
-    /// Empty completions (no reply — e.g. the agent only left a note) re-prompted
+    /// Empty completions (no reply at all) re-prompted
     /// this response cycle. Capped so we ask for an answer without looping forever.
     /// Reset on a new user message.
     empty_reply_reprompts: usize,

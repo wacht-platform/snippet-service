@@ -49,26 +49,25 @@ impl CodingHarness {
                     ),
                 }
             }
-            "note" => {
-                let entry = arguments
-                    .get("entry")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let Some(entry) = entry else {
-                    return (
-                        tool_error("note requires a non-empty `entry`."),
+            "update_plan" => match parse_plan(arguments) {
+                Ok(steps) => {
+                    let done = steps.iter().filter(|s| s.status == PlanStatus::Done).count();
+                    let total = steps.len();
+                    let explanation = arguments
+                        .get("explanation")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    state.plan = steps.clone();
+                    state.events.push(HarnessEvent::PlanUpdated { steps, explanation });
+                    (
+                        json!({"schema_version": 1, "status": "success", "data": {"done": done, "total": total}}),
                         MetaControl::Continue,
-                    );
-                };
-                state.events.push(HarnessEvent::Note {
-                    entry: entry.to_string(),
-                });
-                (
-                    json!({"schema_version": 1, "status": "success", "data": {"noted": true}}),
-                    MetaControl::Continue,
-                )
-            }
+                    )
+                }
+                Err(message) => (tool_error(&message), MetaControl::Continue),
+            },
             "set_session_title" => {
                 let title = arguments
                     .get("title")
@@ -405,4 +404,31 @@ impl CodingHarness {
         }
         definitions
     }
+}
+
+/// Validate an `update_plan` call: 1–12 non-empty steps, at most one in progress.
+fn parse_plan(arguments: &Value) -> Result<Vec<PlanStep>, String> {
+    let steps: Vec<PlanStep> = arguments
+        .get("steps")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("update_plan `steps` must be a list of {{step, status}}: {e}"))?
+        .unwrap_or_default();
+    if steps.is_empty() || steps.len() > 12 {
+        return Err("update_plan needs between 1 and 12 steps.".to_string());
+    }
+    if steps.iter().any(|s| s.step.trim().is_empty()) {
+        return Err("every plan step needs text.".to_string());
+    }
+    if steps.iter().filter(|s| s.status == PlanStatus::InProgress).count() > 1 {
+        return Err("mark at most one step `in_progress`.".to_string());
+    }
+    Ok(steps
+        .into_iter()
+        .map(|s| PlanStep {
+            step: s.step.trim().to_string(),
+            status: s.status,
+        })
+        .collect())
 }

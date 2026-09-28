@@ -408,7 +408,7 @@ fn turn_has_visible_action(events: &[HarnessEvent]) -> bool {
             HarnessEvent::ToolCall { .. }
             | HarnessEvent::ToolResult { .. }
             | HarnessEvent::InvalidToolCall { .. }
-            | HarnessEvent::Note { .. }
+            | HarnessEvent::PlanUpdated { .. }
             | HarnessEvent::FilePresented { .. }
             | HarnessEvent::UserQuestion { .. }
             | HarnessEvent::ApprovalRequest { .. }
@@ -447,14 +447,27 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
         HarnessEvent::AssistantText { text } => {
             indent_block(render_prose(text, width.saturating_sub(SPINE)), SPINE)
         }
-        HarnessEvent::Note { entry } => {
-            // The agent's private scratchpad — recede it (faint + italic) so it
-            // reads as a quiet aside, not content on par with the answer.
-            let mut lines = marker_block("·", faint(), entry, width);
-            for line in &mut lines {
-                for span in &mut line.spans {
-                    span.style = span.style.add_modifier(Modifier::ITALIC | Modifier::DIM);
+        HarnessEvent::Retired => Vec::new(),
+        HarnessEvent::PlanUpdated { steps, explanation } => {
+            let mut lines = Vec::new();
+            if let Some(why) = explanation {
+                lines.extend(marker_block("·", faint(), why, width));
+            }
+            for step in steps {
+                let (mark, color) = match step.status {
+                    PlanStatus::Done => ("✓", success()),
+                    PlanStatus::InProgress => ("▸", accent()),
+                    PlanStatus::Pending => ("○", muted()),
+                };
+                let mut block = marker_block(mark, color, &step.step, width);
+                if step.status == PlanStatus::Done {
+                    for line in &mut block {
+                        for span in line.spans.iter_mut().skip(1) {
+                            span.style = span.style.fg(muted());
+                        }
+                    }
                 }
+                lines.extend(block);
             }
             lines
         }

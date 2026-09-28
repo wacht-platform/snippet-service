@@ -95,7 +95,7 @@ pub struct LaneResult {
     pub status: LaneStatus,
     /// Concise final summary (the lane's terminate_loop text) — shown in the TUI.
     pub summary: Option<String>,
-    /// Full report for the parent agent: action log + findings + summary.
+    /// Full report for the parent agent: action log + summary.
     pub report: Option<String>,
     pub error: Option<String>,
 }
@@ -812,14 +812,13 @@ fn verify_grounding(workspace: &std::path::Path, text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Build the parent-facing report for a finished lane: its final summary, the
-/// full log of tool calls it made, and the findings/notes it recorded — so the
-/// parent agent sees everything the lane did, not just a one-line summary.
+/// Build the parent-facing report for a finished lane: its final summary and
+/// the full log of tool calls it made — so the parent agent sees everything the
+/// lane did, not just a one-line summary.
 fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
     use crate::harness::HarnessEvent;
 
     let mut actions: Vec<String> = Vec::new();
-    let mut findings: Vec<String> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     for event in &outcome.events {
         match event {
@@ -842,12 +841,6 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
                     }
                 }
                 actions.push(action_label(tool_name, arguments));
-            }
-            // The lane's deliberate self-notes are findings; mid-run progress
-            // chatter (AssistantText) is low-signal and redundant with the
-            // summary, so it's left out to keep the report token-dense.
-            HarnessEvent::Note { entry } => {
-                findings.push(truncate_text(entry, 240));
             }
             _ => {}
         }
@@ -878,17 +871,6 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
         }
         if actions.len() > CAP {
             out.push_str(&format!("\n… and {} more", actions.len() - CAP));
-        }
-    }
-
-    if !findings.is_empty() {
-        const FCAP: usize = 40;
-        out.push_str("\n\nNotes:");
-        for finding in findings.iter().take(FCAP) {
-            out.push_str(&format!("\n- {finding}"));
-        }
-        if findings.len() > FCAP {
-            out.push_str(&format!("\n… and {} more", findings.len() - FCAP));
         }
     }
 

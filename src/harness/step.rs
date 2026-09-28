@@ -117,7 +117,8 @@ impl CodingHarness {
             Ok(stats) => stats,
             Err(end) => return end,
         };
-        apply_turn_guards(vars, &stats, conversation_mode);
+        let plan_open = state.plan.iter().any(|s| s.status != PlanStatus::Done);
+        apply_turn_guards(vars, &stats, conversation_mode, plan_open);
 
         // Every call this iteration was a successful delegation → the wait takes
         // effect NOW: end the turn so the agent goes idle and the lane reports
