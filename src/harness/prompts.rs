@@ -141,7 +141,7 @@ next_steps = "prioritized, ordered next actions so the agent can resume immediat
 commitments_and_constraints = "invariants, user rules, line limits (e.g. <= 1,500 lines per file), formatting preferences"
 
 [drop]  # do NOT carry these — they are the bulk of tokens and add nothing
-noise = "assistant chit-chat, conversational pleasantries, intermediate tool dumps (keep the CONCLUSION, not the raw output), restated instructions, and anything trivially re-readable from the code itself. Raw tool payloads are archived in SQLite and retrievable via recall_context/search_history."
+noise = "assistant chit-chat, conversational pleasantries, intermediate tool dumps (keep the CONCLUSION, not the raw output), restated instructions, and anything trivially re-readable from the code itself. Raw tool payloads are archived in SQLite and retrievable with `snippet history search` / `snippet history show`."
 
 [method]
 fold = "if a PRIOR SUMMARY is present, update it in place — preserve all past user requests, update the engineering sections, add what's new, delete what's stale or superseded; do not just blindly append"

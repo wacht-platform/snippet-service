@@ -1107,57 +1107,8 @@ pub(super) fn tool_call_preview(
                 items.push((format!("  … +{} more lines", total - MAX), subtle()));
             }
         }
-        "memory_write" => {
-            let id = arg("id");
-            let content = arg("content");
-            items.push((format!("id  {id}"), path_style));
-            push_text_preview(&mut items, content, MAX, green, subtle());
-        }
-        "memory_rule" => {
-            let scope = arg("scope");
-            let content = arg("content");
-            items.push((format!("scope  {scope}"), path_style));
-            push_text_preview(&mut items, content, MAX, green, subtle());
-        }
-        "memory_pattern" => {
-            let action = arg("action");
-            let content = arg("content");
-            if !action.is_empty() {
-                items.push((format!("action  {action}"), path_style));
-            }
-            push_text_preview(&mut items, content, MAX, green, subtle());
-        }
-        "memory_index" => {
-            push_text_preview(&mut items, arg("content"), MAX, green, subtle());
-        }
-        "memory_delete" => {
-            items.push((format!("id  {}", arg("id")), path_style));
-        }
-        "memory_read" => {
-            items.push((format!("id  {}", arg("id")), path_style));
-        }
         _ => return Vec::new(),
     }
     result_block_verbatim(items, width)
-}
-
-fn push_text_preview(
-    items: &mut Vec<(String, Style)>,
-    content: &str,
-    max: usize,
-    body: Style,
-    more: Style,
-) {
-    let total = content.lines().count();
-    if content.trim().is_empty() {
-        items.push(("  (empty)".to_string(), more));
-        return;
-    }
-    for line in content.lines().take(max) {
-        items.push((format!("  {line}"), body));
-    }
-    if total > max {
-        items.push((format!("  … +{} more lines", total - max), more));
-    }
 }
 

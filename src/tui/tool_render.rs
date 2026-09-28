@@ -20,9 +20,6 @@ pub(super) fn tool_is_expandable(tool_name: &str, arguments: &Value, result: Opt
                 || cmd.chars().count() > 80
                 || result.map(result_has_body).unwrap_or(false)
         }
-        "memory_write" | "memory_rule" | "memory_pattern" | "memory_index" => {
-            !arg("content").trim().is_empty()
-        }
         "web_read" => result.map(result_has_body).unwrap_or(false),
         _ => {
             // Any tool whose header arg was truncated, or result has a body.
@@ -95,45 +92,6 @@ pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, St
             let cmd = arg("command");
             let text = if !label.is_empty() { label } else { cmd };
             ("Bash".into(), ellipsize_one_line(&text, 90))
-        }
-        "memory_write" => ("MemoryWrite".into(), {
-            let id = arg("id");
-            let n = arg("content").lines().count();
-            if id.is_empty() {
-                format!("{n} lines")
-            } else {
-                format!("{id} · {n} lines")
-            }
-        }),
-        "memory_read" => ("MemoryRead".into(), arg("id")),
-        "memory_delete" => ("MemoryDelete".into(), arg("id")),
-        "memory_index" => {
-            let n = arg("content").lines().count();
-            ("MemoryIndex".into(), format!("{n} lines"))
-        }
-        "memory_rule" => {
-            let scope = arg("scope");
-            let n = arg("content").lines().count();
-            (
-                "MemoryRule".into(),
-                if scope.is_empty() {
-                    format!("{n} lines")
-                } else {
-                    format!("{scope} · {n} lines")
-                },
-            )
-        }
-        "memory_pattern" => {
-            let action = arg("action");
-            let n = arg("content").lines().count();
-            (
-                "MemoryPattern".into(),
-                if action.is_empty() {
-                    format!("{n} lines")
-                } else {
-                    format!("{action} · {n} lines")
-                },
-            )
         }
         _ => {
             let pretty = tool_name
@@ -324,29 +282,6 @@ pub(super) fn tool_result_lines_expanded(
             }
             if total > MAX {
                 items.push((format!("… +{} more lines", total - MAX), more));
-            }
-        }
-        "memory_read" => {
-            let content = data
-                .get("content")
-                .or_else(|| data.get("entry"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let total = content.lines().count();
-            for line in content.lines().take(MAX) {
-                items.push((line.to_string(), body));
-            }
-            if total > MAX {
-                items.push((format!("… +{} more lines", total - MAX), more));
-            }
-            if content.is_empty() {
-                items.push(("saved".to_string(), body));
-            }
-        }
-        "memory_write" | "memory_rule" | "memory_pattern" | "memory_index" | "memory_delete" => {
-            items.push(("saved".to_string(), body));
-            if let Some(id) = data.get("id").and_then(Value::as_str) {
-                items.push((format!("id  {id}"), body));
             }
         }
         _ => return tool_result_lines(tool_name, result, width),

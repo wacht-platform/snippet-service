@@ -21,7 +21,6 @@ pub(super) fn build_live_context(
     workspace: &std::path::Path,
     cwd: &std::path::Path,
     browser_summary: Option<String>,
-    memory_writes: &[String],
 ) -> String {
     let signals = std::mem::take(&mut vars.pending_signals);
     let mut block = String::new();
@@ -130,13 +129,6 @@ pub(super) fn build_live_context(
     if skill_n > 0 {
         block.push_str("\n[skills_available]\n");
         block.push_str(&format!("count = {skill_n}\n"));
-    }
-
-    // Mid-session memory writes (system index is cache-fixed until resume).
-    if !memory_writes.is_empty() {
-        let ids: Vec<&str> = memory_writes.iter().map(String::as_str).collect();
-        block.push_str("\n[memory_updated]\n");
-        block.push_str(&format!("ids = \"{}\"\n", ids.join(", ")));
     }
 
     // Background processes the agent started (dev servers, watchers) — so it knows

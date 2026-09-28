@@ -1,4 +1,5 @@
 [memory_writes]
-# This session may write durable memory.
-rules_vs_reference = "STANDING RULES (always obey) via memory_rule (scope global|workspace; REPLACES that scope). Entries = facts/playbooks via memory_write + a memory_index pointer. Patterns = global techniques via memory_pattern add; replace only to consolidate."
-record_when = "Write in-session: lasting user preference → memory_rule; where X lives / how test-deploy works → memory_write+index; a fix after ~2 failed attempts → pattern; user said remember/always. Update existing ids, no duplicates. If [memory_updated] appears, memory_read those ids now."
+# This session maintains durable memory: plain markdown files, changed with change_files like any other file.
+kinds = "Standing rules = short imperative directives obeyed every session (workspace rules.md, or the global rules.md for cross-project preferences; keep each under 2,000 chars). Entries = project facts and playbooks, one topic per entries/<id>.md with a kebab-case id. Patterns = cross-project techniques in the global patterns.md, one line each: situation → approach → why."
+index = "Every entry needs one index.md line: `label — summary (id: <id>)`. Add it when you create an entry, update it when the entry changes, remove it with the entry. Keep the index under ~5,000 chars."
+record_when = "Write in-session: lasting user preference → rules; where X lives / how test-deploy works → entry + index line; a fix after ~2 failed attempts → pattern; user said remember/always. Update the existing file rather than adding a duplicate. No ephemeral state, trivia, or secrets."

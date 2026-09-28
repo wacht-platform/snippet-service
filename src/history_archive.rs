@@ -349,7 +349,7 @@ pub fn search_history(
     store.with_connection(|conn| {
         let mut stmt = conn.prepare(
             "SELECT a.archive_id, a.role, a.tool_name, a.summary, a.affected_paths, a.status,
-                    snippet(session_history_fts, 5, '<b>', '</b>', '...', 16) AS snip
+                    snippet(session_history_fts, 5, '', '', '…', 16) AS snip
              FROM session_history_fts f
              JOIN session_history_archive a ON a.archive_id = f.archive_id
              WHERE session_history_fts MATCH ?1 AND f.session_id = ?2
@@ -377,6 +377,34 @@ pub fn search_history(
     })
 }
 
+/// One archived message as plain text: a `#id` heading, then the message.
+pub fn render_turn(turn: &ArchivedTurnDetail) -> String {
+    let heading = match &turn.tool_name {
+        Some(tool) if turn.role == "tool" => format!("#{} tool: {tool}", turn.archive_id),
+        _ => format!("#{} {}", turn.archive_id, turn.role),
+    };
+    let body = match serde_json::from_value::<HarnessMessage>(turn.payload.clone()) {
+        Ok(HarnessMessage::User { content }) => content,
+        Ok(HarnessMessage::Assistant {
+            content,
+            tool_calls,
+        }) => {
+            let mut text = content.trim_end().to_string();
+            for call in tool_calls {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format!("→ {} {}", call.name, call.arguments));
+            }
+            text
+        }
+        Ok(HarnessMessage::ToolResult { content, .. }) => crate::llm::render_tool_result(&content),
+        Ok(HarnessMessage::System { content }) | Ok(HarnessMessage::Summary { content, .. }) => content,
+        Err(_) => turn.summary.clone(),
+    };
+    format!("{heading}\n{}\n", body.trim_end())
+}
+
 /// Format the ultra-dense IBM-style micro-pointer manifest.
 /// Produces ~12-15 tokens per turn instead of thousands of tokens of lossy text.
 pub fn render_micro_pointers(goal: &str, turns: &[ArchivedTurnSummary]) -> String {
@@ -399,7 +427,7 @@ pub fn render_micro_pointers(goal: &str, turns: &[ArchivedTurnSummary]) -> Strin
             status = turn.status
         ));
     }
-    out.push_str("Hydrate any raw payload with `recall_context(archive_id)` or find turns via `search_history(query)`.\n");
+    out.push_str("Search these with `snippet history search 'term'` and read full messages with `snippet history show <id> [<id>...]` or `snippet history show --from <id> --to <id>` (bash).\n");
     out
 }
 
@@ -500,56 +528,49 @@ fn extract_message_metadata(
             ..
         } => {
             let data = content.get("data").unwrap_or(content);
-            let mut paths = String::new();
-            if let Some(p) = data.get("path").and_then(Value::as_str) {
-                paths = p.to_string();
-            } else if let Some(files) = data.get("files").and_then(Value::as_array) {
-                paths = files
-                    .iter()
-                    .filter_map(|f| f.get("path").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join(",");
+            let paths = if let Some(p) = data.get("path").and_then(Value::as_str) {
+                p.to_string()
             } else if let Some(p) = data.get("saved_output_path").and_then(Value::as_str) {
-                paths = p.to_string();
-            }
+                p.to_string()
+            } else {
+                String::new()
+            };
 
-            let status = if let Some(exit) = content.get("exit_code").and_then(Value::as_i64) {
+            let status = if let Some(exit) = data.get("exit_code").and_then(Value::as_i64) {
                 if exit == 0 { "ok".to_string() } else { format!("exit {exit}") }
-            } else if content.get("error").is_some() || content.get("is_error").and_then(Value::as_bool) == Some(true) {
+            } else if content.get("status").and_then(Value::as_str) == Some("error") {
                 "error".to_string()
             } else {
                 "ok".to_string()
             };
 
-            let summary = match tool_name.as_str() {
-                "bash" => {
-                    if let Some(lbl) = content.get("label").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
-                        let trimmed = lbl.trim();
-                        if trimmed.chars().count() > 80 {
-                            trimmed.chars().take(80).collect::<String>() + "…"
-                        } else {
-                            trimmed.to_string()
-                        }
-                    } else {
-                        // Fallback for old cases where label was omitted
-                        let cmd = content.get("command").and_then(Value::as_str).unwrap_or("");
-                        let first = cmd.lines().next().unwrap_or("").trim();
-                        let short_cmd = if first.chars().count() > 45 {
-                            first.chars().take(45).collect::<String>() + "…"
-                        } else if cmd.lines().count() > 1 {
-                            format!("{first}…")
-                        } else {
-                            first.to_string()
-                        };
-                        format!("bash: {short_cmd}")
-                    }
+            let clip = |text: &str, max: usize| {
+                let first = text.lines().next().unwrap_or("").trim();
+                if first.chars().count() > max || text.trim().lines().count() > 1 {
+                    first.chars().take(max).collect::<String>() + "…"
+                } else {
+                    first.to_string()
                 }
-                "change_files" => format!("changed {paths}"),
-                "view_image" => format!("viewed {paths}"),
-                "edit_file" => format!("edited {paths}"),
-                "read_file" => format!("read {paths}"),
-                "write_file" => format!("wrote {paths}"),
-                _ => format!("{tool_name} completed"),
+            };
+            let summary = if status == "error" {
+                let message = content
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                format!("{tool_name} failed: {}", clip(message, 70))
+            } else {
+                match tool_name.as_str() {
+                    "bash" => match data.get("label").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                        Some(label) => clip(label, 80),
+                        None => format!(
+                            "bash: {}",
+                            clip(data.get("command").and_then(Value::as_str).unwrap_or(""), 45)
+                        ),
+                    },
+                    "change_files" => clip(data.get("summary").and_then(Value::as_str).unwrap_or("changed files"), 80),
+                    "view_image" => format!("viewed {paths}"),
+                    _ => format!("{tool_name} completed"),
+                }
             };
 
             let searchable = content.to_string();
@@ -596,10 +617,10 @@ mod tests {
             },
             HarnessMessage::ToolResult {
                 tool_call_id: "call_2".to_string(),
-                tool_name: "edit_file".to_string(),
+                tool_name: "change_files".to_string(),
                 content: json!({
-                    "path": "src/auth.rs",
-                    "edited": true
+                    "status": "success",
+                    "data": {"summary": "edited src/auth.rs (+1 -1)"}
                 }),
             },
             HarnessMessage::ToolResult {
@@ -623,7 +644,7 @@ mod tests {
         assert!(manifest.contains("[archived_history]"));
         assert!(manifest.contains("#1|user|Please fix compiler error E0308 in auth.rs||ok"));
         assert!(manifest.contains("#2|bash|bash: cargo check||exit 1"));
-        assert!(manifest.contains("#3|edit_file|edited src/auth.rs|src/auth.rs|ok"));
+        assert!(manifest.contains("#3|change_files|edited src/auth.rs (+1 -1)||ok"));
         assert!(manifest.contains("#4|bash|Run auth unit tests||ok"));
 
         // Recall turn 2

@@ -77,10 +77,6 @@ pub struct ToolContext {
     /// external edits, another lane, or a concurrent process). Optimistic
     /// concurrency; replaces the former lock registry.
     seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
-    /// Entry ids written via memory_write this session (main). Surfaced in live
-    /// context as [memory_updated] so the agent can memory_read them now — the
-    /// system-prefix index is cache-fixed until resume.
-    memory_writes: Arc<Mutex<Vec<String>>>,
     mission_control: bool,
     /// Durable session identity (state path relative to the workspaces root).
     /// Set for daemon-managed sessions; lets `report_mission_task` verify the
@@ -148,7 +144,6 @@ impl ToolContext {
             owner: owner.into(),
             browser_summary,
             seen: Arc::new(Mutex::new(HashMap::new())),
-            memory_writes: Arc::new(Mutex::new(Vec::new())),
             mission_control: false,
             durable_session_id: None,
             mission_control_root: None,
@@ -237,28 +232,6 @@ impl ToolContext {
         self.agent_id.as_deref()
     }
 
-
-    /// Record a successful memory_write id for live-context [memory_updated].
-    pub fn note_memory_write(&self, id: &str) {
-        let id = id.trim();
-        if id.is_empty() {
-            return;
-        }
-        let mut w = self.memory_writes.lock().unwrap();
-        if !w.iter().any(|x| x == id) {
-            w.push(id.to_string());
-            // Cap so a noisy session can't bloat the live-context line.
-            if w.len() > 12 {
-                let drain = w.len() - 12;
-                w.drain(0..drain);
-            }
-        }
-    }
-
-    /// Ids written this session (oldest→newest), for live context.
-    pub fn memory_writes_snapshot(&self) -> Vec<String> {
-        self.memory_writes.lock().unwrap().clone()
-    }
 
     pub fn browser_summary(&self) -> Option<String> {
         self.browser_summary.as_ref().map(|provider| provider())

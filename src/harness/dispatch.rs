@@ -4,7 +4,7 @@ use super::*;
 /// run of them can execute concurrently. Results are still recorded in call
 /// order, one ToolCall/ToolResult pair at a time, which is what the clients pair
 /// on.
-const PARALLEL_SAFE_TOOLS: [&str; 4] = ["view_image", "web_search", "web_read", "memory_read"];
+const PARALLEL_SAFE_TOOLS: [&str; 3] = ["view_image", "web_search", "web_read"];
 
 fn scrub_vault(result: &mut Value) {
     let vault = crate::vault::Vault::load();
@@ -43,19 +43,6 @@ fn answer_call(state: &mut HarnessState, tool_name: &str, call_id: &str, result:
     });
 }
 
-fn duplicate_notice(tool_name: &str) -> Value {
-    let skipped = if tool_name == "memory_read" {
-        "Identical memory_read already ran this turn — reuse that result. Don't recall the same id again."
-    } else {
-        "Identical discovery call already ran this turn — reuse the earlier result instead of repeating it."
-    };
-    json!({
-        "schema_version": 1,
-        "status": "ok",
-        "data": {"skipped": skipped},
-    })
-}
-
 impl CodingHarness {
     /// Execute one turn's tool calls. `Err` ends the turn immediately
     /// (`terminate_loop`, `ask_user`); `Ok` carries the turn's productivity.
@@ -85,7 +72,7 @@ impl CodingHarness {
         while i < calls.len() {
             let end = self.parallel_run_end(&calls, i, conversation_mode);
             if end > i + 1 {
-                self.run_parallel_reads(state, lanes, vars, &calls[i..end], &mut stats)
+                self.run_parallel_reads(state, lanes, &calls[i..end], &mut stats)
                     .await;
                 i = end;
                 continue;
@@ -135,86 +122,46 @@ impl CodingHarness {
         end
     }
 
-    /// Whether this exact read-only call already ran this request with an
-    /// unchanged result (for `read_file`: the file is unchanged on disk).
-    fn is_duplicate_read(&self, vars: &LoopVars, call: &GeneratedToolCall) -> bool {
-        let signature = format!("{}:{}", call.tool_name, call.arguments);
-        DEDUP_TOOLS.contains(&call.tool_name.as_str()) && vars.executed_calls.contains(&signature)
-    }
-
-    /// A run of read-only calls: duplicates are answered from history, the rest
-    /// execute concurrently, and every pair is recorded in call order.
+    /// A run of read-only calls: they execute concurrently, and every pair is
+    /// recorded in call order.
     async fn run_parallel_reads(
         &self,
         state: &mut HarnessState,
         lanes: &LaneManager,
-        vars: &mut LoopVars,
         calls: &[GeneratedToolCall],
         stats: &mut TurnStats,
     ) {
         stats.only_delegations = false;
-        let mut seen_in_run = HashSet::new();
-        let duplicate: Vec<bool> = calls
-            .iter()
-            .map(|call| {
-                let signature = format!("{}:{}", call.tool_name, call.arguments);
-                let repeat_in_run = DEDUP_TOOLS.contains(&call.tool_name.as_str())
-                    && !seen_in_run.insert(signature);
-                repeat_in_run || self.is_duplicate_read(vars, call)
-            })
-            .collect();
         for call in calls {
             self.lane_progress("tool_call", format!("running {}", call.tool_name));
         }
-        let results = futures_util::future::join_all(calls.iter().zip(&duplicate).map(
-            |(call, dup)| async move {
-                if *dup {
-                    return None;
-                }
-                Some(
-                    self.tools
-                        .execute(&self.context, &call.tool_name, call.arguments.clone())
-                        .await,
-                )
-            },
-        ))
+        let results = futures_util::future::join_all(calls.iter().map(|call| {
+            self.tools
+                .execute(&self.context, &call.tool_name, call.arguments.clone())
+        }))
         .await;
-        for ((call, dup), outcome) in calls.iter().zip(duplicate).zip(results) {
+        for (call, outcome) in calls.iter().zip(results) {
             let call_id = call.id.clone().unwrap_or_default();
             state.events.push(HarnessEvent::ToolCall {
                 tool_name: call.tool_name.clone(),
                 arguments: call.arguments.clone(),
             });
-            if dup {
-                stats.dedup_hits += 1;
-                answer_call(
-                    state,
-                    &call.tool_name,
-                    &call_id,
-                    duplicate_notice(&call.tool_name),
-                );
-                continue;
-            }
             stats.real_work += 1;
             let mut result = match outcome {
-                Some(Ok(result)) => result.value,
-                Some(Err(error)) => execution_error(error),
-                None => unreachable!("non-duplicate calls always execute"),
+                Ok(result) => result.value,
+                Err(error) => execution_error(error),
             };
             scrub_vault(&mut result);
-            let is_err = is_error_result(&result);
-            if is_err {
+            if is_error_result(&result) {
                 stats.failed += 1;
             }
-            let signature = format!("{}:{}", call.tool_name, call.arguments);
-            note_discovery(vars, &call.tool_name, signature, is_err);
             answer_call(state, &call.tool_name, &call_id, result);
         }
         let _ = self.persist(state, lanes).await;
     }
 
     /// One call through the full policy: headless completion, meta tools,
-    /// unknown tools, read dedup, shell discipline, vault gating, manual
+    /// unknown tools, shell discipline, vault gating, manual
     /// approval, execution. `Some` ends the turn.
     #[allow(clippy::too_many_arguments)]
     async fn run_call(
@@ -341,15 +288,6 @@ impl CodingHarness {
             return None;
         }
 
-        // Dedup: re-calling a read-only tool with identical args this request is
-        // the classic spinning loop — its result is already in history.
-        if self.is_duplicate_read(vars, &call) {
-            stats.dedup_hits += 1;
-            answer_call(state, &tool_name, &call_id, duplicate_notice(&tool_name));
-            let _ = self.persist(state, lanes).await;
-            return None;
-        }
-
         stats.real_work += 1;
 
         if tool_name == "bash" {
@@ -455,7 +393,6 @@ impl CodingHarness {
                     .map(str::to_string)
             })
             .flatten();
-        let signature = format!("{}:{}", tool_name, call.arguments);
         let mut result = match self
             .tools
             .execute(&self.context, &tool_name, call.arguments)
@@ -474,7 +411,6 @@ impl CodingHarness {
         if tool_name == "change_files" {
             note_edit_result(vars, edit_path, is_err);
         }
-        note_discovery(vars, &tool_name, signature, is_err);
         answer_call(state, &tool_name, &call_id, result);
         // Flush after every tool result so a mid-batch kill still keeps completed
         // calls on disk.

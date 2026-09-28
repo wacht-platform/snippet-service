@@ -1,32 +1,25 @@
 pub mod fs;
 pub mod shell_search;
 pub mod web;
-pub mod memory;
-pub mod history;
+pub mod skills;
 pub mod process;
 
 pub use fs::*;
 pub use shell_search::*;
 pub use web::*;
-pub use memory::*;
-pub use history::*;
+pub use skills::*;
 pub use process::*;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 use crate::tools::{ToolError, ToolRegistry};
 
-pub fn coding_tools(
-    exa_api_key: Option<String>,
-    memory: crate::memory::MemoryLimits,
-) -> ToolRegistry {
+pub fn coding_tools(exa_api_key: Option<String>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.insert(BashTool);
     registry.insert(ChangeFilesTool);
     registry.insert(ViewImageTool);
     registry.insert(ManageProcessTool);
-    registry.insert(RecallContextTool);
-    registry.insert(SearchHistoryTool);
     // Skill tools only when the user actually has skills installed — otherwise they
     // are dead weight in every prompt's tool list.
     if !crate::skills::discover().is_empty() {
@@ -39,23 +32,6 @@ pub fn coding_tools(
             api_key: key.clone(),
         });
         registry.insert(WebReadTool { api_key: key });
-    }
-    // Per-workspace memory: read is offered whenever enabled; writes only to the
-    // main session (lanes are read-only, so they can't clobber the shared index).
-    if memory.enabled {
-        registry.insert(MemoryReadTool);
-        if memory.writable {
-            registry.insert(MemoryWriteTool {
-                entry_budget: memory.entry_budget_chars,
-                max_entries: memory.max_entries,
-            });
-            registry.insert(MemoryIndexTool {
-                index_budget: memory.index_budget_chars,
-            });
-            registry.insert(MemoryDeleteTool);
-            registry.insert(MemoryRuleTool);
-            registry.insert(MemoryPatternTool);
-        }
     }
     registry
 }

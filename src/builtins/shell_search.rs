@@ -74,12 +74,13 @@ impl Tool for BashTool {
             // itself isn't blocked on us).
             let mut child = Command::new("sh")
                 .arg("-lc")
-                .arg(&args.command)
+                .arg(format!("{PATH_PRELUDE}{}", args.command))
                 .current_dir(ctx.current_dir())
                 .env(
                     "SNIPPET_SHADOW_GIT",
                     crate::checkpoint::shadow_dir(ctx.workspace_root()),
                 )
+                .envs(agent_env(ctx))
                 .envs(vault_env)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log))
@@ -118,7 +119,7 @@ impl Tool for BashTool {
             &uuid::Uuid::new_v4().to_string()[..12]
         ));
         let script = format!(
-            "__snippet_pwd_file='{}'; trap 'pwd > \"$__snippet_pwd_file\"' EXIT\n{}",
+            "{PATH_PRELUDE}__snippet_pwd_file='{}'; trap 'pwd > \"$__snippet_pwd_file\"' EXIT\n{}",
             pwd_file.display(),
             args.command
         );
@@ -133,6 +134,7 @@ impl Tool for BashTool {
                 "SNIPPET_SHADOW_GIT",
                 crate::checkpoint::shadow_dir(ctx.workspace_root()),
             )
+            .envs(agent_env(ctx))
             .envs(vault_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -226,6 +228,24 @@ impl Tool for BashTool {
         Ok(ToolResult::success(value))
     }
 }
+
+/// Environment every agent shell gets: the session id `snippet history` is
+/// scoped to, and the folder of the running snippet binary so its subcommands
+/// resolve to the same version as the daemon.
+fn agent_env(ctx: &ToolContext) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if let Some(id) = ctx.durable_session_id() {
+        env.push(("SNIPPET_SESSION_ID".to_string(), id.to_string()));
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        env.push(("SNIPPET_BIN_DIR".to_string(), dir.display().to_string()));
+    }
+    env
+}
+
+/// Prepended to every command. `sh -l` sources the login profile, which may
+/// reset PATH, so the snippet binary is put first after that has run.
+const PATH_PRELUDE: &str = "[ -n \"$SNIPPET_BIN_DIR\" ] && export PATH=\"$SNIPPET_BIN_DIR:$PATH\"\n";
 
 fn format_output_preview(
     text: &str,

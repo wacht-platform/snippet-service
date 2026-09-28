@@ -174,7 +174,6 @@ impl CodingHarness {
                 self.context.workspace_root(),
                 &self.context.current_dir(),
                 self.context.browser_summary(),
-                &self.context.memory_writes_snapshot(),
             ),
         });
         request_messages

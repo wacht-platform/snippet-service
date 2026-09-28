@@ -849,8 +849,7 @@ mod dedup_and_stuck_edit_tests {
     use super::*;
 
     #[test]
-    fn test_dedup_and_mutating_tool_sets() {
-        assert!(DEDUP_TOOLS.contains(&"memory_read"));
+    fn test_mutating_tool_set() {
         assert!(MUTATING_TOOLS.contains(&"change_files"));
         assert!(MUTATING_TOOLS.contains(&"bash"));
     }

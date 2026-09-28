@@ -300,7 +300,6 @@ struct RuntimeInputs {
     prompt_ctx: crate::prompts::PromptContext,
     browser_summary: Option<BrowserSummaryProvider>,
     exa_api_key: Option<String>,
-    memory: crate::memory::MemoryLimits,
     base_model: InferenceProfileConfig,
     setups: Option<std::collections::BTreeMap<String, InferenceProfileConfig>>,
 }
@@ -365,7 +364,7 @@ impl AgentRuntime {
         // attribute turn ownership to the right identity.
         .with_agent_id_opt(identity.map(|(agent_id, _)| agent_id.to_string()));
 
-        let mut tools = coding_tools(i.exa_api_key.clone(), i.memory);
+        let mut tools = coding_tools(i.exa_api_key.clone());
         crate::mission_tools::add_worker_report_tool(&mut tools);
         tools.insert(crate::mission_tools::CreateRecurringJob);
         crate::coordination_tools::add_coordination_tools(&mut tools);
@@ -516,13 +515,6 @@ fn start_session_with_role(
     let manual_approval = config.manual_approval;
     let context_window_tokens = model_config.context_window;
     let compact_at_pct = model_config.compact_at_pct;
-    let memory = crate::memory::MemoryLimits {
-        enabled: config.memory_enabled,
-        writable: true,
-        index_budget_chars: config.memory_index_budget_chars,
-        entry_budget_chars: config.memory_entry_budget_chars,
-        max_entries: config.memory_max_entries,
-    };
     let memory_enabled = config.memory_enabled;
     let memory_index_budget_chars = config.memory_index_budget_chars;
     let memory_entry_budget_chars = config.memory_entry_budget_chars;
@@ -560,7 +552,6 @@ fn start_session_with_role(
                 prompt_ctx,
                 browser_summary,
                 exa_api_key: exa_api_key.clone(),
-                memory,
                 base_model: model_config,
                 setups,
             },
