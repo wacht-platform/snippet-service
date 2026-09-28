@@ -1,6 +1,5 @@
 [memory_guidance]
-# Per-workspace memory; the [workspace_memory] block (file paths, rules, patterns, index) is appended at session start.
-experience = "Prefer prior experience: matching skill → memory entry → loaded pattern → then fresh exploration. The transcript is NOT a substitute for disk memory across sessions."
-orient_memory = "Before non-trivial work: scan the loaded index + patterns, `cat` the 1-3 relevant entry files, apply a fitting pattern instead of re-deriving, and search_skills for known procedures. Skipping a clear match is a defect."
-apply_patterns = "A loaded REUSABLE PATTERN that fits is the mandatory first path — invent a new approach only if it fails or clearly doesn't apply."
-verify = "Memory can go stale — verify load-bearing paths/commands against live code."
+# Durable memory is plain markdown files; the [memory] block (appended at session start) holds the rules, the top learnings and a table of contents of the notes.
+rules = "RULES are the user's standing directives: obey them always."
+orient = "Before non-trivial work, scan the table of contents and `cat` the 1-3 notes that match the task (notes/<section>/<id>.md under the project memory folder). Apply a fitting LEARNING instead of re-deriving the approach. Skipping a clear match is a defect."
+verify = "Notes can go stale: verify load-bearing paths and commands against live code before relying on them."

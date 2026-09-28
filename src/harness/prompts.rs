@@ -43,85 +43,91 @@ pub(super) const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
 
 pub(super) const MEMORY_REFLECTOR_SYSTEM: &str = r#"# memory_reflector
 [identity]
-role = "worker that curates a coding agent's PERSISTENT memory — per-workspace facts/playbooks AND a global library of reusable patterns"
-input = "each turn: the workspace path, a compacted table of the session that just ran, the current memory index, the existing entry ids, the current global patterns, your last tool result, and the turn counter"
-purpose = "carry forward what helps FUTURE sessions — in THIS folder (facts/playbooks) and in ANY project (reusable patterns)"
+role = "you curate a coding agent's durable memory after it finished a task"
+input = "the current memory (rules, learnings, notes table of contents, all with ids), the ids the agent read during the task, and the task transcript"
+output = "ONE apply_memory_delta call: small, precise changes. Code merges them; you never rewrite memory wholesale"
 
-[what_to_keep]
-durable = "workspace scope: stable facts (architecture, where things live, conventions), pointers to key files, and how-to PLAYBOOKS for recurring tasks here (steps that worked + gotchas)"
-patterns = "GLOBAL scope: a generalizable TECHNIQUE this session demonstrated that transfers to any project — one line, situation → approach → why. APPEND it with memory_pattern; skip when an existing pattern already covers it. Extract one whenever the session showed a technique worth reapplying anywhere, not just a project fact."
-learning = "when this session revealed a better way or a pitfall, fold it into the relevant playbook (workspace) or pattern (global) so next time is faster"
-skip = "ephemeral task state, one-off details, and anything already obvious from the code — that belongs in the session table, not here"
+[kinds]
+rules = "short imperative directives obeyed every session. Add one ONLY when the user stated a lasting preference or requirement in this task. global=true when it applies to every project (writing style, general workflow), else project scope"
+learnings = "one-line reusable lessons: situation → approach → why. Add one when the task showed a technique or pitfall worth reapplying. global=true when it transfers to any project"
+notes = "project knowledge, one topic per note: where things live, how to build/test/deploy, architecture, conventions, gotchas. Filed in a kebab-case section tree (e.g. build, architecture/harness). Each note has a title and a one-line summary that the table of contents shows, so write the summary to answer 'should I open this?'"
 
-[how]
-entries = "memory_write(id, content) stores a full note under a short kebab-case id; prefer UPDATING an existing entry over creating a near-duplicate (memory_read it first)"
-index = "memory_index(content) REPLACES the always-loaded index — keep it lean: one short line per entry (label, one-line summary, id). It must fit its budget; oversize writes are rejected, so compress"
-evidence = "exact paths, commands, and IDs verbatim; no speculation, no padding"
+[bookkeeping]
+marks = "for every id the agent read, mark helpful if it moved the task forward, harmful if it was wrong, stale or misleading. Leave it unmarked if it didn't matter"
+fix_stale = "when the task proved a note or bullet wrong or outdated, update it (and mark it harmful). Remove what is plainly obsolete"
+update_over_add = "prefer updating an existing note or bullet over adding a near-duplicate; an add that overlaps an existing item is rejected"
+sections = "reuse existing sections; set a section summary when you create a new section"
 
-[finalize]
-write_once = "write each entry ONCE. Do NOT re-save or 'polish' an entry you already wrote in this pass — it changes little and just burns turns. Aim for 1–2 writes total (an entry, then the index), then finalize."
-bias_to_capture = "if the session did REAL work (edits, debugging, a build, multi-step task), write at least one entry before finalizing — prefer UPDATING an existing id that matches the table over a new near-duplicate. Finalizing empty is only correct when the session was genuinely trivial. User lasting prefs → note them in a playbook line if memory_rule is unavailable here."
-when = "finalize as soon as the index and entries reflect the durable procedures/facts from this session — usually within 1–2 writes"
-how = "call finalize (one tool call per turn)""#;
+[skip]
+ephemeral = "task progress, one-off details, and anything obvious from reading the code"
+secrets = "never store secret values"
+trivial = "a task with nothing durable to keep gets an empty delta — that is a correct answer""#;
 
 pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
-    use crate::llm::NativeToolDefinition;
-    let id_schema = json!({
-        "type": "object",
-        "properties": { "id": { "type": "string", "description": "kebab-case entry id" } },
-        "required": ["id"],
-        "additionalProperties": false
-    });
-    vec![
-        NativeToolDefinition {
-            name: "memory_read".to_string(),
-            description: "Read the full content of an existing entry by id.".to_string(),
-            input_schema: id_schema.clone(),
-        },
-        NativeToolDefinition {
-            name: "memory_write".to_string(),
-            description: "Create or replace an entry (durable fact, pointer, or how-to playbook) under a short kebab-case id.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string", "description": "kebab-case entry id" },
-                    "content": { "type": "string" }
+    vec![crate::llm::NativeToolDefinition {
+        name: "apply_memory_delta".to_string(),
+        description: "Apply small changes to memory. Every field is optional; send an empty object when nothing durable came out of the task.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "marks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "verdict": { "type": "string", "enum": ["helpful", "harmful"] }
+                        },
+                        "required": ["id", "verdict"]
+                    }
                 },
-                "required": ["id", "content"],
-                "additionalProperties": false
-            }),
-        },
-        NativeToolDefinition {
-            name: "memory_index".to_string(),
-            description: "Replace the always-loaded index — one short line per entry (label, summary, id). Must fit the budget.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "content": { "type": "string" } },
-                "required": ["content"],
-                "additionalProperties": false
-            }),
-        },
-        NativeToolDefinition {
-            name: "memory_delete".to_string(),
-            description: "Delete an entry by id (also drop its line from the index).".to_string(),
-            input_schema: id_schema,
-        },
-        NativeToolDefinition {
-            name: "memory_pattern".to_string(),
-            description: "APPEND one GLOBAL reusable pattern: a generalizable technique (one line: situation → approach → why) that transfers to ANY project — not a fact about this workspace. Skip it if an existing pattern already covers the technique.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "content": { "type": "string", "description": "one pattern line: situation → approach → why" } },
-                "required": ["content"],
-                "additionalProperties": false
-            }),
-        },
-        NativeToolDefinition {
-            name: "finalize".to_string(),
-            description: "Finish — memory reflects all durable learnings from this session.".to_string(),
-            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
-        },
-    ]
+                "notes": {
+                    "type": "array",
+                    "description": "add: section, id, title, summary, body. update: id plus only the fields that change (section moves the note).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": { "type": "string", "enum": ["add", "update"] },
+                            "id": { "type": "string", "description": "kebab-case note id" },
+                            "section": { "type": "string" },
+                            "title": { "type": "string" },
+                            "summary": { "type": "string" },
+                            "body": { "type": "string", "description": "markdown" }
+                        },
+                        "required": ["op", "id"]
+                    }
+                },
+                "bullets": {
+                    "type": "array",
+                    "description": "add: kind, text, optional global and section. update: id plus text and/or section.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": { "type": "string", "enum": ["add", "update"] },
+                            "kind": { "type": "string", "enum": ["rule", "learning"] },
+                            "id": { "type": "string" },
+                            "global": { "type": "boolean" },
+                            "section": { "type": "string", "description": "short topic label" },
+                            "text": { "type": "string" }
+                        },
+                        "required": ["op"]
+                    }
+                },
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "section": { "type": "string" },
+                            "summary": { "type": "string" }
+                        },
+                        "required": ["section", "summary"]
+                    }
+                },
+                "remove": { "type": "array", "items": { "type": "string" } }
+            }
+        }),
+    }]
 }
 
 pub(super) const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer

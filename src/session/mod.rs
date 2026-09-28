@@ -516,10 +516,7 @@ fn start_session_with_role(
     let context_window_tokens = model_config.context_window;
     let compact_at_pct = model_config.compact_at_pct;
     let memory_enabled = config.memory_enabled;
-    let memory_index_budget_chars = config.memory_index_budget_chars;
-    let memory_entry_budget_chars = config.memory_entry_budget_chars;
-    let memory_max_entries = config.memory_max_entries;
-    let memory_reflect_on_compaction = config.memory_reflect_on_compaction;
+    let memory_reflect = config.memory_reflect;
     let sp = state_path.clone();
     let stream_out = stream.clone();
 
@@ -568,10 +565,7 @@ fn start_session_with_role(
                 compact_at_pct,
                 manual_approval,
                 memory_enabled,
-                memory_index_budget_chars,
-                memory_entry_budget_chars,
-                memory_max_entries,
-                memory_reflect_on_compaction,
+                memory_reflect,
                 allow_lane_control: runtime.allow_lane_control,
                 ..HarnessConfig::default()
             },

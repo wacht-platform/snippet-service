@@ -385,14 +385,20 @@ impl CodingHarness {
         // web fetch) isn't a black box.
         let _ = self.persist(state, lanes).await;
 
-        let edit_path = (tool_name == "edit_file")
+        let edit_path = (tool_name == "change_files")
             .then(|| {
                 call.arguments
-                    .get("path")
+                    .pointer("/changes/0/path")
                     .and_then(Value::as_str)
                     .map(str::to_string)
             })
             .flatten();
+        let markdown_read = match call.arguments.get("command").and_then(Value::as_str) {
+            Some(command) if tool_name == "bash" && self.config.memory_enabled => {
+                crate::memory::markdown_paths_in_command(command, &self.context.current_dir())
+            }
+            _ => Vec::new(),
+        };
         let mut result = match self
             .tools
             .execute(&self.context, &tool_name, call.arguments)
@@ -410,6 +416,9 @@ impl CodingHarness {
         }
         if tool_name == "change_files" {
             note_edit_result(vars, edit_path, is_err);
+        }
+        if !is_err && !markdown_read.is_empty() {
+            crate::memory::Memory::open(self.context.workspace_root()).record_reads(&markdown_read);
         }
         answer_call(state, &tool_name, &call_id, result);
         // Flush after every tool result so a mid-batch kill still keeps completed

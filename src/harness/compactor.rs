@@ -570,9 +570,6 @@ impl CodingHarness {
             }
         };
 
-        // Keep a copy of the fresh table to feed the memory reflection pass below.
-        let table_for_memory = table.clone();
-
         // Archive older messages to SQLite & FTS5 and generate IBM-style micro-pointers
         let store = self.context.store().ok();
         let session_id = self.context.durable_session_id();
@@ -635,25 +632,6 @@ impl CodingHarness {
                 state.last_prompt_tokens, window, self.config.compact_at_pct
             ),
         });
-        // Learning pass: distill durable facts/playbooks from the just-compacted
-        // session into per-workspace memory. Main session only (lanes are read-only,
-        // avoids concurrent index writers). Non-fatal — never abort compaction.
-        // Skip a pure-conversation window (no tool calls / results): there's no
-        // reusable procedure to learn, and skipping saves the reflection round-trips.
-        let did_work = older.iter().any(|m| {
-            matches!(m, HarnessMessage::ToolResult { .. })
-                || matches!(m, HarnessMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty())
-        });
-        let reflect = self.config.memory_enabled
-            && self.config.memory_reflect_on_compaction
-            && self.context.owner() == "main";
-        if reflect && did_work {
-            if let Err(e) = self.run_memory_reflection(model, &table_for_memory).await {
-                self.debug_log(&format!("memory reflection failed (non-fatal): {e}"));
-            }
-        } else if reflect {
-            self.debug_log("memory reflection skipped: no tool work in the compacted window");
-        }
         // Restore the session's reasoning effort for the next real model call.
         model.swap_reasoning_effort(prev_effort);
         state.last_prompt_tokens = 0;

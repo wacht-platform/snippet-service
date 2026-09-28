@@ -418,6 +418,14 @@ impl CodingHarness {
                             TurnEndKind::Complete => HarnessStatus::Idle,
                         };
                         self.persist(&mut state, &lanes).await?;
+                        if matches!(kind, TurnEndKind::Complete)
+                            && self.config.memory_enabled
+                            && self.config.memory_reflect
+                            && self.context.owner() == "main"
+                            && let Err(e) = self.reflect_on_request(model, &state).await
+                        {
+                            self.debug_log(&format!("memory reflection failed (non-fatal): {e}"));
+                        }
                     }
                     StepResult::ModelError { message, retryable } => {
                         state.events.push(HarnessEvent::ModelError {
