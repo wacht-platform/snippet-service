@@ -231,7 +231,7 @@ mod stream_buffer_tests {
     }
 }
 
-/// Split an inlined image out of a `read_image` tool-result value. The harness
+/// Split an inlined image out of a `view_image` tool-result value. The harness
 /// stamps base64 image bytes onto `data.image_base64` (with `data.mime`) before a
 /// turn; providers call this to (a) get the cleaned value for the text part —
 /// without the huge base64 blob — and (b) the `(mime, base64)` to emit as a real

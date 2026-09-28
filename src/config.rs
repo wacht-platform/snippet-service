@@ -164,8 +164,8 @@ pub struct SnippetConfig {
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    /// Durable memory (rules, learnings, notes) under `<ws>/.snippet/memory/` and
-    /// `~/.snippet/memory/`, loaded into context each session and curated by a
+    /// Durable memory (rules, learnings, notes) under
+    /// `~/.snippet/projects/<repo>-<id>/memory/` and `~/.snippet/memory/`, loaded into context each session and curated by a
     /// reflection pass after requests that did real work. These are scalars, so
     /// they're declared before the `setups`/`model` tables (TOML ordering rule).
     #[serde(default = "default_memory_enabled")]
@@ -207,7 +207,7 @@ pub struct InferenceProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
     /// Whether the model accepts image inputs. OFF by default (safe): when off,
-    /// images read by `read_image` are passed as a text placeholder instead of
+    /// images from `view_image` are passed as a text placeholder instead of
     /// inlined bytes, so text-only models don't 400. Set true for multimodal models.
     #[serde(default)]
     pub supports_images: bool,

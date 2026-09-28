@@ -712,7 +712,7 @@ async fn parse_openai_sse(
     })
 }
 
-/// Build the wire message list. Image messages (from read_image results) are held
+/// Build the wire message list. Image messages (from view_image results) are held
 /// and flushed only after the contiguous run of `tool` messages ends — OpenAI
 /// requires every tool result to immediately follow the assistant tool-call turn
 /// with no other message interleaved.

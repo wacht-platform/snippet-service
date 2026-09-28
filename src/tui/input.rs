@@ -167,7 +167,7 @@ impl App {
 
     /// Grab an image from the system clipboard (a screenshot) and attach it: write
     /// it to the workspace temp dir and drop a chip that expands to its path on
-    /// send, so the agent can `read_image` it. macOS via `osascript`; Linux via
+    /// send, so the agent can `view_image` it. macOS via `osascript`; Linux via
     /// `wl-paste` (Wayland) or `xclip` (X11). Multiple screenshots accumulate as
     /// separate chips.
     pub(crate) fn paste_clipboard_image(&mut self) {
@@ -262,7 +262,7 @@ impl App {
     }
 
     /// Copy a dropped file into the workspace scratch dir and add a chip that
-    /// expands to its path on send (images → read_image, others → read).
+    /// expands to its path on send (images → view_image, others → read).
     pub(crate) fn attach_dropped(&mut self, src: &std::path::Path) {
         let is_img = matches!(
             src.extension()
@@ -344,7 +344,7 @@ impl App {
     }
 
     /// The message to send: the expanded input plus any pending attachments, each
-    /// appended as an explicit marker (images → read_image, files → read) so the
+    /// appended as an explicit marker (images → view_image, files → read) so the
     /// agent opens them. Attachments live outside the input text and are cleared
     /// with it on send.
     pub(crate) fn message_for_send(&self) -> String {

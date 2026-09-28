@@ -708,7 +708,7 @@ enum AnthropicContent {
     ToolResult {
         tool_use_id: String,
         // String for text-only results, or an array of blocks (text + image) when
-        // a read_image result carries an inlined image.
+        // a view_image result carries an inlined image.
         content: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<Value>,
