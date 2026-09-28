@@ -68,6 +68,8 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
     registry.insert(ArchiveMissionSession);
+    registry.insert(RegisterAgent);
+    registry.insert(ReportMissionTask);
 }
 
 pub fn add_worker_report_tool(registry: &mut ToolRegistry) {
@@ -93,7 +95,7 @@ impl Tool for ListSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_sessions".into(),
-            description: "Catalog of durable project chats on this device. Use only for ordinary project work, status, or session requests. Do not call it before a direct agent-build request; agent builds do not require a project workspace or session.".into(),
+            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity. Use it to find the session that owns a piece of work. Agent builds need no session.".into(),
             input_schema: schema(json!({}), &[]),        }
     }
     async fn execute(
@@ -288,7 +290,7 @@ impl Tool for ListProfiles {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_profiles".into(),
-            description: "The inference profiles available for `create_mission_task(profile=…)`, with the active default. Names are exact — an unknown one is silently ignored when the session starts, so dispatch only names a profile listed here. Use this before choosing a profile, not to change the default.".into(),
+            description: "The inference profiles a task may name with create_mission_task(profile=…), with the active default. Names are exact and an unknown one is rejected, so pick from this list; leave profile out to keep the target session's own model.".into(),
             input_schema: schema(json!({}), &[]),
         }
     }
@@ -398,7 +400,7 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Persist exactly one ordinary project handoff to an existing durable session. Never use for direct user agent-build requests, [AGENT_BUILD_JOB] envelopes, worker reports, or build-status notifications. Use handoff_mode 'resume' when the target already has context and 'fresh' otherwise.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. Never for an agent build, a worker report or a notification. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -936,6 +938,76 @@ impl Tool for ArchiveMissionSession {
         Ok(ToolResult::success(
             json!({"archived": true, "session_id": session.id}),
         ))
+    }
+}
+
+#[derive(Deserialize)]
+struct RegisterAgentArgs {
+    id: String,
+    display_name: String,
+    role: crate::coordination::types::AgentRole,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    identity: String,
+}
+/// The one step that makes a built agent real: its identity file and its
+/// directory row, written together so an agent is never half-created.
+pub struct RegisterAgent;
+#[async_trait]
+impl Tool for RegisterAgent {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "register_agent".into(),
+            description: "Create or rebuild a specialized agent: writes its identity.md into its agent home (~/.snippet/agents/<id>/) and registers it in the directory so it can be messaged, assigned and dispatched. The identity is the agent's whole persona and expertise, applied on top of the standard coding runtime in every session it works in. Call it once per build, after researching the role; calling it again with the same id replaces the identity.".into(),
+            input_schema: schema(
+                json!({
+                    "id": {"type": "string", "description": "kebab-case agent id, e.g. rust-pr-reviewer"},
+                    "display_name": {"type": "string"},
+                    "role": {"type": "string", "enum": ["implementer", "reviewer", "tester", "researcher", "release"]},
+                    "capabilities": {"type": "array", "items": {"type": "string"}, "description": "short tags, e.g. rust, code-review"},
+                    "identity": {"type": "string", "description": "identity.md in markdown: who the agent is, its mandate, how it works, what it checks, how it reports"}
+                }),
+                &["id", "display_name", "role", "identity"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: RegisterAgentArgs =
+            serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
+                tool: "register_agent".into(),
+            })?;
+        if args.identity.trim().len() < 200 {
+            return Err(ToolError::msg(
+                "identity is too thin: write the agent's mandate, how it works and how it reports",
+            ));
+        }
+        if args.id == crate::coordination::SNIPPET_AGENT_ID || args.id == mission_control::SESSION_ID {
+            return Err(ToolError::msg(format!("`{}` is a built-in agent id", args.id)));
+        }
+        let home = crate::coordination::AgentHome::new(
+            crate::coordination::agents_root(&root(ctx)?),
+            &args.id,
+        )
+        .map_err(|e| ToolError::msg(e.to_string()))?;
+        home.write_identity(args.identity.trim())
+            .map_err(|e| ToolError::msg(e.to_string()))?;
+        let agent = crate::coordination::types::Agent {
+            id: args.id.clone(),
+            display_name: args.display_name,
+            handle: args.id.replace('-', "_"),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: args.role,
+            capabilities: args.capabilities,
+        };
+        db(ctx)?
+            .upsert_agent(&agent)
+            .map_err(|e| ToolError::msg(format!("register agent: {e}")))?;
+        Ok(ToolResult::success(json!({
+            "agent_id": args.id,
+            "home": home.root().display().to_string(),
+            "identity_path": home.identity_path().display().to_string(),
+        })))
     }
 }
 

@@ -25,7 +25,7 @@ pub(crate) fn notice_text(event: &HarnessEvent) -> Option<String> {
             session_id,
             by,
         } => Some(format!(
-            "[dispatched by {by}] {title}\ntask {task_id} → session {session_id}\n             Informational: this work is already routed to a worker and will report back on its own. \
+            "[dispatched by {by}] {title}\ntask {task_id} → session {session_id}\nInformational: this work is already routed to a worker and will report back on its own. \
              Do not dispatch it again."
         )),
         _ => None,

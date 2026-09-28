@@ -8,7 +8,8 @@ pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
 pub const MISSION_CONTROL_LAYER: &str = include_str!("../prompts/mission_control_layer.md");
 pub const COORDINATION_LAYER: &str = include_str!("../prompts/coordination_layer.md");
-pub const WORK_BOUNDARY_LAYER: &str = include_str!("../prompts/work_boundary_layer.md");
+pub const DELEGATION_LAYER: &str = include_str!("../prompts/delegation_layer.md");
+pub const TASK_LAYER: &str = include_str!("../prompts/task_layer.md");
 pub const GIT_WORKTREE_LAYER: &str = include_str!("../prompts/git_worktree_layer.md");
 pub const MEMORY_GUIDANCE_LAYER: &str = include_str!("../prompts/memory_layer.md");
 pub const MEMORY_WRITE_LAYER: &str = include_str!("../prompts/memory_write_layer.md");
@@ -34,8 +35,6 @@ pub struct PromptContext {
     pub vault: bool,
     /// This session can reach connected browsers.
     pub browser: bool,
-    /// An agent is working in this session (not just an ordinary session).
-    pub agent_work: bool,
     /// This is an agent's COORDINATION session: it answers direct messages and
     /// dispatches work, and holds no workspace tools. The layer is what tells it
     /// how to behave, which is not inferable from the tool list alone.
@@ -59,7 +58,6 @@ impl PromptContext {
             skills: !crate::skills::discover().is_empty(),
             vault: !crate::vault::Vault::load().is_empty(),
             browser,
-            agent_work: false,
             // Not inferable from the environment; the role's own constructor sets it.
             coordination: false,
         }
@@ -102,11 +100,8 @@ pub fn conversation_prompt(context: &PromptContext) -> String {
     let mut parts = vec![CODING_AGENT_LAYER.trim()];
     parts.extend(context.conditional_layers());
     parts.push(CONVERSATION_AGENT_LAYER.trim());
-    // Last, only for an agent's work session: it may ask Mission Control to
-    // dispatch work. A plain session has no agent messaging capability.
-    if context.agent_work {
-        parts.push(WORK_BOUNDARY_LAYER.trim());
-    }
+    parts.push(DELEGATION_LAYER.trim());
+    parts.push(TASK_LAYER.trim());
     parts.join("\n\n")
 }
 
@@ -129,18 +124,11 @@ pub fn conversation_system_prompt() -> String {
 /// coordination layer states the real capability set instead, and the
 /// per-workspace memory layers are excluded for the same reason — this session
 /// has no workspace to hold memory about.
-pub fn coordination_prompt(context: &PromptContext) -> String {
-    let mut parts = vec![CONVERSATION_AGENT_LAYER.trim()];
-    if context.browser {
-        parts.push(BROWSER_LAYER.trim());
-    }
-    if context.vault {
-        parts.push(VAULT_LAYER.trim());
-    }
-    // COORDINATION_LAYER is last so its statements about what this session can
-    // and cannot do are the final word.
-    parts.push(COORDINATION_LAYER.trim());
-    parts.join("\n\n")
+pub fn coordination_prompt(_context: &PromptContext) -> String {
+    // No browser or vault layers: both are about commands this session has no
+    // shell to run. COORDINATION_LAYER is last so its statements about what
+    // this session can and cannot do are the final word.
+    [CONVERSATION_AGENT_LAYER.trim(), COORDINATION_LAYER.trim()].join("\n\n")
 }
 
 pub fn mission_control_system_prompt() -> String {
@@ -165,10 +153,19 @@ pub struct SpecializedAgentPromptContext<'a> {
 /// cannot disagree about how the agent is introduced to itself.
 fn identity_overlay(agent_id: &str, identity: &str) -> String {
     format!(
-        "[agent_identity]\nid = \"{id}\"\nidentity = \"\"\"\n{identity}\n\"\"\"\n",
-        id = agent_id,
+        "## Your identity: {agent_id}\n\nThe identity below sets your expertise, judgment and voice. Everything above still governs how you work, talk and finish.\n\n{identity}\n",
         identity = identity.trim(),
     )
+}
+
+/// A delegated lane's prompt: the execution contract, plus the identity of the
+/// agent it was assigned, when there is one.
+pub fn lane_prompt(context: &PromptContext, identity: Option<(&str, &str)>) -> String {
+    let base = coding_prompt(context);
+    match identity {
+        Some((agent_id, body)) => format!("{base}\n\n{}", identity_overlay(agent_id, body)),
+        None => base,
+    }
 }
 
 pub fn specialized_agent_system_prompt(context: SpecializedAgentPromptContext<'_>) -> String {
@@ -191,21 +188,4 @@ pub fn specialized_coordination_prompt(context: SpecializedAgentPromptContext<'_
         base = coordination_prompt(context.context),
         overlay = identity_overlay(context.agent_id, context.identity),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn work_boundary_is_only_in_agent_work_sessions() {
-        let plain = conversation_prompt(&PromptContext::default());
-        assert!(!plain.contains("[delegation_boundary]"));
-
-        let agent = conversation_prompt(&PromptContext {
-            agent_work: true,
-            ..PromptContext::default()
-        });
-        assert!(agent.contains("[delegation_boundary]"));
-    }
 }

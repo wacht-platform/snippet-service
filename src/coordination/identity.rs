@@ -58,6 +58,16 @@ impl AgentHome {
         Ok(())
     }
 
+    /// Replace the identity (a build or rebuild). The home is created if absent.
+    pub fn write_identity(&self, identity: &str) -> Result<(), IdentityError> {
+        if identity.len() > MAX_IDENTITY_BYTES {
+            return Err(IdentityError::TooLarge(identity.len()));
+        }
+        std::fs::create_dir_all(self.tools_path())?;
+        atomic_write(&self.identity_path(), identity.as_bytes())?;
+        Ok(())
+    }
+
     pub fn read_identity(&self) -> Result<String, IdentityError> {
         let bytes = std::fs::read(self.identity_path())?;
         if bytes.len() > MAX_IDENTITY_BYTES {

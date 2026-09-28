@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use crate::harness::{CodingHarness, HarnessConfig};
 use crate::lane_log::LaneLog;
 use crate::llm::AgentModel;
-use crate::prompts::{PromptContext, coding_prompt};
+use crate::prompts::{PromptContext, lane_prompt};
 use crate::tools::ToolContext;
 use crate::tools::coding_tools;
 
@@ -652,14 +652,25 @@ async fn run_lane(
         // The shell remains for inspection — the brief tells the lane its role.
         tools.remove("change_files");
     }
+    let identity = agent.as_deref().map(|agent_name| {
+        let body = crate::coordination::AgentHome::new(
+            crate::coordination::agents_root(&crate::config::snippet_home().join("mission-control")),
+            agent_name,
+        )
+        .ok()
+        .and_then(|home| home.read_identity().ok())
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!("You are working as the specialized agent `{agent_name}`: bring its domain focus and perspective to this work.")
+        });
+        (agent_name.to_string(), body)
+    });
     let harness = CodingHarness::new(
         HarnessConfig {
-            system_prompt: coding_prompt(&PromptContext::detect(
-                &workspace_for_grounding,
-                true,
-                false,
-                false,
-            )),
+            system_prompt: lane_prompt(
+                &PromptContext::detect(&workspace_for_grounding, true, false, false),
+                identity.as_ref().map(|(id, body)| (id.as_str(), body.as_str())),
+            ),
             state_path: Some(state_path),
             resume,
             exa_api_key,
@@ -670,37 +681,13 @@ async fn run_lane(
         tools,
         context,
     );
-    // Lanes report to an orchestrator: make findings navigable with exact locations.
     let role = if read_only {
-        "You are a READ-ONLY investigation lane: your file-editing tools are removed; do not attempt \
-         to mutate the workspace (including via shell) — investigate and report. "
+        "This is a read-only investigation: your file-editing tools are removed, and you must not change the workspace through the shell either. Investigate and report. "
     } else {
         ""
     };
-    let agent_overlay = if let Some(agent_name) = agent.as_deref() {
-        let home_identity = crate::coordination::AgentHome::new(
-            crate::coordination::agents_root(&crate::config::snippet_home().join("mission-control")),
-            agent_name,
-        )
-        .ok()
-        .and_then(|home| home.read_identity().ok())
-        .filter(|text| !text.trim().is_empty());
-
-        if let Some(id_text) = home_identity {
-            format!("[agent_identity: {agent_name}]\n{}\n\n", id_text.trim())
-        } else {
-            format!(
-                "[agent_identity: {agent_name}]\nYou are operating as specialized agent '{agent_name}'. Apply this domain focus, perspective, and specialization to your work.\n\n"
-            )
-        }
-    } else {
-        String::new()
-    };
     let brief = format!(
-        "{agent_overlay}{brief}\n\n[lane_reporting]\n{role}You are a delegated lane reporting back to an orchestrator agent. \
-         In your final terminate_loop summary, cite EXACT file:line references (e.g. `src/foo.rs:42`) \
-         for every location, symbol, definition, or finding you identify — report WHERE things are, not \
-         just that they exist, so the orchestrator can navigate straight to them without re-searching."
+        "{brief}\n\n---\n{role}You are working on this for another agent, who reads only your final summary. Finish with terminate_loop, and in that summary cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so they can go straight there without searching again."
     );
     let outcome = match harness.run(&mut *model, brief).await {
         Ok(outcome) => outcome,

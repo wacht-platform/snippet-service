@@ -287,6 +287,9 @@ struct AgentRuntime {
     prompt: String,
     /// Mission Control coordinates durable sessions; it does not spawn lanes.
     allow_lane_control: bool,
+    /// Whether the project memory block and reflection apply. Only a session
+    /// that works in a project has a project to remember.
+    memory: bool,
 }
 
 /// The config-derived inputs every runtime shares.
@@ -342,6 +345,7 @@ impl AgentRuntime {
             tools,
             prompt: mission_control_system_prompt(),
             allow_lane_control: false,
+            memory: false,
         })
     }
 
@@ -369,8 +373,7 @@ impl AgentRuntime {
         tools.insert(crate::mission_tools::CreateRecurringJob);
         crate::coordination_tools::add_coordination_tools(&mut tools);
 
-        let mut prompt_ctx = i.prompt_ctx;
-        prompt_ctx.agent_work = identity.is_some();
+        let prompt_ctx = i.prompt_ctx;
         let prompt = match identity {
             Some((agent_id, body)) => crate::prompts::specialized_agent_system_prompt(
                 crate::prompts::SpecializedAgentPromptContext {
@@ -407,6 +410,7 @@ impl AgentRuntime {
             tools,
             prompt,
             allow_lane_control: true,
+            memory: true,
         })
     }
 
@@ -463,6 +467,7 @@ impl AgentRuntime {
             ),
             // Nothing to delegate: no lane control in a coordination session.
             allow_lane_control: false,
+            memory: false,
         })
     }
 
@@ -535,7 +540,6 @@ fn start_session_with_role(
                 .as_ref()
                 .map(|provider| browser_summary_is_connected(&provider()))
                 .unwrap_or(false),
-            agent_work: false,
             // Set by the role, once it is known: only a coordination runtime
             // wants that layer, and it is the reason the environment layer is
             // dropped from its prompt.
@@ -564,7 +568,7 @@ fn start_session_with_role(
                 context_window_tokens,
                 compact_at_pct,
                 manual_approval,
-                memory_enabled,
+                memory_enabled: memory_enabled && runtime.memory,
                 memory_reflect,
                 allow_lane_control: runtime.allow_lane_control,
                 ..HarnessConfig::default()
