@@ -112,7 +112,7 @@ mod assistant_dedup_tests {
     }
 
     #[test]
-    fn restated_status_is_not_stored() {
+    fn restated_status_is_not_shown_twice() {
         let mut state = empty_state();
         let first = "I'll inspect the hydrate path, keep loading until the first snapshot, then format worker reports.";
         // Narration (with tool calls) goes through the redundancy filter.
@@ -150,10 +150,10 @@ mod assistant_dedup_tests {
                 "Fresh direction now.",
             ]
         );
-        // Every turn persists (tool calls must keep pairing valid); redundant
-        // narration turns carry empty content.
+        // The model keeps its own words in its history even when the UI skips
+        // a near-duplicate; only the visible event is deduplicated.
         assert_eq!(state.messages.len(), 5);
-        let non_empty = state
+        let empty = state
             .messages
             .iter()
             .filter_map(|m| match m {
@@ -161,7 +161,7 @@ mod assistant_dedup_tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(non_empty, vec![false, true, false, true, false]);
+        assert_eq!(empty, vec![false; 5]);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod assistant_dedup_tests {
                 content,
                 tool_calls,
             } => {
-                assert!(content.is_empty());
+                assert_eq!(content, "Checking the hydrate path now.");
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].name, "list_sessions");
             }
@@ -860,9 +860,8 @@ mod dedup_and_stuck_edit_tests {
             path: "src/main.rs".to_string(),
             count: 2,
         };
-        let rendered = signal.render();
-        assert!(rendered.starts_with("stuck_edit = \""));
-        assert!(rendered.contains("your changes to `src/main.rs` have failed 2 times in a row"));
+        let rendered = signal.message();
+        assert!(rendered.contains("Your changes to `src/main.rs` have failed 2 times in a row"));
         assert!(rendered.contains("rg -n"));
     }
 

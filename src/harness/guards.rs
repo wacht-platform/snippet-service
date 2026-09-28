@@ -47,6 +47,25 @@ pub(super) fn unproductive_stop(
     })
 }
 
+/// Hard stop for a loop the nudge didn't break: the exact same batch issued
+/// five turns running. The run ends and says why, instead of burning tokens.
+pub(super) fn repeat_stop(state: &mut HarnessState, vars: &mut LoopVars) -> Option<StepResult> {
+    const STOP_AT: usize = 4;
+    if vars.repeated_tool_count < STOP_AT {
+        return None;
+    }
+    vars.repeated_tool_count = 0;
+    vars.last_tool_signature = None;
+    state.events.push(HarnessEvent::SystemDecision {
+        step: "stopped_repeating".to_string(),
+        reasoning: "Stopped: the agent issued the same tool call five times in a row.".to_string(),
+    });
+    Some(StepResult::TurnEnded {
+        kind: TurnEndKind::Complete,
+        final_text: None,
+    })
+}
+
 /// Tool-call-loop detection: the exact same batch repeated turn over turn, or
 /// the same call appearing 3+ times within the last 8 turns even with other
 /// calls interleaved, steers the model next turn instead of letting it spin.
@@ -133,10 +152,6 @@ pub(super) fn apply_turn_guards(vars: &mut LoopVars, stats: &TurnStats, conversa
     if !stats.shell_nudged {
         vars.shell_nudge_count = 0;
     }
-
-    // Record whether THIS turn repeated the exact same batch as last turn, so
-    // next turn's live context explains the re-prompt only when actually looping.
-    vars.last_turn_had_repeat = vars.repeated_tool_count > 0;
 
     // Backpressure on very large single-turn fan-outs.
     if stats.real_work >= LARGE_TOOL_BATCH {

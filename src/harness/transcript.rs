@@ -210,6 +210,11 @@ pub(super) fn replied_since_last_user(events: &[HarnessEvent]) -> bool {
 /// text (no tool calls) is the actual reply and always records — filtering it
 /// made legitimate messages vanish from history and clients. Tool-call turns
 /// still persist (empty content when redundant) so pairing stays valid.
+/// A message the user sent while the agent was working, as the model sees it.
+pub(super) fn steer_message(text: &str) -> String {
+    format!("(The user sent this while you were working.)\n{text}")
+}
+
 pub(super) fn record_assistant_text(
     state: &mut HarnessState,
     text: String,
@@ -217,11 +222,7 @@ pub(super) fn record_assistant_text(
 ) {
     let narrating = tool_calls.as_ref().is_some_and(|c| !c.is_empty());
     let redundant = narrating && assistant_text_is_redundant(&text, &state.events);
-    let content = if redundant || text.trim().is_empty() {
-        String::new()
-    } else {
-        text.clone()
-    };
+    let content = text.trim().to_string();
     let calls = tool_calls.unwrap_or_default();
     if !content.is_empty() || !calls.is_empty() {
         state.messages.push(HarnessMessage::Assistant {

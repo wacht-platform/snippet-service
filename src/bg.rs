@@ -1,7 +1,7 @@
 //! Background processes the agent starts via `bash {background:true}`. Each is
 //! recorded as a JSON file under `<workspace>/.snippet/scratch/bg/<id>.json` and
 //! its output redirected to a sibling `<id>.log`. The live list is surfaced to the
-//! agent every turn (see `harness::build_live_context`) so it knows what's running.
+//! agent in a harness reminder whenever it changes (see `harness::live_context`), so it knows what's running.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

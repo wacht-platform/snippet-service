@@ -690,7 +690,7 @@ enum RecoveryAction {
 
 #[derive(Default)]
 struct LoopVars {
-    /// Signals raised this turn, drained into next turn's live context.
+    /// Signals raised this turn, delivered in the next turn's reminder.
     pending_signals: Vec<RuntimeSignal>,
     /// Signature of the previous turn's tool calls, for loop detection.
     last_tool_signature: Option<String>,
@@ -708,13 +708,15 @@ struct LoopVars {
     /// Consecutive turns in which EVERY executed tool call failed — the approach
     /// isn't working; escalates to a re-think-or-ask-for-help nudge.
     consecutive_failed_turns: usize,
-    /// Whether the PREVIOUS turn repeated the previous turn's tool calls
-    /// — so the live context explains the re-prompt only when actually looping.
-    /// Reset on a new user request.
-    last_turn_had_repeat: bool,
-    /// The model's reasoning from the previous turn, surfaced back in the live
-    /// context (experimental). Reset on a new user request.
-    last_thought: Option<String>,
+    /// What the model was last told about each section of volatile state, so a
+    /// reminder carries only what changed.
+    reminded: std::collections::HashMap<&'static str, String>,
+    /// `HarnessState::compactions` when `reminded` was last valid; compaction
+    /// drops the old reminders from history, so everything is told again.
+    reminded_compactions: u64,
+    /// Output fingerprint of each bash command run during this request, so an
+    /// identical rerun returns a short notice instead of the same output again.
+    bash_outputs: std::collections::HashMap<String, u64>,
     /// Empty completions (no reply — e.g. the agent only left a note) re-prompted
     /// this response cycle. Capped so we ask for an answer without looping forever.
     /// Reset on a new user message.

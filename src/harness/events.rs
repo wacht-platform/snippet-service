@@ -25,10 +25,10 @@ impl CodingHarness {
             }
             self.finish_checkpoint(state, vars).await;
             self.begin_checkpoint(state, vars, &text);
-            // Fresh request: prior-turn loop/thought/failure state belongs to
-            // the past run.
-            vars.last_turn_had_repeat = false;
-            vars.last_thought = None;
+            // Fresh request: prior-turn loop/failure state belongs to the past run,
+            // and the first step restates the current state.
+            vars.bash_outputs.clear();
+            vars.reminded.clear();
             vars.turns_this_request = 0;
             vars.consecutive_failed_turns = 0;
         }
@@ -69,6 +69,78 @@ impl CodingHarness {
             });
         }
         Ok(())
+    }
+
+    /// Attachments in the messages the user sent since the model last spoke.
+    /// Clients mark them with `[attached image — …: /path]` and
+    /// `[attached file — …: /path]`; the marker becomes a plain description
+    /// (`[attached image: /path]`) so it reads as the user's material rather than
+    /// an instruction, and each image is opened on the model's behalf with a
+    /// `view_image` call right after, so the model sees it with the message.
+    pub(super) async fn expand_attachments(&self, state: &mut HarnessState) {
+        static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\[attached (image|file) — [^\]/]*(/[^\]]+)\]").expect("valid regex")
+        });
+        let tail_start = state
+            .messages
+            .iter()
+            .rposition(|m| matches!(m, HarnessMessage::Assistant { .. }))
+            .map_or(0, |i| i + 1);
+        let mut images = Vec::new();
+        for message in &mut state.messages[tail_start..] {
+            let HarnessMessage::User { content } = message else {
+                continue;
+            };
+            if !MARKER.is_match(content) {
+                continue;
+            }
+            *content = MARKER
+                .replace_all(content, |caps: &regex::Captures| {
+                    let path = caps[2].trim();
+                    if &caps[1] == "image" {
+                        images.push(path.to_string());
+                    }
+                    format!("[attached {}: {path}]", &caps[1])
+                })
+                .into_owned();
+        }
+        if images.is_empty() || !self.tools.contains("view_image") {
+            return;
+        }
+        let calls: Vec<crate::llm::ToolCallRecord> = images
+            .iter()
+            .enumerate()
+            .map(|(i, path)| crate::llm::ToolCallRecord {
+                id: format!("attachment_{}_{i}", state.iterations),
+                name: "view_image".to_string(),
+                arguments: json!({ "path": path }),
+                signature: None,
+                origin_model: None,
+            })
+            .collect();
+        state.messages.push(HarnessMessage::Assistant {
+            content: String::new(),
+            tool_calls: calls.clone(),
+        });
+        for call in calls {
+            let content = match self
+                .tools
+                .execute(&self.context, "view_image", call.arguments)
+                .await
+            {
+                Ok(result) => result.value,
+                Err(error) => json!({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error": { "code": "tool_execution_error", "message": error.to_string() },
+                }),
+            };
+            state.messages.push(HarnessMessage::ToolResult {
+                tool_call_id: call.id,
+                tool_name: "view_image".to_string(),
+                content,
+            });
+        }
     }
 
     /// Stamp base64 image bytes onto vision tool results so the model can SEE the
@@ -390,7 +462,7 @@ impl CodingHarness {
                 LoopInput::SteerQueued(id) => {
                     if let Some(text) = take_queued(state, &id) {
                         state.messages.push(HarnessMessage::User {
-                            content: format!("[steer]\n{text}"),
+                            content: steer_message(&text),
                         });
                         state.events.push(HarnessEvent::Steer { text });
                         self.bump_activity();
@@ -400,7 +472,7 @@ impl CodingHarness {
                     let text = text.trim().to_string();
                     if !text.is_empty() {
                         state.messages.push(HarnessMessage::User {
-                            content: format!("[steer]\n{text}"),
+                            content: steer_message(&text),
                         });
                         state.events.push(HarnessEvent::Steer { text });
                         self.bump_activity();
@@ -449,7 +521,7 @@ impl CodingHarness {
     }
 
     /// Apply one queued input while a run is active: a message/answer becomes a
-    /// `[steer]`, an interrupt returns `true`. Shared by the between-iteration
+    /// a mid-run user message, an interrupt returns `true`. Shared by the between-iteration
     /// drain and the buffered-input drain.
     pub(super) fn apply_input(&self, state: &mut HarnessState, input: LoopInput) -> bool {
         match input {
@@ -461,7 +533,7 @@ impl CodingHarness {
                 let text = text.trim().to_string();
                 if !text.is_empty() {
                     state.messages.push(HarnessMessage::User {
-                        content: format!("[steer]\n{text}"),
+                        content: steer_message(&text),
                     });
                     state.events.push(HarnessEvent::Steer { text });
                     self.bump_activity();
@@ -488,7 +560,7 @@ impl CodingHarness {
             LoopInput::SteerQueued(id) => {
                 if let Some(text) = take_queued(state, &id) {
                     state.messages.push(HarnessMessage::User {
-                        content: format!("[steer]\n{text}"),
+                        content: steer_message(&text),
                     });
                     state.events.push(HarnessEvent::Steer { text });
                     self.bump_activity();

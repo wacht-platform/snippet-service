@@ -780,8 +780,7 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                 system_prompt = Some(content.clone());
             }
             HarnessMessage::System { content } => {
-                let text = format!("[steering]\n{content}\n[/steering]");
-                push_block(&mut prepared, "user", text_block(text));
+                push_block(&mut prepared, "user", text_block(crate::llm::system_reminder(content)));
             }
             HarnessMessage::User { content } => {
                 push_block(&mut prepared, "user", text_block(content.clone()));

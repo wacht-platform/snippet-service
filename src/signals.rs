@@ -1,16 +1,9 @@
-//! Live-context runtime signals.
-//!
-//! When the model does something off (text with no tool call, an empty turn, the
-//! same call repeated, a tool that doesn't exist), the loop raises a typed signal.
-//! Signals are *transient*: they are drained into the next turn's freshly-rendered
-//! `[live_context]` block as a crisp imperative line, then discarded. They are
-//! never written into the durable message history, so they re-ground the model
-//! every turn without piling up as stale nudges.
+//! Runtime signals: one-shot notes the loop raises when the model does
+//! something off (an empty turn, the same call repeated, a tool that doesn't
+//! exist). Each is delivered once, in the next step's `<system-reminder>`.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeSignal {
-    /// The previous turn was text with no tool call — it did not end the run.
-    CompleteRequired,
     /// The previous turn produced nothing at all (no text, no call).
     EmptyResponse,
     /// The model's previous response was cut off at the token limit.
@@ -41,62 +34,38 @@ pub enum RuntimeSignal {
 }
 
 impl RuntimeSignal {
-    pub fn key(&self) -> &'static str {
-        match self {
-            Self::CompleteRequired => "terminate_required",
-            Self::EmptyResponse => "empty_response",
-            Self::ResponseTruncated => "response_truncated",
-            Self::ToolCallLoop { .. } => "tool_call_loop",
-            Self::UnknownTool { .. } => "unknown_tool",
-            Self::ShellDiscipline { .. } => "shell_discipline",
-            Self::ShellDisciplineEscalated { .. } => "shell_discipline",
-            Self::NoteLoop { .. } => "note_loop",
-            Self::BatchBackpressure { .. } => "batch_backpressure",
-            Self::StuckEscalation { .. } => "stuck_escalation",
-            Self::StuckEdit { .. } => "stuck_edit",
-        }
-    }
-
     pub fn message(&self) -> String {
         match self {
-            Self::CompleteRequired =>
-                "Internal — never mention this to the user. Your previous turn was text with no tool \
-                 call, so the run did not end and your text was already delivered (do not repeat it). \
-                 If that text was your complete answer, call `terminate_loop` now (summary only, no new \
-                 message). If not, take the next concrete step with a real tool call. Do not narrate \
-                 this mechanic or apologize for it — just act."
-                    .to_string(),
             Self::EmptyResponse =>
-                "previous turn was empty (no tool call, no text). Reply to the user, or take the \
-                 next concrete action with a tool call."
+                "Your previous turn was empty (no text, no tool call). Reply to the user, or take \
+                 the next concrete step with a tool call."
                     .to_string(),
             Self::ToolCallLoop { count } => format!(
-                "you have issued the same tool call {count} turns in a row; the result will not \
-                 change. Change the inputs, use a different tool, or finish the turn and deliver \
-                 your conclusion."
+                "You have issued the same tool call {count} times; its result will not change. \
+                 Use the result you already have, change the inputs, or finish and deliver your \
+                 conclusion."
             ),
             Self::UnknownTool { name, available } => format!(
                 "`{name}` is not an available tool. Use one of these by exact name: [{available}]. \
                  If none fit, reply in plain text."
             ),
             Self::ResponseTruncated =>
-                "your previous response was cut off at the output-token limit. It was NOT treated as \
-                 final. Continue with a concrete tool call, or keep the next reply shorter so it \
-                 completes."
+                "Your previous response was cut off at the output-token limit and was not treated \
+                 as final. Continue with a tool call, or keep the next reply shorter."
                     .to_string(),
             Self::ShellDiscipline { message } => message.clone(),
             Self::ShellDisciplineEscalated { count } => format!(
-                "you have reached for the shell to do file work {count} times now despite the \
-                 nudge. Stop and switch: change files only with `change_files`; keep the shell for \
+                "You have used the shell to change files {count} times despite the earlier \
+                 note. Stop and switch: change files only with `change_files`; keep the shell for \
                  reading, searching and running things."
             ),
             Self::NoteLoop { count } => format!(
-                "you have written {count} notes in a row without doing any work. Notes do not make \
+                "You have written {count} notes in a row without doing any work. Notes do not make \
                  progress. Act now with a real tool call, or finish the turn and deliver your \
                  conclusion."
             ),
             Self::BatchBackpressure { batch_size } => format!(
-                "you issued {batch_size} tool calls in one turn. Large fan-outs are hard to verify \
+                "You issued {batch_size} tool calls in one turn. Large fan-outs are hard to verify \
                  and recover from — prefer a few focused calls, read the results, then continue."
             ),
             Self::StuckEscalation { failed_turns, can_ask_user } => {
@@ -108,7 +77,7 @@ impl RuntimeSignal {
                      and what you'd need to continue"
                 };
                 format!(
-                    "your last {failed_turns} turns of tool calls all failed — the current approach \
+                    "Your last {failed_turns} turns of tool calls all failed — the current approach \
                      is not working. STOP repeating it. Step back: question your assumptions, list \
                      what you know, and try a genuinely different angle (different tool, different \
                      starting point, simplify the step, or investigate the failure itself first); \
@@ -116,15 +85,8 @@ impl RuntimeSignal {
                 )
             }
             Self::StuckEdit { path, count } => format!(
-                "your changes to `{path}` have failed {count} times in a row. Stop guessing: look at the current text with `rg -n` or `sed -n` in bash, then copy a small, exact, unique `find` snippet from that output (without the line numbers). If the file already has what you want, move on."
+                "Your changes to `{path}` have failed {count} times in a row. Stop guessing: look at the current text with `rg -n` or `sed -n` in bash, then copy a small, exact, unique `find` snippet from that output (without the line numbers). If the file already has what you want, move on."
             ),
         }
-    }
-
-    /// One-line `key = "message"` rendering for the live-context block.
-    pub fn render(&self) -> String {
-        let one_line = self.message().replace('\n', " ").replace('"', "'");
-        let one_line = one_line.split_whitespace().collect::<Vec<_>>().join(" ");
-        format!("{} = \"{one_line}\"", self.key())
     }
 }

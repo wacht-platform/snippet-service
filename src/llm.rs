@@ -243,6 +243,35 @@ mod stream_buffer_tests {
 /// harder to read and to copy back exactly. Scalars render as `key: value`;
 /// multi-line or long text renders verbatim between `[key]` and `[/key]`; small
 /// nested values stay compact JSON.
+/// A harness note (any System message after the first) as the model sees it:
+/// tagged so it can never pass for something the user wrote, and attached to
+/// the message before it rather than sent as a turn of its own.
+pub fn system_reminder(content: &str) -> String {
+    format!("<system-reminder>\n{}\n</system-reminder>", content.trim())
+}
+
+/// Attach a harness note to the end of a Responses-API input list: into the
+/// last function_call_output's text or the last user message, else as a new
+/// user message.
+pub fn attach_reminder_to_items(input: &mut Vec<Value>, content: &str, user_item: impl Fn(&str) -> Value) {
+    let note = system_reminder(content);
+    if let Some(last) = input.last_mut() {
+        if last.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && let Some(output) = last.get("output").and_then(Value::as_str)
+        {
+            last["output"] = Value::String(format!("{output}\n\n{note}"));
+            return;
+        }
+        if last.get("role").and_then(Value::as_str) == Some("user")
+            && let Some(parts) = last.get_mut("content").and_then(Value::as_array_mut)
+        {
+            parts.push(serde_json::json!({ "type": "input_text", "text": note }));
+            return;
+        }
+    }
+    input.push(user_item(&note));
+}
+
 pub fn render_tool_result(value: &Value) -> String {
     let Some(obj) = value.as_object() else {
         return render_scalar(value);

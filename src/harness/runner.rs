@@ -191,7 +191,7 @@ impl CodingHarness {
                                 had_user_msg = true;
                                 if was_running {
                                     state.messages.push(HarnessMessage::User {
-                                        content: format!("[steer]\n{text}"),
+                                        content: steer_message(&text),
                                     });
                                     state.events.push(HarnessEvent::Steer { text });
                                     self.bump_activity();
@@ -212,7 +212,7 @@ impl CodingHarness {
                             if was_running {
                                 // Mid-run steer: the step continues; fold it in.
                                 state.messages.push(HarnessMessage::User {
-                                    content: format!("[steer]\n{text}"),
+                                    content: steer_message(&text),
                                 });
                                 state.events.push(HarnessEvent::Steer { text });
                                 self.bump_activity();
@@ -276,7 +276,7 @@ impl CodingHarness {
                         consecutive_errors = 0;
                     } else {
                         state.messages.push(HarnessMessage::User {
-                            content: format!("[steer]\n{text}"),
+                            content: steer_message(&text),
                         });
                         state.events.push(HarnessEvent::Steer { text });
                         self.bump_activity();

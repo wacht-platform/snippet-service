@@ -577,7 +577,7 @@ impl App {
         self.scroll = 0;
         // Keep the words on screen until the harness writes Steer / UserInput.
         self.pending_steers.push(text.clone());
-        // Deliver now even if busy — harness folds UserMessage into [steer] mid-run.
+        // Deliver now even if busy — the harness hands it to the running turn.
         // `submit_text` retains its local busy marker until persisted state catches
         // up, so a fast Enter after this steer queues instead of becoming a second,
         // timing-dependent steer.
