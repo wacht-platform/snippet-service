@@ -4,7 +4,8 @@
 //! reflection pass's helpful/harmful marks and deltas.
 //!
 //! ```text
-//! <ws>/.snippet/memory/
+//! ~/.snippet/projects/<repo>-<id>/memory/   one per repository, shared by
+//!                                           all its worktrees and subfolders
 //!   rules.md                      always-obeyed bullets:  - [r1] text
 //!   learnings.md                  reusable lessons:       - [l1] (+2/-0) text
 //!   notes/<section>/<id>.md       one topic per note, title + summary header
@@ -169,9 +170,24 @@ impl Memory {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
-            workspace: workspace_root.join(".snippet").join("memory"),
+            workspace: project_memory_dir(workspace_root),
             global: home.join(".snippet").join("memory"),
         }
+    }
+
+    /// Serialise writers across sessions: worktrees of one repository share a
+    /// store, so two reflection passes can land at once. Released on drop.
+    fn lock(&self, global: bool) -> Option<fs::File> {
+        use std::os::fd::AsRawFd;
+        let dir = self.store(global);
+        fs::create_dir_all(dir).ok()?;
+        let file = fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".lock"))
+            .ok()?;
+        (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file)
     }
 
     fn store(&self, global: bool) -> &Path {
@@ -190,6 +206,7 @@ impl Memory {
     /// something changed.
     pub fn normalize(&self) {
         for global in [false, true] {
+            let _lock = self.lock(global);
             for kind in [Kind::Rule, Kind::Learning] {
                 let Ok(text) = fs::read_to_string(self.store(global).join(kind.file())) else {
                     continue;
@@ -299,6 +316,7 @@ impl Memory {
         if !paths.iter().any(|p| p.starts_with(&notes_dir)) {
             return;
         }
+        let _lock = self.lock(false);
         for mut note in self.notes().into_iter().filter(|n| paths.contains(&n.path)) {
             note.read += 1;
             let _ = self.save_counters(&note);
@@ -318,6 +336,7 @@ impl Memory {
         let title = one_line(title, "title", MAX_TITLE_CHARS)?;
         let summary = one_line(summary, "summary", MAX_SUMMARY_CHARS)?;
         let body = clean_body(body)?;
+        let _lock = self.lock(false);
         let notes = self.notes();
         if let Some(existing) = notes.iter().find(|n| n.id == id) {
             return Err(format!(
@@ -356,6 +375,7 @@ impl Memory {
     }
 
     pub fn update_note(&self, id: &str, edit: NoteEdit) -> Result<String, String> {
+        let _lock = self.lock(false);
         let mut note = self.find_note(id)?;
         let old_path = note.path.clone();
         let mut changed = Vec::new();
@@ -390,6 +410,7 @@ impl Memory {
     pub fn set_section(&self, section: &str, summary: &str) -> Result<String, String> {
         let section = clean_section(section)?;
         let summary = one_line(summary, "summary", MAX_SUMMARY_CHARS)?;
+        let _lock = self.lock(false);
         write_atomic(&self.section_dir(&section).join(SECTION_FILE), &format!("{summary}\n"))?;
         Ok(format!("section {section}/ summary set"))
     }
@@ -403,6 +424,7 @@ impl Memory {
     ) -> Result<String, String> {
         let text = one_line(text, kind.noun(), MAX_BULLET_CHARS)?;
         let section = clean_label(section)?;
+        let _lock = self.lock(global);
         let words = tokens(&text);
         if let Some((bullet, overlap)) = self
             .bullets(false, kind)
@@ -448,6 +470,7 @@ impl Memory {
         if text.is_none() && section.is_none() {
             return Err("nothing to change — give text or section".to_string());
         }
+        let _lock = self.lock(global);
         let mut bullets = self.bullets(global, kind);
         let bullet = bullets
             .iter_mut()
@@ -466,6 +489,7 @@ impl Memory {
     pub fn remove(&self, id: &str) -> Result<String, String> {
         match classify(id) {
             Target::Bullet { global, kind } => {
+                let _lock = self.lock(global);
                 let mut bullets = self.bullets(global, kind);
                 let before = bullets.len();
                 bullets.retain(|b| b.id != id);
@@ -476,6 +500,7 @@ impl Memory {
                 Ok(format!("removed {} [{id}]", kind.noun()))
             }
             Target::Note => {
+                let _lock = self.lock(false);
                 let note = self.find_note(id)?;
                 fs::remove_file(&note.path).map_err(|e| e.to_string())?;
                 prune_empty_dirs(note.path.parent(), &self.notes_dir());
@@ -488,6 +513,7 @@ impl Memory {
         let verdict = if helpful { "helpful" } else { "harmful" };
         match classify(id) {
             Target::Bullet { global, kind } => {
+                let _lock = self.lock(global);
                 let mut bullets = self.bullets(global, kind);
                 let bullet = bullets
                     .iter_mut()
@@ -510,6 +536,7 @@ impl Memory {
                 Ok(format!("marked [{id}] {verdict} (+{h}/-{x})"))
             }
             Target::Note => {
+                let _lock = self.lock(false);
                 let mut note = self.find_note(id)?;
                 if helpful {
                     note.helpful += 1;
@@ -619,6 +646,51 @@ impl Memory {
         )
         .trim_end()
         .to_string()
+    }
+}
+
+/// The project memory folder for a workspace, keyed by its repository so every
+/// linked worktree and subfolder of one repository shares it. The key is the
+/// main checkout (or a bare repository's git dir); outside git it is the
+/// workspace itself.
+fn project_memory_dir(workspace: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let project = repository_root(workspace);
+    let name: String = project
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let digest = Sha256::digest(project.to_string_lossy().as_bytes());
+    let id: String = digest.iter().take(5).map(|b| format!("{b:02x}")).collect();
+    let name = if name.is_empty() { "project".to_string() } else { name };
+    crate::config::snippet_home()
+        .join("projects")
+        .join(format!("{name}-{id}"))
+        .join("memory")
+}
+
+fn repository_root(workspace: &Path) -> PathBuf {
+    let workspace = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let common = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|dir| !dir.is_empty());
+    let Some(common) = common else {
+        return workspace;
+    };
+    let common = workspace.join(common);
+    let common = common.canonicalize().unwrap_or(common);
+    match common.parent() {
+        Some(main) if common.file_name().is_some_and(|n| n == ".git") => main.to_path_buf(),
+        _ => common,
     }
 }
 
