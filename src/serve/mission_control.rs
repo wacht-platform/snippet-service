@@ -204,7 +204,7 @@ async fn build_agent_from_prompt(
     let task_id = uuid::Uuid::new_v4().to_string();
     let title = "Build specialized agent";
     let description = format!(
-        "Build a specialized agent from this user brief:\n\n{prompt}\n\nResearch the role using web_search/web_read when useful. Produce a proposed durable identity, capabilities, and Python tool manifests in the agent home. Do not execute generated tools or claim completion until the identity and manifests validate. Report the proposed agent id, identity summary, research sources, tools, validation, and blockers to Mission Control."
+        "Build a specialized agent from this user brief:\n\n{prompt}\n\nResearch the role first (web_search / web_read when available): the domain's standards, the checks an expert runs, common failure modes. Choose a short kebab-case id and a display name, then write the identity: who the agent is, its mandate, how it works step by step, what it checks, and how it reports. Create the agent with register_agent, then report this task with report_mission_task: the agent id, a two-line identity summary, and the sources you used."
     );
     let task = Task::dispatched_to(
         task_id,
@@ -480,18 +480,38 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String
         format!("owned_paths: [{}]\n", paths.join(", "))
     };
 
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&managed.workspace)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|text| !text.is_empty())
+    };
+    let revision_line = match (
+        git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        git(&["log", "-1", "--format=%h %s"]),
+    ) {
+        (Some(branch), Some(head)) => format!("branch: {branch} at {head}\n"),
+        _ => String::new(),
+    };
     let text = format!(
-        "[mission_control_task]\ntask_id: {}\ntitle: {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}scope: {}\nworkspace: {}\nexpected_report: scope done; files changed; verification; blockers\nrules: do not confirm scope; begin immediately. If handoff_mode is fresh, this envelope is the complete briefing — do not ask for missing history. Stay in this session — it already has the context; do not spawn lanes unless the work is independently parallel. Stay in scope; do not manage other sessions. If a prior read-only report is gone, redo the evaluation from current sources and deliver it. You MUST call report_mission_task for task_id {} before you stop — even on a clean success with no errors. Status done if finished; blocked if you need a unique artifact or user decision; failed only for a hard stop. Call inspect_task anytime to view the complete plan and dependencies. If coordination with other agents or Mission Control is needed, post updates to the task board or transfer the lease.\n[/mission_control_task]",
+        "[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}scope:\n{}\n\nBegin now. Before you stop, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
         task.id,
         task.title,
+        task.created_by_kind,
+        task.created_by_id,
         mode_line,
         active_worker,
+        managed.workspace.display(),
         if handoff.is_empty() {
             task.description.as_str()
         } else {
             handoff
         },
-        managed.workspace.display(),
         task.id,
     );
     if let Some(profile) = task.profile.as_deref() {
