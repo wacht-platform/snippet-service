@@ -800,36 +800,29 @@ fn verify_grounding(workspace: &std::path::Path, text: &str) -> Option<String> {
 }
 
 /// Build the parent-facing report for a finished lane: its final summary and
-/// the full log of tool calls it made — so the parent agent sees everything the
-/// lane did, not just a one-line summary.
+/// the files it changed. The call-by-call activity is kept in the lane's own
+/// log (and shown in the app); repeating it here only cost the parent tokens.
 fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
     use crate::harness::HarnessEvent;
 
-    let mut actions: Vec<String> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     for event in &outcome.events {
-        match event {
-            HarnessEvent::ToolCall {
-                tool_name,
-                arguments,
-            } => {
-                // Track files the lane actually operated on — the concrete results.
-                if tool_name == "change_files" {
-                    let paths = arguments
-                        .get("changes")
-                        .and_then(|v| v.as_array())
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|c| c.get("path").and_then(|v| v.as_str()));
-                    for path in paths {
-                        if !changed.iter().any(|p| p == path) {
-                            changed.push(path.to_string());
-                        }
-                    }
-                }
-                actions.push(action_label(tool_name, arguments));
+        let HarnessEvent::ToolCall { tool_name, arguments } = event else {
+            continue;
+        };
+        if tool_name != "change_files" {
+            continue;
+        }
+        let paths = arguments
+            .get("changes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("path").and_then(|v| v.as_str()));
+        for path in paths {
+            if !changed.iter().any(|p| p == path) {
+                changed.push(path.to_string());
             }
-            _ => {}
         }
     }
 
@@ -839,62 +832,13 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
         .unwrap_or_else(|| "lane completed without a summary".to_string());
 
     let mut out = format!("Summary:\n{summary}");
-
     if !changed.is_empty() {
         out.push_str(&format!("\n\nFiles changed/created ({}):", changed.len()));
         for path in &changed {
             out.push_str(&format!("\n- {path}"));
         }
     }
-
-    if !actions.is_empty() {
-        const CAP: usize = 80;
-        out.push_str(&format!(
-            "\n\nActions taken ({} tool calls):",
-            actions.len()
-        ));
-        for (i, action) in actions.iter().take(CAP).enumerate() {
-            out.push_str(&format!("\n{}. {action}", i + 1));
-        }
-        if actions.len() > CAP {
-            out.push_str(&format!("\n… and {} more", actions.len() - CAP));
-        }
-    }
-
     out
-}
-
-/// One-line label for a tool call in a lane's action log (tool + key argument).
-fn action_label(tool_name: &str, args: &serde_json::Value) -> String {
-    let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
-    let detail = match tool_name {
-        "bash" => arg("command"),
-        "view_image" => arg("path"),
-        "change_files" => args
-            .pointer("/changes/0/path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(""),
-        "web_search" => arg("query"),
-        "web_read" => arg("url"),
-        "delegate_task" => arg("title"),
-        _ => "",
-    };
-    let detail = truncate_text(detail, 120);
-    if detail.is_empty() {
-        tool_name.to_string()
-    } else {
-        format!("{tool_name}: {detail}")
-    }
-}
-
-fn truncate_text(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        let head: String = text.chars().take(max).collect();
-        format!("{head}…")
-    }
 }
 
 #[cfg(test)]
