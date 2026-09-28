@@ -81,6 +81,13 @@ enum Command {
         #[command(subcommand)]
         action: DbAction,
     },
+    /// Search and read the archived history of an agent session — the messages
+    /// compaction moved out of its context. Scoped to $SNIPPET_SESSION_ID (set in
+    /// the agent's shell) unless --session is given.
+    History {
+        #[command(subcommand)]
+        action: HistoryAction,
+    },
     /// Message internal agents and give one work in a session, through the
     /// running serve daemon. The daemon owns delivery, so a message accepted here
     /// is still delivered after a restart.
@@ -136,6 +143,35 @@ enum AgentAction {
         /// Print the response as raw JSON.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryAction {
+    /// Full-text search, best matches first.
+    Search {
+        /// Words to look for.
+        query: String,
+        /// Maximum number of matches.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Session to search (defaults to $SNIPPET_SESSION_ID).
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Print archived messages in full, by id or as an id range.
+    Show {
+        /// Message ids from `snippet history search`.
+        ids: Vec<i64>,
+        /// First id of a range.
+        #[arg(long)]
+        from: Option<i64>,
+        /// Last id of a range.
+        #[arg(long)]
+        to: Option<i64>,
+        /// Session to read (defaults to $SNIPPET_SESSION_ID).
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 
@@ -336,6 +372,62 @@ fn vault_cli(action: VaultAction) -> Result<(), Box<dyn std::error::Error>> {
 /// Opening the database is what creates it — `Store::open` runs the
 /// schema migration — so `init` is deliberately just an open plus a report, not a
 /// separate creation path that could drift from what the daemon does at startup.
+fn history_cli(action: HistoryAction) -> Result<(), Box<dyn std::error::Error>> {
+    use snippet::history_archive::{recall_turn_range, recall_turns, render_turn, search_history};
+    let session = |explicit: Option<String>| {
+        explicit
+            .or_else(|| std::env::var("SNIPPET_SESSION_ID").ok())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("no session: pass --session <id> (inside an agent shell $SNIPPET_SESSION_ID is set)")
+    };
+    let store = snippet::store::Store::open(snippet::store::default_db_path())?;
+    match action {
+        HistoryAction::Search {
+            query,
+            limit,
+            session: explicit,
+        } => {
+            let hits = search_history(&store, &session(explicit)?, &query, limit.clamp(1, 50))?;
+            if hits.is_empty() {
+                println!("no matches for {query:?}");
+            }
+            for hit in hits {
+                let who = hit.tool_name.as_deref().unwrap_or(&hit.role);
+                println!("#{}  {who}  {}", hit.archive_id, hit.summary);
+                let snippet = hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !snippet.is_empty() {
+                    println!("    {snippet}");
+                }
+            }
+        }
+        HistoryAction::Show {
+            ids,
+            from,
+            to,
+            session: explicit,
+        } => {
+            let session = session(explicit)?;
+            let turns = match (from, to) {
+                (Some(from), Some(to)) => recall_turn_range(&store, &session, from, to, 50)?,
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err("pass both --from and --to for a range".into());
+                }
+                (None, None) if ids.is_empty() => {
+                    return Err("pass message ids, or --from and --to".into());
+                }
+                (None, None) => recall_turns(&store, &session, &ids)?,
+            };
+            if turns.is_empty() {
+                println!("no archived messages with those ids in this session");
+            }
+            for turn in turns {
+                println!("{}", render_turn(&turn));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn db_cli(action: DbAction) -> Result<(), Box<dyn std::error::Error>> {
     let path = snippet::store::default_db_path();
     let existed = path.exists();
@@ -1140,6 +1232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Command::Vault { action }) => return vault_cli(action),
         Some(Command::Db { action }) => return db_cli(action),
+        Some(Command::History { action }) => return history_cli(action),
         Some(Command::Agent { action }) => return runtime()?.block_on(agent_cli(action)),
         Some(Command::Browser { action }) => return runtime()?.block_on(browser_cli(action)),
         Some(Command::Serve {

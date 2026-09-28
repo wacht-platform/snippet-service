@@ -6,7 +6,6 @@ pub(super) struct TurnStats {
     pub failed: usize,
     pub had_note: bool,
     pub shell_nudged: bool,
-    pub dedup_hits: usize,
     /// Every call this turn was `delegate_task` (and none failed).
     pub only_delegations: bool,
     pub delegations_ok: usize,
@@ -19,7 +18,6 @@ impl Default for TurnStats {
             failed: 0,
             had_note: false,
             shell_nudged: false,
-            dedup_hits: 0,
             only_delegations: true,
             delegations_ok: 0,
         }
@@ -129,26 +127,6 @@ pub(super) fn note_edit_result(vars: &mut LoopVars, path: Option<String>, is_err
     }
 }
 
-/// Keep the read-only dedup set honest after a call ran. A successful mutation
-/// makes prior discovery stale (memory reads survive file/shell mutations); a
-/// memory write makes prior memory reads stale; a discovery call is recorded.
-pub(super) fn note_discovery(
-    vars: &mut LoopVars,
-    tool_name: &str,
-    signature: String,
-    is_err: bool,
-) {
-    if !is_err && MUTATING_TOOLS.contains(&tool_name) {
-        vars.executed_calls
-            .retain(|s| s.starts_with("memory_read:"));
-    } else if !is_err && matches!(tool_name, "memory_write" | "memory_delete" | "memory_index") {
-        vars.executed_calls
-            .retain(|s| !s.starts_with("memory_read:"));
-    } else if DEDUP_TOOLS.contains(&tool_name) {
-        vars.executed_calls.insert(signature);
-    }
-}
-
 /// Post-turn signals from how the batch went.
 pub(super) fn apply_turn_guards(vars: &mut LoopVars, stats: &TurnStats, conversation_mode: bool) {
     // A turn with no shell nudge breaks the escalation streak.
@@ -156,10 +134,9 @@ pub(super) fn apply_turn_guards(vars: &mut LoopVars, stats: &TurnStats, conversa
         vars.shell_nudge_count = 0;
     }
 
-    // Record whether THIS turn repeated a call (dedup-caught or the exact same
-    // batch as last turn), so next turn's live context explains the re-prompt
-    // only when actually looping.
-    vars.last_turn_had_repeat = stats.dedup_hits > 0 || vars.repeated_tool_count > 0;
+    // Record whether THIS turn repeated the exact same batch as last turn, so
+    // next turn's live context explains the re-prompt only when actually looping.
+    vars.last_turn_had_repeat = vars.repeated_tool_count > 0;
 
     // Backpressure on very large single-turn fan-outs.
     if stats.real_work >= LARGE_TOOL_BATCH {

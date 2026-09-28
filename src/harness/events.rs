@@ -25,9 +25,8 @@ impl CodingHarness {
             }
             self.finish_checkpoint(state, vars).await;
             self.begin_checkpoint(state, vars, &text);
-            // Fresh request: re-discovery is legitimate again, and prior-turn
-            // loop/thought/failure state belongs to the past run.
-            vars.executed_calls.clear();
+            // Fresh request: prior-turn loop/thought/failure state belongs to
+            // the past run.
             vars.last_turn_had_repeat = false;
             vars.last_thought = None;
             vars.turns_this_request = 0;

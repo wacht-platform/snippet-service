@@ -34,7 +34,6 @@ const SHELL_NUDGE_ESCALATE_AT: usize = 2;
 
 /// Read-only tools whose exact-duplicate re-call within a request is wasteful
 /// spinning (the result is already in history). A write to memory clears it.
-const DEDUP_TOOLS: [&str; 1] = ["memory_read"];
 
 /// Tools that change the workspace: manual approval gates them, and a
 /// successful one invalidates the dedup set.
@@ -715,11 +714,7 @@ struct LoopVars {
     /// Consecutive turns in which EVERY executed tool call failed — the approach
     /// isn't working; escalates to a re-think-or-ask-for-help nudge.
     consecutive_failed_turns: usize,
-    /// Signatures of read-only discovery calls already executed THIS request, to
-    /// short-circuit exact-duplicate re-calls. Cleared on a new user request and
-    /// whenever a mutation makes re-discovery legitimate again.
-    executed_calls: std::collections::HashSet<String>,
-    /// Whether the PREVIOUS turn repeated a tool call (consecutive or dedup-caught)
+    /// Whether the PREVIOUS turn repeated the previous turn's tool calls
     /// — so the live context explains the re-prompt only when actually looping.
     /// Reset on a new user request.
     last_turn_had_repeat: bool,

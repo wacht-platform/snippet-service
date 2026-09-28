@@ -5,7 +5,7 @@
 //! ```text
 //! <ws>/.snippet/memory/
 //!   index.md          # always loaded into context; LLM-maintained, budget-capped
-//!   entries/<id>.md   # full resources, loaded on demand via memory_read
+//!   entries/<id>.md   # full resources, read on demand with the shell
 //! ```
 //!
 //! The index is a lean, always-loaded pointer list; entries hold the detail.
@@ -31,47 +31,10 @@ pub fn patterns_budget() -> usize {
 /// small (not user-tunable) — they're directives, not a knowledge store.
 const RULES_BUDGET_CHARS: usize = 2_000;
 
-const BLOCK_HEADER: &str = "[workspace_memory]\nDurable across sessions. Obey STANDING RULES always. Apply matching REUSABLE PATTERNS. Load index entries with memory_read(id). Maintain via memory_rule / memory_pattern / memory_write+memory_index. Verify load-bearing details against live code.";
-
-const EMPTY_BLOCK: &str = "[workspace_memory]\n(empty) — save durable project facts/playbooks with memory_write+memory_index; always-on prefs with memory_rule(scope=global|workspace); cross-project techniques with memory_pattern.";
 
 /// The hard cap on a standing-rules file (global or per-workspace).
 pub fn rules_budget() -> usize {
     RULES_BUDGET_CHARS
-}
-
-/// Budgets/flags controlling the memory tools, sourced from config.
-#[derive(Debug, Clone)]
-pub struct MemoryLimits {
-    /// Memory injected into context + read tool offered.
-    pub enabled: bool,
-    /// Write tools offered (main session only; lanes are read-only).
-    pub writable: bool,
-    pub index_budget_chars: usize,
-    pub entry_budget_chars: usize,
-    pub max_entries: usize,
-}
-
-impl Default for MemoryLimits {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            writable: true,
-            index_budget_chars: 5_000,
-            entry_budget_chars: 12_000,
-            max_entries: 128,
-        }
-    }
-}
-
-impl MemoryLimits {
-    /// Read-only view for delegated lanes: they see the memory but can't write it.
-    pub fn read_only() -> Self {
-        Self {
-            writable: false,
-            ..Self::default()
-        }
-    }
 }
 
 pub struct MemoryStore {
@@ -292,23 +255,11 @@ impl MemoryStore {
         let manifest = if entries.is_empty() {
             String::new()
         } else {
-            format!(
-                "\n\nentries (load with memory_read): {}",
-                entries.join(", ")
-            )
+            format!("\n\nentries: {}", entries.join(", "))
         };
         Some(format!("{body}{manifest}"))
     }
 
-    /// This workspace's index block alone (no rules), or the empty hint.
-    pub fn render_for_prompt(&self, index_budget: usize) -> Option<String> {
-        match self.index_body(index_budget) {
-            Some(body) => Some(format!(
-                "{BLOCK_HEADER}\n\nREFERENCE INDEX (memory_read id):\n{body}"
-            )),
-            None => Some(EMPTY_BLOCK.to_string()),
-        }
-    }
 }
 
 /// Global + this-workspace standing rules, joined (global first), or `None`.
@@ -329,9 +280,22 @@ fn combined_rules(workspace_root: &Path) -> Option<String> {
     }
 }
 
+fn block_header(workspace_root: &Path) -> String {
+    let local = MemoryStore::for_workspace(workspace_root);
+    let global = MemoryStore::global();
+    format!(
+        "[workspace_memory]\nDurable notes kept as plain files. Obey STANDING RULES always, apply a REUSABLE PATTERN when it fits, and read an index entry with `cat` before relying on it. Verify load-bearing details against live code.\nfiles:\n- index: {}\n- entries: {}/<id>.md\n- workspace rules: {}\n- global rules: {}\n- patterns: {}",
+        local.index_path().display(),
+        local.entries_dir().display(),
+        local.rules_path().display(),
+        global.rules_path().display(),
+        global.patterns_path().display(),
+    )
+}
+
 /// The full `[workspace_memory]` block injected into a session's system prefix:
-/// always-on STANDING RULES (global + workspace) followed by the on-demand
-/// REFERENCE INDEX. Returns the empty hint when there's nothing at all yet.
+/// where the memory files live, then the always-on STANDING RULES (global +
+/// workspace), patterns and the on-demand REFERENCE INDEX.
 pub fn render_session_memory(workspace_root: &Path, index_budget: usize) -> Option<String> {
     let rules = combined_rules(workspace_root);
     let patterns = {
@@ -339,10 +303,11 @@ pub fn render_session_memory(workspace_root: &Path, index_budget: usize) -> Opti
         (!p.trim().is_empty()).then(|| p.trim().to_string())
     };
     let index = MemoryStore::for_workspace(workspace_root).index_body(index_budget);
+    let mut out = block_header(workspace_root);
     if rules.is_none() && patterns.is_none() && index.is_none() {
-        return Some(EMPTY_BLOCK.to_string());
+        out.push_str("\n\n(empty)");
+        return Some(out);
     }
-    let mut out = String::from(BLOCK_HEADER);
     if let Some(r) = rules {
         out.push_str("\n\nSTANDING RULES (always):\n");
         out.push_str(&r);
@@ -352,7 +317,7 @@ pub fn render_session_memory(workspace_root: &Path, index_budget: usize) -> Opti
         out.push_str(&p);
     }
     if let Some(i) = index {
-        out.push_str("\n\nREFERENCE INDEX (memory_read id):\n");
+        out.push_str("\n\nREFERENCE INDEX:\n");
         out.push_str(&i);
     }
     Some(out)

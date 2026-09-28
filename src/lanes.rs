@@ -645,10 +645,7 @@ async fn run_lane(
             return Err(message);
         }
     };
-    let mut tools = coding_tools(
-        exa_api_key.clone(),
-        crate::memory::MemoryLimits::read_only(),
-    );
+    let mut tools = coding_tools(exa_api_key.clone());
     if read_only {
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.
