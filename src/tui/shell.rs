@@ -18,10 +18,12 @@ pub(crate) enum PaneTab {
     Plan,
     Lanes,
     Checkpoints,
+    Agents,
 }
 
 impl PaneTab {
-    pub(crate) const ALL: [PaneTab; 4] = [PaneTab::Tools, PaneTab::Plan, PaneTab::Lanes, PaneTab::Checkpoints];
+    pub(crate) const ALL: [PaneTab; 5] =
+        [PaneTab::Tools, PaneTab::Plan, PaneTab::Lanes, PaneTab::Checkpoints, PaneTab::Agents];
 
     fn label(self) -> &'static str {
         match self {
@@ -29,6 +31,7 @@ impl PaneTab {
             PaneTab::Plan => "Plan",
             PaneTab::Lanes => "Lanes",
             PaneTab::Checkpoints => "Checkpoints",
+            PaneTab::Agents => "Agents",
         }
     }
 }
@@ -261,6 +264,22 @@ fn tool_row(tool: &str, args: &Value, result: Option<&Value>, width: usize, sele
     .style(Style::default().bg(if selected { surface3() } else { surface1() }))
 }
 
+/// The pane's tab labels on one line; when they overflow, drop tabs from the
+/// front so the active one stays in view.
+fn tab_strip(mut spans: Vec<Span<'static>>, width: usize, active: PaneTab) -> Line<'static> {
+    let active_at = PaneTab::ALL.iter().position(|t| *t == active).unwrap_or(0) * 2;
+    let len = |sp: &[Span<'static>]| sp.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let mut start = 0;
+    while len(&spans[start..]) > width && start + 2 <= active_at {
+        start += 2;
+    }
+    if start > 0 {
+        spans.drain(..start);
+        spans.insert(0, Span::styled("‹ ", Style::default().fg(faint())));
+    }
+    Line::from(spans)
+}
+
 pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     fill(frame, area, surface1());
     let inner = Rect { x: area.x + 1, width: area.width.saturating_sub(2), y: area.y + 1, height: area.height.saturating_sub(1) };
@@ -281,7 +300,7 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
         ));
     }
     let w = inner.width as usize;
-    let mut lines = vec![Line::from(tabs), Line::from("")];
+    let mut lines = vec![tab_strip(tabs, w, app.shell.tab), Line::from("")];
     match app.shell.tab {
         PaneTab::Tools => {
             let tools = turn_tools(app);
@@ -289,7 +308,7 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
                 let (tool, args, result) = &tools[i];
                 lines.push(Line::from(vec![
                     Span::styled("‹ ", Style::default().fg(accent())),
-                    Span::styled(format!("step {} of {}", i + 1, tools.len()), Style::default().fg(faint())),
+                    Span::styled("back", Style::default().fg(faint())),
                 ]));
                 lines.push(Line::from(""));
                 lines.extend(transcript::tool_call_head_lines_status(tool, args, w, match result {
@@ -307,11 +326,6 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
             } else if tools.is_empty() {
                 lines.push(Line::from(Span::styled("No tool calls in this turn yet.", Style::default().fg(faint()))));
             } else {
-                lines.push(Line::from(Span::styled(
-                    format!("{} step{} this turn", tools.len(), if tools.len() == 1 { "" } else { "s" }),
-                    Style::default().fg(faint()),
-                )));
-                lines.push(Line::from(""));
                 for (i, (tool, args, result)) in tools.iter().enumerate() {
                     lines.push(tool_row(tool, args, result.as_ref(), w, focused && i == app.shell.pane_index));
                 }
@@ -361,6 +375,11 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
                 lines.push(Line::from(Span::styled("Enter opens the full lanes view", Style::default().fg(faint()))));
             }
         }
+        PaneTab::Agents => {
+            let body = super::boards::board_lines(app, app.shell.tab, w);
+            let scroll = if app.shell.pane_detail.is_some() { app.shell.pane_scroll as usize } else { 0 };
+            lines.extend(body.into_iter().skip(scroll));
+        }
         PaneTab::Checkpoints => {
             let cps = app.state.as_ref().map(|s| s.checkpoints.clone()).unwrap_or_default();
             if cps.is_empty() {
@@ -385,7 +404,7 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     frame.render_widget(Paragraph::new(lines), Rect { height: inner.height.saturating_sub(1), ..inner });
     let hint = if focused {
         match (app.shell.tab, app.shell.pane_detail) {
-            (PaneTab::Tools, Some(_)) => "↑↓ scroll · ← back · Tab next tab · Esc",
+            (_, Some(_)) => "↑↓ scroll · ← back · Tab next tab · Esc",
             _ => "↑↓ move · Enter open · Tab next tab · Esc",
         }
     } else {
@@ -397,8 +416,10 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     );
 }
 
-pub(crate) const PALETTE_ACTIONS: [(&str, &str); 15] = [
+pub(crate) const PALETTE_ACTIONS: [(&str, &str); 17] = [
     ("new", "New session"),
+    ("mission", "Open Mission Control"),
+    ("agents", "Show agents"),
     ("sessions", "Switch session…"),
     ("sidebar", "Toggle sessions sidebar"),
     ("pane", "Toggle side panel"),
@@ -509,6 +530,8 @@ impl App {
             "plan" => self.open_pane(PaneTab::Plan),
             "lanes" => self.open_pane(PaneTab::Lanes),
             "checkpoints" => self.open_pane(PaneTab::Checkpoints),
+            "mission" => self.open_mission_control(),
+            "agents" => self.open_pane(PaneTab::Agents),
             "model" => self.handle_slash_command("/model"),
             "mode" => self.handle_slash_command("/mode"),
             "compact" => self.handle_slash_command("/compact"),
@@ -525,6 +548,7 @@ impl App {
             PaneTab::Plan => self.state.as_ref().map_or(0, |s| s.plan.len()),
             PaneTab::Lanes => self.state.as_ref().map_or(0, |s| s.lanes.len()),
             PaneTab::Checkpoints => self.state.as_ref().map_or(0, |s| s.checkpoints.len()),
+            tab => self.board_len(tab),
         }
     }
 }
@@ -624,7 +648,7 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
             true
         }
         Focus::Pane => {
-            if app.shell.tab == PaneTab::Tools && app.shell.pane_detail.is_some() {
+            if app.shell.pane_detail.is_some() {
                 match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
                         app.shell.pane_detail = None;
@@ -676,6 +700,10 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
                                 app.checkpoint_selected_index = pos;
                             }
                         }
+                    }
+                    PaneTab::Agents => {
+                        app.shell.pane_detail = Some(app.shell.pane_index.min(len - 1));
+                        app.shell.pane_scroll = 0;
                     }
                     PaneTab::Plan => {}
                 },

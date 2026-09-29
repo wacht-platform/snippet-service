@@ -180,3 +180,54 @@ use super::*;
             "welcome art should not draw over a real conversation"
         );
     }
+
+/// Render one frame of an already-prepared app, as text rows.
+fn snapshot_app(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal.draw(|f| render(f, app)).expect("draw a frame");
+    let buf = terminal.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" ")).collect())
+        .collect()
+}
+
+fn board_app() -> App {
+    let mut app = tui_app();
+    app.shell.width = 170;
+    app.shell.pane = Some(true);
+    app.shell.focus = Focus::Pane;
+    app.boards.seed(
+        "agents",
+        serde_json::json!([
+            {"id": "snippet", "display_name": "Snippet", "role": "coding", "status": "idle", "kind": "general",
+             "capabilities": ["code", "review"]},
+            {"id": "designer", "display_name": "Designer", "role": "ui", "status": "busy"},
+        ]),
+    );
+    app.boards.seed(
+        "board:snippet",
+        serde_json::json!({"entries": [
+            {"kind": "dispatched", "summary": "Wire the traffic path panel", "workspace": "/home/u/ext"},
+            {"kind": "reported", "summary": "31 taxonomy assertions pass; combination gating verified.", "workspace": "/home/u/ext"},
+        ]}),
+    );
+    app
+}
+
+#[test]
+fn agents_panel_lists_agents_and_opens_a_board() {
+    let mut app = board_app();
+    app.shell.tab = PaneTab::Agents;
+    let list = snapshot_app(&mut app, 170, 30).join("\n");
+    for row in list.lines() { println!("|{row}|"); }
+    assert!(list.contains("Snippet") && list.contains("Designer"));
+    assert!(list.contains("idle") && list.contains("busy"));
+
+    app.shell.pane_detail = Some(0);
+    let detail = snapshot_app(&mut app, 170, 30).join("\n");
+    for row in detail.lines() { println!("|{row}|"); }
+    assert!(detail.contains("Board"));
+    assert!(detail.contains("Wire the traffic path panel"));
+    assert!(detail.contains("reported"));
+}
