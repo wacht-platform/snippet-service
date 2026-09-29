@@ -398,6 +398,16 @@ pub(crate) fn profile_status(cfg: &crate::config::InferenceProfileConfig) -> Str
                 "not signed in — Enter to sign in".to_string()
             }
         }
+        // Grok signs in with the SuperGrok / X Premium subscription; it never
+        // takes an API key, so "no api key" would be a false warning.
+        "xai" | "grok" => {
+            if crate::xai_auth::is_signed_in() {
+                "✓ signed in".to_string()
+            } else {
+                // Sign-in lives in the profile's edit form.
+                "not signed in — e to sign in".to_string()
+            }
+        }
         "openai-compatible" => {
             let host = cfg
                 .base_url
