@@ -568,13 +568,13 @@ fn pad(text: &str, width: usize) -> String {
     }
 }
 
-/// A status word's tone: done green, working amber, failed red, else faint.
+/// Tone for the daemon's statuses: tasks, agents, board kinds and jobs.
 pub(crate) fn status_color(status: &str) -> ratatui::style::Color {
-    match status.to_lowercase().as_str() {
-        "done" | "completed" | "complete" | "reported" | "idle" | "enabled" => success(),
-        "running" | "active" | "working" | "in_progress" | "dispatched" | "claimed" | "busy" => warn(),
-        "failed" | "blocked" | "error" | "cancelled" => danger(),
-        "waiting_for_input" | "pending" | "queued" => accent(),
+    match status {
+        "done" | "reported" | "active" | "enabled" => success(),
+        "in_progress" | "dispatched" | "draining" => warn(),
+        "failed" | "blocked" | "cancelled" => danger(),
+        "todo" => accent(),
         _ => faint(),
     }
 }
