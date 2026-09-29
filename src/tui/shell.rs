@@ -397,12 +397,13 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     );
 }
 
-pub(crate) const PALETTE_ACTIONS: [(&str, &str); 14] = [
+pub(crate) const PALETTE_ACTIONS: [(&str, &str); 15] = [
     ("new", "New session"),
     ("sessions", "Switch session…"),
     ("sidebar", "Toggle sessions sidebar"),
     ("pane", "Toggle side panel"),
     ("tools", "Show this turn's tools"),
+    ("steps", "Expand or fold tool steps in the transcript"),
     ("plan", "Show the plan"),
     ("lanes", "Show delegated work"),
     ("checkpoints", "Show checkpoints"),
@@ -460,7 +461,7 @@ pub(crate) fn render_palette(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
 
 pub(crate) fn render_key_hints(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let hints: &[(&str, &str)] = match app.shell.focus {
-        Focus::Composer => &[("Enter", "send"), ("Ctrl-P", "commands"), ("Ctrl-B", "sessions"), ("Ctrl-L", "panel"), ("Esc", "stop")],
+        Focus::Composer => &[("Enter", "send"), ("Ctrl-P", "commands"), ("Ctrl-B", "sessions"), ("Ctrl-L", "panel"), ("Ctrl-O", "steps"), ("Esc", "stop")],
         Focus::Sidebar => &[("↑↓", "move"), ("Enter", "open"), ("n", "new"), ("Esc", "back")],
         Focus::Pane => &[("↑↓", "move"), ("Enter", "open"), ("Tab", "tab"), ("Esc", "back")],
     };
@@ -504,6 +505,7 @@ impl App {
             "sidebar" => self.shell.sidebar = Some(!self.shell.sidebar.unwrap_or(true)),
             "pane" => self.shell.pane = Some(!self.shell.pane.unwrap_or(true)),
             "tools" => self.open_pane(PaneTab::Tools),
+            "steps" => self.tools_expanded = !self.tools_expanded,
             "plan" => self.open_pane(PaneTab::Plan),
             "lanes" => self.open_pane(PaneTab::Lanes),
             "checkpoints" => self.open_pane(PaneTab::Checkpoints),

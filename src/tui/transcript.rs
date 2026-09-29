@@ -168,25 +168,31 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Tool call: render `• verb arg` cleanly without double-tagging
-        if let HarnessEvent::ToolCall {
-            tool_name,
-            arguments,
-        } = event
-        {
-            if HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
-                // Drop the paired hidden result too, so no orphan row renders.
-                if let Some(HarnessEvent::ToolResult { tool_name: rn, .. }) = events.peek() {
-                    if HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
+        if matches!(event, HarnessEvent::ToolCall { .. }) {
+            let mut run: Vec<RunStep> = Vec::new();
+            let mut cur = Some(event);
+            while let Some(HarnessEvent::ToolCall { tool_name, arguments }) = cur {
+                let mut result = None;
+                if let Some(HarnessEvent::ToolResult { tool_name: rn, result: r }) = events.peek() {
+                    if rn == tool_name {
+                        result = Some(r.clone());
                         events.next();
                     }
                 }
+                if !HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
+                    run.push(RunStep { tool: tool_name.clone(), args: arguments.clone(), result });
+                }
+                cur = if matches!(events.peek(), Some(HarnessEvent::ToolCall { .. })) {
+                    events.next()
+                } else {
+                    None
+                };
+            }
+            if run.is_empty() {
                 continue;
             }
 
             set_speaker(&mut lines, &mut speaker, &mut tag_pending, true);
-
-            // If transitioning from prose text to a tool call, add a blank line above the tool run
             if !prev_tool_row
                 && !lines.is_empty()
                 && lines.last().map_or(true, |l| !l.spans.is_empty())
@@ -194,51 +200,29 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
             }
 
-            // Pair call + result into one Cursor-style row. Ctrl-O (tools_expanded)
-            // reveals arg previews and fuller result bodies; collapsed stays one line.
+            let running = state.status == HarnessStatus::Running;
+            let live = running && events.peek().is_none();
             let expanded = app.tools_expanded;
-            let mut status = if state.status == HarnessStatus::Running {
-                ToolRowStatus::Running
+            if run.len() > 1 && !live && !expanded {
+                lines.extend(run_summary_lines(&run, content_w));
             } else {
-                ToolRowStatus::Done
-            };
-            let mut result_value: Option<Value> = None;
-            if let Some(HarnessEvent::ToolResult {
-                tool_name: rn,
-                result,
-            }) = events.peek()
-            {
-                if rn == tool_name && !HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
-                    let failed = result.get("status").and_then(Value::as_str) == Some("error");
-                    status = if failed {
-                        ToolRowStatus::Failed
-                    } else {
-                        ToolRowStatus::Done
+                for step in &run {
+                    let status = match &step.result {
+                        _ if step.failed() => ToolRowStatus::Failed,
+                        None if live => ToolRowStatus::Running,
+                        _ => ToolRowStatus::Done,
                     };
-                    result_value = Some(result.clone());
-                    events.next();
-                }
-            } else if state.status != HarnessStatus::Running {
-                status = ToolRowStatus::Done;
-            }
-
-            let mut call_lines =
-                tool_call_head_lines_status(tool_name, arguments, content_w, status);
-
-            if expanded {
-                call_lines.extend(tool_call_preview(tool_name, arguments, content_w));
-                if let Some(result) = result_value.as_ref() {
-                    call_lines.extend(tool_result_lines_expanded(tool_name, result, content_w));
-                }
-            } else if let Some(result) = result_value.as_ref() {
-                // Collapsed: keep errors visible under the row; success stays one-line.
-                if result.get("status").and_then(Value::as_str) == Some("error") {
-                    call_lines.extend(tool_result_lines(tool_name, result, content_w));
+                    lines.extend(tool_call_head_lines_status(&step.tool, &step.args, content_w, status));
+                    if expanded {
+                        lines.extend(tool_call_preview(&step.tool, &step.args, content_w));
+                        if let Some(result) = &step.result {
+                            lines.extend(tool_result_lines_expanded(&step.tool, result, content_w));
+                        }
+                    } else if let (true, Some(result)) = (step.failed(), &step.result) {
+                        lines.extend(tool_result_lines(&step.tool, result, content_w));
+                    }
                 }
             }
-
-            // Push tool rows flush with the content column (no speaker double-tag).
-            lines.extend(call_lines);
             prev_tool_row = true;
             prev_plan = false;
             continue;
@@ -252,6 +236,18 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 | HarnessEvent::LaneCancelled { .. }
                 | HarnessEvent::LaneCompleted { .. }
         ) {
+            continue;
+        }
+
+        if let Some(card) = event_card(event) {
+            if lines.last().is_some_and(|l| !l.spans.is_empty()) {
+                lines.push(Line::from(""));
+            }
+            lines.extend(card_lines(&card, width));
+            speaker = None;
+            tag_pending = false;
+            prev_tool_row = false;
+            prev_plan = true;
             continue;
         }
 
@@ -346,7 +342,15 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     format!("{spinner} "),
                     Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("working…", subtle()),
+                Span::styled(
+                    match state.events.last() {
+                        _ if state.status != HarnessStatus::Running => "delegated work running…",
+                        Some(HarnessEvent::ToolCall { .. }) => "working…",
+                        _ if !live.is_empty() => "writing…",
+                        _ => "thinking…",
+                    },
+                    subtle(),
+                ),
             ]));
         }
     }
@@ -414,6 +418,9 @@ fn thinking_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 
 /// Map one event to a block of styled, wrapped lines. Empty = hidden.
 pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
+    if let Some(card) = event_card(event) {
+        return card_lines(&card, width);
+    }
     match event {
         HarnessEvent::UserInput { text } => user_lines(text, width),
         // Steers are still your words mid-run — same column as user messages, no

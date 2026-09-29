@@ -322,67 +322,84 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
 }
 
 
+fn keycap(key: &str, label: &str, color: Color) -> [Span<'static>; 2] {
+    [
+        Span::styled(format!("{key} "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{label}   "), Style::default().fg(muted())),
+    ]
+}
+
+fn card_block(glyph: &str, title: String, tone: Color, frame_color: Color) -> ratatui::widgets::Block<'static> {
+    use ratatui::widgets::{Block, BorderType, Borders, Padding};
+    Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(frame_color))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!("{glyph} "), Style::default().fg(tone).add_modifier(Modifier::BOLD)),
+            Span::styled(title, Style::default().fg(soft())),
+            Span::raw(" "),
+        ]))
+}
+
+fn approval_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let Some((tool, summary, _, total)) = app.pending_approval() else {
+        return Vec::new();
+    };
+    let inner = width.saturating_sub(4).max(10);
+    let prefix = if tool == "bash" { "$ " } else { "" };
+    let preview = if summary.trim().is_empty() {
+        "(no preview)".to_string()
+    } else {
+        format!("{prefix}{}", summary.trim())
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let wrapped = wrap_one(&preview, inner);
+    let more = wrapped.len().saturating_sub(4);
+    for seg in wrapped.into_iter().take(4) {
+        lines.push(Line::from(Span::styled(seg, Style::default().fg(text()))));
+    }
+    if more > 0 {
+        lines.push(Line::from(Span::styled(format!("… {more} more lines"), Style::default().fg(faint()))));
+    }
+    let mut actions = Vec::new();
+    actions.extend(keycap("y", "approve", success()));
+    if total > 1 {
+        actions.extend(keycap("a", "approve all", accent()));
+    }
+    actions.extend(keycap("n", "deny", danger()));
+    actions.extend(keycap("esc", "stop", soft()));
+    lines.push(Line::from(actions));
+    lines
+}
+
+pub(crate) fn approval_height(app: &App, width: u16) -> u16 {
+    let n = approval_lines(app, width as usize).len();
+    if n == 0 { 0 } else { n as u16 + 2 }
+}
+
+fn approval_subject(tool: &str) -> String {
+    match tool {
+        "bash" => "command".into(),
+        "change_files" => "file changes".into(),
+        other => other.replace('_', " "),
+    }
+}
+
 pub(crate) fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, Borders, Wrap};
-    let Some((tool, summary, index, total)) = app.pending_approval() else {
+    let Some((tool, _, index, total)) = app.pending_approval() else {
         return;
     };
     let title = if total > 1 {
-        format!(" approve · {tool}   {index}/{total} ")
+        format!("Approve {} · {index} of {total}", approval_subject(&tool))
     } else {
-        format!(" approve · {tool} ")
+        format!("Approve {}", approval_subject(&tool))
     };
-    let prefix = if tool == "bash" { "$ " } else { "" };
-    let cmd = if summary.trim().is_empty() {
-        "(no preview)".to_string()
-    } else {
-        summary
-    };
-    // "approve all" only makes sense with more than one pending in this batch.
-    let mut action_spans = vec![
-        Span::styled(
-            "  ✓ y ",
-            Style::default().fg(success()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("approve   ", subtle()),
-    ];
-    if total > 1 {
-        action_spans.push(Span::styled(
-            "⏩ a ",
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-        ));
-        action_spans.push(Span::styled("approve all   ", subtle()));
-    }
-    action_spans.extend([
-        Span::styled(
-            "✗ n ",
-            Style::default().fg(danger()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("deny   ", subtle()),
-        Span::styled(
-            "esc ",
-            Style::default().fg(muted()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("stop", subtle()),
-    ]);
-    let actions = Line::from(action_spans);
-    let body = vec![
-        Line::from(Span::styled(
-            format!("  {prefix}{cmd}"),
-            Style::default().fg(self::text()),
-        )),
-        Line::from(""),
-        actions,
-    ];
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(warn()))
-        .title(Span::styled(
-            title,
-            Style::default().fg(warn()).add_modifier(Modifier::BOLD),
-        ));
+    let block = card_block("!", title, warn(), warn());
     frame.render_widget(
-        Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(approval_lines(app, area.width as usize)).block(block),
         area,
     );
 }
@@ -955,92 +972,78 @@ pub(crate) fn question_text(pending: &Value) -> Option<String> {
     (!rendered.is_empty()).then_some(rendered)
 }
 
-pub(crate) fn question_height(app: &App) -> u16 {
-    let qs = questions_of(app);
-    let Some(q) = qs.get(app.q_index.min(qs.len().saturating_sub(1))) else {
-        return 0;
-    };
-    let opts = q_options(q);
-    let body = if opts.is_empty() { 2 } else { opts.len() + 1 };
-    ((2 + body).min(16)) as u16
-}
-
-/// Render the interactive picker: the current question, its options (or a
-/// free-text hint), and a controls line. Sits pinned above the input box.
-pub(crate) fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn question_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let qs = questions_of(app);
     let Some(question) = qs.get(app.q_index.min(qs.len().saturating_sub(1))) else {
-        return;
+        return Vec::new();
     };
-
-    let accent = accent();
-    let faint = faint();
-    let dim = muted();
-
-    let width = (area.width as usize).max(20);
-    let counter = if qs.len() > 1 {
-        format!("  ({}/{})", app.q_index + 1, qs.len())
-    } else {
-        String::new()
-    };
-
-    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
-
-    let q_line = wrap_one(&q_text(question), width.saturating_sub(counter.len() + 3))
-        .into_iter()
-        .next()
-        .unwrap_or_default();
-    lines.push(Line::from(vec![
-        Span::styled(
-            q_line,
-            Style::default()
-                .fg(self::text())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(counter, Style::default().fg(faint)),
-    ]));
-
+    let inner = width.saturating_sub(4).max(10);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let bold = Style::default().fg(text()).add_modifier(Modifier::BOLD);
+    let wrapped = wrap_one(&q_text(question), inner);
+    let more = wrapped.len() > 5;
+    for seg in wrapped.into_iter().take(if more { 4 } else { 5 }) {
+        lines.push(Line::from(Span::styled(seg, bold)));
+    }
+    if more {
+        lines.push(Line::from(Span::styled("…", Style::default().fg(faint()))));
+    }
+    lines.push(Line::from(""));
     let opts = q_options(question);
-    if opts.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  ↳ ", Style::default().fg(accent)),
-            Span::styled(
-                "type your answer below, then press ↵",
-                Style::default().fg(faint),
-            ),
-        ]));
+    let hints = if opts.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  ↵ submit · Esc cancel",
-            Style::default().fg(faint),
+            "Type your answer in the box below",
+            Style::default().fg(muted()),
         )));
+        vec![keycap("↵", "send", accent()), keycap("esc", "cancel", soft())]
     } else {
         let sel = app.q_sel.min(opts.len() - 1);
-        for (i, (_value, label)) in opts.iter().enumerate() {
+        for (i, (_value, label)) in opts.iter().enumerate().take(8) {
             let focused = i == sel;
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if focused { "  ▸ " } else { "    " },
-                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    label.clone(),
-                    if focused {
-                        Style::default()
-                            .fg(self::text())
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(dim)
-                    },
-                ),
-            ]));
+            let label: String = label.chars().take(inner.saturating_sub(2)).collect();
+            let pad = inner.saturating_sub(label.chars().count() + 2);
+            let row = if focused {
+                Line::from(vec![
+                    Span::styled("▸ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                    Span::styled(label, bold),
+                    Span::raw(" ".repeat(pad)),
+                ])
+                .style(Style::default().bg(surface3()))
+            } else {
+                Line::from(vec![Span::raw("  "), Span::styled(label, Style::default().fg(soft()))])
+            };
+            lines.push(row);
         }
-        lines.push(Line::from(Span::styled(
-            "  ↑/↓ choose · ↵ select · Esc cancel",
-            Style::default().fg(faint),
-        )));
-    }
+        vec![
+            keycap("↑↓", "choose", accent()),
+            keycap("↵", "select", accent()),
+            keycap("esc", "cancel", soft()),
+        ]
+    };
+    lines.push(Line::from(hints.into_iter().flatten().collect::<Vec<_>>()));
+    lines
+}
 
-    frame.render_widget(Paragraph::new(lines), area);
+pub(crate) fn question_height(app: &App, width: u16) -> u16 {
+    let n = question_lines(app, width as usize).len();
+    if n == 0 { 0 } else { n as u16 + 2 }
+}
+
+pub(crate) fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let qs = questions_of(app);
+    if qs.is_empty() || area.height == 0 {
+        return;
+    }
+    let title = if qs.len() > 1 {
+        format!("Question · {} of {}", app.q_index + 1, qs.len())
+    } else {
+        "Question".to_string()
+    };
+    let block = card_block("?", title, accent(), border2());
+    frame.render_widget(
+        Paragraph::new(question_lines(app, area.width as usize)).block(block),
+        area,
+    );
 }
 
 /// The compact "📎 N attachments" summary shown above the prompt when files are
