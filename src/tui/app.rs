@@ -233,6 +233,10 @@ pub(crate) struct App {
     pub(crate) q_sel: usize,
     pub(crate) q_answers: Vec<(String, String)>,
     pub(crate) q_token: String,
+    /// Ticked options of the current multi-choice question.
+    pub(crate) q_multi: std::collections::BTreeSet<usize>,
+    /// Every question answered: showing the review before sending.
+    pub(crate) q_review: bool,
     /// Live text the running agent is streaming this turn. Shared with the agent
     /// task; rendered as a transient block at the transcript tail and cleared
     /// whenever a newer persisted state loads (the turn has committed).
@@ -355,6 +359,8 @@ impl App {
             q_index: 0,
             q_sel: 0,
             q_answers: Vec::new(),
+            q_multi: Default::default(),
+            q_review: false,
             q_token: String::new(),
             stream: crate::llm::StreamHandle::default(),
             sidecar: None,
@@ -501,40 +507,84 @@ impl App {
         if qs.is_empty() {
             return;
         }
+        if self.q_review {
+            self.send_answers(&qs);
+            return;
+        }
         let idx = self.q_index.min(qs.len() - 1);
         let question = &qs[idx];
         let opts = q_options(question);
 
-        let answer = if opts.is_empty() {
-            let typed = self.message_for_send();
-            let typed = typed.trim().to_string();
-            if typed.is_empty() {
-                self.status = "Type an answer, then press Enter.".to_string();
-                return;
-            }
+        // Typing in the box always answers in the user's own words, even on a
+        // choice question.
+        let typed = self.message_for_send().trim().to_string();
+        let answer = if !typed.is_empty() {
             self.input_clear();
             typed
+        } else if opts.is_empty() {
+            self.status = "Type an answer, then press Enter.".to_string();
+            return;
+        } else if q_kind(question) == "multi_choice" {
+            let picked: Vec<String> = opts
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.q_multi.contains(i))
+                .map(|(_, o)| o.answer())
+                .collect();
+            if picked.is_empty() {
+                self.status = "Tick at least one option (Space), or type an answer.".to_string();
+                return;
+            }
+            picked.join(", ")
         } else {
-            opts[self.q_sel.min(opts.len() - 1)].0.clone()
+            opts[self.q_sel.min(opts.len() - 1)].answer()
         };
 
+        self.q_answers.truncate(idx);
         self.q_answers.push((q_text(question), answer));
-        self.q_sel = 0;
-        self.q_index += 1;
+        self.q_index = idx + 1;
 
         if self.q_index >= qs.len() {
-            let combined = if self.q_answers.len() == 1 {
-                self.q_answers[0].1.clone()
+            if qs.len() == 1 {
+                self.send_answers(&qs);
             } else {
-                self.q_answers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (q, a))| format!("{}. {} → {}", i + 1, q, a))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            self.finish_answer(combined);
+                // Several questions: show them all once more before sending.
+                self.q_review = true;
+            }
+        } else {
+            prepare_question(self, &qs);
         }
+    }
+
+    /// Step back to the previous question (or out of the review).
+    pub(crate) fn question_back(&mut self) {
+        let qs = questions_of(self);
+        if self.q_review {
+            self.q_review = false;
+            self.q_index = qs.len().saturating_sub(1);
+        } else if self.q_index > 0 {
+            self.q_index -= 1;
+        } else {
+            return;
+        }
+        self.q_answers.truncate(self.q_index);
+        prepare_question(self, &qs);
+    }
+
+    fn send_answers(&mut self, qs: &[serde_json::Value]) {
+        let combined = if self.q_answers.len() == 1 {
+            self.q_answers[0].1.clone()
+        } else {
+            self.q_answers
+                .iter()
+                .enumerate()
+                .map(|(i, (q, a))| format!("{}. {} → {}", i + 1, q, a))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let _ = qs;
+        self.q_review = false;
+        self.finish_answer(combined);
     }
 
     /// Send a completed answer set into the live loop and reset picker state.
@@ -611,6 +661,12 @@ impl App {
         self.apply_pending_session_op().await;
         self.apply_pending_mission_control().await;
         self.poll_boards();
+        // A new question set is prepared as soon as it arrives (cursor on the
+        // recommended option, recommended multi-choice options ticked), not on
+        // the first keypress.
+        if pending_question_text(self).is_some() {
+            ensure_q_init(self);
+        }
         // If the sidecar dropped, clear attachment so the next spawn can recover.
         if self
             .sidecar_attach

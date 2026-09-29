@@ -254,9 +254,13 @@ fn ask_user_tool() -> NativeToolDefinition {
             Ends the turn and pauses until answered; one pending question set at a time. Each \
             question needs `text` and `answer_kind.kind` chosen by the SHAPE of the answer: \
             free_text (open-ended), single_choice (one of a known set; provide `choices`), \
-            yes_no (literal yes/no), or confirm (irreversible action gate). `id` is OPTIONAL — \
-            only useful to distinguish MULTIPLE questions asked together; omit it for a single \
-            question."
+            multi_choice (any number of a known set; provide `choices`), yes_no (literal yes/no), \
+            or confirm (irreversible action gate). Make choices easy to decide: give each a short \
+            `label` and a one-line `description` of what it means or costs, and mark the one you \
+            would pick with `recommended: true`. The user can always write their own answer \
+            instead. When asking SEVERAL questions together, give each a `header` of one or two \
+            words (shown as its tab). `id` is OPTIONAL — only useful to distinguish multiple \
+            questions; omit it for a single question."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -270,23 +274,25 @@ fn ask_user_tool() -> NativeToolDefinition {
                         "properties": {
                             "id": {"type": "string", "description": "OPTIONAL — defaults to the question's index. Only needed to distinguish multiple questions asked together; if you provide ids they must be unique."},
                             "text": {"type": "string", "description": "Question text shown to the user."},
+                            "header": {"type": "string", "description": "OPTIONAL — one or two words naming the question (at most 16 characters), shown as its tab when several questions are asked together."},
                             "answer_kind": {
                                 "type": "object",
                                 "properties": {
                                     "kind": {
                                         "type": "string",
-                                        "enum": ["free_text", "single_choice", "yes_no", "confirm"],
+                                        "enum": ["free_text", "single_choice", "multi_choice", "yes_no", "confirm"],
                                         "description": "Discriminator selecting the answer shape."
                                     },
                                     "choices": {
                                         "type": "array",
-                                        "description": "single_choice: REQUIRED options, ordered by likelihood. Each has a `value` and a `label`.",
+                                        "description": "single_choice / multi_choice: REQUIRED options, ordered by likelihood. Each has a `value` and a short `label`.",
                                         "items": {
                                             "type": "object",
                                             "properties": {
                                                 "value": {"type": "string"},
-                                                "label": {"type": "string"},
-                                                "description": {"type": "string"}
+                                                "label": {"type": "string", "description": "A few words."},
+                                                "description": {"type": "string", "description": "One line on what choosing this means or costs."},
+                                                "recommended": {"type": "boolean", "description": "The option you would pick; shown first and preselected. At most one for single_choice."}
                                             },
                                             "required": ["value", "label"]
                                         }
@@ -507,7 +513,14 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
             .and_then(|k| k.get("kind"))
             .and_then(Value::as_str)
             .ok_or_else(|| format!("ask_user: question `{id}` needs `answer_kind.kind`."))?;
-        if kind == "single_choice" {
+        const KINDS: [&str; 5] = ["free_text", "single_choice", "multi_choice", "yes_no", "confirm"];
+        if !KINDS.contains(&kind) {
+            return Err(format!(
+                "ask_user: question `{id}` has unknown answer kind `{kind}`; use one of {}.",
+                KINDS.join(", ")
+            ));
+        }
+        if kind == "single_choice" || kind == "multi_choice" {
             let has_choices = question
                 .get("answer_kind")
                 .and_then(|k| k.get("choices"))
@@ -516,7 +529,7 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
                 .unwrap_or(false);
             if !has_choices {
                 return Err(format!(
-                    "ask_user: question `{id}` is single_choice and requires non-empty `choices`."
+                    "ask_user: question `{id}` is {kind} and requires non-empty `choices`."
                 ));
             }
         }
@@ -524,6 +537,15 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
         let mut q = question.clone();
         if let Some(obj) = q.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id));
+            // A header is a tab label: keep it short whatever the model sent.
+            if let Some(h) = obj.get("header").and_then(Value::as_str) {
+                let h: String = h.trim().chars().take(16).collect();
+                if h.is_empty() {
+                    obj.remove("header");
+                } else {
+                    obj.insert("header".to_string(), Value::String(h));
+                }
+            }
         }
         out.push(q);
     }
@@ -537,6 +559,35 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_user_accepts_multi_choice_and_trims_headers() {
+        let parsed = parse_ask_user(&json!({
+            "questions": [
+                {"text": "Which targets?", "header": "   Build targets for release   ",
+                 "answer_kind": {"kind": "multi_choice", "choices": [
+                     {"value": "android", "label": "Android", "recommended": true},
+                     {"value": "macos", "label": "macOS"}]}},
+                {"text": "Ship now?", "header": "  ", "answer_kind": {"kind": "yes_no"}}
+            ]
+        }))
+        .expect("valid");
+        let qs = parsed["questions"].as_array().unwrap();
+        assert_eq!(qs[0]["header"], "Build targets fo");
+        assert!(qs[1].get("header").is_none());
+    }
+
+    #[test]
+    fn ask_user_rejects_multi_choice_without_choices_and_unknown_kinds() {
+        let err = parse_ask_user(&json!({"questions": [
+            {"text": "Pick", "answer_kind": {"kind": "multi_choice"}}]}))
+        .unwrap_err();
+        assert!(err.contains("multi_choice"));
+        let err = parse_ask_user(&json!({"questions": [
+            {"text": "Pick", "answer_kind": {"kind": "slider"}}]}))
+        .unwrap_err();
+        assert!(err.contains("unknown answer kind"));
+    }
 
     #[test]
     fn test_parse_delegate_brief_with_agent() {

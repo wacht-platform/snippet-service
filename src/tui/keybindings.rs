@@ -765,30 +765,65 @@ pub(crate) fn handle_question_key(app: &mut App, key: KeyEvent) -> bool {
     }
     ensure_q_init(app);
     let qs = questions_of(app);
+    if app.q_review {
+        return match key.code {
+            KeyCode::Enter => {
+                app.answer_current_question();
+                true
+            }
+            KeyCode::Left | KeyCode::Backspace => {
+                app.question_back();
+                true
+            }
+            KeyCode::Esc => false,
+            _ => true,
+        };
+    }
     let q = qs.get(app.q_index.min(qs.len().saturating_sub(1))).cloned();
     let opts = q.as_ref().map(q_options).unwrap_or_default();
     let is_choice = !opts.is_empty();
+    let multi = q.as_ref().is_some_and(|q| q_kind(q) == "multi_choice");
+    // Shortcuts only while the box is empty; once typing starts, keys type.
+    let empty = app.input.is_empty();
 
     match key.code {
         KeyCode::Up if is_choice => {
-            app.q_sel = if app.q_sel == 0 {
-                opts.len() - 1
-            } else {
-                app.q_sel - 1
-            };
+            app.q_sel = if app.q_sel == 0 { opts.len() - 1 } else { app.q_sel - 1 };
             true
         }
         KeyCode::Down if is_choice => {
             app.q_sel = (app.q_sel + 1) % opts.len();
             true
         }
+        KeyCode::Char(c @ '1'..='9') if is_choice && empty => {
+            let i = c as usize - '1' as usize;
+            if i < opts.len() {
+                app.q_sel = i;
+                if multi {
+                    if !app.q_multi.remove(&i) {
+                        app.q_multi.insert(i);
+                    }
+                } else {
+                    app.answer_current_question();
+                }
+            }
+            true
+        }
+        KeyCode::Char(' ') if multi && empty => {
+            let i = app.q_sel.min(opts.len() - 1);
+            if !app.q_multi.remove(&i) {
+                app.q_multi.insert(i);
+            }
+            true
+        }
+        KeyCode::Left if empty && app.q_index > 0 => {
+            app.question_back();
+            true
+        }
         KeyCode::Enter => {
             app.answer_current_question();
             true
         }
-        // Swallow stray typing while a pure picker is focused; let Esc through to
-        // the normal interrupt path.
-        KeyCode::Char(_) | KeyCode::Backspace if is_choice => true,
         _ => false,
     }
 }
