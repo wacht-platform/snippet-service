@@ -21,7 +21,7 @@ use crate::tools::{ToolContext, ToolError, ToolRegistry};
 use crate::watches::{WatchEvent, WatchManager, WatchRecord};
 
 /// Consecutive tool-call turns with no real work before the run is wrapped up.
-const MAX_UNPRODUCTIVE_TURNS: usize = 4;
+const MAX_UNPRODUCTIVE_TURNS: usize = 10;
 
 /// Consecutive plan-only turns before raising a `PlanOnly` nudge.
 const PLAN_LOOP_AT: usize = 3;
