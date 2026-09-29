@@ -223,6 +223,26 @@ impl App {
         }
     }
 
+    /// Whether the active conversation already exists. Sessions live in the
+    /// store, most with no state file, so the file is only one of the signals:
+    /// the daemon's catalog and the store itself are the inventory.
+    pub(crate) fn session_known(&self) -> bool {
+        if self.active_state_path.exists() {
+            return true;
+        }
+        let id = crate::session::session_id_for_state_path(&self.active_state_path);
+        if self
+            .daemon_sessions
+            .as_ref()
+            .is_some_and(|rows| rows.iter().any(|s| s.id == id))
+        {
+            return true;
+        }
+        crate::session::list_device_sessions()
+            .iter()
+            .any(|s| s.id == id)
+    }
+
     /// The conversation this workspace was last used in.
     ///
     /// Read from the store, which is the only inventory: a filesystem walk would
@@ -372,8 +392,10 @@ impl App {
         }
         // No daemon catalog yet: build the same list straight from the store, so
         // the picker shows real sessions instead of an empty directory walk.
+        let folder = self.options.config.workspace.clone();
         let mut list: Vec<(String, String, i64)> = crate::session::list_device_sessions()
             .into_iter()
+            .filter(|s| s.folder == folder)
             .filter(|s| {
                 if s.conversation.is_empty() {
                     return false;
@@ -742,7 +764,7 @@ impl App {
                             self.status = "Agent is already running.".to_string();
                             return;
                         }
-                        if !self.active_state_path.exists() {
+                        if !self.session_known() {
                             if let Some(last_active) = self.find_last_active_conversation() {
                                 self.switch_conversation(&last_active);
                             }
@@ -750,7 +772,7 @@ impl App {
                     }
                 }
 
-                if self.active_state_path.exists() {
+                if self.session_known() {
                     self.spawn_loop(None, true);
                 } else {
                     self.status =

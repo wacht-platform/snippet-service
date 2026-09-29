@@ -929,10 +929,11 @@ impl App {
             return;
         };
 
-        // Existing state file → attach by path (daemon ensure_live resumes it).
-        // Brand-new conversation with no file yet → POST /sessions new_conversation
-        // so the daemon creates the conversations/<uuid>.json the TUI expects.
-        if !self.active_state_path.exists() {
+        // A known session (state file, catalog or store) → attach by path and the
+        // daemon resumes it. Only a genuinely new conversation is created with
+        // POST /sessions; treating a stored session as new is what started a
+        // fresh chat instead of resuming the one picked.
+        if !self.session_known() {
             let folder = self.options.config.workspace.clone();
             let new_conversation = self.active_conversation != "default";
             match crate::serve::sidecar::open_session(
@@ -974,8 +975,9 @@ impl App {
                 self.agent = None;
             }
             Err(error) => {
-                // State may exist but daemon can't resolve id yet — open then re-attach.
-                if self.active_state_path.exists() {
+                // The session exists but the daemon can't resolve it yet — open
+                // then re-attach.
+                if self.session_known() {
                     let folder = self.options.config.workspace.clone();
                     let _ = crate::serve::sidecar::open_session(&info, &folder, true, false).await;
                     if let Ok(attach) =
