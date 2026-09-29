@@ -375,7 +375,7 @@ fn ask_user_picker_shows_recommended_multi_choice_tabs_and_review() {
     let review = snapshot_app(&mut app, 100, 40).join("\n");
     for row in review.lines() { println!("|{row}|"); }
     assert!(review.contains("Check your answers"));
-    assert!(review.contains("Android (android), macOS (macos)"));
+    assert!(review.contains("Android, macOS"));
     assert!(review.contains("Publish (confirm)"));
 }
 
