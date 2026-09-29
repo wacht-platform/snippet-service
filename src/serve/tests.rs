@@ -365,6 +365,203 @@ use super::*;
         assert_eq!(tail[0].sequence, 2);
     }
 
+    // -- Board wake routing and dispatch waits --------------------------------
+
+    fn board_event(
+        event_type: &str,
+        actor: (&str, &str),
+        payload: serde_json::Value,
+    ) -> crate::coordination::types::CoordinationEvent {
+        crate::coordination::types::CoordinationEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: "task:t1".into(),
+            partition_key: "thread:task:t1".into(),
+            sequence: 1,
+            event_type: event_type.into(),
+            actor_kind: actor.0.into(),
+            actor_id: actor.1.into(),
+            payload_version: 1,
+            payload,
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn member(agent_id: &str, status: &str) -> crate::coordination::TaskAgent {
+        crate::coordination::TaskAgent {
+            task_id: "t1".into(),
+            agent_id: agent_id.into(),
+            work_session_id: None,
+            scope: String::new(),
+            status: status.into(),
+            role: "implementer".into(),
+            added_at: "2026-01-01T00:00:00Z".into(),
+            removed_at: None,
+        }
+    }
+
+    fn room() -> Vec<(String, String)> {
+        vec![
+            ("mission-control".into(), "agent".into()),
+            ("snippet".into(), "agent".into()),
+            ("reviewer".into(), "agent".into()),
+        ]
+    }
+
+    fn sessions(targets: &[coordination::WakeTarget]) -> Vec<&str> {
+        targets.iter().map(|t| t.session.as_str()).collect()
+    }
+
+    /// A worker session posting to its own task room must not be handed its own
+    /// message back: the default worker's active seat resolves to that session.
+    #[test]
+    fn a_post_never_wakes_the_session_it_came_from() {
+        let event = board_event(
+            "message.posted",
+            ("session", "work-1"),
+            serde_json::json!({"body": "progress", "origin_session": "work-1"}),
+        );
+        let roster = [member("snippet", "active"), member("reviewer", "waiting")];
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        assert_eq!(sessions(&targets), ["mission-control", "inbox-reviewer"]);
+    }
+
+    #[test]
+    fn a_long_agent_exchange_stops_waking_until_a_human_posts() {
+        let roster = [member("snippet", "active"), member("reviewer", "waiting")];
+        let mut history: Vec<_> = (0..coordination::MAX_AGENT_CHAIN - 1)
+            .map(|i| {
+                let who = if i % 2 == 0 { "reviewer" } else { "snippet" };
+                board_event("message.posted", ("agent", who), serde_json::json!({"body": "ok"}))
+            })
+            .collect();
+        let event = board_event(
+            "message.posted",
+            ("agent", "reviewer"),
+            serde_json::json!({"body": "ok"}),
+        );
+        assert!(coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1")).is_empty());
+
+        history.push(board_event(
+            "message.posted",
+            ("human", "local"),
+            serde_json::json!({"body": "go on"}),
+        ));
+        assert!(!coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1")).is_empty());
+    }
+
+    #[test]
+    fn a_lease_transfer_wakes_only_the_incoming_agent() {
+        let event = board_event(
+            "task.lease_transferred",
+            ("agent", "snippet"),
+            serde_json::json!({"body": "yours", "to_agent_id": "reviewer"}),
+        );
+        let roster = [member("snippet", "waiting"), member("reviewer", "active")];
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        assert_eq!(sessions(&targets), ["work-1"]);
+    }
+
+    /// Reports and worker messages reach Mission Control as task notifications,
+    /// so the room post must not wake it a second time.
+    #[test]
+    fn notified_events_do_not_wake_mission_control_twice() {
+        let event = board_event(
+            "task.reported",
+            ("agent", "snippet"),
+            serde_json::json!({"body": "done"}),
+        );
+        let roster = [member("snippet", "active"), member("reviewer", "waiting")];
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        assert_eq!(sessions(&targets), ["inbox-reviewer"]);
+    }
+
+    #[test]
+    fn removed_members_and_quiet_events_wake_no_one() {
+        let event = board_event(
+            "message.posted",
+            ("agent", "snippet"),
+            serde_json::json!({"body": "hi"}),
+        );
+        let mut gone = member("reviewer", "waiting");
+        gone.removed_at = Some("2026-01-02T00:00:00Z".into());
+        let roster = [member("snippet", "active"), gone];
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        assert_eq!(sessions(&targets), ["mission-control"]);
+
+        let assigned = board_event(
+            "task.agent_assigned",
+            ("agent", "mission-control"),
+            serde_json::json!({}),
+        );
+        assert!(coordination::wake_targets(&assigned, &[], &room(), &roster, Some("work-1")).is_empty());
+    }
+
+    fn queued_task(id: &str, paths: &[&str]) -> crate::coordination::Task {
+        crate::coordination::Task::dispatched_to(
+            id.into(),
+            "work-1".into(),
+            id.into(),
+            "do it".into(),
+            paths.iter().map(PathBuf::from).collect(),
+            crate::coordination::HandoffMode::Resume,
+            "agent",
+            "mission-control",
+            "2026-01-01T00:00:00Z".into(),
+        )
+    }
+
+    /// Waiting on another task's paths keeps the task queued, reports it once,
+    /// and writes no `blocks` edge that could outlive the conflict.
+    #[tokio::test]
+    async fn a_path_conflict_waits_in_the_queue_without_a_dependency() {
+        let d = test_daemon();
+        let mut owner = queued_task("owner", &["/w/src"]);
+        owner.status = crate::coordination::TaskStatus::InProgress;
+        d.store.create_task(&owner).unwrap();
+        d.store.create_task(&queued_task("waiter", &["/w/src"])).unwrap();
+
+        for _ in 0..3 {
+            let task = mission_control::dispatch_mission_task(&d, "waiter").await.unwrap();
+            assert_eq!(task.status, crate::coordination::TaskStatus::Todo);
+        }
+        let waiter = d.store.get_task("waiter").unwrap().unwrap();
+        assert_eq!(waiter.notifications.len(), 1, "reported once, not every tick");
+        assert!(d.store.blockers_of("waiter").unwrap().is_empty());
+    }
+
+    /// A failed dependency parks its dependent once. It used to re-queue it every
+    /// tick, where dispatch blocked it again and messaged Mission Control.
+    #[tokio::test]
+    async fn a_failed_dependency_parks_its_dependent_once() {
+        let d = test_daemon();
+        d.store.create_task(&queued_task("first", &["/w/a"])).unwrap();
+        d.store.create_task(&queued_task("second", &["/w/b"])).unwrap();
+        d.store
+            .link_tasks(&crate::coordination::TaskLink {
+                from_task_id: "first".into(),
+                to_task_id: "second".into(),
+                kind: crate::coordination::TaskLinkKind::Blocks,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        d.store
+            .complete_task(
+                "first",
+                crate::coordination::TaskStatus::Failed,
+                crate::coordination::TaskResult::default(),
+                "2026-01-01T00:00:01Z",
+            )
+            .unwrap();
+
+        let parked = mission_control::dispatch_mission_task(&d, "second").await.unwrap();
+        assert_eq!(parked.status, crate::coordination::TaskStatus::Blocked);
+        assert!(parked.notifications[0].message.contains("first is failed"));
+        assert!(d.store.unblock_ready_tasks("2026-01-01T00:00:02Z").unwrap().is_empty());
+    }
+
     // -- Coordination visibility routes -------------------------------------
 
 

@@ -714,6 +714,104 @@ pub(super) fn should_wake_mission_control(actor_id: &str) -> bool {
     actor_id != crate::mission_control::SESSION_ID
 }
 
+/// Consecutive agent-to-agent messages after which a room stops waking anyone
+/// until a human posts. Without it two agents can answer each other forever.
+pub(super) const MAX_AGENT_CHAIN: usize = 8;
+
+/// Events that are recorded on the room but are not worth a turn for anyone.
+const QUIET_EVENTS: &[&str] = &["task.agent_assigned", "task.dispatched"];
+
+/// Events Mission Control already receives as a task notification; waking it
+/// for the room post as well would deliver the same news twice.
+const NOTIFIED_EVENTS: &[&str] = &["task.reported", "task.message"];
+
+/// One session a board event should wake. `inbox_agent` is set when the
+/// session is that agent's inbox, which may need creating first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct WakeTarget {
+    pub session: String,
+    pub inbox_agent: Option<String>,
+}
+
+/// Whether the room's tail is an agent-only exchange long enough to stop.
+fn agent_chain_exhausted(history: &[CoordinationEvent], event: &CoordinationEvent) -> bool {
+    let tail: Vec<&CoordinationEvent> = history
+        .iter()
+        .chain(std::iter::once(event))
+        .rev()
+        .take_while(|e| e.actor_kind != "human")
+        .collect();
+    let mut actors: Vec<&str> = tail.iter().map(|e| e.actor_id.as_str()).collect();
+    actors.sort();
+    actors.dedup();
+    tail.len() >= MAX_AGENT_CHAIN && actors.len() >= 2
+}
+
+/// The sessions a board event wakes. Pure, so the routing rules are testable.
+///
+/// Never the session the event came from: a worker posting to its own task
+/// room used to be handed its own message back as a new turn.
+pub(super) fn wake_targets(
+    event: &CoordinationEvent,
+    history: &[CoordinationEvent],
+    participants: &[(String, String)],
+    roster: &[crate::coordination::TaskAgent],
+    task_session: Option<&str>,
+) -> Vec<WakeTarget> {
+    let mc = crate::mission_control::SESSION_ID;
+    if QUIET_EVENTS.contains(&event.event_type.as_str()) || agent_chain_exhausted(history, event) {
+        return Vec::new();
+    }
+    let mut targets: Vec<WakeTarget> = Vec::new();
+    if participants.is_empty() {
+        if should_wake_mission_control(&event.actor_id) {
+            targets.push(WakeTarget { session: mc.to_string(), inbox_agent: None });
+        }
+        return targets;
+    }
+    let lease_to = (event.event_type == "task.lease_transferred")
+        .then(|| event.payload.get("to_agent_id").and_then(|v| v.as_str()))
+        .flatten();
+    for (actor_id, actor_kind) in participants {
+        if *actor_id == event.actor_id || lease_to.is_some_and(|to| to != actor_id) {
+            continue;
+        }
+        if actor_id == mc || actor_kind == "system" {
+            if !NOTIFIED_EVENTS.contains(&event.event_type.as_str()) {
+                targets.push(WakeTarget { session: mc.to_string(), inbox_agent: None });
+            }
+            continue;
+        }
+        if actor_kind != "agent" {
+            continue;
+        }
+        let member = roster.iter().find(|m| m.agent_id == *actor_id);
+        if member.is_some_and(|m| m.removed_at.is_some()) {
+            continue;
+        }
+        let working = member
+            .filter(|m| m.status == "active")
+            .and_then(|m| m.work_session_id.clone().or_else(|| task_session.map(str::to_string)))
+            .filter(|session| !session.is_empty());
+        targets.push(match working {
+            Some(session) => WakeTarget { session, inbox_agent: None },
+            None => WakeTarget {
+                session: crate::session::inbox_session_id(actor_id),
+                inbox_agent: Some(actor_id.clone()),
+            },
+        });
+    }
+    let origin = event.payload.get("origin_session").and_then(|v| v.as_str());
+    let from_session = (event.actor_kind == "session").then_some(event.actor_id.as_str());
+    let mut seen = std::collections::HashSet::new();
+    targets.retain(|t| {
+        Some(t.session.as_str()) != origin
+            && Some(t.session.as_str()) != from_session
+            && seen.insert(t.session.clone())
+    });
+    targets
+}
+
 pub async fn wake_coordination_thread_participants(
     d: &Shared,
     saved: &CoordinationEvent,
@@ -733,60 +831,34 @@ pub async fn wake_coordination_thread_participants(
         .filter(|e| e.sequence < saved.sequence)
         .collect();
     let task = d.store.get_task_by_thread(&saved.thread_id).ok().flatten();
-
-    if participants.is_empty() {
-        if should_wake_mission_control(&saved.actor_id) {
-            let daemon = d.clone();
-            let envelope = board_message_envelope_with_task(saved, &history, task.as_ref());
-            tokio::spawn(async move {
-                daemon
-                    .deliver(
-                        crate::mission_control::SESSION_ID,
-                        LoopInput::UserMessage(envelope),
-                    )
-                    .await;
-            });
-        }
+    let roster = task
+        .as_ref()
+        .and_then(|t| d.store.list_task_agents(&t.id).ok())
+        .unwrap_or_default();
+    let targets = wake_targets(
+        saved,
+        &history,
+        &participants,
+        &roster,
+        task.as_ref().map(|t| t.session_id.as_str()),
+    );
+    if targets.is_empty() {
         return;
     }
-
-    for (actor_id, actor_kind) in participants {
-        if actor_id == saved.actor_id {
-            continue;
-        }
-
+    let envelope = board_message_envelope_with_task(saved, &history, task.as_ref());
+    for target in targets {
         let daemon = d.clone();
-        let envelope = board_message_envelope_with_task(saved, &history, task.as_ref());
-
-        if actor_id == crate::mission_control::SESSION_ID || actor_kind == "system" {
-            tokio::spawn(async move {
-                daemon
-                    .deliver(
-                        crate::mission_control::SESSION_ID,
-                        LoopInput::UserMessage(envelope),
-                    )
-                    .await;
-            });
-        } else if actor_kind == "agent" {
-            let target_session = if let Some(ref t) = task {
-                let roster = daemon.store.list_task_agents(&t.id).unwrap_or_default();
-                roster
-                    .iter()
-                    .find(|a| a.agent_id == actor_id && a.status == "active")
-                    .and_then(|a| a.work_session_id.clone().or_else(|| Some(t.session_id.clone())))
-                    .unwrap_or_else(|| crate::session::inbox_session_id(&actor_id))
-            } else {
-                crate::session::inbox_session_id(&actor_id)
-            };
-
-            tokio::spawn(async move {
-                if crate::session::is_inbox_session_id(&target_session) {
-                    let _ = direct::ensure_agent_inbox(&daemon, &actor_id).await;
+        let envelope = envelope.clone();
+        tokio::spawn(async move {
+            if let Some(agent_id) = target.inbox_agent.as_deref() {
+                if let Err(error) = direct::ensure_agent_inbox(&daemon, agent_id).await {
+                    eprintln!("[coordination] no inbox for `{agent_id}`: {error}");
+                    return;
                 }
-                daemon
-                    .deliver(&target_session, LoopInput::UserMessage(envelope))
-                    .await;
-            });
-        }
+            }
+            daemon
+                .deliver(&target.session, LoopInput::UserMessage(envelope))
+                .await;
+        });
     }
 }

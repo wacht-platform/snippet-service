@@ -91,8 +91,8 @@ pub struct Task {
     pub result: Option<TaskResult>,
     /// Pending / undelivered notification markers for Mission Control.
     pub notifications: Vec<NotificationMarker>,
-    /// Workspace paths this task is *currently* writing to, for ownership
-    /// conflict detection.
+    /// Workspace paths this task writes to. Held only while `InProgress`, so a
+    /// blocked or retried task keeps its claim without locking anyone out.
     pub owned_paths: Vec<std::path::PathBuf>,
     /// Inference profile the target session should run on, when the dispatcher
     /// named one. A model is bound when a session's loop starts, so this is
@@ -160,6 +160,20 @@ pub struct NotificationMarker {
 /// Create a task's initial dispatch state in one value, so a caller cannot
 /// forget `handoff_mode` and leave delivery semantics unset.
 impl Task {
+    /// Queue a notice for Mission Control unless the same one is already on the
+    /// task, so a condition that persists across ticks is reported once.
+    pub fn notify_once(&mut self, kind: &str, message: &str) {
+        if self.notifications.iter().any(|n| n.kind == kind && n.message == message) {
+            return;
+        }
+        self.notifications.push(NotificationMarker {
+            target: "mission_control".into(),
+            kind: kind.into(),
+            message: message.into(),
+            delivered: false,
+        });
+    }
+
     /// The message room for a task, derived from its id so the two can never
     /// drift. Every participant on the task — agents and the human — reads and
     /// posts to exactly this thread.
@@ -689,7 +703,6 @@ impl Store {
             task.status = TaskStatus::Todo;
             task.dispatch_failures = 0;
             task.reporting_session = None;
-            task.owned_paths.clear();
             task.notifications.push(NotificationMarker {
                 target: "mission_control".into(),
                 kind: "info".into(),
@@ -706,8 +719,11 @@ impl Store {
         Ok(task)
     }
 
-    /// Return every `Blocked` task whose dependencies are all terminal back to
+    /// Return every `Blocked` task whose dependencies are all `Done` back to
     /// `Todo`, so the dispatch loop can pick them up. Returns the ids re-queued.
+    ///
+    /// A failed or cancelled dependency does not release its dependents: dispatch
+    /// would only block them again, every tick. They wait for a retry or cancel.
     ///
     /// Tasks parked by the dispatch retry ceiling are excluded: they are blocked
     /// with no dependencies, and re-queuing them would spin the loop forever.
@@ -730,7 +746,7 @@ impl Store {
                 self.get_task(id)
                     .ok()
                     .flatten()
-                    .is_some_and(|other| other.status.is_terminal())
+                    .is_some_and(|other| other.status == TaskStatus::Done)
             });
             if !all_done {
                 continue;
@@ -1151,7 +1167,6 @@ impl Store {
                     }
                     t.status = TaskStatus::Blocked;
                     t.reporting_session = None;
-                    t.owned_paths.clear();
                     t.notifications.push(NotificationMarker {
                         target: "mission_control".into(),
                         kind: "blocked".into(),
