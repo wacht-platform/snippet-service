@@ -1,8 +1,98 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Where a new session works: an isolated git worktree of the folder, or the
+/// folder itself. Always chosen by the caller; there is no implicit default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    Worktree,
+    Folder,
+}
+
+/// The workspace for a new session in `folder`. A worktree needs a git repo;
+/// anywhere else the folder itself is used.
+pub fn session_workspace(folder: &Path, mode: WorkspaceMode) -> PathBuf {
+    match mode {
+        WorkspaceMode::Worktree => prepare_new_session_workspace(folder),
+        WorkspaceMode::Folder => folder.to_path_buf(),
+    }
+}
+
 pub fn prepare_new_session_workspace(folder: &Path) -> PathBuf {
     try_session_worktree(folder).unwrap_or_else(|| folder.to_path_buf())
+}
+
+/// The folder a linked worktree was made from, and the branch it has out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeOrigin {
+    /// The same place in the main checkout: the repository root plus the
+    /// workspace's path inside the worktree.
+    pub folder: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// Where a workspace inside a linked worktree comes from, read from git's own
+/// files so a session list can ask for every row without running git.
+pub fn worktree_origin(folder: &Path) -> Option<WorktreeOrigin> {
+    let root = linked_worktree_root(folder)?;
+    let pointer = std::fs::read_to_string(root.join(".git")).ok()?;
+    let gitdir = PathBuf::from(pointer.trim().strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_absolute() { gitdir } else { root.join(gitdir) };
+    // `<repo>/.git/worktrees/<name>`; a submodule's pointer names
+    // `.git/modules/…` instead and is not a worktree.
+    let worktrees = gitdir.parent()?;
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let repo = worktrees.parent()?.parent()?;
+    let inside = folder.strip_prefix(&root).unwrap_or(Path::new(""));
+    let branch = std::fs::read_to_string(gitdir.join("HEAD"))
+        .ok()
+        .and_then(|head| {
+            head.trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string)
+        });
+    Some(WorktreeOrigin {
+        folder: repo.join(inside),
+        branch,
+    })
+}
+
+/// One checkout of a repository.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// A repository's main checkout and its linked worktrees, for the folder a new
+/// session is being started in. `None` outside a git repository.
+pub fn repo_worktrees(folder: &Path) -> Option<(PathBuf, Vec<Worktree>)> {
+    let listing = git_stdout(folder, &["worktree", "list", "--porcelain"])?;
+    let mut all = Vec::new();
+    for block in listing.split("\n\n") {
+        let mut path = None;
+        let mut branch = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(b.to_string());
+            }
+        }
+        if let Some(path) = path {
+            all.push(Worktree { path, branch });
+        }
+    }
+    if all.is_empty() {
+        return None;
+    }
+    let main = all.remove(0);
+    // Worktrees whose directory is gone are listed by git until pruned.
+    all.retain(|w| w.path.is_dir());
+    Some((main.path, all))
 }
 
 pub(crate) fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
@@ -95,6 +185,13 @@ pub(crate) fn drop_session_worktree(folder: &Path) {
     let Some(worktree) = linked_worktree_root(&folder) else {
         return;
     };
+    // Only worktrees snippet made. A session started in a person's own
+    // worktree must never delete it.
+    let root = crate::config::worktrees_root();
+    let root = root.canonicalize().unwrap_or(root);
+    if !worktree.starts_with(&root) {
+        return;
+    }
     if let Some(common) = git_stdout(&worktree, &["rev-parse", "--git-common-dir"]) {
         let common_path = PathBuf::from(&common);
         let common_path = if common_path.is_absolute() {

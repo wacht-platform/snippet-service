@@ -26,7 +26,7 @@ use crate::config::{InferenceProfileConfig, SnippetConfig, save_config, workspac
 use crate::harness::{HarnessEvent, LoopInput};
 use crate::mission_control as mc;
 use crate::session::{
-    list_device_sessions, prepare_new_session_workspace,
+    list_device_sessions,
     read_session_profile, read_session_sidecar, read_session_meta, read_session_state, read_session_state_tail, replay_notification_events,
     session_id_for_state_path, start_session_with_browser_summary,
     state_path_for_id, subscribe_device_events, write_session_profile,
@@ -792,6 +792,7 @@ pub async fn run_serve(
         .route("/session/exec", post(exec_in_session))
         .route("/session/delete", post(delete_session))
         .route("/session/rename", post(rename_session))
+        .route("/git/worktrees", get(git_worktrees))
         .route("/git/status", post(git_status))
         .route("/git/diff", post(git_diff))
         .route("/git/log", post(git_log))
@@ -1111,8 +1112,9 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
         return unauthorized();
     }
     let mut sessions = list_device_sessions();
+    // A folder's sessions include those in worktrees made from it.
     if let Some(folder) = q.folder.as_deref().filter(|f| !f.is_empty()) {
-        sessions.retain(|s| s.folder == folder);
+        sessions.retain(|s| s.folder == folder || s.origin_folder.as_deref() == Some(folder));
     }
     if let Some(n) = q.limit {
         sessions.truncate(n);
@@ -1236,6 +1238,9 @@ struct OpenReq {
     /// conversations, like the TUI — the existing ones are left untouched.
     #[serde(default)]
     new_conversation: bool,
+    /// Work in a new git worktree of the folder, or in the folder itself.
+    /// Required: where a session's edits land is the caller's choice.
+    workspace: crate::session::WorkspaceMode,
 }
 fn default_true() -> bool {
     true
@@ -1250,25 +1255,11 @@ async fn open_session(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let mut folder = PathBuf::from(&req.folder);
+    let folder = PathBuf::from(&req.folder);
     if !folder.is_dir() {
         return (StatusCode::BAD_REQUEST, "not a directory").into_response();
     }
-    // Git repos get an isolated worktree for any NEW session (first open of
-    // this folder, or an explicit new conversation). Resume of an existing
-    // chat stays in its original folder so old sessions are untouched.
-    let original_state = {
-        let c = d.config.lock().unwrap();
-        c.for_workspace(folder.clone()).state_path
-    };
-    // A session lives in the store, so `state_path.exists()` alone reports
-    // "new" for every migrated workspace — which created a second worktree and
-    // a second session beside the real one.
-    let has_existing =
-        original_state.exists() || crate::session::store_default_session_id(&folder).is_some();
-    if req.new_conversation || !has_existing {
-        folder = prepare_new_session_workspace(&folder);
-    }
+    let folder = crate::session::session_workspace(&folder, req.workspace);
     let base_state = {
         let c = d.config.lock().unwrap();
         c.for_workspace(folder.clone()).state_path

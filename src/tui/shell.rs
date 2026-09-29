@@ -152,40 +152,18 @@ fn status_dot(status: &str) -> Span<'static> {
     Span::styled(glyph, Style::default().fg(color))
 }
 
-pub(crate) fn sidebar_rows(app: &App) -> Vec<(String, String, String, String)> {
-    let Some(rows) = app.daemon_sessions.as_ref() else {
-        return app
-            .list_conversations()
-            .into_iter()
-            .map(|(name, desc)| (name, desc, String::new(), String::new()))
-            .collect();
-    };
-    let mut rows: Vec<_> = rows
-        .iter()
-        .filter(|s| !s.conversation.is_empty())
-        .filter(|s| s.conversation != "default" || !s.title.trim().is_empty())
-        .collect();
-    rows.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-    rows.into_iter()
-        .map(|s| {
-            let title = if s.title.trim().is_empty() {
-                "Untitled".to_string()
-            } else {
-                s.title.trim().to_string()
-            };
-            (s.conversation.clone(), title, s.status.clone(), compact_age(s.last_active))
-        })
-        .collect()
+pub(crate) fn sidebar_rows(app: &App) -> Vec<crate::tui::commands::Conversation> {
+    app.list_conversations()
 }
 
 pub(crate) fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     fill(frame, area, surface1());
     let inner = Rect { x: area.x + 1, width: area.width.saturating_sub(2), ..area };
     let focused = app.shell.focus == Focus::Sidebar;
+    // Named by the home folder, so a worktree session reads as part of the
+    // project it was made from.
     let folder = app
-        .options
-        .config
-        .workspace
+        .home_folder()
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace")
@@ -204,10 +182,16 @@ pub(crate) fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
     let w = inner.width as usize;
     let visible = inner.height.saturating_sub(4) as usize;
     let start = app.shell.sidebar_index.saturating_sub(visible.saturating_sub(1));
-    for (i, (name, title, status, age)) in rows.iter().enumerate().skip(start).take(visible) {
-        let active = *name == app.active_conversation;
+    for (i, row) in rows.iter().enumerate().skip(start).take(visible) {
+        let active = app.is_active(row);
         let selected = focused && i == app.shell.sidebar_index;
         let bg = if selected { surface3() } else if active { surface2() } else { surface1() };
+        let age = compact_age(row.last_active);
+        let title = match &row.branch {
+            Some(branch) => format!("{} ⎇ {branch}", row.title),
+            None => row.title.clone(),
+        };
+        let status = &row.status;
         let title_w = w.saturating_sub(4 + age.chars().count() + 1);
         let title_style = if active {
             Style::default().fg(text()).add_modifier(Modifier::BOLD)
@@ -219,7 +203,7 @@ pub(crate) fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
                 Span::styled(if active { "▍" } else { " " }, Style::default().fg(accent())),
                 status_dot(status),
                 Span::raw(" "),
-                Span::styled(pad(title, title_w), title_style),
+                Span::styled(pad(&title, title_w), title_style),
                 Span::raw(" "),
                 Span::styled(age.clone(), Style::default().fg(faint())),
             ])
@@ -632,10 +616,8 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
                     app.shell.sidebar = Some(true);
                     app.shell.focus = Focus::Sidebar;
                     let rows = sidebar_rows(app);
-                    app.shell.sidebar_index = rows
-                        .iter()
-                        .position(|(name, ..)| *name == app.active_conversation)
-                        .unwrap_or(0);
+                    app.shell.sidebar_index =
+                        rows.iter().position(|c| app.is_active(c)).unwrap_or(0);
                 }
                 return true;
             }
@@ -666,10 +648,10 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
                     app.shell.sidebar_index = (app.shell.sidebar_index + 1).min(rows.len().saturating_sub(1))
                 }
                 KeyCode::Enter => {
-                    if let Some((name, ..)) = rows.get(app.shell.sidebar_index).cloned() {
+                    if let Some(row) = rows.get(app.shell.sidebar_index).cloned() {
                         app.shell.focus = Focus::Composer;
-                        if name != app.active_conversation {
-                            app.resume_conversation(&name);
+                        if !app.is_active(&row) {
+                            app.open_conversation(&row);
                         }
                     }
                 }

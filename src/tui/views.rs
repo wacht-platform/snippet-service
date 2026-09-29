@@ -623,6 +623,81 @@ pub(crate) fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
 }
 
 
+/// Where a new session works, chosen before it starts in a git repository.
+pub(crate) fn render_new_session(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use crate::tui::commands::NewChoice;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(1)])
+        .split(area);
+    let folder = app
+        .home_folder()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("folder")
+        .to_string();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("✦ > snippet", Style::default().fg(lane()).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  │  New session in {folder}"), Style::default().fg(text())),
+        ])),
+        chunks[0],
+    );
+    let name_of = |path: &std::path::Path| {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut lines = vec![Line::from("")];
+    let mut existing_header = false;
+    for (i, choice) in app.new_choices.iter().enumerate() {
+        let (title, detail) = match choice {
+            NewChoice::Worktree(_) => (
+                "New worktree".to_string(),
+                "its own branch and checkout; other sessions' edits stay apart".to_string(),
+            ),
+            NewChoice::Folder(path) => (
+                format!("This folder ({})", name_of(path)),
+                "work directly in the checkout".to_string(),
+            ),
+            NewChoice::Existing { path, branch } => {
+                if !existing_header {
+                    existing_header = true;
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  Existing worktrees",
+                        Style::default().fg(faint()).add_modifier(Modifier::BOLD),
+                    )));
+                }
+                (
+                    format!("⎇ {}", branch.clone().unwrap_or_else(|| name_of(path))),
+                    path.display().to_string(),
+                )
+            }
+        };
+        let selected = i == app.new_choice_index;
+        let (marker, title_style) = if selected {
+            ("▶ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD))
+        } else {
+            ("  ", Style::default().fg(text()))
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(accent())),
+            Span::styled(format!("{title:<34} "), title_style),
+            Span::styled(detail, Style::default().fg(faint())),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ choose · Enter start · Esc cancel",
+            Style::default().fg(faint()),
+        ))),
+        chunks[2],
+    );
+}
+
 pub(crate) fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     use ratatui::widgets::{Block, BorderType, Borders};
 
@@ -674,22 +749,30 @@ pub(crate) fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect
                 Style::default().fg(faint()),
             )));
         }
-        for (offset, (name, desc)) in convs[start..end].iter().enumerate() {
+        for (offset, c) in convs[start..end].iter().enumerate() {
             let is_selected = start + offset == selected_idx;
+            // A worktree session is marked by its branch, so it reads as part of
+            // this folder yet stays distinguishable from the root's sessions.
+            let (mark, place) = match &c.branch {
+                Some(branch) => ("⎇ ", format!(" · {branch}")),
+                None => ("📁 ", String::new()),
+            };
             let line = if is_selected {
                 Line::from(vec![
-                    Span::styled("▶ 📁 ", Style::default().fg(accent())),
+                    Span::styled(format!("▶ {mark}"), Style::default().fg(accent())),
                     Span::styled(
-                        format!("{:<36} ", name),
+                        format!("{:<36} ", c.name),
                         Style::default().fg(accent()).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(desc.to_string(), subtle()),
+                    Span::styled(c.desc.clone(), subtle()),
+                    Span::styled(place, Style::default().fg(lane())),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled("  📁 ", Style::default().fg(muted())),
-                    Span::styled(format!("{:<36} ", name), Style::default().fg(text())),
-                    Span::styled(desc.to_string(), Style::default().fg(faint())),
+                    Span::styled(format!("  {mark}"), Style::default().fg(muted())),
+                    Span::styled(format!("{:<36} ", c.name), Style::default().fg(text())),
+                    Span::styled(c.desc.clone(), Style::default().fg(faint())),
+                    Span::styled(place, Style::default().fg(lane())),
                 ])
             };
             lines.push(line);

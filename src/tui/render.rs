@@ -111,6 +111,11 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         return;
     }
 
+    if app.screen == Screen::NewSession {
+        render_new_session(frame, area, app);
+        return;
+    }
+
     if app.screen == Screen::RewindCheckpointSelection
         || app.screen == Screen::ForkCheckpointSelection
     {
@@ -223,8 +228,14 @@ pub(crate) fn get_suggestions(app: &App) -> Vec<(String, String)> {
         let convs = app.list_conversations();
         return convs
             .into_iter()
-            .filter(|(name, _)| name.starts_with(query_part))
-            .map(|(name, desc)| (format!("/resume {}", name), desc))
+            .filter(|c| c.name.starts_with(query_part))
+            .map(|c| {
+                let desc = match &c.branch {
+                    Some(branch) => format!("⎇ {branch} {}", c.desc),
+                    None => c.desc,
+                };
+                (format!("/resume {}", c.name), desc)
+            })
             .collect();
     }
 
@@ -699,10 +710,22 @@ pub(crate) fn layout_input(input: &str, cursor: usize, width: usize) -> (Vec<Str
 pub(crate) fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let st = app.state.as_ref();
     let faint_style = Style::default().fg(faint());
-    let folder_name = std::path::Path::new(&app.options.config.workspace)
+    // A worktree reads as its project plus branch, not its generated folder.
+    let origin = crate::session::worktree_origin(&app.options.config.workspace);
+    let project = origin
+        .as_ref()
+        .map(|o| o.folder.clone())
+        .unwrap_or_else(|| app.options.config.workspace.clone());
+    let project = project
         .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
+        .unwrap_or("workspace")
+        .to_string();
+    let folder_name = match origin.and_then(|o| o.branch) {
+        Some(branch) => format!("{project} ⎇ {branch}"),
+        None => project,
+    };
+    let folder_name = folder_name.as_str();
     let model = if app.effective_model.1.is_empty() {
         "no model"
     } else {

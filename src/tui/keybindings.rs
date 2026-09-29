@@ -325,6 +325,38 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.screen == Screen::NewSession {
+        let count = app.new_choices.len().max(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.new_choice_index = (app.new_choice_index + count - 1) % count;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.new_choice_index = (app.new_choice_index + 1) % count;
+            }
+            KeyCode::Enter => {
+                if let Some(choice) = app.new_choices.get(app.new_choice_index).cloned() {
+                    let name = std::mem::take(&mut app.new_session_name);
+                    app.start_new_session(choice, name);
+                }
+            }
+            // Back to the session on screen; with none yet (at launch), the
+            // new session works in the folder.
+            KeyCode::Esc => {
+                if app.session_known() {
+                    app.screen = Screen::Main;
+                    app.status = "New session cancelled.".to_string();
+                } else {
+                    let name = std::mem::take(&mut app.new_session_name);
+                    let home = app.home_folder();
+                    app.start_new_session(crate::tui::commands::NewChoice::Folder(home), name);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if app.screen == Screen::ResumeSelection {
         // Use the snapshot taken when the picker opened (see conv_cache) —
         // re-scanning every session file per keypress made the picker laggy.
@@ -364,9 +396,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Enter => {
                     let idx = app.resume_selected_index.min(convs.len() - 1);
-                    let name = convs[idx].0.clone();
+                    let target = convs[idx].clone();
                     let title = app.resume_rename.take().unwrap_or_default();
-                    app.rename_conversation(&name, title.trim());
+                    app.rename_conversation(&target, title.trim());
                     app.conv_cache = Some(app.list_conversations());
                     let short: String = title.trim().chars().take(40).collect();
                     app.status = if short.is_empty() {
@@ -399,9 +431,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Char('d') => {
                 let idx = app.resume_selected_index.min(convs.len() - 1);
-                let (name, title) = convs[idx].clone();
+                let target = convs[idx].clone();
+                let title = target.title.clone();
                 if app.resume_pending_delete {
-                    app.delete_conversation(&name);
+                    app.delete_conversation(&target);
                     app.conv_cache = Some(app.list_conversations());
                     app.resume_pending_delete = false;
                     let remaining = convs.len() - 1;
@@ -430,12 +463,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 app.resume_pending_delete = false;
                 app.conv_cache = None;
                 let selected_idx = app.resume_selected_index.min(convs.len().saturating_sub(1));
-                let name = convs[selected_idx].0.clone();
-                app.switch_conversation(&name);
-                app.screen = Screen::Main;
-                if app.session_known() {
-                    app.spawn_loop(None, true);
-                } else {
+                let target = convs[selected_idx].clone();
+                app.open_conversation(&target);
+                if !app.session_known() {
                     app.status =
                         "No saved session to resume. Start a new one with /new or type a task."
                             .to_string();
