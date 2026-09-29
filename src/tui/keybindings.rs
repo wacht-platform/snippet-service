@@ -429,7 +429,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 let name = convs[selected_idx].0.clone();
                 app.switch_conversation(&name);
                 app.screen = Screen::Main;
-                if app.active_state_path.exists() {
+                if app.session_known() {
                     app.spawn_loop(None, true);
                 } else {
                     app.status =
