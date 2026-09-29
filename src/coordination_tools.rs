@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::coordination::{NotificationMarker, Store, types::CoordinationEvent};
+use crate::coordination::{NotificationMarker, Store, StoreError, types::CoordinationEvent};
 use crate::llm::NativeToolDefinition;
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
@@ -63,6 +63,36 @@ fn actor(ctx: &ToolContext) -> Result<(&'static str, String), ToolError> {
         return Ok(("session", session_id.to_string()));
     }
     Err(ToolError::msg("posting to the coordination board requires a session identity"))
+}
+
+/// Refuse a board thread this session has no place in. Allowed: the shared
+/// room, a room it is a member of, the room of a task dispatched to this
+/// session, and every room for Mission Control, which coordinates them all.
+fn require_thread_access(db: &Store, ctx: &ToolContext, actor_id: &str, thread_id: &str) -> Result<(), ToolError> {
+    if thread_id == crate::serve::COORDINATION_THREAD {
+        return Ok(());
+    }
+    let lookup = |e: StoreError| ToolError::msg(format!("look up thread: {e}"));
+    if !db.thread_exists(thread_id).map_err(lookup)? {
+        return Err(ToolError::msg(format!("no thread `{thread_id}`")));
+    }
+    if actor_id == crate::mission_control::SESSION_ID
+        || db
+            .list_thread_participants(thread_id)
+            .map_err(lookup)?
+            .iter()
+            .any(|(member, _)| member == actor_id)
+    {
+        return Ok(());
+    }
+    let own_task = db
+        .get_task_by_thread(thread_id)
+        .map_err(lookup)?
+        .is_some_and(|task| Some(task.session_id.as_str()) == ctx.durable_session_id());
+    if own_task {
+        return Ok(());
+    }
+    Err(ToolError::msg(format!("this session is not a member of `{thread_id}`")))
 }
 
 /// The specialized agent holding the lease on a task this session is running.
@@ -140,6 +170,8 @@ impl Tool for PostCoordinationMessage {
             return Err(ToolError::msg("body must not be empty"));
         }
         let (actor_kind, actor_id) = actor(ctx)?;
+        let db = db(ctx)?;
+        require_thread_access(&db, ctx, &actor_id, &args.thread_id)?;
         let key = args
             .idempotency_key
             .filter(|s| !s.trim().is_empty())
@@ -159,7 +191,7 @@ impl Tool for PostCoordinationMessage {
             idempotency_key: key,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        let saved = db(ctx)?
+        let saved = db
             .append_event(&event)
             .map_err(|e| ToolError::msg(format!("post message: {e}")))?;
         crate::session::emit_device_event(json!({
@@ -225,6 +257,8 @@ impl Tool for ReadCoordinationThread {
             .unwrap_or_else(|| crate::serve::COORDINATION_THREAD.to_string());
         let limit = args.limit.unwrap_or(20).clamp(1, 100);
         let db = db(ctx)?;
+        let (_, actor_id) = actor(ctx)?;
+        require_thread_access(&db, ctx, &actor_id, &thread_id)?;
 
         // No cursor → the most recent messages. Cursor → the next page forward.
         // `after_sequence: 0` deliberately means "from the beginning".
@@ -363,14 +397,20 @@ impl Tool for SendAgentMessage {
         if to_kind == "agent" {
             // A recipient that is not in the directory would sit undelivered
             // forever, so an unknown id is refused rather than accepted and dropped.
-            if db
+            // A paused agent's mail waits; a disabled agent takes none.
+            match db
                 .get_agent(to_id)
                 .map_err(|e| ToolError::msg(format!("look up agent: {e}")))?
-                .is_none()
             {
-                return Err(ToolError::msg(format!(
-                    "unknown agent `{to_id}` — list_coordination_agents shows the directory. Use `human` to reply to the person."
-                )));
+                None => {
+                    return Err(ToolError::msg(format!(
+                        "unknown agent `{to_id}` — list_coordination_agents shows the directory. Use `human` to reply to the person."
+                    )));
+                }
+                Some(agent) if agent.status == crate::coordination::types::AgentStatus::Disabled => {
+                    return Err(ToolError::msg(format!("agent `{to_id}` is disabled")));
+                }
+                Some(_) => {}
             }
         } else if to_kind == "session" {
             // A session id that does not resolve would create a delivery row that
@@ -702,6 +742,7 @@ impl Tool for MessageMissionControl {
             .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
             .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
         let (actor_kind, actor_id) = actor(ctx)?;
+        require_thread_access(&db, ctx, &actor_id, &task.thread_id)?;
         let now = now_rfc3339();
         let event = CoordinationEvent {
             event_id: Uuid::new_v4().to_string(),
@@ -782,6 +823,7 @@ impl Tool for PostTaskCoordination {
             .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
             .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
         let (actor_kind, actor_id) = actor(ctx)?;
+        require_thread_access(&db, ctx, &actor_id, &task.thread_id)?;
         let now = now_rfc3339();
         let event = CoordinationEvent {
             event_id: Uuid::new_v4().to_string(),
@@ -855,6 +897,7 @@ impl Tool for TransferTaskSessionLease {
             .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
             .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
         let (_, actor_id) = actor(ctx)?;
+        crate::mission_tools::require_working_agent(&db, to_agent)?;
         let now = now_rfc3339();
 
         let roster = db.list_task_agents(task_id).unwrap_or_default();
@@ -1030,6 +1073,7 @@ impl Tool for ClaimAndDispatchTask {
         if actor_kind != "agent" {
             return Err(ToolError::msg("claiming a task needs an agent identity; this session has none"));
         }
+        crate::mission_tools::require_working_agent(&db, &actor_id)?;
         let now = now_rfc3339();
         db.add_task_agent_full(task_id, &actor_id, "implementer", None, "", "active", &now)
             .map_err(|e| ToolError::msg(format!("take the lease: {e}")))?;
@@ -1103,6 +1147,50 @@ mod tests {
 
     fn migrate(root: &std::path::Path) -> Store {
         Store::open(root.join("snippet.db")).unwrap()
+    }
+
+    /// A session cannot read or post in a room it has no place in, such as
+    /// another task's room or a direct thread between two others.
+    #[tokio::test]
+    async fn rooms_are_closed_to_outsiders() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrate(dir.path());
+        db.create_task(&crate::coordination::Task::filed_by_human(
+            "t1".into(),
+            "Private".into(),
+            "work".into(),
+            "work-1".into(),
+            0,
+            "2026-01-01T00:00:00Z".into(),
+        ))
+        .unwrap();
+        let room = crate::coordination::Task::thread_for("t1");
+
+        let outsider = context(dir.path(), "work-2");
+        assert!(PostCoordinationMessage
+            .execute(&outsider, json!({"thread_id": room, "body": "hi"}))
+            .await
+            .is_err());
+        assert!(ReadCoordinationThread
+            .execute(&outsider, json!({"thread_id": room}))
+            .await
+            .is_err());
+        assert!(PostCoordinationMessage
+            .execute(&outsider, json!({"thread_id": "made-up", "body": "hi"}))
+            .await
+            .is_err());
+
+        // The task's own session and Mission Control are let in.
+        let worker = context(dir.path(), "work-1");
+        PostCoordinationMessage
+            .execute(&worker, json!({"thread_id": room, "body": "progress"}))
+            .await
+            .unwrap();
+        let mc = context(dir.path(), "mc").with_agent_id("mission-control");
+        ReadCoordinationThread
+            .execute(&mc, json!({"thread_id": room}))
+            .await
+            .unwrap();
     }
 
     /// Claiming takes the lease (demoting the holder) and queues the task for
@@ -1199,7 +1287,7 @@ mod tests {
         let ctx = context(dir.path(), "mission-control");
 
         let result = PostCoordinationMessage
-            .execute(&ctx, json!({"thread_id":"t1","body":"starting"}))
+            .execute(&ctx, json!({"thread_id":"system","body":"starting"}))
             .await
             .unwrap();
 
@@ -1207,7 +1295,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let events = db.events_for_thread("t1", 0, 10).unwrap();
+        let events = db.events_for_thread("system", 0, 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_id, event_id);
         // Identity came from the session, not from caller arguments. This session
@@ -1225,11 +1313,11 @@ mod tests {
         let ctx = context(dir.path(), "s1").with_agent_id("rust-pr-reviewer");
 
         PostCoordinationMessage
-            .execute(&ctx, json!({"thread_id":"t1","body":"reviewing"}))
+            .execute(&ctx, json!({"thread_id":"system","body":"reviewing"}))
             .await
             .unwrap();
 
-        let events = db.events_for_thread("t1", 0, 10).unwrap();
+        let events = db.events_for_thread("system", 0, 10).unwrap();
         // An agent-bound session posts as the AGENT, so the board names the
         // identity rather than the address it happens to run in.
         assert_eq!(events[0].actor_id, "rust-pr-reviewer");
@@ -1255,7 +1343,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = migrate(dir.path());
         let ctx = context(dir.path(), "mission-control");
-        let args = json!({"thread_id":"t1","body":"once","idempotency_key":"k1"});
+        let args = json!({"thread_id":"system","body":"once","idempotency_key":"k1"});
 
         PostCoordinationMessage
             .execute(&ctx, args.clone())
@@ -1263,7 +1351,7 @@ mod tests {
             .unwrap();
         PostCoordinationMessage.execute(&ctx, args).await.unwrap();
 
-        assert_eq!(db.events_for_thread("t1", 0, 10).unwrap().len(), 1);
+        assert_eq!(db.events_for_thread("system", 0, 10).unwrap().len(), 1);
     }
 
 
@@ -1340,14 +1428,14 @@ mod tests {
         let ctx = context(dir.path(), "mission-control");
         for body in ["m1", "m2", "m3", "m4"] {
             PostCoordinationMessage
-                .execute(&ctx, json!({"thread_id": "t", "body": body}))
+                .execute(&ctx, json!({"thread_id": "system", "body": body}))
                 .await
                 .unwrap();
         }
 
         // Recent window, then page further back using the returned oldest.
         let recent = ReadCoordinationThread
-            .execute(&ctx, json!({"thread_id": "t", "limit": 2}))
+            .execute(&ctx, json!({"thread_id": "system", "limit": 2}))
             .await
             .unwrap();
         let data = &recent.value["data"];
@@ -1362,7 +1450,7 @@ mod tests {
 
         // after_sequence pages forward from a cursor.
         let forward = ReadCoordinationThread
-            .execute(&ctx, json!({"thread_id": "t", "after_sequence": 2}))
+            .execute(&ctx, json!({"thread_id": "system", "after_sequence": 2}))
             .await
             .unwrap();
         let fwd: Vec<&str> = forward.value["data"]["messages"]

@@ -741,6 +741,7 @@ pub async fn run_serve(
         .route("/health", get(|| async { "ok" }))
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{agent_id}/board", get(agent_board))
+        .route("/agents/{agent_id}/status", post(set_agent_status))
         .merge(coordination::router())
         .route(
             "/coordination/direct/messages",

@@ -445,15 +445,7 @@ impl Tool for CreateMissionTask {
                 crate::session::read_session_sidecar(&path).and_then(|sidecar| sidecar.agent_id)
             })
             .unwrap_or_else(|| crate::coordination::SNIPPET_AGENT_ID.to_string());
-        if store
-            .get_agent(&agent_id)
-            .map_err(|e| ToolError::msg(format!("look up agent: {e}")))?
-            .is_none()
-        {
-            return Err(ToolError::msg(format!(
-                "unknown agent `{agent_id}` — list_coordination_agents shows the directory"
-            )));
-        }
+        require_working_agent(&store, &agent_id)?;
         // Refuse a profile the config does not define. Applying an unknown name
         // is a silent no-op at session start, so the task would quietly run on
         // the wrong model — the failure would be invisible until someone
@@ -549,6 +541,25 @@ struct UpdateMissionTaskArgs {
     profile: Option<String>,
     #[serde(default)]
     context_note: Option<String>,
+}
+
+/// Refuse to hand work to an agent that is unknown or not active.
+pub(crate) fn require_working_agent(store: &Store, agent_id: &str) -> Result<(), ToolError> {
+    match store
+        .get_agent(agent_id)
+        .map_err(|e| ToolError::msg(format!("look up agent: {e}")))?
+    {
+        None => Err(ToolError::msg(format!(
+            "unknown agent `{agent_id}` — list_coordination_agents shows the directory"
+        ))),
+        Some(agent) if agent.status != crate::coordination::types::AgentStatus::Active => {
+            Err(ToolError::msg(format!(
+                "agent `{agent_id}` is {:?} and takes no new work",
+                agent.status
+            )))
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// Refuse a profile the config does not define. Applying an unknown name is a
@@ -722,9 +733,10 @@ impl Tool for AssignTaskAgent {
             Some("waiting") => "waiting",
             _ => if has_active { "waiting" } else { "active" },
         };
+        if status == "active" {
+            require_working_agent(&store, agent_id)?;
+        }
         let now = now_rfc3339();
-
-
         store.add_task_agent_full(task_id, agent_id, role, None, scope, status, &now)
             .map_err(|e| ToolError::msg(format!("assign agent: {e}")))?;
 
@@ -799,6 +811,7 @@ impl Tool for TransferMissionTaskLease {
             .get_task(task_id)
             .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
             .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        require_working_agent(&store, to_agent)?;
         let roster = store.list_task_agents(task_id).unwrap_or_default();
         let current_active = roster.iter().find(|m| m.status == "active" && m.removed_at.is_none()).map(|m| m.agent_id.as_str()).unwrap_or("none");
         let now = now_rfc3339();

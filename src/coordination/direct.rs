@@ -52,6 +52,9 @@ pub struct DirectThreadSummary {
     pub created_at: String,
 }
 
+/// Failed deliveries after which a message is given up on.
+pub const MAX_DELIVERY_ATTEMPTS: u32 = 12;
+
 const EVENT_COLUMNS: &str = "event_id, thread_id, partition_key, sequence, event_type,
      actor_kind, actor_id, payload_version, payload_json, causation_id, correlation_id,
      idempotency_key, created_at";
@@ -210,9 +213,13 @@ impl Store {
     /// A LEFT JOIN against `message_deliveries`: an event with no delivery row is
     /// reported as pending, which is what makes a crash between the two inserts
     /// self-healing rather than a silently dropped message.
+    /// Messages due for delivery: never delivered, not given up on, past their
+    /// retry time, and not addressed to a paused or disabled agent, whose mail
+    /// waits without holding up anyone else's.
     pub fn list_pending_direct_deliveries(
         &self,
         limit: u32,
+        now: &str,
     ) -> Result<Vec<PendingDirectMessage>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(&format!(
@@ -225,11 +232,18 @@ impl Store {
                    ON d.event_id = e.event_id
                   AND d.recipient_kind = p.actor_kind
                   AND d.recipient_id = p.actor_id
-                 WHERE d.event_id IS NULL OR d.delivered_at IS NULL
+                 WHERE (d.event_id IS NULL
+                        OR (d.delivered_at IS NULL
+                            AND d.attempts < ?2
+                            AND (d.retry_at IS NULL OR d.retry_at <= ?3)))
+                   AND NOT EXISTS (
+                        SELECT 1 FROM agents a
+                        WHERE p.actor_kind = 'agent' AND a.id = p.actor_id
+                          AND a.status IN ('paused', 'disabled'))
                  ORDER BY e.created_at, e.sequence
                  LIMIT ?1"
             ))?;
-            let rows = stmt.query_map(params![limit], |row| {
+            let rows = stmt.query_map(params![limit, MAX_DELIVERY_ATTEMPTS, now], |row| {
                 Ok(PendingDirectMessage {
                     event: event_from_row(row)?,
                     recipient_kind: row.get(13)?,
@@ -269,27 +283,46 @@ impl Store {
 
     /// Count a failed delivery attempt so a permanently undeliverable message is
     /// visible rather than retried forever in silence.
+    /// Count a failed delivery and push the next attempt back, doubling from
+    /// two seconds up to five minutes. After [`MAX_DELIVERY_ATTEMPTS`] the
+    /// message is no longer pending; `last_error` says why.
     pub fn record_direct_delivery_failure(
         &self,
         event_id: &str,
         recipient_kind: &str,
         recipient_id: &str,
         error: &str,
+        at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), StoreError> {
         self.with_connection(|conn| {
+            let recipient = actor_ref(recipient_kind, recipient_id);
+            let attempts: u32 = conn
+                .query_row(
+                    "SELECT attempts FROM message_deliveries WHERE event_id = ?1 AND recipient = ?2",
+                    params![event_id, recipient],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0)
+                + 1;
+            let backoff = (1i64 << attempts.min(9)).min(300);
+            let retry_at = (at + chrono::Duration::seconds(backoff)).to_rfc3339();
             conn.execute(
                 "INSERT INTO message_deliveries
-                 (event_id, recipient_kind, recipient_id, recipient, queued_at, attempts, last_error)
-                 VALUES (?1, ?2, ?3, ?4, ?4, 1, ?5)
+                 (event_id, recipient_kind, recipient_id, recipient, queued_at, attempts, last_error, retry_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(event_id, recipient) DO UPDATE SET
-                    attempts = message_deliveries.attempts + 1,
-                    last_error = excluded.last_error",
+                    attempts = excluded.attempts,
+                    last_error = excluded.last_error,
+                    retry_at = excluded.retry_at",
                 params![
                     event_id,
                     recipient_kind,
                     recipient_id,
-                    actor_ref(recipient_kind, recipient_id),
-                    error
+                    recipient,
+                    at.to_rfc3339(),
+                    attempts,
+                    error,
+                    retry_at
                 ],
             )?;
             Ok(())
@@ -449,10 +482,45 @@ mod tests {
         )
         .unwrap();
 
-        let pending = db.list_pending_direct_deliveries(50).unwrap();
+        let pending = db.list_pending_direct_deliveries(50, "9999").unwrap();
         assert_eq!(pending.len(), 1, "exactly one undelivered recipient");
         assert_eq!(pending[0].recipient_id, "b");
         assert_eq!(pending[0].event.payload["body"], "hello");
+    }
+
+    /// A failing delivery backs off and is eventually given up on, so it can
+    /// never hold the queue; a paused agent's mail waits without being tried.
+    #[test]
+    fn failed_deliveries_back_off_and_paused_mail_waits() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&worker("a")).unwrap();
+        db.create_agent(&worker("b")).unwrap();
+        let sent = db
+            .send_direct_message(("agent", "a"), ("agent", "b"), "hi", "k", "2026-01-01T00:00:00Z")
+            .unwrap();
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        db.record_direct_delivery_failure(&sent.event_id, "agent", "b", "no inbox", t0)
+            .unwrap();
+        assert!(
+            db.list_pending_direct_deliveries(50, "2026-01-01T00:00:01+00:00").unwrap().is_empty(),
+            "not retried before its backoff"
+        );
+        assert_eq!(db.list_pending_direct_deliveries(50, "2026-01-01T00:00:03+00:00").unwrap().len(), 1);
+
+        for _ in 1..MAX_DELIVERY_ATTEMPTS {
+            db.record_direct_delivery_failure(&sent.event_id, "agent", "b", "no inbox", t0)
+                .unwrap();
+        }
+        assert!(db.list_pending_direct_deliveries(50, "9999").unwrap().is_empty(), "given up");
+
+        db.send_direct_message(("agent", "a"), ("agent", "b"), "later", "k2", "2026-01-01T00:00:00Z")
+            .unwrap();
+        db.set_agent_status("b", &crate::coordination::types::AgentStatus::Paused).unwrap();
+        assert!(db.list_pending_direct_deliveries(50, "9999").unwrap().is_empty());
+        db.set_agent_status("b", &crate::coordination::types::AgentStatus::Active).unwrap();
+        assert_eq!(db.list_pending_direct_deliveries(50, "9999").unwrap().len(), 1);
     }
 
     #[test]
@@ -490,7 +558,7 @@ mod tests {
             .unwrap();
         db.mark_direct_delivered(&saved.event_id, "agent", "b", "2026-01-01T00:00:01Z")
             .unwrap();
-        assert!(db.list_pending_direct_deliveries(50).unwrap().is_empty());
+        assert!(db.list_pending_direct_deliveries(50, "9999").unwrap().is_empty());
     }
 
     #[test]
@@ -533,7 +601,7 @@ mod tests {
         })
         .unwrap();
 
-        let pending = db.list_pending_direct_deliveries(50).unwrap();
+        let pending = db.list_pending_direct_deliveries(50, "9999").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].recipient_id, "b");
     }

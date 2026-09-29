@@ -20,6 +20,8 @@ pub enum StoreError {
     NotRetryable { id: String, status: String },
     #[error("task {id} cannot be moved to {status} by hand; only a dispatch starts work")]
     InvalidTransition { id: String, status: String },
+    #[error("{from} blocking {to} would make a dependency cycle")]
+    DependencyCycle { from: String, to: String },
     #[error("task status must be terminal, got {0}")]
     NotTerminal(String),
     #[error("could not encode session state: {0}")]

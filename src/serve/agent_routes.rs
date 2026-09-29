@@ -316,6 +316,33 @@ pub(crate) async fn create_agent(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct AgentStatusReq {
+    pub(crate) status: crate::coordination::types::AgentStatus,
+}
+
+/// POST /agents/{id}/status — pause, drain, disable or resume an agent. A
+/// paused agent keeps its current lease but takes no new work or wake-ups.
+pub(crate) async fn set_agent_status(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(req): Json<AgentStatusReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.store.set_agent_status(&agent_id, &req.status) {
+        Ok(true) => match d.store.get_agent(&agent_id) {
+            Ok(Some(agent)) => Json(agent).into_response(),
+            _ => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        },
+        Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent status: {error}"))
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub(crate) struct NotificationReplayQuery {
     pub(crate) token: Option<String>,
     #[serde(default)]

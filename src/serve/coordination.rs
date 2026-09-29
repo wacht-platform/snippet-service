@@ -327,18 +327,19 @@ async fn set_task_status(
     let note = format!("Marked {status} on the board.");
     match d.store.move_task(&task_id, status, &note, &now) {
         Ok(task) => Json(task).into_response(),
-        Err(error) => move_error(error),
+        Err(error) => store_error(error),
     }
 }
 
-/// The response for a refused or failed [`crate::store::Store::move_task`].
-pub(super) fn move_error(error: crate::store::StoreError) -> Response {
+/// The response for a store error: refused transitions are conflicts.
+pub(super) fn store_error(error: crate::store::StoreError) -> Response {
     use crate::store::StoreError;
     let code = match &error {
         StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => StatusCode::NOT_FOUND,
         StoreError::AlreadyTerminal { .. }
         | StoreError::NotRetryable { .. }
-        | StoreError::InvalidTransition { .. } => StatusCode::CONFLICT,
+        | StoreError::InvalidTransition { .. }
+        | StoreError::DependencyCycle { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (code, error.to_string()).into_response()
@@ -401,11 +402,7 @@ async fn link_tasks(
     };
     match d.store.link_tasks(&link) {
         Ok(()) => (StatusCode::CREATED, Json(link)).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("link tasks: {error}"),
-        )
-            .into_response(),
+        Err(error) => store_error(error),
     }
 }
 
@@ -756,6 +753,7 @@ fn agent_chain_exhausted(history: &[CoordinationEvent], event: &CoordinationEven
 }
 
 /// The sessions a board event wakes. Pure, so the routing rules are testable.
+/// `idle_agents` are the paused, draining and disabled ones, which are not woken.
 ///
 /// Never the session the event came from: a worker posting to its own task
 /// room used to be handed its own message back as a new turn.
@@ -765,6 +763,7 @@ pub(super) fn wake_targets(
     participants: &[(String, String)],
     roster: &[crate::coordination::TaskAgent],
     task_session: Option<&str>,
+    idle_agents: &[String],
 ) -> Vec<WakeTarget> {
     let mc = crate::mission_control::SESSION_ID;
     if QUIET_EVENTS.contains(&event.event_type.as_str()) || agent_chain_exhausted(history, event) {
@@ -790,7 +789,7 @@ pub(super) fn wake_targets(
             }
             continue;
         }
-        if actor_kind != "agent" {
+        if actor_kind != "agent" || idle_agents.contains(actor_id) {
             continue;
         }
         let member = roster.iter().find(|m| m.agent_id == *actor_id);
@@ -877,12 +876,21 @@ pub async fn wake_coordination_thread_participants(
         .as_ref()
         .and_then(|t| d.store.list_task_agents(&t.id).ok())
         .unwrap_or_default();
+    let idle_agents: Vec<String> = d
+        .store
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| agent.status != crate::coordination::types::AgentStatus::Active)
+        .map(|agent| agent.id)
+        .collect();
     let targets = wake_targets(
         saved,
         &history,
         &participants,
         &roster,
         task.as_ref().map(|t| t.session_id.as_str()),
+        &idle_agents,
     );
     if targets.is_empty() {
         return;

@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, types::Type};
 
-use super::{Store, StoreError, types::Agent};
+use super::{Store, StoreError, types::{Agent, AgentStatus}};
 
 fn now() -> String {
     SystemTime::now()
@@ -59,7 +59,8 @@ impl Store {
     /// hit the primary key on the second start. The DESCRIPTIVE fields are
     /// refreshed so a changed display name or role lands; `created_at` is
     /// preserved, because rewriting it would erase the row's history rather than
-    /// update it.
+    /// update it. `status` is set only on insert: a boot or a rebuild must not
+    /// resume an agent someone paused.
     pub fn upsert_agent(&self, agent: &Agent) -> Result<(), StoreError> {
         let capabilities = serde_json::to_string(&agent.capabilities).unwrap();
         let timestamp = now();
@@ -73,7 +74,6 @@ impl Store {
                      display_name = excluded.display_name,
                      handle = excluded.handle,
                      kind = excluded.kind,
-                     status = excluded.status,
                      role = excluded.role,
                      capabilities_json = excluded.capabilities_json,
                      updated_at = excluded.updated_at",
@@ -90,6 +90,26 @@ impl Store {
             )?;
             Ok(())
         })
+    }
+
+    /// Pause, drain, disable or resume an agent. Returns whether it exists.
+    pub fn set_agent_status(&self, id: &str, status: &AgentStatus) -> Result<bool, StoreError> {
+        let timestamp = now();
+        self.with_connection(|conn| {
+            Ok(conn.execute(
+                "UPDATE agents SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, enum_text(status), timestamp],
+            )? == 1)
+        })
+    }
+
+    /// Whether an agent may be handed new work. Paused, draining and disabled
+    /// agents keep what they hold but take nothing new; an unknown id takes
+    /// nothing at all.
+    pub fn agent_takes_work(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .get_agent(id)?
+            .is_some_and(|agent| agent.status == AgentStatus::Active))
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, StoreError> {
@@ -254,6 +274,11 @@ mod tests {
 
         let stored = db.get_agent("mission-control").unwrap().unwrap();
         assert_eq!(stored.display_name, "Coordinator");
+
+        // A boot or rebuild must not resume a paused agent.
+        db.set_agent_status("mission-control", &AgentStatus::Paused).unwrap();
+        db.upsert_agent(&renamed).unwrap();
+        assert!(!db.agent_takes_work("mission-control").unwrap());
         assert_eq!(stored.kind, AgentKind::MissionControl);
         assert_eq!(db.list_agents().unwrap().len(), 1, "still one row");
     }

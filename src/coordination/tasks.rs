@@ -914,7 +914,16 @@ impl Store {
         })
     }
 
+    /// Record an edge. A `blocks` edge that would close a cycle (including a
+    /// task blocking itself) is refused: every task on the cycle would wait on
+    /// another forever.
     pub fn link_tasks(&self, link: &TaskLink) -> Result<(), StoreError> {
+        if link.kind == TaskLinkKind::Blocks && self.blocks_path(&link.to_task_id, &link.from_task_id)? {
+            return Err(StoreError::DependencyCycle {
+                from: link.from_task_id.clone(),
+                to: link.to_task_id.clone(),
+            });
+        }
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (from_task_id, to_task_id, kind, created_at)
@@ -928,6 +937,31 @@ impl Store {
             )?;
             Ok(())
         })
+    }
+
+    /// Whether `to` is reachable from `from` along `blocks` edges (or is it).
+    fn blocks_path(&self, from: &str, to: &str) -> Result<bool, StoreError> {
+        let mut stack = vec![from.to_string()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = stack.pop() {
+            if id == to {
+                return Ok(true);
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            self.with_connection(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT to_task_id FROM task_links WHERE from_task_id = ?1 AND kind = 'blocks'",
+                )?;
+                let next = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+                for id in next {
+                    stack.push(id?);
+                }
+                Ok(())
+            })?;
+        }
+        Ok(false)
     }
 
     pub fn unlink_tasks(
@@ -1108,6 +1142,17 @@ impl Store {
         })
     }
 
+    /// Whether a board thread exists at all.
+    pub fn thread_exists(&self, thread_id: &str) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM board_threads WHERE id = ?1)",
+                params![thread_id],
+                |row| row.get(0),
+            )
+        })
+    }
+
     pub fn list_thread_participants(
         &self,
         thread_id: &str,
@@ -1132,11 +1177,21 @@ impl Store {
         now: &str,
     ) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
-            Ok(conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let removed = tx.execute(
                 "UPDATE task_agents SET removed_at = ?3
                  WHERE task_id = ?1 AND agent_id = ?2 AND removed_at IS NULL",
                 params![task_id, agent_id, now],
-            )? == 1)
+            )? == 1;
+            // Leaving the task is leaving its room: a removed agent is no longer
+            // woken by it or able to post to it.
+            tx.execute(
+                "DELETE FROM board_participants
+                 WHERE thread_id = (SELECT thread_id FROM tasks WHERE id = ?1) AND actor_id = ?2",
+                params![task_id, agent_id],
+            )?;
+            tx.commit()?;
+            Ok(removed)
         })
     }
 
@@ -1500,6 +1555,46 @@ mod tests {
             seen.extend(page.into_iter().map(|t| t.id));
         }
         assert_eq!(seen, ["t2", "t1", "t3"]);
+    }
+
+    #[test]
+    fn dependency_cycles_are_refused() {
+        let db = db();
+        for id in ["a", "b", "c"] {
+            db.create_task(&task(id)).unwrap();
+        }
+        let blocks = |from: &str, to: &str| {
+            db.link_tasks(&TaskLink {
+                from_task_id: from.into(),
+                to_task_id: to.into(),
+                kind: TaskLinkKind::Blocks,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            })
+        };
+        blocks("a", "b").unwrap();
+        blocks("b", "c").unwrap();
+        assert!(matches!(blocks("c", "a"), Err(StoreError::DependencyCycle { .. })));
+        assert!(matches!(blocks("a", "a"), Err(StoreError::DependencyCycle { .. })));
+    }
+
+    #[test]
+    fn a_removed_agent_leaves_the_room() {
+        let db = db();
+        db.create_task(&task("t1")).unwrap();
+        db.create_agent(&crate::coordination::types::Agent {
+            id: "a1".into(),
+            display_name: "Ada".into(),
+            handle: "ada".into(),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Implementer,
+            capabilities: vec![],
+        })
+        .unwrap();
+        db.add_task_agent("t1", "a1", "implementer", "2026-01-01T00:00:00Z").unwrap();
+        db.remove_task_agent("t1", "a1", "2026-01-01T00:01:00Z").unwrap();
+        let members = db.list_thread_participants(&Task::thread_for("t1")).unwrap();
+        assert!(members.iter().all(|(id, _)| id != "a1"));
     }
 
     #[test]

@@ -155,6 +155,8 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              read_at TEXT,
              attempts INTEGER NOT NULL DEFAULT 0,
              last_error TEXT,
+             -- When a failed delivery may be tried again; NULL means now.
+             retry_at TEXT,
              PRIMARY KEY (event_id, recipient)
          );
          CREATE INDEX IF NOT EXISTS message_deliveries_pending
@@ -184,6 +186,14 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
 "#,
     )?;
     add_missing_columns(connection)?;
+    let delivery_columns: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(message_deliveries)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if !delivery_columns.iter().any(|column| column == "retry_at") {
+        connection.execute("ALTER TABLE message_deliveries ADD COLUMN retry_at TEXT", [])?;
+    }
     Ok(())
 }
 
