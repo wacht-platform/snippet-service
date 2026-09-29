@@ -7,6 +7,7 @@ use crate::config::SnippetConfig;
 use crate::harness::{HarnessEvent, HarnessState};
 use super::app::*;
 use super::render::*;
+use super::keybindings::handle_question_key;
 use super::*;
 
 
@@ -320,4 +321,75 @@ fn ctrl_f_opens_sessions_and_ctrl_g_still_steers() {
     assert_eq!(app.shell.focus, Focus::Sidebar);
     // Ctrl-G is steer-now; the shell must leave it to the global handler.
     assert!(!handle_shell_key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+}
+
+fn question_app(pending: serde_json::Value) -> App {
+    let mut app = tui_app();
+    let mut st = HarnessState::default();
+    st.status = crate::harness::HarnessStatus::WaitingForInput;
+    st.pending_question = Some(pending.clone());
+    st.events.push(HarnessEvent::UserQuestion { questions: pending });
+    app.state = Some(st);
+    app
+}
+
+#[test]
+fn ask_user_picker_shows_recommended_multi_choice_tabs_and_review() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let key = |c| KeyEvent::new(c, KeyModifiers::NONE);
+    let mut app = question_app(serde_json::json!({"questions": [
+        {"id": "targets", "header": "Targets", "text": "Which builds should I make?",
+         "answer_kind": {"kind": "multi_choice", "choices": [
+            {"value": "macos", "label": "macOS", "description": "Universal app bundle"},
+            {"value": "android", "label": "Android", "description": "ARM64 release APK", "recommended": true}]}},
+        {"id": "ship", "header": "Ship", "text": "Publish the release now?",
+         "answer_kind": {"kind": "confirm", "confirm_label": "Publish", "cancel_label": "Hold"}}
+    ]}));
+    ensure_q_init(&mut app); // what tick() does when the question arrives
+
+    let first = snapshot_app(&mut app, 100, 40).join("\n");
+    for row in first.lines() { println!("|{row}|"); }
+    assert!(first.contains("Targets") && first.contains("Ship"), "question tabs");
+    assert!(first.contains("recommended") && first.contains("ARM64 release APK"));
+    // Recommended leads and is already ticked.
+    let android = first.lines().position(|l| l.contains("Android")).unwrap();
+    let macos = first.lines().position(|l| l.contains("macOS")).unwrap();
+    assert!(android < macos);
+    assert!(first.lines().nth(android).unwrap().contains("[x]"));
+
+    // 2 ticks macOS too, Enter moves on to the confirm with its own labels.
+    assert!(handle_question_key(&mut app, key(KeyCode::Char('2'))));
+    assert!(handle_question_key(&mut app, key(KeyCode::Enter)));
+    let second = snapshot_app(&mut app, 100, 40).join("\n");
+    assert!(second.contains("Publish") && second.contains("Hold") && second.contains("✓ Targets"));
+
+    // Back returns to the first question; forward again, then pick Publish.
+    assert!(handle_question_key(&mut app, key(KeyCode::Left)));
+    assert_eq!(app.q_index, 0);
+    assert!(handle_question_key(&mut app, key(KeyCode::Char('2'))));
+    assert!(handle_question_key(&mut app, key(KeyCode::Enter)));
+    assert!(handle_question_key(&mut app, key(KeyCode::Char('1'))));
+
+    // Every question answered: a review before anything is sent.
+    assert!(app.q_review);
+    let review = snapshot_app(&mut app, 100, 40).join("\n");
+    for row in review.lines() { println!("|{row}|"); }
+    assert!(review.contains("Check your answers"));
+    assert!(review.contains("Android (android), macOS (macos)"));
+    assert!(review.contains("Publish (confirm)"));
+}
+
+#[test]
+fn ask_user_choice_question_takes_a_typed_answer() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = question_app(serde_json::json!({"questions": [
+        {"text": "Which branch?", "answer_kind": {"kind": "single_choice", "choices": [
+            {"value": "main", "label": "main"}]}}
+    ]}));
+    ensure_q_init(&mut app);
+    app.input = "release/1.2".into();
+    // Typing isn't swallowed by the picker any more; Enter sends the typed text.
+    assert!(!handle_question_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
+    app.answer_current_question();
+    assert!(app.q_answers.is_empty() && app.input.is_empty(), "sent and reset");
 }

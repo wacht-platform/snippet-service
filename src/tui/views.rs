@@ -856,14 +856,53 @@ pub(crate) fn q_text(question: &Value) -> String {
         .to_string()
 }
 
-/// Selectable options for a question as `(value, label)`. Empty = free-text
-/// (the answer is typed in the input box instead of picked).
-pub(crate) fn q_options(question: &Value) -> Vec<(String, String)> {
-    let kind = question
+/// One selectable answer to a question.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct QOption {
+    pub(crate) value: String,
+    pub(crate) label: String,
+    pub(crate) description: String,
+    pub(crate) recommended: bool,
+}
+
+impl QOption {
+    fn plain(value: &str, label: String) -> Self {
+        Self { value: value.into(), label, description: String::new(), recommended: false }
+    }
+
+    /// How the choice reads in the answer sent back: the label, with the value
+    /// alongside when the model gave it a different one.
+    pub(crate) fn answer(&self) -> String {
+        if self.value.is_empty() || self.value == self.label {
+            self.label.clone()
+        } else {
+            format!("{} ({})", self.label, self.value)
+        }
+    }
+}
+
+pub(crate) fn q_kind(question: &Value) -> &str {
+    question
         .get("answer_kind")
         .and_then(|k| k.get("kind"))
         .and_then(Value::as_str)
-        .unwrap_or("free_text");
+        .unwrap_or("free_text")
+}
+
+/// The question's tab label when several are asked together.
+pub(crate) fn q_header(question: &Value, index: usize) -> String {
+    question
+        .get("header")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Q{}", index + 1))
+}
+
+/// Selectable options for a question, the recommended one first. Empty =
+/// free-text (the answer is typed in the input box instead of picked).
+pub(crate) fn q_options(question: &Value) -> Vec<QOption> {
     let ak = question.get("answer_kind");
     let label_or = |k: &str, fallback: &str| {
         ak.and_then(|a| a.get(k))
@@ -873,39 +912,38 @@ pub(crate) fn q_options(question: &Value) -> Vec<(String, String)> {
             .unwrap_or(fallback)
             .to_string()
     };
-    match kind {
-        "single_choice" => ak
-            .and_then(|a| a.get("choices"))
-            .and_then(Value::as_array)
-            .map(|cs| {
-                cs.iter()
-                    .map(|c| {
-                        let value = c
-                            .get("value")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let label = c
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| value.clone());
-                        let value = if value.is_empty() {
-                            label.clone()
-                        } else {
-                            value
-                        };
-                        (value, label)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        "yes_no" => vec![("yes".into(), "Yes".into()), ("no".into(), "No".into())],
+    let text = |c: &Value, k: &str| {
+        c.get(k).and_then(Value::as_str).map(str::trim).unwrap_or("").to_string()
+    };
+    match q_kind(question) {
+        "single_choice" | "multi_choice" => {
+            let mut opts: Vec<QOption> = ak
+                .and_then(|a| a.get("choices"))
+                .and_then(Value::as_array)
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| {
+                            let value = text(c, "value");
+                            let label = text(c, "label");
+                            let label = if label.is_empty() { value.clone() } else { label };
+                            QOption {
+                                value: if value.is_empty() { label.clone() } else { value },
+                                label,
+                                description: text(c, "description"),
+                                recommended: c.get("recommended").and_then(Value::as_bool).unwrap_or(false),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Stable: the recommended option leads, the rest keep their order.
+            opts.sort_by_key(|o| !o.recommended);
+            opts
+        }
+        "yes_no" => vec![QOption::plain("yes", "Yes".into()), QOption::plain("no", "No".into())],
         "confirm" => vec![
-            ("confirm".into(), label_or("confirm_label", "Confirm")),
-            ("cancel".into(), label_or("cancel_label", "Cancel")),
+            QOption::plain("confirm", label_or("confirm_label", "Confirm")),
+            QOption::plain("cancel", label_or("cancel_label", "Cancel")),
         ],
         _ => Vec::new(),
     }
@@ -935,8 +973,9 @@ pub(crate) fn ensure_q_init(app: &mut App) {
     if token != app.q_token {
         app.q_token = token;
         app.q_index = 0;
-        app.q_sel = 0;
         app.q_answers.clear();
+        app.q_review = false;
+        prepare_question(app, &qs);
     }
     let len = qs.len().max(1);
     if app.q_index >= len {
@@ -946,6 +985,23 @@ pub(crate) fn ensure_q_init(app: &mut App) {
         let opts = q_options(q);
         if !opts.is_empty() && app.q_sel >= opts.len() {
             app.q_sel = 0;
+        }
+    }
+}
+
+/// Point the picker at the current question: the cursor on the first option
+/// (the recommended one leads), and a multi-choice question's recommended
+/// options already ticked.
+pub(crate) fn prepare_question(app: &mut App, qs: &[Value]) {
+    app.q_sel = 0;
+    app.q_multi.clear();
+    if let Some(q) = qs.get(app.q_index) {
+        if q_kind(q) == "multi_choice" {
+            for (i, o) in q_options(q).iter().enumerate() {
+                if o.recommended {
+                    app.q_multi.insert(i);
+                }
+            }
         }
     }
 }
@@ -974,12 +1030,55 @@ pub(crate) fn question_text(pending: &Value) -> Option<String> {
 
 fn question_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let qs = questions_of(app);
-    let Some(question) = qs.get(app.q_index.min(qs.len().saturating_sub(1))) else {
+    if qs.is_empty() {
         return Vec::new();
-    };
+    }
     let inner = width.saturating_sub(4).max(10);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let bold = Style::default().fg(text()).add_modifier(Modifier::BOLD);
+    let current = app.q_index.min(qs.len() - 1);
+
+    // Several questions: one tab per question, answered ones ticked.
+    if qs.len() > 1 {
+        let mut tabs = Vec::new();
+        for (i, q) in qs.iter().enumerate() {
+            if i > 0 {
+                tabs.push(Span::styled("  ", Style::default()));
+            }
+            let header = q_header(q, i);
+            let answered = i < app.q_answers.len();
+            let (label, style) = if !app.q_review && i == current {
+                (header, Style::default().fg(accent()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
+            } else if answered {
+                (format!("✓ {header}"), Style::default().fg(success()))
+            } else {
+                (header, Style::default().fg(faint()))
+            };
+            tabs.push(Span::styled(label, style));
+        }
+        if app.q_review {
+            tabs.push(Span::styled("  Review", Style::default().fg(accent()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)));
+        }
+        lines.push(Line::from(tabs));
+        lines.push(Line::from(""));
+    }
+
+    // The last step of a multi-question set: every answer, then send.
+    if app.q_review {
+        lines.push(Line::from(Span::styled("Check your answers", bold)));
+        for (i, (q, (_, answer))) in qs.iter().zip(app.q_answers.iter()).enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}  ", q_header(q, i)), Style::default().fg(faint())),
+                Span::styled(answer.chars().take(inner.saturating_sub(14)).collect::<String>(), Style::default().fg(text())),
+            ]));
+        }
+        lines.push(Line::from(""));
+        let hints = [keycap("↵", "send", accent()), keycap("←", "edit", soft()), keycap("esc", "cancel", soft())];
+        lines.push(Line::from(hints.into_iter().flatten().collect::<Vec<_>>()));
+        return lines;
+    }
+
+    let question = &qs[current];
     let wrapped = wrap_one(&q_text(question), inner);
     let more = wrapped.len() > 5;
     for seg in wrapped.into_iter().take(if more { 4 } else { 5 }) {
@@ -990,36 +1089,52 @@ fn question_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(""));
     let opts = q_options(question);
-    let hints = if opts.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Type your answer in the box below",
-            Style::default().fg(muted()),
-        )));
-        vec![keycap("↵", "send", accent()), keycap("esc", "cancel", soft())]
+    let multi = q_kind(question) == "multi_choice";
+    let back = current > 0;
+    let mut hints = Vec::new();
+    if opts.is_empty() {
+        lines.push(Line::from(Span::styled("Type your answer in the box below", Style::default().fg(muted()))));
+        hints.push(keycap("↵", "send", accent()));
     } else {
         let sel = app.q_sel.min(opts.len() - 1);
-        for (i, (_value, label)) in opts.iter().enumerate().take(8) {
+        for (i, opt) in opts.iter().enumerate().take(9) {
             let focused = i == sel;
-            let label: String = label.chars().take(inner.saturating_sub(2)).collect();
-            let pad = inner.saturating_sub(label.chars().count() + 2);
-            let row = if focused {
+            let mark = if multi {
+                if app.q_multi.contains(&i) { "[x] " } else { "[ ] " }
+            } else if focused {
+                "▸ "
+            } else {
+                "  "
+            };
+            let badge = if opt.recommended { " recommended" } else { "" };
+            let room = inner.saturating_sub(4 + mark.len() + badge.len());
+            let label: String = opt.label.chars().take(room).collect();
+            let pad = inner.saturating_sub(4 + mark.chars().count() + label.chars().count() + badge.len());
+            let row_style = if focused { Style::default().bg(surface3()) } else { Style::default() };
+            lines.push(
                 Line::from(vec![
-                    Span::styled("▸ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
-                    Span::styled(label, bold),
+                    Span::styled(format!("{} ", i + 1), Style::default().fg(faint())),
+                    Span::styled(mark.to_string(), Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+                    Span::styled(label, if focused { bold } else { Style::default().fg(soft()) }),
+                    Span::styled(badge.to_string(), Style::default().fg(accent())),
                     Span::raw(" ".repeat(pad)),
                 ])
-                .style(Style::default().bg(surface3()))
-            } else {
-                Line::from(vec![Span::raw("  "), Span::styled(label, Style::default().fg(soft()))])
-            };
-            lines.push(row);
+                .style(row_style),
+            );
+            if !opt.description.is_empty() {
+                let indent = 2 + mark.chars().count();
+                let desc: String = opt.description.chars().take(inner.saturating_sub(indent + 1)).collect();
+                lines.push(Line::from(Span::styled(format!("{}{desc}", " ".repeat(indent)), Style::default().fg(faint()))));
+            }
         }
-        vec![
-            keycap("↑↓", "choose", accent()),
-            keycap("↵", "select", accent()),
-            keycap("esc", "cancel", soft()),
-        ]
-    };
+        lines.push(Line::from(Span::styled("or type your own answer below", Style::default().fg(faint()))));
+        hints.push(keycap(if multi { "1-9 space" } else { "1-9" }, if multi { "toggle" } else { "pick" }, accent()));
+        hints.push(keycap("↵", if multi { "confirm" } else { "select" }, accent()));
+    }
+    if back {
+        hints.push(keycap("←", "back", soft()));
+    }
+    hints.push(keycap("esc", "cancel", soft()));
     lines.push(Line::from(hints.into_iter().flatten().collect::<Vec<_>>()));
     lines
 }
@@ -1035,7 +1150,7 @@ pub(crate) fn render_question(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         return;
     }
     let title = if qs.len() > 1 {
-        format!("Question · {} of {}", app.q_index + 1, qs.len())
+        format!("Questions · {} of {}", (app.q_index + 1).min(qs.len()), qs.len())
     } else {
         "Question".to_string()
     };
