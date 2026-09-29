@@ -875,7 +875,7 @@ impl QOption {
     /// "Android" adds nothing).
     pub(crate) fn answer(&self) -> String {
         let norm = |x: &str| x.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
-        if self.value.is_empty() || norm(&self.value) == norm(&self.label) {
+        if norm(&self.value) == norm(&self.label) {
             self.label.clone()
         } else {
             format!("{} ({})", self.label, self.value)
@@ -924,17 +924,12 @@ pub(crate) fn q_options(question: &Value) -> Vec<QOption> {
                 .and_then(Value::as_array)
                 .map(|cs| {
                     cs.iter()
-                        .map(|c| {
-                            let value = text(c, "value");
-                            let label = text(c, "label");
-                            let label = if label.is_empty() { value.clone() } else { label };
-                            QOption {
-                                value: if value.is_empty() { label.clone() } else { value },
-                                label,
+                        .map(|c| QOption {
+                                value: text(c, "value"),
+                                label: text(c, "label"),
                                 description: text(c, "description"),
                                 recommended: c.get("recommended").and_then(Value::as_bool).unwrap_or(false),
-                            }
-                        })
+                            })
                         .collect()
                 })
                 .unwrap_or_default();

@@ -201,9 +201,9 @@ fn board_app() -> App {
     app.boards.seed(
         "agents",
         serde_json::json!([
-            {"id": "snippet", "display_name": "Snippet", "role": "coding", "status": "idle", "kind": "general",
+            {"id": "snippet", "display_name": "Snippet", "role": "coding", "status": "active", "kind": "general",
              "capabilities": ["code", "review"]},
-            {"id": "designer", "display_name": "Designer", "role": "ui", "status": "busy"},
+            {"id": "designer", "display_name": "Designer", "role": "ui", "status": "paused"},
         ]),
     );
     app.boards.seed(
@@ -223,7 +223,7 @@ fn agents_panel_lists_agents_and_opens_a_board() {
     let list = snapshot_app(&mut app, 170, 30).join("\n");
     for row in list.lines() { println!("|{row}|"); }
     assert!(list.contains("Snippet") && list.contains("Designer"));
-    assert!(list.contains("idle") && list.contains("busy"));
+    assert!(list.contains("active") && list.contains("paused"));
 
     app.shell.pane_detail = Some(0);
     let detail = snapshot_app(&mut app, 170, 30).join("\n");

@@ -508,7 +508,7 @@ impl App {
             return;
         }
         if self.q_review {
-            self.send_answers(&qs);
+            self.send_answers();
             return;
         }
         let idx = self.q_index.min(qs.len() - 1);
@@ -546,7 +546,7 @@ impl App {
 
         if self.q_index >= qs.len() {
             if qs.len() == 1 {
-                self.send_answers(&qs);
+                self.send_answers();
             } else {
                 // Several questions: show them all once more before sending.
                 self.q_review = true;
@@ -571,7 +571,7 @@ impl App {
         prepare_question(self, &qs);
     }
 
-    fn send_answers(&mut self, qs: &[serde_json::Value]) {
+    fn send_answers(&mut self) {
         let combined = if self.q_answers.len() == 1 {
             self.q_answers[0].1.clone()
         } else {
@@ -582,7 +582,6 @@ impl App {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let _ = qs;
         self.q_review = false;
         self.finish_answer(combined);
     }
