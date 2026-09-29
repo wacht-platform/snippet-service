@@ -99,6 +99,8 @@ pub(crate) struct App {
     pub(crate) boards: super::boards::Boards,
     /// Mission Control was asked for; opened on the next tick.
     pub(crate) pending_mission_control: bool,
+    /// A panel action waiting for y (delete a job or a secret).
+    pub(crate) board_confirm: Option<super::boards::Confirm>,
     pub(crate) error: Option<String>,
     pub(crate) state: Option<HarnessState>,
     /// The resident conversation loop. Spawned once, lives across turns.
@@ -340,6 +342,7 @@ impl App {
             update_notice: std::sync::Arc::new(std::sync::Mutex::new(None)),
             boards: Default::default(),
             pending_mission_control: false,
+            board_confirm: None,
             original_config: None,
             last_state_stamp: None,
             login_active: false,
