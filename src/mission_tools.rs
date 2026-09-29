@@ -465,14 +465,7 @@ impl Tool for CreateMissionTask {
             .filter(|name| !name.is_empty())
             .map(str::to_string);
         if let Some(name) = profile.as_deref() {
-            let config = crate::config::SnippetConfig::load(crate::config::default_config_path())
-                .await
-                .map_err(|e| ToolError::msg(format!("read config: {e}")))?;
-            if !config.profile_names().iter().any(|known| known == name) {
-                return Err(ToolError::msg(format!(
-                    "unknown profile `{name}` — list_profiles shows the available names"
-                )));
-            }
+            check_profile(name).await?;
         }
         if mission_control::get_session(&root, &session_id).is_err() {
             mission_control::create_session(
@@ -558,20 +551,35 @@ struct UpdateMissionTaskArgs {
     context_note: Option<String>,
 }
 
+/// Refuse a profile the config does not define. Applying an unknown name is a
+/// silent no-op at session start, so the task would quietly run on the wrong
+/// model.
+pub(crate) async fn check_profile(name: &str) -> Result<(), ToolError> {
+    let config = crate::config::SnippetConfig::load(crate::config::default_config_path())
+        .await
+        .map_err(|e| ToolError::msg(format!("read config: {e}")))?;
+    if !config.profile_names().iter().any(|known| known == name) {
+        return Err(ToolError::msg(format!(
+            "unknown profile `{name}` — list_profiles shows the available names"
+        )));
+    }
+    Ok(())
+}
+
 pub struct UpdateMissionTask;
 #[async_trait]
 impl Tool for UpdateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "update_mission_task".into(),
-            description: "Update an existing task on the board (title, description, plan, status, or inference profile). Use this to add context, update scope, or reuse an existing task instead of creating duplicate tasks.".into(),
+            description: "Update an existing task on the board (title, description, plan, status, or inference profile). Use this to add context, update scope, or reuse an existing task instead of creating duplicate tasks. status `todo` re-queues the task for dispatch; `blocked` parks it. Work starts only through dispatch. An empty profile clears it.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string"},
                     "title": {"type": "string"},
                     "description": {"type": "string"},
                     "plan": {"type": "string"},
-                    "status": {"type": "string", "enum": ["todo", "in_progress", "blocked"]},
+                    "status": {"type": "string", "enum": ["todo", "blocked"]},
                     "profile": {"type": "string"},
                     "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"}
                 }),
@@ -586,9 +594,21 @@ impl Tool for UpdateMissionTask {
         if task_id.is_empty() {
             return Err(ToolError::msg("task_id must not be empty"));
         }
+        let status = match args.status.as_deref() {
+            None => None,
+            Some("todo") => Some(TaskStatus::Todo),
+            Some("blocked") => Some(TaskStatus::Blocked),
+            Some(other) => {
+                return Err(ToolError::msg(format!("status must be todo or blocked, got `{other}`")));
+            }
+        };
+        let profile = args.profile.as_deref().map(str::trim);
+        if let Some(name) = profile.filter(|name| !name.is_empty()) {
+            check_profile(name).await?;
+        }
         let store = db(ctx)?;
         let now = now_rfc3339();
-        let updated_task = store
+        let mut updated_task = store
             .update_task_in(task_id, &now, |t| {
                 if let Some(ref title) = args.title {
                     if !title.trim().is_empty() {
@@ -603,20 +623,16 @@ impl Tool for UpdateMissionTask {
                 if let Some(ref plan) = args.plan {
                     t.plan = plan.trim().to_string();
                 }
-                if let Some(ref status_str) = args.status {
-                    match status_str.as_str() {
-                        "todo" => t.status = TaskStatus::Todo,
-                        "in_progress" => t.status = TaskStatus::InProgress,
-                        "blocked" => t.status = TaskStatus::Blocked,
-                        _ => {}
-                    }
-                }
-                if let Some(ref prof) = args.profile {
-                    t.profile = Some(prof.trim().to_string());
+                if let Some(name) = profile {
+                    t.profile = Some(name.to_string()).filter(|name| !name.is_empty());
                 }
             })
             .map_err(|e| ToolError::msg(format!("update task: {e}")))?;
-
+        if let Some(status) = status {
+            updated_task = store
+                .move_task(task_id, status, "", &now)
+                .map_err(|e| ToolError::msg(format!("update task: {e}")))?;
+        }
         let note = args.context_note.or(args.description);
         if let Some(body) = note.filter(|b| !b.trim().is_empty()) {
             let event = CoordinationEvent {
@@ -708,13 +724,6 @@ impl Tool for AssignTaskAgent {
         };
         let now = now_rfc3339();
 
-        if status == "active" {
-            for m in &existing {
-                if m.status == "active" && m.agent_id != agent_id {
-                    let _ = store.set_task_agent_status(task_id, &m.agent_id, "waiting");
-                }
-            }
-        }
 
         store.add_task_agent_full(task_id, agent_id, role, None, scope, status, &now)
             .map_err(|e| ToolError::msg(format!("assign agent: {e}")))?;
@@ -849,7 +858,7 @@ impl Tool for RetryMissionTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "retry_mission_task".into(),
-            description: "Re-queue a blocked, failed, or stuck in-progress Mission Control task after a temporary failure (rate limit, dispatch error). Does not create a new task. Refuses done/cancelled work.".into(),
+            description: "Re-queue a blocked, failed, or stuck in-progress Mission Control task (rate limit, dispatch error, a worker that stopped without reporting). The task is delivered to its session again. Does not create a new task. Refuses done/cancelled work.".into(),
             input_schema: schema(json!({"task_id":{"type":"string"}}), &["task_id"]),
         }
     }

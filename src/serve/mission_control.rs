@@ -129,18 +129,6 @@ struct MissionSessionUpdate {
     title: Option<String>,
 }
 
-fn task_status(raw: &str) -> Option<TaskStatus> {
-    match raw {
-        "pending" | "todo" => Some(TaskStatus::Todo),
-        "in_progress" => Some(TaskStatus::InProgress),
-        "blocked" => Some(TaskStatus::Blocked),
-        "done" | "completed" => Some(TaskStatus::Done),
-        "failed" => Some(TaskStatus::Failed),
-        "cancelled" => Some(TaskStatus::Cancelled),
-        _ => None,
-    }
-}
-
 fn mission_task_view(task: &Task) -> serde_json::Value {
     serde_json::json!({
         "id": task.id,
@@ -588,6 +576,17 @@ async fn create_task(
         Ok(paths) => paths,
         Err(error) => return mission_error(error),
     };
+    let handoff_mode = match req.handoff_mode.as_deref() {
+        None => HandoffMode::Resume,
+        Some(raw) => match HandoffMode::parse(raw) {
+            Some(mode) => mode,
+            None => {
+                return mission_error(format!(
+                    "handoff_mode must be 'resume' or 'fresh', got '{raw}'"
+                ));
+            }
+        },
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let task = Task::dispatched_to(
         id,
@@ -595,7 +594,7 @@ async fn create_task(
         req.title.trim().to_string(),
         req.description.trim().to_string(),
         owned_paths,
-        HandoffMode::Resume,
+        handoff_mode,
         "mission-control",
         "mission-control",
         chrono::Utc::now().to_rfc3339(),
@@ -606,24 +605,15 @@ async fn create_task(
     let task = if req.status.as_deref() == Some("pending") {
         task
     } else {
-        match dispatch_mission_task(&d, &task.id).await {
-            Ok(task) => task,
-            Err(error) => {
-                let now = chrono::Utc::now().to_rfc3339();
-                match d.store.update_task_in(&task.id, &now, |task| {
-                    task.status = TaskStatus::Blocked;
-                    task.reporting_session = None;
-                    task.notifications.push(NotificationMarker {
-                        target: "mission_control".to_string(),
-                        kind: "blocked".to_string(),
-                        message: error,
-                        delivered: false,
-                    });
-                }) {
-                    Ok(task) => task,
-                    Err(error) => return mission_error(error.to_string()),
-                }
-            }
+        // A failed first attempt is already counted and re-queued; the loop
+        // retries it like any other, up to the failure ceiling.
+        if let Err(error) = dispatch_mission_task(&d, &task.id).await {
+            eprintln!("[mission-control] first dispatch of {} failed: {error}", task.id);
+        }
+        match d.store.get_task(&task.id) {
+            Ok(Some(task)) => task,
+            Ok(None) => return mission_error("task vanished".to_string()),
+            Err(error) => return mission_error(error.to_string()),
         }
     };
     Json(mission_task_view(&task)).into_response()
@@ -664,7 +654,13 @@ async fn update_task(
             },
         )
     };
-    let status = req.status.as_deref().and_then(task_status);
+    let status = match req.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => match super::coordination::parse_task_status(raw) {
+            Ok(status) => Some(status),
+            Err(error) => return mission_error(error),
+        },
+        None => None,
+    };
     let handoff_mode = match req.handoff_mode.as_deref() {
         None => None,
         Some(mode_raw) => match HandoffMode::parse(mode_raw) {
@@ -695,14 +691,17 @@ async fn update_task(
             if let Some(mode) = handoff_mode {
                 task.handoff_mode = mode;
             }
-            if let Some(status) = status {
-                let clears_binding = status.is_terminal() || status == TaskStatus::Blocked;
-                task.status = status;
-                if clears_binding {
-                    task.reporting_session = None;
-                }
-            }
         });
+    let updated = match (updated, status) {
+        (Ok(_), Some(status)) => {
+            let note = format!("Marked {status} by Mission Control.");
+            match d.store.move_task(&id, status, &note, &chrono::Utc::now().to_rfc3339()) {
+                Ok(task) => Ok(task),
+                Err(error) => return super::coordination::move_error(error),
+            }
+        }
+        (updated, _) => updated,
+    };
     match updated {
         Ok(task) if task.status == TaskStatus::Todo => match dispatch_mission_task(&d, &id).await {
             Ok(task) => Json(mission_task_view(&task)).into_response(),
@@ -1030,7 +1029,7 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
         return;
     };
     for task in tasks {
-        for (index, marker) in task.notifications.iter().enumerate() {
+        for marker in &task.notifications {
             if marker.delivered || marker.target != "mission_control" {
                 continue;
             }
@@ -1044,7 +1043,9 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
             let _ = daemon
                 .store
                 .update_task_in(&task.id, &chrono::Utc::now().to_rfc3339(), |t| {
-                    if let Some(n) = t.notifications.get_mut(index) {
+                    // Matched by content, not position: the list can change
+                    // between this read and the write.
+                    if let Some(n) = t.notifications.iter_mut().find(|n| !n.delivered && **n == *marker) {
                         n.delivered = true;
                     }
                 });

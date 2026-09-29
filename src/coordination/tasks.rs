@@ -667,6 +667,7 @@ impl Store {
                 return;
             }
             task.status = status.clone();
+            task.completed_at = Some(now.to_string());
             task.result = Some(result.clone());
             task.owned_paths.clear();
             task.reporting_session = None;
@@ -686,37 +687,82 @@ impl Store {
         Ok(task)
     }
 
-    /// Re-queue a blocked or failed task so dispatch can deliver it again.
-    ///
-    /// Refuses `Done`/`Cancelled` (finished) and `InProgress` (still delivered to
-    /// a worker) — only work that is genuinely waiting can be retried.
+    /// Re-queue unfinished work so dispatch delivers it again: blocked, failed,
+    /// or in progress with a worker that went quiet. Refuses done and cancelled
+    /// work, which only a person reopens ([`Self::move_task`]).
     pub fn retry_task(&self, id: &str, now: &str) -> Result<Task, StoreError> {
+        self.requeue(id, now, false)
+    }
+
+    fn requeue(&self, id: &str, now: &str, reopen: bool) -> Result<Task, StoreError> {
         let mut refused = None;
         let task = self.update_task_in(id, now, |task| {
-            if matches!(
-                task.status,
-                TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::InProgress
-            ) {
+            if !reopen && matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
                 refused = Some(task.status.clone());
                 return;
             }
             task.status = TaskStatus::Todo;
             task.dispatch_failures = 0;
             task.reporting_session = None;
-            task.notifications.push(NotificationMarker {
-                target: "mission_control".into(),
-                kind: "info".into(),
-                message: "re-queued after temporary failure".into(),
-                delivered: true,
-            });
+            task.completed_at = None;
+            task.result = None;
+            task.notifications.retain(|n| n.kind != "stalled");
         })?;
         if let Some(status) = refused {
             return Err(StoreError::NotRetryable {
                 id: id.to_string(),
-                status: format!("{status:?}"),
+                status: status.to_string(),
             });
         }
         Ok(task)
+    }
+
+    /// Move a task by hand, keeping the lifecycle's rules: a terminal move is a
+    /// completion with `note` as its result, `Todo` re-queues (reopening
+    /// finished work), and `InProgress` is refused — only a dispatch claim
+    /// starts work, because only a claim binds the session allowed to report.
+    pub fn move_task(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        note: &str,
+        now: &str,
+    ) -> Result<Task, StoreError> {
+        match status {
+            TaskStatus::Todo => self.requeue(id, now, true),
+            TaskStatus::InProgress => Err(StoreError::InvalidTransition {
+                id: id.to_string(),
+                status: status.to_string(),
+            }),
+            TaskStatus::Blocked => {
+                let mut finished = None;
+                let task = self.update_task_in(id, now, |task| {
+                    if task.status.is_terminal() {
+                        finished = Some(task.status.clone());
+                        return;
+                    }
+                    task.status = TaskStatus::Blocked;
+                    task.reporting_session = None;
+                })?;
+                match finished {
+                    Some(from) => Err(StoreError::AlreadyTerminal {
+                        id: id.to_string(),
+                        status: from.to_string(),
+                    }),
+                    None => Ok(task),
+                }
+            }
+            terminal => self.complete_task(
+                id,
+                terminal,
+                TaskResult {
+                    summary: note.to_string(),
+                    artifacts: Vec::new(),
+                    authoritative: true,
+                },
+                now,
+            ),
+        }
     }
 
     /// Return every `Blocked` task whose dependencies are all `Done` back to
@@ -779,7 +825,12 @@ impl Store {
                 continue;
             }
             for path in candidate_paths {
-                if task.owned_paths.iter().any(|owned| owned == path) {
+                // Nested either way is a conflict: owning `src/` covers `src/a.rs`.
+                if task
+                    .owned_paths
+                    .iter()
+                    .any(|owned| owned.starts_with(path) || path.starts_with(owned))
+                {
                     conflicts.push((task.id.clone(), path.clone()));
                 }
             }
@@ -790,32 +841,37 @@ impl Store {
     /// Tasks in board order: status column order is left to the caller, but
     /// within it the highest priority wins and ties break oldest-first so a
     /// stable queue does not reshuffle between reads.
+    ///
+    /// `after` is the previous page's last `(priority, created_at, id)`. The
+    /// cursor carries every sort key: without the priority, a page after a
+    /// high-priority row skipped every older row of lower priority.
     pub fn list_tasks_page(
         &self,
         filter: &TaskFilter<'_>,
-        after: Option<(&str, &str)>,
+        after: Option<(i64, &str, &str)>,
         limit: u32,
     ) -> Result<Vec<Task>, StoreError> {
-        let (after_created, after_id) = match after {
-            Some((created, id)) => (Some(created), Some(id)),
-            None => (None, None),
+        let (after_priority, after_created, after_id) = match after {
+            Some((priority, created, id)) => (Some(priority), Some(created), Some(id)),
+            None => (None, None, None),
         };
         let status = filter.status.as_ref().map(status_text);
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {TASK_COLUMNS} FROM tasks
-                 WHERE (?1 IS NULL OR (created_at, id) > (?1, ?2))
-                   AND (?3 IS NULL OR status = ?3)
-                   AND (?4 IS NULL OR EXISTS (
+                 WHERE (?1 IS NULL OR priority < ?1
+                        OR (priority = ?1 AND (created_at, id) > (?2, ?3)))
+                   AND (?4 IS NULL OR status = ?4)
+                   AND (?5 IS NULL OR EXISTS (
                         SELECT 1 FROM task_agents ta
                         WHERE ta.task_id = tasks.id
-                          AND ta.agent_id = ?4
+                          AND ta.agent_id = ?5
                           AND ta.removed_at IS NULL))
                  ORDER BY priority DESC, created_at, id
-                 LIMIT ?5"
+                 LIMIT ?6"
             ))?;
             let rows = stmt.query_map(
-                params![after_created, after_id, status, filter.agent_id, limit],
+                params![after_priority, after_created, after_id, status, filter.agent_id, limit],
                 task_from_row,
             )?;
             rows.collect()
@@ -854,32 +910,6 @@ impl Store {
                     updated_at = ?6
                  WHERE id = ?1",
                 params![id, title, description, plan, priority, now],
-            )? == 1)
-        })
-    }
-
-    /// Move a task between columns. `completed_at` is stamped on `Done` and
-    /// cleared on any move out of it, so the timestamp always describes the
-    /// current state rather than the last time it was ever done.
-    pub fn set_task_status(
-        &self,
-        id: &str,
-        status: &TaskStatus,
-        now: &str,
-    ) -> Result<bool, StoreError> {
-        let completed = if *status == TaskStatus::Done {
-            Some(now)
-        } else {
-            None
-        };
-        self.with_connection(|conn| {
-            Ok(conn.execute(
-                "UPDATE tasks
-                 SET status = ?2,
-                     completed_at = ?3,
-                     updated_at = ?4
-                 WHERE id = ?1",
-                params![id, status_text(status), completed, now],
             )? == 1)
         })
     }
@@ -993,6 +1023,15 @@ impl Store {
             let Some(thread_id) = thread else {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             };
+            // One agent holds the lease: seating an active member demotes the
+            // current one in the same transaction.
+            if status == "active" {
+                tx.execute(
+                    "UPDATE task_agents SET status = 'waiting'
+                     WHERE task_id = ?1 AND agent_id <> ?2 AND status = 'active'",
+                    params![task_id, agent_id],
+                )?;
+            }
             tx.execute(
                 "INSERT INTO task_agents (task_id, agent_id, role, work_session_id, scope, status, added_at, removed_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
@@ -1127,6 +1166,28 @@ impl Store {
             })?;
             rows.collect()
         })
+    }
+
+    /// Tell Mission Control, once, that a worker session stopped with tasks it
+    /// never reported. Left in progress: the worker may yet be woken to finish,
+    /// and `retry_task` re-delivers it if not. Returns how many were flagged.
+    pub fn flag_unreported_tasks(&self, session_id: &str, now: &str) -> Result<usize, StoreError> {
+        let mut flagged = 0;
+        for task in self.list_tasks(Some(session_id), Some(&TaskStatus::InProgress))? {
+            if task.reporting_session.as_deref() != Some(session_id)
+                || task.notifications.iter().any(|n| n.kind == "stalled")
+            {
+                continue;
+            }
+            self.update_task_in(&task.id, now, |t| {
+                t.notify_once(
+                    "stalled",
+                    "the worker session stopped without reporting; retry_mission_task re-delivers it, or cancel it",
+                );
+            })?;
+            flagged += 1;
+        }
+        Ok(flagged)
     }
 
     /// Park the work a failed session was doing, so it can be retried or
@@ -1363,22 +1424,98 @@ mod tests {
     }
 
     #[test]
-    fn done_stamps_completion_and_leaving_done_clears_it() {
+    fn moving_by_hand_keeps_the_lifecycle_rules() {
         let db = db();
         db.create_task(&task("t1")).unwrap();
 
-        db.set_task_status("t1", &TaskStatus::Done, "2026-01-02T00:00:00Z")
+        let done = db
+            .move_task("t1", TaskStatus::Done, "shipped", "2026-01-02T00:00:00Z")
             .unwrap();
-        let done = db.get_task("t1").unwrap().unwrap();
         assert_eq!(done.completed_at.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(done.result.unwrap().summary, "shipped");
 
-        db.set_task_status("t1", &TaskStatus::InProgress, "2026-01-03T00:00:00Z")
+        assert!(matches!(
+            db.move_task("t1", TaskStatus::InProgress, "", "2026-01-03T00:00:00Z"),
+            Err(StoreError::InvalidTransition { .. })
+        ));
+        assert!(matches!(
+            db.move_task("t1", TaskStatus::Blocked, "", "2026-01-03T00:00:00Z"),
+            Err(StoreError::AlreadyTerminal { .. })
+        ));
+
+        let reopened = db
+            .move_task("t1", TaskStatus::Todo, "", "2026-01-03T00:00:00Z")
             .unwrap();
-        let reopened = db.get_task("t1").unwrap().unwrap();
-        assert_eq!(
-            reopened.completed_at, None,
-            "a reopened task must not keep a stale completion time"
-        );
+        assert_eq!(reopened.status, TaskStatus::Todo);
+        assert_eq!(reopened.completed_at, None, "no stale completion time");
+        assert_eq!(reopened.result, None);
+    }
+
+    #[test]
+    fn retry_takes_back_stuck_work_but_not_finished_work() {
+        let db = db();
+        db.create_task(&task("t1")).unwrap();
+        db.claim_task_for_dispatch("t1", "2026-01-01T00:00:01Z").unwrap();
+        db.flag_unreported_tasks("s1", "2026-01-01T00:00:02Z").unwrap();
+        assert_eq!(db.flag_unreported_tasks("s1", "2026-01-01T00:00:03Z").unwrap(), 0, "flagged once");
+
+        let retried = db.retry_task("t1", "2026-01-01T00:00:04Z").unwrap();
+        assert_eq!(retried.status, TaskStatus::Todo);
+        assert!(retried.notifications.iter().all(|n| n.kind != "stalled"));
+
+        db.move_task("t1", TaskStatus::Cancelled, "dropped", "2026-01-01T00:00:05Z").unwrap();
+        assert!(matches!(
+            db.retry_task("t1", "2026-01-01T00:00:06Z"),
+            Err(StoreError::NotRetryable { .. })
+        ));
+    }
+
+    /// The cursor carries every sort key; without the priority, the page after
+    /// a high-priority row skipped older rows of lower priority.
+    #[test]
+    fn pages_follow_board_order_without_skipping() {
+        let db = db();
+        for (id, created, priority) in [
+            ("t1", "2026-01-01T00:00:01Z", 0),
+            ("t2", "2026-01-01T00:00:02Z", 5),
+            ("t3", "2026-01-01T00:00:03Z", 0),
+        ] {
+            let mut t = task(id);
+            t.created_at = created.into();
+            t.priority = priority;
+            db.create_task(&t).unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut after: Option<(i64, String, String)> = None;
+        loop {
+            let page = db
+                .list_tasks_page(
+                    &TaskFilter::default(),
+                    after.as_ref().map(|(p, c, i)| (*p, c.as_str(), i.as_str())),
+                    1,
+                )
+                .unwrap();
+            let Some(last) = page.last() else { break };
+            after = Some((last.priority, last.created_at.clone(), last.id.clone()));
+            seen.extend(page.into_iter().map(|t| t.id));
+        }
+        assert_eq!(seen, ["t2", "t1", "t3"]);
+    }
+
+    #[test]
+    fn nested_paths_conflict() {
+        let db = db();
+        let mut owner = task("owner");
+        owner.status = TaskStatus::InProgress;
+        owner.owned_paths = vec!["/w/src".into()];
+        db.create_task(&owner).unwrap();
+
+        let inside = db.task_path_conflicts("other", &["/w/src/a.rs".into()]).unwrap();
+        assert_eq!(inside.len(), 1);
+        let around = db.task_path_conflicts("other", &["/w".into()]).unwrap();
+        assert_eq!(around.len(), 1);
+        let sibling = db.task_path_conflicts("other", &["/w/srcx".into()]).unwrap();
+        assert!(sibling.is_empty(), "a shared name prefix is not nesting");
     }
 
     #[test]

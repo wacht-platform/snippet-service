@@ -920,12 +920,20 @@ pub fn set_session_title(state_path: &Path, title: &str) -> Result<(), String> {
 pub mod fork;
 pub use fork::*;
 
-/// Park the work a dead worker session was doing.
+/// Settle the work a worker session stopped doing without reporting.
 ///
-/// A dispatched session that dies without calling `report_mission_task` leaves
-/// its task looking active forever, so this is the one place that notices.
+/// A dispatched session that dies, or finishes its turn, without calling
+/// `report_mission_task` leaves its task looking active forever, so this is the
+/// one place that notices: a failure parks the task, an idle stop tells
+/// Mission Control once.
 pub fn park_failed_session_work(id: &str, prev_status: &str, state: &HarnessState) {
     let status = status_str(state.status);
+    if status == "idle" && prev_status == "running" {
+        if let Some(store) = store_for_sessions() {
+            let _ = store.flag_unreported_tasks(id, &chrono::Utc::now().to_rfc3339());
+        }
+        return;
+    }
     if status != "failed" || prev_status == "failed" {
         return;
     }
