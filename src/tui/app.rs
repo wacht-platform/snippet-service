@@ -79,6 +79,7 @@ pub(crate) struct App {
     /// Collapsed pastes: (placeholder shown in the input, real content). A big
     /// paste shows as a compact chip and expands back on send.
     pub(crate) pasted_blocks: Vec<(String, String)>,
+    pub(crate) shell: ShellState,
     /// Pending file attachments (images/files) dropped or pasted — kept OUT of the
     /// input text. Shown as a compact "📎 N attachments" line above the prompt and
     /// appended to the message on send. Tuple: (is_image, absolute_path, filename).
@@ -268,6 +269,7 @@ impl App {
             history_pos: None,
             history_draft: String::new(),
             pasted_blocks: Vec::new(),
+            shell: ShellState::default(),
             attachments: Vec::new(),
             status,
             status_shown: String::new(),

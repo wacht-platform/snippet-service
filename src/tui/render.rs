@@ -133,6 +133,20 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         return;
     }
 
+    app.shell.width = area.width;
+    let (sidebar_area, centre, pane_area) = shell_areas(app, area);
+    if let Some(sidebar) = sidebar_area {
+        render_sidebar(frame, sidebar, app);
+    }
+    if let Some(pane) = pane_area {
+        render_pane(frame, pane, app);
+    }
+    let area = Rect {
+        x: centre.x + u16::from(sidebar_area.is_some()),
+        width: centre.width.saturating_sub(u16::from(sidebar_area.is_some()) + u16::from(pane_area.is_some())),
+        ..centre
+    };
+
     let sugg_h = suggestion_height(app);
     let input_h = input_height(app, area.width);
     // Compaction/prune status lives in the footer usage cluster (bottom-right).
@@ -188,8 +202,13 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         render_approval_bar(frame, approval_area, app);
     }
     render_input(frame, input_area, app);
-    render_status_message(frame, status_msg_area, app);
+    if app.error.is_none() && app.status.is_empty() {
+        render_key_hints(frame, status_msg_area, app);
+    } else {
+        render_status_message(frame, status_msg_area, app);
+    }
     render_status(frame, footer_area, app);
+    render_palette(frame, frame.area(), app);
 }
 
 
@@ -360,7 +379,6 @@ pub(crate) fn ansi_color(idx: u8) -> Color {
 
 
 pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let model = app.effective_model.1.clone();
     let has_events = app
         .state
         .as_ref()
@@ -384,10 +402,16 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
         Style::default().fg(text()).add_modifier(Modifier::BOLD),
     )];
 
-    let mut right: Vec<Span<'static>> = vec![Span::styled(
-        format!("·  {model}"),
-        Style::default().fg(Color::Rgb(125, 207, 245)),
-    )];
+    let (dot, label, color) = match app.state.as_ref().map(|s| s.status) {
+        Some(HarnessStatus::Running) => ("●", "Working", accent()),
+        Some(HarnessStatus::WaitingForInput) => ("●", "Waiting for you", warn()),
+        Some(HarnessStatus::Failed) => ("●", "Failed", danger()),
+        _ => ("○", "Idle", faint()),
+    };
+    let mut right: Vec<Span<'static>> = vec![
+        Span::styled(format!("{dot} "), Style::default().fg(color)),
+        Span::styled(label.to_string(), Style::default().fg(muted())),
+    ];
 
     // Compact lane indicator in the header bar.
     if let Some(state) = &app.state {
@@ -399,11 +423,11 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
                 .count();
             let total = state.lanes.len();
             let label = if running > 0 {
-                format!("{total} delegated lanes \u{25B2}{running}  ")
+                format!("{running} of {total} delegated running   ")
             } else {
-                format!("{total} delegated lanes  ")
+                format!("{total} delegated   ")
             };
-            right.insert(0, Span::styled(label, Style::default().fg(accent())));
+            right.insert(0, Span::styled(label, Style::default().fg(faint())));
         }
     }
 
@@ -678,108 +702,60 @@ pub(crate) fn layout_input(input: &str, cursor: usize, width: usize) -> (Vec<Str
 
 pub(crate) fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let st = app.state.as_ref();
-    let dim = Style::default().fg(muted());
     let faint_style = Style::default().fg(faint());
-
     let folder_name = std::path::Path::new(&app.options.config.workspace)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
-
-    let left: Vec<Span<'static>> = vec![
-        Span::styled("◇ ", Style::default().fg(accent())),
-        Span::styled(
-            format!(
-                "{} ",
-                if app.effective_model.1.is_empty() {
-                    "opus"
-                } else {
-                    &app.effective_model.1
-                }
-            ),
-            Style::default().fg(text()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("· ", faint_style),
-        // Workspace rounded pill tab
-        Span::styled("", Style::default().fg(Color::Rgb(245, 158, 11))),
-        Span::styled(
-            format!("📁 {folder_name}"),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(245, 158, 11))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("", Style::default().fg(Color::Rgb(245, 158, 11))),
-    ];
-
-    // Bottom-right usage cluster: conversation-compaction chip (90% path) + gauge.
-    // Tool-payload prune stays a quiet transcript divider only — not footer chrome.
-    // Gauge uses last provider-reported prompt tokens only (never a local estimate).
-    let mut right: Vec<Span<'static>> = Vec::new();
-
-    if app.is_compacting() {
-        // Animated status while the agentic ~90% history compact runs.
-        let dots = match (app.frame / 3) % 4 {
-            0 => "   ",
-            1 => ".  ",
-            2 => ".. ",
-            _ => "...",
-        };
-        right.push(Span::styled(
-            format!("✦ compacting context{dots}"),
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-        ));
-        right.push(Span::styled(" · ", faint_style));
-    }
-
-    let (ctx_pct, filled) = st
-        .map(|s| {
-            if s.context_window > 0 && s.last_prompt_tokens > 0 {
-                let pct = ((s.last_prompt_tokens as f64 / s.context_window as f64) * 100.0)
-                    .round()
-                    .clamp(0.0, 100.0) as usize;
-                let filled = ((pct as f64 / 100.0) * 6.0).round() as usize;
-                (pct, filled.min(6))
-            } else {
-                (0usize, 0usize)
-            }
-        })
-        .unwrap_or((0, 0));
-
-    let mut bar = String::from("[");
-    for i in 0..6 {
-        bar.push(if i < filled { '█' } else { '░' });
-    }
-    bar.push(']');
-    let bar_color = if app.is_compacting() {
-        accent()
-    } else if ctx_pct >= 90 {
-        danger()
-    } else if ctx_pct >= 75 {
-        warn()
+    let model = if app.effective_model.1.is_empty() {
+        "no model"
     } else {
-        text()
+        &app.effective_model.1
     };
-    right.push(Span::styled(
-        format!("{bar} {ctx_pct}%"),
-        Style::default().fg(bar_color),
-    ));
-    right.push(Span::styled(" · ", faint_style));
-    right.push(Span::styled("^K", dim));
 
-    let left_line = Line::from(left);
+    let mut left: Vec<Span<'static>> = vec![
+        Span::styled(model.to_string(), Style::default().fg(soft()).add_modifier(Modifier::BOLD)),
+        Span::styled("  ·  ", faint_style),
+        Span::styled(folder_name.to_string(), Style::default().fg(muted())),
+    ];
+    if st.is_some_and(|s| s.approval_mode == crate::harness::ApprovalMode::Manual) {
+        left.push(Span::styled("  ·  ", faint_style));
+        left.push(Span::styled("manual approval", Style::default().fg(warn())));
+    }
+
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if app.is_compacting() {
+        right.push(Span::styled("compacting context", Style::default().fg(accent())));
+    } else {
+        let pct = st
+            .filter(|s| s.context_window > 0 && s.last_prompt_tokens > 0)
+            .map(|s| {
+                ((s.last_prompt_tokens as f64 / s.context_window as f64) * 100.0)
+                    .round()
+                    .clamp(0.0, 100.0) as usize
+            })
+            .unwrap_or(0);
+        let color = if pct >= 90 {
+            danger()
+        } else if pct >= 75 {
+            warn()
+        } else {
+            accent()
+        };
+        let filled = (pct * 8 + 50) / 100;
+        right.push(Span::styled("context ", faint_style));
+        right.push(Span::styled("━".repeat(filled), Style::default().fg(color)));
+        right.push(Span::styled("━".repeat(8 - filled), Style::default().fg(border2())));
+        right.push(Span::styled(format!(" {pct}%"), Style::default().fg(muted())));
+    }
+
     let right_line = Line::from(right);
     let right_w = right_line.width() as u16;
-
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(10),
-            Constraint::Length(right_w.saturating_add(1)),
-        ])
+        .constraints([Constraint::Min(10), Constraint::Length(right_w.saturating_add(1))])
         .split(area);
-
-    frame.render_widget(Paragraph::new(left_line), cols[0]);
+    frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
     frame.render_widget(
         Paragraph::new(right_line).alignment(ratatui::layout::Alignment::Right),
         cols[1],

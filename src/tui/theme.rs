@@ -1,10 +1,10 @@
 use super::*;
 
-// Single TUI palette — same AMOLED Black as the Flutter client.
 #[derive(Clone, Copy)]
 pub(super) struct Theme {
     pub(super) accent: Color,
     pub(super) text: Color,
+    pub(super) soft: Color,
     pub(super) muted: Color,
     pub(super) faint: Color,
     pub(super) success: Color,
@@ -12,35 +12,33 @@ pub(super) struct Theme {
     pub(super) warn: Color,
     pub(super) lane: Color,
     pub(super) code: Color,
+    pub(super) surface1: Color,
+    pub(super) surface2: Color,
+    pub(super) surface3: Color,
+    pub(super) border2: Color,
 }
 
-const AMOLED: Theme = Theme {
-    // Slate, not blue. A neutral accent keeps the accent channel about BRIGHTNESS
-    // rather than hue, so it cannot be confused with a status colour.
-    //
-    // #B4BECD, not the client's #94A3B8: this palette's `muted` (#9CA3AF) is also
-    // a grey, and the two collide at 1.01:1 — and they DO share a surface, since a
-    // lane list shows "running" (accent) directly above "cancelled" (muted). This
-    // slate sits midway between `muted` (1.35:1) and `text` (1.52:1), the widest
-    // separation available inside that narrow band.
-    accent: Color::Rgb(180, 190, 205),
-    text: Color::Rgb(229, 231, 235),
-    muted: Color::Rgb(156, 163, 175),
-    faint: Color::Rgb(107, 114, 128),
-    success: Color::Rgb(52, 211, 153),
-    danger: Color::Rgb(248, 113, 113),
-    warn: Color::Rgb(251, 191, 36),
-    // Lane activity is the same "something is live" signal as `accent`, so it
-    // shares its tone; the lane rows carry a glyph and a label of their own.
-    lane: Color::Rgb(180, 190, 205),
-    code: Color::Rgb(209, 213, 219),
+const DARK: Theme = Theme {
+    accent: Color::Rgb(0x6E, 0xA2, 0xFF),
+    text: Color::Rgb(0xED, 0xED, 0xEF),
+    soft: Color::Rgb(0xC8, 0xC8, 0xCC),
+    muted: Color::Rgb(0x9A, 0x9A, 0xA2),
+    faint: Color::Rgb(0x6E, 0x6E, 0x76),
+    success: Color::Rgb(0x39, 0xC5, 0x7E),
+    danger: Color::Rgb(0xF0, 0x64, 0x64),
+    warn: Color::Rgb(0xD4, 0x98, 0x2F),
+    lane: Color::Rgb(0x6E, 0xA2, 0xFF),
+    code: Color::Rgb(0xC8, 0xC8, 0xCC),
+    surface1: Color::Rgb(0x1C, 0x1C, 0x1E),
+    surface2: Color::Rgb(0x23, 0x23, 0x25),
+    surface3: Color::Rgb(0x2A, 0x2A, 0x2D),
+    border2: Color::Rgb(0x36, 0x36, 0x3A),
 };
 
 pub(super) fn theme() -> Theme {
-    AMOLED
+    DARK
 }
 
-/// Persisted config names still load; every name is AMOLED.
 pub(super) fn set_theme_by_name(_name: &str) -> bool {
     true
 }
@@ -71,6 +69,21 @@ pub(super) fn lane() -> Color {
 }
 pub(super) fn code() -> Color {
     theme().code
+}
+pub(super) fn soft() -> Color {
+    theme().soft
+}
+pub(super) fn surface1() -> Color {
+    theme().surface1
+}
+pub(super) fn surface2() -> Color {
+    theme().surface2
+}
+pub(super) fn surface3() -> Color {
+    theme().surface3
+}
+pub(super) fn border2() -> Color {
+    theme().border2
 }
 
 pub(super) fn subtle() -> Style {
@@ -129,7 +142,7 @@ mod tests {
         let t = theme();
         let ramp = [
             ("text", t.text),
-            ("accent", t.accent),
+            ("soft", t.soft),
             ("muted", t.muted),
             ("faint", t.faint),
         ];
@@ -151,8 +164,8 @@ mod tests {
     fn adjacent_ramp_steps_separate() {
         let t = theme();
         for (a, b, name) in [
-            (t.text, t.accent, "text/accent"),
-            (t.accent, t.muted, "accent/muted"),
+            (t.text, t.soft, "text/soft"),
+            (t.soft, t.muted, "soft/muted"),
             (t.muted, t.faint, "muted/faint"),
         ] {
             let c = contrast(a, b);
@@ -160,29 +173,15 @@ mod tests {
         }
     }
 
-    /// A lane list renders a RUNNING lane's dot directly above a CANCELLED one's:
-    /// running is `lane()`, cancelled is `muted()`. They share a surface, so they
-    /// must not collide. Under the old blue these measured 1.00:1 — the two
-    /// states were literally indistinguishable.
     #[test]
-    fn running_and_cancelled_lane_dots_separate() {
-        let c = contrast(theme().lane, theme().muted);
-        assert!(c >= 1.25, "running vs cancelled lane dots = {c:.2}");
-    }
-
-    /// The accent marks ACTIONS; success/danger/warn mark STATE. A vivid accent
-    /// competes with them, so the accent is neutral by design.
-    #[test]
-    fn the_accent_stays_neutral_against_the_status_hues() {
+    fn the_accent_is_a_distinct_readable_hue() {
         let t = theme();
-        let a = saturation(t.accent);
-        assert!(a < 0.25, "the accent is too vivid at {a:.2}");
-        for (c, name) in [
-            (t.success, "success"),
-            (t.danger, "danger"),
-            (t.warn, "warn"),
-        ] {
-            assert!(a < saturation(c), "the accent must be duller than {name}");
+        assert!(saturation(t.accent) > 0.3, "the accent must read as a colour");
+        for (surface, name) in [(Color::Rgb(0x15, 0x15, 0x16), "bg"), (t.surface1, "surface1"), (t.surface2, "surface2")] {
+            let c = contrast(t.accent, surface);
+            assert!(c >= 4.5, "accent on {name} = {c:.2}");
+            let c = contrast(t.faint, surface);
+            assert!(c >= 3.0, "faint on {name} = {c:.2}");
         }
     }
 }

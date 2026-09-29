@@ -32,6 +32,7 @@ mod input;
 mod keybindings;
 mod render;
 mod settings;
+mod shell;
 mod term_pane;
 mod views;
 #[cfg(test)]
@@ -41,6 +42,7 @@ pub(crate) use app::*;
 pub(crate) use render::*;
 pub(crate) use term_pane::*;
 pub(crate) use views::*;
+pub(crate) use shell::*;
 
 use markdown::*;
 use theme::*;

@@ -90,6 +90,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    if app.screen == Screen::Main && handle_shell_key(app, key) {
+        return;
+    }
+
     // Dedicated lane navigation owns the ordinary navigation keys while open.
     if app.screen == Screen::Lanes && !key.modifiers.contains(KeyModifiers::CONTROL) {
         let count = app.state.as_ref().map(|s| s.lanes.len()).unwrap_or(0);
