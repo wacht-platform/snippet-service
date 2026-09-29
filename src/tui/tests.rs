@@ -25,6 +25,9 @@ use super::*;
             resume: None,
         });
         app.connecting_phase = None;
+        // The repo is a git checkout, so launch opens the new-session screen;
+        // these tests are about the main screen.
+        app.screen = Screen::Main;
         app.active_conversation = "tui-snapshot".to_string();
         app
     }
@@ -156,6 +159,7 @@ use super::*;
             resume: Some("existing".to_string()),
         });
         app.connecting_phase = None;
+        app.screen = Screen::Main;
         // A real state with a message in it, so `empty` is false. Built by
         // mutation, not struct-update syntax: `HarnessState` carries a private
         // field, so `..Default::default()` is not allowed from out here.
@@ -392,4 +396,86 @@ fn ask_user_choice_question_takes_a_typed_answer() {
     assert!(!handle_question_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
     app.answer_current_question();
     assert!(app.q_answers.is_empty() && app.input.is_empty(), "sent and reset");
+
+    /// Render one frame of a given app.
+    fn snapshot_of(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal.draw(|f| render(f, app)).expect("draw a frame");
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn row(id: &str, folder: &str, origin: Option<&str>, name: &str, title: &str, at: i64) -> crate::serve::sidecar::SessionRow {
+        crate::serve::sidecar::SessionRow {
+            id: id.into(),
+            folder: folder.into(),
+            origin_folder: origin.map(str::to_string),
+            branch: origin.map(|_| "snippet/ab12".to_string()),
+            conversation: name.into(),
+            title: title.into(),
+            status: "idle".into(),
+            last_active: at,
+        }
+    }
+
+    /// A folder's picker holds its own sessions and those in worktrees made from
+    /// it, and opening a worktree session moves the TUI into that worktree.
+    #[test]
+    fn the_picker_lists_worktree_sessions_under_their_folder() {
+        let mut app = tui_app();
+        app.options.config = app.options.config.for_workspace(PathBuf::from("/code/repo"));
+        app.daemon_sessions = Some(vec![
+            row("a", "/code/repo", None, "c1", "Root work", 10),
+            row("b", "/wt/repo/ab12", Some("/code/repo"), "default", "Isolated work", 20),
+            row("c", "/code/other", None, "c2", "Elsewhere", 30),
+        ]);
+        let list = app.list_conversations();
+        assert_eq!(list.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["Isolated work", "Root work"]);
+        assert_eq!(list[0].branch.as_deref(), Some("snippet/ab12"));
+        assert_eq!(list[1].branch, None);
+
+        app.open_conversation(&list[0]);
+        assert_eq!(app.options.config.workspace, PathBuf::from("/wt/repo/ab12"));
+        assert_eq!(app.active_conversation, "default");
+    }
+
+    /// In a git repository a new session asks where it works, offering a new
+    /// worktree, the folder, and the worktrees that already exist.
+    #[test]
+    fn a_new_session_in_a_repo_asks_where_it_works() {
+        use crate::tui::commands::NewChoice;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+        let side = dir.path().join("side");
+        git(&["worktree", "add", "-q", "-b", "side", side.to_str().unwrap()]);
+        let repo = repo.canonicalize().unwrap();
+
+        let mut app = tui_app();
+        app.options.config = app.options.config.for_workspace(repo.clone());
+        app.begin_new_session("fresh".into());
+        assert!(app.screen == Screen::NewSession);
+        assert_eq!(app.new_choices[0], NewChoice::Worktree(repo.clone()));
+        assert_eq!(app.new_choices[1], NewChoice::Folder(repo.clone()));
+        assert!(matches!(&app.new_choices[2], NewChoice::Existing { branch: Some(b), .. } if b == "side"));
+
+        let text = snapshot_of(&mut app, 100, 20).join("\n");
+        assert!(text.contains("New worktree") && text.contains("Existing worktrees"), "{text}");
+
+        app.start_new_session(app.new_choices[0].clone(), "fresh".into());
+        assert!(app.screen == Screen::Main);
+        assert_eq!(app.new_workspace, Some(crate::session::WorkspaceMode::Worktree));
+        assert_eq!(app.active_conversation, "fresh");
+    }
 }

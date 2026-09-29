@@ -162,7 +162,7 @@ mod create_blank_tests {
         let folder = temp_folder(stamp, "blank");
         let store = Store::open_in_memory().unwrap();
 
-        let info = create_blank_session_in(&store, &folder, "Odd request", true).unwrap();
+        let info = create_blank_session_in(&store, &folder, "Odd request", true, WorkspaceMode::Folder).unwrap();
         assert_eq!(info.title, "Odd request");
         assert_eq!(info.status, "idle");
         assert_eq!(
@@ -192,8 +192,8 @@ mod create_blank_tests {
         let folder = temp_folder(stamp, "dup");
         let store = Store::open_in_memory().unwrap();
 
-        create_blank_session_in(&store, &folder, "first", false).unwrap();
-        let second = create_blank_session_in(&store, &folder, "second", false);
+        create_blank_session_in(&store, &folder, "first", false, WorkspaceMode::Folder).unwrap();
+        let second = create_blank_session_in(&store, &folder, "second", false, WorkspaceMode::Folder);
         assert!(second.is_err(), "uniqueness is the store's question now");
 
         let _ = fs::remove_dir_all(&folder);
@@ -288,15 +288,16 @@ mod create_blank_tests {
     }
 
     #[test]
-    fn blank_session_in_git_repo_always_gets_a_worktree() {
+    fn a_worktree_blank_session_is_isolated_and_cleaned_up() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let repo = init_repo(stamp, "mc-blank");
         let store = Store::open_in_memory().unwrap();
-        // Mission Control often creates with new_conversation=false.
-        let info = create_blank_session_in(&store, &repo, "from mc", false).unwrap();
+        let info =
+            create_blank_session_in(&store, &repo, "from mc", false, WorkspaceMode::Worktree)
+                .unwrap();
         let root = crate::config::worktrees_root();
         let folder = PathBuf::from(&info.folder);
         assert_ne!(folder, repo);
@@ -315,6 +316,90 @@ mod create_blank_tests {
     }
 
     #[test]
+    fn folder_mode_works_in_the_repo_itself() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "folder-mode");
+        let store = Store::open_in_memory().unwrap();
+        let info =
+            create_blank_session_in(&store, &repo, "here", false, WorkspaceMode::Folder).unwrap();
+        assert_eq!(PathBuf::from(&info.folder), repo);
+        assert_eq!(info.origin_folder, None, "the repo is not a worktree");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_worktree_session_knows_its_origin_and_branch() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "origin");
+        fs::create_dir_all(repo.join("app")).unwrap();
+        fs::write(repo.join("app/main.rs"), "fn main() {}\n").unwrap();
+        git_ok(&repo, &["add", "app"]);
+        git_ok(&repo, &["commit", "-qm", "app"]);
+
+        let workspace = session_workspace(&repo.join("app"), WorkspaceMode::Worktree);
+        assert!(workspace.ends_with("app"));
+        let origin = worktree_origin(&workspace).expect("a linked worktree");
+        assert_eq!(origin.folder, repo.join("app"));
+        let branch = origin.branch.expect("a branch");
+        assert!(branch.starts_with("snippet/"), "got {branch}");
+
+        let (main, linked) = repo_worktrees(&repo).expect("a repo");
+        assert_eq!(main, repo);
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].branch.as_deref(), Some(branch.as_str()));
+
+        drop_worktree(&repo, workspace.parent().unwrap());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_shared_worktree_outlives_one_of_its_sessions() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "shared");
+        let workspace = session_workspace(&repo, WorkspaceMode::Worktree);
+        let store = Store::open_in_memory().unwrap();
+        let first =
+            create_blank_session_in(&store, &workspace, "one", true, WorkspaceMode::Folder)
+                .unwrap();
+        let second =
+            create_blank_session_in(&store, &workspace, "two", true, WorkspaceMode::Folder)
+                .unwrap();
+
+        remove_session_files_with(Some(&store), &state_path_for_id(&first.id).unwrap());
+        assert!(workspace.exists(), "the other session still works here");
+        remove_session_files_with(Some(&store), &state_path_for_id(&second.id).unwrap());
+        assert!(!workspace.exists(), "the last session takes the worktree with it");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_persons_own_worktree_is_never_deleted() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = init_repo(stamp, "own");
+        let mine = repo.with_file_name(format!("snippet-wt-mine-{stamp}"));
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "feature", mine.to_str().unwrap()]);
+        let store = Store::open_in_memory().unwrap();
+        let info =
+            create_blank_session_in(&store, &mine, "mine", false, WorkspaceMode::Folder).unwrap();
+        remove_session_files_with(Some(&store), &state_path_for_id(&info.id).unwrap());
+        assert!(mine.exists(), "a worktree snippet did not make stays");
+        drop_worktree(&repo, &mine);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn deleting_a_session_drops_its_worktree() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -324,7 +409,9 @@ mod create_blank_tests {
         let workspace = prepare_new_session_workspace(&repo);
         assert!(workspace.exists());
         let store = Store::open_in_memory().unwrap();
-        let info = create_blank_session_in(&store, &workspace, "wt-drop", false).unwrap();
+        let info =
+            create_blank_session_in(&store, &workspace, "wt-drop", false, WorkspaceMode::Folder)
+                .unwrap();
         let path = state_path_for_id(&info.id).expect("created session is resolvable");
         remove_session_files_with(Some(&store), &path);
         assert!(!workspace.exists(), "isolated worktree should be gone");

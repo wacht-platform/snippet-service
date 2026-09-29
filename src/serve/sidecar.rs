@@ -251,12 +251,15 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
 
 /// Ensure the daemon has a live session for this workspace folder.
 /// Returns the daemon session id.
+/// POST /sessions — open or create a session, returning its id and the
+/// workspace it runs in (a new worktree's path when `workspace` asked for one).
 pub async fn open_session(
     info: &DaemonInfo,
     folder: &Path,
     resume: bool,
     new_conversation: bool,
-) -> Result<String, String> {
+    workspace: crate::session::WorkspaceMode,
+) -> Result<(String, std::path::PathBuf), String> {
     let url = format!("{}/sessions", info.api_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -269,6 +272,7 @@ pub async fn open_session(
             "folder": folder.display().to_string(),
             "resume": resume,
             "new_conversation": new_conversation,
+            "workspace": workspace,
         }))
         .send()
         .await
@@ -282,10 +286,16 @@ pub async fn open_session(
         .json()
         .await
         .map_err(|e| format!("open session body: {e}"))?;
-    body.get("id")
+    let id = body
+        .get("id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("open session: missing id in {body}"))
+        .ok_or_else(|| format!("open session: missing id in {body}"))?;
+    let workspace = body
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| folder.to_path_buf());
+    Ok((id.to_string(), workspace))
 }
 
 /// One session as the daemon reports it in `GET /sessions`.
@@ -297,6 +307,14 @@ pub async fn open_session(
 pub struct SessionRow {
     /// Stable id (path relative to the workspaces root). Used to attach.
     pub id: String,
+    /// The workspace the session runs in.
+    #[serde(default)]
+    pub folder: String,
+    /// For a session in a git worktree: the folder in the main checkout.
+    #[serde(default)]
+    pub origin_folder: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
     /// Conversation name: `default` for the workspace root state, else the stem.
     #[serde(default)]
     pub conversation: String,
@@ -310,9 +328,8 @@ pub struct SessionRow {
 
 /// GET /sessions[?folder=] — the daemon's session catalog.
 ///
-/// `folder` scopes the list to one workspace, which is what the TUI wants: the
-/// resume picker only ever shows the sessions belonging to the folder it is
-/// currently working in.
+/// `folder` scopes the list to one folder and the git worktrees made from it,
+/// which is what the TUI's picker shows.
 pub async fn list_sessions(
     info: &DaemonInfo,
     folder: Option<&Path>,

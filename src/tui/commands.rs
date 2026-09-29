@@ -271,37 +271,37 @@ impl App {
     /// daemon owns every session, so routing through it keeps the store row and
     /// its messages/events consistent — deleting files alone leaves a migrated
     /// conversation readable. Falls back to the local delete with no daemon.
-    pub(crate) fn delete_conversation(&mut self, name: &str) {
+    pub(crate) fn delete_conversation(&mut self, c: &Conversation) {
         if self.sidecar.is_some() {
-            let session_id = self.session_id_for(name);
             // Drop it from the catalog now. The op is deferred to the next tick,
             // so without this the entry the user just deleted keeps rendering
             // until the daemon round-trip lands.
-            self.forget_session(&session_id);
-            self.pending_session_op = Some(PendingSessionOp::Delete { session_id });
+            self.forget_session(&c.id);
+            self.pending_session_op = Some(PendingSessionOp::Delete { session_id: c.id.clone() });
             return;
         }
-        let path = self.state_path_for_conversation(name);
-        crate::session::remove_session_files(&path);
+        if let Some(path) = crate::session::state_path_for_id(&c.id) {
+            crate::session::remove_session_files(&path);
+        }
     }
 
     /// Set a saved conversation's title override (resume picker `r`).
-    pub(crate) fn rename_conversation(&mut self, name: &str, title: &str) {
+    pub(crate) fn rename_conversation(&mut self, c: &Conversation, title: &str) {
         if self.sidecar.is_some() {
-            let session_id = self.session_id_for(name);
             if let Some(rows) = self.daemon_sessions.as_mut()
-                && let Some(row) = rows.iter_mut().find(|s| s.id == session_id)
+                && let Some(row) = rows.iter_mut().find(|s| s.id == c.id)
             {
                 row.title = title.to_string();
             }
             self.pending_session_op = Some(PendingSessionOp::Rename {
-                session_id,
+                session_id: c.id.clone(),
                 title: title.to_string(),
             });
             return;
         }
-        let path = self.state_path_for_conversation(name);
-        let _ = crate::session::set_session_title(&path, title);
+        if let Some(path) = crate::session::state_path_for_id(&c.id) {
+            let _ = crate::session::set_session_title(&path, title);
+        }
     }
 
     /// Drop one session from the cached catalog, so a queued mutation renders
@@ -312,20 +312,6 @@ impl App {
         }
     }
 
-    /// The daemon's session id for a picker entry.
-    ///
-    /// The picker speaks in conversation names; the API speaks in session ids
-    /// (path relative to the workspaces root). Derived from the same path helper
-    /// the picker uses, so the two can never disagree about which session it is.
-    pub(crate) fn session_id_for(&self, name: &str) -> String {
-        crate::session::session_id_for_state_path(&self.state_path_for_conversation(name))
-    }
-
-    /// Perform a picker mutation through the daemon.
-    ///
-    /// The key handler is synchronous and the daemon call is not, so the intent is
-    /// recorded there and run here. On success the catalog is re-fetched so the
-    /// picker reflects the change on its next frame instead of after the next
     /// unrelated refresh.
     pub(crate) async fn apply_pending_session_op(&mut self) {
         let Some(op) = self.pending_session_op.take() else {
@@ -352,74 +338,124 @@ impl App {
         }
     }
 
-    pub(crate) fn list_conversations(&self) -> Vec<(String, String)> {
-        // The daemon is the source of truth for the catalog. A migrated
-        // conversation has no state file, so walking the directory below would
-        // silently omit it — the picker would show a subset of what exists.
-        if let Some(rows) = self.daemon_sessions.as_ref() {
-            let mut list: Vec<(String, String, i64)> = rows
-                .iter()
-                .filter(|s| {
-                    if s.conversation.is_empty() {
-                        return false;
-                    }
-                    // Every workspace has a root `default` state, but the disk
-                    // walk only surfaces it once it has content — otherwise a
-                    // fresh folder shows a phantom "default session" with
-                    // nothing to resume into. Match that: a titled root state
-                    // means someone has actually used it.
-                    s.conversation != "default" || !s.title.trim().is_empty()
-                })
-                .map(|s| {
-                    let desc = if s.title.trim().is_empty() {
-                        "empty session".to_string()
-                    } else {
-                        s.title.trim().to_string()
-                    };
-                    (s.conversation.clone(), desc, s.last_active)
-                })
-                .collect();
-            list.sort_by(|a, b| b.2.cmp(&a.2));
-            return list
+    /// The folder this TUI's sessions belong to: the main checkout when the
+    /// current workspace is a git worktree made from it, else the workspace.
+    pub(crate) fn home_folder(&self) -> PathBuf {
+        let workspace = &self.options.config.workspace;
+        crate::session::worktree_origin(workspace)
+            .map(|origin| origin.folder)
+            .unwrap_or_else(|| workspace.clone())
+    }
+
+    /// Sessions in the home folder and in every git worktree made from it,
+    /// newest first. Read from the daemon's catalog when there is one, else
+    /// straight from the store.
+    pub(crate) fn list_conversations(&self) -> Vec<Conversation> {
+        let home = self.home_folder();
+        let rows: Vec<crate::serve::sidecar::SessionRow> = match self.daemon_sessions.as_ref() {
+            Some(rows) => rows.clone(),
+            None => crate::session::list_device_sessions()
                 .into_iter()
-                .map(|(name, desc, last_active)| {
-                    (
-                        name,
-                        format!("({}) — {}", relative_age(last_active), shorten(desc)),
-                    )
+                .map(|s| crate::serve::sidecar::SessionRow {
+                    id: s.id,
+                    folder: s.folder,
+                    origin_folder: s.origin_folder,
+                    branch: s.branch,
+                    conversation: s.conversation,
+                    title: s.title,
+                    status: s.status,
+                    last_active: s.last_active,
                 })
-                .collect();
-        }
-        // No daemon catalog yet: build the same list straight from the store, so
-        // the picker shows real sessions instead of an empty directory walk.
-        let folder = self.options.config.workspace.clone();
-        let mut list: Vec<(String, String, i64)> = crate::session::list_device_sessions()
+                .collect(),
+        };
+        let home_str = home.display().to_string();
+        let mut list: Vec<_> = rows
             .into_iter()
-            .filter(|s| s.folder == folder)
+            .filter(|s| s.folder == home_str || s.origin_folder.as_deref() == Some(home_str.as_str()))
+            // A workspace's root `default` state exists before anyone uses it;
+            // only a titled one is a session worth resuming.
             .filter(|s| {
-                if s.conversation.is_empty() {
-                    return false;
-                }
-                s.conversation != "default" || !s.title.trim().is_empty()
+                !s.conversation.is_empty()
+                    && (s.conversation != "default" || !s.title.trim().is_empty())
             })
+            .collect();
+        list.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        list.into_iter()
             .map(|s| {
-                let desc = if s.title.trim().is_empty() {
+                let title = if s.title.trim().is_empty() {
                     "empty session".to_string()
                 } else {
                     s.title.trim().to_string()
                 };
-                (s.conversation, desc, s.last_active)
-            })
-            .collect();
-        list.sort_by(|a, b| b.2.cmp(&a.2));
-        list.into_iter()
-            .map(|(name, desc, last_active)| {
-                (
-                    name,
-                    format!("({}) — {}", relative_age(last_active), shorten(desc)),
-                )
+                Conversation {
+                    desc: format!("({}) — {}", relative_age(s.last_active), shorten(title.clone())),
+                    title,
+                    status: s.status,
+                    last_active: s.last_active,
+                    branch: s.origin_folder.as_ref().and(s.branch),
+                    folder: PathBuf::from(s.folder),
+                    name: s.conversation,
+                    id: s.id,
+                }
             })
             .collect()
+    }
+
+    /// Whether `c` is the session on screen.
+    pub(crate) fn is_active(&self, c: &Conversation) -> bool {
+        c.name == self.active_conversation && c.folder == self.options.config.workspace
+    }
+
+    /// Resume a session from the picker or sidebar, moving to its worktree
+    /// first when it works in one.
+    pub(crate) fn open_conversation(&mut self, c: &Conversation) {
+        if c.folder != self.options.config.workspace {
+            self.options.config = self.options.config.for_workspace(c.folder.clone());
+        }
+        self.resume_conversation(&c.name);
+    }
+
+    /// Start a new session. In a git repository the new-session screen asks
+    /// where it works first; elsewhere it works in the folder.
+    pub(crate) fn begin_new_session(&mut self, name: String) {
+        let home = self.home_folder();
+        let Some((_, worktrees)) = crate::session::repo_worktrees(&home) else {
+            self.start_new_session(NewChoice::Folder(home), name);
+            return;
+        };
+        let mut choices = vec![NewChoice::Worktree(home.clone()), NewChoice::Folder(home)];
+        choices.extend(
+            worktrees
+                .into_iter()
+                .map(|w| NewChoice::Existing { path: w.path, branch: w.branch }),
+        );
+        self.new_choices = choices;
+        self.new_choice_index = 0;
+        self.new_session_name = name;
+        self.screen = Screen::NewSession;
+        self.status = "↑↓ choose · Enter start · Esc cancel".to_string();
+    }
+
+    /// Start the new session where `choice` says. It is created on the first
+    /// message, with this choice.
+    pub(crate) fn start_new_session(&mut self, choice: NewChoice, name: String) {
+        let (folder, mode) = match choice {
+            NewChoice::Worktree(folder) => (folder, crate::session::WorkspaceMode::Worktree),
+            NewChoice::Folder(folder) => (folder, crate::session::WorkspaceMode::Folder),
+            NewChoice::Existing { path, .. } => (path, crate::session::WorkspaceMode::Folder),
+        };
+        if folder != self.options.config.workspace {
+            self.options.config = self.options.config.for_workspace(folder);
+        }
+        self.switch_conversation(&name);
+        self.new_workspace = Some(mode);
+        self.screen = Screen::Main;
+        self.status = match mode {
+            crate::session::WorkspaceMode::Worktree => {
+                "New session in a new worktree — it is created with your first message.".to_string()
+            }
+            crate::session::WorkspaceMode::Folder => String::new(),
+        };
     }
 
     /// Poll the daemon catalog without putting an HTTP round trip on the render
@@ -461,7 +497,7 @@ impl App {
             return;
         }
 
-        let folder = self.options.config.workspace.clone();
+        let folder = self.home_folder();
         self.daemon_sessions_refresh = Some(tokio::spawn(async move {
             crate::serve::sidecar::list_sessions(&info, Some(folder.as_path())).await
         }));
@@ -699,11 +735,7 @@ impl App {
                     let n = parts[1].to_string();
                     // A name collision would silently OPEN the existing session
                     // instead of creating a new one — surface it instead.
-                    if self
-                        .list_conversations()
-                        .iter()
-                        .any(|(existing, _)| existing == &n)
-                    {
+                    if self.list_conversations().iter().any(|c| c.name == n) {
                         self.status = format!(
                             "`{n}` already exists — /resume {n} to open it, or pick another name"
                         );
@@ -713,8 +745,8 @@ impl App {
                 } else {
                     uuid::Uuid::new_v4().to_string()
                 };
-                self.switch_conversation(&name);
                 self.status = String::new();
+                self.begin_new_session(name);
             }
             "/resume" => {
                 let target_name = if parts.len() > 1 {
@@ -729,17 +761,23 @@ impl App {
                     // FIRST: a typo must not abandon the current session into a
                     // phantom empty one named after the typo.
                     Some(name) => {
-                        if !self
+                        // The same name can exist in the folder and a worktree;
+                        // the one in the current workspace wins.
+                        let workspace = self.options.config.workspace.clone();
+                        let mut matches: Vec<_> = self
                             .list_conversations()
-                            .iter()
-                            .any(|(existing, _)| existing == &name)
-                        {
+                            .into_iter()
+                            .filter(|c| c.name == name)
+                            .collect();
+                        matches.sort_by_key(|c| c.folder != workspace);
+                        let Some(target) = matches.into_iter().next() else {
                             self.status = format!(
                                 "no session named `{name}` — bare /resume opens the picker"
                             );
                             return;
-                        }
-                        self.switch_conversation(&name)
+                        };
+                        self.open_conversation(&target);
+                        return;
                     }
                     None => {
                         // Bare /resume opens the picker (arrow keys, Enter to
@@ -1102,4 +1140,30 @@ pub(crate) fn split_recur_prompt_and_plan(rest: &str) -> (String, Option<String>
         }
     }
     (rest.to_string(), None)
+}
+
+/// A session in the picker and sidebar: where it works and its name there.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Conversation {
+    pub(crate) id: String,
+    pub(crate) folder: PathBuf,
+    pub(crate) name: String,
+    pub(crate) title: String,
+    /// Picker line: "(2h) — title".
+    pub(crate) desc: String,
+    pub(crate) status: String,
+    pub(crate) last_active: i64,
+    /// Set for a session in a git worktree of the home folder.
+    pub(crate) branch: Option<String>,
+}
+
+/// Where a new session can work.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum NewChoice {
+    /// A new worktree of this folder, on its own branch.
+    Worktree(PathBuf),
+    /// The folder itself.
+    Folder(PathBuf),
+    /// A worktree that already exists.
+    Existing { path: PathBuf, branch: Option<String> },
 }

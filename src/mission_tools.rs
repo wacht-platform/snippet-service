@@ -334,6 +334,9 @@ struct CreateSessionArgs {
     /// to the existing id instead.
     #[serde(default)]
     new_conversation: bool,
+    /// `worktree` isolates the session on its own branch; `folder` works in
+    /// the folder itself.
+    workspace: crate::session::WorkspaceMode,
 }
 pub struct CreateMissionSession;
 #[async_trait]
@@ -341,14 +344,15 @@ impl Tool for CreateMissionSession {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_mission_session".into(),
-            description: "Open a durable project chat in an existing folder. Use only for ordinary project work when no existing session owns the folder. Never use this for an agent build; agent identity homes are separate from project sessions.".into(),
+            description: "Open a durable project chat in an existing folder. Use only for ordinary project work when no existing session owns the folder. Never use this for an agent build; agent identity homes are separate from project sessions. `workspace` is required: `worktree` gives the session its own git worktree and branch (isolated from other sessions' edits; only in a git repo), `folder` works directly in the folder.".into(),
             input_schema: schema(
                 json!({
                     "folder": {"type": "string"},
                     "title": {"type": "string"},
-                    "new_conversation": {"type": "boolean"}
+                    "new_conversation": {"type": "boolean"},
+                    "workspace": {"type": "string", "enum": ["worktree", "folder"]}
                 }),
-                &["folder"],
+                &["folder", "workspace"],
             ),
         }
     }
@@ -362,7 +366,8 @@ impl Tool for CreateMissionSession {
         if args.folder.trim().is_empty() {
             return Err(ToolError::msg("folder must be a non-empty path"));
         }
-        let session = create_blank_session(&folder, &args.title, args.new_conversation)
+        let session =
+            create_blank_session(&folder, &args.title, args.new_conversation, args.workspace)
             .map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({
             "session": session,

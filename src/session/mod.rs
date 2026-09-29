@@ -613,6 +613,13 @@ pub struct SessionInfo {
     /// session list showed nothing for exactly the case the badge exists for —
     /// the user asked to see "the agent when it is working in a session".
     pub worker_agent_id: Option<String>,
+    /// For a session in a git worktree: the folder in the main checkout it was
+    /// made from, which is what a person recognises the session by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_folder: Option<String>,
+    /// The worktree's branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// The inbox session id for an agent: `inbox-<agent-id>`.
@@ -781,17 +788,22 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
         .and_then(|store| store.list_all_sessions().ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|row| SessionInfo {
-            conversation: conversation_name_from_id(&row.id).to_string(),
-            // Read before `row.id` is moved out below — struct-literal fields
-            // evaluate in the order written.
-            worker_agent_id: workers.get(&row.id).cloned(),
-            id: row.id,
-            folder: row.workspace,
-            title: row.title.unwrap_or_default(),
-            status: row.status,
-            last_active: row.last_active.unwrap_or(0),
-            agent_id: row.agent_id,
+        .map(|row| {
+            let origin = worktree_origin(Path::new(&row.workspace));
+            SessionInfo {
+                conversation: conversation_name_from_id(&row.id).to_string(),
+                // Read before `row.id` is moved out below — struct-literal
+                // fields evaluate in the order written.
+                worker_agent_id: workers.get(&row.id).cloned(),
+                id: row.id,
+                folder: row.workspace,
+                title: row.title.unwrap_or_default(),
+                status: row.status,
+                last_active: row.last_active.unwrap_or(0),
+                agent_id: row.agent_id,
+                origin_folder: origin.as_ref().map(|o| o.folder.display().to_string()),
+                branch: origin.and_then(|o| o.branch),
+            }
         })
         .collect();
 
@@ -1214,10 +1226,11 @@ pub fn create_blank_session(
     folder: &Path,
     title: &str,
     new_conversation: bool,
+    mode: WorkspaceMode,
 ) -> Result<SessionInfo, String> {
     let store =
         store_for_sessions().ok_or_else(|| "the session store is unavailable".to_string())?;
-    create_blank_session_in(&store, folder, title, new_conversation)
+    create_blank_session_in(&store, folder, title, new_conversation, mode)
 }
 
 /// [`create_blank_session`] against an explicit store, so tests can use an
@@ -1227,6 +1240,7 @@ pub fn create_blank_session_in(
     folder: &Path,
     title: &str,
     new_conversation: bool,
+    mode: WorkspaceMode,
 ) -> Result<SessionInfo, String> {
     let mut folder = folder
         .canonicalize()
@@ -1234,9 +1248,8 @@ pub fn create_blank_session_in(
     if !folder.is_dir() {
         return Err("folder is not a directory".into());
     }
-    // A git repo gets an isolated worktree for the new session. That is the
-    // WORKSPACE, not the session's storage — the two are independent now.
-    folder = prepare_new_session_workspace(&folder);
+    // The workspace, not the session's storage — the two are independent.
+    folder = session_workspace(&folder, mode);
     if let Ok(canonical) = folder.canonicalize() {
         folder = canonical;
     }
@@ -1282,9 +1295,12 @@ pub fn create_blank_session_in(
         .import_session(&id, &crate::config::workspace_key(&folder), &state, &extras)
         .map_err(|e| format!("create session: {e}"))?;
 
+    let origin = worktree_origin(&folder);
     Ok(SessionInfo {
         id,
         folder: folder.display().to_string(),
+        origin_folder: origin.as_ref().map(|o| o.folder.display().to_string()),
+        branch: origin.and_then(|o| o.branch),
         conversation: if new_conversation {
             dest.file_stem()
                 .and_then(|s| s.to_str())
@@ -1324,11 +1340,30 @@ pub fn remove_session_files_with(store: Option<&crate::store::Store>, state_path
         .filter(|p| !p.as_os_str().is_empty())
         .or_else(|| workspace_from_state_file(state_path));
     if let Some(folder) = folder {
-        drop_session_worktree(&folder);
+        // A worktree can hold several sessions once one is started in an
+        // existing worktree; it goes with the last of them.
+        let shared = store.is_some_and(|s| worktree_has_other_sessions(s, &id, &folder));
+        if !shared {
+            drop_session_worktree(&folder);
+        }
     }
     if let Some(store) = store {
         let _ = store.delete_conversation(&id);
     }
+}
+
+/// Whether a session other than `id` works inside the worktree holding `folder`.
+fn worktree_has_other_sessions(store: &crate::store::Store, id: &str, folder: &Path) -> bool {
+    let Some(worktree) = linked_worktree_root(folder) else {
+        return false;
+    };
+    store.list_all_sessions().is_ok_and(|rows| {
+        rows.iter().any(|row| {
+            row.id != id
+                && linked_worktree_root(Path::new(&row.workspace)).as_deref()
+                    == Some(worktree.as_path())
+        })
+    })
 }
 
 fn workspace_from_state_file(state_path: &Path) -> Option<PathBuf> {

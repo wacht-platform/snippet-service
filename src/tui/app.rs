@@ -45,6 +45,9 @@ pub(crate) enum Screen {
     Term,
     RewindCheckpointSelection,
     ForkCheckpointSelection,
+    /// Where a new session works: a new worktree, the folder, or an existing
+    /// worktree. Shown before a new session starts in a git repository.
+    NewSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +178,14 @@ pub(crate) struct App {
     /// re-reads + deserializes EVERY session file; doing that per keystroke/frame
     /// made the picker laggy at scale. Populated on picker open, refreshed after
     /// rename/delete, dropped on close.
-    pub(crate) conv_cache: Option<Vec<(String, String)>>,
+    pub(crate) conv_cache: Option<Vec<crate::tui::commands::Conversation>>,
+    /// Where the next new session works, once chosen. Taken when it is created.
+    pub(crate) new_workspace: Option<crate::session::WorkspaceMode>,
+    /// The new-session screen's choices and selection.
+    pub(crate) new_choices: Vec<crate::tui::commands::NewChoice>,
+    pub(crate) new_choice_index: usize,
+    /// The name the chosen new session will take.
+    pub(crate) new_session_name: String,
     /// The daemon's session catalog for this workspace, refreshed periodically.
     ///
     /// The picker renders from this rather than walking the filesystem: the
@@ -322,6 +332,10 @@ impl App {
             sent_turn_pending: false,
             effective_model: (String::new(), String::new()),
             conv_cache: None,
+            new_workspace: None,
+            new_choices: Vec::new(),
+            new_choice_index: 0,
+            new_session_name: String::new(),
             daemon_sessions: None,
             daemon_sessions_refresh: None,
             daemon_sessions_refreshed_at: None,
@@ -376,13 +390,19 @@ impl App {
         if let Some(id) = app.options.resume.clone() {
             // Explicit --resume <id> wins: reopen exactly that conversation.
             app.switch_conversation(&id);
-        } else if app.options.config.resume_on_start {
-            if let Some(last_active) = app.find_last_active_conversation() {
-                app.switch_conversation(&last_active);
-            }
+        } else if let Some(last_active) = app
+            .options
+            .config
+            .resume_on_start
+            .then(|| app.find_last_active_conversation())
+            .flatten()
+        {
+            app.switch_conversation(&last_active);
         } else {
-            let name = uuid::Uuid::new_v4().to_string();
-            app.switch_conversation(&name);
+            // Nothing to resume: a new session, and in a git repository the
+            // new-session screen asks where it works.
+            app.refresh_effective_model();
+            app.begin_new_session(uuid::Uuid::new_v4().to_string());
         }
 
         let chatgpt_ready =
@@ -1010,15 +1030,24 @@ impl App {
         if !self.session_known() {
             let folder = self.options.config.workspace.clone();
             let new_conversation = self.active_conversation != "default";
+            let workspace = self
+                .new_workspace
+                .take()
+                .unwrap_or(crate::session::WorkspaceMode::Folder);
             match crate::serve::sidecar::open_session(
                 &info,
                 &folder,
                 pending.resume && !new_conversation,
                 new_conversation,
+                workspace,
             )
             .await
             {
-                Ok(session_id) => {
+                Ok((session_id, runs_in)) => {
+                    // A new worktree is where the session works from now on.
+                    if runs_in != self.options.config.workspace {
+                        self.options.config = self.options.config.for_workspace(runs_in);
+                    }
                     // Don't use state_path_for_id here — it canonicalize()s and
                     // fails before the first persist creates the file. Join the
                     // workspaces root directly.
@@ -1053,7 +1082,14 @@ impl App {
                 // then re-attach.
                 if self.session_known() {
                     let folder = self.options.config.workspace.clone();
-                    let _ = crate::serve::sidecar::open_session(&info, &folder, true, false).await;
+                    let _ = crate::serve::sidecar::open_session(
+                        &info,
+                        &folder,
+                        true,
+                        false,
+                        crate::session::WorkspaceMode::Folder,
+                    )
+                    .await;
                     if let Ok(attach) =
                         crate::serve::sidecar::attach(&info, &self.active_state_path).await
                     {
