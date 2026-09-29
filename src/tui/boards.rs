@@ -89,15 +89,6 @@ impl Boards {
         }
     }
 
-    /// Mark `key` for refetch on the next poll.
-    pub(crate) fn invalidate(&self, key: &str) {
-        if let Ok(mut s) = self.slots.lock() {
-            if let Some(slot) = s.get_mut(key) {
-                slot.at = None;
-            }
-        }
-    }
-
     /// Run an action (POST/PUT/DELETE) and refetch `refresh` when it lands.
     pub(crate) fn act(
         &self,
@@ -137,6 +128,13 @@ pub(crate) fn board_request(
     let _ = app;
     match tab {
         PaneTab::Agents => Some(("agents".into(), "/agents".into(), vec![], Duration::from_secs(10))),
+        PaneTab::Tasks => Some((
+            "tasks".into(),
+            "/mission-control/tasks".into(),
+            vec![("archived", "false".into())],
+            Duration::from_secs(5),
+        )),
+        PaneTab::Jobs => Some(("jobs".into(), "/recurring".into(), vec![], Duration::from_secs(10))),
         _ => None,
     }
 }
@@ -181,8 +179,85 @@ impl App {
     /// How many rows the current panel lists, for cursor movement.
     pub(crate) fn board_len(&self, tab: PaneTab) -> usize {
         match tab {
-            PaneTab::Agents => self.boards.get("agents").value.and_then(|v| v.as_array().map(Vec::len)).unwrap_or(0),
+            PaneTab::Agents => list_len(&self.boards.get("agents")),
+            PaneTab::Tasks => list_len(&self.boards.get("tasks")),
+            PaneTab::Jobs => list_len(&self.boards.get("jobs")),
             _ => 0,
+        }
+    }
+
+    fn board_item(&self, key: &str) -> Option<Value> {
+        let v = self.boards.get(key).value?;
+        v.as_array()?.get(self.shell.pane_index).cloned()
+    }
+
+    /// Panel-specific keys; true when handled.
+    pub(crate) fn handle_board_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::KeyCode;
+        // A pending confirmation takes the next key: y runs it, anything else
+        // cancels.
+        if let Some(confirm) = self.board_confirm.take() {
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.run_confirmed(confirm.action);
+            } else {
+                self.set_notice("Cancelled.");
+            }
+            return true;
+        }
+        let Some(info) = self.sidecar.clone() else {
+            return false;
+        };
+        match (self.shell.tab, key.code) {
+            (PaneTab::Jobs, KeyCode::Char('p') | KeyCode::Char(' ')) => {
+                if let Some(job) = self.board_item("jobs") {
+                    let enabled = job.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    let title = job_title(&job);
+                    self.boards.act(
+                        info,
+                        reqwest::Method::PUT,
+                        format!("/recurring/{}", urlencode(&s(&job, "id"))),
+                        vec![],
+                        Some(serde_json::json!({ "enabled": !enabled })),
+                        format!("{} {title}.", if enabled { "Paused" } else { "Resumed" }),
+                        "jobs".into(),
+                    );
+                }
+                true
+            }
+            (PaneTab::Jobs, KeyCode::Char('d')) => {
+                if let Some(job) = self.board_item("jobs") {
+                    self.board_confirm = Some(Confirm {
+                        prompt: format!("Delete {}? y to confirm", job_title(&job)),
+                        action: ConfirmAction::DeleteJob(s(&job, "id"), job_title(&job)),
+                    });
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn run_confirmed(&mut self, action: ConfirmAction) {
+        let Some(info) = self.sidecar.clone() else {
+            return;
+        };
+        match action {
+            ConfirmAction::DeleteJob(id, title) => self.boards.act(
+                info,
+                reqwest::Method::DELETE,
+                format!("/recurring/{}", urlencode(&id)),
+                vec![],
+                None,
+                format!("Deleted {title}."),
+                "jobs".into(),
+            ),
+        }
+        self.shell.pane_index = self.shell.pane_index.saturating_sub(1);
+    }
+
+    fn set_notice(&self, text: &str) {
+        if let Ok(mut n) = self.boards.notice.lock() {
+            *n = Some(text.into());
         }
     }
 
@@ -214,6 +289,78 @@ impl App {
             }
             Err(e) => self.status = format!("Mission Control: {e}"),
         }
+    }
+}
+
+/// An action that waits for a y.
+pub(crate) struct Confirm {
+    pub(crate) prompt: String,
+    pub(crate) action: ConfirmAction,
+}
+
+pub(crate) enum ConfirmAction {
+    DeleteJob(String, String),
+}
+
+fn list_len(f: &Fetched) -> usize {
+    f.value.as_ref().and_then(Value::as_array).map_or(0, Vec::len)
+}
+
+fn job_title(job: &Value) -> String {
+    let t = s(job, "title");
+    if t.is_empty() { s(job, "id") } else { t }
+}
+
+/// "every 1h", "daily 02:30", "once" — as the apps word a schedule.
+fn schedule_label(job: &Value) -> String {
+    let Some(sch) = job.get("schedule") else {
+        return String::new();
+    };
+    let n = |k: &str| sch.get(k).and_then(Value::as_i64).unwrap_or(0);
+    match s(sch, "kind").as_str() {
+        "interval" => {
+            let secs = n("every_secs");
+            if secs > 0 && secs % 86_400 == 0 {
+                format!("every {}d", secs / 86_400)
+            } else if secs > 0 && secs % 3600 == 0 {
+                format!("every {}h", secs / 3600)
+            } else if secs > 0 && secs % 60 == 0 {
+                format!("every {}m", secs / 60)
+            } else {
+                format!("every {secs}s")
+            }
+        }
+        "daily" => format!("daily {:02}:{:02}", n("hour"), n("minute")),
+        "once" => "once".into(),
+        other => other.to_string(),
+    }
+}
+
+/// "next in 3h", "due now"; nothing for a paused job (its row says so).
+fn next_run(job: &Value) -> String {
+    if !job.get("enabled").and_then(Value::as_bool).unwrap_or(true) {
+        return String::new();
+    }
+    if job.get("queued").and_then(Value::as_bool).unwrap_or(false) {
+        return "queued".into();
+    }
+    let next = job.get("next_run_at").and_then(Value::as_i64).unwrap_or(0);
+    if next <= 0 {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = next - now;
+    if secs <= 0 {
+        "due now".into()
+    } else if secs < 3600 {
+        format!("next in {}m", (secs + 59) / 60)
+    } else if secs < 86_400 {
+        format!("next in {}h", secs / 3600)
+    } else {
+        format!("next in {}d", secs / 86_400)
     }
 }
 
@@ -343,11 +490,70 @@ pub(crate) fn board_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                 }
             }
         }
+        PaneTab::Tasks => {
+            let f = app.boards.get("tasks");
+            let tasks = f.value.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Some(i) = app.shell.pane_detail.filter(|i| *i < tasks.len()) {
+                lines.extend(task_detail(&tasks[i], width));
+            } else if let Some(state) = state_lines(&f, "No open tasks on the board.", tasks.is_empty()) {
+                lines.extend(state);
+            } else {
+                for (i, t) in tasks.iter().enumerate() {
+                    lines.push(row(&s(t, "title"), &short(&s(t, "id")), &s(t, "status"), width, focused && i == app.shell.pane_index));
+                }
+            }
+        }
+        PaneTab::Jobs => {
+            let f = app.boards.get("jobs");
+            let jobs = f.value.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
+            if let Some(state) = state_lines(&f, "No scheduled jobs.", jobs.is_empty()) {
+                lines.extend(state);
+            } else {
+                for (i, j) in jobs.iter().enumerate() {
+                    let enabled = j.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                    let selected = focused && i == app.shell.pane_index;
+                    lines.push(row(&job_title(j), "", if enabled { "enabled" } else { "paused" }, width, selected));
+                    let meta = [schedule_label(j), next_run(j)].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ");
+                    lines.push(Line::from(Span::styled(format!("   {meta}"), Style::default().fg(faint())))
+                        .style(Style::default().bg(if selected { surface3() } else { surface1() })));
+                    let err = s(j, "last_error");
+                    if !err.is_empty() {
+                        lines.push(Line::from(Span::styled(format!("   {}", pad(&err, width.saturating_sub(3))), Style::default().fg(danger()))));
+                    }
+                }
+            }
+        }
         _ => {}
     }
-    if let Some(n) = app.boards.notice.lock().ok().and_then(|n| n.clone()) {
+    if let Some(c) = app.board_confirm.as_ref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(c.prompt.clone(), Style::default().fg(warn()))));
+    } else if let Some(n) = app.boards.notice.lock().ok().and_then(|n| n.clone()) {
         lines.push(Line::from(""));
         lines.push(faint_line(&n));
+    }
+    lines
+}
+
+fn task_detail(t: &Value, width: usize) -> Vec<Line<'static>> {
+    let status = s(t, "status");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("‹ ", Style::default().fg(accent())),
+            Span::styled(s(t, "title"), Style::default().fg(text()).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(status.replace('_', " "), Style::default().fg(status_color(&status))),
+            Span::styled(format!("  task {}", short(&s(t, "id"))), Style::default().fg(faint())),
+        ]),
+    ];
+    for (label, key) in [("Briefing", "description"), ("Latest", "summary")] {
+        let body = s(t, key);
+        if !body.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(section(label));
+            lines.extend(wrap(&body, width, 1, Style::default().fg(soft())));
+        }
     }
     lines
 }
@@ -403,6 +609,5 @@ fn agent_detail(app: &App, a: &Value, width: usize) -> Vec<Line<'static>> {
             lines.extend(wrap(&s(e, "summary"), width, 3, Style::default().fg(soft())));
         }
     }
-    let _ = short;
     lines
 }

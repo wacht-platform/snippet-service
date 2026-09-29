@@ -231,3 +231,47 @@ fn agents_panel_lists_agents_and_opens_a_board() {
     assert!(detail.contains("Wire the traffic path panel"));
     assert!(detail.contains("reported"));
 }
+
+#[test]
+fn tasks_and_jobs_panels_render() {
+    let mut app = board_app();
+    app.boards.seed(
+        "tasks",
+        serde_json::json!([
+            {"id": "eaa98084-fee3", "title": "Check Secure Access extension", "status": "in_progress",
+             "description": "Confirm whether all Secure Access work is done.", "summary": "31 assertions pass."},
+            {"id": "9f8e7d6c5b4a", "title": "Package the extension", "status": "blocked"},
+        ]),
+    );
+    app.boards.seed(
+        "jobs",
+        serde_json::json!([
+            {"id": "j1", "title": "Nightly dependency audit", "enabled": true,
+             "schedule": {"kind": "daily", "hour": 2, "minute": 30}, "next_run_at": 0},
+            {"id": "j2", "title": "Check CI on open PRs", "enabled": false,
+             "schedule": {"kind": "interval", "every_secs": 3600}, "last_error": "session not found"},
+        ]),
+    );
+    app.shell.tab = PaneTab::Tasks;
+    let tasks = snapshot_app(&mut app, 170, 30).join("\n");
+    for row in tasks.lines() { println!("|{row}|"); }
+    assert!(tasks.contains("Check Secure Access extension") && tasks.contains("in progress"));
+    assert!(tasks.contains("blocked") && tasks.contains("eaa98084"));
+
+    app.shell.pane_detail = Some(0);
+    let detail = snapshot_app(&mut app, 170, 30).join("\n");
+    assert!(detail.contains("Briefing") && detail.contains("Confirm whether all Secure Access"));
+    assert!(detail.contains("31 assertions pass."));
+
+    app.shell.pane_detail = None;
+    app.shell.tab = PaneTab::Jobs;
+    app.board_confirm = Some(super::boards::Confirm {
+        prompt: "Delete Nightly dependency audit? y to confirm".into(),
+        action: super::boards::ConfirmAction::DeleteJob("j1".into(), "Nightly dependency audit".into()),
+    });
+    let jobs = snapshot_app(&mut app, 170, 30).join("\n");
+    for row in jobs.lines() { println!("|{row}|"); }
+    assert!(jobs.contains("daily 02:30") && jobs.contains("every 1h"));
+    assert!(jobs.contains("paused") && jobs.contains("session not found"));
+    assert!(jobs.contains("y to confirm"));
+}
