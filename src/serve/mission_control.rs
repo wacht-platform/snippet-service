@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::config::workspaces_root;
 use crate::serve::task_summary;
 use crate::coordination::{
-    HandoffMode, NotificationMarker, Task, TaskLink, TaskLinkKind, TaskResult, TaskStatus,
+    HandoffMode, NotificationMarker, Task, TaskResult, TaskStatus,
 };
 use crate::mission_control::{self, ManagedSession};
 use crate::session::{
@@ -335,9 +335,14 @@ async fn task(
     }
 }
 
-async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String> {
+pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String> {
     let root = &d.mission_control_root;
     let now = chrono::Utc::now().to_rfc3339();
+    // Checked before the claim so a task waiting on someone else's paths stays
+    // queued without being claimed and released every tick.
+    if let Some(waiting) = wait_for_path_owners(d, task_id, &now, false)? {
+        return Ok(waiting);
+    }
     let task = d
         .store
         .claim_task_for_dispatch(task_id, &now)
@@ -368,18 +373,20 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String
             }
         };
         if other.status != TaskStatus::Done {
-            let reason = format!("waiting on dependency {blocker_id}");
+            let reason = if other.status.is_terminal() {
+                format!(
+                    "dependency {blocker_id} is {}; retry it, or cancel or unlink this task",
+                    other.status
+                )
+            } else {
+                format!("waiting on dependency {blocker_id}")
+            };
             let blocked = d
                 .store
                 .update_task_in(task_id, &now, |task| {
                     task.status = TaskStatus::Blocked;
                     task.reporting_session = None;
-                    task.notifications.push(NotificationMarker {
-                        target: "mission_control".to_string(),
-                        kind: "blocked".to_string(),
-                        message: reason.clone(),
-                        delivered: false,
-                    });
+                    task.notify_once("blocked", &reason);
                 })
                 .map_err(|error| error.to_string())?;
             return Ok(blocked);
@@ -397,43 +404,10 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String
         release_failed_claim(d, &task, &error)?;
         return Err(error);
     }
-    let conflicts = d
-        .store
-        .task_path_conflicts(task_id, &task.owned_paths)
-        .map_err(|error| error.to_string())?;
-    if !conflicts.is_empty() {
-        let mut owners = Vec::new();
-        for conflict in &conflicts {
-            if !owners.contains(&conflict.0) {
-                owners.push(conflict.0.clone());
-            }
-        }
-        let reason = format!("waiting on workspace owner(s): {}", owners.join(", "));
-        let blocked = d
-            .store
-            .update_task_in(task_id, &now, |task| {
-                task.status = TaskStatus::Blocked;
-                task.reporting_session = None;
-                task.dispatch_failures = 0;
-                if !task.notifications.iter().any(|n| n.message == reason) {
-                    task.notifications.push(NotificationMarker {
-                        target: "mission_control".to_string(),
-                        kind: "blocked".to_string(),
-                        message: reason.clone(),
-                        delivered: false,
-                    });
-                }
-            })
-            .map_err(|error| error.to_string())?;
-        for owner in &owners {
-            let _ = d.store.link_tasks(&TaskLink {
-                from_task_id: owner.clone(),
-                to_task_id: task_id.to_string(),
-                kind: TaskLinkKind::Blocks,
-                created_at: now.clone(),
-            });
-        }
-        return Ok(blocked);
+    // A concurrent dispatch may have taken the paths between the check above
+    // and the claim; hand the claim back rather than deliver into them.
+    if let Some(waiting) = wait_for_path_owners(d, task_id, &now, true)? {
+        return Ok(waiting);
     }
     let handoff = task
         .handoff
@@ -527,6 +501,51 @@ async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<Task, String
         .update_task_in(task_id, &now, |t| t.dispatch_failures = 0)
         .map_err(|error| error.to_string())?;
     Ok(task)
+}
+
+/// If other in-progress tasks own any of this task's paths, leave it queued
+/// behind them and tell Mission Control once. `claimed` hands a claim back.
+///
+/// The wait is not written as a `blocks` link: that edge would outlive the
+/// conflict, and a failed owner would then hold this task forever.
+fn wait_for_path_owners(
+    d: &Daemon,
+    task_id: &str,
+    now: &str,
+    claimed: bool,
+) -> Result<Option<Task>, String> {
+    let Some(task) = d.store.get_task(task_id).map_err(|error| error.to_string())? else {
+        return Err(format!("unknown task {task_id}"));
+    };
+    let expected = if claimed { TaskStatus::InProgress } else { TaskStatus::Todo };
+    if task.status != expected {
+        return Ok(None);
+    }
+    let conflicts = d
+        .store
+        .task_path_conflicts(task_id, &task.owned_paths)
+        .map_err(|error| error.to_string())?;
+    if conflicts.is_empty() {
+        return Ok(None);
+    }
+    let mut owners: Vec<String> = conflicts.into_iter().map(|(owner, _)| owner).collect();
+    owners.sort();
+    owners.dedup();
+    let reason = format!("waiting on workspace owner(s): {}", owners.join(", "));
+    if !claimed && task.notifications.iter().any(|n| n.message == reason) {
+        return Ok(Some(task));
+    }
+    let task = d
+        .store
+        .update_task_in(task_id, now, |task| {
+            if claimed {
+                task.status = TaskStatus::Todo;
+                task.reporting_session = None;
+            }
+            task.notify_once("blocked", &reason);
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(Some(task))
 }
 
 fn release_failed_claim(d: &Daemon, task: &Task, error: &str) -> Result<(), String> {

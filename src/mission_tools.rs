@@ -623,10 +623,10 @@ impl Tool for UpdateMissionTask {
                 actor_kind: "agent".into(),
                 actor_id: crate::mission_control::SESSION_ID.into(),
                 payload_version: 1,
-                payload: json!({
+                payload: crate::coordination_tools::stamp_origin(ctx, json!({
                     "body": format!("Task updated by Mission Control: {body}"),
                     "task_id": task_id,
-                }),
+                })),
                 causation_id: None,
                 correlation_id: Some(task_id.to_string()),
                 idempotency_key: uuid::Uuid::new_v4().to_string(),
@@ -728,13 +728,13 @@ impl Tool for AssignTaskAgent {
             actor_kind: "agent".into(),
             actor_id: crate::mission_control::SESSION_ID.into(),
             payload_version: 1,
-            payload: json!({
+            payload: crate::coordination_tools::stamp_origin(ctx, json!({
                 "body": format!("Agent `{agent_id}` assigned to task as `{role}` (status: {status})"),
                 "task_id": task_id,
                 "agent_id": agent_id,
                 "role": role,
                 "status": status,
-            }),
+            })),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
             idempotency_key: uuid::Uuid::new_v4().to_string(),
@@ -818,12 +818,12 @@ impl Tool for TransferMissionTaskLease {
             actor_kind: "agent".into(),
             actor_id: crate::mission_control::SESSION_ID.into(),
             payload_version: 1,
-            payload: json!({
+            payload: crate::coordination_tools::stamp_origin(ctx, json!({
                 "body": body,
                 "task_id": task_id,
                 "from_agent_id": current_active,
                 "to_agent_id": to_agent,
-            }),
+            })),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
             idempotency_key: uuid::Uuid::new_v4().to_string(),
@@ -1076,7 +1076,6 @@ impl Tool for ReportMissionTask {
             store
                 .update_task_in(&args.task_id, &now, |task| {
                     task.status = status;
-                    task.owned_paths.clear(); // release ownership while blocked
                     task.notifications.push(NotificationMarker {
                         target: "mission_control".into(),
                         kind: "blocked".into(),
@@ -1130,12 +1129,12 @@ impl Tool for ReportMissionTask {
             actor_kind: "agent".into(),
             actor_id: reporter.unwrap_or_else(|| "worker".into()),
             payload_version: 1,
-            payload: json!({
+            payload: crate::coordination_tools::stamp_origin(ctx, json!({
                 "body": format!("Task reported {status_for_board}: {summary_for_board}"),
                 "task_id": task.id,
                 "status": status_for_board.to_string(),
                 "summary": summary_for_board,
-            }),
+            })),
             causation_id: None,
             correlation_id: Some(task.id.clone()),
             idempotency_key: uuid::Uuid::new_v4().to_string(),

@@ -141,7 +141,7 @@ impl Tool for PostCoordinationMessage {
             actor_kind: actor_kind.to_string(),
             actor_id,
             payload_version: 1,
-            payload: json!({"body": args.body}),
+            payload: stamp_origin(ctx, json!({"body": args.body})),
             causation_id: None,
             correlation_id: None,
             idempotency_key: key,
@@ -700,11 +700,11 @@ impl Tool for MessageMissionControl {
             actor_kind: actor_kind.to_string(),
             actor_id: actor_id.clone(),
             payload_version: 1,
-            payload: json!({
+            payload: stamp_origin(ctx, json!({
                 "body": message,
                 "task_id": task_id,
                 "to": "mission_control",
-            }),
+            })),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
             idempotency_key: Uuid::new_v4().to_string(),
@@ -780,7 +780,7 @@ impl Tool for PostTaskCoordination {
             actor_kind: actor_kind.to_string(),
             actor_id,
             payload_version: 1,
-            payload: json!({"body": body, "task_id": task_id}),
+            payload: stamp_origin(ctx, json!({"body": body, "task_id": task_id})),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
             idempotency_key: Uuid::new_v4().to_string(),
@@ -886,7 +886,7 @@ impl Tool for TransferTaskSessionLease {
             actor_kind: "agent".into(),
             actor_id: actor_id.clone(),
             payload_version: 1,
-            payload: json!({
+            payload: stamp_origin(ctx, json!({
                 "body": body,
                 "task_id": task_id,
                 "from_agent_id": current_active,
@@ -894,7 +894,7 @@ impl Tool for TransferTaskSessionLease {
                 "reason": reason_str,
                 "handoff_context": args.handoff_context,
                 "artifacts": args.artifacts,
-            }),
+            })),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
             idempotency_key: Uuid::new_v4().to_string(),
@@ -1053,11 +1053,11 @@ impl Tool for ClaimAndDispatchTask {
             actor_kind: actor_kind.to_string(),
             actor_id: actor_id.clone(),
             payload_version: 1,
-            payload: json!({
+            payload: stamp_origin(ctx, json!({
                 "task_id": task_id,
                 "agent_id": actor_id,
                 "profile": updated.profile,
-            }),
+            })),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
             idempotency_key: Uuid::new_v4().to_string(),
@@ -1081,6 +1081,14 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+
+/// Record the session an event was posted from, so the room's wake-up skips it.
+pub(crate) fn stamp_origin(ctx: &ToolContext, mut payload: Value) -> Value {
+    if let Some(session) = ctx.durable_session_id() {
+        payload["origin_session"] = json!(session);
+    }
+    payload
+}
 
 #[cfg(test)]
 mod tests {
