@@ -871,9 +871,11 @@ impl QOption {
     }
 
     /// How the choice reads in the answer sent back: the label, with the value
-    /// alongside when the model gave it a different one.
+    /// alongside when it says something the label doesn't ("android" for
+    /// "Android" adds nothing).
     pub(crate) fn answer(&self) -> String {
-        if self.value.is_empty() || self.value == self.label {
+        let norm = |x: &str| x.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase();
+        if self.value.is_empty() || norm(&self.value) == norm(&self.label) {
             self.label.clone()
         } else {
             format!("{} ({})", self.label, self.value)
