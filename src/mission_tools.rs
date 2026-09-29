@@ -513,18 +513,23 @@ impl Tool for CreateMissionTask {
             now_rfc3339(),
         );
         task.profile = profile.clone();
-        let now = now_rfc3339();
+        // The ROSTER is what carries the worker identity forward: it names who
+        // does the work and gives that agent its seat in the task room. Written
+        // with the task in one transaction, or the dispatch loop could deliver
+        // the task in between and fall back to the default worker.
+        let worker = crate::coordination::TaskAgent {
+            task_id: task.id.clone(),
+            agent_id: agent_id.clone(),
+            work_session_id: None,
+            scope: String::new(),
+            status: "active".into(),
+            role: "implementer".into(),
+            added_at: task.created_at.clone(),
+            removed_at: None,
+        };
         store
-            .create_task(&task)
+            .create_task_with_agents(&task, &[worker])
             .map_err(|e| ToolError::msg(format!("create task: {e}")))?;
-        // The ROSTER is what carries the worker identity forward. The target
-        // session is not always agent-bound, so at completion the session's own
-        // context cannot say which agent did the work — this row is the only
-        // place that can, and it is what lets the report reach that agent's own
-        // board. Membership also grants the agent its room on the task thread.
-        store
-            .add_task_agent_full(&task.id, &agent_id, "implementer", None, "", "active", &now)
-            .map_err(|e| ToolError::msg(format!("record task agent: {e}")))?;
         Ok(ToolResult::success(
             json!({
                 "task": task_view(&task),
@@ -709,11 +714,6 @@ impl Tool for AssignTaskAgent {
                     let _ = store.set_task_agent_status(task_id, &m.agent_id, "waiting");
                 }
             }
-            if !task.session_id.trim().is_empty() {
-                let session_role = if agent_id == "snippet" { "standard" } else { "specialized" };
-                let agent_opt = if agent_id == "snippet" { None } else { Some(agent_id) };
-                let _ = store.set_session_role(&task.session_id, session_role, agent_opt);
-            }
         }
 
         store.add_task_agent_full(task_id, agent_id, role, None, scope, status, &now)
@@ -801,12 +801,6 @@ impl Tool for TransferMissionTaskLease {
 
         store.transfer_task_session_lease(task_id, current_active, to_agent)
             .map_err(|e| ToolError::msg(format!("transfer lease: {e}")))?;
-
-        if !task.session_id.trim().is_empty() {
-            let role = if to_agent == "snippet" { "standard" } else { "specialized" };
-            let agent_opt = if to_agent == "snippet" { None } else { Some(to_agent) };
-            let _ = store.set_session_role(&task.session_id, role, agent_opt);
-        }
 
         let body = format!("Session lease transferred to `{to_agent}` by Mission Control");
         let event = CoordinationEvent {
@@ -1090,12 +1084,13 @@ impl Tool for ReportMissionTask {
         // agent-bound, so `ctx.agent_id()` is usually None here and the report
         // would be silently skipped. The roster was written when Mission Control
         // created the task, so it is the one record that knows who did the work.
-        let reporter = store
-            .list_task_agents(&task.id)
-            .unwrap_or_default()
-            .into_iter()
-            .find(|member| member.removed_at.is_none())
-            .map(|member| member.agent_id)
+        let roster = store.list_task_agents(&task.id).unwrap_or_default();
+        let current = roster.iter().filter(|member| member.removed_at.is_none());
+        let reporter = current
+            .clone()
+            .find(|member| member.status == "active")
+            .or_else(|| current.clone().next())
+            .map(|member| member.agent_id.clone())
             .or_else(|| ctx.agent_id().map(str::to_string));
         if let Some(agent_id) = reporter.as_deref() {
             let verb = match status_for_board {
@@ -1114,10 +1109,6 @@ impl Tool for ReportMissionTask {
                     created_at: &now,
                 },
             );
-        }
-
-        if status_for_board.is_terminal() && !task.session_id.trim().is_empty() {
-            let _ = store.set_session_role(&task.session_id, "standard", None);
         }
 
         let report_event = CoordinationEvent {
@@ -1506,10 +1497,20 @@ mod tests {
             .unwrap();
         assert_eq!(report_res.value["status"], "success");
 
-        // Verify session role reverted to standard Snippet
+        // The session is the reviewer's own; finishing a task must not strip it.
         let s_row = db.get_session_row("s-mc").unwrap().unwrap();
-        assert_eq!(s_row.role, "standard");
-        assert_eq!(s_row.agent_id, None);
+        assert_eq!(s_row.role, "specialized");
+        assert_eq!(s_row.agent_id.as_deref(), Some("reviewer"));
+
+        // Credited to the agent holding the lease, not the first one on the roster.
+        let reviewer_board = db
+            .read_board(
+                "reviewer",
+                &crate::coordination::BoardQuery { workspace: None, contains: None, kind: None },
+                10,
+            )
+            .unwrap();
+        assert!(reviewer_board.iter().any(|e| e.summary.contains("finished")));
 
         // Verify thread event was emitted
         let events = db.events_for_thread(&task.thread_id, 0, 10).unwrap();

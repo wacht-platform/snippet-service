@@ -51,26 +51,38 @@ fn db(ctx: &ToolContext) -> Result<Store, ToolError> {
 /// the session posts as `agent`, a plain session posts as `session`. Both are
 /// addressable, but only the former is an identity the directory knows.
 fn actor(ctx: &ToolContext) -> Result<(&'static str, String), ToolError> {
+    // The lease holder on work dispatched here comes first: a lease can move an
+    // agent into a session that belongs to someone else, or to no one.
+    if let Some(agent_id) = ctx.durable_session_id().and_then(|session| lease_holder(ctx, session)) {
+        return Ok(("agent", agent_id));
+    }
     if let Some(agent_id) = ctx.agent_id() {
         return Ok(("agent", agent_id.to_string()));
     }
     if let Some(session_id) = ctx.durable_session_id() {
-        if let Ok(db) = db(ctx) {
-            if let Ok(tasks) = db.list_tasks(Some(session_id), Some(&crate::coordination::TaskStatus::InProgress)) {
-                for task in tasks {
-                    if let Ok(roster) = db.list_task_agents(&task.id) {
-                        if let Some(active) = roster.iter().find(|m| m.status == "active" && m.removed_at.is_none()) {
-                            if active.agent_id != "snippet" {
-                                return Ok(("agent", active.agent_id.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
         return Ok(("session", session_id.to_string()));
     }
     Err(ToolError::msg("posting to the coordination board requires a session identity"))
+}
+
+/// The specialized agent holding the lease on a task this session is running.
+/// The default worker is not one: it has no identity beyond the session's own.
+fn lease_holder(ctx: &ToolContext, session_id: &str) -> Option<String> {
+    let db = db(ctx).ok()?;
+    let tasks = db
+        .list_tasks(Some(session_id), Some(&crate::coordination::TaskStatus::InProgress))
+        .ok()?;
+    tasks
+        .iter()
+        .filter(|task| task.reporting_session.as_deref() == Some(session_id))
+        .find_map(|task| {
+            db.list_task_agents(&task.id)
+                .ok()?
+                .into_iter()
+                .find(|m| m.status == "active" && m.removed_at.is_none())
+                .map(|m| m.agent_id)
+                .filter(|agent| agent != crate::coordination::SNIPPET_AGENT_ID)
+        })
 }
 
 
@@ -860,12 +872,6 @@ impl Tool for TransferTaskSessionLease {
         db.transfer_task_session_lease(task_id, current_active, to_agent)
             .map_err(|e| ToolError::msg(format!("transfer lease: {e}")))?;
 
-        if !task.session_id.trim().is_empty() {
-            let role = if to_agent == "snippet" { "standard" } else { "specialized" };
-            let agent_opt = if to_agent == "snippet" { None } else { Some(to_agent) };
-            let _ = db.set_session_role(&task.session_id, role, agent_opt);
-        }
-
         let reason_str = args.reason.as_deref().unwrap_or("Handoff to next agent");
         let mut body = format!("Session lease transferred from {current_active} to {to_agent}: {reason_str}");
         if let Some(ref h_ctx) = args.handoff_context {
@@ -1038,12 +1044,6 @@ impl Tool for ClaimAndDispatchTask {
             })
             .map_err(|e| ToolError::msg(format!("claim task: {e}")))?;
 
-        if !task.session_id.trim().is_empty() {
-            let role = if actor_id == "snippet" { "standard" } else { "specialized" };
-            let agent_opt = if actor_id == "snippet" { None } else { Some(actor_id.as_str()) };
-            let _ = db.set_session_role(&task.session_id, role, agent_opt);
-        }
-
         let event = CoordinationEvent {
             event_id: Uuid::new_v4().to_string(),
             thread_id: task.thread_id.clone(),
@@ -1104,6 +1104,45 @@ mod tests {
 
     fn migrate(root: &std::path::Path) -> Store {
         Store::open(root.join("snippet.db")).unwrap()
+    }
+
+    /// A lease moves an agent into a session it does not own; posts from that
+    /// session are the lease holder's, not the session owner's.
+    #[tokio::test]
+    async fn posts_are_attributed_to_the_lease_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrate(dir.path());
+        db.create_agent(&Agent {
+            id: "reviewer".into(),
+            display_name: "Reviewer".into(),
+            handle: "reviewer".into(),
+            kind: AgentKind::Worker,
+            status: AgentStatus::Active,
+            role: AgentRole::Reviewer,
+            capabilities: vec![],
+        })
+        .unwrap();
+        let mut task = crate::coordination::Task::filed_by_human(
+            "t1".into(),
+            "Review".into(),
+            "look".into(),
+            "s1".into(),
+            0,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        task.status = crate::coordination::TaskStatus::InProgress;
+        task.reporting_session = Some("s1".into());
+        db.create_task(&task).unwrap();
+        db.add_task_agent_full("t1", "reviewer", "reviewer", None, "", "active", "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        let ctx = context(dir.path(), "s1").with_agent_id("owner");
+        let posted = PostTaskCoordination
+            .execute(&ctx, json!({"task_id": "t1", "body": "looks good"}))
+            .await
+            .unwrap();
+        assert_eq!(posted.value["data"]["event"]["actor_id"], "reviewer");
+        assert_eq!(posted.value["data"]["event"]["payload"]["origin_session"], "s1");
     }
 
     #[tokio::test]

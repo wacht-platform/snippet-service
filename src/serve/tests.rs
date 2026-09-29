@@ -562,6 +562,24 @@ use super::*;
         assert!(d.store.unblock_ready_tasks("2026-01-01T00:00:02Z").unwrap().is_empty());
     }
 
+    /// An agent taking the lease on a session it does not own carries its
+    /// identity in the handoff; the session's own agent needs none.
+    #[test]
+    fn identity_overlay_is_only_for_a_foreign_agent() {
+        let d = test_daemon();
+        let home = crate::coordination::AgentHome::new(
+            crate::coordination::agents_root(&d.mission_control_root),
+            "reviewer",
+        )
+        .unwrap();
+        home.write_identity("# Reviewer\n\nChecks every change twice.").unwrap();
+
+        let overlay = coordination::identity_overlay(&d, "reviewer", "unowned-session");
+        assert!(overlay.starts_with("[agent_identity]"));
+        assert!(overlay.contains("Checks every change twice."));
+        assert!(coordination::identity_overlay(&d, "snippet", "unowned-session").is_empty());
+    }
+
     // -- Coordination visibility routes -------------------------------------
 
 

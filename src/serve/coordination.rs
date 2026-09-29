@@ -812,6 +812,40 @@ pub(super) fn wake_targets(
     targets
 }
 
+/// The identity an agent brings into a session it does not own.
+///
+/// A session's system prompt is fixed when its loop starts, so an agent that
+/// takes the lease on a running conversation brings its identity in the message
+/// that hands it the work. Empty when the session already runs as that agent.
+pub(super) fn identity_overlay(d: &super::Daemon, agent_id: &str, session_id: &str) -> String {
+    let owner = crate::session::state_path_for_id(session_id)
+        .and_then(|path| crate::session::read_session_sidecar(&path))
+        .and_then(|sidecar| sidecar.agent_id);
+    let native = owner
+        .as_deref()
+        .unwrap_or(crate::coordination::SNIPPET_AGENT_ID);
+    if native == agent_id {
+        return String::new();
+    }
+    let identity = crate::coordination::AgentHome::new(
+        crate::coordination::agents_root(&d.mission_control_root),
+        agent_id,
+    )
+    .and_then(|home| home.read_identity());
+    match identity {
+        Ok(identity) => format!(
+            "[agent_identity]\nagent_id: {agent_id}\nYou are working this task as \
+             {agent_id} until the lease moves. This identity takes precedence over \
+             the one this session started with.\n\n{}\n[/agent_identity]\n",
+            identity.trim()
+        ),
+        Err(error) => {
+            eprintln!("[coordination] identity of `{agent_id}` unavailable: {error}");
+            String::new()
+        }
+    }
+}
+
 pub async fn wake_coordination_thread_participants(
     d: &Shared,
     saved: &CoordinationEvent,
@@ -846,9 +880,17 @@ pub async fn wake_coordination_thread_participants(
         return;
     }
     let envelope = board_message_envelope_with_task(saved, &history, task.as_ref());
+    let incoming = (saved.event_type == "task.lease_transferred")
+        .then(|| saved.payload.get("to_agent_id").and_then(|v| v.as_str()))
+        .flatten();
     for target in targets {
         let daemon = d.clone();
-        let envelope = envelope.clone();
+        let envelope = match incoming {
+            Some(agent_id) if target.inbox_agent.is_none() => {
+                format!("{}{envelope}", identity_overlay(d, agent_id, &target.session))
+            }
+            _ => envelope.clone(),
+        };
         tokio::spawn(async move {
             if let Some(agent_id) = target.inbox_agent.as_deref() {
                 if let Err(error) = direct::ensure_agent_inbox(&daemon, agent_id).await {

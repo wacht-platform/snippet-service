@@ -427,10 +427,6 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         .map(|m| m.agent_id.as_str())
         .unwrap_or("snippet");
 
-    if active_worker != "snippet" {
-        let _ = d.store.set_session_role(&managed.id, "specialized", Some(active_worker));
-    }
-
     let mut plan_line = String::new();
     if !task.plan.trim().is_empty() {
         plan_line = format!("plan:\n{}\n", task.plan.trim());
@@ -472,8 +468,9 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         (Some(branch), Some(head)) => format!("branch: {branch} at {head}\n"),
         _ => String::new(),
     };
+    let identity = super::coordination::identity_overlay(d, active_worker, &managed.id);
     let text = format!(
-        "[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}scope:\n{}\n\nBegin now. Before you stop, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
+        "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}scope:\n{}\n\nBegin now. Before you stop, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
         task.id,
         task.title,
         task.created_by_kind,
