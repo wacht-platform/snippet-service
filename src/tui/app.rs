@@ -101,6 +101,10 @@ pub(crate) struct App {
     pub(crate) pending_mission_control: bool,
     /// A panel action waiting for y (delete a job or a secret).
     pub(crate) board_confirm: Option<super::boards::Confirm>,
+    /// The vault panel's add prompt, while open.
+    pub(crate) vault_input: Option<super::boards::VaultInput>,
+    /// Which range the usage panel shows (see `USAGE_RANGES`).
+    pub(crate) usage_range: usize,
     pub(crate) error: Option<String>,
     pub(crate) state: Option<HarnessState>,
     /// The resident conversation loop. Spawned once, lives across turns.
@@ -343,6 +347,8 @@ impl App {
             boards: Default::default(),
             pending_mission_control: false,
             board_confirm: None,
+            vault_input: None,
+            usage_range: 0,
             original_config: None,
             last_state_stamp: None,
             login_active: false,
@@ -1077,7 +1083,8 @@ pub(crate) async fn run_app(
                 // act on Press/Repeat only so a key isn't handled twice.
                 Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(&mut app, key),
                 Event::Paste(text) => {
-                    if app.screen == Screen::Term {
+                    if app.vault_paste(&text) {
+                    } else if app.screen == Screen::Term {
                         app.send_term_bytes(text.as_bytes());
                     } else if app.login_active {
                         app.login_paste(&text);

@@ -21,10 +21,12 @@ pub(crate) enum PaneTab {
     Agents,
     Tasks,
     Jobs,
+    Usage,
+    Vault,
 }
 
 impl PaneTab {
-    pub(crate) const ALL: [PaneTab; 7] = [
+    pub(crate) const ALL: [PaneTab; 9] = [
         PaneTab::Tools,
         PaneTab::Plan,
         PaneTab::Lanes,
@@ -32,6 +34,8 @@ impl PaneTab {
         PaneTab::Agents,
         PaneTab::Tasks,
         PaneTab::Jobs,
+        PaneTab::Usage,
+        PaneTab::Vault,
     ];
 
     fn label(self) -> &'static str {
@@ -43,6 +47,8 @@ impl PaneTab {
             PaneTab::Agents => "Agents",
             PaneTab::Tasks => "Tasks",
             PaneTab::Jobs => "Jobs",
+            PaneTab::Usage => "Usage",
+            PaneTab::Vault => "Vault",
         }
     }
 }
@@ -386,9 +392,13 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
                 lines.push(Line::from(Span::styled("Enter opens the full lanes view", Style::default().fg(faint()))));
             }
         }
-        PaneTab::Agents | PaneTab::Tasks | PaneTab::Jobs => {
+        PaneTab::Agents | PaneTab::Tasks | PaneTab::Jobs | PaneTab::Usage | PaneTab::Vault => {
             let body = super::boards::board_lines(app, app.shell.tab, w);
-            let scroll = if app.shell.pane_detail.is_some() { app.shell.pane_scroll as usize } else { 0 };
+            let scroll = if app.shell.pane_detail.is_some() || app.shell.tab == PaneTab::Usage {
+                app.shell.pane_scroll as usize
+            } else {
+                0
+            };
             lines.extend(body.into_iter().skip(scroll));
         }
         PaneTab::Checkpoints => {
@@ -417,6 +427,8 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
         match (app.shell.tab, app.shell.pane_detail) {
             (_, Some(_)) => "↑↓ scroll · ← back · Tab next tab · Esc",
             (PaneTab::Jobs, None) => "↑↓ move · p pause/resume · d delete · Tab next tab",
+            (PaneTab::Usage, None) => "↑↓ scroll · r range · Tab next tab · Esc",
+            (PaneTab::Vault, None) => "↑↓ move · a add · d delete · Tab next tab",
             _ => "↑↓ move · Enter open · Tab next tab · Esc",
         }
     } else {
@@ -428,12 +440,14 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     );
 }
 
-pub(crate) const PALETTE_ACTIONS: [(&str, &str); 19] = [
+pub(crate) const PALETTE_ACTIONS: [(&str, &str); 21] = [
     ("new", "New session"),
     ("mission", "Open Mission Control"),
     ("agents", "Show agents"),
     ("tasks", "Show the task board"),
     ("jobs", "Show scheduled jobs"),
+    ("usage", "Show usage and rate limits"),
+    ("vault", "Manage vault secrets"),
     ("sessions", "Switch session…"),
     ("sidebar", "Toggle sessions sidebar"),
     ("pane", "Toggle side panel"),
@@ -548,6 +562,8 @@ impl App {
             "agents" => self.open_pane(PaneTab::Agents),
             "tasks" => self.open_pane(PaneTab::Tasks),
             "jobs" => self.open_pane(PaneTab::Jobs),
+            "usage" => self.open_pane(PaneTab::Usage),
+            "vault" => self.open_pane(PaneTab::Vault),
             "model" => self.handle_slash_command("/model"),
             "mode" => self.handle_slash_command("/mode"),
             "compact" => self.handle_slash_command("/compact"),
@@ -681,6 +697,16 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
             if app.handle_board_key(key) {
                 return true;
             }
+            if app.shell.tab == PaneTab::Usage {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => app.shell.pane_scroll = app.shell.pane_scroll.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => app.shell.pane_scroll = app.shell.pane_scroll.saturating_add(1),
+                    _ => {}
+                }
+                if matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Char('k') | KeyCode::Char('j')) {
+                    return true;
+                }
+            }
             let len = app.pane_len();
             match key.code {
                 KeyCode::Esc | KeyCode::Left => app.shell.focus = Focus::Composer,
@@ -724,7 +750,7 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
                         app.shell.pane_detail = Some(app.shell.pane_index.min(len - 1));
                         app.shell.pane_scroll = 0;
                     }
-                    PaneTab::Plan | PaneTab::Jobs => {}
+                    PaneTab::Plan | PaneTab::Jobs | PaneTab::Usage | PaneTab::Vault => {}
                 },
                 _ => {}
             }
