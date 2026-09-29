@@ -275,3 +275,38 @@ fn tasks_and_jobs_panels_render() {
     assert!(jobs.contains("paused") && jobs.contains("session not found"));
     assert!(jobs.contains("y to confirm"));
 }
+
+#[test]
+fn usage_and_vault_panels_render_without_exposing_secrets() {
+    let mut app = board_app();
+    app.boards.seed(
+        "usage:all",
+        serde_json::json!({"providers": [
+            {"provider": "chatgpt", "sessions": 3, "calls": 42, "total_tokens": 1_234_567,
+             "prompt_tokens": 1_000_000, "cache_read_tokens": 800_000, "completion_tokens": 234_567,
+             "models": [{"model": "gpt-5-codex", "total_tokens": 1_234_567, "calls": 42}],
+             "rate_limits": [{"window_minutes": 300, "used_percent": 30.0, "resets_at": 9_999_999_999i64}]},
+            {"provider": "xai", "sessions": 1, "calls": 2, "total_tokens": 0, "rate_limits": [],
+             "rate_limits_supported": false},
+        ]}),
+    );
+    app.shell.tab = PaneTab::Usage;
+    let usage = snapshot_app(&mut app, 170, 30).join("\n");
+    for row in usage.lines() { println!("|{row}|"); }
+    assert!(usage.contains("All time") && usage.contains("chatgpt"));
+    assert!(usage.contains("1.2M") && usage.contains("gpt-5-codex"));
+    assert!(usage.contains("5-hour window") && usage.contains("70% left"));
+    assert!(usage.contains("aren't exposed"));
+
+    app.boards.seed("vault", serde_json::json!({"names": ["GITHUB_TOKEN", "OPENAI_KEY"]}));
+    app.shell.tab = PaneTab::Vault;
+    app.vault_input = Some(super::boards::VaultInput {
+        name: "NEW_SECRET".into(),
+        value: "hunter2-super-secret".into(),
+        on_value: true,
+    });
+    let vault = snapshot_app(&mut app, 170, 30).join("\n");
+    for row in vault.lines() { println!("|{row}|"); }
+    assert!(vault.contains("GITHUB_TOKEN") && vault.contains("NEW_SECRET"));
+    assert!(!vault.contains("hunter2"), "a secret value must never render");
+}

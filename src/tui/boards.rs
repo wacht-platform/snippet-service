@@ -90,6 +90,7 @@ impl Boards {
     }
 
     /// Run an action (POST/PUT/DELETE) and refetch `refresh` when it lands.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn act(
         &self,
         info: crate::serve::sidecar::DaemonInfo,
@@ -111,21 +112,19 @@ impl Boards {
                     Err(e) => e,
                 });
             }
-            if let Ok(mut s) = slots.lock() {
-                if let Some(slot) = s.get_mut(&refresh) {
+            if let Ok(mut s) = slots.lock()
+                && let Some(slot) = s.get_mut(&refresh) {
                     slot.at = None;
                 }
-            }
         });
     }
 }
 
+/// A panel's data: its slot key, API path, query and how long it stays fresh.
+type BoardRequest = (String, String, Vec<(&'static str, String)>, Duration);
+
 /// The key and request a panel shows, or None for session-local tabs.
-pub(crate) fn board_request(
-    app: &App,
-    tab: PaneTab,
-) -> Option<(String, String, Vec<(&'static str, String)>, Duration)> {
-    let _ = app;
+pub(crate) fn board_request(app: &App, tab: PaneTab) -> Option<BoardRequest> {
     match tab {
         PaneTab::Agents => Some(("agents".into(), "/agents".into(), vec![], Duration::from_secs(10))),
         PaneTab::Tasks => Some((
@@ -135,6 +134,15 @@ pub(crate) fn board_request(
             Duration::from_secs(5),
         )),
         PaneTab::Jobs => Some(("jobs".into(), "/recurring".into(), vec![], Duration::from_secs(10))),
+        PaneTab::Usage => {
+            let range = USAGE_RANGES[app.usage_range % USAGE_RANGES.len()];
+            let mut query = vec![];
+            if let Some(since) = range_since(range.1) {
+                query.push(("since", since.to_string()));
+            }
+            Some((format!("usage:{}", range.0), "/usage".into(), query, Duration::from_secs(20)))
+        }
+        PaneTab::Vault => Some(("vault".into(), "/vault".into(), vec![], Duration::from_secs(30))),
         _ => None,
     }
 }
@@ -148,14 +156,13 @@ impl App {
         if !self.shell.pane_visible(self.shell.width) {
             return;
         }
-        if let Some((key, path, query, max_age)) = board_request(self, self.shell.tab) {
-            if self.boards.stale(&key, max_age) {
+        if let Some((key, path, query, max_age)) = board_request(self, self.shell.tab)
+            && self.boards.stale(&key, max_age) {
                 self.boards.fetch(info.clone(), key, path, query);
             }
-        }
         // An open agent also needs its coordination board.
-        if self.shell.tab == PaneTab::Agents {
-            if let Some(id) = self.selected_agent_id().filter(|_| self.shell.pane_detail.is_some()) {
+        if self.shell.tab == PaneTab::Agents
+            && let Some(id) = self.selected_agent_id().filter(|_| self.shell.pane_detail.is_some()) {
                 let key = format!("board:{id}");
                 if self.boards.stale(&key, Duration::from_secs(10)) {
                     self.boards.fetch(
@@ -166,7 +173,6 @@ impl App {
                     );
                 }
             }
-        }
     }
 
     pub(crate) fn selected_agent_id(&self) -> Option<String> {
@@ -182,6 +188,7 @@ impl App {
             PaneTab::Agents => list_len(&self.boards.get("agents")),
             PaneTab::Tasks => list_len(&self.boards.get("tasks")),
             PaneTab::Jobs => list_len(&self.boards.get("jobs")),
+            PaneTab::Vault => vault_names(&self.boards.get("vault")).len(),
             _ => 0,
         }
     }
@@ -204,10 +211,32 @@ impl App {
             }
             return true;
         }
+        if self.shell.tab == PaneTab::Vault && self.vault_input.is_some() {
+            self.vault_input_key(key);
+            return true;
+        }
         let Some(info) = self.sidecar.clone() else {
             return false;
         };
         match (self.shell.tab, key.code) {
+            (PaneTab::Usage, KeyCode::Char('r')) => {
+                self.usage_range = (self.usage_range + 1) % USAGE_RANGES.len();
+                true
+            }
+            (PaneTab::Vault, KeyCode::Char('a')) => {
+                self.vault_input = Some(VaultInput::default());
+                true
+            }
+            (PaneTab::Vault, KeyCode::Char('d')) => {
+                let names = vault_names(&self.boards.get("vault"));
+                if let Some(name) = names.get(self.shell.pane_index) {
+                    self.board_confirm = Some(Confirm {
+                        prompt: format!("Delete secret {name}? y to confirm"),
+                        action: ConfirmAction::DeleteSecret(name.clone()),
+                    });
+                }
+                true
+            }
             (PaneTab::Jobs, KeyCode::Char('p') | KeyCode::Char(' ')) => {
                 if let Some(job) = self.board_item("jobs") {
                     let enabled = job.get("enabled").and_then(Value::as_bool).unwrap_or(true);
@@ -251,8 +280,73 @@ impl App {
                 format!("Deleted {title}."),
                 "jobs".into(),
             ),
+            ConfirmAction::DeleteSecret(name) => self.boards.act(
+                info,
+                reqwest::Method::DELETE,
+                "/vault".into(),
+                vec![("name", name.clone())],
+                None,
+                format!("Deleted {name}."),
+                "vault".into(),
+            ),
         }
         self.shell.pane_index = self.shell.pane_index.saturating_sub(1);
+    }
+
+    /// Typing into the vault's add prompt: the name, then the value (masked).
+    fn vault_input_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        let Some(input) = self.vault_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.vault_input = None;
+                self.set_notice("Cancelled.");
+            }
+            KeyCode::Backspace => {
+                if input.on_value { input.value.pop(); } else { input.name.pop(); }
+            }
+            KeyCode::Enter => {
+                if !input.on_value {
+                    if !input.name.trim().is_empty() {
+                        input.on_value = true;
+                    }
+                } else if !input.value.is_empty() {
+                    let input = self.vault_input.take().unwrap_or_default();
+                    if let Some(info) = self.sidecar.clone() {
+                        let name = input.name.trim().to_string();
+                        self.boards.act(
+                            info,
+                            reqwest::Method::PUT,
+                            "/vault".into(),
+                            vec![],
+                            Some(serde_json::json!({ "name": name, "value": input.value })),
+                            format!("Saved {name}."),
+                            "vault".into(),
+                        );
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if input.on_value {
+                    input.value.push(c);
+                } else if !c.is_whitespace() {
+                    input.name.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pasted text goes to the vault prompt when it is open; true if taken.
+    pub(crate) fn vault_paste(&mut self, text: &str) -> bool {
+        let Some(input) = self.vault_input.as_mut() else {
+            return false;
+        };
+        let clean = text.trim_end_matches(['\n', '\r']);
+        if input.on_value { input.value.push_str(clean); } else { input.name.push_str(clean.trim()); }
+        true
     }
 
     fn set_notice(&self, text: &str) {
@@ -300,6 +394,82 @@ pub(crate) struct Confirm {
 
 pub(crate) enum ConfirmAction {
     DeleteJob(String, String),
+    DeleteSecret(String),
+}
+
+/// The vault's two-step add prompt.
+#[derive(Default)]
+pub(crate) struct VaultInput {
+    pub(crate) name: String,
+    pub(crate) value: String,
+    pub(crate) on_value: bool,
+}
+
+/// Usage ranges `r` cycles through: key, and seconds back (None = all time).
+const USAGE_RANGES: [(&str, Option<i64>); 4] =
+    [("all", None), ("today", Some(0)), ("7d", Some(7 * 86_400)), ("30d", Some(30 * 86_400))];
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The `since` for a range: 0 means since local midnight.
+fn range_since(back: Option<i64>) -> Option<i64> {
+    let back = back?;
+    if back == 0 {
+        let now = chrono::Local::now();
+        return now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .and_then(|m| m.and_local_timezone(chrono::Local).single())
+            .map(|m| m.timestamp());
+    }
+    Some(now_secs() - back)
+}
+
+fn range_label(key: &str) -> &'static str {
+    match key {
+        "today" => "Today",
+        "7d" => "7 days",
+        "30d" => "30 days",
+        _ => "All time",
+    }
+}
+
+fn vault_names(f: &Fetched) -> Vec<String> {
+    f.value
+        .as_ref()
+        .and_then(|v| v.get("names"))
+        .and_then(Value::as_array)
+        .map(|n| n.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// 1234567 → "1.2M", as the apps print token counts.
+fn si(n: i64) -> String {
+    let f = n as f64;
+    if n >= 1_000_000_000 {
+        format!("{:.1}B", f / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", f / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", f / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
+fn window_label(minutes: i64) -> String {
+    match minutes {
+        m if m > 0 && m % 10_080 == 0 => format!("{}-week window", m / 10_080),
+        m if m > 0 && m % 1_440 == 0 => format!("{}-day window", m / 1_440),
+        m if m > 0 && m % 60 == 0 => format!("{}-hour window", m / 60),
+        m if m > 0 => format!("{m}-minute window"),
+        _ => "window".into(),
+    }
 }
 
 fn list_len(f: &Fetched) -> usize {
@@ -523,6 +693,70 @@ pub(crate) fn board_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                 }
             }
         }
+        PaneTab::Usage => {
+            let (key, _) = USAGE_RANGES[app.usage_range % USAGE_RANGES.len()];
+            lines.push(Line::from(vec![
+                Span::styled(range_label(key), Style::default().fg(text()).add_modifier(Modifier::BOLD)),
+                Span::styled("  r changes range", Style::default().fg(faint())),
+            ]));
+            lines.push(Line::from(""));
+            let f = app.boards.get(&format!("usage:{key}"));
+            let providers = f
+                .value
+                .as_ref()
+                .and_then(|v| v.get("providers"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(state) = state_lines(&f, "No model calls in this period.", providers.is_empty()) {
+                lines.extend(state);
+            } else {
+                for (i, p) in providers.iter().enumerate() {
+                    if i > 0 {
+                        lines.push(Line::from(""));
+                    }
+                    lines.extend(provider_lines(p, width));
+                }
+            }
+        }
+        PaneTab::Vault => {
+            let f = app.boards.get("vault");
+            let names = vault_names(&f);
+            if let Some(input) = app.vault_input.as_ref() {
+                lines.push(section("Add a secret"));
+                let cursor = Span::styled("▏", Style::default().fg(accent()));
+                lines.push(Line::from(vec![
+                    Span::styled(" name   ", Style::default().fg(faint())),
+                    Span::styled(input.name.clone(), Style::default().fg(text())),
+                    if input.on_value { Span::raw("") } else { cursor.clone() },
+                ]));
+                if input.on_value {
+                    lines.push(Line::from(vec![
+                        Span::styled(" value  ", Style::default().fg(faint())),
+                        // Never echo a secret, not even its length.
+                        Span::styled(if input.value.is_empty() { "" } else { "••••••••" }, Style::default().fg(soft())),
+                        cursor,
+                    ]));
+                }
+                lines.push(faint_line(if input.on_value { " Enter saves · Esc cancels" } else { " Enter next · Esc cancels" }));
+                lines.push(Line::from(""));
+            }
+            if let Some(state) = state_lines(&f, "No secrets stored. a adds one.", names.is_empty()) {
+                lines.extend(state);
+            } else {
+                for (i, n) in names.iter().enumerate() {
+                    let selected = focused && app.vault_input.is_none() && i == app.shell.pane_index;
+                    lines.push(
+                        Line::from(vec![
+                            Span::styled(" ● ", Style::default().fg(faint())),
+                            Span::styled(pad(n, width.saturating_sub(12)), Style::default().fg(text())),
+                            Span::styled(" ••••••", Style::default().fg(faint())),
+                        ])
+                        .style(Style::default().bg(if selected { surface3() } else { surface1() })),
+                    );
+                }
+            }
+        }
         _ => {}
     }
     if let Some(c) = app.board_confirm.as_ref() {
@@ -531,6 +765,90 @@ pub(crate) fn board_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
     } else if let Some(n) = app.boards.notice.lock().ok().and_then(|n| n.clone()) {
         lines.push(Line::from(""));
         lines.push(faint_line(&n));
+    }
+    lines
+}
+
+fn provider_lines(p: &Value, width: usize) -> Vec<Line<'static>> {
+    let n = |v: &Value, k: &str| v.get(k).and_then(Value::as_i64).unwrap_or(0);
+    let sessions = n(p, "sessions");
+    let calls = n(p, "calls");
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(s(p, "provider"), Style::default().fg(text()).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(
+                    "  {sessions} session{} · {calls} call{}",
+                    if sessions == 1 { "" } else { "s" },
+                    if calls == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(faint()),
+            ),
+        ]),
+    ];
+    if n(p, "total_tokens") > 0 {
+        let cols = [
+            ("Total", n(p, "total_tokens")),
+            ("Input", n(p, "prompt_tokens")),
+            ("Cached", n(p, "cache_read_tokens")),
+            ("Output", n(p, "completion_tokens")),
+        ];
+        let cw = (width / 4).max(8);
+        lines.push(Line::from(
+            cols.iter().map(|(l, _)| Span::styled(pad(l, cw), Style::default().fg(faint()))).collect::<Vec<_>>(),
+        ));
+        lines.push(Line::from(
+            cols.iter()
+                .map(|(_, v)| Span::styled(pad(&si(*v), cw), Style::default().fg(text()).add_modifier(Modifier::BOLD)))
+                .collect::<Vec<_>>(),
+        ));
+    }
+    for m in p.get("models").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let model = s(&m, "model");
+        if model.is_empty() {
+            continue;
+        }
+        let right = format!("{} · {}×", si(n(&m, "total_tokens")), n(&m, "calls"));
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {}", pad(&model, width.saturating_sub(right.len() + 2))), Style::default().fg(code())),
+            Span::styled(format!(" {right}"), Style::default().fg(faint())),
+        ]));
+    }
+    let limits = p.get("rate_limits").and_then(Value::as_array).cloned().unwrap_or_default();
+    if limits.is_empty() {
+        let note = match p.get("rate_limits_supported").and_then(Value::as_bool) {
+            Some(true) => "No rate-limit report yet.",
+            Some(false) => "Subscription limits aren't exposed by this provider's API.",
+            None => "No reported rate-limit usage.",
+        };
+        lines.extend(wrap(note, width, 0, Style::default().fg(faint())));
+    }
+    for r in limits {
+        let label = window_label(n(&r, "window_minutes"));
+        let resets = n(&r, "resets_at");
+        // A window that already rolled over would state the previous one's
+        // usage as current; say so instead.
+        if resets > 0 && resets <= now_secs() {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {label}"), Style::default().fg(soft())),
+                Span::styled("  rolled over · awaiting the next report", Style::default().fg(faint())),
+            ]));
+            continue;
+        }
+        let used = r.get("used_percent").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0);
+        let left = 100.0 - used;
+        let color = if left < 20.0 { danger() } else if left < 50.0 { warn() } else { success() };
+        let bar_w = width.saturating_sub(4).min(40);
+        let filled = ((left / 100.0) * bar_w as f64).round() as usize;
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {label}"), Style::default().fg(soft())),
+            Span::styled(format!("  {left:.0}% left"), Style::default().fg(color)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("█".repeat(filled), Style::default().fg(color)),
+            Span::styled("░".repeat(bar_w - filled), Style::default().fg(faint())),
+        ]));
     }
     lines
 }
