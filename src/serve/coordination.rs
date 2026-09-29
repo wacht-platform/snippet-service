@@ -50,6 +50,8 @@ pub fn router() -> Router<Shared> {
 pub struct CoordinationTasksQuery {
     pub token: Option<String>,
     #[serde(default)]
+    pub after_priority: Option<i64>,
+    #[serde(default)]
     pub after_created: Option<String>,
     #[serde(default)]
     pub after_id: Option<String>,
@@ -155,16 +157,16 @@ async fn list_tasks(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    let after = match (q.after_created.as_deref(), q.after_id.as_deref()) {
-        (Some(created), Some(id)) => Some((created, id)),
-        (Some(_), None) | (None, Some(_)) => {
+    let after = match (q.after_priority, q.after_created.as_deref(), q.after_id.as_deref()) {
+        (Some(priority), Some(created), Some(id)) => Some((priority, created, id)),
+        (None, None, None) => None,
+        _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                "after_created and after_id must be provided together",
+                "after_priority, after_created and after_id must be provided together",
             )
                 .into_response();
         }
-        (None, None) => None,
     };
     let status = match q.status.as_deref().filter(|s| !s.trim().is_empty()) {
         Some(raw) => match parse_task_status(raw) {
@@ -322,18 +324,24 @@ async fn set_task_status(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     let now = chrono::Utc::now().to_rfc3339();
-    match d.store.set_task_status(&task_id, &status, &now) {
-        Ok(true) => match d.store.get_task(&task_id) {
-            Ok(Some(task)) => Json(task).into_response(),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "task vanished").into_response(),
-        },
-        Ok(false) => (StatusCode::NOT_FOUND, "no such task").into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("set task status: {error}"),
-        )
-            .into_response(),
+    let note = format!("Marked {status} on the board.");
+    match d.store.move_task(&task_id, status, &note, &now) {
+        Ok(task) => Json(task).into_response(),
+        Err(error) => move_error(error),
     }
+}
+
+/// The response for a refused or failed [`crate::store::Store::move_task`].
+pub(super) fn move_error(error: crate::store::StoreError) -> Response {
+    use crate::store::StoreError;
+    let code = match &error {
+        StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => StatusCode::NOT_FOUND,
+        StoreError::AlreadyTerminal { .. }
+        | StoreError::NotRetryable { .. }
+        | StoreError::InvalidTransition { .. } => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (code, error.to_string()).into_response()
 }
 
 async fn task_links(

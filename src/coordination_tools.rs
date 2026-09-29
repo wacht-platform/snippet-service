@@ -991,10 +991,10 @@ impl Tool for ClaimAndDispatchTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "claim_and_dispatch_task".into(),
-            description: "Claim an assigned or offered task and dispatch yourself into its target workspace session. Specify `profile` to select an inference profile from config setups, or omit it to preserve the session's active model for prompt cache hits.".into(),
+            description: "Take the lease on a queued or blocked task and queue it for dispatch into its target session; the daemon delivers it within seconds, with your identity. Refuses finished work and work already running (use transfer_task_session_lease for that). Specify `profile` to select an inference profile, or omit it to keep the session's model and its prompt cache.".into(),
             input_schema: schema(
                 json!({
-                    "task_id": {"type": "string", "description": "The task ID to claim and dispatch into"},
+                    "task_id": {"type": "string", "description": "The task ID to claim"},
                     "profile": {"type": "string", "description": "Optional inference profile name. Omit to preserve prompt cache affinity."}
                 }),
                 &["task_id"],
@@ -1009,40 +1009,39 @@ impl Tool for ClaimAndDispatchTask {
         if task_id.is_empty() {
             return Err(ToolError::msg("task_id must not be empty"));
         }
-        let db = db(ctx)?;
-        let task = db
-            .get_task(task_id)
-            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
-            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
-
-        if task.status == crate::coordination::TaskStatus::Done || task.status == crate::coordination::TaskStatus::Failed {
-            return Err(ToolError::msg(format!("task `{task_id}` is already {:?}", task.status)));
-        }
-
-        let (actor_kind, actor_id) = actor(ctx)?;
-        let now = now_rfc3339();
-
-        let roster = db.list_task_agents(task_id).unwrap_or_default();
-        if !roster.iter().any(|m| m.agent_id == actor_id && m.removed_at.is_none()) {
-            db.add_task_agent_full(task_id, &actor_id, "implementer", None, "", "active", &now)
-                .map_err(|e| ToolError::msg(format!("add agent to roster: {e}")))?;
-        }
-
-        let profile_opt = args
+        let profile = args
             .profile
             .as_deref()
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
-        let updated = db
+        if let Some(name) = profile.as_deref() {
+            crate::mission_tools::check_profile(name).await?;
+        }
+        let db = db(ctx)?;
+        let task = db
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        if task.status.is_terminal() || task.status == crate::coordination::TaskStatus::InProgress {
+            return Err(ToolError::msg(format!("task `{task_id}` is {}; only queued or blocked work can be claimed", task.status)));
+        }
+        let (actor_kind, actor_id) = actor(ctx)?;
+        if actor_kind != "agent" {
+            return Err(ToolError::msg("claiming a task needs an agent identity; this session has none"));
+        }
+        let now = now_rfc3339();
+        db.add_task_agent_full(task_id, &actor_id, "implementer", None, "", "active", &now)
+            .map_err(|e| ToolError::msg(format!("take the lease: {e}")))?;
+        db.retry_task(task_id, &now)
+            .map_err(|e| ToolError::msg(format!("queue task: {e}")))?;
+        let queued = db
             .update_task_in(task_id, &now, |t| {
-                t.status = crate::coordination::TaskStatus::InProgress;
-                t.reporting_session = Some(t.session_id.clone());
-                if profile_opt.is_some() {
-                    t.profile = profile_opt.clone();
+                if profile.is_some() {
+                    t.profile = profile.clone();
                 }
             })
-            .map_err(|e| ToolError::msg(format!("claim task: {e}")))?;
+            .map_err(|e| ToolError::msg(format!("queue task: {e}")))?;
 
         let event = CoordinationEvent {
             event_id: Uuid::new_v4().to_string(),
@@ -1054,9 +1053,10 @@ impl Tool for ClaimAndDispatchTask {
             actor_id: actor_id.clone(),
             payload_version: 1,
             payload: stamp_origin(ctx, json!({
+                "body": format!("{actor_id} claimed the task"),
                 "task_id": task_id,
                 "agent_id": actor_id,
-                "profile": updated.profile,
+                "profile": queued.profile,
             })),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
@@ -1066,13 +1066,12 @@ impl Tool for ClaimAndDispatchTask {
         let _ = db.append_event(&event);
 
         Ok(ToolResult::success(json!({
-            "dispatched": true,
+            "queued": true,
             "task_id": task_id,
-            "session_id": task.session_id,
-            "profile": updated.profile,
-            "prompt_cache_preserved": args.profile.is_none(),
+            "session_id": queued.session_id,
+            "profile": queued.profile,
             "active_agent": actor_id,
-            "note": "Claimed task and dispatched into session.",
+            "note": "Lease taken; the daemon dispatches the task to its session within seconds.",
         })))
     }
 }
@@ -1104,6 +1103,54 @@ mod tests {
 
     fn migrate(root: &std::path::Path) -> Store {
         Store::open(root.join("snippet.db")).unwrap()
+    }
+
+    /// Claiming takes the lease (demoting the holder) and queues the task for
+    /// the dispatcher; it used to mark the task running and deliver nothing.
+    #[tokio::test]
+    async fn claiming_takes_the_lease_and_queues_for_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = migrate(dir.path());
+        for id in ["snippet", "reviewer"] {
+            db.create_agent(&Agent {
+                id: id.into(),
+                display_name: id.into(),
+                handle: id.into(),
+                kind: AgentKind::Worker,
+                status: AgentStatus::Active,
+                role: AgentRole::Reviewer,
+                capabilities: vec![],
+            })
+            .unwrap();
+        }
+        let mut task = crate::coordination::Task::filed_by_human(
+            "t1".into(),
+            "Review".into(),
+            "look".into(),
+            "work-1".into(),
+            0,
+            "2026-01-01T00:00:00Z".into(),
+        );
+        task.status = crate::coordination::TaskStatus::Blocked;
+        db.create_task(&task).unwrap();
+        db.add_task_agent_full("t1", "snippet", "implementer", None, "", "active", "2026-01-01T00:00:00Z")
+            .unwrap();
+
+        let ctx = context(dir.path(), "inbox-reviewer").with_agent_id("reviewer");
+        ClaimAndDispatchTask
+            .execute(&ctx, json!({"task_id": "t1"}))
+            .await
+            .unwrap();
+
+        let task = db.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.status, crate::coordination::TaskStatus::Todo);
+        let roster = db.list_task_agents("t1").unwrap();
+        let status = |id: &str| roster.iter().find(|m| m.agent_id == id).unwrap().status.clone();
+        assert_eq!(status("reviewer"), "active");
+        assert_eq!(status("snippet"), "waiting", "one lease holder at a time");
+
+        db.claim_task_for_dispatch("t1", "2026-01-01T00:00:01Z").unwrap();
+        assert!(ClaimAndDispatchTask.execute(&ctx, json!({"task_id": "t1"})).await.is_err());
     }
 
     /// A lease moves an agent into a session it does not own; posts from that

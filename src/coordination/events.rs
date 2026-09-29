@@ -17,8 +17,9 @@ impl Store {
                     "SELECT event_id, thread_id, partition_key, sequence, event_type,
                             actor_kind, actor_id, payload_version, payload_json,
                             causation_id, correlation_id, idempotency_key, created_at
-                     FROM board_events WHERE actor_id = ?1 AND idempotency_key = ?2",
-                    params![event.actor_id, event.idempotency_key],
+                     FROM board_events
+                     WHERE thread_id = ?1 AND actor_id = ?2 AND idempotency_key = ?3",
+                    params![event.thread_id, event.actor_id, event.idempotency_key],
                     event_from_row,
                 )
                 .optional()?
@@ -203,6 +204,21 @@ mod tests {
         let replay = db.append_event(&event(1, "one")).unwrap();
         assert_eq!(replay, first);
         assert_eq!(db.events_after("goal:1", 0, 20).unwrap().len(), 1);
+    }
+
+    /// A key is unique per thread: reusing one in a second room is a new post,
+    /// not a replay of the first room's message.
+    #[test]
+    fn idempotency_keys_are_scoped_to_their_thread() {
+        let db = Store::open_in_memory().unwrap();
+        db.append_event(&event(0, "status")).unwrap();
+        let mut elsewhere = event(0, "status");
+        elsewhere.event_id = "event-elsewhere".into();
+        elsewhere.thread_id = "thread-2".into();
+        elsewhere.partition_key = "thread:thread-2".into();
+        let saved = db.append_event(&elsewhere).unwrap();
+        assert_eq!(saved.thread_id, "thread-2");
+        assert_eq!(db.events_for_thread("thread-2", 0, 10).unwrap().len(), 1);
     }
 
     #[test]

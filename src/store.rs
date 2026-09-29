@@ -16,8 +16,10 @@ pub enum StoreError {
     HandoffDecode(String),
     #[error("task {id} was already terminal ({status}); refusing to overwrite its result")]
     AlreadyTerminal { id: String, status: String },
-    #[error("task {id} is {status}; only blocked or failed work can be retried")]
+    #[error("task {id} is {status}; finished work cannot be retried")]
     NotRetryable { id: String, status: String },
+    #[error("task {id} cannot be moved to {status} by hand; only a dispatch starts work")]
+    InvalidTransition { id: String, status: String },
     #[error("task status must be terminal, got {0}")]
     NotTerminal(String),
     #[error("could not encode session state: {0}")]
