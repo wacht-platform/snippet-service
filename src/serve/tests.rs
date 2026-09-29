@@ -424,7 +424,7 @@ use super::*;
             serde_json::json!({"body": "progress", "origin_session": "work-1"}),
         );
         let roster = [member("snippet", "active"), member("reviewer", "waiting")];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
         assert_eq!(sessions(&targets), ["mission-control", "inbox-reviewer"]);
     }
 
@@ -442,14 +442,14 @@ use super::*;
             ("agent", "reviewer"),
             serde_json::json!({"body": "ok"}),
         );
-        assert!(coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1")).is_empty());
+        assert!(coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[]).is_empty());
 
         history.push(board_event(
             "message.posted",
             ("human", "local"),
             serde_json::json!({"body": "go on"}),
         ));
-        assert!(!coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1")).is_empty());
+        assert!(!coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[]).is_empty());
     }
 
     #[test]
@@ -460,7 +460,7 @@ use super::*;
             serde_json::json!({"body": "yours", "to_agent_id": "reviewer"}),
         );
         let roster = [member("snippet", "waiting"), member("reviewer", "active")];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
         assert_eq!(sessions(&targets), ["work-1"]);
     }
 
@@ -474,7 +474,7 @@ use super::*;
             serde_json::json!({"body": "done"}),
         );
         let roster = [member("snippet", "active"), member("reviewer", "waiting")];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
         assert_eq!(sessions(&targets), ["inbox-reviewer"]);
     }
 
@@ -488,7 +488,7 @@ use super::*;
         let mut gone = member("reviewer", "waiting");
         gone.removed_at = Some("2026-01-02T00:00:00Z".into());
         let roster = [member("snippet", "active"), gone];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"));
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
         assert_eq!(sessions(&targets), ["mission-control"]);
 
         let assigned = board_event(
@@ -496,7 +496,7 @@ use super::*;
             ("agent", "mission-control"),
             serde_json::json!({}),
         );
-        assert!(coordination::wake_targets(&assigned, &[], &room(), &roster, Some("work-1")).is_empty());
+        assert!(coordination::wake_targets(&assigned, &[], &room(), &roster, Some("work-1"), &[]).is_empty());
     }
 
     fn queued_task(id: &str, paths: &[&str]) -> crate::coordination::Task {
@@ -578,6 +578,34 @@ use super::*;
         assert!(overlay.starts_with("[agent_identity]"));
         assert!(overlay.contains("Checks every change twice."));
         assert!(coordination::identity_overlay(&d, "snippet", "unowned-session").is_empty());
+    }
+
+    /// A task whose worker is paused waits in the queue, reported once.
+    #[tokio::test]
+    async fn a_paused_worker_holds_its_task_in_the_queue() {
+        let d = test_daemon();
+        d.store
+            .create_agent(&crate::coordination::types::Agent {
+                id: "reviewer".into(),
+                display_name: "Reviewer".into(),
+                handle: "reviewer".into(),
+                kind: crate::coordination::types::AgentKind::Worker,
+                status: crate::coordination::types::AgentStatus::Paused,
+                role: crate::coordination::types::AgentRole::Reviewer,
+                capabilities: vec![],
+            })
+            .unwrap();
+        d.store.create_task(&queued_task("t1", &["/w/a"])).unwrap();
+        d.store
+            .add_task_agent_full("t1", "reviewer", "reviewer", None, "", "active", "2026-01-01T00:00:00Z")
+            .unwrap();
+        for _ in 0..2 {
+            let task = mission_control::dispatch_mission_task(&d, "t1").await.unwrap();
+            assert_eq!(task.status, crate::coordination::TaskStatus::Todo);
+        }
+        let task = d.store.get_task("t1").unwrap().unwrap();
+        assert_eq!(task.notifications.len(), 1);
+        assert!(task.notifications[0].message.contains("reviewer is not taking work"));
     }
 
     // -- Coordination visibility routes -------------------------------------

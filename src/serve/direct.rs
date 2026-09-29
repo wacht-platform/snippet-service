@@ -249,7 +249,8 @@ async fn deliver_direct(
 /// retried in silence forever.
 pub(super) async fn direct_dispatch_loop(d: Shared) {
     loop {
-        match d.store.list_pending_direct_deliveries(DELIVER_BATCH) {
+        let now = chrono::Utc::now().to_rfc3339();
+        match d.store.list_pending_direct_deliveries(DELIVER_BATCH, &now) {
             Ok(pending) => {
                 for message in pending {
                     let at = chrono::Utc::now().to_rfc3339();
@@ -269,6 +270,7 @@ pub(super) async fn direct_dispatch_loop(d: Shared) {
                                 &message.recipient_kind,
                                 &message.recipient_id,
                                 &error,
+                                chrono::Utc::now(),
                             );
                         }
                     }

@@ -188,6 +188,9 @@ async fn build_agent_from_prompt(
         )
             .into_response();
     }
+    if !d.store.has_conversation(mission_control::SESSION_ID).unwrap_or(false) {
+        return (StatusCode::CONFLICT, "open Mission Control before building an agent").into_response();
+    }
     let session_id = crate::mission_control::SESSION_ID;
     let task_id = uuid::Uuid::new_v4().to_string();
     let title = "Build specialized agent";
@@ -331,6 +334,9 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
     if let Some(waiting) = wait_for_path_owners(d, task_id, &now, false)? {
         return Ok(waiting);
     }
+    if let Some(waiting) = wait_for_worker(d, task_id, &now)? {
+        return Ok(waiting);
+    }
     let task = d
         .store
         .claim_task_for_dispatch(task_id, &now)
@@ -380,18 +386,30 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
             return Ok(blocked);
         }
     }
-    let managed = match mission_control::get_session(root, &task.session_id) {
-        Ok(managed) => managed,
-        Err(error) => {
+    // Mission Control's own work (building an agent) runs in its home; it is
+    // not a managed session, and listing it as one would show it to the human.
+    let (session_id, workspace) = if mission_control::is_session_id(&task.session_id) {
+        if !d.store.has_conversation(mission_control::SESSION_ID).unwrap_or(false) {
+            let error = "Mission Control has not been opened yet".to_string();
             release_failed_claim(d, &task, &error)?;
             return Err(error);
         }
+        (mission_control::SESSION_ID.to_string(), mission_control::workspace_path())
+    } else {
+        let managed = match mission_control::get_session(root, &task.session_id) {
+            Ok(managed) => managed,
+            Err(error) => {
+                release_failed_claim(d, &task, &error)?;
+                return Err(error);
+            }
+        };
+        if managed.status != mission_control::SessionStatus::Active {
+            let error = "target session is archived".to_string();
+            release_failed_claim(d, &task, &error)?;
+            return Err(error);
+        }
+        (managed.id, managed.workspace)
     };
-    if managed.status != mission_control::SessionStatus::Active {
-        let error = "target session is archived".to_string();
-        release_failed_claim(d, &task, &error)?;
-        return Err(error);
-    }
     // A concurrent dispatch may have taken the paths between the check above
     // and the claim; hand the claim back rather than deliver into them.
     if let Some(waiting) = wait_for_path_owners(d, task_id, &now, true)? {
@@ -441,7 +459,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .arg("-C")
-            .arg(&managed.workspace)
+            .arg(&workspace)
             .args(args)
             .output()
             .ok()
@@ -456,7 +474,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         (Some(branch), Some(head)) => format!("branch: {branch} at {head}\n"),
         _ => String::new(),
     };
-    let identity = super::coordination::identity_overlay(d, active_worker, &managed.id);
+    let identity = super::coordination::identity_overlay(d, active_worker, &session_id);
     let text = format!(
         "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}scope:\n{}\n\nBegin now. Before you stop, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
         task.id,
@@ -465,7 +483,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         task.created_by_id,
         mode_line,
         active_worker,
-        managed.workspace.display(),
+        workspace.display(),
         if handoff.is_empty() {
             task.description.as_str()
         } else {
@@ -474,12 +492,12 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         task.id,
     );
     if let Some(profile) = task.profile.as_deref() {
-        if let Err(error) = d.run_session_on_profile(&managed.id, profile, false).await {
+        if let Err(error) = d.run_session_on_profile(&session_id, profile, false).await {
             release_failed_claim(d, &task, &error)?;
             return Err(error);
         }
     }
-    d.deliver(&managed.id, LoopInput::UserMessage(text)).await;
+    d.deliver(&session_id, LoopInput::UserMessage(text)).await;
     record_dispatch_notice(d, &task).await;
     let task = d
         .store
@@ -531,6 +549,38 @@ fn wait_for_path_owners(
         })
         .map_err(|error| error.to_string())?;
     Ok(Some(task))
+}
+
+/// If the agent holding the task's lease is paused, draining or disabled, leave
+/// the task queued until it is active again, and tell Mission Control once.
+fn wait_for_worker(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, String> {
+    let roster = d.store.list_task_agents(task_id).map_err(|error| error.to_string())?;
+    let Some(worker) = roster
+        .iter()
+        .find(|m| m.status == "active" && m.removed_at.is_none())
+    else {
+        return Ok(None);
+    };
+    if d.store.agent_takes_work(&worker.agent_id).map_err(|error| error.to_string())? {
+        return Ok(None);
+    }
+    let reason = format!(
+        "agent {} is not taking work; activate it or move the lease",
+        worker.agent_id
+    );
+    let Some(task) = d.store.get_task(task_id).map_err(|error| error.to_string())? else {
+        return Err(format!("unknown task {task_id}"));
+    };
+    if task.status != TaskStatus::Todo {
+        return Ok(None);
+    }
+    if task.notifications.iter().any(|n| n.message == reason) {
+        return Ok(Some(task));
+    }
+    d.store
+        .update_task_in(task_id, now, |task| task.notify_once("blocked", &reason))
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn release_failed_claim(d: &Daemon, task: &Task, error: &str) -> Result<(), String> {
@@ -697,7 +747,7 @@ async fn update_task(
             let note = format!("Marked {status} by Mission Control.");
             match d.store.move_task(&id, status, &note, &chrono::Utc::now().to_rfc3339()) {
                 Ok(task) => Ok(task),
-                Err(error) => return super::coordination::move_error(error),
+                Err(error) => return super::coordination::store_error(error),
             }
         }
         (updated, _) => updated,
@@ -895,7 +945,8 @@ async fn open(
     };
     let state_path = mission_control::session_state_path();
     let id = mission_control::SESSION_ID.to_string();
-    let resume = state_path.exists();
+    // The conversation lives in the store; its path is only a key.
+    let resume = d.store.has_conversation(&id).unwrap_or(false);
     let profile = req
         .profile
         .clone()
