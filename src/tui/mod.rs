@@ -32,6 +32,7 @@ mod input;
 mod keybindings;
 mod render;
 mod settings;
+mod cards;
 mod shell;
 mod term_pane;
 mod views;
@@ -43,6 +44,7 @@ pub(crate) use render::*;
 pub(crate) use term_pane::*;
 pub(crate) use views::*;
 pub(crate) use shell::*;
+use cards::*;
 
 use markdown::*;
 use theme::*;

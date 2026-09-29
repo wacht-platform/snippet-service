@@ -152,11 +152,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     // Compaction/prune status lives in the footer usage cluster (bottom-right).
     // Approval prompt (manual mode): rows directly above the input when a mutating
     // tool is awaiting y/n.
-    let approval_h: u16 = if app.pending_approval().is_some() {
-        6
-    } else {
-        0
-    };
+    let approval_h = approval_height(app, area.width);
 
     // Header, Content, Suggestions, Question, Approval, Input, Status, Footer
     let chunks = Layout::default()
@@ -166,7 +162,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
             Constraint::Length(1),                    // gap under header
             Constraint::Min(10),                      // Content
             Constraint::Length(sugg_h),               // Suggestions
-            Constraint::Length(question_height(app)), // Question
+            Constraint::Length(question_height(app, area.width)), // Question
             Constraint::Length(approval_h),           // Approval prompt (above input)
             Constraint::Length(1),                    // gap above input
             Constraint::Length(input_h),              // Input (grows with wrapped lines)
