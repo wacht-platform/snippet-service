@@ -227,7 +227,7 @@ pub(crate) fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
         );
     }
     frame.render_widget(Paragraph::new(lines), Rect { height: area.height.saturating_sub(2), y: area.y + 1, ..inner });
-    let hint = if focused { "↑↓ move · Enter open · n new · Esc back" } else { "Ctrl-B sessions" };
+    let hint = if focused { "↑↓ move · Enter open · n new · Esc back" } else { "Ctrl-F sessions" };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(faint())))),
         Rect { y: area.y + area.height.saturating_sub(1), height: 1, ..inner },
@@ -510,7 +510,7 @@ pub(crate) fn render_palette(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
 
 pub(crate) fn render_key_hints(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let hints: &[(&str, &str)] = match app.shell.focus {
-        Focus::Composer => &[("Enter", "send"), ("Ctrl-P", "commands"), ("Ctrl-B", "sessions"), ("Ctrl-L", "panel"), ("Ctrl-O", "steps"), ("Esc", "stop")],
+        Focus::Composer => &[("Enter", "send"), ("Ctrl-P", "commands"), ("Ctrl-F", "sessions"), ("Ctrl-L", "panel"), ("Ctrl-O", "steps"), ("Esc", "stop")],
         Focus::Sidebar => &[("↑↓", "move"), ("Enter", "open"), ("n", "new"), ("Esc", "back")],
         Focus::Pane => &[("↑↓", "move"), ("Enter", "open"), ("Tab", "tab"), ("Esc", "back")],
     };
@@ -622,7 +622,9 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
                 app.shell.palette = Some(Palette::default());
                 return true;
             }
-            KeyCode::Char('b') => {
+            // Ctrl-F finds a session; Ctrl-B still works where tmux doesn't
+            // claim it as its prefix.
+            KeyCode::Char('f') | KeyCode::Char('b') => {
                 if app.shell.sidebar_visible(width) && app.shell.focus == Focus::Sidebar {
                     app.shell.sidebar = Some(false);
                     app.shell.focus = Focus::Composer;

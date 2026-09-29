@@ -310,3 +310,14 @@ fn usage_and_vault_panels_render_without_exposing_secrets() {
     assert!(vault.contains("GITHUB_TOKEN") && vault.contains("NEW_SECRET"));
     assert!(!vault.contains("hunter2"), "a secret value must never render");
 }
+
+#[test]
+fn ctrl_f_opens_sessions_and_ctrl_g_still_steers() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = tui_app();
+    app.shell.width = 170;
+    assert!(handle_shell_key(&mut app, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)));
+    assert_eq!(app.shell.focus, Focus::Sidebar);
+    // Ctrl-G is steer-now; the shell must leave it to the global handler.
+    assert!(!handle_shell_key(&mut app, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)));
+}
