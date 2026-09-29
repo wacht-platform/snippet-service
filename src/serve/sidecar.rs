@@ -657,3 +657,53 @@ mod tests {
         );
     }
 }
+
+/// A JSON request to the daemon's API, for the TUI's panels (agents, tasks,
+/// jobs, usage, vault). `method` is GET, POST, PUT or DELETE; the token rides
+/// in the query like every other call here.
+pub async fn api_json(
+    info: &DaemonInfo,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}{path}", info.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut q: Vec<(&str, String)> = vec![("token", info.token.clone())];
+    q.extend(query.iter().cloned());
+    let mut req = client.request(method, &url).query(&q);
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.map_err(|e| format!("{path}: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("{path} {status}: {text}"));
+    }
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|e| format!("{path} body: {e}"))
+}
+
+/// POST /mission-control/open — the dedicated Mission Control session's id,
+/// created on first use.
+pub async fn open_mission_control(info: &DaemonInfo) -> Result<String, String> {
+    let v = api_json(
+        info,
+        reqwest::Method::POST,
+        "/mission-control/open",
+        &[],
+        Some(serde_json::json!({})),
+    )
+    .await?;
+    v.get("id")
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "mission control: no session id".to_string())
+}

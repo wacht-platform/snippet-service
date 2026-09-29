@@ -32,6 +32,7 @@ mod input;
 mod keybindings;
 mod render;
 mod settings;
+mod boards;
 mod cards;
 mod shell;
 mod term_pane;
@@ -68,6 +69,7 @@ const HIDDEN_TOOL_ROWS: [&str; 9] = [
 const ALL_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/resume", "Resume a saved session"),
+    ("/mission", "Open Mission Control"),
     ("/rewind", "Restore the workspace to a checkpoint"),
     ("/fork", "Branch a new session from a checkpoint or event"),
     ("/model", "Connect or change the AI model"),

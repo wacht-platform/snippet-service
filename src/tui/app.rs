@@ -95,6 +95,10 @@ pub(crate) struct App {
     /// Set by the startup self-update task to the version it installed; shown in
     /// the header as a "restart to apply" hint.
     pub(crate) update_notice: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Daemon-backed side-pane panels (agents, tasks, jobs, usage, vault).
+    pub(crate) boards: super::boards::Boards,
+    /// Mission Control was asked for; opened on the next tick.
+    pub(crate) pending_mission_control: bool,
     pub(crate) error: Option<String>,
     pub(crate) state: Option<HarnessState>,
     /// The resident conversation loop. Spawned once, lives across turns.
@@ -334,6 +338,8 @@ impl App {
             xai_device_begin_handle: None,
             models_fetch_status: String::new(),
             update_notice: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            boards: Default::default(),
+            pending_mission_control: false,
             original_config: None,
             last_state_stamp: None,
             login_active: false,
@@ -594,6 +600,8 @@ impl App {
         self.refresh_daemon_sessions(false).await;
         // Then apply any picker mutation queued by a key handler.
         self.apply_pending_session_op().await;
+        self.apply_pending_mission_control().await;
+        self.poll_boards();
         // If the sidecar dropped, clear attachment so the next spawn can recover.
         if self
             .sidecar_attach

@@ -885,6 +885,9 @@ impl App {
                     self.open_term();
                 }
             }
+            "/mission" => {
+                self.open_mission_control();
+            }
             "/theme" => {
                 self.status = "AMOLED is the only theme.".to_string();
             }
