@@ -6,55 +6,6 @@ use super::fmt_si;
 
 const AGENT: usize = 3;
 
-/// Tools whose collapsed row is incomplete without an expanded body.
-pub(super) fn tool_is_expandable(tool_name: &str, arguments: &Value, result: Option<&Value>) -> bool {
-    let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
-    match tool_name {
-        "change_files" => arguments
-            .get("changes")
-            .and_then(Value::as_array)
-            .is_some_and(|c| !c.is_empty()),
-        "bash" => {
-            let cmd = arg("command");
-            cmd.lines().count() > 1
-                || cmd.chars().count() > 80
-                || result.map(result_has_body).unwrap_or(false)
-        }
-        "web_read" => result.map(result_has_body).unwrap_or(false),
-        _ => {
-            // Any tool whose header arg was truncated, or result has a body.
-            let (_, shown) = tool_call_parts(tool_name, arguments);
-            shown.contains('…') || result.map(result_has_body).unwrap_or(false)
-        }
-    }
-}
-
-fn result_has_body(result: &Value) -> bool {
-    if result.get("status").and_then(Value::as_str) == Some("error") {
-        return true;
-    }
-    let data = result.get("data").unwrap_or(result);
-    for key in ["stdout", "stderr", "content", "text", "output"] {
-        if data
-            .get(key)
-            .and_then(Value::as_str)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-    }
-    data.get("entries")
-        .and_then(Value::as_array)
-        .map(|a| !a.is_empty())
-        .unwrap_or(false)
-        || data
-            .get("matches")
-            .and_then(Value::as_array)
-            .map(|a| !a.is_empty())
-            .unwrap_or(false)
-}
-
 /// A tool call as (verb, argument) — e.g. ("Read", "src/auth.rs") — so the verb
 /// and its target can be styled distinctly instead of a single `Read(path)` blob.
 pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, String) {

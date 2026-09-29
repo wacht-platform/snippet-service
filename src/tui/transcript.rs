@@ -111,6 +111,7 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // sits flush beneath it, and the header (not blank lines) separates speakers.
     let mut speaker: Option<bool> = None; // Some(true)=agent, Some(false)=you
     let mut prev_tool_row = false;
+    let mut prev_plan = false;
 
     // Content is rendered in a column to the RIGHT of the fixed speaker tag.
     let content_w = width.saturating_sub(TAG_W).max(20);
@@ -224,36 +225,6 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             let mut call_lines =
                 tool_call_head_lines_status(tool_name, arguments, content_w, status);
 
-            let can_expand = tool_is_expandable(tool_name, arguments, result_value.as_ref());
-            if can_expand {
-                let hint = if expanded {
-                    "(ctrl+o to collapse)"
-                } else {
-                    "(ctrl+o to expand)"
-                };
-                if let Some(first) = call_lines.first_mut() {
-                    let need = hint.chars().count() + 1;
-                    if content_w > first.width() + need {
-                        first.spans.push(Span::raw(" "));
-                        first.spans.push(Span::styled(
-                            hint.to_string(),
-                            Style::default().fg(faint()).add_modifier(Modifier::DIM),
-                        ));
-                    }
-                }
-            }
-
-            if matches!(status, ToolRowStatus::Running) {
-                let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
-                if let Some(first) = call_lines.first_mut() {
-                    first.spans.push(Span::raw(" "));
-                    first.spans.push(Span::styled(
-                        spinner.to_string(),
-                        Style::default().fg(accent()),
-                    ));
-                }
-            }
-
             if expanded {
                 call_lines.extend(tool_call_preview(tool_name, arguments, content_w));
                 if let Some(result) = result_value.as_ref() {
@@ -269,6 +240,7 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             // Push tool rows flush with the content column (no speaker double-tag).
             lines.extend(call_lines);
             prev_tool_row = true;
+            prev_plan = false;
             continue;
         }
 
@@ -294,12 +266,15 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
         set_speaker(&mut lines, &mut speaker, &mut tag_pending, !is_user);
 
-        if prev_tool_row && !lines.is_empty() && lines.last().map_or(true, |l| !l.spans.is_empty())
+        if (prev_tool_row || prev_plan)
+            && !lines.is_empty()
+            && lines.last().map_or(true, |l| !l.spans.is_empty())
         {
             lines.push(Line::from(""));
         }
         push_tagged(&mut lines, rendered, !is_user, &mut tag_pending);
         prev_tool_row = false;
+        prev_plan = matches!(event, HarnessEvent::PlanUpdated { .. });
     }
     for pending in &app.pending_steers {
         if pending.trim().is_empty() {
@@ -1018,7 +993,11 @@ pub(super) fn tool_call_head_lines_status(
         ToolRowStatus::Running => ("●", accent()),
         ToolRowStatus::Failed => ("●", danger()),
     };
-    let verb_style = Style::default().fg(warn()).add_modifier(Modifier::BOLD);
+    let verb_style = if arg.trim().is_empty() {
+        Style::default().fg(soft())
+    } else {
+        Style::default().fg(text()).add_modifier(Modifier::BOLD)
+    };
     let arg_style = Style::default().fg(self::text());
     let paren_style = Style::default().fg(muted());
 
