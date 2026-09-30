@@ -74,6 +74,12 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
          );
          CREATE INDEX IF NOT EXISTS notification_journal_created
              ON notification_journal(created_at);
+         CREATE INDEX IF NOT EXISTS notification_journal_cursor
+             ON notification_journal(created_at, event_id);
+         CREATE TABLE IF NOT EXISTS notification_clock (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             created_at INTEGER NOT NULL
+         );
 "#,
     )
 }

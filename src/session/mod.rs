@@ -1154,7 +1154,7 @@ fn emit_device_event_with_store(
 fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value> {
     let kind = event.get("kind")?.as_str()?;
     let mut value = event.clone();
-    if matches!(kind, "waiting" | "done" | "error") {
+    if matches!(kind, "waiting" | "done" | "error" | "idle") {
         let session = event.get("session")?.as_str()?;
         value["destination"] = serde_json::json!({"type": "session", "id": session});
     } else if kind == "coordination_event" {
@@ -1234,6 +1234,35 @@ pub fn emit_status_transition(
             "status": status,
         }));
     }
+}
+
+pub fn replay_notification_events_after_cursor(created_at: i64, event_id: u64, limit: usize) -> Result<serde_json::Value, String> {
+    let store = store_for_sessions().ok_or("notification store unavailable")?;
+    let settings = store.load_control_settings().map_err(|e| e.to_string())?;
+    notification_tuple_page(&store, &settings, created_at, event_id, limit)
+}
+
+fn notification_tuple_page(store: &crate::store::Store, settings: &crate::mission_control::ControlSettings, created_at: i64, event_id: u64, limit: usize) -> Result<serde_json::Value, String> {
+    let mut rows = store.notification_events_after_cursor(created_at, event_id).map_err(|e| e.to_string())?;
+    let more_rows = rows.len() > 500;
+    rows.truncate(500);
+    let mut cursor = serde_json::json!({"created_at": created_at, "event_id": event_id});
+    let now = chrono::Utc::now().timestamp();
+    let mut events = Vec::new();
+    let mut has_more = more_rows;
+    for row in rows {
+        let eligible = row.get("notification_id").is_some()
+            && row["created_at"].as_i64().is_some_and(|ts| ts >= now - NOTIFICATION_RETENTION_SECS)
+            && row["expires_at"].as_i64().is_some_and(|expiry| expiry > now)
+            && notification_allowed(settings, &row);
+        if eligible && events.len() == limit.clamp(1, 500) {
+            has_more = true;
+            break;
+        }
+        cursor = serde_json::json!({"created_at": row["created_at"], "event_id": row["event_id"]});
+        if eligible { events.push(row); }
+    }
+    Ok(serde_json::json!({"events": events, "next_cursor": cursor, "has_more": has_more}))
 }
 
 pub fn replay_notification_events(since: u64, limit: usize) -> Result<serde_json::Value, String> {

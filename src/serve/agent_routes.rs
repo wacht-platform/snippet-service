@@ -347,6 +347,8 @@ pub(crate) struct NotificationReplayQuery {
     pub(crate) token: Option<String>,
     #[serde(default)]
     pub(crate) since: u64,
+    pub(crate) since_created_at: Option<i64>,
+    pub(crate) since_event_id: Option<u64>,
     #[serde(default = "notification_limit")]
     pub(crate) limit: usize,
 }
@@ -363,7 +365,18 @@ pub(crate) async fn notification_replay(
     if q.since > i64::MAX as u64 || q.limit == 0 || q.limit > 500 {
         return (StatusCode::BAD_REQUEST, "since must fit signed 64-bit; limit must be 1..500").into_response();
     }
-    match replay_notification_events(q.since, q.limit) {
+    if q.since_event_id.is_some_and(|id| id > i64::MAX as u64)
+        || (q.since_created_at.is_none() && q.since_event_id.is_some())
+        || (q.since_created_at.is_some() && q.since != 0)
+        || q.since_created_at.is_some_and(|ts| ts < 0) {
+        return (StatusCode::BAD_REQUEST, "use since_created_at >= 0 with optional since_event_id (signed 64-bit); do not mix with since").into_response();
+    }
+    let result = if let Some(created_at) = q.since_created_at {
+        crate::session::replay_notification_events_after_cursor(created_at, q.since_event_id.unwrap_or(0), q.limit)
+    } else {
+        replay_notification_events(q.since, q.limit)
+    };
+    match result {
         Ok(page) => Json(page).into_response(),
         Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
     }

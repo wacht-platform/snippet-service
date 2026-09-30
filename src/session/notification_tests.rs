@@ -43,10 +43,10 @@ fn notification_policy_pagination_expiry_and_legacy_filtering() {
 
 #[test]
 fn actionable_candidates_do_not_include_ui_only_events() {
-    for kind in ["running", "idle", "term", "models", "activity"] {
+    for kind in ["running", "term", "models", "activity"] {
         assert!(notification_candidate(&json!({"kind":kind,"session":"s"})).is_none());
     }
-    for kind in ["waiting", "done", "error"] {
+    for kind in ["waiting", "done", "error", "idle"] {
         let candidate =
             notification_candidate(&json!({"kind":kind,"session":"s","notify":true})).unwrap();
         assert_eq!(candidate["destination"], json!({"type":"session","id":"s"}));

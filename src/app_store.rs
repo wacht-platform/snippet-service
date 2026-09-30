@@ -270,6 +270,16 @@ impl Store {
                         ));
                 }
             }
+            let created_at: i64 = tx.query_row(
+                "SELECT MAX(?1, COALESCE((SELECT created_at FROM notification_clock WHERE id = 1), 0),
+                 COALESCE((SELECT MAX(created_at) FROM notification_journal), 0))",
+                params![now], |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO notification_clock VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at",
+                params![created_at],
+            )?;
             let floor: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(event_id), 0) + 1 FROM notification_journal",
                 [],
@@ -292,13 +302,13 @@ impl Store {
             if let Some(obj) = event.as_object_mut() {
                 obj.insert("event_id".into(), serde_json::json!(id));
                 obj.insert("notification_id".into(), serde_json::json!(uuid::Uuid::new_v4().to_string()));
-                obj.insert("created_at".into(), serde_json::json!(now));
+                obj.insert("created_at".into(), serde_json::json!(created_at));
                 obj.insert("expires_at".into(), serde_json::json!(now + retention_secs));
             }
             tx.execute(
                 "INSERT INTO notification_journal (event_id, kind, created_at, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![id, kind, now, event.to_string()],
+                params![id, kind, created_at, event.to_string()],
             )?;
             if let Some(key) = event.get("source_key").and_then(|v| v.as_str()) {
                 tx.execute("INSERT OR IGNORE INTO notification_sources VALUES (?1, ?2)", params![key, id])?;
@@ -310,6 +320,31 @@ impl Store {
             )?;
             tx.commit()?;
             Ok(event)
+        })
+    }
+
+    pub fn notification_events_after_cursor(
+        &self,
+        created_at: i64,
+        event_id: u64,
+    ) -> Result<Vec<serde_json::Value>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, created_at, payload_json FROM notification_journal
+                 WHERE (created_at, event_id) > (?1, ?2)
+                 ORDER BY created_at, event_id LIMIT 501",
+            )?;
+            let rows = stmt.query_map(params![created_at, event_id as i64], |row| {
+                let id: i64 = row.get(0)?;
+                let timestamp: i64 = row.get(1)?;
+                let raw: String = row.get(2)?;
+                let mut value = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok().filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}));
+                value["event_id"] = serde_json::json!(id);
+                value["created_at"] = serde_json::json!(timestamp);
+                Ok(value)
+            })?;
+            rows.collect()
         })
     }
 
