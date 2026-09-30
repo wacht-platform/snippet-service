@@ -94,6 +94,18 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
          );"#,
     )?;
     ensure_session_id_columns(connection)?;
+    connection.execute_batch(
+        r#"CREATE TRIGGER IF NOT EXISTS session_stop_insert AFTER INSERT ON sessions
+             WHEN NEW.status = 'idle'
+             BEGIN UPDATE sessions SET stop_identity = lower(hex(randomblob(16))) WHERE id = NEW.id; END;
+           CREATE TRIGGER IF NOT EXISTS session_stop_transition AFTER UPDATE OF status ON sessions
+             WHEN OLD.status != NEW.status
+             BEGIN UPDATE sessions SET stop_identity = CASE WHEN NEW.status = 'idle'
+                 THEN lower(hex(randomblob(16))) ELSE NULL END WHERE id = NEW.id; END;
+           CREATE TRIGGER IF NOT EXISTS session_stop_user_input AFTER INSERT ON session_messages
+             WHEN NEW.role = 'user'
+             BEGIN UPDATE sessions SET stop_identity = NULL WHERE id = NEW.session_id; END;"#,
+    )?;
     rewrite_legacy_session_ids(connection)?;
     Ok(())
 }
@@ -109,6 +121,9 @@ fn ensure_session_id_columns(connection: &rusqlite::Connection) -> Result<(), ru
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
         rows.collect::<Result<_, _>>()?
     };
+    if !existing.iter().any(|c| c == "stop_identity") {
+        connection.execute("ALTER TABLE sessions ADD COLUMN stop_identity TEXT", [])?;
+    }
     if !existing.iter().any(|c| c == "legacy_id") {
         connection.execute("ALTER TABLE sessions ADD COLUMN legacy_id TEXT", [])?;
     }
@@ -877,6 +892,16 @@ impl Store {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    pub fn current_stop_identity(&self, id: &str) -> Result<Option<String>, StoreError> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT stop_identity FROM sessions WHERE id = ?1 AND status = 'idle'",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            ).optional().map(Option::flatten)
         })
     }
 
