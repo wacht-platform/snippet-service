@@ -456,8 +456,7 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
 
 // WS /events — device-wide firehose. Emits a compact event on status changes
 // (including running) so the session list can update live, even for chats the
-// app isn't painting. `notify` is true when the event should also raise an OS
-// banner; the app still receives every frame for UI.
+// app isn't painting. Durable notifications are emitted as separate full frames.
 pub(crate) async fn events_ws(
     ws: WebSocketUpgrade,
     State(d): State<Shared>,
@@ -469,18 +468,6 @@ pub(crate) async fn events_ws(
     ws.on_upgrade(move |socket| handle_events_ws(socket, d))
 }
 
-fn allow_device_event(daemon: &Daemon, event: &serde_json::Value) -> bool {
-    let settings = mc::load_settings(&daemon.mission_control_root);
-    if settings.notification_policy == "none" {
-        return false;
-    }
-    if settings.notification_policy != "mission_control_only" {
-        return true;
-    }
-    let session = event.get("session").and_then(|v| v.as_str()).unwrap_or("");
-    settings.mission_control_session_id.as_deref() == Some(session)
-        || session == mc::SESSION_ID
-}
 
 async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
     let (mut sender, mut receiver) = socket.split();
@@ -495,17 +482,6 @@ async fn handle_events_ws(socket: WebSocket, daemon: Shared) {
                 ev = rx.recv() => {
                     match ev {
                         Ok(e) => {
-                            let mut e = e;
-                            let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                            // Always push to the UI. OS banners stay policy-gated
-                            // and never fire just because a chat started running.
-                            let notify = kind != "running"
-                                && kind != "models"
-                                && kind != "coordination_event"
-                                && allow_device_event(&daemon, &e);
-                            if let Some(obj) = e.as_object_mut() {
-                                obj.insert("notify".into(), serde_json::Value::Bool(notify));
-                            }
                             if sender
                                 .send(Message::Text(e.to_string().into()))
                                 .await

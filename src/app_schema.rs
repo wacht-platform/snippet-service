@@ -55,8 +55,13 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              updated_at INTEGER NOT NULL
          );
 
-         -- The device event journal, read back by `/notifications/replay`.
-         -- `emit_device_event` appends status / done / error frames here.
+         -- Durable notification feed, shared by `/notifications` and its replay alias.
+         CREATE TABLE IF NOT EXISTS notification_sources (
+             source_key TEXT PRIMARY KEY NOT NULL,
+             event_id INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS notification_sources_event
+             ON notification_sources(event_id);
          CREATE TABLE IF NOT EXISTS notification_sequence (
              id INTEGER PRIMARY KEY CHECK (id = 1),
              next_id INTEGER NOT NULL

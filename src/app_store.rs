@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use crate::mission_control::{ControlSettings, ManagedSession, SessionStatus};
@@ -258,6 +258,18 @@ impl Store {
         let now = chrono::Utc::now().timestamp();
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
+            if let Some(key) = event.get("source_key").and_then(|v| v.as_str()) {
+                let existing = tx.query_row(
+                    "SELECT payload_json FROM notification_journal JOIN notification_sources USING(event_id) WHERE source_key = ?1",
+                    params![key], |row| row.get::<_, String>(0),
+                ).optional()?;
+                if let Some(raw) = existing {
+                    return serde_json::from_str(&raw)
+                        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                            0, rusqlite::types::Type::Text, Box::new(error),
+                        ));
+                }
+            }
             let floor: i64 = tx.query_row(
                 "SELECT COALESCE(MAX(event_id), 0) + 1 FROM notification_journal",
                 [],
@@ -279,13 +291,19 @@ impl Store {
             )?;
             if let Some(obj) = event.as_object_mut() {
                 obj.insert("event_id".into(), serde_json::json!(id));
+                obj.insert("notification_id".into(), serde_json::json!(uuid::Uuid::new_v4().to_string()));
                 obj.insert("created_at".into(), serde_json::json!(now));
+                obj.insert("expires_at".into(), serde_json::json!(now + retention_secs));
             }
             tx.execute(
                 "INSERT INTO notification_journal (event_id, kind, created_at, payload_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![id, kind, now, event.to_string()],
             )?;
+            if let Some(key) = event.get("source_key").and_then(|v| v.as_str()) {
+                tx.execute("INSERT OR IGNORE INTO notification_sources VALUES (?1, ?2)", params![key, id])?;
+            }
+            tx.execute("DELETE FROM notification_sources WHERE event_id IN (SELECT event_id FROM notification_journal WHERE created_at < ?1)", params![now - retention_secs])?;
             tx.execute(
                 "DELETE FROM notification_journal WHERE created_at < ?1",
                 params![now - retention_secs],
@@ -298,13 +316,14 @@ impl Store {
     pub fn notification_events_since(
         &self,
         since: u64,
+        limit: usize,
     ) -> Result<Vec<serde_json::Value>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT event_id, created_at, payload_json FROM notification_journal
-                 WHERE event_id > ?1 ORDER BY event_id LIMIT 500",
+                 WHERE event_id > ?1 ORDER BY event_id LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![since as i64], |row| {
+            let rows = stmt.query_map(params![since as i64, limit.clamp(1, 501) as i64], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
@@ -314,12 +333,10 @@ impl Store {
             let mut out = Vec::new();
             for row in rows {
                 let (id, created_at, raw) = row?;
-                // A malformed row is skipped rather than failing the whole
-                // replay: the journal is a convenience, and one bad record must
-                // not make the firehose unreadable.
-                let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                    continue;
-                };
+                let mut value = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .filter(|value| value.is_object())
+                    .unwrap_or_else(|| serde_json::json!({}));
                 // The id and timestamp are columns, not payload fields, so they
                 // are re-attached here. A caller filtering on `event_id` (which
                 // is how a client resumes) would otherwise see nothing.

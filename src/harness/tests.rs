@@ -1,5 +1,57 @@
 use super::*;
 
+#[tokio::test]
+async fn tool_persistence_updates_store_without_activity_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = CodingHarness::new(
+        HarnessConfig {
+            state_path: Some(dir.path().join("state.json")),
+            memory_enabled: false,
+            ..HarnessConfig::default()
+        },
+        ToolRegistry::new(),
+        ToolContext::new(dir.path())
+            .unwrap()
+            .with_store_path(dir.path().join("store.db")),
+    );
+    let mut events = crate::session::subscribe_device_events();
+    let mut state = harness
+        .load_or_initialize_state(Some("test".into()))
+        .await
+        .unwrap();
+    let id = harness.session_id().unwrap();
+    let store = harness.store().unwrap();
+    store.set_session_last_active(&id, 123).unwrap();
+    let before = state.updated_at.clone();
+    state.events.push(HarnessEvent::ToolResult {
+        tool_name: "bash".into(),
+        result: serde_json::json!({"stdout": "ok"}),
+    });
+    harness.persist_state(&mut state).await.unwrap();
+    let row = store.get_session_row(&id).unwrap().unwrap();
+    assert_eq!(row.status, "running");
+    assert_eq!(row.updated_at, state.updated_at);
+    assert_ne!(state.updated_at, before);
+    assert_eq!(row.last_active, Some(123));
+    assert_eq!(
+        store.load_conversation_events(&id).unwrap(),
+        state.events
+    );
+    state.status = HarnessStatus::Completed;
+    harness.persist_state(&mut state).await.unwrap();
+    let mut kinds = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if event["session"] == id {
+            kinds.push(event["kind"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(kinds, ["running", "done"]);
+    assert_eq!(
+        store.get_session_row(&id).unwrap().unwrap().status,
+        "completed"
+    );
+}
+
 #[cfg(test)]
 mod state_migration_tests {
     use super::*;
