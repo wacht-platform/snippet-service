@@ -434,13 +434,12 @@ fn is_server_tool_type(kind: &str) -> bool {
     )
 }
 
-/// The only server-side tool this client ever declares to xAI (`x_search`, when
-/// enabled — see `build_responses_request`). A `function_call` whose name is not
-/// this one is a CLIENT call we must execute, even when the name happens to
-/// coincide with an xAI server tool: `web_search` is our Exa client tool and is
-/// also an xAI server-tool name, so matching by name alone silently swallowed it.
+/// Native X search names must not swallow the unrelated local `web_search` tool.
 fn is_declared_server_tool_name(name: &str) -> bool {
-    name == "x_search"
+    matches!(
+        name,
+        "x_search" | "x_keyword_search" | "x_semantic_search" | "x_user_search" | "x_thread_fetch"
+    )
 }
 
 fn is_x_search_item(item: &Value) -> bool {
@@ -451,7 +450,7 @@ fn is_x_search_item(item: &Value) -> bool {
                 .get("name")
                 .or_else(|| item.pointer("/function/name"))
                 .and_then(Value::as_str)
-                == Some("x_search"))
+                .is_some_and(is_declared_server_tool_name))
 }
 
 /// Responses output items for provider-executed tools. These are observations
@@ -1127,6 +1126,55 @@ mod tests {
         let text = out.content_text.unwrap();
         assert!(text.contains("done"));
         assert!(text.contains("https://x.com/status/1"));
+    }
+
+    const X_SEARCH_ALIASES: [&str; 4] = [
+        "x_keyword_search",
+        "x_semantic_search",
+        "x_user_search",
+        "x_thread_fetch",
+    ];
+
+    fn alias_items(name: &str) -> Vec<Value> {
+        vec![
+            json!({"type": "function_call", "name": name, "id": "xs_1", "call_id": "c1", "arguments": "{}"}),
+            json!({"type": "function", "id": "xs_1", "function": {"name": name, "arguments": {}}}),
+        ]
+    }
+
+    #[test]
+    fn parser_recognizes_native_x_search_aliases() {
+        for name in X_SEARCH_ALIASES {
+            for item in alias_items(name) {
+                let out = parse_responses_value(&json!({"output": [item]}), None).expect("parse");
+                assert!(out.calls.is_empty(), "{name} must not execute locally");
+                assert!(out.used_server_tools, "{name} is a server observation");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_recognizes_native_x_search_aliases() {
+        for name in X_SEARCH_ALIASES {
+            for item in alias_items(name) {
+                for event_type in ["response.output_item.done", "response.completed"] {
+                    let event = if event_type == "response.output_item.done" {
+                        json!({"type": event_type, "item": item})
+                    } else {
+                        json!({"type": event_type, "response": {"output": [item]}})
+                    };
+                    let added = json!({"type": "response.output_item.added", "item": item});
+                    let body = format!("data: {added}\n\ndata: {event}\n\ndata: [DONE]\n\n");
+                    let response = axum::http::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .expect("response");
+                    let out = parse_responses_sse(response.into(), None).await.expect("parse");
+                    assert!(out.calls.is_empty(), "{name} via {event_type} must not execute locally");
+                    assert!(out.used_server_tools, "{name} via {event_type} is a server observation");
+                }
+            }
+        }
     }
 
     #[test]
