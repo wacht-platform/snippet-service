@@ -1,5 +1,43 @@
 use super::*;
 
+fn tool_activity_text(name: &str) -> String {
+    match name {
+        "bash" => "Running command".into(),
+        "change_files" => "Editing files".into(),
+        "view_image" => "Viewing image".into(),
+        "web_search" => "Searching the web".into(),
+        "web_read" => "Reading web page".into(),
+        "search_skills" => "Finding skills".into(),
+        "skill" => "Loading skill".into(),
+        "manage_process" => "Managing background process".into(),
+        "delegate_task" => "Delegating task".into(),
+        "update_plan" => "Updating plan".into(),
+        "terminate_loop" => "Finishing task".into(),
+        _ => format!("Running {name}"),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn tool_activity_uses_precise_labels_and_preserves_unknown_names() {
+    for (name, expected) in [
+        ("bash", "Running command"),
+        ("change_files", "Editing files"),
+        ("view_image", "Viewing image"),
+        ("web_search", "Searching the web"),
+        ("web_read", "Reading web page"),
+        ("search_skills", "Finding skills"),
+        ("skill", "Loading skill"),
+        ("manage_process", "Managing background process"),
+        ("delegate_task", "Delegating task"),
+        ("update_plan", "Updating plan"),
+        ("terminate_loop", "Finishing task"),
+        ("custom_tool", "Running custom_tool"),
+    ] {
+        assert_eq!(tool_activity_text(name), expected);
+    }
+}
+
 /// Read-only tools with no side effects on the workspace or the session, so a
 /// run of them can execute concurrently. Results are still recorded in call
 /// order, one ToolCall/ToolResult pair at a time, which is what the clients pair
@@ -169,7 +207,7 @@ impl CodingHarness {
     ) {
         stats.only_delegations = false;
         for call in calls {
-            self.lane_progress("tool_call", format!("running {}", call.tool_name));
+            self.lane_progress("tool_call", tool_activity_text(&call.tool_name));
         }
         let results = futures_util::future::join_all(calls.iter().map(|call| {
             self.tools
@@ -224,7 +262,7 @@ impl CodingHarness {
             tool_name: tool_name.clone(),
             arguments: call.arguments.clone(),
         });
-        self.lane_progress("tool_call", format!("running {tool_name}"));
+        self.lane_progress("tool_call", tool_activity_text(&tool_name));
 
         // Headless explicit completion: a lane / one-shot run ends with a
         // structured `summary` (folded back into the caller). Not advertised to

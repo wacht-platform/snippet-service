@@ -1,5 +1,13 @@
 use super::*;
 
+const MODEL_ACTIVITY_TEXT: &str = "Thinking";
+
+#[cfg(test)]
+#[test]
+fn model_activity_is_human_readable() {
+    assert_eq!(MODEL_ACTIVITY_TEXT, "Thinking");
+}
+
 /// What the model's output resolved to once inline markup was salvaged and
 /// phantom calls dropped.
 struct ParsedTurn {
@@ -40,13 +48,7 @@ impl CodingHarness {
 
         let request_messages = self.build_request(state, vars, model).await;
 
-        self.lane_progress(
-            "model",
-            format!(
-                "waiting for model response (iteration {})",
-                state.iterations
-            ),
-        );
+        self.lane_progress("model", MODEL_ACTIVITY_TEXT);
         // Clear any leftover live-stream text before this turn streams into it;
         // the sink is present only for the interactive conversation.
         if let Some(sink) = sink {

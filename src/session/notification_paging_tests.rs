@@ -36,8 +36,12 @@ fn notification_tuple_pages_ties_filters_expiry_and_retention() {
     let dir = tempfile::tempdir().unwrap();
     let store = crate::store::Store::open(&dir.path().join("notifications.db")).unwrap();
     let now = chrono::Utc::now().timestamp();
+    store.save_session_scalar("worker", "workspace", "/workspace", None,
+        "idle", "{}", "same", "same").unwrap();
+    let identity = store.current_stop_identity("worker").unwrap().unwrap();
     for _ in 0..502 {
-        store.append_notification_event(json!({"kind":"idle","destination":{"type":"session","id":"worker"}}), 86400).unwrap();
+        store.append_notification_event(json!({"kind":"idle","session":"worker",
+            "stop_identity":identity,"destination":{"type":"session","id":"worker"}}), 86400).unwrap();
     }
     store.with_connection(|conn| {
         conn.execute("UPDATE notification_journal SET created_at = ?1", [now])?;

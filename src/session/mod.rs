@@ -1124,6 +1124,8 @@ mod notification_wire_tests;
 mod notification_paging_tests;
 #[cfg(test)]
 mod notification_attention_tests;
+#[cfg(test)]
+mod notification_stop_tests;
 
 const NOTIFICATION_RETENTION_SECS: i64 = 24 * 60 * 60;
 
@@ -1146,6 +1148,15 @@ fn emit_device_event_with_store(
                     return;
                 };
                 notification["attention"] = attention;
+            }
+            if notification["kind"] == "idle" {
+                let identity = notification["session"].as_str()
+                    .and_then(|id| store.current_stop_identity(id).ok().flatten());
+                let Some(identity) = identity else {
+                    let _ = events.send(event);
+                    return;
+                };
+                notification["stop_identity"] = identity.into();
             }
             if let Ok(settings) = store.load_control_settings() {
                 if notification_allowed(&settings, &notification) {
@@ -1201,6 +1212,11 @@ fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value
 }
 
 fn notification_attention_current(store: &crate::store::Store, event: &serde_json::Value) -> bool {
+    if event["kind"] == "idle" {
+        let Some(session) = event["session"].as_str() else { return false; };
+        return store.current_stop_identity(session).ok().flatten()
+            .is_some_and(|identity| event["stop_identity"].as_str() == Some(identity.as_str()));
+    }
     if event["kind"] != "waiting" { return true; }
     let Some(session) = event["session"].as_str() else { return false; };
     store.current_attention(session).ok().flatten()
