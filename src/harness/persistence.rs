@@ -276,16 +276,6 @@ impl CodingHarness {
                     store
                         .append_conversation_events(&id, &state.events[from..], &now)
                         .map_err(|e| e.to_string())?;
-                    if state.events[from..]
-                        .iter()
-                        .any(|e| matches!(e, HarnessEvent::ToolResult { .. }))
-                    {
-                        crate::session::emit_device_event(serde_json::json!({
-                            "kind": "activity",
-                            "session": id,
-                            "workspace": workspace,
-                        }));
-                    }
                 }
             }
             Ok::<(), String>(())

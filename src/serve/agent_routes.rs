@@ -347,7 +347,11 @@ pub(crate) struct NotificationReplayQuery {
     pub(crate) token: Option<String>,
     #[serde(default)]
     pub(crate) since: u64,
+    #[serde(default = "notification_limit")]
+    pub(crate) limit: usize,
 }
+
+fn notification_limit() -> usize { 100 }
 
 pub(crate) async fn notification_replay(
     State(d): State<Shared>,
@@ -356,9 +360,12 @@ pub(crate) async fn notification_replay(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    Json(serde_json::json!({
-        "events": replay_notification_events(q.since),
-    }))
-    .into_response()
+    if q.since > i64::MAX as u64 || q.limit == 0 || q.limit > 500 {
+        return (StatusCode::BAD_REQUEST, "since must fit signed 64-bit; limit must be 1..500").into_response();
+    }
+    match replay_notification_events(q.since, q.limit) {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
 }
 

@@ -1116,25 +1116,92 @@ pub fn subscribe_device_events() -> broadcast::Receiver<serde_json::Value> {
     device_events().subscribe()
 }
 
+#[cfg(test)]
+mod notification_tests;
+#[cfg(test)]
+mod notification_wire_tests;
+#[cfg(test)]
+mod notification_paging_tests;
+
 const NOTIFICATION_RETENTION_SECS: i64 = 24 * 60 * 60;
 
 pub fn emit_device_event(event: serde_json::Value) {
-    let journaled = matches!(
-        event.get("kind").and_then(|k| k.as_str()),
-        Some("waiting" | "done" | "error" | "idle" | "term")
-    );
-    let event = if journaled {
-        store_for_sessions()
-            .and_then(|store| {
-                store
-                    .append_notification_event(event.clone(), NOTIFICATION_RETENTION_SECS)
-                    .ok()
-            })
-            .unwrap_or(event)
+    emit_device_event_with_store(event, store_for_sessions().as_ref(), device_events());
+}
+
+fn emit_device_event_with_store(
+    event: serde_json::Value,
+    store: Option<&crate::store::Store>,
+    events: &broadcast::Sender<serde_json::Value>,
+) {
+    if let Some(store) = store {
+        if let Some(notification) = notification_candidate(&event) {
+            if let Ok(settings) = store.load_control_settings() {
+                if notification_allowed(&settings, &notification) {
+                    match store.append_notification_event(notification, NOTIFICATION_RETENTION_SECS) {
+                        Ok(saved) => { let _ = events.send(serde_json::json!({
+                            "kind": "notification", "notification": saved
+                        })); }
+                        Err(error) => eprintln!("persist notification: {error}"),
+                    }
+                }
+            }
+        }
+    }
+    let _ = events.send(event);
+}
+
+fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let kind = event.get("kind")?.as_str()?;
+    let mut value = event.clone();
+    if matches!(kind, "waiting" | "done" | "error") {
+        let session = event.get("session")?.as_str()?;
+        value["destination"] = serde_json::json!({"type": "session", "id": session});
+    } else if kind == "coordination_event" {
+        let source = event.get("event")?;
+        let event_type = source.get("event_type")?.as_str()?;
+        let destination = match event_type {
+            "direct_message.sent" => {
+                let recipient = source["payload"]["recipient"].as_str()?;
+                let (recipient_type, id) = recipient.split_once(':')?;
+                if recipient_type != "session" {
+                    return None;
+                }
+                serde_json::json!({"type": "session", "id": id})
+            }
+            "task.message" => {
+                let id = source.get("correlation_id")?.as_str()?;
+                serde_json::json!({"type": "task", "id": id, "session": crate::mission_control::SESSION_ID})
+            }
+            _ => return None,
+        };
+        value = serde_json::json!({
+            "kind": event_type, "destination": destination,
+            "source_key": source["event_id"], "payload": source["payload"]
+        });
+        if event_type == "direct_message.sent" {
+            value["thread_id"] = source["thread_id"].clone();
+        }
     } else {
-        event
-    };
-    let _ = device_events().send(event);
+        return None;
+    }
+    value.as_object_mut()?.remove("notify");
+    Some(value)
+}
+
+fn notification_allowed(settings: &crate::mission_control::ControlSettings, event: &serde_json::Value) -> bool {
+    let destination = &event["destination"];
+    let session = if destination["type"] == "session" {
+        destination["id"].as_str()
+    } else { destination["session"].as_str() };
+    match settings.notification_policy.as_str() {
+        "all_sessions" => true,
+        "mission_control_only" => session.is_some_and(|id| {
+            id == crate::mission_control::SESSION_ID
+                || settings.mission_control_session_id.as_deref() == Some(id)
+        }),
+        _ => false,
+    }
 }
 
 fn notify_kind(prev: &str, status: &str) -> Option<&'static str> {
@@ -1169,10 +1236,44 @@ pub fn emit_status_transition(
     }
 }
 
-pub fn replay_notification_events(since: u64) -> Vec<serde_json::Value> {
-    store_for_sessions()
-        .and_then(|store| store.notification_events_since(since).ok())
-        .unwrap_or_default()
+pub fn replay_notification_events(since: u64, limit: usize) -> Result<serde_json::Value, String> {
+    let store = store_for_sessions().ok_or("notification store unavailable")?;
+    let settings = store.load_control_settings().map_err(|e| e.to_string())?;
+    notification_page_from_store(&store, &settings, since, limit)
+}
+
+fn notification_page_from_store(
+    store: &crate::store::Store,
+    settings: &crate::mission_control::ControlSettings,
+    since: u64,
+    limit: usize,
+) -> Result<serde_json::Value, String> {
+    let mut rows = store.notification_events_since(since, 501).map_err(|e| e.to_string())?;
+    let more_rows = rows.len() > 500;
+    rows.truncate(500);
+    let mut page = notification_page(rows, settings, since, limit);
+    if more_rows {
+        page["has_more"] = serde_json::json!(true);
+    }
+    Ok(page)
+}
+
+fn notification_page(rows: Vec<serde_json::Value>, settings: &crate::mission_control::ControlSettings, since: u64, limit: usize) -> serde_json::Value {
+    let limit = limit.clamp(1, 500);
+    let now = chrono::Utc::now().timestamp();
+    let mut events = Vec::new();
+    let mut cursor = since;
+    let mut has_more = false;
+    for row in rows {
+        let id = row["event_id"].as_u64().unwrap_or(cursor);
+        let eligible = row.get("notification_id").is_some()
+            && row["expires_at"].as_i64().is_some_and(|expiry| expiry > now)
+            && notification_allowed(settings, &row);
+        if eligible && events.len() == limit { has_more = true; break; }
+        cursor = id;
+        if eligible { events.push(row); }
+    }
+    serde_json::json!({"events": events, "next_cursor": cursor, "has_more": has_more})
 }
 
 /// Last-active unix seconds for a state file: the store's stamp if the session
