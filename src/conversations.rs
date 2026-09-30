@@ -880,6 +880,31 @@ impl Store {
         })
     }
 
+    pub fn current_attention(&self, id: &str) -> Result<Option<serde_json::Value>, StoreError> {
+        self.with_connection(|conn| {
+            let request = conn.query_row(
+                "SELECT e.ordinal, e.created_at, json_extract(e.payload_json, '$.kind')
+                 FROM sessions s JOIN session_events e ON e.session_id = s.id
+                 WHERE s.id = ?1 AND s.status = 'waiting_for_input'
+                   AND json_extract(e.payload_json, '$.kind') IN ('user_question', 'approval_request')
+                   AND e.ordinal = (SELECT MAX(ordinal) FROM session_events
+                       WHERE session_id = s.id AND json_extract(payload_json, '$.kind')
+                           IN ('user_question', 'approval_request'))
+                   AND ((json_extract(e.payload_json, '$.kind') = 'user_question'
+                         AND json_extract(s.state_json, '$.pending_question') IS NOT NULL
+                         AND json_extract(s.state_json, '$.pending_question') = json_extract(e.payload_json, '$.questions'))
+                        OR (json_extract(e.payload_json, '$.kind') = 'approval_request'
+                            AND json_extract(s.state_json, '$.pending_question') IS NULL))",
+                params![id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            ).optional()?;
+            Ok(request.map(|(ordinal, created_at, kind)| serde_json::json!({
+                "type": if kind == "user_question" { "question" } else { "approval" },
+                "id": format!("{ordinal}:{created_at}")
+            })))
+        })
+    }
+
     /// Read a session's stored scalar state, if this store has the session.
     pub fn load_session_scalar(&self, id: &str) -> Result<Option<String>, StoreError> {
         self.with_connection(|conn| {
