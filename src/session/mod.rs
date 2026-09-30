@@ -1122,6 +1122,8 @@ mod notification_tests;
 mod notification_wire_tests;
 #[cfg(test)]
 mod notification_paging_tests;
+#[cfg(test)]
+mod notification_attention_tests;
 
 const NOTIFICATION_RETENTION_SECS: i64 = 24 * 60 * 60;
 
@@ -1135,7 +1137,16 @@ fn emit_device_event_with_store(
     events: &broadcast::Sender<serde_json::Value>,
 ) {
     if let Some(store) = store {
-        if let Some(notification) = notification_candidate(&event) {
+        if let Some(mut notification) = notification_candidate(&event) {
+            if notification["kind"] == "waiting" {
+                let attention = notification["session"].as_str()
+                    .and_then(|id| store.current_attention(id).ok().flatten());
+                let Some(attention) = attention else {
+                    let _ = events.send(event);
+                    return;
+                };
+                notification["attention"] = attention;
+            }
             if let Ok(settings) = store.load_control_settings() {
                 if notification_allowed(&settings, &notification) {
                     match store.append_notification_event(notification, NOTIFICATION_RETENTION_SECS) {
@@ -1187,6 +1198,13 @@ fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value
     }
     value.as_object_mut()?.remove("notify");
     Some(value)
+}
+
+fn notification_attention_current(store: &crate::store::Store, event: &serde_json::Value) -> bool {
+    if event["kind"] != "waiting" { return true; }
+    let Some(session) = event["session"].as_str() else { return false; };
+    store.current_attention(session).ok().flatten()
+        .is_some_and(|attention| event["attention"] == attention)
 }
 
 fn notification_allowed(settings: &crate::mission_control::ControlSettings, event: &serde_json::Value) -> bool {
@@ -1254,7 +1272,8 @@ fn notification_tuple_page(store: &crate::store::Store, settings: &crate::missio
         let eligible = row.get("notification_id").is_some()
             && row["created_at"].as_i64().is_some_and(|ts| ts >= now - NOTIFICATION_RETENTION_SECS)
             && row["expires_at"].as_i64().is_some_and(|expiry| expiry > now)
-            && notification_allowed(settings, &row);
+            && notification_allowed(settings, &row)
+            && notification_attention_current(store, &row);
         if eligible && events.len() == limit.clamp(1, 500) {
             has_more = true;
             break;
@@ -1280,6 +1299,12 @@ fn notification_page_from_store(
     let mut rows = store.notification_events_since(since, 501).map_err(|e| e.to_string())?;
     let more_rows = rows.len() > 500;
     rows.truncate(500);
+    let rows = rows.into_iter().map(|mut row| {
+        if !notification_attention_current(store, &row) {
+            row.as_object_mut().map(|object| object.remove("notification_id"));
+        }
+        row
+    }).collect();
     let mut page = notification_page(rows, settings, since, limit);
     if more_rows {
         page["has_more"] = serde_json::json!(true);
