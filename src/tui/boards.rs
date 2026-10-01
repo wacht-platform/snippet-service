@@ -211,10 +211,6 @@ impl App {
             }
             return true;
         }
-        if self.shell.tab == PaneTab::Vault && self.vault_input.is_some() {
-            self.vault_input_key(key);
-            return true;
-        }
         let Some(info) = self.sidecar.clone() else {
             return false;
         };
@@ -294,11 +290,24 @@ impl App {
     }
 
     /// Typing into the vault's add prompt: the name, then the value (masked).
-    fn vault_input_key(&mut self, key: crossterm::event::KeyEvent) {
-        use crossterm::event::KeyCode;
+    pub(crate) fn vault_prompt_open(&self) -> bool {
+        self.vault_input.is_some()
+            && self.screen == Screen::Main
+            && self.shell.focus == Focus::Pane
+            && self.shell.tab == PaneTab::Vault
+            && self.shell.pane_visible(self.shell.width)
+    }
+
+    pub(crate) fn vault_input_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
         let Some(input) = self.vault_input.as_mut() else {
             return;
         };
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && key.code != KeyCode::Esc
+        {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.vault_input = None;
@@ -341,6 +350,9 @@ impl App {
 
     /// Pasted text goes to the vault prompt when it is open; true if taken.
     pub(crate) fn vault_paste(&mut self, text: &str) -> bool {
+        if !self.vault_prompt_open() {
+            return false;
+        }
         let Some(input) = self.vault_input.as_mut() else {
             return false;
         };
