@@ -689,12 +689,25 @@ impl Store {
 
     /// Re-queue unfinished work so dispatch delivers it again: blocked, failed,
     /// or in progress with a worker that went quiet. Refuses done and cancelled
-    /// work, which only a person reopens ([`Self::move_task`]).
+    /// work, which only a person reopens ([`Self::move_task`]), and work whose
+    /// worker session is still running or waiting on a question.
     pub fn retry_task(&self, id: &str, now: &str) -> Result<Task, StoreError> {
         self.requeue(id, now, false)
     }
 
     fn requeue(&self, id: &str, now: &str, reopen: bool) -> Result<Task, StoreError> {
+        if let Some(task) = self.get_task(id)?
+            && task.status == TaskStatus::InProgress
+            && let Some(session) = task.reporting_session.as_deref()
+            && self
+                .get_session_row(session)?
+                .is_some_and(|row| matches!(row.status.as_str(), "running" | "waiting_for_input"))
+        {
+            return Err(StoreError::WorkerBusy {
+                id: id.to_string(),
+                session: session.to_string(),
+            });
+        }
         let mut refused = None;
         let task = self.update_task_in(id, now, |task| {
             if !reopen && matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled) {
