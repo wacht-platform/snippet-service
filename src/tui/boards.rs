@@ -39,7 +39,7 @@ impl Boards {
         self.slots.lock().ok().and_then(|s| s.get(key).cloned()).unwrap_or_default()
     }
 
-    fn stale(&self, key: &str, max_age: Duration) -> bool {
+    pub(crate) fn stale(&self, key: &str, max_age: Duration) -> bool {
         let f = self.get(key);
         !f.loading && f.at.is_none_or(|at| at.elapsed() >= max_age)
     }
@@ -52,19 +52,24 @@ impl Boards {
         path: String,
         query: Vec<(&'static str, String)>,
     ) {
+        self.fetch_with(info, key, reqwest::Method::GET, path, query, None);
+    }
+
+    pub(crate) fn fetch_with(
+        &self,
+        info: crate::serve::sidecar::DaemonInfo,
+        key: String,
+        method: reqwest::Method,
+        path: String,
+        query: Vec<(&'static str, String)>,
+        body: Option<Value>,
+    ) {
         if let Ok(mut s) = self.slots.lock() {
             s.entry(key.clone()).or_default().loading = true;
         }
         let slots = self.slots.clone();
         tokio::spawn(async move {
-            let result = crate::serve::sidecar::api_json(
-                &info,
-                reqwest::Method::GET,
-                &path,
-                &query,
-                None,
-            )
-            .await;
+            let result = crate::serve::sidecar::api_json(&info, method, &path, &query, body).await;
             if let Ok(mut s) = slots.lock() {
                 let slot = s.entry(key).or_default();
                 slot.loading = false;
@@ -153,6 +158,7 @@ impl App {
         let Some(info) = self.sidecar.clone() else {
             return;
         };
+        self.poll_panels(&info);
         if !self.shell.pane_visible(self.shell.width) {
             return;
         }
@@ -189,6 +195,7 @@ impl App {
             PaneTab::Tasks => list_len(&self.boards.get("tasks")),
             PaneTab::Jobs => list_len(&self.boards.get("jobs")),
             PaneTab::Vault => vault_names(&self.boards.get("vault")).len(),
+            PaneTab::Inbox | PaneTab::Procs | PaneTab::Git | PaneTab::Files => self.panel_len(tab),
             _ => 0,
         }
     }
@@ -284,6 +291,15 @@ impl App {
                 None,
                 format!("Deleted {name}."),
                 "vault".into(),
+            ),
+            ConfirmAction::KillProcess(session, id, name) => self.boards.act(
+                info,
+                reqwest::Method::POST,
+                "/bg/kill".into(),
+                vec![],
+                Some(serde_json::json!({ "session": session, "id": id })),
+                format!("Stopped {name}."),
+                format!("procs:{session}"),
             ),
         }
         self.shell.pane_index = self.shell.pane_index.saturating_sub(1);
@@ -407,6 +423,7 @@ pub(crate) struct Confirm {
 pub(crate) enum ConfirmAction {
     DeleteJob(String, String),
     DeleteSecret(String),
+    KillProcess(String, String, String),
 }
 
 /// The vault's two-step add prompt.

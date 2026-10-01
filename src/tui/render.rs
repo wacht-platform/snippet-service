@@ -139,6 +139,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     }
 
     app.shell.width = area.width;
+    app.shell.height = area.height;
     let (sidebar_area, centre, pane_area) = shell_areas(app, area);
     if let Some(sidebar) = sidebar_area {
         render_sidebar(frame, sidebar, app);
