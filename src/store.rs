@@ -18,6 +18,8 @@ pub enum StoreError {
     AlreadyTerminal { id: String, status: String },
     #[error("task {id} is {status}; finished work cannot be retried")]
     NotRetryable { id: String, status: String },
+    #[error("task {id} is still being worked in session {session}; message it, or wait for it to stop")]
+    WorkerBusy { id: String, session: String },
     #[error("task {id} cannot be moved to {status} by hand; only a dispatch starts work")]
     InvalidTransition { id: String, status: String },
     #[error("{from} blocking {to} would make a dependency cycle")]

@@ -339,6 +339,7 @@ pub(super) fn store_error(error: crate::store::StoreError) -> Response {
         StoreError::AlreadyTerminal { .. }
         | StoreError::NotRetryable { .. }
         | StoreError::InvalidTransition { .. }
+        | StoreError::WorkerBusy { .. }
         | StoreError::DependencyCycle { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -525,11 +526,6 @@ async fn transfer_task_lease(
     match d.store.transfer_task_session_lease(&task_id, &agent_id, to_agent) {
         Ok(()) => {
             if let Ok(Some(task)) = d.store.get_task(&task_id) {
-                if !task.session_id.trim().is_empty() {
-                    let role = if to_agent == "snippet" { "standard" } else { "specialized" };
-                    let agent_opt = if to_agent == "snippet" { None } else { Some(to_agent) };
-                    let _ = d.store.set_session_role(&task.session_id, role, agent_opt);
-                }
                 let now = chrono::Utc::now().to_rfc3339();
                 let event = CoordinationEvent {
                     event_id: uuid::Uuid::new_v4().to_string(),
@@ -738,13 +734,19 @@ pub(super) struct WakeTarget {
     pub inbox_agent: Option<String>,
 }
 
+const CHATTER_EVENTS: &[&str] = &["message.posted", "task.message"];
+
 /// Whether the room's tail is an agent-only exchange long enough to stop.
 fn agent_chain_exhausted(history: &[CoordinationEvent], event: &CoordinationEvent) -> bool {
+    let chatter = |e: &&CoordinationEvent| CHATTER_EVENTS.contains(&e.event_type.as_str());
+    if !chatter(&event) {
+        return false;
+    }
     let tail: Vec<&CoordinationEvent> = history
         .iter()
         .chain(std::iter::once(event))
         .rev()
-        .take_while(|e| e.actor_kind != "human")
+        .take_while(|e| e.actor_kind != "human" && chatter(e))
         .collect();
     let mut actors: Vec<&str> = tail.iter().map(|e| e.actor_id.as_str()).collect();
     actors.sort();
