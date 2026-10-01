@@ -82,7 +82,7 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
     );
 
     let lane_color = |status: LaneStatus| match status {
-        LaneStatus::Running => accent(),
+        LaneStatus::Running => warn(),
         LaneStatus::Completed => success(),
         LaneStatus::Failed => danger(),
         LaneStatus::Cancelled => faint(),
@@ -1025,7 +1025,7 @@ pub(crate) fn lane_lines(app: &App) -> Vec<Line<'static>> {
                 Span::styled(title, Style::default().fg(muted())),
             ];
             if let Some(agent) = &l.agent {
-                spans.push(Span::styled(format!(" [{agent}]"), Style::default().fg(accent())));
+                spans.push(Span::styled(format!(" [{agent}]"), Style::default().fg(muted())));
             }
             if let Some(profile) = &l.profile {
                 spans.push(Span::styled(format!(" [{profile}]"), Style::default().fg(faint())));

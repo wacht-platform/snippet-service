@@ -69,7 +69,7 @@ fn windowed(rows: Vec<Line<'static>>, selected: usize, visible: usize) -> Vec<Li
 
 fn notification_label(e: &Value) -> (&'static str, ratatui::style::Color) {
     match s(e, "kind").as_str() {
-        "waiting" => ("Needs you", warn()),
+        "waiting" => ("Needs you", text()),
         "done" => ("Finished", success()),
         "error" => ("Failed", danger()),
         "idle" => ("Stopped", soft()),
@@ -447,14 +447,14 @@ pub(crate) fn panel_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                         let code = s(p, "status");
                         if code.is_empty() { "exited".into() } else { format!("exit {code}") }
                     };
-                    let color = if running { accent() } else if s(p, "status") == "0" { success() } else { danger() };
+                    let color = if running { warn() } else if s(p, "status") == "0" { success() } else { danger() };
                     super::chrome::Row {
                         selected: focused && i == sel,
                         dot: Some(color),
                         title: &proc_name(p),
                         emphasis: false,
                         meta: "",
-                        right: Some((status, if running { accent() } else { faint() })),
+                        right: Some((status, if running { warn() } else { faint() })),
                     }
                     .line(width)
                 })

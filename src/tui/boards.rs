@@ -601,10 +601,10 @@ fn pad(text: &str, width: usize) -> String {
 pub(crate) fn status_color(status: &str) -> ratatui::style::Color {
     match status {
         "done" | "reported" | "active" | "enabled" | "completed" => success(),
-        "in_progress" | "dispatched" | "running" | "working" => accent(),
-        "waiting_for_input" | "waiting" | "draining" | "blocked" => warn(),
-        "failed" | "error" | "cancelled" => danger(),
-        "todo" | "paused" | "idle" => soft(),
+        "in_progress" | "dispatched" | "running" | "working" | "draining" => warn(),
+        "waiting_for_input" | "waiting" => text(),
+        "failed" | "error" | "blocked" => danger(),
+        "todo" | "paused" | "idle" => muted(),
         _ => faint(),
     }
 }

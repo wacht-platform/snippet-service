@@ -346,7 +346,7 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{spinner} "),
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(warn()).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     match state.events.last() {
@@ -1003,7 +1003,7 @@ pub(super) fn tool_call_head_lines_status(
 
     let (dot_glyph, dot_color) = match status {
         ToolRowStatus::Done => ("●", success()),
-        ToolRowStatus::Running => ("●", accent()),
+        ToolRowStatus::Running => ("●", warn()),
         ToolRowStatus::Failed => ("●", danger()),
     };
     let verb_style = if arg.trim().is_empty() {

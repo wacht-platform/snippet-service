@@ -157,8 +157,8 @@ fn compact_age(ts: i64) -> String {
 
 fn status_dot(status: &str) -> Span<'static> {
     let (glyph, color) = match status {
-        "running" => ("●", accent()),
-        "waiting_for_input" => ("●", warn()),
+        "running" => ("●", warn()),
+        "waiting_for_input" => ("●", text()),
         "failed" => ("●", danger()),
         _ => ("○", faint()),
     };
