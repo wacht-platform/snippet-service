@@ -711,7 +711,7 @@ pub(crate) fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
     let st = app.state.as_ref();
     let faint_style = Style::default().fg(faint());
     // A worktree reads as its project plus branch, not its generated folder.
-    let origin = crate::session::worktree_origin(&app.options.config.workspace);
+    let origin = app.workspace_origin();
     let project = origin
         .as_ref()
         .map(|o| o.folder.clone())

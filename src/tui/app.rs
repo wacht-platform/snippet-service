@@ -108,6 +108,9 @@ pub(crate) struct App {
     pub(crate) vault_input: Option<super::boards::VaultInput>,
     /// Which range the usage panel shows (see `USAGE_RANGES`).
     pub(crate) usage_range: usize,
+    pub(crate) origin_cache: std::cell::RefCell<
+        Option<(PathBuf, std::time::Instant, Option<crate::session::WorktreeOrigin>)>,
+    >,
     pub(crate) error: Option<String>,
     pub(crate) state: Option<HarnessState>,
     /// The resident conversation loop. Spawned once, lives across turns.
@@ -367,6 +370,7 @@ impl App {
             board_confirm: None,
             vault_input: None,
             usage_range: 0,
+            origin_cache: Default::default(),
             original_config: None,
             last_state_stamp: None,
             login_active: false,

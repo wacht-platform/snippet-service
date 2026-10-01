@@ -8,6 +8,10 @@ use super::views::*;
 use super::*;
 
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
+    if app.vault_prompt_open() {
+        app.vault_input_key(key);
+        return;
+    }
     // An error banner shows until the user acts again — one keypress means it's
     // been seen. Without this, `error` (cleared only on spawn) permanently masks
     // every later status line ("queued (1)…", "Session deleted", …).

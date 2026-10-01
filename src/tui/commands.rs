@@ -340,9 +340,22 @@ impl App {
 
     /// The folder this TUI's sessions belong to: the main checkout when the
     /// current workspace is a git worktree made from it, else the workspace.
+    pub(crate) fn workspace_origin(&self) -> Option<crate::session::WorktreeOrigin> {
+        let workspace = &self.options.config.workspace;
+        let mut cache = self.origin_cache.borrow_mut();
+        let fresh = cache.as_ref().is_some_and(|(path, at, _)| {
+            path == workspace && at.elapsed() < Duration::from_secs(5)
+        });
+        if !fresh {
+            let origin = crate::session::worktree_origin(workspace);
+            *cache = Some((workspace.clone(), std::time::Instant::now(), origin));
+        }
+        cache.as_ref().and_then(|(_, _, origin)| origin.clone())
+    }
+
     pub(crate) fn home_folder(&self) -> PathBuf {
         let workspace = &self.options.config.workspace;
-        crate::session::worktree_origin(workspace)
+        self.workspace_origin()
             .map(|origin| origin.folder)
             .unwrap_or_else(|| workspace.clone())
     }
