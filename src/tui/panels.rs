@@ -462,7 +462,12 @@ pub(crate) fn panel_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                 return state(&f, "", false).unwrap_or_default();
             };
             if v.get("ok").and_then(Value::as_bool) == Some(false) {
-                return vec![faint_line(&format!("Not a git repository: {}", s(v, "error")))];
+                let error = s(v, "error");
+                return vec![faint_line(if error.contains("not a git repository") {
+                    "This workspace isn't a git repository."
+                } else {
+                    error.lines().next().unwrap_or("git status failed")
+                })];
             }
             let mut head = vec![
                 Span::styled("⎇ ", Style::default().fg(accent())),
