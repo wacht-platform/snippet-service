@@ -149,6 +149,28 @@ pub(super) fn event_card(event: &HarnessEvent) -> Option<Card> {
             body: body.clone(),
             footer: None,
         }),
+        HarnessEvent::UserQuestion { questions } => {
+            let items: Vec<String> = questions
+                .get("questions")
+                .and_then(Value::as_array)
+                .map(|qs| {
+                    qs.iter()
+                        .filter_map(|q| q.get("text").and_then(Value::as_str))
+                        .map(|t| format!("- {t}"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Card {
+                glyph: "?",
+                tone: warn(),
+                kind: "Asked you".into(),
+                reference: None,
+                status: if items.len() > 1 { format!("{} questions", items.len()) } else { "Question".into() },
+                title: None,
+                body: items.join("\n"),
+                footer: None,
+            })
+        }
         HarnessEvent::TaskDispatched {
             task_id,
             title,

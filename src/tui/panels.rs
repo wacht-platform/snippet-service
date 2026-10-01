@@ -419,14 +419,15 @@ pub(crate) fn panel_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                 .map(|(i, e)| {
                     let (label, color) = notification_label(e);
                     let age = ago(e.get("created_at").and_then(Value::as_i64).unwrap_or(0));
-                    let title_w = width.saturating_sub(label.chars().count() + age.chars().count() + 6);
-                    Line::from(vec![
-                        Span::styled(" ● ", Style::default().fg(color)),
-                        Span::styled(format!("{label} "), Style::default().fg(color)),
-                        Span::styled(pad(&notification_title(e), title_w), Style::default().fg(text())),
-                        Span::styled(format!(" {age}"), Style::default().fg(faint())),
-                    ])
-                    .style(selected_bg(focused && i == sel))
+                    super::chrome::Row {
+                        selected: focused && i == sel,
+                        dot: Some(color),
+                        title: &notification_title(e),
+                        emphasis: false,
+                        meta: label,
+                        right: Some((age, faint())),
+                    }
+                    .line(width)
                 })
                 .collect();
             lines.extend(windowed(rows, sel, visible));
@@ -446,13 +447,16 @@ pub(crate) fn panel_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                         let code = s(p, "status");
                         if code.is_empty() { "exited".into() } else { format!("exit {code}") }
                     };
-                    let color = if running { success() } else if s(p, "status") == "0" { faint() } else { danger() };
-                    Line::from(vec![
-                        Span::styled(" ● ", Style::default().fg(color)),
-                        Span::styled(pad(&proc_name(p), width.saturating_sub(status.len() + 4)), Style::default().fg(text())),
-                        Span::styled(format!(" {status}"), Style::default().fg(color)),
-                    ])
-                    .style(selected_bg(focused && i == sel))
+                    let color = if running { accent() } else if s(p, "status") == "0" { success() } else { danger() };
+                    super::chrome::Row {
+                        selected: focused && i == sel,
+                        dot: Some(color),
+                        title: &proc_name(p),
+                        emphasis: false,
+                        meta: "",
+                        right: Some((status, if running { accent() } else { faint() })),
+                    }
+                    .line(width)
                 })
                 .collect();
             lines.extend(windowed(rows, sel, visible));
@@ -495,12 +499,14 @@ pub(crate) fn panel_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                     let y = s(e, "y");
                     let code = if x == "?" { "?".to_string() } else if x.trim().is_empty() { y.clone() } else { x.clone() };
                     let staged = e.get("staged").and_then(Value::as_bool).unwrap_or(false);
+                    let selected = focused && i == sel;
                     Line::from(vec![
-                        Span::styled(format!(" {} ", if code == "?" { "U" } else { code.as_str() }), Style::default().fg(git_color(&code)).add_modifier(Modifier::BOLD)),
-                        Span::styled(pad(&s(e, "path"), width.saturating_sub(10)), Style::default().fg(text())),
-                        Span::styled(if staged { " staged" } else { "       " }, Style::default().fg(faint())),
+                        Span::styled(if selected { "▍ " } else { "  " }, Style::default().fg(accent())),
+                        Span::styled(format!("{} ", if code == "?" { "U" } else { code.as_str() }), Style::default().fg(git_color(&code)).add_modifier(Modifier::BOLD)),
+                        Span::styled(pad(&s(e, "path"), width.saturating_sub(12)), Style::default().fg(if selected { text() } else { soft() })),
+                        Span::styled(if staged { " staged " } else { "        " }, Style::default().fg(faint())),
                     ])
-                    .style(selected_bg(focused && i == sel))
+                    .style(selected_bg(selected))
                 })
                 .collect();
             lines.extend(windowed(rows, sel, visible.saturating_sub(2)));
@@ -526,17 +532,22 @@ pub(crate) fn panel_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                 .map(|(i, e)| {
                     let dir = e.get("is_dir").and_then(Value::as_bool).unwrap_or(false);
                     let name = if dir { format!("{}/", s(e, "name")) } else { s(e, "name") };
-                    Line::from(vec![
-                        Span::styled(if dir { " ▸ " } else { "   " }, Style::default().fg(accent())),
-                        Span::styled(pad(&name, width.saturating_sub(3)), Style::default().fg(if dir { text() } else { soft() })),
-                    ])
-                    .style(selected_bg(focused && i == sel))
+                    super::chrome::Row {
+                        selected: focused && i == sel,
+                        dot: None,
+                        title: &name,
+                        emphasis: dir,
+                        meta: "",
+                        right: None,
+                    }
+                    .line(width)
                 })
                 .collect();
             lines.extend(windowed(rows, sel, visible.saturating_sub(2)));
         }
         _ => {}
     }
+    lines.extend(super::boards::footer_lines(app, width));
     lines
 }
 

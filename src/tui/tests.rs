@@ -278,7 +278,7 @@ fn tasks_and_jobs_panels_render() {
     for row in jobs.lines() { println!("|{row}|"); }
     assert!(jobs.contains("daily 02:30") && jobs.contains("every 1h"));
     assert!(jobs.contains("paused") && jobs.contains("session not found"));
-    assert!(jobs.contains("y to confirm"));
+    assert!(jobs.contains("Delete Nightly dependency audit?") && jobs.contains("y confirm"));
 }
 
 #[test]
