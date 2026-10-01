@@ -411,8 +411,8 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
     )];
 
     let (dot, label, color) = match app.state.as_ref().map(|s| s.status) {
-        Some(HarnessStatus::Running) => ("●", "Working", accent()),
-        Some(HarnessStatus::WaitingForInput) => ("●", "Waiting for you", warn()),
+        Some(HarnessStatus::Running) => ("●", "Working", warn()),
+        Some(HarnessStatus::WaitingForInput) => ("●", "Waiting for you", text()),
         Some(HarnessStatus::Failed) => ("●", "Failed", danger()),
         _ => ("○", "Idle", faint()),
     };

@@ -63,7 +63,7 @@ pub(super) fn envelope_card(text: &str) -> Option<Card> {
         let (glyph, tone, label) = match status.as_str() {
             "failed" | "cancelled" => ("✗", danger(), "Failed"),
             "blocked" => ("!", danger(), "Blocked"),
-            "in_progress" | "working" => ("◆", accent(), "Working"),
+            "in_progress" | "working" => ("◆", warn(), "Working"),
             _ => ("✓", success(), "Done"),
         };
         let id = field(t, "task_id");
