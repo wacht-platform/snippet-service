@@ -11,192 +11,108 @@ use super::theme::*;
 use super::*;
 
 pub(crate) fn render_checkpoint_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, Borders, Paragraph};
+    use super::chrome::{Row, age, note, screen_frame, window};
     let checkpoints = app
         .state
         .as_ref()
         .map(|s| s.checkpoints.clone())
         .unwrap_or_default();
     let is_rewind = app.screen == Screen::RewindCheckpointSelection;
-    let title = if is_rewind {
-        " Rewind current chat + files · choose a checkpoint "
+    let (title, subtitle, verb) = if is_rewind {
+        ("Rewind", "the chat and its files go back to just before the chosen message", "rewind")
     } else {
-        " Fork a new chat · choose a checkpoint "
+        ("Fork", "a new chat starts from just before the chosen message", "fork")
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent()))
-        .title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let visible = inner.height.saturating_sub(3) as usize;
-    let selected = app
-        .checkpoint_selected_index
-        .min(checkpoints.len().saturating_sub(1));
-    let start = if selected >= visible && visible > 0 {
-        selected + 1 - visible
-    } else {
-        0
-    };
+    let body = screen_frame(frame, area, title, subtitle, &[("↑↓", "choose"), ("Enter", verb), ("Esc", "cancel")]);
+    let width = body.width as usize;
+    let selected = app.checkpoint_selected_index.min(checkpoints.len().saturating_sub(1));
+    let (start, end) = window(&checkpoints, selected, body.height as usize);
     let mut lines = Vec::new();
-    for (index, checkpoint) in checkpoints
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(visible.max(1))
-    {
-        let is_selected = index == selected;
-        let marker = if is_selected { "›" } else { " " };
+    for (index, checkpoint) in checkpoints.iter().enumerate().take(end).skip(start) {
         let short_id: String = checkpoint.id.chars().take(8).collect();
-        let style = if is_selected {
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(text())
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{marker} "), style),
-            Span::styled("● ", Style::default().fg(lane())),
-            Span::styled(checkpoint.label.clone(), style),
-            Span::styled(format!("  {short_id}"), Style::default().fg(faint())),
-        ]));
+        lines.push(
+            Row {
+                selected: index == selected,
+                dot: Some(accent()),
+                title: &checkpoint.label,
+                emphasis: false,
+                meta: &short_id,
+                right: Some((age(&checkpoint.created_at), faint())),
+            }
+            .line(width),
+        );
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No checkpoints available.",
-            muted(),
-        )));
+        lines.push(note("No checkpoints yet — one is taken before each message."));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
-
-    let footer = if is_rewind {
-        "↑↓ select · Enter rewind · Esc cancel"
-    } else {
-        "↑↓ select · Enter fork · Esc cancel"
-    };
-    let footer_area = Rect {
-        x: inner.x,
-        y: inner.y + inner.height.saturating_sub(1),
-        width: inner.width,
-        height: 1,
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer, subtle()))),
-        footer_area,
-    );
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
-
 pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, Borders, Paragraph};
+    use super::chrome::{Row, note, screen_frame, window};
 
     let lanes = app.state.as_ref().map(|state| &state.lanes);
-    let (running, completed, failed, total) = lanes
-        .map(|items| {
-            (
-                items
-                    .iter()
-                    .filter(|item| item.status == LaneStatus::Running)
-                    .count(),
-                items
-                    .iter()
-                    .filter(|item| item.status == LaneStatus::Completed)
-                    .count(),
-                items
-                    .iter()
-                    .filter(|item| item.status == LaneStatus::Failed)
-                    .count(),
-                items.len(),
-            )
-        })
-        .unwrap_or_default();
-
-    // One title only — counts live here; no second "delegated work" banner.
-    let title = if total == 0 {
-        " Lanes ".to_string()
+    let count = |status: LaneStatus| lanes.map_or(0, |items| items.iter().filter(|i| i.status == status).count());
+    let (running, completed, failed) = (count(LaneStatus::Running), count(LaneStatus::Completed), count(LaneStatus::Failed));
+    let total = lanes.map_or(0, |items| items.len());
+    let subtitle = if total == 0 {
+        String::new()
     } else {
-        format!(" Lanes  ·  {total}  ·  {running} live  ·  {completed} ok  ·  {failed} fail ")
+        format!("{running} running · {completed} done · {failed} failed")
     };
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(accent()))
-        .title(title);
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
+    let body = screen_frame(
+        frame,
+        area,
+        "Delegated work",
+        &subtitle,
+        &[
+            ("↑↓", "lane"),
+            ("Enter", if app.lanes_detail_expanded { "collapse" } else { "full report" }),
+            ("PgUp/PgDn", "scroll"),
+            ("Esc", "back"),
+        ],
+    );
+    let list_w = 34.min(body.width / 3).max(20);
+    let list_area = Rect { width: list_w, ..body };
+    let rule_area = Rect { x: body.x + list_w, width: 1, ..body };
+    let detail_inner = Rect { x: body.x + list_w + 2, width: body.width.saturating_sub(list_w + 2), ..body };
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(Span::styled("│", Style::default().fg(border2()))); body.height as usize]),
+        rule_area,
+    );
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(1)])
-        .split(inner);
-
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(28), Constraint::Min(1)])
-        .split(chunks[0]);
-
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(faint()));
-    let detail_title = if app.lanes_detail_expanded {
-        " Detail "
-    } else {
-        " Detail  ·  Enter expands "
+    let lane_color = |status: LaneStatus| match status {
+        LaneStatus::Running => accent(),
+        LaneStatus::Completed => success(),
+        LaneStatus::Failed => danger(),
+        LaneStatus::Cancelled => faint(),
     };
-    let detail_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(faint()))
-        .title(detail_title);
-    let list_inner = list_block.inner(panes[0]);
-    let detail_inner = detail_block.inner(panes[1]);
-    frame.render_widget(list_block, panes[0]);
-    frame.render_widget(detail_block, panes[1]);
-
-    // Left: › ● title only (status is the colored dot — no "done" word).
     let mut list_lines = Vec::new();
     if let Some(items) = lanes {
-        for (index, item) in items.iter().enumerate() {
-            let (glyph, color) = match item.status {
-                LaneStatus::Running => ("●", lane()),
-                LaneStatus::Completed => ("●", success()),
-                LaneStatus::Failed => ("●", danger()),
-                LaneStatus::Cancelled => ("●", muted()),
-            };
-            let selected = index == app.lanes_selected_index;
-            let style = if selected {
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(text())
-            };
-            let max_title = list_inner.width.saturating_sub(4) as usize;
-            let mut title = item.title.clone();
-            if max_title > 1 && title.chars().count() > max_title {
-                title = title
-                    .chars()
-                    .take(max_title.saturating_sub(1))
-                    .collect::<String>()
-                    + "…";
-            }
-            list_lines.push(Line::from(vec![
-                Span::styled(if selected { "›" } else { " " }, style),
-                Span::styled(format!("{glyph} "), Style::default().fg(color)),
-                Span::styled(title, style),
-            ]));
+        let (start, end) = window(items, app.lanes_selected_index, list_area.height as usize);
+        for (index, item) in items.iter().enumerate().take(end).skip(start) {
+            list_lines.push(
+                Row {
+                    selected: index == app.lanes_selected_index,
+                    dot: Some(lane_color(item.status)),
+                    title: &item.title,
+                    emphasis: false,
+                    meta: "",
+                    right: None,
+                }
+                .line(list_area.width as usize),
+            );
         }
     }
     if list_lines.is_empty() {
-        list_lines.push(Line::from(Span::styled("No lanes yet.", muted())));
+        list_lines.push(note("No delegated work yet."));
     }
-    frame.render_widget(Paragraph::new(list_lines), list_inner);
+    frame.render_widget(Paragraph::new(list_lines), list_area);
 
     let mut detail_lines = Vec::new();
     let prose_w = detail_inner.width.saturating_sub(1) as usize;
     if let Some(item) = lanes.and_then(|items| items.get(app.lanes_selected_index)) {
-        let (dot, color) = match item.status {
-            LaneStatus::Running => ("●", lane()),
-            LaneStatus::Completed => ("●", success()),
-            LaneStatus::Failed => ("●", danger()),
-            LaneStatus::Cancelled => ("●", muted()),
-        };
+        let (dot, color) = ("●", lane_color(item.status));
         detail_lines.push(Line::from(vec![
             Span::styled(format!("{dot} "), Style::default().fg(color)),
             Span::styled(
@@ -222,7 +138,7 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
             if let Some(handoff) = item.handoff.as_deref().filter(|s| !s.trim().is_empty()) {
                 detail_lines.push(Line::from(Span::styled(
                     "Handoff",
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(faint()).add_modifier(Modifier::BOLD),
                 )));
                 detail_lines.extend(markdown::render_prose(handoff, prose_w));
                 detail_lines.push(Line::from(""));
@@ -230,7 +146,7 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
             if !item.activity_log.is_empty() {
                 detail_lines.push(Line::from(Span::styled(
                     "Activity",
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(faint()).add_modifier(Modifier::BOLD),
                 )));
                 for entry in &item.activity_log {
                     let kind = entry.kind.trim();
@@ -263,7 +179,7 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
             if let Some(summary) = item.summary.as_deref().filter(|s| !s.trim().is_empty()) {
                 detail_lines.push(Line::from(Span::styled(
                     "Summary",
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(faint()).add_modifier(Modifier::BOLD),
                 )));
                 detail_lines.extend(markdown::render_prose(summary, prose_w));
                 detail_lines.push(Line::from(""));
@@ -271,14 +187,14 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
             if let Some(report) = item.report.as_deref().filter(|s| !s.trim().is_empty()) {
                 detail_lines.push(Line::from(Span::styled(
                     "Report",
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(faint()).add_modifier(Modifier::BOLD),
                 )));
                 detail_lines.extend(markdown::render_prose(report, prose_w));
             }
         } else {
             detail_lines.push(Line::from(Span::styled(
                 "Summary",
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                Style::default().fg(faint()).add_modifier(Modifier::BOLD),
             )));
             let preview: String = summary_body.chars().take(700).collect();
             let preview = if summary_body.chars().count() > 700 {
@@ -287,14 +203,9 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
                 preview
             };
             detail_lines.extend(markdown::render_prose(&preview, prose_w));
-            detail_lines.push(Line::from(""));
-            detail_lines.push(Line::from(Span::styled(
-                "Enter / Ctrl-O · full report",
-                faint(),
-            )));
         }
     } else {
-        detail_lines.push(Line::from(Span::styled("↑↓ select a lane", muted())));
+        detail_lines.push(Line::from(Span::styled("Choose a lane to see its work.", Style::default().fg(faint()))));
     }
 
     let visible_h = detail_inner.height as usize;
@@ -306,21 +217,7 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
         .take(visible_h.max(1))
         .collect();
     frame.render_widget(Paragraph::new(shown), detail_inner);
-
-    let scroll_hint = if max_scroll > 0 {
-        format!("  ·  PgUp/PgDn ({}/{})", scroll + 1, max_scroll + 1)
-    } else {
-        String::new()
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("↑↓ lane   Enter expand   Esc back{scroll_hint}"),
-            Style::default().fg(faint()),
-        ))),
-        chunks[1],
-    );
 }
-
 
 fn keycap(key: &str, label: &str, color: Color) -> [Span<'static>; 2] {
     [
@@ -449,152 +346,71 @@ pub(crate) fn profile_status(cfg: &crate::config::InferenceProfileConfig) -> Str
 /// The profiles screen — every saved provider config as a card, one active. Enter
 /// activates, `e` edits, `a` adds, `d` deletes.
 pub(crate) fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, Borders};
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(6),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    // Lane count only when something is actually running — "0 active lanes" on
-    // the models page was pure noise.
+    use super::chrome::{Row, screen_frame, sub_line};
     let active_lanes = app
         .state
         .as_ref()
-        .map(|s| {
-            s.lanes
-                .iter()
-                .filter(|l| l.status == LaneStatus::Running)
-                .count()
-        })
+        .map(|s| s.lanes.iter().filter(|l| l.status == LaneStatus::Running).count())
         .unwrap_or(0);
-    let mut header_spans = vec![
-        Span::styled(
-            " snippet",
-            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ·  models", subtle()),
-    ];
-    if active_lanes > 0 {
-        header_spans.push(Span::styled(
-            format!(
-                "  ·  {} active lane{}",
-                active_lanes,
-                if active_lanes == 1 { "" } else { "s" }
-            ),
-            Style::default().fg(lane()),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(header_spans)), chunks[0]);
-
+    let subtitle = if active_lanes > 0 {
+        format!("{active_lanes} delegated running")
+    } else {
+        "the profiles chats and delegated work run on".to_string()
+    };
+    let body = screen_frame(
+        frame,
+        area,
+        "Models",
+        &subtitle,
+        &[("↑↓", "move"), ("Enter", "this chat"), ("g", "global"), ("l", "delegate"), ("e", "edit"), ("a", "add"), ("d", "delete"), ("Esc", "back")],
+    );
+    let width = body.width as usize;
     let names = app.options.config.profile_names();
     let total = names.len();
     let active = app.options.config.active_setup.clone().unwrap_or_default();
-    let delegate = app
-        .options
-        .config
-        .delegate_setup
-        .clone()
-        .unwrap_or_default();
+    let delegate = app.options.config.delegate_setup.clone().unwrap_or_default();
     let setups = app.options.config.setups.as_ref();
-    let sel = app.profiles_selected_index.min(total); // index `total` == the Add row
+    let sel = app.profiles_selected_index.min(total);
 
-    // Window over profile cards (3 lines each); the Add row always shows at the end.
-    let list_h = (chunks[1].height as usize).saturating_sub(2);
-    let visible = (list_h.saturating_sub(2) / 3).max(1);
+    let visible = ((body.height as usize).saturating_sub(2) / 3).max(1);
     let focus = sel.min(total.saturating_sub(1));
-    let start = if total > 0 && focus >= visible {
-        focus + 1 - visible
-    } else {
-        0
-    };
+    let start = if total > 0 && focus >= visible { focus + 1 - visible } else { 0 };
     let end = (start + visible).min(total);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     if start > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("  ↑ {start} more"),
-            Style::default().fg(faint()),
-        )));
+        lines.push(super::chrome::note(&format!("↑ {start} more")));
     }
-    for i in start..end {
-        let name = &names[i];
+    for (i, name) in names.iter().enumerate().take(end).skip(start) {
         let is_sel = i == sel;
-        let is_active = *name == active;
-        let mut head = vec![
-            Span::styled(
-                if is_sel { "▍ " } else { "  " },
-                Style::default().fg(accent()),
-            ),
-            Span::styled(
-                name.clone(),
-                if is_sel {
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(self::text())
-                        .add_modifier(Modifier::BOLD)
-                },
-            ),
-        ];
-        if is_active {
-            head.push(Span::styled("   ● active", Style::default().fg(success())));
+        let mut badges = Vec::new();
+        if *name == active {
+            badges.push("active");
         }
         if !delegate.is_empty() && *name == delegate {
-            head.push(Span::styled("   ⇣ delegate", Style::default().fg(lane())));
+            badges.push("delegate");
         }
-        lines.push(Line::from(head));
+        let right = (!badges.is_empty()).then(|| {
+            (badges.join(" · "), if *name == active { success() } else { accent() })
+        });
+        lines.push(
+            Row { selected: is_sel, dot: None, title: name, emphasis: true, meta: "", right }.line(width),
+        );
         if let Some(cfg) = setups.and_then(|m| m.get(name)) {
-            let model = if cfg.model.is_empty() {
-                "(no model)".to_string()
-            } else {
-                cfg.model.clone()
-            };
-            lines.push(Line::from(Span::styled(
-                format!("     {model} · {}", profile_status(cfg)),
-                subtle(),
-            )));
+            let model = if cfg.model.is_empty() { "no model".to_string() } else { cfg.model.clone() };
+            lines.push(sub_line(&format!("{model} · {}", profile_status(cfg)), is_sel, 2, width));
         }
         lines.push(Line::from(""));
     }
     if end < total {
-        lines.push(Line::from(Span::styled(
-            format!("  ↓ {} more", total - end),
-            Style::default().fg(faint()),
-        )));
+        lines.push(super::chrome::note(&format!("↓ {} more", total - end)));
     }
-
     let add_sel = sel >= total;
-    lines.push(Line::from(vec![
-        Span::styled(
-            if add_sel { "▍ " } else { "  " },
-            Style::default().fg(accent()),
-        ),
-        Span::styled(
-            "+ Add a model",
-            if add_sel {
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(faint())
-            },
-        ),
-    ]));
-
-    let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(faint()));
-    frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "↑/↓ move  ·  ↵ this chat  ·  g global  ·  l delegate  ·  e edit  ·  a add  ·  d delete  ·  Esc",
-            subtle(),
-        ))),
-        chunks[2],
+    lines.push(
+        Row { selected: add_sel, dot: None, title: "+ Add a model", emphasis: false, meta: "", right: None }
+            .line(width),
     );
+    frame.render_widget(Paragraph::new(lines), body);
 
     if app.login_active {
         let popup_width = area.width.saturating_sub(8).min(96).max(64);
@@ -606,13 +422,7 @@ pub(crate) fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
             height: popup_height,
         };
         frame.render_widget(Clear, popup);
-        let block = Block::default()
-            .title(Span::styled(
-                " model setup ",
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(accent()));
+        let block = card_block("◆", "Model setup".into(), accent(), border2());
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         frame.render_widget(
@@ -622,182 +432,113 @@ pub(crate) fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
     }
 }
 
-
 /// Where a new session works, chosen before it starts in a git repository.
 pub(crate) fn render_new_session(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use super::chrome::{Row, section, screen_frame, sub_line};
     use crate::tui::commands::NewChoice;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(1)])
-        .split(area);
     let folder = app
         .home_folder()
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("folder")
         .to_string();
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("✦ > snippet", Style::default().fg(lane()).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  │  New session in {folder}"), Style::default().fg(text())),
-        ])),
-        chunks[0],
+    let body = screen_frame(
+        frame,
+        area,
+        "New session",
+        &format!("in {folder} — where should it work?"),
+        &[("↑↓", "choose"), ("Enter", "start"), ("Esc", "cancel")],
     );
-    let name_of = |path: &std::path::Path| {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let mut lines = vec![Line::from("")];
+    let width = body.width as usize;
+    let name_of = |path: &std::path::Path| path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let mut lines = Vec::new();
     let mut existing_header = false;
     for (i, choice) in app.new_choices.iter().enumerate() {
         let (title, detail) = match choice {
             NewChoice::Worktree(_) => (
                 "New worktree".to_string(),
-                "its own branch and checkout; other sessions' edits stay apart".to_string(),
+                "Its own branch and checkout; other sessions' edits stay apart.".to_string(),
             ),
             NewChoice::Folder(path) => (
                 format!("This folder ({})", name_of(path)),
-                "work directly in the checkout".to_string(),
+                "Work directly in the checkout.".to_string(),
             ),
             NewChoice::Existing { path, branch } => {
                 if !existing_header {
                     existing_header = true;
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "  Existing worktrees",
-                        Style::default().fg(faint()).add_modifier(Modifier::BOLD),
-                    )));
+                    lines.push(section("Existing worktrees"));
                 }
-                (
-                    format!("⎇ {}", branch.clone().unwrap_or_else(|| name_of(path))),
-                    path.display().to_string(),
-                )
+                (format!("⎇ {}", branch.clone().unwrap_or_else(|| name_of(path))), path.display().to_string())
             }
         };
         let selected = i == app.new_choice_index;
-        let (marker, title_style) = if selected {
-            ("▶ ", Style::default().fg(accent()).add_modifier(Modifier::BOLD))
-        } else {
-            ("  ", Style::default().fg(text()))
-        };
-        lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(accent())),
-            Span::styled(format!("{title:<34} "), title_style),
-            Span::styled(detail, Style::default().fg(faint())),
-        ]));
+        lines.push(Row { selected, dot: None, title: &title, emphasis: true, meta: "", right: None }.line(width));
+        lines.push(sub_line(&detail, selected, 2, width));
+        lines.push(Line::from(""));
     }
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "↑↓ choose · Enter start · Esc cancel",
-            Style::default().fg(faint()),
-        ))),
-        chunks[2],
-    );
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 pub(crate) fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use ratatui::widgets::{Block, BorderType, Borders};
-
+    use super::chrome::{Row, compact_secs, note, screen_frame, window};
     let convs = match &app.conv_cache {
         Some(c) => c.clone(),
         None => app.list_conversations(),
     };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(10),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    let header_text = vec![
-        Span::styled(
-            "✦ > snippet",
-            Style::default().fg(lane()).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "  │  Select a session to resume",
-            Style::default().fg(text()),
-        ),
-    ];
-    frame.render_widget(Paragraph::new(Line::from(header_text)), chunks[0]);
-
-    let mut lines = Vec::new();
-    if convs.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  No saved conversations found.",
-            subtle(),
-        )));
+    let folder = app
+        .home_folder()
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    let subtitle = format!("{folder} · {} session{}", convs.len(), if convs.len() == 1 { "" } else { "s" });
+    let hints: &[(&str, &str)] = if app.resume_rename.is_some() {
+        &[("Enter", "save"), ("Esc", "cancel")]
+    } else if app.resume_pending_delete {
+        &[("d", "delete"), ("any key", "keep")]
     } else {
-        let total = convs.len();
-        let selected_idx = app.resume_selected_index.min(total - 1);
-        let visible = (chunks[1].height as usize).saturating_sub(4).max(1);
-        let start = if selected_idx >= visible {
-            selected_idx + 1 - visible
-        } else {
-            0
-        };
-        let end = (start + visible).min(total);
-        if start > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("  ↑ {} more", start),
-                Style::default().fg(faint()),
-            )));
-        }
+        &[("↑↓", "move"), ("Enter", "open"), ("r", "rename"), ("d", "delete"), ("Esc", "back")]
+    };
+    let body = screen_frame(frame, area, "Sessions", &subtitle, hints);
+    let width = body.width as usize;
+    let mut lines = Vec::new();
+    if let Some(name) = app.resume_rename.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled(" Rename  ", Style::default().fg(faint())),
+            Span::styled(name.clone(), Style::default().fg(text())),
+            Span::styled("▏", Style::default().fg(accent())),
+        ]));
+        lines.push(Line::from(""));
+    } else if app.resume_pending_delete {
+        lines.push(Line::from(Span::styled(
+            " Delete this session? d again to delete, any other key keeps it.",
+            Style::default().fg(warn()),
+        )));
+        lines.push(Line::from(""));
+    }
+    if convs.is_empty() {
+        lines.push(note("No saved sessions in this folder yet."));
+    } else {
+        let selected_idx = app.resume_selected_index.min(convs.len() - 1);
+        let visible = (body.height as usize).saturating_sub(lines.len());
+        let (start, end) = window(&convs, selected_idx, visible);
         for (offset, c) in convs[start..end].iter().enumerate() {
-            let is_selected = start + offset == selected_idx;
-            // A worktree session is marked by its branch, so it reads as part of
-            // this folder yet stays distinguishable from the root's sessions.
-            let (mark, place) = match &c.branch {
-                Some(branch) => ("⎇ ", format!(" · {branch}")),
-                None => ("📁 ", String::new()),
-            };
-            let line = if is_selected {
-                Line::from(vec![
-                    Span::styled(format!("▶ {mark}"), Style::default().fg(accent())),
-                    Span::styled(
-                        format!("{:<36} ", c.name),
-                        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(c.desc.clone(), subtle()),
-                    Span::styled(place, Style::default().fg(lane())),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(format!("  {mark}"), Style::default().fg(muted())),
-                    Span::styled(format!("{:<36} ", c.name), Style::default().fg(text())),
-                    Span::styled(c.desc.clone(), Style::default().fg(faint())),
-                    Span::styled(place, Style::default().fg(lane())),
-                ])
-            };
-            lines.push(line);
-        }
-        if end < total {
-            lines.push(Line::from(Span::styled(
-                format!("  ↓ {} more", total - end),
-                Style::default().fg(faint()),
-            )));
+            let meta = c.branch.as_ref().map(|b| format!("⎇ {b}")).unwrap_or_default();
+            let age = compact_secs(chrono::Utc::now().timestamp() - c.last_active);
+            lines.push(
+                Row {
+                    selected: start + offset == selected_idx,
+                    dot: Some(super::boards::status_color(&c.status)),
+                    title: &c.title,
+                    emphasis: false,
+                    meta: &meta,
+                    right: Some((age, faint())),
+                }
+                .line(width),
+            );
         }
     }
-
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(faint()));
-
-    frame.render_widget(Paragraph::new(lines).block(list_block), chunks[1]);
-
-    // Render Footer
-    let footer_text = "↑/↓ scroll  ·  Enter resume  ·  r rename  ·  d delete  ·  Esc go back";
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer_text, subtle()))),
-        chunks[2],
-    );
+    frame.render_widget(Paragraph::new(lines), body);
 }
 
 /// Models offered by the picker: the live-fetched list (uncapped) or the static
@@ -1153,7 +894,7 @@ fn question_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ]));
         }
         lines.push(Line::from(""));
-        let hints = [keycap("↵", "send", accent()), keycap("←", "edit", soft()), keycap("esc", "cancel", soft())];
+        let hints = [keycap("↵", "send", soft()), keycap("←", "edit", soft()), keycap("esc", "cancel", soft())];
         lines.push(Line::from(hints.into_iter().flatten().collect::<Vec<_>>()));
         return lines;
     }
@@ -1174,7 +915,7 @@ fn question_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut hints = Vec::new();
     if opts.is_empty() {
         lines.push(Line::from(Span::styled("Type your answer in the box below", Style::default().fg(muted()))));
-        hints.push(keycap("↵", "send", accent()));
+        hints.push(keycap("↵", "send", soft()));
     } else {
         let sel = app.q_sel.min(opts.len() - 1);
         for (i, opt) in opts.iter().enumerate().take(9) {
@@ -1208,8 +949,8 @@ fn question_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             }
         }
         lines.push(Line::from(Span::styled("or type your own answer below", Style::default().fg(faint()))));
-        hints.push(keycap(if multi { "1-9 space" } else { "1-9" }, if multi { "toggle" } else { "pick" }, accent()));
-        hints.push(keycap("↵", if multi { "confirm" } else { "select" }, accent()));
+        hints.push(keycap(if multi { "1-9 space" } else { "1-9" }, if multi { "toggle" } else { "pick" }, soft()));
+        hints.push(keycap("↵", if multi { "confirm" } else { "select" }, soft()));
     }
     if back {
         hints.push(keycap("←", "back", soft()));

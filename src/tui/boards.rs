@@ -600,10 +600,11 @@ fn pad(text: &str, width: usize) -> String {
 /// Tone for the daemon's statuses: tasks, agents, board kinds and jobs.
 pub(crate) fn status_color(status: &str) -> ratatui::style::Color {
     match status {
-        "done" | "reported" | "active" | "enabled" => success(),
-        "in_progress" | "dispatched" | "draining" => warn(),
-        "failed" | "blocked" | "cancelled" => danger(),
-        "todo" => accent(),
+        "done" | "reported" | "active" | "enabled" | "completed" => success(),
+        "in_progress" | "dispatched" | "running" | "working" => accent(),
+        "waiting_for_input" | "waiting" | "draining" | "blocked" => warn(),
+        "failed" | "error" | "cancelled" => danger(),
+        "todo" | "paused" | "idle" => soft(),
         _ => faint(),
     }
 }
@@ -615,20 +616,32 @@ fn faint_line(text: &str) -> Line<'static> {
 /// A list row: status dot, title, and a right-aligned status word.
 fn row(title: &str, meta: &str, status: &str, width: usize, selected: bool) -> Line<'static> {
     let label = status.replace('_', " ");
-    let right = if label.is_empty() { 0 } else { label.chars().count() + 1 };
-    let meta_w = if meta.is_empty() { 0 } else { meta.chars().count().min(14) + 1 };
-    let title_w = width.saturating_sub(3 + right + meta_w);
-    let mut spans = vec![
-        Span::styled(" ● ", Style::default().fg(status_color(status))),
-        Span::styled(pad(title, title_w), Style::default().fg(text())),
-    ];
-    if meta_w > 0 {
-        spans.push(Span::styled(format!(" {}", pad(meta, meta_w - 1)), Style::default().fg(faint())));
+    super::chrome::Row {
+        selected,
+        dot: Some(status_color(status)),
+        title,
+        emphasis: false,
+        meta,
+        right: (!label.is_empty()).then(|| (label, status_color(status))),
     }
-    if right > 0 {
-        spans.push(Span::styled(format!(" {label}"), Style::default().fg(status_color(status))));
+    .line(width)
+}
+
+pub(crate) fn footer_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(c) = app.board_confirm.as_ref() {
+        lines.push(Line::from(""));
+        let body = format!(" ! {}?", c.prompt.trim_end_matches("? y to confirm").trim_end_matches('?'));
+        let bar = Style::default().bg(surface2());
+        lines.push(Line::from(Span::styled(pad(&body, width), Style::default().fg(warn()))).style(bar));
+        let mut keys = super::chrome::hint_line(&[("y", "confirm"), ("any key", "cancel")]);
+        keys.spans.insert(0, Span::raw("   "));
+        lines.push(keys.style(bar));
+    } else if let Some(n) = app.boards.notice.lock().ok().and_then(|n| n.clone()) {
+        lines.push(Line::from(""));
+        lines.push(faint_line(&format!(" {n}")));
     }
-    Line::from(spans).style(Style::default().bg(if selected { surface3() } else { surface1() }))
+    lines
 }
 
 /// Wrap `text` to `width`, prefixed by `indent` spaces.
@@ -713,11 +726,10 @@ pub(crate) fn board_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                     let selected = focused && i == app.shell.pane_index;
                     lines.push(row(&job_title(j), "", if enabled { "enabled" } else { "paused" }, width, selected));
                     let meta = [schedule_label(j), next_run(j)].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" · ");
-                    lines.push(Line::from(Span::styled(format!("   {meta}"), Style::default().fg(faint())))
-                        .style(Style::default().bg(if selected { surface3() } else { surface1() })));
+                    lines.push(super::chrome::sub_line(&meta, selected, 4, width));
                     let err = s(j, "last_error");
                     if !err.is_empty() {
-                        lines.push(Line::from(Span::styled(format!("   {}", pad(&err, width.saturating_sub(3))), Style::default().fg(danger()))));
+                        lines.push(Line::from(Span::styled(format!("    {}", pad(&err, width.saturating_sub(4))), Style::default().fg(danger()))));
                     }
                 }
             }
@@ -753,21 +765,28 @@ pub(crate) fn board_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
             let names = vault_names(&f);
             if let Some(input) = app.vault_input.as_ref() {
                 lines.push(section("Add a secret"));
-                let cursor = Span::styled("▏", Style::default().fg(accent()));
+                let field_w = width.saturating_sub(10);
+                let field = |value: String, focused: bool| {
+                    let shown = format!(" {value}{}", if focused { "▏" } else { "" });
+                    Span::styled(
+                        pad(&shown, field_w),
+                        Style::default().fg(text()).bg(if focused { surface3() } else { surface2() }),
+                    )
+                };
                 lines.push(Line::from(vec![
-                    Span::styled(" name   ", Style::default().fg(faint())),
-                    Span::styled(input.name.clone(), Style::default().fg(text())),
-                    if input.on_value { Span::raw("") } else { cursor.clone() },
+                    Span::styled(" name    ", Style::default().fg(faint())),
+                    field(input.name.clone(), !input.on_value),
                 ]));
                 if input.on_value {
+                    lines.push(Line::from(""));
                     lines.push(Line::from(vec![
-                        Span::styled(" value  ", Style::default().fg(faint())),
+                        Span::styled(" value   ", Style::default().fg(faint())),
                         // Never echo a secret, not even its length.
-                        Span::styled(if input.value.is_empty() { "" } else { "••••••••" }, Style::default().fg(soft())),
-                        cursor,
+                        field(if input.value.is_empty() { String::new() } else { "••••••••".into() }, true),
                     ]));
                 }
-                lines.push(faint_line(if input.on_value { " Enter saves · Esc cancels" } else { " Enter next · Esc cancels" }));
+                lines.push(Line::from(""));
+                lines.push(super::chrome::hint_line(if input.on_value { &[("Enter", "save"), ("Esc", "cancel")] } else { &[("Enter", "next"), ("Esc", "cancel")] }));
                 lines.push(Line::from(""));
             }
             if let Some(state) = state_lines(&f, "No secrets stored. a adds one.", names.is_empty()) {
@@ -776,25 +795,15 @@ pub(crate) fn board_lines(app: &App, tab: PaneTab, width: usize) -> Vec<Line<'st
                 for (i, n) in names.iter().enumerate() {
                     let selected = focused && app.vault_input.is_none() && i == app.shell.pane_index;
                     lines.push(
-                        Line::from(vec![
-                            Span::styled(" ● ", Style::default().fg(faint())),
-                            Span::styled(pad(n, width.saturating_sub(12)), Style::default().fg(text())),
-                            Span::styled(" ••••••", Style::default().fg(faint())),
-                        ])
-                        .style(Style::default().bg(if selected { surface3() } else { surface1() })),
+                        super::chrome::Row { selected, dot: None, title: n, emphasis: false, meta: "", right: Some(("••••••".into(), faint())) }
+                            .line(width),
                     );
                 }
             }
         }
         _ => {}
     }
-    if let Some(c) = app.board_confirm.as_ref() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(c.prompt.clone(), Style::default().fg(warn()))));
-    } else if let Some(n) = app.boards.notice.lock().ok().and_then(|n| n.clone()) {
-        lines.push(Line::from(""));
-        lines.push(faint_line(&n));
-    }
+    lines.extend(footer_lines(app, width));
     lines
 }
 
@@ -868,16 +877,13 @@ fn provider_lines(p: &Value, width: usize) -> Vec<Line<'static>> {
         let left = 100.0 - used;
         let color = if left < 20.0 { danger() } else if left < 50.0 { warn() } else { success() };
         let bar_w = width.saturating_sub(4).min(40);
-        let filled = ((left / 100.0) * bar_w as f64).round() as usize;
         lines.push(Line::from(vec![
             Span::styled(format!(" {label}"), Style::default().fg(soft())),
             Span::styled(format!("  {left:.0}% left"), Style::default().fg(color)),
         ]));
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("█".repeat(filled), Style::default().fg(color)),
-            Span::styled("░".repeat(bar_w - filled), Style::default().fg(faint())),
-        ]));
+        let mut bar = vec![Span::raw(" ")];
+        bar.extend(super::chrome::thin_bar(left / 100.0, bar_w, color));
+        lines.push(Line::from(bar));
     }
     lines
 }

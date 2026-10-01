@@ -278,18 +278,52 @@ fn tool_row(tool: &str, args: &Value, result: Option<&Value>, width: usize, sele
     .style(Style::default().bg(if selected { surface3() } else { surface1() }))
 }
 
-/// The pane's tab labels on one line; when they overflow, drop tabs from the
-/// front so the active one stays in view.
-fn tab_strip(mut spans: Vec<Span<'static>>, width: usize, active: PaneTab) -> Line<'static> {
-    let active_at = PaneTab::ALL.iter().position(|t| *t == active).unwrap_or(0) * 2;
-    let len = |sp: &[Span<'static>]| sp.iter().map(|s| s.content.chars().count()).sum::<usize>();
-    let mut start = 0;
-    while len(&spans[start..]) > width && start + 2 <= active_at {
-        start += 2;
+fn tab_strip(app: &App, width: usize) -> Line<'static> {
+    let labels: Vec<String> = PaneTab::ALL
+        .iter()
+        .map(|t| {
+            let badge = super::panels::tab_badge(app, *t).map(|(b, _)| b).unwrap_or_default();
+            format!("{}{badge}", t.label())
+        })
+        .collect();
+    let active = PaneTab::ALL.iter().position(|t| *t == app.shell.tab).unwrap_or(0);
+    let cost = |lo: usize, hi: usize| {
+        let body: usize = labels[lo..=hi].iter().map(|l| l.chars().count()).sum::<usize>() + 2 * (hi - lo);
+        body + if lo > 0 { 2 } else { 0 } + if hi + 1 < labels.len() { 2 } else { 0 }
+    };
+    let (mut lo, mut hi) = (active, active);
+    loop {
+        let grew_right = hi + 1 < labels.len() && cost(lo, hi + 1) <= width;
+        if grew_right {
+            hi += 1;
+        }
+        let grew_left = lo > 0 && cost(lo - 1, hi) <= width;
+        if grew_left {
+            lo -= 1;
+        }
+        if !grew_right && !grew_left {
+            break;
+        }
     }
-    if start > 0 {
-        spans.drain(..start);
-        spans.insert(0, Span::styled("‹ ", Style::default().fg(faint())));
+    let mut spans = Vec::new();
+    if lo > 0 {
+        spans.push(Span::styled("‹ ", Style::default().fg(faint())));
+    }
+    for (i, label) in labels.iter().enumerate().take(hi + 1).skip(lo) {
+        if i > lo {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            label.clone(),
+            if i == active {
+                Style::default().fg(text()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(faint())
+            },
+        ));
+    }
+    if hi + 1 < labels.len() {
+        spans.push(Span::styled(" ›", Style::default().fg(faint())));
     }
     Line::from(spans)
 }
@@ -298,24 +332,8 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     fill(frame, area, surface1());
     let inner = Rect { x: area.x + 1, width: area.width.saturating_sub(2), y: area.y + 1, height: area.height.saturating_sub(1) };
     let focused = app.shell.focus == Focus::Pane;
-    let mut tabs = Vec::new();
-    for (i, tab) in PaneTab::ALL.iter().enumerate() {
-        if i > 0 {
-            tabs.push(Span::raw("  "));
-        }
-        let active = *tab == app.shell.tab;
-        let badge = super::panels::tab_badge(app, *tab).map(|(b, _)| b).unwrap_or_default();
-        tabs.push(Span::styled(
-            format!("{}{badge}", tab.label()),
-            if active {
-                Style::default().fg(text()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default().fg(faint())
-            },
-        ));
-    }
     let w = inner.width as usize;
-    let mut lines = vec![tab_strip(tabs, w, app.shell.tab), Line::from("")];
+    let mut lines = vec![tab_strip(app, w), Line::from("")];
     match app.shell.tab {
         PaneTab::Tools => {
             let tools = turn_tools(app);
@@ -448,31 +466,54 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
 
 pub(crate) const PALETTE_ACTIONS: [(&str, &str); 25] = [
     ("new", "New session"),
-    ("mission", "Open Mission Control"),
-    ("agents", "Show agents"),
-    ("tasks", "Show the task board"),
-    ("jobs", "Show scheduled jobs"),
-    ("usage", "Show usage and rate limits"),
-    ("vault", "Manage vault secrets"),
-    ("inbox", "Show notifications"),
-    ("procs", "Show background processes"),
-    ("git", "Show git changes"),
-    ("files", "Browse files"),
     ("sessions", "Switch session…"),
-    ("sidebar", "Toggle sessions sidebar"),
-    ("pane", "Toggle side panel"),
-    ("tools", "Show this turn's tools"),
-    ("steps", "Expand or fold tool steps in the transcript"),
-    ("plan", "Show the plan"),
-    ("lanes", "Show delegated work"),
-    ("checkpoints", "Show checkpoints"),
     ("model", "Switch model…"),
     ("mode", "Toggle manual approval"),
     ("compact", "Compact history now"),
+    ("steps", "Expand or fold tool steps"),
     ("term", "Open a terminal"),
+    ("tools", "This turn's tools"),
+    ("plan", "Plan"),
+    ("lanes", "Delegated work"),
+    ("checkpoints", "Checkpoints"),
+    ("procs", "Background processes"),
+    ("git", "Git changes"),
+    ("files", "Browse files"),
+    ("mission", "Open Mission Control"),
+    ("agents", "Agents"),
+    ("tasks", "Task board"),
+    ("jobs", "Scheduled jobs"),
+    ("inbox", "Notifications"),
+    ("usage", "Usage and rate limits"),
+    ("vault", "Vault secrets"),
+    ("sidebar", "Toggle sessions sidebar"),
+    ("pane", "Toggle side panel"),
     ("profiles", "Model profiles and settings"),
     ("quit", "Quit"),
 ];
+
+fn palette_meta(id: &str) -> (&'static str, &'static str) {
+    let section = match id {
+        "new" | "sessions" | "model" | "mode" | "compact" | "steps" | "term" => "Session",
+        "tools" | "plan" | "lanes" | "checkpoints" | "procs" | "git" | "files" => "This session",
+        "mission" | "agents" | "tasks" | "jobs" | "inbox" | "usage" | "vault" => "Workspace",
+        _ => "App",
+    };
+    let shortcut = match id {
+        "sidebar" => "Ctrl-F",
+        "pane" => "Ctrl-L",
+        "steps" => "Ctrl-O",
+        "term" => "Ctrl-T",
+        "quit" => "Ctrl-C",
+        "sessions" => "/resume",
+        "model" => "/model",
+        "new" => "/new",
+        "compact" => "/compact",
+        "mission" => "/mission",
+        _ => "",
+    };
+    (section, shortcut)
+}
 
 pub(crate) fn palette_matches(query: &str) -> Vec<(&'static str, &'static str)> {
     let q = query.to_lowercase();
@@ -484,36 +525,88 @@ pub(crate) fn palette_matches(query: &str) -> Vec<(&'static str, &'static str)> 
 }
 
 pub(crate) fn render_palette(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    use ratatui::widgets::{Block, BorderType, Borders, Padding};
     let Some(palette) = app.shell.palette.as_ref() else {
         return;
     };
-    let w = 60.min(area.width.saturating_sub(4));
     let matches = palette_matches(&palette.query);
-    let h = (matches.len() as u16 + 4).min(area.height.saturating_sub(4)).max(5);
-    let rect = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height / 6, width: w, height: h };
+    let grouped = palette.query.is_empty();
+    let mut rows: Vec<(Option<&str>, usize)> = Vec::new();
+    let mut last = "";
+    for (i, (id, _)) in matches.iter().enumerate() {
+        let (section, _) = palette_meta(id);
+        if grouped && section != last {
+            if !rows.is_empty() {
+                rows.push((Some(""), 0));
+            }
+            rows.push((Some(section), 0));
+            last = section;
+        }
+        rows.push((None, i));
+    }
+    let w = 64.min(area.width.saturating_sub(4));
+    let h = (rows.len() as u16 + 5).min(area.height.saturating_sub(4)).max(7);
+    let rect = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height / 8, width: w, height: h };
     frame.render_widget(Clear, rect);
-    fill(frame, rect, surface2());
-    let inner = Rect { x: rect.x + 2, width: rect.width.saturating_sub(4), y: rect.y + 1, height: rect.height.saturating_sub(2) };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border2()))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(surface2()))
+        .title(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("› ", Style::default().fg(accent()).add_modifier(Modifier::BOLD)),
+            Span::styled("Commands ", Style::default().fg(soft())),
+        ]));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let width = inner.width as usize;
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("› ", Style::default().fg(accent())),
             Span::styled(palette.query.clone(), Style::default().fg(text())),
             Span::styled("▏", Style::default().fg(accent())),
+            Span::styled(
+                if palette.query.is_empty() { " Type to filter" } else { "" },
+                Style::default().fg(faint()),
+            ),
         ]),
-        Line::from(Span::styled("─".repeat(inner.width as usize), Style::default().fg(border2()))),
+        Line::from(Span::styled("─".repeat(width), Style::default().fg(border2()))),
     ];
-    for (i, (_, label)) in matches.iter().enumerate() {
-        let selected = i == palette.index;
+    let visible = (inner.height as usize).saturating_sub(2).max(1);
+    let sel_row = rows.iter().position(|(h, i)| h.is_none() && *i == palette.index).unwrap_or(0);
+    let start = sel_row.saturating_sub(visible.saturating_sub(2)).min(rows.len().saturating_sub(visible));
+    for (header, i) in rows.iter().skip(start).take(visible) {
+        if let Some(label) = header {
+            lines.push(Line::from(Span::styled(
+                label.to_string(),
+                Style::default().fg(faint()).add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        let (id, label) = matches[*i];
+        let (section, shortcut) = palette_meta(id);
+        let selected = *i == palette.index;
+        let right = if grouped { shortcut.to_string() } else if shortcut.is_empty() { section.to_string() } else { format!("{shortcut} · {section}") };
+        let label_w = width.saturating_sub(right.chars().count() + 3);
         lines.push(
-            Line::from(Span::styled(
-                pad(&format!(" {label}"), inner.width as usize),
-                Style::default().fg(if selected { text() } else { soft() }),
-            ))
+            Line::from(vec![
+                Span::styled(if selected { "▍ " } else { "  " }, Style::default().fg(accent())),
+                Span::styled(
+                    pad(label, label_w),
+                    if selected {
+                        Style::default().fg(text()).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(soft())
+                    },
+                ),
+                Span::styled(format!(" {right}"), Style::default().fg(faint())),
+            ])
             .style(Style::default().bg(if selected { surface3() } else { surface2() })),
         );
     }
     if matches.is_empty() {
-        lines.push(Line::from(Span::styled(" No matching command", Style::default().fg(faint()))));
+        lines.push(Line::from(Span::styled("No matching command", Style::default().fg(faint()))));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -524,15 +617,7 @@ pub(crate) fn render_key_hints(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
         Focus::Sidebar => &[("↑↓", "move"), ("Enter", "open"), ("n", "new"), ("Esc", "back")],
         Focus::Pane => &[("↑↓", "move"), ("Enter", "open"), ("Tab", "tab"), ("Esc", "back")],
     };
-    let mut spans = Vec::new();
-    for (i, (key, label)) in hints.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("  ", Style::default()));
-        }
-        spans.push(Span::styled(key.to_string(), Style::default().fg(soft()).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(format!(" {label}"), Style::default().fg(faint())));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(super::chrome::hint_line(hints)), area);
 }
 
 impl App {

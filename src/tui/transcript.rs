@@ -239,6 +239,12 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
+        let pending_question = matches!(event, HarnessEvent::UserQuestion { .. })
+            && state.status == HarnessStatus::WaitingForInput
+            && events.peek().is_none();
+        if pending_question {
+            continue;
+        }
         if let Some(card) = event_card(event) {
             if lines.last().is_some_and(|l| !l.spans.is_empty()) {
                 lines.push(Line::from(""));

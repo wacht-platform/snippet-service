@@ -34,6 +34,7 @@ mod render;
 mod settings;
 mod boards;
 mod cards;
+mod chrome;
 mod panels;
 mod shell;
 mod term_pane;
