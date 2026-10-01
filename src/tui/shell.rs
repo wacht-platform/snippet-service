@@ -23,10 +23,14 @@ pub(crate) enum PaneTab {
     Jobs,
     Usage,
     Vault,
+    Inbox,
+    Procs,
+    Git,
+    Files,
 }
 
 impl PaneTab {
-    pub(crate) const ALL: [PaneTab; 9] = [
+    pub(crate) const ALL: [PaneTab; 13] = [
         PaneTab::Tools,
         PaneTab::Plan,
         PaneTab::Lanes,
@@ -36,6 +40,10 @@ impl PaneTab {
         PaneTab::Jobs,
         PaneTab::Usage,
         PaneTab::Vault,
+        PaneTab::Inbox,
+        PaneTab::Procs,
+        PaneTab::Git,
+        PaneTab::Files,
     ];
 
     fn label(self) -> &'static str {
@@ -49,6 +57,10 @@ impl PaneTab {
             PaneTab::Jobs => "Jobs",
             PaneTab::Usage => "Usage",
             PaneTab::Vault => "Vault",
+            PaneTab::Inbox => "Inbox",
+            PaneTab::Procs => "Procs",
+            PaneTab::Git => "Git",
+            PaneTab::Files => "Files",
         }
     }
 }
@@ -65,6 +77,7 @@ pub(crate) struct ShellState {
     pub(crate) pane_scroll: u16,
     pub(crate) palette: Option<Palette>,
     pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 #[derive(Default)]
@@ -291,8 +304,9 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
             tabs.push(Span::raw("  "));
         }
         let active = *tab == app.shell.tab;
+        let badge = super::panels::tab_badge(app, *tab).map(|(b, _)| b).unwrap_or_default();
         tabs.push(Span::styled(
-            tab.label(),
+            format!("{}{badge}", tab.label()),
             if active {
                 Style::default().fg(text()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
             } else {
@@ -376,6 +390,11 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
                 lines.push(Line::from(Span::styled("Enter opens the full lanes view", Style::default().fg(faint()))));
             }
         }
+        PaneTab::Inbox | PaneTab::Procs | PaneTab::Git | PaneTab::Files => {
+            let body = super::panels::panel_lines(app, app.shell.tab, w);
+            let scroll = if app.shell.pane_detail.is_some() { app.shell.pane_scroll as usize } else { 0 };
+            lines.extend(body.into_iter().skip(scroll));
+        }
         PaneTab::Agents | PaneTab::Tasks | PaneTab::Jobs | PaneTab::Usage | PaneTab::Vault => {
             let body = super::boards::board_lines(app, app.shell.tab, w);
             let scroll = if app.shell.pane_detail.is_some() || app.shell.tab == PaneTab::Usage {
@@ -413,6 +432,9 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
             (PaneTab::Jobs, None) => "↑↓ move · p pause/resume · d delete · Tab next tab",
             (PaneTab::Usage, None) => "↑↓ scroll · r range · Tab next tab · Esc",
             (PaneTab::Vault, None) => "↑↓ move · a add · d delete · Tab next tab",
+            (tab, None) if super::panels::panel_hint(tab, false).is_some() => {
+                super::panels::panel_hint(tab, false).unwrap_or_default()
+            }
             _ => "↑↓ move · Enter open · Tab next tab · Esc",
         }
     } else {
@@ -424,7 +446,7 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
     );
 }
 
-pub(crate) const PALETTE_ACTIONS: [(&str, &str); 21] = [
+pub(crate) const PALETTE_ACTIONS: [(&str, &str); 25] = [
     ("new", "New session"),
     ("mission", "Open Mission Control"),
     ("agents", "Show agents"),
@@ -432,6 +454,10 @@ pub(crate) const PALETTE_ACTIONS: [(&str, &str); 21] = [
     ("jobs", "Show scheduled jobs"),
     ("usage", "Show usage and rate limits"),
     ("vault", "Manage vault secrets"),
+    ("inbox", "Show notifications"),
+    ("procs", "Show background processes"),
+    ("git", "Show git changes"),
+    ("files", "Browse files"),
     ("sessions", "Switch session…"),
     ("sidebar", "Toggle sessions sidebar"),
     ("pane", "Toggle side panel"),
@@ -548,6 +574,10 @@ impl App {
             "jobs" => self.open_pane(PaneTab::Jobs),
             "usage" => self.open_pane(PaneTab::Usage),
             "vault" => self.open_pane(PaneTab::Vault),
+            "inbox" => self.open_pane(PaneTab::Inbox),
+            "procs" => self.open_pane(PaneTab::Procs),
+            "git" => self.open_pane(PaneTab::Git),
+            "files" => self.open_pane(PaneTab::Files),
             "model" => self.handle_slash_command("/model"),
             "mode" => self.handle_slash_command("/mode"),
             "compact" => self.handle_slash_command("/compact"),
@@ -678,7 +708,7 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
                 }
                 return true;
             }
-            if app.handle_board_key(key) {
+            if app.handle_board_key(key) || app.handle_panel_key(key) {
                 return true;
             }
             if app.shell.tab == PaneTab::Usage {
@@ -734,7 +764,14 @@ pub(crate) fn handle_shell_key(app: &mut App, key: crossterm::event::KeyEvent) -
                         app.shell.pane_detail = Some(app.shell.pane_index.min(len - 1));
                         app.shell.pane_scroll = 0;
                     }
-                    PaneTab::Plan | PaneTab::Jobs | PaneTab::Usage | PaneTab::Vault => {}
+                    PaneTab::Plan
+                    | PaneTab::Jobs
+                    | PaneTab::Usage
+                    | PaneTab::Vault
+                    | PaneTab::Inbox
+                    | PaneTab::Procs
+                    | PaneTab::Git
+                    | PaneTab::Files => {}
                 },
                 _ => {}
             }

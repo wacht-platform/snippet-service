@@ -108,6 +108,7 @@ pub(crate) struct App {
     pub(crate) vault_input: Option<super::boards::VaultInput>,
     /// Which range the usage panel shows (see `USAGE_RANGES`).
     pub(crate) usage_range: usize,
+    pub(crate) panels: super::panels::PanelState,
     pub(crate) origin_cache: std::cell::RefCell<
         Option<(PathBuf, std::time::Instant, Option<crate::session::WorktreeOrigin>)>,
     >,
@@ -370,6 +371,7 @@ impl App {
             board_confirm: None,
             vault_input: None,
             usage_range: 0,
+            panels: Default::default(),
             origin_cache: Default::default(),
             original_config: None,
             last_state_stamp: None,
