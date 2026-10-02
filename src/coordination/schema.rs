@@ -122,6 +122,10 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              PRIMARY KEY (from_task_id, to_task_id, kind)
          );
          CREATE INDEX IF NOT EXISTS task_links_to ON task_links(to_task_id, kind);
+         CREATE TABLE IF NOT EXISTS task_requesters (
+             task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             reply_to TEXT NOT NULL
+         );
 
          -- Which agents are on a task, and what they own. Kept as a membership
          -- row with a removal timestamp rather than a hard delete: the record of

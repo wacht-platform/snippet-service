@@ -658,6 +658,7 @@ impl Store {
         let kind = match status {
             TaskStatus::Done => "done",
             TaskStatus::Failed => "failed",
+            TaskStatus::Cancelled => "cancelled",
             _ => "info",
         };
         let mut already_terminal = None;
@@ -699,9 +700,10 @@ impl Store {
         if let Some(task) = self.get_task(id)?
             && task.status == TaskStatus::InProgress
             && let Some(session) = task.reporting_session.as_deref()
-            && self
+            && (self
                 .get_session_row(session)?
                 .is_some_and(|row| matches!(row.status.as_str(), "running" | "waiting_for_input"))
+                || self.session_has_running_lanes(session)?)
         {
             return Err(StoreError::WorkerBusy {
                 id: id.to_string(),
@@ -1152,6 +1154,28 @@ impl Store {
                 "SELECT {TASK_COLUMNS} FROM tasks WHERE thread_id = ?1"
             ))?;
             Ok(stmt.query_row(params![thread_id], task_from_row).optional()?)
+        })
+    }
+
+    pub fn set_task_requester(&self, task_id: &str, reply_to: &str) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO task_requesters (task_id, reply_to) VALUES (?1, ?2)
+                 ON CONFLICT(task_id) DO UPDATE SET reply_to = excluded.reply_to",
+                params![task_id, reply_to],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn task_requester(&self, task_id: &str) -> Result<Option<String>, StoreError> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT reply_to FROM task_requesters WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .optional()
         })
     }
 

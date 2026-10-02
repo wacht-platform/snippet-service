@@ -895,6 +895,19 @@ impl Store {
         })
     }
 
+    pub fn session_has_running_lanes(&self, id: &str) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM sessions s, json_each(s.state_json, '$.lanes') l
+                     WHERE (s.id = ?1 OR s.legacy_id = ?1)
+                       AND json_extract(l.value, '$.status') = 'running')",
+                params![id],
+                |row| row.get(0),
+            )
+        })
+    }
+
     pub fn current_stop_identity(&self, id: &str) -> Result<Option<String>, StoreError> {
         self.with_connection(|conn| {
             conn.query_row(

@@ -940,7 +940,11 @@ pub use fork::*;
 /// Mission Control once.
 pub fn park_failed_session_work(id: &str, prev_status: &str, state: &HarnessState) {
     let status = status_str(state.status);
-    if status == "idle" && prev_status == "running" {
+    let lanes_running = state
+        .lanes
+        .iter()
+        .any(|lane| lane.status == crate::lanes::LaneStatus::Running);
+    if status == "idle" && prev_status == "running" && !lanes_running {
         if let Some(store) = store_for_sessions() {
             let _ = store.flag_unreported_tasks(id, &chrono::Utc::now().to_rfc3339());
         }

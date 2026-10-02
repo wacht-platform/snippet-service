@@ -61,10 +61,14 @@ pub(super) fn envelope_card(text: &str) -> Option<Card> {
     if t.contains("[mission_task_report]") {
         let status = field(t, "status");
         let (glyph, tone, label) = match status.as_str() {
-            "failed" | "cancelled" => ("✗", danger(), "Failed"),
+            "done" | "completed" => ("✓", success(), "Done"),
+            "failed" => ("✗", danger(), "Failed"),
+            "cancelled" => ("✗", muted(), "Cancelled"),
             "blocked" => ("!", danger(), "Blocked"),
+            "stalled" => ("!", warn(), "Stalled"),
             "in_progress" | "working" => ("◆", warn(), "Working"),
-            _ => ("✓", success(), "Done"),
+            "message" => ("✉", muted(), "Message"),
+            _ => ("·", muted(), "Update"),
         };
         let id = field(t, "task_id");
         return Some(Card {
