@@ -400,12 +400,14 @@ struct CreateTaskArgs {
     /// `list_profiles` gives the exact names.
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
 }
 pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. Never for an agent build, a worker report or a notification. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. Never for an agent build, a worker report or a notification. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -520,6 +522,16 @@ impl Tool for CreateMissionTask {
         store
             .create_task_with_agents(&task, &[worker])
             .map_err(|e| ToolError::msg(format!("create task: {e}")))?;
+        if let Some(reply_to) = args
+            .reply_to
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| r.starts_with("session:") || r.starts_with("agent:"))
+        {
+            store
+                .set_task_requester(&task.id, reply_to)
+                .map_err(|e| ToolError::msg(format!("record requester: {e}")))?;
+        }
         Ok(ToolResult::success(
             json!({
                 "task": task_view(&task),
@@ -1052,8 +1064,9 @@ impl Tool for ReportMissionTask {
                 tool: "report_mission_task".into(),
             })?;
         // Authority binding: the caller must be the durable session this task
-        // was dispatched to. Tasks are bound at dispatch time via
-        // `claim_task_for_dispatch`; anything else is rejected.
+        // was dispatched to (bound at dispatch via `claim_task_for_dispatch`),
+        // or the task's own target session while parking has cleared that
+        // binding. Any other session is rejected.
         let Some(caller) = ctx.durable_session_id() else {
             return Err(ToolError::msg(
                 "this session is not bound to a Mission Control task; report_mission_task is only available to dispatched task sessions",
@@ -1072,8 +1085,12 @@ impl Tool for ReportMissionTask {
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
             let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
+            let caller = canonical(caller);
             let bound_to = bound.reporting_session.as_deref().map(canonical);
-            if bound_to.as_deref() != Some(canonical(caller).as_str()) {
+            let own_unbound = bound_to.is_none()
+                && !bound.status.is_terminal()
+                && canonical(&bound.session_id) == caller;
+            if bound_to.as_deref() != Some(caller.as_str()) && !own_unbound {
                 return Err(ToolError::msg("task was not dispatched to this session"));
             }
         }
@@ -1138,6 +1155,24 @@ impl Tool for ReportMissionTask {
             );
         }
 
+        if status_for_board.is_terminal()
+            && let Ok(Some(reply_to)) = store.task_requester(&task.id)
+            && let Some((kind, id)) = reply_to.split_once(':')
+        {
+            let verb = match status_for_board {
+                TaskStatus::Done => "is done",
+                TaskStatus::Failed => "failed",
+                _ => "was stopped",
+            };
+            let body = format!("“{}” {verb}.\n\n{summary_for_board}", task.title);
+            let _ = store.send_direct_message(
+                ("agent", crate::mission_control::SESSION_ID),
+                (kind, id),
+                &body,
+                &format!("task-outcome:{}", task.id),
+                &now,
+            );
+        }
         let report_event = CoordinationEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             thread_id: task.thread_id.clone(),
