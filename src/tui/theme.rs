@@ -19,20 +19,20 @@ pub(super) struct Theme {
 }
 
 const DARK: Theme = Theme {
-    accent: Color::Rgb(0x6E, 0xA2, 0xFF),
-    text: Color::Rgb(0xED, 0xED, 0xEF),
-    soft: Color::Rgb(0xC8, 0xC8, 0xCC),
-    muted: Color::Rgb(0x9A, 0x9A, 0xA2),
-    faint: Color::Rgb(0x6E, 0x6E, 0x76),
-    success: Color::Rgb(0x39, 0xC5, 0x7E),
-    danger: Color::Rgb(0xF0, 0x64, 0x64),
-    warn: Color::Rgb(0xD4, 0x98, 0x2F),
-    lane: Color::Rgb(0xD4, 0x98, 0x2F),
-    code: Color::Rgb(0xC8, 0xC8, 0xCC),
-    surface1: Color::Rgb(0x1C, 0x1C, 0x1E),
-    surface2: Color::Rgb(0x23, 0x23, 0x25),
-    surface3: Color::Rgb(0x2A, 0x2A, 0x2D),
-    border2: Color::Rgb(0x36, 0x36, 0x3A),
+    accent: Color::Rgb(0x8B, 0x8D, 0xFF),
+    text: Color::Rgb(0xEE, 0xEE, 0xF1),
+    soft: Color::Rgb(0xC4, 0xC4, 0xCC),
+    muted: Color::Rgb(0x8F, 0x8F, 0x9B),
+    faint: Color::Rgb(0x6B, 0x6B, 0x77),
+    success: Color::Rgb(0x4C, 0xC3, 0x8A),
+    danger: Color::Rgb(0xEB, 0x57, 0x57),
+    warn: Color::Rgb(0xD9, 0x9E, 0x45),
+    lane: Color::Rgb(0xD9, 0x9E, 0x45),
+    code: Color::Rgb(0xC4, 0xC4, 0xCC),
+    surface1: Color::Rgb(0x17, 0x17, 0x1A),
+    surface2: Color::Rgb(0x1E, 0x1E, 0x22),
+    surface3: Color::Rgb(0x26, 0x26, 0x2B),
+    border2: Color::Rgb(0x32, 0x32, 0x38),
 };
 
 pub(super) fn theme() -> Theme {
@@ -177,7 +177,7 @@ mod tests {
     fn the_accent_is_a_distinct_readable_hue() {
         let t = theme();
         assert!(saturation(t.accent) > 0.3, "the accent must read as a colour");
-        for (surface, name) in [(Color::Rgb(0x15, 0x15, 0x16), "bg"), (t.surface1, "surface1"), (t.surface2, "surface2")] {
+        for (surface, name) in [(Color::Rgb(0x10, 0x10, 0x12), "bg"), (t.surface1, "surface1"), (t.surface2, "surface2")] {
             let c = contrast(t.accent, surface);
             assert!(c >= 4.5, "accent on {name} = {c:.2}");
             let c = contrast(t.faint, surface);
