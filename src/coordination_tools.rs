@@ -122,7 +122,7 @@ impl Tool for ListCoordinationAgents {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_coordination_agents".into(),
-            description: "List specialized agents in the coordination directory. Use it to pick a direct recipient; Mission Control does not relay their messages.".into(),
+            description: "The agent directory: every agent's id, role, status, capabilities and a one-line summary of what it is for. Use it to choose whom to message, invite onto a task (invite_task_agent) or run a lane as (delegate_task agent). Only active agents take new work.".into(),
             input_schema: schema(json!({}), &[]),
         }
     }
@@ -130,10 +130,43 @@ impl Tool for ListCoordinationAgents {
         let agents = db(ctx)?
             .list_agents()
             .map_err(|e| ToolError::msg(format!("list agents: {e}")))?;
+        let root = crate::coordination::agents_root(
+            &ctx.mission_control_root()
+                .unwrap_or_else(|| crate::config::snippet_home().join("mission-control")),
+        );
+        let agents: Vec<Value> = agents
+            .into_iter()
+            .map(|agent| {
+                let summary = crate::coordination::AgentHome::new(root.clone(), &agent.id)
+                    .ok()
+                    .and_then(|home| home.read_identity().ok())
+                    .map(|text| identity_summary(&text))
+                    .unwrap_or_default();
+                let mut row = serde_json::to_value(&agent).unwrap_or(Value::Null);
+                if !summary.is_empty() {
+                    row["summary"] = json!(summary);
+                }
+                row
+            })
+            .collect();
         Ok(ToolResult::success(json!({"agents": agents})))
     }
 }
 
+
+fn identity_summary(identity: &str) -> String {
+    let para = identity
+        .split("\n\n")
+        .map(str::trim)
+        .find(|p| !p.is_empty() && !p.starts_with('#'))
+        .unwrap_or("");
+    let line = para.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > 240 {
+        format!("{}…", line.chars().take(239).collect::<String>())
+    } else {
+        line
+    }
+}
 
 #[derive(Deserialize)]
 struct PostArgs {

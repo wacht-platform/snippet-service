@@ -74,6 +74,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
 
 pub fn add_worker_report_tool(registry: &mut ToolRegistry) {
     registry.insert(ReportMissionTask);
+    registry.insert(InviteTaskAgent);
 }
 
 /// Read-only session awareness, for a session that ROUTES work rather than doing
@@ -792,6 +793,109 @@ impl Tool for AssignTaskAgent {
             "agent_id": agent_id,
             "role": role,
             "status": status,
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct InviteTaskAgentArgs {
+    task_id: String,
+    agent_id: String,
+    #[serde(default)]
+    role: Option<String>,
+    ask: String,
+}
+pub struct InviteTaskAgent;
+#[async_trait]
+impl Tool for InviteTaskAgent {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "invite_task_agent".into(),
+            description: "Bring a specialist onto the task you are working as a collaborator: it joins the task room as a waiting member and is woken with your ask. Use it for a review, a second opinion or expertise you need while you keep the session. It does not hand over the session; transfer_task_session_lease does that. Only for a task dispatched to this session.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string"},
+                    "agent_id": {"type": "string", "description": "from list_coordination_agents"},
+                    "role": {"type": "string", "description": "e.g. reviewer, advisor, planner. Default reviewer."},
+                    "ask": {"type": "string", "description": "what you need from them, self-contained: what to look at and what answer you want"}
+                }),
+                &["task_id", "agent_id", "ask"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: InviteTaskAgentArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let (task_id, agent_id, ask) = (args.task_id.trim(), args.agent_id.trim(), args.ask.trim());
+        if task_id.is_empty() || agent_id.is_empty() || ask.is_empty() {
+            return Err(ToolError::msg("task_id, agent_id and ask must not be empty"));
+        }
+        if agent_id == crate::mission_control::SESSION_ID {
+            return Err(ToolError::msg("Mission Control is not a task collaborator; use message_mission_control"));
+        }
+        let Some(caller) = ctx.durable_session_id() else {
+            return Err(ToolError::msg("only the session working a task can invite collaborators"));
+        };
+        let store = db(ctx)?;
+        let task = store
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
+        let caller = canonical(caller);
+        let works_it = match task.reporting_session.as_deref() {
+            Some(bound) => canonical(bound) == caller,
+            None => canonical(&task.session_id) == caller,
+        };
+        if !works_it || task.status.is_terminal() {
+            return Err(ToolError::msg("you can only invite collaborators to an open task this session is working"));
+        }
+        require_working_agent(&store, agent_id)?;
+        let role = args.role.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("reviewer");
+        let now = now_rfc3339();
+        let already = store
+            .list_task_agents(task_id)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|m| m.agent_id == agent_id && m.removed_at.is_none());
+        if !already {
+            store
+                .add_task_agent_full(task_id, agent_id, role, None, ask, "waiting", &now)
+                .map_err(|e| ToolError::msg(format!("invite agent: {e}")))?;
+        }
+        let (actor_kind, actor_id) = match ctx.agent_id() {
+            Some(agent) => ("agent", agent.to_string()),
+            None => ("session", caller.clone()),
+        };
+        let event = CoordinationEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "message.posted".into(),
+            actor_kind: actor_kind.into(),
+            actor_id,
+            payload_version: 1,
+            payload: crate::coordination_tools::stamp_origin(ctx, json!({
+                "body": format!("@{agent_id} joined as {role}. {ask}"),
+                "task_id": task_id,
+                "invited": agent_id,
+            })),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        let saved = store
+            .append_event(&event)
+            .map_err(|e| ToolError::msg(format!("post invitation: {e}")))?;
+        crate::session::emit_device_event(json!({"kind": "coordination_event", "event": saved.clone()}));
+        crate::serve::queue_coordination_wake(saved);
+        Ok(ToolResult::success(json!({
+            "invited": agent_id,
+            "task_id": task_id,
+            "role": role,
+            "note": "They are on the roster and woken with your ask; their reply arrives on the task room. You keep the session."
         })))
     }
 }
