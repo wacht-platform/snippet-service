@@ -231,11 +231,113 @@ mod stream_buffer_tests {
     }
 }
 
-/// Split an inlined image out of a `read_image` tool-result value. The harness
+/// Split an inlined image out of a `view_image` tool-result value. The harness
 /// stamps base64 image bytes onto `data.image_base64` (with `data.mime`) before a
 /// turn; providers call this to (a) get the cleaned value for the text part —
 /// without the huge base64 blob — and (b) the `(mime, base64)` to emit as a real
 /// image block. Returns `None` when there's no inlined image.
+/// Render a tool result for the model as plain text.
+///
+/// Serialized JSON escapes every string, so file contents, command output and
+/// diffs reached the model as `"fn main() {\n    println!(\"hi\");\n}"` —
+/// harder to read and to copy back exactly. Scalars render as `key: value`;
+/// multi-line or long text renders verbatim between `[key]` and `[/key]`; small
+/// nested values stay compact JSON.
+/// A harness note (any System message after the first) as the model sees it:
+/// tagged so it can never pass for something the user wrote, and attached to
+/// the message before it rather than sent as a turn of its own.
+pub fn system_reminder(content: &str) -> String {
+    format!("<system-reminder>\n{}\n</system-reminder>", content.trim())
+}
+
+/// Attach a harness note to the end of a Responses-API input list: into the
+/// last function_call_output's text or the last user message, else as a new
+/// user message.
+pub fn attach_reminder_to_items(input: &mut Vec<Value>, content: &str, user_item: impl Fn(&str) -> Value) {
+    let note = system_reminder(content);
+    if let Some(last) = input.last_mut() {
+        if last.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && let Some(output) = last.get("output").and_then(Value::as_str)
+        {
+            last["output"] = Value::String(format!("{output}\n\n{note}"));
+            return;
+        }
+        if last.get("role").and_then(Value::as_str) == Some("user")
+            && let Some(parts) = last.get_mut("content").and_then(Value::as_array_mut)
+        {
+            parts.push(serde_json::json!({ "type": "input_text", "text": note }));
+            return;
+        }
+    }
+    input.push(user_item(&note));
+}
+
+pub fn render_tool_result(value: &Value) -> String {
+    let Some(obj) = value.as_object() else {
+        return render_scalar(value);
+    };
+    if !obj.contains_key("schema_version") {
+        let mut out = String::new();
+        render_fields(obj, &mut out);
+        return out.trim_end().to_string();
+    }
+    let status = obj.get("status").and_then(Value::as_str).unwrap_or("");
+    if status == "error" {
+        let error = obj.get("error");
+        let code = error
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or("error");
+        let message = error
+            .and_then(|e| e.get("message"))
+            .map(render_scalar)
+            .unwrap_or_default();
+        return format!("error ({code}): {message}");
+    }
+    let mut out = String::new();
+    if !matches!(status, "success" | "") {
+        out.push_str(&format!("status: {status}\n"));
+    }
+    match obj.get("data") {
+        Some(Value::Object(data)) => render_fields(data, &mut out),
+        Some(other) => out.push_str(&render_scalar(other)),
+        None => {}
+    }
+    out.trim_end().to_string()
+}
+
+fn render_scalar(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn render_fields(obj: &serde_json::Map<String, Value>, out: &mut String) {
+    // Short fields first, long blocks after, so the context reads before the body.
+    let mut blocks = String::new();
+    for (key, value) in obj {
+        match value {
+            Value::String(s) if s.contains('\n') || s.chars().count() > 200 => {
+                blocks.push_str(&format!("[{key}]\n{}\n[/{key}]\n", s.trim_end_matches('\n')));
+            }
+            Value::String(s) => out.push_str(&format!("{key}: {s}\n")),
+            Value::Array(_) | Value::Object(_) => {
+                let compact = value.to_string();
+                if compact.chars().count() <= 300 {
+                    out.push_str(&format!("{key}: {compact}\n"));
+                } else {
+                    let pretty = serde_json::to_string_pretty(value).unwrap_or(compact);
+                    blocks.push_str(&format!("[{key}]\n{pretty}\n[/{key}]\n"));
+                }
+            }
+            other => out.push_str(&format!("{key}: {other}\n")),
+        }
+    }
+    out.push_str(&blocks);
+}
+
 pub fn split_inlined_image(content: &Value) -> (Value, Option<(String, String)>) {
     let base64 = content
         .pointer("/data/image_base64")
@@ -397,7 +499,9 @@ impl RateLimitWindow {
 
 impl RateLimitSnapshot {
     pub fn is_reported(&self) -> bool {
-        self.primary.as_ref().is_some_and(RateLimitWindow::is_reported)
+        self.primary
+            .as_ref()
+            .is_some_and(RateLimitWindow::is_reported)
             || self
                 .secondary
                 .as_ref()
@@ -440,6 +544,10 @@ pub trait AgentModel: Send + Sync {
     fn swap_reasoning_effort(&mut self, _effort: Option<String>) -> Option<String> {
         None
     }
+
+    fn cli_agent_profile(&self) -> Option<crate::config::InferenceProfileConfig> {
+        None
+    }
 }
 
 #[async_trait]
@@ -464,6 +572,10 @@ impl<T: ?Sized + AgentModel + Send> AgentModel for Box<T> {
 
     fn swap_reasoning_effort(&mut self, effort: Option<String>) -> Option<String> {
         (**self).swap_reasoning_effort(effort)
+    }
+
+    fn cli_agent_profile(&self) -> Option<crate::config::InferenceProfileConfig> {
+        (**self).cli_agent_profile()
     }
 }
 

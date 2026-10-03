@@ -1,5 +1,6 @@
 use super::markdown::*;
 use super::theme::*;
+use super::tool_render::*;
 use super::*;
 
 /// The empty-state welcome: calm, left-aligned context + a compact command
@@ -20,11 +21,7 @@ pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<L
     let title_style = Style::default()
         .fg(Color::Rgb(165, 180, 252))
         .add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::Rgb(71, 85, 105));
 
-    lines.push(Line::from(""));
-    lines.push(center("t                                          T", dim));
-    lines.push(center("G                                           ", dim));
     lines.push(Line::from(""));
 
     let green = Style::default().fg(Color::Rgb(74, 222, 128));
@@ -72,9 +69,6 @@ pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<L
     ));
     lines.push(Line::from(""));
 
-    lines.push(center("g                                          g", dim));
-    lines.push(center("   t                                        ", dim));
-
     lines
 }
 
@@ -117,6 +111,7 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // sits flush beneath it, and the header (not blank lines) separates speakers.
     let mut speaker: Option<bool> = None; // Some(true)=agent, Some(false)=you
     let mut prev_tool_row = false;
+    let mut prev_plan = false;
 
     // Content is rendered in a column to the RIGHT of the fixed speaker tag.
     let content_w = width.saturating_sub(TAG_W).max(20);
@@ -173,25 +168,31 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Tool call: render `• verb arg` cleanly without double-tagging
-        if let HarnessEvent::ToolCall {
-            tool_name,
-            arguments,
-        } = event
-        {
-            if HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
-                // Drop the paired hidden result too, so no orphan row renders.
-                if let Some(HarnessEvent::ToolResult { tool_name: rn, .. }) = events.peek() {
-                    if HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
+        if matches!(event, HarnessEvent::ToolCall { .. }) {
+            let mut run: Vec<RunStep> = Vec::new();
+            let mut cur = Some(event);
+            while let Some(HarnessEvent::ToolCall { tool_name, arguments }) = cur {
+                let mut result = None;
+                if let Some(HarnessEvent::ToolResult { tool_name: rn, result: r }) = events.peek() {
+                    if rn == tool_name {
+                        result = Some(r.clone());
                         events.next();
                     }
                 }
+                if !HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
+                    run.push(RunStep { tool: tool_name.clone(), args: arguments.clone(), result });
+                }
+                cur = if matches!(events.peek(), Some(HarnessEvent::ToolCall { .. })) {
+                    events.next()
+                } else {
+                    None
+                };
+            }
+            if run.is_empty() {
                 continue;
             }
 
             set_speaker(&mut lines, &mut speaker, &mut tag_pending, true);
-
-            // If transitioning from prose text to a tool call, add a blank line above the tool run
             if !prev_tool_row
                 && !lines.is_empty()
                 && lines.last().map_or(true, |l| !l.spans.is_empty())
@@ -199,82 +200,31 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 lines.push(Line::from(""));
             }
 
-            // Pair call + result into one Cursor-style row. Ctrl-O (tools_expanded)
-            // reveals arg previews and fuller result bodies; collapsed stays one line.
+            let running = state.status == HarnessStatus::Running;
+            let live = running && events.peek().is_none();
             let expanded = app.tools_expanded;
-            let mut status = if state.status == HarnessStatus::Running {
-                ToolRowStatus::Running
+            if run.len() > 1 && !live && !expanded {
+                lines.extend(run_summary_lines(&run, content_w));
             } else {
-                ToolRowStatus::Done
-            };
-            let mut result_value: Option<Value> = None;
-            if let Some(HarnessEvent::ToolResult {
-                tool_name: rn,
-                result,
-            }) = events.peek()
-            {
-                if rn == tool_name && !HIDDEN_TOOL_ROWS.contains(&rn.as_str()) {
-                    let failed = result.get("status").and_then(Value::as_str) == Some("error");
-                    status = if failed {
-                        ToolRowStatus::Failed
-                    } else {
-                        ToolRowStatus::Done
+                for step in &run {
+                    let status = match &step.result {
+                        _ if step.failed() => ToolRowStatus::Failed,
+                        None if live => ToolRowStatus::Running,
+                        _ => ToolRowStatus::Done,
                     };
-                    result_value = Some(result.clone());
-                    events.next();
-                }
-            } else if state.status != HarnessStatus::Running {
-                status = ToolRowStatus::Done;
-            }
-
-            let mut call_lines =
-                tool_call_head_lines_status(tool_name, arguments, content_w, status);
-
-            let can_expand = tool_is_expandable(tool_name, arguments, result_value.as_ref());
-            if can_expand {
-                let hint = if expanded {
-                    "(ctrl+o to collapse)"
-                } else {
-                    "(ctrl+o to expand)"
-                };
-                if let Some(first) = call_lines.first_mut() {
-                    let need = hint.chars().count() + 1;
-                    if content_w > first.width() + need {
-                        first.spans.push(Span::raw(" "));
-                        first.spans.push(Span::styled(
-                            hint.to_string(),
-                            Style::default().fg(faint()).add_modifier(Modifier::DIM),
-                        ));
+                    lines.extend(tool_call_head_lines_status(&step.tool, &step.args, content_w, status));
+                    if expanded {
+                        lines.extend(tool_call_preview(&step.tool, &step.args, content_w));
+                        if let Some(result) = &step.result {
+                            lines.extend(tool_result_lines_expanded(&step.tool, result, content_w));
+                        }
+                    } else if let (true, Some(result)) = (step.failed(), &step.result) {
+                        lines.extend(tool_result_lines(&step.tool, result, content_w));
                     }
                 }
             }
-
-            if matches!(status, ToolRowStatus::Running) {
-                let spinner = SPINNER[(app.frame / 2) % SPINNER.len()];
-                if let Some(first) = call_lines.first_mut() {
-                    first.spans.push(Span::raw(" "));
-                    first.spans.push(Span::styled(
-                        spinner.to_string(),
-                        Style::default().fg(accent()),
-                    ));
-                }
-            }
-
-            if expanded {
-                call_lines.extend(tool_call_preview(tool_name, arguments, content_w));
-                if let Some(result) = result_value.as_ref() {
-                    call_lines.extend(tool_result_lines_expanded(tool_name, result, content_w));
-                }
-            } else if let Some(result) = result_value.as_ref() {
-                // Collapsed: keep errors visible under the row; success stays one-line.
-                if result.get("status").and_then(Value::as_str) == Some("error") {
-                    call_lines.extend(tool_result_lines(tool_name, result, content_w));
-                }
-            }
-
-            // Push tool rows flush with the content column (no speaker double-tag).
-            lines.extend(call_lines);
             prev_tool_row = true;
+            prev_plan = false;
             continue;
         }
 
@@ -289,6 +239,24 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
+        let pending_question = matches!(event, HarnessEvent::UserQuestion { .. })
+            && state.status == HarnessStatus::WaitingForInput
+            && events.peek().is_none();
+        if pending_question {
+            continue;
+        }
+        if let Some(card) = event_card(event) {
+            if lines.last().is_some_and(|l| !l.spans.is_empty()) {
+                lines.push(Line::from(""));
+            }
+            lines.extend(card_lines(&card, width));
+            speaker = None;
+            tag_pending = false;
+            prev_tool_row = false;
+            prev_plan = true;
+            continue;
+        }
+
         let rendered = event_lines(event, content_w);
         if rendered.is_empty() {
             continue;
@@ -300,12 +268,15 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
         set_speaker(&mut lines, &mut speaker, &mut tag_pending, !is_user);
 
-        if prev_tool_row && !lines.is_empty() && lines.last().map_or(true, |l| !l.spans.is_empty())
+        if (prev_tool_row || prev_plan)
+            && !lines.is_empty()
+            && lines.last().map_or(true, |l| !l.spans.is_empty())
         {
             lines.push(Line::from(""));
         }
         push_tagged(&mut lines, rendered, !is_user, &mut tag_pending);
         prev_tool_row = false;
+        prev_plan = matches!(event, HarnessEvent::PlanUpdated { .. });
     }
     for pending in &app.pending_steers {
         if pending.trim().is_empty() {
@@ -375,9 +346,17 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{spinner} "),
-                    Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                    Style::default().fg(warn()).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("working…", subtle()),
+                Span::styled(
+                    match state.events.last() {
+                        _ if state.status != HarnessStatus::Running => "delegated work running…",
+                        Some(HarnessEvent::ToolCall { .. }) => "working…",
+                        _ if !live.is_empty() => "writing…",
+                        _ => "thinking…",
+                    },
+                    subtle(),
+                ),
             ]));
         }
     }
@@ -414,7 +393,7 @@ fn turn_has_visible_action(events: &[HarnessEvent]) -> bool {
             HarnessEvent::ToolCall { .. }
             | HarnessEvent::ToolResult { .. }
             | HarnessEvent::InvalidToolCall { .. }
-            | HarnessEvent::Note { .. }
+            | HarnessEvent::PlanUpdated { .. }
             | HarnessEvent::FilePresented { .. }
             | HarnessEvent::UserQuestion { .. }
             | HarnessEvent::ApprovalRequest { .. }
@@ -445,6 +424,9 @@ fn thinking_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 
 /// Map one event to a block of styled, wrapped lines. Empty = hidden.
 pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'static>> {
+    if let Some(card) = event_card(event) {
+        return card_lines(&card, width);
+    }
     match event {
         HarnessEvent::UserInput { text } => user_lines(text, width),
         // Steers are still your words mid-run — same column as user messages, no
@@ -453,20 +435,63 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
         HarnessEvent::AssistantText { text } => {
             indent_block(render_prose(text, width.saturating_sub(SPINE)), SPINE)
         }
-        HarnessEvent::Note { entry } => {
-            // The agent's private scratchpad — recede it (faint + italic) so it
-            // reads as a quiet aside, not content on par with the answer.
-            let mut lines = marker_block("·", faint(), entry, width);
-            for line in &mut lines {
-                for span in &mut line.spans {
-                    span.style = span.style.add_modifier(Modifier::ITALIC | Modifier::DIM);
+        HarnessEvent::Retired => Vec::new(),
+        HarnessEvent::PlanUpdated { steps, explanation } => {
+            let mut lines = Vec::new();
+            if let Some(why) = explanation {
+                lines.extend(marker_block("·", faint(), why, width));
+            }
+            for step in steps {
+                let (mark, color) = match step.status {
+                    PlanStatus::Done => ("✓", success()),
+                    PlanStatus::InProgress => ("▸", accent()),
+                    PlanStatus::Pending => ("○", muted()),
+                };
+                let mut block = marker_block(mark, color, &step.step, width);
+                if step.status == PlanStatus::Done {
+                    for line in &mut block {
+                        for span in line.spans.iter_mut().skip(1) {
+                            span.style = span.style.fg(muted());
+                        }
+                    }
                 }
+                lines.extend(block);
             }
             lines
         }
+        // A direct message to or from another agent. Both directions render, so
+        // the exchange reads as one conversation rather than a reply appearing
+        // with nothing before it.
+        HarnessEvent::AgentMessage {
+            agent_id,
+            body,
+            outbound,
+        } => marker_block(
+            if *outbound { "→" } else { "←" },
+            if *outbound { muted() } else { lane() },
+            &format!(
+                "{} {agent_id}: {body}",
+                if *outbound { "to" } else { "from" }
+            ),
+            width,
+        ),
         HarnessEvent::FilePresented { path, caption } => {
             present_file_lines(path, caption.as_deref(), width)
         }
+        // Work routed on this session's behalf by someone else (usually the
+        // user). A quiet aside: it is already dispatched, so it is a record of
+        // what went out, not a decision to make.
+        HarnessEvent::TaskDispatched {
+            task_id,
+            title,
+            session_id,
+            by,
+        } => marker_block(
+            "→",
+            muted(),
+            &format!("{by} dispatched: {title}\ntask {task_id} → {session_id}"),
+            width,
+        ),
         HarnessEvent::SystemDecision { step, reasoning } => {
             if step == "history_compaction_pass" {
                 // Keep the live banner only during the turn; the durable
@@ -650,7 +675,7 @@ fn audio_block_lines(name: &str, body: &str, width: usize) -> Vec<Line<'static>>
 }
 
 pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    let cleaned = strip_attachment_markers(text);
+    let cleaned = strip_attachment_markers(&strip_pasted_blocks(text));
     let (prose, audio) = split_audio_sections(&cleaned);
     let body = Style::default()
         .fg(self::text())
@@ -663,16 +688,7 @@ pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         }
         lines.extend(audio_block_lines(name, transcript, width));
     }
-    let (imgs, files) = count_attachments(text);
-    if imgs + files > 0 {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(SPINE)),
-            Span::styled(
-                attachment_summary(imgs, files),
-                Style::default().fg(muted()),
-            ),
-        ]));
-    }
+    lines.extend(attachment_lines(text, width));
     if lines.is_empty() {
         // Pure attachment / empty after strip — keep a single blank body so the
         // speaker tag still has a row.
@@ -683,7 +699,7 @@ pub(super) fn user_lines(text: &str, width: usize) -> Vec<Line<'static>> {
 
 /// Mid-run steer: same column as user text, quiet label, no enter-arrow glyph.
 fn steer_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    let cleaned = strip_attachment_markers(text);
+    let cleaned = strip_attachment_markers(&strip_pasted_blocks(text));
     let (prose, audio) = split_audio_sections(&cleaned);
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
@@ -701,16 +717,7 @@ fn steer_lines(text: &str, width: usize) -> Vec<Line<'static>> {
         }
         lines.extend(audio_block_lines(name, transcript, width));
     }
-    let (imgs, files) = count_attachments(text);
-    if imgs + files > 0 {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(SPINE)),
-            Span::styled(
-                attachment_summary(imgs, files),
-                Style::default().fg(muted()),
-            ),
-        ]));
-    }
+    lines.extend(attachment_lines(text, width));
     lines
 }
 
@@ -786,32 +793,70 @@ fn push_tagged(
 }
 
 /// Count `[attached image — …]` / `[attached file — …]` markers by kind.
-fn count_attachments(text: &str) -> (usize, usize) {
-    let (mut imgs, mut files) = (0usize, 0usize);
-    for line in text.lines() {
-        let t = line.trim_start();
-        if !t.ends_with(']') {
-            continue;
-        }
-        if t.starts_with("[attached image —") {
-            imgs += 1;
-        } else if t.starts_with("[attached file —") {
-            files += 1;
-        }
-    }
-    (imgs, files)
+static PASTED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\[pasted text — \d+ lines?\]\n([\s\S]*?)\n\[/pasted text\]")
+        .expect("valid regex")
+});
+static ATTACHED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\[attached (image|file) — ([^\]/]*)(/[^\]]+)\]").expect("valid regex")
+});
+
+fn strip_pasted_blocks(text: &str) -> String {
+    PASTED_RE.replace_all(text, "").into_owned()
 }
 
-/// "📎 2 images · 1 file" from the per-kind counts.
-fn attachment_summary(imgs: usize, files: usize) -> String {
-    let mut parts = Vec::new();
-    if imgs > 0 {
-        parts.push(format!("{imgs} image{}", if imgs == 1 { "" } else { "s" }));
+/// One row per attachment (its kind and file name) and one per pasted block
+/// (its size and first line), in the content column under the message.
+fn attachment_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let label = Style::default().fg(muted());
+    let name = Style::default().fg(self::text());
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for caps in ATTACHED_RE.captures_iter(text) {
+        let path = caps[3].trim();
+        let file = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let lower = file.to_lowercase();
+        let kind = if &caps[1] == "image" {
+            "image"
+        } else if caps[2].contains("pasted text") {
+            "pasted"
+        } else if [".m4a", ".mp3", ".wav", ".ogg", ".opus", ".webm", ".aac", ".flac"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+        {
+            "audio"
+        } else {
+            "file"
+        };
+        rows.push((kind.to_string(), file));
     }
-    if files > 0 {
-        parts.push(format!("{files} file{}", if files == 1 { "" } else { "s" }));
+    for caps in PASTED_RE.captures_iter(text) {
+        let body = &caps[1];
+        let count = body.lines().count().max(1);
+        let first = body.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+        rows.push((
+            "pasted".to_string(),
+            format!("{count} line{} · {first}", if count == 1 { "" } else { "s" }),
+        ));
     }
-    format!("📎 {}", parts.join(" · "))
+    let room = width.saturating_sub(SPINE + 8).max(8);
+    rows.into_iter()
+        .map(|(kind, text)| {
+            let shown: String = if text.chars().count() > room {
+                text.chars().take(room.saturating_sub(1)).collect::<String>() + "…"
+            } else {
+                text
+            };
+            Line::from(vec![
+                Span::raw(" ".repeat(SPINE)),
+                Span::styled(format!("{kind:<7} "), label),
+                Span::styled(shown, name),
+            ])
+        })
+        .collect()
 }
 
 /// A leading glyph + optional label, then wrapped body text in one color.
@@ -958,10 +1003,14 @@ pub(super) fn tool_call_head_lines_status(
 
     let (dot_glyph, dot_color) = match status {
         ToolRowStatus::Done => ("●", success()),
-        ToolRowStatus::Running => ("●", accent()),
+        ToolRowStatus::Running => ("●", warn()),
         ToolRowStatus::Failed => ("●", danger()),
     };
-    let verb_style = Style::default().fg(warn()).add_modifier(Modifier::BOLD);
+    let verb_style = if arg.trim().is_empty() {
+        Style::default().fg(soft())
+    } else {
+        Style::default().fg(text()).add_modifier(Modifier::BOLD)
+    };
     let arg_style = Style::default().fg(self::text());
     let paren_style = Style::default().fg(muted());
 
@@ -1023,7 +1072,6 @@ pub(super) fn tool_call_preview(
     width: usize,
 ) -> Vec<Line<'static>> {
     let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
-    let path = arg("path");
     let path_style = Style::default().fg(code()).add_modifier(Modifier::ITALIC);
     let green = Style::default().fg(success());
     let red = Style::default().fg(danger());
@@ -1032,69 +1080,48 @@ pub(super) fn tool_call_preview(
     let mut items: Vec<(String, Style)> = Vec::new();
 
     match tool_name {
-        "write_file" => {
-            let content = arg("content");
-            let total = content.lines().count();
-
-            // Header with file path
-            items.push((format!("→ {}", path), path_style));
-            items.push(("".to_string(), subtle()));
-
-            // Content preview
-            for line in content.lines().take(MAX) {
-                items.push((format!("  {}", line), green));
-            }
-            if total > MAX {
-                items.push(("".to_string(), subtle()));
-                items.push((format!("  … +{} more lines", total - MAX), subtle()));
-            }
-        }
-        "edit_file" => {
-            let old = arg("old_string");
-            let new = arg("new_string");
-            let old_total = old.lines().count();
-            let new_total = new.lines().count();
-
-            // Header with file path
-            items.push((format!("→ {}", path), path_style));
-            items.push(("".to_string(), subtle()));
-
-            // Old content (removed)
-            if old_total > 0 {
-                for line in old.lines().take(MAX) {
-                    items.push((format!("  {}", line), red));
+        "change_files" => {
+            let changes = arguments
+                .get("changes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (i, change) in changes.iter().enumerate() {
+                let field = |key: &str| change.get(key).and_then(Value::as_str).unwrap_or("");
+                if i > 0 {
+                    items.push(("".to_string(), subtle()));
                 }
-                if old_total > MAX {
-                    items.push((format!("  … +{} more", old_total - MAX), subtle()));
+                let action = field("action");
+                let target = match action {
+                    "move" => format!("→ move {} → {}", field("path"), field("to")),
+                    _ => format!("→ {action} {}", field("path")),
+                };
+                items.push((target, path_style));
+                let mut push_lines = |text: &str, style: Style| {
+                    let total = text.lines().count();
+                    for line in text.lines().take(MAX) {
+                        items.push((format!("  {line}"), style));
+                    }
+                    if total > MAX {
+                        items.push((format!("  … +{} more", total - MAX), subtle()));
+                    }
+                };
+                match action {
+                    "replace" => {
+                        push_lines(field("find"), red);
+                        push_lines(field("with"), green);
+                    }
+                    "create" => push_lines(field("content"), green),
+                    _ => {}
                 }
-                items.push(("".to_string(), subtle()));
-            }
-
-            // New content (added)
-            if new_total > 0 {
-                for line in new.lines().take(MAX) {
-                    items.push((format!("  {}", line), green));
-                }
-                if new_total > MAX {
-                    items.push((format!("  … +{} more", new_total - MAX), subtle()));
-                }
-            }
-        }
-        "append_file" => {
-            let content = arg("content");
-            let total = content.lines().count();
-
-            items.push((format!("→ {}", path), path_style));
-            items.push(("".to_string(), subtle()));
-            for line in content.lines().take(MAX) {
-                items.push((format!("  {}", line), green));
-            }
-            if total > MAX {
-                items.push(("".to_string(), subtle()));
-                items.push((format!("  … +{} more lines", total - MAX), subtle()));
             }
         }
         "bash" => {
+            let label = arg("label");
+            if !label.is_empty() {
+                items.push((format!("→ {label}"), path_style));
+                items.push(("".to_string(), subtle()));
+            }
             let cmd = arg("command");
             let total = cmd.lines().count().max(1);
             items.push(("command".to_string(), path_style));
@@ -1105,611 +1132,8 @@ pub(super) fn tool_call_preview(
                 items.push((format!("  … +{} more lines", total - MAX), subtle()));
             }
         }
-        "memory_write" => {
-            let id = arg("id");
-            let content = arg("content");
-            items.push((format!("id  {id}"), path_style));
-            push_text_preview(&mut items, content, MAX, green, subtle());
-        }
-        "memory_rule" => {
-            let scope = arg("scope");
-            let content = arg("content");
-            items.push((format!("scope  {scope}"), path_style));
-            push_text_preview(&mut items, content, MAX, green, subtle());
-        }
-        "memory_pattern" => {
-            let action = arg("action");
-            let content = arg("content");
-            if !action.is_empty() {
-                items.push((format!("action  {action}"), path_style));
-            }
-            push_text_preview(&mut items, content, MAX, green, subtle());
-        }
-        "memory_index" => {
-            push_text_preview(&mut items, arg("content"), MAX, green, subtle());
-        }
-        "memory_delete" => {
-            items.push((format!("id  {}", arg("id")), path_style));
-        }
-        "memory_read" => {
-            items.push((format!("id  {}", arg("id")), path_style));
-        }
         _ => return Vec::new(),
     }
     result_block_verbatim(items, width)
 }
 
-fn push_text_preview(
-    items: &mut Vec<(String, Style)>,
-    content: &str,
-    max: usize,
-    body: Style,
-    more: Style,
-) {
-    let total = content.lines().count();
-    if content.trim().is_empty() {
-        items.push(("  (empty)".to_string(), more));
-        return;
-    }
-    for line in content.lines().take(max) {
-        items.push((format!("  {line}"), body));
-    }
-    if total > max {
-        items.push((format!("  … +{} more lines", total - max), more));
-    }
-}
-
-/// Tools whose collapsed row is incomplete without an expanded body.
-fn tool_is_expandable(tool_name: &str, arguments: &Value, result: Option<&Value>) -> bool {
-    let arg = |key: &str| arguments.get(key).and_then(Value::as_str).unwrap_or("");
-    match tool_name {
-        "write_file" | "append_file" => !arg("content").trim().is_empty(),
-        "edit_file" => !arg("old_string").is_empty() || !arg("new_string").is_empty(),
-        "bash" => {
-            let cmd = arg("command");
-            cmd.lines().count() > 1
-                || cmd.chars().count() > 80
-                || result.map(result_has_body).unwrap_or(false)
-        }
-        "memory_write" | "memory_rule" | "memory_pattern" | "memory_index" => {
-            !arg("content").trim().is_empty()
-        }
-        "read_file" | "search_content" | "list_files" | "web_read" | "view_outline"
-        | "code_map" => result.map(result_has_body).unwrap_or(false),
-        _ => {
-            // Any tool whose header arg was truncated, or result has a body.
-            let (_, shown) = tool_call_parts(tool_name, arguments);
-            shown.contains('…') || result.map(result_has_body).unwrap_or(false)
-        }
-    }
-}
-
-fn result_has_body(result: &Value) -> bool {
-    if result.get("status").and_then(Value::as_str) == Some("error") {
-        return true;
-    }
-    let data = result.get("data").unwrap_or(result);
-    for key in ["stdout", "stderr", "content", "text", "output"] {
-        if data
-            .get(key)
-            .and_then(Value::as_str)
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false)
-        {
-            return true;
-        }
-    }
-    data.get("entries")
-        .and_then(Value::as_array)
-        .map(|a| !a.is_empty())
-        .unwrap_or(false)
-        || data
-            .get("matches")
-            .and_then(Value::as_array)
-            .map(|a| !a.is_empty())
-            .unwrap_or(false)
-}
-
-/// A tool call as (verb, argument) — e.g. ("Read", "src/auth.rs") — so the verb
-/// and its target can be styled distinctly instead of a single `Read(path)` blob.
-pub(super) fn tool_call_parts(tool_name: &str, arguments: &Value) -> (String, String) {
-    let arg = |key: &str| {
-        arguments
-            .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    match tool_name {
-        "read_file" => ("Read".into(), arg("path")),
-        "write_file" => ("Write".into(), arg("path")),
-        "edit_file" => ("Edit".into(), arg("path")),
-        "list_files" => (
-            "List".into(),
-            arguments
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(".")
-                .to_string(),
-        ),
-        "search_content" => ("Search".into(), arg("query")),
-        "search_files" => {
-            let pattern = arg("pattern");
-            (
-                "Search".into(),
-                if pattern.is_empty() {
-                    arg("query")
-                } else {
-                    pattern
-                },
-            )
-        }
-        "view_outline" => ("Outline".into(), arg("path")),
-        "code_map" => {
-            let q = arg("query");
-            let path = arg("path");
-            let detail = if !q.is_empty() && !path.is_empty() {
-                format!("{path} · {q}")
-            } else if !q.is_empty() {
-                q
-            } else if !path.is_empty() {
-                path
-            } else {
-                ".".into()
-            };
-            ("Map".into(), detail)
-        }
-        "web_search" => ("Web".into(), arg("query")),
-        "web_read" => ("Fetch".into(), arg("url")),
-        "read_image" => ("Read".into(), arg("path")),
-        "bash" => {
-            // Commands can be long or multi-line; show a compact single line (first
-            // line, whitespace-collapsed, capped) with an ellipsis when elided.
-            let cmd = arg("command");
-            ("Bash".into(), ellipsize_one_line(&cmd, 90))
-        }
-        "memory_write" => ("MemoryWrite".into(), {
-            let id = arg("id");
-            let n = arg("content").lines().count();
-            if id.is_empty() {
-                format!("{n} lines")
-            } else {
-                format!("{id} · {n} lines")
-            }
-        }),
-        "memory_read" => ("MemoryRead".into(), arg("id")),
-        "memory_delete" => ("MemoryDelete".into(), arg("id")),
-        "memory_index" => {
-            let n = arg("content").lines().count();
-            ("MemoryIndex".into(), format!("{n} lines"))
-        }
-        "memory_rule" => {
-            let scope = arg("scope");
-            let n = arg("content").lines().count();
-            (
-                "MemoryRule".into(),
-                if scope.is_empty() {
-                    format!("{n} lines")
-                } else {
-                    format!("{scope} · {n} lines")
-                },
-            )
-        }
-        "memory_pattern" => {
-            let action = arg("action");
-            let n = arg("content").lines().count();
-            (
-                "MemoryPattern".into(),
-                if action.is_empty() {
-                    format!("{n} lines")
-                } else {
-                    format!("{action} · {n} lines")
-                },
-            )
-        }
-        "append_file" => ("Append".into(), arg("path")),
-        _ => {
-            let pretty = tool_name
-                .split('_')
-                .map(|w| {
-                    let mut c = w.chars();
-                    match c.next() {
-                        Some(f) => format!("{}{}", f.to_uppercase(), c.as_str()),
-                        None => String::new(),
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            // Never dump full JSON for unknown tools — pick a short label field.
-            let detail = arguments
-                .get("path")
-                .or_else(|| arguments.get("id"))
-                .or_else(|| arguments.get("query"))
-                .or_else(|| arguments.get("name"))
-                .or_else(|| arguments.get("title"))
-                .and_then(Value::as_str)
-                .map(|s| ellipsize_one_line(s, 80))
-                .unwrap_or_else(|| {
-                    let raw = serde_json::to_string(arguments).unwrap_or_default();
-                    ellipsize_one_line(&raw, 60)
-                });
-            (pretty, detail)
-        }
-    }
-}
-
-fn ellipsize_one_line(text: &str, max_chars: usize) -> String {
-    let first = text.lines().next().unwrap_or("").trim();
-    let compact = first.split_whitespace().collect::<Vec<_>>().join(" ");
-    let multi = text.lines().count() > 1;
-    if compact.chars().count() <= max_chars && !multi {
-        return compact;
-    }
-    let capped: String = compact.chars().take(max_chars).collect();
-    if capped.chars().count() < compact.chars().count() || multi {
-        format!("{capped} …")
-    } else {
-        capped
-    }
-}
-
-pub(super) fn tool_result_lines(
-    tool_name: &str,
-    result: &Value,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let status = result.get("status").and_then(Value::as_str).unwrap_or("");
-    let data = result.get("data").unwrap_or(result);
-
-    // Oversized output was spilled to a scratch file (no stdout/data here) — say so
-    // explicitly instead of falling through to a misleading "no output".
-    if result
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        let chars = result
-            .pointer("/original_stats/char_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let where_ = result
-            .get("saved_output_path")
-            .and_then(Value::as_str)
-            .map(|p| format!(" → {p}"))
-            .unwrap_or_default();
-        let head = if chars > 0 {
-            format!("output too large ({} chars){where_}", fmt_si(chars))
-        } else {
-            format!("output too large{where_}")
-        };
-        return result_block(vec![(head, subtle().add_modifier(Modifier::ITALIC))], width);
-    }
-
-    if status == "error" {
-        let message = result
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("failed");
-        return result_block(
-            vec![(format!("✗ {message}"), Style::default().fg(danger()))],
-            width,
-        );
-    }
-
-    let str_field = |key: &str| data.get(key).and_then(Value::as_str).unwrap_or("");
-    let items: Vec<(String, Style)> = match tool_name {
-        "read_file" => {
-            let lines = str_field("content").lines().count();
-            vec![(format!("Read {lines} lines"), subtle())]
-        }
-        "write_file" => vec![(format!("Wrote {}", str_field("path")), subtle())],
-        "edit_file" => vec![(format!("Updated {}", str_field("path")), subtle())],
-        "list_files" => {
-            let entries = data.get("entries").and_then(Value::as_array);
-            let count = entries.map(|e| e.len()).unwrap_or(0);
-            let names = entries
-                .map(|e| {
-                    e.iter()
-                        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
-                        .take(12)
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                })
-                .unwrap_or_default();
-            vec![(format!("{count} entries"), subtle()), (names, subtle())]
-        }
-        "search_content" => {
-            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
-            vec![(format!("Found {count} content matches"), subtle())]
-        }
-        "web_search" => {
-            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
-            vec![(format!("{count} web results"), subtle())]
-        }
-        "web_read" => {
-            let chars = data
-                .get("text")
-                .and_then(Value::as_str)
-                .map(|t| t.chars().count())
-                .unwrap_or(0);
-            vec![(format!("Read {chars} chars"), subtle())]
-        }
-        "view_outline" => {
-            if data
-                .get("is_directory")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                let count = data
-                    .get("entries")
-                    .and_then(Value::as_array)
-                    .map(|e| e.len())
-                    .unwrap_or(0);
-                vec![(format!("Directory — {count} entries"), subtle())]
-            } else {
-                let outline = data.get("outline").and_then(Value::as_array);
-                let count = outline.map(|o| o.len()).unwrap_or(0);
-                vec![(format!("Outline has {count} code declarations"), subtle())]
-            }
-        }
-        "bash" => bash_result_items(data),
-        _ => vec![(status.to_string(), subtle())],
-    };
-
-    let items: Vec<(String, Style)> = items.into_iter().filter(|(t, _)| !t.is_empty()).collect();
-    // Bash output is rendered verbatim so leading whitespace / column alignment is
-    // preserved (word-wrap would strip indentation); other results word-wrap.
-    if tool_name == "bash" {
-        result_block_verbatim(items, width)
-    } else {
-        result_block(items, width)
-    }
-}
-
-pub(super) fn bash_result_items(data: &Value) -> Vec<(String, Style)> {
-    let success = data
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let exit = data
-        .get("exit_code")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    let stdout = data.get("stdout").and_then(Value::as_str).unwrap_or("");
-    let stderr = data.get("stderr").and_then(Value::as_str).unwrap_or("");
-
-    let total = stdout
-        .lines()
-        .chain(stderr.lines())
-        .filter(|l| !l.trim().is_empty())
-        .count();
-
-    // Just a one-line summary — the command is already the call row above, and the
-    // model has the full output; the UI doesn't echo it.
-    let noun = if total == 1 { "line" } else { "lines" };
-    let summary = match (success, total) {
-        (true, 0) => "ran · no output".to_string(),
-        (true, n) => format!("ran · {n} {noun}"),
-        (false, 0) => format!("exited {exit} · no output"),
-        (false, n) => format!("exited {exit} · {n} {noun}"),
-    };
-    let summary_style = if success {
-        subtle()
-    } else {
-        Style::default().fg(danger())
-    };
-    vec![(summary, summary_style)]
-}
-
-/// Expanded tool result body (Ctrl-O): show stdout/content samples, not just counts.
-pub(super) fn tool_result_lines_expanded(
-    tool_name: &str,
-    result: &Value,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let status = result.get("status").and_then(Value::as_str).unwrap_or("");
-    let data = result.get("data").unwrap_or(result);
-    const MAX: usize = 24;
-
-    if result
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return tool_result_lines(tool_name, result, width);
-    }
-    if status == "error" {
-        return tool_result_lines(tool_name, result, width);
-    }
-
-    let str_field = |key: &str| data.get(key).and_then(Value::as_str).unwrap_or("");
-    let mut items: Vec<(String, Style)> = Vec::new();
-    let body = subtle();
-    let more = Style::default().fg(faint());
-
-    match tool_name {
-        "bash" => {
-            items.extend(bash_result_items_expanded(data, MAX));
-        }
-        "read_file" => {
-            let content = str_field("content");
-            let total = content.lines().count();
-            items.push((format!("{total} lines"), body));
-            for line in content.lines().take(MAX) {
-                items.push((line.to_string(), body));
-            }
-            if total > MAX {
-                items.push((format!("… +{} more lines", total - MAX), more));
-            }
-        }
-        "search_content" => {
-            let count = data.get("count").and_then(Value::as_u64).unwrap_or(0);
-            items.push((format!("{count} matches"), body));
-            if let Some(arr) = data.get("matches").and_then(Value::as_array) {
-                for m in arr.iter().take(MAX) {
-                    let line = m
-                        .get("line")
-                        .or_else(|| m.get("text"))
-                        .or_else(|| m.get("content"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let path = m.get("path").and_then(Value::as_str).unwrap_or("");
-                    let ln = m.get("line_number").or_else(|| m.get("line_no"));
-                    let head = match (path.is_empty(), ln.and_then(Value::as_u64)) {
-                        (false, Some(n)) => format!("{path}:{n}: {line}"),
-                        (false, None) => format!("{path}: {line}"),
-                        _ => line.to_string(),
-                    };
-                    if !head.is_empty() {
-                        items.push((head, body));
-                    }
-                }
-                if arr.len() > MAX {
-                    items.push((format!("… +{} more", arr.len() - MAX), more));
-                }
-            }
-        }
-        "list_files" => {
-            return tool_result_lines(tool_name, result, width);
-        }
-        "web_read" => {
-            let text = str_field("text");
-            let total = text.lines().count();
-            items.push((format!("{total} lines"), body));
-            for line in text.lines().take(MAX) {
-                items.push((line.to_string(), body));
-            }
-            if total > MAX {
-                items.push((format!("… +{} more lines", total - MAX), more));
-            }
-        }
-        "memory_read" => {
-            let content = data
-                .get("content")
-                .or_else(|| data.get("entry"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let total = content.lines().count();
-            for line in content.lines().take(MAX) {
-                items.push((line.to_string(), body));
-            }
-            if total > MAX {
-                items.push((format!("… +{} more lines", total - MAX), more));
-            }
-            if content.is_empty() {
-                items.push(("saved".to_string(), body));
-            }
-        }
-        "memory_write" | "memory_rule" | "memory_pattern" | "memory_index" | "memory_delete" => {
-            items.push(("saved".to_string(), body));
-            if let Some(id) = data.get("id").and_then(Value::as_str) {
-                items.push((format!("id  {id}"), body));
-            }
-        }
-        _ => return tool_result_lines(tool_name, result, width),
-    }
-
-    let items: Vec<(String, Style)> = items.into_iter().filter(|(s, _)| !s.is_empty()).collect();
-    if items.is_empty() {
-        return tool_result_lines(tool_name, result, width);
-    }
-    if tool_name == "bash" || tool_name == "read_file" {
-        result_block_verbatim(items, width)
-    } else {
-        result_block(items, width)
-    }
-}
-
-fn bash_result_items_expanded(data: &Value, max: usize) -> Vec<(String, Style)> {
-    let success = data
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let exit = data
-        .get("exit_code")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "?".to_string());
-    let stdout = data.get("stdout").and_then(Value::as_str).unwrap_or("");
-    let stderr = data.get("stderr").and_then(Value::as_str).unwrap_or("");
-    let body = if success {
-        subtle()
-    } else {
-        Style::default().fg(danger())
-    };
-    let more = Style::default().fg(faint());
-    let mut items = Vec::new();
-    items.push((
-        if success {
-            format!("exit {exit}")
-        } else {
-            format!("exited {exit}")
-        },
-        body,
-    ));
-    let mut shown = 0usize;
-    for line in stdout.lines().chain(stderr.lines()) {
-        if shown >= max {
-            break;
-        }
-        items.push((line.to_string(), body));
-        shown += 1;
-    }
-    let total = stdout.lines().count() + stderr.lines().count();
-    if total > max {
-        items.push((format!("… +{} more lines", total - max), more));
-    }
-    if total == 0 {
-        items.push(("no output".to_string(), more));
-    }
-    items
-}
-
-/// Render result/output logical lines under a gutter, wrapped to width.
-pub(super) fn result_block(items: Vec<(String, Style)>, width: usize) -> Vec<Line<'static>> {
-    result_block_inner(items, width, false)
-}
-
-/// Like `result_block` but preserves each line verbatim (indentation and runs of
-/// spaces) instead of word-wrapping — used for code/diff previews where leading
-/// whitespace is meaningful.
-pub(super) fn result_block_verbatim(
-    items: Vec<(String, Style)>,
-    width: usize,
-) -> Vec<Line<'static>> {
-    result_block_inner(items, width, true)
-}
-
-pub(super) fn result_block_inner(
-    items: Vec<(String, Style)>,
-    width: usize,
-    verbatim: bool,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut first = true;
-    for (text, style) in items {
-        let segs = if verbatim {
-            wrap_code_line(&text, width.saturating_sub(AGENT + 2))
-        } else {
-            wrap_one(&text, width.saturating_sub(AGENT + 2))
-        };
-        for seg in segs {
-            // Plain indent — avoid ↳ (reads like an Enter key and breaks alignment
-            // in some fonts). First line gets a light bar; wraps stay padded.
-            let prefix = if first {
-                format!("{}│ ", " ".repeat(AGENT))
-            } else {
-                " ".repeat(AGENT + 2)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(
-                    prefix,
-                    Style::default().fg(faint()).add_modifier(Modifier::DIM),
-                ),
-                Span::styled(seg, style.add_modifier(Modifier::DIM)),
-            ]));
-            first = false;
-        }
-    }
-    lines
-}

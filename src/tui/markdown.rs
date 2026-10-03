@@ -385,20 +385,26 @@ pub(super) fn wrap_runs(runs: Vec<(String, Style)>, width: usize) -> Vec<Line<'s
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut cur_w = 0usize;
 
+    let mut spaced = false;
     for (text, style) in runs {
-        for word in text.split(' ') {
+        for (idx, word) in text.split(' ').enumerate() {
+            if idx > 0 {
+                spaced = true;
+            }
             if word.is_empty() {
                 continue;
             }
             let wlen = word.chars().count();
-            if cur_w > 0 && cur_w + 1 + wlen > width {
+            let gap = usize::from(cur_w > 0 && spaced);
+            if cur_w > 0 && cur_w + gap + wlen > width {
                 lines.push(Line::from(std::mem::take(&mut cur)));
                 cur_w = 0;
             }
-            if cur_w > 0 {
+            if cur_w > 0 && spaced {
                 cur.push(Span::raw(" "));
                 cur_w += 1;
             }
+            spaced = false;
             if wlen > width {
                 if cur_w > 0 {
                     lines.push(Line::from(std::mem::take(&mut cur)));

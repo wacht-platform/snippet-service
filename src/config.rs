@@ -3,21 +3,75 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Per-workspace state path: `~/.snippet/workspaces/{name}-{hash}/state.json`.
-/// Single source of truth, used by the per-launch config and the serve daemon.
-pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    workspace.hash(&mut hasher);
-    let hash = hasher.finish();
+/// Stable key for a workspace folder, derived from its full path.
+///
+/// SHA-256 rather than `DefaultHasher`: the std hasher's algorithm is explicitly
+/// unspecified and may change between Rust releases, which would silently
+/// re-key every workspace at once and strand all history on a toolchain bump.
+///
+/// Keyed on the absolute path, so a MOVE changes the key (a moved folder is a
+/// new project from the store's point of view). Renames and moves are accepted
+/// as breaking; the value of a stable algorithm is that it breaks ONCE and
+/// predictably, never spontaneously.
+pub fn workspace_key(workspace: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    format!("{digest:x}")[..16].to_string()
+}
+
+/// The workspace's state directory name: `<folder-name>-<stable-key>`.
+pub fn workspace_dir_name(workspace: &Path) -> String {
     let name = workspace
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(format!(".snippet/workspaces/{name}-{hash:x}/state.json"))
+    format!("{name}-{}", workspace_key(workspace))
+}
+
+/// The default session's path for a workspace:
+/// `~/.snippet/workspaces/{name}-{key}`.
+///
+/// The DIRECTORY, not a file in it. A session id is this path.
+/// Nothing is written here any more; it is a key.
+pub fn state_path_for_workspace(workspace: &Path) -> PathBuf {
+    snippet_home()
+        .join("workspaces")
+        .join(workspace_dir_name(workspace))
+}
+
+/// A workspace's state path for READING: an existing directory wins over a
+/// freshly computed one.
+///
+/// The key is derived from the absolute path, so a directory recorded under an
+/// older key still holds this workspace's history. Resolving that first keeps
+/// the history reachable instead of silently starting a blank session; only when
+/// nothing matches is the new path chosen (and created on first write).
+pub fn resolve_state_path_for_workspace(workspace: &Path) -> PathBuf {
+    let fresh = state_path_for_workspace(workspace);
+    if fresh.exists() {
+        return fresh;
+    }
+    find_existing_workspace_state(workspace).unwrap_or(fresh)
+}
+
+/// Find the directory holding a workspace's session when the freshly computed
+/// name does not exist.
+///
+/// That happens when the workspace key changed: the directory was created under
+/// an older algorithm, so deriving the name again misses it. The store records
+/// the folder directly, which makes it the authority here.
+///
+/// This used to start with a disk scan reading a `state.meta.json` sidecar's
+/// `folder` field. That scan could only ever report what a store row already
+/// said — measured against the live workspaces, it returned the same directory
+/// for every one — and it read a file nothing writes any more. The store lookup
+/// below is the whole job.
+fn find_existing_workspace_state(workspace: &Path) -> Option<PathBuf> {
+    let id = crate::session::store_default_session_id(workspace)?;
+    Some(workspaces_root().join(id))
 }
 
 /// Root holding every workspace's session state.
@@ -35,6 +89,15 @@ pub fn snippet_home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".snippet")
+}
+
+/// The default config file: `~/.snippet/config.toml`.
+///
+/// Derived from [`snippet_home`] rather than re-reading `HOME` at each call site,
+/// so a tool that needs the profile list reads the same file the daemon does —
+/// including under a test's `HOME`.
+pub fn default_config_path() -> PathBuf {
+    snippet_home().join("config.toml")
 }
 
 /// Restrict a file to owner-only (0600) on Unix; no-op elsewhere.
@@ -101,20 +164,14 @@ pub struct SnippetConfig {
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    /// Per-workspace memory: the agent accumulates durable facts/playbooks per
-    /// folder under `<ws>/.snippet/memory/`, loaded into context each session and
-    /// refreshed by a reflection pass during compaction. These are scalars, so
+    /// Durable memory (rules, learnings, notes) under
+    /// `~/.snippet/projects/<repo>-<id>/memory/` and `~/.snippet/memory/`, loaded into context each session and curated by a
+    /// reflection pass after requests that did real work. These are scalars, so
     /// they're declared before the `setups`/`model` tables (TOML ordering rule).
     #[serde(default = "default_memory_enabled")]
     pub memory_enabled: bool,
-    #[serde(default = "default_memory_index_budget_chars")]
-    pub memory_index_budget_chars: usize,
-    #[serde(default = "default_memory_entry_budget_chars")]
-    pub memory_entry_budget_chars: usize,
-    #[serde(default = "default_memory_max_entries")]
-    pub memory_max_entries: usize,
-    #[serde(default = "default_memory_reflect_on_compaction")]
-    pub memory_reflect_on_compaction: bool,
+    #[serde(default = "default_memory_reflect")]
+    pub memory_reflect: bool,
     /// Saved provider profiles, keyed by name. Multiple can be configured; one is
     /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
     /// stays valid (tables must follow top-level scalars).
@@ -124,13 +181,13 @@ pub struct SnippetConfig {
         alias = "setups",
         skip_serializing_if = "Option::is_none"
     )]
-    pub setups: Option<BTreeMap<String, ModelConfig>>,
+    pub setups: Option<BTreeMap<String, InferenceProfileConfig>>,
     #[serde(default)]
-    pub model: ModelConfig,
+    pub model: InferenceProfileConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelConfig {
+pub struct InferenceProfileConfig {
     #[serde(default = "default_provider")]
     pub provider: String,
     pub api_key: String,
@@ -150,7 +207,7 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
     /// Whether the model accepts image inputs. OFF by default (safe): when off,
-    /// images read by `read_image` are passed as a text placeholder instead of
+    /// images from `view_image` are passed as a text placeholder instead of
     /// inlined bytes, so text-only models don't 400. Set true for multimodal models.
     #[serde(default)]
     pub supports_images: bool,
@@ -192,15 +249,12 @@ impl Default for SnippetConfig {
             active_setup: None,
             delegate_setup: None,
             setups: None,
-            model: ModelConfig::default(),
+            model: InferenceProfileConfig::default(),
             exa_api_key: None,
             assemblyai_api_key: None,
             theme: None,
             memory_enabled: default_memory_enabled(),
-            memory_index_budget_chars: default_memory_index_budget_chars(),
-            memory_entry_budget_chars: default_memory_entry_budget_chars(),
-            memory_max_entries: default_memory_max_entries(),
-            memory_reflect_on_compaction: default_memory_reflect_on_compaction(),
+            memory_reflect: default_memory_reflect(),
         }
     }
 }
@@ -282,7 +336,7 @@ impl SnippetConfig {
         } else if self.workspace.as_os_str().is_empty() {
             self.workspace = PathBuf::from(".");
         }
-        self.state_path = state_path_for_workspace(&self.workspace);
+        self.state_path = resolve_state_path_for_workspace(&self.workspace);
     }
 
     /// A copy of this config pinned to a different workspace folder — keeps the
@@ -290,7 +344,10 @@ impl SnippetConfig {
     /// daemon uses this to open a session in any folder the user picks.
     pub fn for_workspace(&self, workspace: PathBuf) -> SnippetConfig {
         let mut c = self.clone();
-        c.state_path = state_path_for_workspace(&workspace);
+        // Resolve, not compute: a folder whose state directory was keyed by an
+        // older algorithm still holds this workspace's history, and opening a
+        // blank session beside it would look like data loss.
+        c.state_path = resolve_state_path_for_workspace(&workspace);
         c.workspace = workspace;
         c
     }
@@ -319,7 +376,7 @@ impl SnippetConfig {
         // real deviation (a key, a different provider/model/base_url — including
         // chatgpt's OAuth) is a user-configured model worth migrating.
         let m = &self.model;
-        let placeholder = ModelConfig::default();
+        let placeholder = InferenceProfileConfig::default();
         let is_placeholder = m.api_key.trim().is_empty()
             && m.provider == placeholder.provider
             && m.model == placeholder.model
@@ -360,7 +417,7 @@ impl SnippetConfig {
     }
 
     /// Insert or replace a profile; mirror it into `model` when it's the active one.
-    pub fn upsert_profile(&mut self, name: &str, cfg: ModelConfig) {
+    pub fn upsert_profile(&mut self, name: &str, cfg: InferenceProfileConfig) {
         let map = self.setups.get_or_insert_with(BTreeMap::new);
         map.insert(name.to_string(), cfg.clone());
         if self.active_setup.as_deref() == Some(name) || self.active_setup.is_none() {
@@ -396,10 +453,10 @@ impl SnippetConfig {
         }
     }
 
-    /// The model config for delegated lanes. Uses the `delegate_setup` profile
-    /// when it names a known one; otherwise falls back to the active model, so
+    /// The inference profile for delegated lanes. Uses the `delegate_setup` profile
+    /// when it names a known one; otherwise falls back to the active profile, so
     /// delegation keeps working unchanged when no separate profile is chosen.
-    pub fn delegate_model_config(&self) -> ModelConfig {
+    pub fn delegate_profile(&self) -> InferenceProfileConfig {
         if let Some(name) = self.delegate_setup.as_deref() {
             if let Some(cfg) = self.setups.as_ref().and_then(|m| m.get(name)) {
                 return cfg.clone();
@@ -409,7 +466,7 @@ impl SnippetConfig {
     }
 }
 
-impl ModelConfig {
+impl InferenceProfileConfig {
     pub fn build_model_for_session(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
         self.build_model_with_session(session_id)
     }
@@ -419,7 +476,25 @@ impl ModelConfig {
     }
 
     fn build_model_with_session(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
+        let model = if self.model.trim().is_empty() {
+            "default".to_string()
+        } else {
+            self.model.clone()
+        };
+        let mut resolved = self.clone();
+        resolved.reasoning_effort =
+            crate::reasoning::effective(&self.provider, &self.model, self.reasoning_effort.as_deref());
+        Box::new(crate::usage_ledger::MeteredModel::new(
+            resolved.build_adapter(session_id.clone()),
+            self.provider.clone(),
+            model,
+            session_id,
+        ))
+    }
+
+    fn build_adapter(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
         match self.provider.as_str() {
+            "claude-code" | "antigravity" => Box::new(crate::harness::CliAgentModel::new(self.clone())),
             "openai" => {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
                 if config.base_url == "https://api.openai.com/v1"
@@ -532,8 +607,8 @@ impl ModelConfig {
     }
 }
 
-impl From<ModelConfig> for OpenAiCompatibleConfig {
-    fn from(value: ModelConfig) -> Self {
+impl From<InferenceProfileConfig> for OpenAiCompatibleConfig {
+    fn from(value: InferenceProfileConfig) -> Self {
         Self {
             api_key: value.api_key,
             base_url: value.base_url,
@@ -556,8 +631,12 @@ fn default_workspace() -> PathBuf {
     ".".into()
 }
 
+/// The placeholder for `state_path` before a workspace is resolved.
+///
+/// Derived rather than hardcoded: the field is `#[serde(skip)]` and every real
+/// path goes through `resolve_state_path_for_workspace`.
 fn default_state_path() -> PathBuf {
-    ".snippet/state.json".into()
+    state_path_for_workspace(&default_workspace())
 }
 
 /// The providers `load` accepts for the active model. Config writers (the serve
@@ -574,10 +653,33 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
     "opencode-go",
     "chatgpt",
     "xai",
+    "claude-code",
+    "antigravity",
 ];
 
 pub fn provider_supported(provider: &str) -> bool {
     SUPPORTED_PROVIDERS.contains(&provider)
+}
+
+/// Whether a provider exposes its SUBSCRIPTION rate limits over the API.
+///
+/// Only the ChatGPT/Codex subscription does, via response headers
+/// (`x-codex-primary/secondary-*`) that carry a window, a used percentage and a
+/// reset time — exactly the shape the Usage screen renders.
+///
+/// xAI is deliberately NOT counted, even though it does send rate-limit headers.
+/// Probed directly: it returns only flat API caps
+/// (`x-ratelimit-limit-tokens: 53000000`, `...-limit-requests: 8300`, and their
+/// `remaining-` twins) with NO window, reset, period or percentage. Those are
+/// per-API-tier ceilings, not the weekly SuperGrok quota — they report ~0% used
+/// while the subscription itself reads 43%. Rendering them would invent a
+/// figure unrelated to what the user is actually consuming.
+///
+/// opencode returns no such headers at all. Everything else hardcodes an empty
+/// snapshot. So this exists to let the Usage screen distinguish "cannot report"
+/// from "hasn't reported yet" instead of one generic empty state for both.
+pub fn provider_reports_rate_limits(provider: &str) -> bool {
+    provider == "chatgpt"
 }
 
 fn default_provider() -> String {
@@ -616,23 +718,11 @@ fn default_memory_enabled() -> bool {
     true
 }
 
-fn default_memory_index_budget_chars() -> usize {
-    5_000
-}
-
-fn default_memory_entry_budget_chars() -> usize {
-    12_000
-}
-
-fn default_memory_max_entries() -> usize {
-    128
-}
-
-fn default_memory_reflect_on_compaction() -> bool {
+fn default_memory_reflect() -> bool {
     true
 }
 
-impl Default for ModelConfig {
+impl Default for InferenceProfileConfig {
     fn default() -> Self {
         Self {
             provider: default_provider(),

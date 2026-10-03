@@ -8,10 +8,11 @@
 //! Progressive disclosure: skills are NOT preloaded into context — the agent
 //! finds them on demand with `search_skills` (level 1: name + description),
 //! loads a body with `skill(name)` (level 2), and reads/runs bundled files with
-//! the normal read_file / bash tools (level 3).
+//! bash (level 3).
 
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
@@ -44,6 +45,43 @@ pub fn skills_roots() -> Vec<PathBuf> {
 
 /// Discover every skill across all roots, deduped by name (first root wins).
 pub fn discover() -> Vec<Skill> {
+    type Stamp = Vec<(PathBuf, Option<std::time::SystemTime>, u64)>;
+    static CACHE: std::sync::Mutex<Option<(Stamp, Vec<Skill>)>> = std::sync::Mutex::new(None);
+    let stamp = skills_stamp();
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached, skills)) = cache.as_ref() {
+        if *cached == stamp {
+            return skills.clone();
+        }
+    }
+    let skills = discover_uncached();
+    *cache = Some((stamp, skills.clone()));
+    skills
+}
+
+fn skills_stamp() -> Vec<(PathBuf, Option<std::time::SystemTime>, u64)> {
+    let mut stamp = Vec::new();
+    for root in skills_roots() {
+        let Ok(meta) = std::fs::metadata(&root) else {
+            stamp.push((root, None, 0));
+            continue;
+        };
+        stamp.push((root.clone(), meta.modified().ok(), 0));
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path().join("SKILL.md");
+            if let Ok(m) = std::fs::metadata(&path) {
+                stamp.push((path, m.modified().ok(), m.len()));
+            }
+        }
+    }
+    stamp.sort();
+    stamp
+}
+
+fn discover_uncached() -> Vec<Skill> {
     let mut out: Vec<Skill> = Vec::new();
     for root in skills_roots() {
         for sk in discover_in(&root) {
@@ -223,7 +261,7 @@ fn bundled_files(dir: &Path) -> Vec<String> {
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             } else if p.file_name().map(|n| n != "SKILL.md").unwrap_or(true) {
-                // Absolute paths, so the agent can read_file / bash them directly.
+                // Absolute paths, so the agent can read or run them from bash directly.
                 files.push(p.display().to_string());
             }
         }

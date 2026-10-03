@@ -1,6 +1,4 @@
-//! Local sidecar client — the TUI talks to a running `snippet serve` daemon
-//! over its **local** HTTP/WS API so the daemon is the sole owner of every
-//! `run_interactive` loop and every `state.json` write.
+//! `run_interactive` loop and every session state write.
 //!
 //! Discovery:
 //!   `~/.snippet/serve.json` → `{ api_url, token, … }`
@@ -253,12 +251,15 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
 
 /// Ensure the daemon has a live session for this workspace folder.
 /// Returns the daemon session id.
+/// POST /sessions — open or create a session, returning its id and the
+/// workspace it runs in (a new worktree's path when `workspace` asked for one).
 pub async fn open_session(
     info: &DaemonInfo,
     folder: &Path,
     resume: bool,
     new_conversation: bool,
-) -> Result<String, String> {
+    workspace: crate::session::WorkspaceMode,
+) -> Result<(String, std::path::PathBuf), String> {
     let url = format!("{}/sessions", info.api_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -271,6 +272,7 @@ pub async fn open_session(
             "folder": folder.display().to_string(),
             "resume": resume,
             "new_conversation": new_conversation,
+            "workspace": workspace,
         }))
         .send()
         .await
@@ -284,10 +286,132 @@ pub async fn open_session(
         .json()
         .await
         .map_err(|e| format!("open session body: {e}"))?;
-    body.get("id")
+    let id = body
+        .get("id")
         .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("open session: missing id in {body}"))
+        .ok_or_else(|| format!("open session: missing id in {body}"))?;
+    let workspace = body
+        .get("folder")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| folder.to_path_buf());
+    Ok((id.to_string(), workspace))
+}
+
+/// One session as the daemon reports it in `GET /sessions`.
+///
+/// Mirrors `session::SessionInfo` — the TUI renders from this instead of walking
+/// the filesystem, so a conversation that lives in the database appears in the
+/// picker exactly like one on disk.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SessionRow {
+    /// Stable id (path relative to the workspaces root). Used to attach.
+    pub id: String,
+    /// The workspace the session runs in.
+    #[serde(default)]
+    pub folder: String,
+    /// For a session in a git worktree: the folder in the main checkout.
+    #[serde(default)]
+    pub origin_folder: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Conversation name: `default` for the workspace root state, else the stem.
+    #[serde(default)]
+    pub conversation: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub last_active: i64,
+}
+
+/// GET /sessions[?folder=] — the daemon's session catalog.
+///
+/// `folder` scopes the list to one folder and the git worktrees made from it,
+/// which is what the TUI's picker shows.
+pub async fn list_sessions(
+    info: &DaemonInfo,
+    folder: Option<&Path>,
+) -> Result<Vec<SessionRow>, String> {
+    let url = format!("{}/sessions", info.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut query: Vec<(&str, String)> = vec![("token", info.token.clone())];
+    if let Some(folder) = folder {
+        query.push(("folder", folder.display().to_string()));
+    }
+    let resp = client
+        .get(&url)
+        .query(&query)
+        .send()
+        .await
+        .map_err(|e| format!("list sessions: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("list sessions {status}: {body}"));
+    }
+    resp.json::<Vec<SessionRow>>()
+        .await
+        .map_err(|e| format!("list sessions body: {e}"))
+}
+
+/// POST /session/delete — remove a conversation from wherever it lives.
+///
+/// Goes through the daemon rather than deleting files, so the store row, its
+/// messages, and its events all go with it.
+pub async fn delete_session(info: &DaemonInfo, session_id: &str) -> Result<(), String> {
+    post_session_op(info, "/session/delete", session_id, serde_json::json!({})).await
+}
+
+/// POST /session/rename — set a conversation's title override.
+pub async fn rename_session(
+    info: &DaemonInfo,
+    session_id: &str,
+    title: &str,
+) -> Result<(), String> {
+    post_session_op(
+        info,
+        "/session/rename",
+        session_id,
+        serde_json::json!({ "title": title }),
+    )
+    .await
+}
+
+async fn post_session_op(
+    info: &DaemonInfo,
+    path: &str,
+    session_id: &str,
+    extra: serde_json::Value,
+) -> Result<(), String> {
+    let url = format!("{}{path}", info.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut body = serde_json::json!({ "session": session_id });
+    if let (Some(dst), Some(src)) = (body.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    let resp = client
+        .post(&url)
+        .query(&[("token", info.token.as_str())])
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("{path}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("{path} {status}: {text}"));
+    }
+    Ok(())
 }
 
 /// POST /session/model — switch the model profile for one live conversation.
@@ -434,7 +558,9 @@ fn apply_wire_frame(
                         acc.checkpoints = partial.checkpoints;
                     }
                     acc.goal = partial.goal;
-                    acc.lanes = partial.lanes;
+                    if v.get("lanes").is_some() {
+                        acc.lanes = partial.lanes;
+                    }
                     acc.watches = partial.watches;
                     acc.compacting = partial.compacting;
                     acc.turn_started_at = partial.turn_started_at;
@@ -547,4 +673,54 @@ mod tests {
             "proj/conversations/abc.json"
         );
     }
+}
+
+/// A JSON request to the daemon's API, for the TUI's panels (agents, tasks,
+/// jobs, usage, vault). `method` is GET, POST, PUT or DELETE; the token rides
+/// in the query like every other call here.
+pub async fn api_json(
+    info: &DaemonInfo,
+    method: reqwest::Method,
+    path: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}{path}", info.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut q: Vec<(&str, String)> = vec![("token", info.token.clone())];
+    q.extend(query.iter().cloned());
+    let mut req = client.request(method, &url).query(&q);
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.map_err(|e| format!("{path}: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("{path} {status}: {text}"));
+    }
+    if text.trim().is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|e| format!("{path} body: {e}"))
+}
+
+/// POST /mission-control/open — the dedicated Mission Control session's id,
+/// created on first use.
+pub async fn open_mission_control(info: &DaemonInfo) -> Result<String, String> {
+    let v = api_json(
+        info,
+        reqwest::Method::POST,
+        "/mission-control/open",
+        &[],
+        Some(serde_json::json!({})),
+    )
+    .await?;
+    v.get("id")
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "mission control: no session id".to_string())
 }

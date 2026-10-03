@@ -11,7 +11,7 @@ use crate::llm::NativeToolDefinition;
 
 /// Names the harness loop must intercept instead of dispatching to the registry.
 pub const META_TOOL_NAMES: [&str; 8] = [
-    "note",
+    "update_plan",
     "ask_user",
     "delegate_task",
     "cancel_delegated_task",
@@ -38,7 +38,7 @@ pub fn conversation_meta_definitions_for(
     allow_lane_control: bool,
 ) -> Vec<NativeToolDefinition> {
     let mut tools = vec![
-        note_tool(),
+        update_plan_tool(),
         ask_user_tool(),
         monitor_tool(),
         present_file_tool(),
@@ -115,7 +115,7 @@ fn monitor_tool() -> NativeToolDefinition {
             to wait on output you don't control (a build log, test output, a long process's log, \
             a file another program writes). Register the watch, then END YOUR TURN: going idle is \
             how you wait; each append arrives later as a [file_watch] message carrying the new \
-            text. Do NOT poll the file with read_file in a loop. \
+            text. Do NOT poll the file in a loop. \
             ALWAYS set a `filter` regex — a bare watch wakes you on EVERY line the process writes \
             and each wake costs a full model turn, so watching a chatty build/test log without a \
             filter burns tokens fast. Filter for only the lines you actually need to act on: the \
@@ -207,27 +207,39 @@ pub fn terminate_loop_tool() -> NativeToolDefinition {
     }
 }
 
-fn note_tool() -> NativeToolDefinition {
+fn update_plan_tool() -> NativeToolDefinition {
     NativeToolDefinition {
-        name: "note".to_string(),
-        description: "Write a private note to yourself, recorded in history so you can read it \
-            back on a later turn. Use it ONLY to plan a genuinely multi-step sequence, record an \
-            observation from a tool result, or anchor a decision during real work. Do NOT use it on \
-            a conversational turn — an acknowledgement, a preference the user stated, a simple \
-            question, or small talk have nothing to plan, so a note there is noise and (since it's \
-            a tool call) forces a needless extra reply. On those, just reply in plain text and stop. \
-            Notes do NOT execute work, are NOT shown to the user, and do NOT end the turn. After a \
-            note, act on the next turn — do not take notes repeatedly without making progress."
+        name: "update_plan".to_string(),
+        description: "Keep a short, visible plan for work with several distinct steps; the user \
+            sees it as a checklist. Send the whole list every time: short concrete steps, each \
+            `pending`, `in_progress` or `done`, with exactly one `in_progress` while you work. Mark \
+            a step done as soon as it is, and reshape the list when you learn something that \
+            changes the work (say why in `explanation`). Skip it for small tasks. Updating the \
+            plan is not progress by itself: after updating it, do the work."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "entry": {
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 12,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": { "type": "string", "description": "A short, concrete step." },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "done"] }
+                        },
+                        "required": ["step", "status"],
+                        "additionalProperties": false
+                    }
+                },
+                "explanation": {
                     "type": "string",
-                    "description": "The note content. Specific and grounded in what you just observed."
+                    "description": "Optional: why the plan changed."
                 }
             },
-            "required": ["entry"],
+            "required": ["steps"],
             "additionalProperties": false,
         }),
     }
@@ -242,9 +254,13 @@ fn ask_user_tool() -> NativeToolDefinition {
             Ends the turn and pauses until answered; one pending question set at a time. Each \
             question needs `text` and `answer_kind.kind` chosen by the SHAPE of the answer: \
             free_text (open-ended), single_choice (one of a known set; provide `choices`), \
-            yes_no (literal yes/no), or confirm (irreversible action gate). `id` is OPTIONAL — \
-            only useful to distinguish MULTIPLE questions asked together; omit it for a single \
-            question."
+            multi_choice (any number of a known set; provide `choices`), yes_no (literal yes/no), \
+            or confirm (irreversible action gate). Make choices easy to decide: give each a short \
+            `label` and a one-line `description` of what it means or costs, and mark the one you \
+            would pick with `recommended: true`. The user can always write their own answer \
+            instead. When asking SEVERAL questions together, give each a `header` of one or two \
+            words (shown as its tab). `id` is OPTIONAL — only useful to distinguish multiple \
+            questions; omit it for a single question."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -258,23 +274,25 @@ fn ask_user_tool() -> NativeToolDefinition {
                         "properties": {
                             "id": {"type": "string", "description": "OPTIONAL — defaults to the question's index. Only needed to distinguish multiple questions asked together; if you provide ids they must be unique."},
                             "text": {"type": "string", "description": "Question text shown to the user."},
+                            "header": {"type": "string", "description": "OPTIONAL — one or two words naming the question (at most 16 characters), shown as its tab when several questions are asked together."},
                             "answer_kind": {
                                 "type": "object",
                                 "properties": {
                                     "kind": {
                                         "type": "string",
-                                        "enum": ["free_text", "single_choice", "yes_no", "confirm"],
+                                        "enum": ["free_text", "single_choice", "multi_choice", "yes_no", "confirm"],
                                         "description": "Discriminator selecting the answer shape."
                                     },
                                     "choices": {
                                         "type": "array",
-                                        "description": "single_choice: REQUIRED options, ordered by likelihood. Each has a `value` and a `label`.",
+                                        "description": "single_choice / multi_choice: REQUIRED options, ordered by likelihood. Each has a `value` and a short `label`.",
                                         "items": {
                                             "type": "object",
                                             "properties": {
                                                 "value": {"type": "string"},
-                                                "label": {"type": "string"},
-                                                "description": {"type": "string"}
+                                                "label": {"type": "string", "description": "A few words."},
+                                                "description": {"type": "string", "description": "One line on what choosing this means or costs."},
+                                                "recommended": {"type": "boolean", "description": "The option you would pick; shown first and preselected. At most one for single_choice."}
                                             },
                                             "required": ["value", "label"]
                                         }
@@ -341,6 +359,14 @@ fn delegate_task_tool() -> NativeToolDefinition {
                     "type": "string",
                     "enum": ["full", "read_only"],
                     "description": "read_only removes the lane's file-editing tools (investigation/review lanes). Default full."
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Optional specialized agent identity or role name for this lane (e.g. 'reviewer', 'researcher', 'security')."
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Optional inference profile name from setups in config. Defaults to your active model to preserve prompt cache affinity and avoid cold-start latency."
                 }
             },
             "required": ["description"],
@@ -360,6 +386,10 @@ pub struct DelegateBrief {
     pub lane_id: Option<String>,
     /// Strip the lane's file-mutation tools (investigation lanes).
     pub read_only: bool,
+    /// Specialized agent identity or role name.
+    pub agent: Option<String>,
+    /// Optional inference profile name.
+    pub profile: Option<String>,
 }
 
 /// Validate a `delegate_task` payload: the brief must state both a scope
@@ -369,6 +399,18 @@ pub struct DelegateBrief {
 pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> {
     let lane_id = arguments
         .get("lane_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let agent = arguments
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let profile = arguments
+        .get("profile")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -426,6 +468,8 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         description,
         lane_id,
         read_only,
+        agent,
+        profile,
     })
 }
 
@@ -469,7 +513,14 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
             .and_then(|k| k.get("kind"))
             .and_then(Value::as_str)
             .ok_or_else(|| format!("ask_user: question `{id}` needs `answer_kind.kind`."))?;
-        if kind == "single_choice" {
+        const KINDS: [&str; 5] = ["free_text", "single_choice", "multi_choice", "yes_no", "confirm"];
+        if !KINDS.contains(&kind) {
+            return Err(format!(
+                "ask_user: question `{id}` has unknown answer kind `{kind}`; use one of {}.",
+                KINDS.join(", ")
+            ));
+        }
+        if kind == "single_choice" || kind == "multi_choice" {
             let has_choices = question
                 .get("answer_kind")
                 .and_then(|k| k.get("choices"))
@@ -478,7 +529,7 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
                 .unwrap_or(false);
             if !has_choices {
                 return Err(format!(
-                    "ask_user: question `{id}` is single_choice and requires non-empty `choices`."
+                    "ask_user: question `{id}` is {kind} and requires non-empty `choices`."
                 ));
             }
         }
@@ -486,6 +537,15 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
         let mut q = question.clone();
         if let Some(obj) = q.as_object_mut() {
             obj.insert("id".to_string(), Value::String(id));
+            // A header is a tab label: keep it short whatever the model sent.
+            if let Some(h) = obj.get("header").and_then(Value::as_str) {
+                let h: String = h.trim().chars().take(16).collect();
+                if h.is_empty() {
+                    obj.remove("header");
+                } else {
+                    obj.insert("header".to_string(), Value::String(h));
+                }
+            }
         }
         out.push(q);
     }
@@ -494,4 +554,77 @@ pub fn parse_ask_user(arguments: &Value) -> Result<Value, String> {
         "questions": out,
         "context": arguments.get("context").cloned().unwrap_or(Value::Null),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ask_user_accepts_multi_choice_and_trims_headers() {
+        let parsed = parse_ask_user(&json!({
+            "questions": [
+                {"text": "Which targets?", "header": "   Build targets for release   ",
+                 "answer_kind": {"kind": "multi_choice", "choices": [
+                     {"value": "android", "label": "Android", "recommended": true},
+                     {"value": "macos", "label": "macOS"}]}},
+                {"text": "Ship now?", "header": "  ", "answer_kind": {"kind": "yes_no"}}
+            ]
+        }))
+        .expect("valid");
+        let qs = parsed["questions"].as_array().unwrap();
+        assert_eq!(qs[0]["header"], "Build targets fo");
+        assert!(qs[1].get("header").is_none());
+    }
+
+    #[test]
+    fn ask_user_rejects_multi_choice_without_choices_and_unknown_kinds() {
+        let err = parse_ask_user(&json!({"questions": [
+            {"text": "Pick", "answer_kind": {"kind": "multi_choice"}}]}))
+        .unwrap_err();
+        assert!(err.contains("multi_choice"));
+        let err = parse_ask_user(&json!({"questions": [
+            {"text": "Pick", "answer_kind": {"kind": "slider"}}]}))
+        .unwrap_err();
+        assert!(err.contains("unknown answer kind"));
+    }
+
+    #[test]
+    fn test_parse_delegate_brief_with_agent() {
+        let payload = json!({
+            "title": "security audit",
+            "description": "Inspect all authentication endpoints and verify timing-safe token comparison is applied.",
+            "access": "read_only",
+            "agent": "security"
+        });
+        let brief = parse_delegate_brief(&payload).expect("should parse");
+        assert_eq!(brief.title, "security audit");
+        assert_eq!(brief.read_only, true);
+        assert_eq!(brief.agent.as_deref(), Some("security"));
+        assert!(brief.lane_id.is_none());
+    }
+
+    #[test]
+    fn test_parse_delegate_brief_without_agent() {
+        let payload = json!({
+            "title": "refactor handlers",
+            "description": "Refactor route handlers to use the shared error type and return structured responses."
+        });
+        let brief = parse_delegate_brief(&payload).expect("should parse");
+        assert_eq!(brief.title, "refactor handlers");
+        assert_eq!(brief.read_only, false);
+        assert_eq!(brief.agent, None);
+        assert_eq!(brief.profile, None);
+    }
+
+    #[test]
+    fn test_parse_delegate_brief_with_profile() {
+        let payload = json!({
+            "title": "explore dependencies",
+            "description": "Examine Cargo.toml and lockfile to map dependency tree versions and vulnerabilities.",
+            "profile": "claude-haiku"
+        });
+        let brief = parse_delegate_brief(&payload).expect("should parse");
+        assert_eq!(brief.profile.as_deref(), Some("claude-haiku"));
+    }
 }

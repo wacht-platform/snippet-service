@@ -326,6 +326,51 @@ fn normalize_effort(effort: Option<&str>) -> Option<String> {
     })
 }
 
+fn strict_schema_compatible(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    let Some(kind) = object.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "type"
+                | "description"
+                | "enum"
+                | "properties"
+                | "required"
+                | "additionalProperties"
+                | "items"
+        )
+    }) {
+        return false;
+    }
+    match kind {
+        "object" => {
+            let Some(properties) = object.get("properties").and_then(Value::as_object) else {
+                return false;
+            };
+            let Some(required) = object.get("required").and_then(Value::as_array) else {
+                return false;
+            };
+            if object.get("additionalProperties") != Some(&json!(false))
+                || required.len() != properties.len()
+                || properties
+                    .keys()
+                    .any(|name| !required.iter().any(|field| field.as_str() == Some(name)))
+            {
+                return false;
+            }
+            properties.values().all(strict_schema_compatible)
+        }
+        "array" => object.get("items").is_some_and(strict_schema_compatible),
+        "string" | "integer" | "number" | "boolean" => true,
+        _ => false,
+    }
+}
+
 fn build_responses_request(
     config: &ChatGptConfig,
     messages: &[HarnessMessage],
@@ -345,10 +390,9 @@ fn build_responses_request(
                 instructions = content.clone();
             }
             HarnessMessage::System { content } => {
-                input.push(message_item(
-                    "user",
-                    &format!("[steering]\n{content}\n[/steering]"),
-                ));
+                crate::llm::attach_reminder_to_items(&mut input, content, |text| {
+                    message_item("user", text)
+                });
             }
             HarnessMessage::User { content } => {
                 input.push(message_item("user", content));
@@ -382,7 +426,7 @@ fn build_responses_request(
             } => {
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
                 let output =
-                    serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                    crate::llm::render_tool_result(&cleaned);
                 if tool_call_id.is_empty() {
                     // Legacy state with no native call id — render as user text.
                     input.push(message_item(
@@ -462,7 +506,7 @@ fn build_responses_request(
                 "type": "function",
                 "name": t.name,
                 "description": t.description,
-                "strict": false,
+                "strict": strict_schema_compatible(&t.input_schema),
                 "parameters": t.input_schema,
             })
         })
@@ -638,4 +682,46 @@ async fn parse_responses_sse(
         rate_limit: None,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::Tool;
+
+    fn test_config() -> ChatGptConfig {
+        ChatGptConfig {
+            model: "test-model".to_string(),
+            reasoning_effort: None,
+            supports_images: false,
+            max_retries: 0,
+            initial_retry_ms: 0,
+            max_retry_ms: 0,
+        }
+    }
+
+    #[test]
+    fn change_files_schema_is_sent_without_strict_mode() {
+        let tools = [crate::builtins::ChangeFilesTool.definition()];
+        let request = build_responses_request(&test_config(), &[], &tools, false);
+        assert_eq!(request["tools"][0]["name"], "change_files");
+        assert_eq!(request["tools"][0]["strict"], false);
+    }
+
+    #[test]
+    fn strict_mode_stays_disabled_for_schemas_with_optional_fields() {
+        let tool = NativeToolDefinition {
+            name: "optional_path".to_string(),
+            description: "test".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": [],
+                "additionalProperties": false
+            }),
+        };
+        let request = build_responses_request(&test_config(), &[], &[tool], false);
+
+        assert_eq!(request["tools"][0]["strict"], false);
+    }
 }

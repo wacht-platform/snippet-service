@@ -546,3 +546,36 @@ pub(super) async fn git_stash(
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
+
+#[derive(Deserialize)]
+pub(super) struct WorktreesQuery {
+    token: Option<String>,
+    folder: String,
+}
+
+/// GET /git/worktrees?folder= — the repository a new session in `folder`
+/// would belong to and its linked worktrees, so a client can offer "new
+/// worktree", "this folder", or an existing worktree. `repo` is null outside a
+/// git repository.
+pub(super) async fn git_worktrees(
+    State(d): State<Shared>,
+    Query(q): Query<WorktreesQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let folder = std::path::PathBuf::from(&q.folder);
+    if !folder.is_dir() {
+        return (StatusCode::BAD_REQUEST, "not a directory").into_response();
+    }
+    let found = tokio::task::spawn_blocking(move || crate::session::repo_worktrees(&folder))
+        .await
+        .ok()
+        .flatten();
+    match found {
+        Some((repo, worktrees)) => {
+            Json(serde_json::json!({ "repo": repo, "worktrees": worktrees })).into_response()
+        }
+        None => Json(serde_json::json!({ "repo": null, "worktrees": [] })).into_response(),
+    }
+}
