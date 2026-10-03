@@ -30,6 +30,7 @@ pub mod mission_control;
 pub mod mission_tools;
 pub mod openai;
 pub mod prompts;
+pub mod reasoning;
 pub mod recurring;
 pub mod replay;
 pub mod sanitize;

@@ -53,6 +53,21 @@ fn catalog_client() -> reqwest::Client {
 /// (possibly empty for providers with no catalog endpoint) or a human-readable
 /// error. The API key never leaves this process.
 pub async fn fetch_models(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogModel>, String> {
+    let mut models = fetch_provider_models(cfg).await?;
+    if matches!(
+        cfg.provider.as_str(),
+        "chatgpt" | "claude-code" | "antigravity" | "gemini" | "openai" | "xai" | "grok"
+    ) {
+        for model in &mut models {
+            let spec = crate::reasoning::spec(&cfg.provider, &model.id);
+            model.reasoning = Some(spec.control != crate::reasoning::Control::None);
+            model.efforts = Some(spec.options.iter().map(|o| o.to_string()).collect());
+        }
+    }
+    Ok(models)
+}
+
+async fn fetch_provider_models(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogModel>, String> {
     match cfg.provider.as_str() {
         "anthropic" | "anthropic-compatible" => fetch_anthropic(cfg).await,
         "openai" | "openai-compatible" => fetch_openai_compatible(cfg).await,

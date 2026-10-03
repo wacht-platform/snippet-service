@@ -1291,20 +1291,29 @@ pub(crate) fn login_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ));
 
     let r_focus = focus == SettingsField::Reasoning;
-    let reasoning = app
-        .form_reasoning_effort
-        .clone()
-        .unwrap_or_else(|| "medium".to_string());
-    let reasoning_hint = match app.form_provider.as_str() {
-        "anthropic" | "anthropic-compatible" => "thinking",
-        "gemini" => "thinking",
-        _ => "reasoning",
-    };
-    lines.push(field_row(
-        reasoning_hint,
-        r_focus,
-        chooser(reasoning, r_focus, ""),
-    ));
+    let spec = app.reasoning_spec();
+    let reasoning_label = spec.label.to_ascii_lowercase();
+    if app.reasoning_adjustable() {
+        let reasoning = app
+            .form_reasoning_effort
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        lines.push(field_row(&reasoning_label, r_focus, chooser(reasoning, r_focus, "")));
+        if r_focus {
+            lines.push(Line::from(Span::styled(format!("      {}", spec.note), Style::default().fg(faint))));
+        }
+    } else {
+        let fixed = if spec.control == crate::reasoning::Control::Model {
+            "set by the model"
+        } else {
+            "not adjustable"
+        };
+        lines.push(field_row(
+            &reasoning_label,
+            false,
+            vec![Span::styled(fixed.to_string(), Style::default().fg(faint))],
+        ));
+    }
 
     let cw_focus = focus == SettingsField::ContextWindow;
     let mut cw_val = vec![Span::styled(

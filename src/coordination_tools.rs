@@ -1106,6 +1106,11 @@ impl Tool for ClaimAndDispatchTask {
         if actor_kind != "agent" {
             return Err(ToolError::msg("claiming a task needs an agent identity; this session has none"));
         }
+        if actor_id == crate::mission_control::SESSION_ID {
+            return Err(ToolError::msg(
+                "Mission Control routes work and never takes a task's lease. To send a blocked or failed task to its session again, use retry_mission_task (pass profile to switch the worker's model).",
+            ));
+        }
         crate::mission_tools::require_working_agent(&db, &actor_id)?;
         let now = now_rfc3339();
         db.add_task_agent_full(task_id, &actor_id, "implementer", None, "", "active", &now)

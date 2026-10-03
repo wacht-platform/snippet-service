@@ -6,21 +6,7 @@ pub const SESSION_ENV: &str = "SNIPPET_MCP_URL";
 pub const MCP_SERVER_NAME: &str = "snippet_snippet";
 const RULE_CHUNK_BYTES: usize = 20_000;
 
-const ALLOWED: &[&str] = &[
-    "view_file",
-    "list_dir",
-    "find_by_name",
-    "grep_search",
-    "read_url_content",
-    "search_web",
-    "list_resources",
-    "read_resource",
-    "list_permissions",
-    "command_status",
-    "finish",
-    "wait",
-    "wait_5_seconds",
-];
+const ALLOWED: &[&str] = &["list_resources", "read_resource", "finish", "wait", "wait_5_seconds"];
 
 pub fn binary() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SNIPPET_AGY_BIN") {
@@ -69,7 +55,21 @@ fn decision(raw: &str, in_snippet: bool) -> Value {
     if ALLOWED.contains(&name) {
         return json!({"decision": "allow"});
     }
+    if name == "view_file" {
+        let own = real_home()
+            .map(|home| home.join(".gemini"))
+            .zip(payload.pointer("/toolCall/args/AbsolutePath").and_then(Value::as_str))
+            .is_some_and(|(root, path)| Path::new(path).starts_with(root));
+        if own {
+            return json!({"decision": "allow"});
+        }
+    }
     let instead = match name {
+        "view_file" | "list_dir" | "find_by_name" | "grep_search" | "command_status" => {
+            "the snippet `bash` tool (cat, sed -n, ls, rg)"
+        }
+        "search_web" => "the snippet `web_search` tool",
+        "read_url_content" => "the snippet `web_read` tool",
         "run_command" | "send_command_input" => "the snippet `bash` tool",
         "write_to_file" | "replace_file_content" | "multi_replace_file_content" | "sed_file" | "notebook_edit" => {
             "the snippet `change_files` tool"

@@ -226,6 +226,22 @@ pub(crate) async fn chatgpt_status(State(d): State<Shared>, Query(a): Query<Auth
 }
 
 #[derive(serde::Deserialize)]
+pub(crate) struct ReasoningQuery {
+    token: Option<String>,
+    provider: String,
+    #[serde(default)]
+    model: String,
+}
+
+// GET /reasoning — the reasoning controls a provider + model really has.
+pub(crate) async fn reasoning_spec(State(d): State<Shared>, Query(q): Query<ReasoningQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    Json(crate::reasoning::spec(&q.provider, &q.model)).into_response()
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct CliAgentQuery {
     token: Option<String>,
     provider: String,
