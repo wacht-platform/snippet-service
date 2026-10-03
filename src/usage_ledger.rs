@@ -205,6 +205,15 @@ fn bucket_floor(since: Option<i64>) -> i64 {
         .unwrap_or(i64::MIN)
 }
 
+pub fn record(session_id: &str, provider: &str, model: &str, usage: &TokenUsage) {
+    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 && usage.total_tokens == 0 {
+        return;
+    }
+    if let Ok(store) = Store::open_cached(crate::store::default_db_path()) {
+        let _ = store.record_usage(session_id, provider, model, usage);
+    }
+}
+
 pub struct MeteredModel {
     inner: Box<dyn AgentModel>,
     provider: String,
@@ -228,12 +237,7 @@ impl MeteredModel {
     }
 
     fn record(&self, usage: &TokenUsage) {
-        if usage.prompt_tokens == 0 && usage.completion_tokens == 0 && usage.total_tokens == 0 {
-            return;
-        }
-        if let Ok(store) = Store::open_cached(crate::store::default_db_path()) {
-            let _ = store.record_usage(&self.session_id, &self.provider, &self.model, usage);
-        }
+        record(&self.session_id, &self.provider, &self.model, usage);
     }
 }
 
@@ -266,5 +270,9 @@ impl AgentModel for MeteredModel {
 
     fn swap_reasoning_effort(&mut self, effort: Option<String>) -> Option<String> {
         self.inner.swap_reasoning_effort(effort)
+    }
+
+    fn cli_agent_profile(&self) -> Option<crate::config::InferenceProfileConfig> {
+        self.inner.cli_agent_profile()
     }
 }

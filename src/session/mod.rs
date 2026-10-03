@@ -528,6 +528,7 @@ fn start_session_with_role(
     let join = tokio::spawn(async move {
         let durable_id = Some(session_id_for_state_path(&sp));
         let mut model = model_config.build_model_for_session(durable_id.clone());
+        let cli_profile = model.cli_agent_profile();
         // Session-start capability snapshot for conditional prompt layers. This
         // is computed once and stays fixed for the session (cache-stable).
         let prompt_ctx = crate::prompts::PromptContext {
@@ -576,6 +577,12 @@ fn start_session_with_role(
             runtime.tools,
             runtime.context,
         );
+        if let Some(profile) = cli_profile {
+            return harness
+                .run_cli_agent(profile, initial, rx, runtime.factory, stream)
+                .await
+                .map_err(|e| e.to_string());
+        }
         harness
             .run_interactive(&mut model, initial, rx, runtime.factory, stream)
             .await

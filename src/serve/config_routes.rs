@@ -225,6 +225,23 @@ pub(crate) async fn chatgpt_status(State(d): State<Shared>, Query(a): Query<Auth
     Json(serde_json::json!({ "signed_in": crate::chatgpt_auth::is_signed_in() })).into_response()
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct CliAgentQuery {
+    token: Option<String>,
+    provider: String,
+}
+
+// GET /cli-agent/status — whether a CLI-backed provider is installed and signed in here.
+pub(crate) async fn cli_agent_status(State(d): State<Shared>, Query(q): Query<CliAgentQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if !matches!(q.provider.as_str(), "claude-code" | "antigravity") {
+        return (StatusCode::BAD_REQUEST, "not a CLI-backed provider").into_response();
+    }
+    Json(crate::harness::cli_agent_status(&q.provider).await).into_response()
+}
+
 // POST /chatgpt/logout — drop the stored ChatGPT token.
 pub(crate) async fn chatgpt_logout(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
     if !d.authed(&a.token) {

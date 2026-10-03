@@ -85,8 +85,35 @@ pub async fn fetch_models(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogMod
         // Codex subscription backend has no models endpoint — offer the
         // known slugs so the editor picker is not empty.
         "chatgpt" => Ok(chatgpt_catalog()),
+        "claude-code" => Ok(claude_code_catalog()),
+        "antigravity" => Ok(crate::antigravity::models()
+            .await?
+            .into_iter()
+            .map(|id| CatalogModel {
+                id,
+                display_name: None,
+                context_window: None,
+                efforts: None,
+                reasoning: Some(true),
+                supports_images: Some(true),
+            })
+            .collect()),
         other => Err(format!("no model catalog for provider `{other}`")),
     }
+}
+
+fn claude_code_catalog() -> Vec<CatalogModel> {
+    ["opus", "sonnet", "haiku"]
+        .iter()
+        .map(|id| CatalogModel {
+            id: id.to_string(),
+            display_name: None,
+            context_window: None,
+            efforts: Some(["low", "medium", "high", "xhigh", "max"].map(String::from).to_vec()),
+            reasoning: Some(true),
+            supports_images: Some(true),
+        })
+        .collect()
 }
 
 fn chatgpt_catalog() -> Vec<CatalogModel> {

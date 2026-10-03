@@ -544,6 +544,10 @@ pub trait AgentModel: Send + Sync {
     fn swap_reasoning_effort(&mut self, _effort: Option<String>) -> Option<String> {
         None
     }
+
+    fn cli_agent_profile(&self) -> Option<crate::config::InferenceProfileConfig> {
+        None
+    }
 }
 
 #[async_trait]
@@ -568,6 +572,10 @@ impl<T: ?Sized + AgentModel + Send> AgentModel for Box<T> {
 
     fn swap_reasoning_effort(&mut self, effort: Option<String>) -> Option<String> {
         (**self).swap_reasoning_effort(effort)
+    }
+
+    fn cli_agent_profile(&self) -> Option<crate::config::InferenceProfileConfig> {
+        (**self).cli_agent_profile()
     }
 }
 
