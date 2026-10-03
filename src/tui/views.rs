@@ -305,6 +305,8 @@ pub(crate) fn render_approval_bar(frame: &mut ratatui::Frame<'_>, area: Rect, ap
 
 pub(crate) fn profile_status(cfg: &crate::config::InferenceProfileConfig) -> String {
     match cfg.provider.as_str() {
+        "claude-code" => "installed Claude Code CLI".to_string(),
+        "antigravity" => "installed Antigravity CLI".to_string(),
         "chatgpt" => {
             if crate::chatgpt_auth::is_signed_in() {
                 "✓ signed in".to_string()

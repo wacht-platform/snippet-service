@@ -4,6 +4,7 @@
 unsafe extern "C" {}
 
 pub mod anthropic;
+pub mod antigravity;
 pub mod app_schema;
 pub mod app_store;
 pub mod bg;

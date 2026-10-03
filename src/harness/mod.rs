@@ -833,6 +833,7 @@ pub struct CodingHarness {
 
 
 
+mod cli_agent;
 mod compactor;
 mod dispatch;
 mod events;
@@ -850,6 +851,7 @@ mod transcript;
 use guards::*;
 use live_context::*;
 use prompts::*;
+pub use cli_agent::{CliAgentModel, cli_agent_status};
 pub use state::*;
 use transcript::*;
 

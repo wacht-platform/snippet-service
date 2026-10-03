@@ -689,7 +689,11 @@ async fn run_lane(
     let brief = format!(
         "{brief}\n\n---\n{role}You are working on this for another agent, who reads only your final summary. Finish with terminate_loop, and in that summary cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so they can go straight there without searching again."
     );
-    let outcome = match harness.run(&mut *model, brief).await {
+    let run = match model.cli_agent_profile() {
+        Some(cli) => harness.run_cli_lane(cli, brief).await,
+        None => harness.run(&mut *model, brief).await,
+    };
+    let outcome = match run {
         Ok(outcome) => outcome,
         Err(error) => {
             let message = error.to_string();

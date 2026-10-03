@@ -407,7 +407,7 @@ impl CodingHarness {
 }
 
 /// Validate an `update_plan` call: 1–12 non-empty steps, at most one in progress.
-fn parse_plan(arguments: &Value) -> Result<Vec<PlanStep>, String> {
+pub(super) fn parse_plan(arguments: &Value) -> Result<Vec<PlanStep>, String> {
     let steps: Vec<PlanStep> = arguments
         .get("steps")
         .cloned()

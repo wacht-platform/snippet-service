@@ -491,6 +491,7 @@ impl InferenceProfileConfig {
 
     fn build_adapter(&self, session_id: Option<String>) -> Box<dyn AgentModel> {
         match self.provider.as_str() {
+            "claude-code" | "antigravity" => Box::new(crate::harness::CliAgentModel::new(self.clone())),
             "openai" => {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
                 if config.base_url == "https://api.openai.com/v1"
@@ -649,6 +650,8 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &[
     "opencode-go",
     "chatgpt",
     "xai",
+    "claude-code",
+    "antigravity",
 ];
 
 pub fn provider_supported(provider: &str) -> bool {
