@@ -139,13 +139,12 @@ impl App {
     pub(crate) fn login_focus_order(&self) -> Vec<SettingsField> {
         // Subscription providers sign in via OAuth — no API key / base URL fields.
         if matches!(self.form_provider.as_str(), "chatgpt" | "xai" | "claude-code" | "antigravity") {
-            let mut order = vec![
-                SettingsField::Provider,
-                SettingsField::Model,
-                SettingsField::Reasoning,
-                SettingsField::ContextWindow,
-                SettingsField::Compaction,
-            ];
+            let mut order = vec![SettingsField::Provider, SettingsField::Model];
+            if self.reasoning_adjustable() {
+                order.push(SettingsField::Reasoning);
+            }
+            order.push(SettingsField::ContextWindow);
+            order.push(SettingsField::Compaction);
             if self.form_provider == "xai" {
                 order.push(SettingsField::XSearch);
             }
@@ -156,7 +155,9 @@ impl App {
             order.push(SettingsField::BaseUrl);
         }
         order.push(SettingsField::Model);
-        order.push(SettingsField::Reasoning);
+        if self.reasoning_adjustable() {
+            order.push(SettingsField::Reasoning);
+        }
         order.push(SettingsField::ContextWindow);
         order.push(SettingsField::Compaction);
         order
@@ -205,22 +206,34 @@ impl App {
         }
     }
 
+    pub(crate) fn reasoning_spec(&self) -> crate::reasoning::ReasoningSpec {
+        crate::reasoning::spec(&self.form_provider, &self.form_model)
+    }
+
+    pub(crate) fn reasoning_adjustable(&self) -> bool {
+        self.reasoning_spec().control == crate::reasoning::Control::Effort
+    }
+
     pub(crate) fn login_cycle_reasoning(&mut self, forward: bool) {
-        pub(crate) const OPTIONS: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
-        let current = self
-            .form_reasoning_effort
-            .as_deref()
-            .unwrap_or("medium")
-            .to_ascii_lowercase();
-        let idx = OPTIONS.iter().position(|v| *v == current).unwrap_or(2);
+        let spec = self.reasoning_spec();
+        let mut choices: Vec<Option<&str>> = vec![None];
+        if spec.can_disable {
+            choices.push(Some("off"));
+        }
+        choices.extend(spec.options.iter().map(|o| Some(*o)));
+        let current = self.form_reasoning_effort.as_deref().map(str::to_ascii_lowercase);
+        let idx = choices
+            .iter()
+            .position(|c| c.map(str::to_string) == current)
+            .unwrap_or(0);
         let next = if forward {
-            (idx + 1) % OPTIONS.len()
+            (idx + 1) % choices.len()
         } else if idx == 0 {
-            OPTIONS.len() - 1
+            choices.len() - 1
         } else {
             idx - 1
         };
-        self.form_reasoning_effort = Some(OPTIONS[next].to_string());
+        self.form_reasoning_effort = choices[next].map(str::to_string);
     }
 
     pub(crate) fn login_cycle_compaction_pct(&mut self, forward: bool) {
@@ -568,8 +581,7 @@ impl App {
             .config
             .model
             .reasoning_effort
-            .clone()
-            .or(Some("medium".to_string()));
+            .clone();
         self.form_context_window = self.options.config.model.context_window.to_string();
         self.form_compact_at_pct = self.options.config.model.compact_at_pct.to_string();
         self.form_x_search = self.options.config.model.x_search;
@@ -684,10 +696,6 @@ impl App {
         let (context_window, compact_at_pct) = provider_context_defaults(&self.form_provider);
         self.form_context_window = context_window.to_string();
         self.form_compact_at_pct = compact_at_pct.to_string();
-        // Keep the user's current reasoning preference if present; otherwise default to medium.
-        if self.form_reasoning_effort.is_none() {
-            self.form_reasoning_effort = Some("medium".to_string());
-        }
         self.form_model_query = String::new();
         // The previous provider's model list no longer applies.
         self.form_fetched_models = None;

@@ -985,6 +985,8 @@ impl Tool for TransferMissionTaskLease {
 #[derive(Deserialize)]
 struct RetryTaskArgs {
     task_id: String,
+    #[serde(default)]
+    profile: Option<String>,
 }
 pub struct RetryMissionTask;
 #[async_trait]
@@ -992,8 +994,8 @@ impl Tool for RetryMissionTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "retry_mission_task".into(),
-            description: "Re-queue a blocked, failed, or stuck in-progress Mission Control task (rate limit, dispatch error, a worker that stopped without reporting). The task is delivered to its session again. Does not create a new task. Refuses done/cancelled work.".into(),
-            input_schema: schema(json!({"task_id":{"type":"string"}}), &["task_id"]),
+            description: "Re-queue a blocked, failed, or stuck in-progress Mission Control task (rate limit, dispatch error, a worker that stopped without reporting). The task is delivered to its session again. Does not create a new task. Refuses done/cancelled work. Pass profile only to move the worker onto another model, e.g. when its own is rate limited.".into(),
+            input_schema: schema(json!({"task_id":{"type":"string"}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The worker session restarts on that model."}}), &["task_id"]),
         }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
@@ -1004,9 +1006,25 @@ impl Tool for RetryMissionTask {
         if args.task_id.trim().is_empty() {
             return Err(ToolError::msg("task_id must be non-empty"));
         }
-        let task = db(ctx)?
-            .retry_task(args.task_id.trim(), &now_rfc3339())
+        let profile = args
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        if let Some(name) = profile.as_deref() {
+            check_profile(name).await?;
+        }
+        let store = db(ctx)?;
+        let now = now_rfc3339();
+        let mut task = store
+            .retry_task(args.task_id.trim(), &now)
             .map_err(|e| ToolError::msg(format!("retry task: {e}")))?;
+        if profile.is_some() {
+            task = store
+                .update_task_in(args.task_id.trim(), &now, |t| t.profile = profile.clone())
+                .map_err(|e| ToolError::msg(format!("retry task: {e}")))?;
+        }
         Ok(ToolResult::success(json!({
             "task": task_view(&task),
             "note": "Re-queued as pending. The daemon will dispatch it again."

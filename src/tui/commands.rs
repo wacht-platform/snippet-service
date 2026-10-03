@@ -51,7 +51,7 @@ impl App {
                 self.form_base_url = base;
                 self.form_model = model;
                 self.form_api_key = String::new();
-                self.form_reasoning_effort = Some("medium".to_string());
+                self.form_reasoning_effort = None;
                 self.form_x_search = false;
                 let (context_window, compact_at_pct) =
                     provider_context_defaults(&self.form_provider);

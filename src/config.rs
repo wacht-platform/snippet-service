@@ -481,8 +481,11 @@ impl InferenceProfileConfig {
         } else {
             self.model.clone()
         };
+        let mut resolved = self.clone();
+        resolved.reasoning_effort =
+            crate::reasoning::effective(&self.provider, &self.model, self.reasoning_effort.as_deref());
         Box::new(crate::usage_ledger::MeteredModel::new(
-            self.build_adapter(session_id.clone()),
+            resolved.build_adapter(session_id.clone()),
             self.provider.clone(),
             model,
             session_id,

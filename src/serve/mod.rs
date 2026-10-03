@@ -787,6 +787,7 @@ pub async fn run_serve(
         .route("/chatgpt/login", post(chatgpt_login))
         .route("/chatgpt/status", get(chatgpt_status))
         .route("/cli-agent/status", get(cli_agent_status))
+        .route("/reasoning", get(reasoning_spec))
         .route("/chatgpt/logout", post(chatgpt_logout))
         .route("/session/model", post(set_session_model))
         .route("/session/rewind", post(rewind_session))

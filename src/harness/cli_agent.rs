@@ -19,7 +19,6 @@ use crate::llm::{ModelOutput, StreamBuffer, StreamHandle};
 
 const MCP_SERVER: &str = "snippet";
 const MCP_PREFIX: &str = "mcp__snippet__";
-const READ_TOOLS: &str = "Read,Grep,Glob";
 const QUIET_TOOLS: [&str; 3] = ["update_plan", "ask_user", "set_session_title"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,28 +60,37 @@ struct CliSession {
     key: String,
     id: Option<String>,
     started: bool,
+    synced: usize,
+    tool_guide: String,
 }
 
 impl CliSession {
     fn open(kind: CliKind, snippet_session: &str, reuse: bool) -> Self {
         let key = sanitize_key(snippet_session);
         let file = Self::sidecar(kind, &key);
-        let existing = std::fs::read_to_string(&file)
-            .ok()
+        let raw = std::fs::read_to_string(&file).unwrap_or_default();
+        let mut lines = raw.lines();
+        let existing = lines
+            .next()
             .map(|id| id.trim().to_string())
             .filter(|id| reuse && !id.is_empty());
-        match (kind, existing) {
-            (_, Some(id)) => Self { kind, key, id: Some(id), started: true },
-            (CliKind::ClaudeCode, None) => {
-                let id = uuid::Uuid::new_v4().to_string();
-                let _ = std::fs::write(&file, &id);
-                Self { kind, key, id: Some(id), started: false }
-            }
-            (CliKind::Antigravity, None) => {
-                let _ = std::fs::remove_file(&file);
-                Self { kind, key, id: None, started: false }
-            }
+        let synced = lines.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+        let session = match (kind, existing) {
+            (_, Some(id)) => Self { kind, key, id: Some(id), started: true, synced, tool_guide: String::new() },
+            (CliKind::ClaudeCode, None) => Self {
+                kind,
+                key,
+                id: Some(uuid::Uuid::new_v4().to_string()),
+                started: false,
+                synced: 0,
+                tool_guide: String::new(),
+            },
+            (CliKind::Antigravity, None) => Self { kind, key, id: None, started: false, synced: 0, tool_guide: String::new() },
+        };
+        if !session.started {
+            session.save();
         }
+        session
     }
 
     fn sidecar(kind: CliKind, key: &str) -> PathBuf {
@@ -91,13 +99,79 @@ impl CliSession {
         dir.join(key)
     }
 
+    fn save(&self) {
+        let file = Self::sidecar(self.kind, &self.key);
+        match self.id.as_deref() {
+            Some(id) => {
+                let _ = std::fs::write(file, format!("{id}\n{}", self.synced));
+            }
+            None => {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
+
     fn adopt(&mut self, id: &str) {
+        self.started = true;
         if self.id.as_deref() != Some(id) {
             self.id = Some(id.to_string());
-            let _ = std::fs::write(Self::sidecar(self.kind, &self.key), id);
+            self.save();
         }
-        self.started = true;
     }
+
+    fn mark_synced(&mut self, upto: usize) {
+        if self.synced != upto {
+            self.synced = upto;
+            self.save();
+        }
+    }
+}
+
+fn missed_context(messages: &[HarnessMessage]) -> Option<String> {
+    const BUDGET: usize = 30_000;
+    const PER_MESSAGE: usize = 2_000;
+    let clip = |text: &str| -> String {
+        let text = text.trim();
+        if text.chars().count() > PER_MESSAGE {
+            format!("{}…", text.chars().take(PER_MESSAGE).collect::<String>())
+        } else {
+            text.to_string()
+        }
+    };
+    let mut entries: Vec<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            HarnessMessage::User { content } if !content.trim().is_empty() => Some(format!("user: {}", clip(content))),
+            HarnessMessage::Assistant { content, tool_calls } => {
+                let tools: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+                let mut line = format!("assistant: {}", clip(content));
+                if !tools.is_empty() {
+                    line.push_str(&format!(" (used {})", tools.join(", ")));
+                }
+                (!content.trim().is_empty() || !tools.is_empty()).then_some(line)
+            }
+            HarnessMessage::Summary { content, .. } => Some(format!("summary of earlier work: {}", clip(content))),
+            _ => None,
+        })
+        .collect();
+    let mut used = 0;
+    let mut keep = entries.len();
+    while keep > 0 && used + entries[keep - 1].len() <= BUDGET {
+        used += entries[keep - 1].len();
+        keep -= 1;
+    }
+    let dropped = keep;
+    entries.drain(..keep);
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("<conversation_so_far>\nThis session's earlier conversation, from before this runtime joined it. Treat it as your own history.\n");
+    if dropped > 0 {
+        out.push_str(&format!("({dropped} older messages omitted)\n"));
+    }
+    out.push_str(&entries.join("\n\n"));
+    out.push_str("\n</conversation_so_far>\n\n");
+    Some(out)
 }
 
 #[derive(Default)]
@@ -244,14 +318,53 @@ fn sanitize_key(id: &str) -> String {
 fn tool_prompt_preamble(kind: CliKind) -> String {
     match kind {
         CliKind::ClaudeCode => format!(
-            "## Tools in this runtime\n\nThe tools named in this prompt are served to you as `{MCP_PREFIX}<name>`: where it says `bash`, call `{MCP_PREFIX}bash`, and so on. You also have Read, Grep and Glob for reading and searching files. Every change and command goes through the snippet tools."
+            "## Tools in this runtime\n\nThe tools named in this prompt are served to you as `{MCP_PREFIX}<name>`: where it says `bash`, call `{MCP_PREFIX}bash`, and so on. These are your only tools: you have no built-in ones in this session. Read and search files with `bash` (cat, sed -n, rg, ls), and make every change, command, question and delegation through the snippet tools."
         ),
         CliKind::Antigravity => format!(
-            "## Tools in this runtime\n\nThe tools named in these instructions are served by the `{}` MCP server: call them with call_mcp_tool, ServerName `{}` and ToolName exactly as named here (`bash`, `change_files`, `update_plan`, `ask_user`, `delegate_task`, and the rest). Your own view_file, list_dir, find_by_name, grep_search and web tools work for reading and research. Your built-in terminal, file-editing, browser, subagent and question tools are switched off in this session: every command, edit, question and delegation goes through the snippet tools.",
+            "## Tools in this runtime\n\nThe tools named in these instructions are served by the `{}` MCP server: call them with call_mcp_tool, ServerName `{}` and ToolName exactly as named here (`bash`, `change_files`, `update_plan`, `ask_user`, `delegate_task`, and the rest). These are your only working tools: every built-in tool of yours is switched off in this session. Read and search files with the snippet `bash` tool (cat, sed -n, rg, ls), research with its `web_search` and `web_read`, and make every change, command, question and delegation through the snippet tools. The one exception: when a tool result says its output was saved to a file inside your own Antigravity folder, read that file with view_file.",
             crate::antigravity::MCP_SERVER_NAME,
             crate::antigravity::MCP_SERVER_NAME,
         ),
     }
+}
+
+fn tool_guide(defs: &[NativeToolDefinition]) -> String {
+    let mut out = String::from("## Snippet tools and their arguments\n\nCall each through call_mcp_tool with ServerName `snippet_snippet`. Pass every required argument by its exact name; optional ones in brackets.\n");
+    for def in defs {
+        let schema = &def.input_schema;
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|r| r.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let args: Vec<String> = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|props| {
+                props
+                    .iter()
+                    .map(|(name, prop)| {
+                        let ty = prop.get("type").and_then(Value::as_str).unwrap_or("any");
+                        if required.contains(&name.as_str()) {
+                            format!("{name}: {ty}")
+                        } else {
+                            format!("[{name}: {ty}]")
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let summary: String = def
+            .description
+            .split(". ")
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect();
+        out.push_str(&format!("- `{}`({}) — {}\n", def.name, args.join(", "), summary.trim_end_matches('.')));
+    }
+    out
 }
 
 fn error_result(code: &str, message: &str) -> Value {
@@ -381,7 +494,8 @@ impl CodingHarness {
             .collect()
     }
 
-    fn cli_system_prompt(&self, state: &HarnessState, kind: CliKind) -> String {
+    fn cli_system_prompt(&self, state: &HarnessState, session: &CliSession) -> String {
+        let kind = session.kind;
         let system = state
             .messages
             .iter()
@@ -390,7 +504,12 @@ impl CodingHarness {
                 _ => None,
             })
             .unwrap_or_else(|| self.config.system_prompt.clone());
-        format!("{system}\n\n{}", tool_prompt_preamble(kind))
+        let mut prompt = format!("{system}\n\n{}", tool_prompt_preamble(kind));
+        if !session.tool_guide.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&session.tool_guide);
+        }
+        prompt
     }
 
     fn effort_arg(profile: &InferenceProfileConfig) -> Option<&str> {
@@ -411,7 +530,6 @@ impl CodingHarness {
             "Claude Code isn't installed or isn't on PATH (set SNIPPET_CLAUDE_BIN to its path)".to_string()
         })?;
         let mcp_config = json!({"mcpServers": {MCP_SERVER: {"type": "http", "url": mcp_url}}});
-        let full_replace = profile.base_url.trim() == "tools:none";
         let mut cmd = Command::new(bin);
         cmd.current_dir(self.context.workspace_root())
             .arg("-p")
@@ -419,8 +537,8 @@ impl CodingHarness {
             .args(["--include-partial-messages", "--verbose"])
             .args(["--system-prompt", prompt])
             .args(["--mcp-config", &mcp_config.to_string(), "--strict-mcp-config"])
-            .args(["--tools", if full_replace { "" } else { READ_TOOLS }])
-            .args(["--allowedTools", &format!("{READ_TOOLS},mcp__{MCP_SERVER}")])
+            .args(["--tools", ""])
+            .args(["--allowedTools", &format!("mcp__{MCP_SERVER}")])
             .args(["--permission-prompts", "none"])
             .args(["--setting-sources", ""])
             .arg("--disable-slash-commands")
@@ -465,10 +583,6 @@ impl CodingHarness {
         if !model.is_empty() {
             cmd.args(["--model", model]);
         }
-        let effort_in_name = ["-low", "-medium", "-high"].iter().any(|s| model.ends_with(s));
-        if let Some(effort) = Self::effort_arg(profile).filter(|_| !effort_in_name) {
-            cmd.args(["--effort", effort]);
-        }
         if let Some(id) = session.id.as_deref() {
             cmd.args(["--conversation", id]);
         }
@@ -485,7 +599,7 @@ impl CodingHarness {
         session: &CliSession,
     ) -> Result<CliProcess, String> {
         let kind = session.kind;
-        let prompt = self.cli_system_prompt(state, kind);
+        let prompt = self.cli_system_prompt(state, session);
         let mut cmd = match kind {
             CliKind::ClaudeCode => self.claude_command(profile, &prompt, mcp_url, session)?,
             CliKind::Antigravity => self.antigravity_command(profile, &prompt, mcp_url, session)?,
@@ -595,6 +709,7 @@ impl CodingHarness {
         let meta_names: Vec<String> = meta_defs.iter().map(|d| d.name.clone()).collect();
         let mut bridge_tools = self.tools.definitions();
         bridge_tools.extend(meta_defs);
+        let guide = tool_guide(&bridge_tools);
         let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools).await.map_err(ToolError::msg)?;
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<CliLine>();
         let mut process: Option<CliProcess> = None;
@@ -602,6 +717,9 @@ impl CodingHarness {
         let kind = CliKind::of(&profile.provider);
         let session_key = self.session_id().unwrap_or_else(|| "main".to_string());
         let mut session = CliSession::open(kind, &session_key, self.config.resume);
+        if kind == CliKind::Antigravity {
+            session.tool_guide = guide;
+        }
         let mut parse = CliParse::default();
         let mut pending_approval: Option<McpCall> = None;
         let mut pending_question: Option<McpCall> = None;
@@ -645,6 +763,14 @@ impl CodingHarness {
                     }
                 }
                 if let Some(p) = process.as_mut() {
+                    let prior_end = state.messages.len().saturating_sub(outbox.len());
+                    if prior_end > session.synced.max(1)
+                        && let Some(context) = missed_context(&state.messages[session.synced.max(1)..prior_end])
+                        && let Some(first) = outbox.first_mut()
+                    {
+                        *first = format!("{context}{first}");
+                    }
+                    session.mark_synced(state.messages.len());
                     for text in std::mem::take(&mut outbox) {
                         let line = kind.user_line(&text);
                         let sent = p.stdin.write_all(format!("{line}\n").as_bytes()).await;
@@ -738,6 +864,9 @@ impl CodingHarness {
                                 ),
                                 CliKind::Antigravity => self.apply_agy_event(&mut state, &event, sink.as_ref(), &mut parse),
                             };
+                            if finished {
+                                session.mark_synced(state.messages.len());
+                            }
                             if let Some(usage) = parse.turn_usage.take() {
                                 let model = if profile.model.trim().is_empty() { "default" } else { profile.model.trim() };
                                 let owner = self.context.durable_session_id().map(str::to_string).unwrap_or_else(|| session_key.clone());
@@ -839,7 +968,22 @@ impl CodingHarness {
     async fn execute_cli_call(&self, call: McpCall) {
         let value = match self.tools.execute(&self.context, &call.name, call.arguments).await {
             Ok(result) => result.value,
-            Err(error) => error_result("tool_error", &error.to_string()),
+            Err(error) => {
+                let schema = self
+                    .tools
+                    .definitions()
+                    .into_iter()
+                    .find(|d| d.name == call.name)
+                    .map(|d| d.input_schema);
+                let message = match schema {
+                    Some(schema) => format!(
+                        "{error}\nCall `{}` again with arguments matching this schema: {schema}",
+                        call.name
+                    ),
+                    None => error.to_string(),
+                };
+                error_result("tool_error", &message)
+            }
         };
         let _ = call.reply.send(value);
     }
@@ -878,7 +1022,7 @@ impl CodingHarness {
                             state.last_prompt_tokens = n("input_tokens") + n("cache_read_tokens");
                             let turn = &mut parse.agy_steps;
                             turn.prompt_tokens += n("input_tokens");
-                            turn.completion_tokens += n("output_tokens") + n("thinking_tokens");
+                            turn.completion_tokens += n("output_tokens");
                             turn.cache_read_tokens += n("cache_read_tokens");
                             turn.total_tokens = turn.prompt_tokens + turn.completion_tokens;
                         }
@@ -908,9 +1052,15 @@ impl CodingHarness {
                         };
                         let schema_read = raw == "view_file"
                             && arguments.get("AbsolutePath").and_then(Value::as_str).is_some_and(|p| p.contains("/antigravity-cli/mcp/"));
-                        let quiet = schema_read || QUIET_TOOLS.contains(&name.as_str());
+                        let redirected = done == Some("ERROR")
+                            && info
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .is_some_and(|m| m.contains("denied by pre-tool hook"));
+                        let quiet = schema_read || redirected || QUIET_TOOLS.contains(&name.as_str());
                         let mut changed = false;
-                        if parse.agy_tools.insert(index) && !quiet {
+                        let announce = mcp || done.is_some_and(|d| d == "DONE" || d == "ERROR");
+                        if announce && !quiet && parse.agy_tools.insert(index) {
                             state.events.push(HarnessEvent::ToolCall { tool_name: name.clone(), arguments });
                             changed = true;
                         }
