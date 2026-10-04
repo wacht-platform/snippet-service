@@ -145,7 +145,10 @@ impl Tool for BashTool {
             .await
             .map_err(|_| {
                 let _ = std::fs::remove_file(&pwd_file);
-                ToolError::msg(format!("command timed out after {}s", timeout.as_secs()))
+                ToolError::msg(format!(
+                    "command timed out after {}s and was stopped. Start servers, browsers, displays and anything else that keeps running with background: true; for a long finite job, raise timeout_seconds.",
+                    timeout.as_secs()
+                ))
             })??;
         let end_dir = std::fs::read_to_string(&pwd_file)
             .ok()

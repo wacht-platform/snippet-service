@@ -84,7 +84,7 @@ fn parse_codex_rate_limits(
     if primary.is_none() && secondary.is_none() {
         return None;
     }
-    Some(RateLimitSnapshot { primary, secondary })
+    Some(RateLimitSnapshot { primary, secondary, label: None })
 }
 
 #[derive(Debug, Clone)]

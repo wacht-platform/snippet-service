@@ -179,8 +179,8 @@ struct CliParse {
     tool_names: HashMap<String, String>,
     agy_text: HashMap<i64, String>,
     agy_tools: HashSet<i64>,
-    turn_usage: Option<crate::llm::TokenUsage>,
-    agy_steps: crate::llm::TokenUsage,
+    calls: Vec<crate::llm::TokenUsage>,
+    claude_call: Option<crate::llm::TokenUsage>,
 }
 
 pub struct CliAgentModel {
@@ -228,6 +228,14 @@ async fn run_probe(bin: &Path, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn claude_rate_limits_path() -> PathBuf {
+    crate::config::snippet_home().join("claude-code/rate_limits.json")
+}
+
+pub fn claude_rate_limits() -> Option<crate::llm::RateLimitSnapshot> {
+    serde_json::from_str(&std::fs::read_to_string(claude_rate_limits_path()).ok()?).ok()
 }
 
 pub async fn cli_agent_status(provider: &str) -> Value {
@@ -848,6 +856,7 @@ impl CodingHarness {
                             if let Some(mut p) = process.take() {
                                 let _ = p.child.start_kill();
                             }
+                            generation += 1;
                             running.clear();
                             pending_approval = None;
                             pending_question = None;
@@ -885,16 +894,21 @@ impl CodingHarness {
                             };
                             if finished {
                                 session.mark_synced(state.messages.len());
+                                if kind == CliKind::Antigravity {
+                                    crate::antigravity::refresh_quota_if_stale(300);
+                                }
                                 let leftover: Vec<String> = steers.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
                                 if !leftover.is_empty() {
                                     outbox.push(leftover.join("\n\n"));
                                     state.status = HarnessStatus::Running;
                                 }
                             }
-                            if let Some(usage) = parse.turn_usage.take() {
+                            if !parse.calls.is_empty() {
                                 let model = if profile.model.trim().is_empty() { "default" } else { profile.model.trim() };
                                 let owner = self.context.durable_session_id().map(str::to_string).unwrap_or_else(|| session_key.clone());
-                                crate::usage_ledger::record(&owner, &profile.provider, model, &usage);
+                                for usage in std::mem::take(&mut parse.calls) {
+                                    crate::usage_ledger::record(&owner, &profile.provider, model, &usage);
+                                }
                             }
                             if changed {
                                 self.persist(&mut state, &lanes).await?;
@@ -993,11 +1007,16 @@ impl CodingHarness {
         let value = match self.tools.execute(&self.context, &call.name, call.arguments).await {
             Ok(result) => result.value,
             Err(error) => {
+                let text = error.to_string();
+                let argument_error = matches!(error, ToolError::Json(_) | ToolError::InvalidArguments { .. })
+                    || ["missing field", "unknown field", "invalid type", "unknown variant", "expected JSON object"]
+                        .iter()
+                        .any(|marker| text.contains(marker));
                 let schema = self
                     .tools
                     .definitions()
                     .into_iter()
-                    .find(|d| d.name == call.name)
+                    .find(|d| argument_error && d.name == call.name)
                     .map(|d| d.input_schema);
                 let message = match schema {
                     Some(schema) => format!(
@@ -1043,12 +1062,20 @@ impl CodingHarness {
                         }
                         if let Some(usage) = step.get("usage") {
                             let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-                            state.last_prompt_tokens = n("input_tokens") + n("cache_read_tokens");
-                            let turn = &mut parse.agy_steps;
-                            turn.prompt_tokens += n("input_tokens");
-                            turn.completion_tokens += n("output_tokens");
-                            turn.cache_read_tokens += n("cache_read_tokens");
-                            turn.total_tokens = turn.prompt_tokens + turn.completion_tokens;
+                            let prompt = n("input_tokens") + n("cache_read_tokens");
+                            let completion = n("output_tokens");
+                            state.last_prompt_tokens = prompt;
+                            state.prompt_tokens += prompt;
+                            state.completion_tokens += completion;
+                            state.total_tokens += prompt + completion;
+                            state.cache_read_tokens += n("cache_read_tokens");
+                            parse.calls.push(crate::llm::TokenUsage {
+                                prompt_tokens: prompt,
+                                completion_tokens: completion,
+                                total_tokens: prompt + completion,
+                                cache_read_tokens: n("cache_read_tokens"),
+                                ..Default::default()
+                            });
                         }
                         let text = parse.agy_text.remove(&index).unwrap_or_default().trim().to_string();
                         if text.is_empty() {
@@ -1123,20 +1150,11 @@ impl CodingHarness {
                 }
                 parse.agy_text.clear();
                 parse.agy_tools.clear();
-                let turn = std::mem::take(&mut parse.agy_steps);
-                state.prompt_tokens += turn.prompt_tokens;
-                state.completion_tokens += turn.completion_tokens;
-                state.total_tokens += turn.total_tokens;
-                state.cache_read_tokens += turn.cache_read_tokens;
-                parse.turn_usage = Some(turn);
                 state.iterations += result.get("num_turns").and_then(Value::as_u64).unwrap_or(1) as usize;
-                if result.get("status").and_then(Value::as_str) == Some("ERROR") {
-                    let message = result
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .filter(|m| !m.is_empty())
-                        .unwrap_or("Antigravity reported an error")
-                        .to_string();
+                let error = result.get("error").and_then(Value::as_str).unwrap_or("");
+                let cancelled = error.contains("context canceled");
+                if result.get("status").and_then(Value::as_str) == Some("ERROR") && !cancelled {
+                    let message = if error.is_empty() { "Antigravity reported an error" } else { error }.to_string();
                     state.events.push(HarnessEvent::ModelError { message });
                 } else if let Some(text) = result.get("response").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
                     state.final_text = Some(text.to_string());
@@ -1160,6 +1178,36 @@ impl CodingHarness {
         let tool_names = &mut parse.tool_names;
         match event.get("type").and_then(Value::as_str) {
             Some("stream_event") => {
+                let n = |v: Option<&Value>, k: &str| v.and_then(|u| u.get(k)).and_then(Value::as_u64).unwrap_or(0);
+                match event.pointer("/event/type").and_then(Value::as_str) {
+                    Some("message_start") => {
+                        let usage = event.pointer("/event/message/usage");
+                        let prompt = n(usage, "input_tokens") + n(usage, "cache_read_input_tokens") + n(usage, "cache_creation_input_tokens");
+                        parse.claude_call = Some(crate::llm::TokenUsage {
+                            prompt_tokens: prompt,
+                            completion_tokens: n(usage, "output_tokens"),
+                            cache_read_tokens: n(usage, "cache_read_input_tokens"),
+                            cache_creation_tokens: n(usage, "cache_creation_input_tokens"),
+                            ..Default::default()
+                        });
+                    }
+                    Some("message_delta") => {
+                        let out = n(event.pointer("/event/usage"), "output_tokens");
+                        if let Some(call) = parse.claude_call.as_mut()
+                            && out > 0
+                        {
+                            call.completion_tokens = out;
+                        }
+                    }
+                    Some("message_stop") => {
+                        if let Some(mut call) = parse.claude_call.take() {
+                            call.total_tokens = call.prompt_tokens + call.completion_tokens;
+                            state.last_prompt_tokens = call.prompt_tokens;
+                            parse.calls.push(call);
+                        }
+                    }
+                    _ => {}
+                }
                 if let (Some(sink), Some(delta)) = (sink, event.pointer("/event/delta")) {
                     match delta.get("type").and_then(Value::as_str) {
                         Some("text_delta") => {
@@ -1241,10 +1289,19 @@ impl CodingHarness {
                         resets_at: w.get("resetsAt").and_then(Value::as_i64).unwrap_or(0),
                     })
                 };
-                state.rate_limit = Some(crate::llm::RateLimitSnapshot {
+                let snapshot = crate::llm::RateLimitSnapshot {
                     primary: window("five_hour", 300),
                     secondary: window("seven_day", 10080),
-                });
+                    label: None,
+                };
+                if let Ok(body) = serde_json::to_string(&snapshot) {
+                    let path = claude_rate_limits_path();
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(path, body);
+                }
+                state.rate_limit = Some(snapshot);
                 true
             }
             Some("result") => {
@@ -1255,18 +1312,10 @@ impl CodingHarness {
                 let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
                 let prompt = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
                 let completion = n("output_tokens");
-                parse.turn_usage = Some(crate::llm::TokenUsage {
-                    prompt_tokens: prompt,
-                    completion_tokens: completion,
-                    total_tokens: prompt + completion,
-                    cache_read_tokens: n("cache_read_input_tokens"),
-                    cache_creation_tokens: n("cache_creation_input_tokens"),
-                });
                 state.prompt_tokens += prompt;
                 state.completion_tokens += completion;
                 state.total_tokens += prompt + completion;
                 state.cache_read_tokens += n("cache_read_input_tokens");
-                state.last_prompt_tokens = prompt;
                 state.iterations += event.get("num_turns").and_then(Value::as_u64).unwrap_or(1) as usize;
                 let failed = event.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                 if failed {

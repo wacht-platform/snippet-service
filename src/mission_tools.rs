@@ -1206,6 +1206,12 @@ impl Tool for ReportMissionTask {
                 .get_task(&args.task_id)
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
+            if bound.status.is_terminal() {
+                return Err(ToolError::msg(format!(
+                    "task `{}` is already {}; there is nothing to report. Work the user asks for directly in this chat is not a task: answer them here instead.",
+                    args.task_id, bound.status
+                )));
+            }
             let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
             let caller = canonical(caller);
             let bound_to = bound.reporting_session.as_deref().map(canonical);

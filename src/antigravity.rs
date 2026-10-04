@@ -248,3 +248,183 @@ pub async fn models() -> Result<Vec<String>, String> {
     }
     Ok(models)
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct QuotaCache {
+    fetched_at: i64,
+    groups: Vec<crate::llm::RateLimitSnapshot>,
+}
+
+static QUOTA_REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn quota_path() -> PathBuf {
+    crate::config::snippet_home().join("antigravity/quota.json")
+}
+
+pub fn cached_quota() -> Option<(i64, Vec<crate::llm::RateLimitSnapshot>)> {
+    let cache: QuotaCache = serde_json::from_str(&std::fs::read_to_string(quota_path()).ok()?).ok()?;
+    Some((cache.fetched_at, cache.groups))
+}
+
+pub fn refresh_quota_if_stale(max_age_secs: i64) {
+    let now = chrono::Utc::now().timestamp();
+    if cached_quota().is_some_and(|(at, _)| now - at < max_age_secs) {
+        return;
+    }
+    if QUOTA_REFRESHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        if let Ok(groups) = read_quota_screen()
+            && !groups.is_empty()
+        {
+            let cache = QuotaCache { fetched_at: chrono::Utc::now().timestamp(), groups };
+            if let Ok(body) = serde_json::to_string(&cache) {
+                let path = quota_path();
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(path, body);
+            }
+        }
+        QUOTA_REFRESHING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+#[cfg(unix)]
+fn read_quota_screen() -> Result<Vec<crate::llm::RateLimitSnapshot>, String> {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::time::{Duration, Instant};
+
+    let bin = binary().ok_or("agy isn't installed")?;
+    let cbin = std::ffi::CString::new(bin.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    let cwd = std::ffi::CString::new(std::env::temp_dir().as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    let (rows, cols) = (60u16, 130u16);
+    let mut ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut master_fd = -1;
+    let pid = unsafe { libc::forkpty(&mut master_fd, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws) };
+    if pid < 0 {
+        return Err(format!("forkpty: {}", std::io::Error::last_os_error()));
+    }
+    if pid == 0 {
+        unsafe {
+            libc::chdir(cwd.as_ptr());
+            libc::setenv(c"TERM".as_ptr(), c"xterm-256color".as_ptr(), 1);
+            let argv = [cbin.as_ptr(), std::ptr::null()];
+            libc::execv(cbin.as_ptr(), argv.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    unsafe {
+        let flags = libc::fcntl(master_fd, libc::F_GETFL);
+        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    let pump = |master: &mut std::fs::File, parser: &mut vt100::Parser, until: &dyn Fn(&str) -> bool, limit: Duration| {
+        let start = Instant::now();
+        let mut buf = [0u8; 65536];
+        while start.elapsed() < limit {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => parser.process(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => break,
+            }
+            if until(&parser.screen().contents()) {
+                break;
+            }
+        }
+    };
+    pump(&mut master, &mut parser, &|s| s.contains("Antigravity CLI") && s.contains('>'), Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = master.write_all(b"/usage");
+    pump(&mut master, &mut parser, &|_| false, Duration::from_millis(1200));
+    let _ = master.write_all(b"\r");
+    pump(&mut master, &mut parser, &|s| s.matches("Five Hour Limit Remaining").count() >= 2, Duration::from_secs(15));
+    pump(&mut master, &mut parser, &|_| false, Duration::from_millis(400));
+    let screen = parser.screen().contents();
+    let _ = master.write_all(b"\x1b");
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = master.write_all(b"\x03\x03");
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+    Ok(parse_quota_screen(&screen, chrono::Utc::now().timestamp()))
+}
+
+#[cfg(not(unix))]
+fn read_quota_screen() -> Result<Vec<crate::llm::RateLimitSnapshot>, String> {
+    Err("quota reading needs a Unix pty".into())
+}
+
+fn parse_quota_screen(screen: &str, now: i64) -> Vec<crate::llm::RateLimitSnapshot> {
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let mut groups = Vec::new();
+    let mut current: Option<crate::llm::RateLimitSnapshot> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.ends_with("MODELS") && line.chars().all(|c| c.is_ascii_uppercase() || c == ' ') {
+            if let Some(group) = current.take() {
+                groups.push(group);
+            }
+            let mut label = line.to_ascii_lowercase();
+            if let Some(first) = label.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            current = Some(crate::llm::RateLimitSnapshot {
+                label: Some(label.replace("gpt", "GPT").replace("claude", "Claude").replace("gemini", "Gemini")),
+                ..Default::default()
+            });
+        } else if let (Some(group), Some(minutes)) = (
+            current.as_mut(),
+            match line {
+                "Weekly Limit Remaining" => Some(10080),
+                "Five Hour Limit Remaining" => Some(300),
+                _ => None,
+            },
+        ) {
+            let remaining = lines
+                .get(i + 1)
+                .and_then(|l| l.rsplit(' ').next())
+                .and_then(|p| p.trim_end_matches('%').parse::<f64>().ok());
+            let resets_in = lines.get(i + 2).and_then(|l| l.strip_prefix("Refreshes in ")).map(parse_duration_secs);
+            if let Some(remaining) = remaining {
+                let window = crate::llm::RateLimitWindow {
+                    used_percent: (100.0 - remaining).clamp(0.0, 100.0),
+                    window_minutes: minutes,
+                    resets_at: resets_in.map(|s| now + s).unwrap_or(0),
+                };
+                if minutes == 300 {
+                    group.primary = Some(window);
+                } else {
+                    group.secondary = Some(window);
+                }
+            }
+        }
+        i += 1;
+    }
+    if let Some(group) = current {
+        groups.push(group);
+    }
+    groups.into_iter().filter(|g| g.primary.is_some() || g.secondary.is_some()).collect()
+}
+
+fn parse_duration_secs(text: &str) -> i64 {
+    text.split_whitespace()
+        .filter_map(|part| {
+            let (num, unit) = part.split_at(part.find(|c: char| !c.is_ascii_digit())?);
+            let n: i64 = num.parse().ok()?;
+            Some(match unit {
+                "d" => n * 86400,
+                "h" => n * 3600,
+                "m" => n * 60,
+                "s" => n,
+                _ => 0,
+            })
+        })
+        .sum()
+}
