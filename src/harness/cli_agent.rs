@@ -272,11 +272,14 @@ struct McpCall {
     reply: oneshot::Sender<Value>,
 }
 
+type SteerQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 #[derive(Clone)]
 struct McpState {
     token: String,
     tools: Vec<NativeToolDefinition>,
     calls: mpsc::UnboundedSender<McpCall>,
+    steers: SteerQueue,
 }
 
 struct CliProcess {
@@ -452,8 +455,16 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
                 .await
                 .unwrap_or_else(|_| error_result("interrupted", "The call was interrupted."));
             let failed = value.get("status").and_then(Value::as_str) == Some("error");
+            let mut content = vec![json!({"type": "text", "text": value.to_string()})];
+            let steers: Vec<String> = state.steers.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+            if !steers.is_empty() {
+                content.push(json!({"type": "text", "text": format!(
+                    "<user_message_mid_turn>\nThe user sent this while you were working. It takes priority: adjust what you are doing now.\n{}\n</user_message_mid_turn>",
+                    steers.join("\n\n")
+                )}));
+            }
             json!({
-                "content": [{"type": "text", "text": value.to_string()}],
+                "content": content,
                 "isError": failed,
             })
         }
@@ -466,10 +477,11 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
 
 async fn start_mcp_server(
     tools: Vec<NativeToolDefinition>,
+    steers: SteerQueue,
 ) -> Result<(String, mpsc::UnboundedReceiver<McpCall>), String> {
     let (calls, rx) = mpsc::unbounded_channel();
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let state = McpState { token: token.clone(), tools, calls };
+    let state = McpState { token: token.clone(), tools, calls, steers };
     let app = Router::new()
         .route(
             "/mcp/{token}",
@@ -710,7 +722,8 @@ impl CodingHarness {
         let mut bridge_tools = self.tools.definitions();
         bridge_tools.extend(meta_defs);
         let guide = tool_guide(&bridge_tools);
-        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools).await.map_err(ToolError::msg)?;
+        let steers: SteerQueue = Default::default();
+        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone()).await.map_err(ToolError::msg)?;
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<CliLine>();
         let mut process: Option<CliProcess> = None;
         let mut generation = 0u64;
@@ -802,7 +815,13 @@ impl CodingHarness {
                                 state.events.push(HarnessEvent::Steer { text: text.clone() });
                                 state.messages.push(HarnessMessage::User { content: text.clone() });
                                 self.bump_activity();
-                                outbox.push(text);
+                                if kind == CliKind::Antigravity && process.is_some() {
+                                    if let Ok(mut queue) = steers.lock() {
+                                        queue.push(text);
+                                    }
+                                } else {
+                                    outbox.push(text);
+                                }
                             } else {
                                 self.accept_user_message(&mut state, &mut vars, text.clone()).await;
                                 outbox.push(text);
@@ -866,6 +885,11 @@ impl CodingHarness {
                             };
                             if finished {
                                 session.mark_synced(state.messages.len());
+                                let leftover: Vec<String> = steers.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+                                if !leftover.is_empty() {
+                                    outbox.push(leftover.join("\n\n"));
+                                    state.status = HarnessStatus::Running;
+                                }
                             }
                             if let Some(usage) = parse.turn_usage.take() {
                                 let model = if profile.model.trim().is_empty() { "default" } else { profile.model.trim() };
@@ -1067,8 +1091,10 @@ impl CodingHarness {
                         let result = match done {
                             Some("DONE") => {
                                 let output = info.get("output").and_then(Value::as_str).unwrap_or("").to_string();
-                                serde_json::from_str::<Value>(&output)
-                                    .ok()
+                                serde_json::Deserializer::from_str(output.trim_start())
+                                    .into_iter::<Value>()
+                                    .next()
+                                    .and_then(Result::ok)
                                     .filter(|v| mcp && v.get("status").is_some())
                                     .unwrap_or_else(|| json!({"schema_version": 1, "status": "success", "data": {"output": output}}))
                             }
