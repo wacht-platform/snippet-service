@@ -181,6 +181,7 @@ struct CliParse {
     agy_tools: HashSet<i64>,
     calls: Vec<crate::llm::TokenUsage>,
     claude_call: Option<crate::llm::TokenUsage>,
+    served: ServedResults,
 }
 
 pub struct CliAgentModel {
@@ -281,6 +282,7 @@ struct McpCall {
 }
 
 type SteerQueue = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+type ServedResults = std::sync::Arc<std::sync::Mutex<HashMap<String, std::collections::VecDeque<Value>>>>;
 
 #[derive(Clone)]
 struct McpState {
@@ -288,6 +290,7 @@ struct McpState {
     tools: Vec<NativeToolDefinition>,
     calls: mpsc::UnboundedSender<McpCall>,
     steers: SteerQueue,
+    served: ServedResults,
 }
 
 struct CliProcess {
@@ -456,12 +459,20 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("").to_string();
             let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             let (reply, rx) = oneshot::channel();
+            let name_for_record = name.clone();
             if state.calls.send(McpCall { name, arguments, reply }).is_err() {
                 return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "session ended"}}));
             }
             let value = rx
                 .await
                 .unwrap_or_else(|_| error_result("interrupted", "The call was interrupted."));
+            if let Ok(mut served) = state.served.lock() {
+                let queue = served.entry(name_for_record).or_default();
+                queue.push_back(value.clone());
+                if queue.len() > 32 {
+                    queue.pop_front();
+                }
+            }
             let failed = value.get("status").and_then(Value::as_str) == Some("error");
             let mut content = vec![json!({"type": "text", "text": value.to_string()})];
             let steers: Vec<String> = state.steers.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
@@ -486,10 +497,11 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
 async fn start_mcp_server(
     tools: Vec<NativeToolDefinition>,
     steers: SteerQueue,
+    served: ServedResults,
 ) -> Result<(String, mpsc::UnboundedReceiver<McpCall>), String> {
     let (calls, rx) = mpsc::unbounded_channel();
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let state = McpState { token: token.clone(), tools, calls, steers };
+    let state = McpState { token: token.clone(), tools, calls, steers, served };
     let app = Router::new()
         .route(
             "/mcp/{token}",
@@ -731,7 +743,8 @@ impl CodingHarness {
         bridge_tools.extend(meta_defs);
         let guide = tool_guide(&bridge_tools);
         let steers: SteerQueue = Default::default();
-        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone()).await.map_err(ToolError::msg)?;
+        let served: ServedResults = Default::default();
+        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone(), served.clone()).await.map_err(ToolError::msg)?;
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<CliLine>();
         let mut process: Option<CliProcess> = None;
         let mut generation = 0u64;
@@ -741,9 +754,8 @@ impl CodingHarness {
         if kind == CliKind::Antigravity {
             session.tool_guide = guide;
         }
-        let mut parse = CliParse::default();
+        let mut parse = CliParse { served, ..Default::default() };
         let mut pending_approval: Option<McpCall> = None;
-        let mut pending_question: Option<McpCall> = None;
         let mut approval_index = 0usize;
         let mut running = FuturesUnordered::new();
         let mut outbox: Vec<String> = Vec::new();
@@ -816,9 +828,21 @@ impl CodingHarness {
                             if text.is_empty() {
                                 continue;
                             }
-                            if let Some(call) = pending_question.take() {
+                            if state.pending_question.is_some() {
+                                let mid_turn = state.status == HarnessStatus::Running && process.is_some();
+                                state.status = HarnessStatus::WaitingForInput;
                                 self.accept_user_message(&mut state, &mut vars, text.clone()).await;
-                                let _ = call.reply.send(json!({"schema_version": 1, "status": "success", "data": {"answer": text}}));
+                                let answer = match state.messages.last() {
+                                    Some(HarnessMessage::User { content }) => content.clone(),
+                                    _ => text,
+                                };
+                                if mid_turn && kind == CliKind::Antigravity {
+                                    if let Ok(mut queue) = steers.lock() {
+                                        queue.push(answer);
+                                    }
+                                } else {
+                                    outbox.push(answer);
+                                }
                             } else if state.status == HarnessStatus::Running {
                                 state.events.push(HarnessEvent::Steer { text: text.clone() });
                                 state.messages.push(HarnessMessage::User { content: text.clone() });
@@ -859,7 +883,6 @@ impl CodingHarness {
                             generation += 1;
                             running.clear();
                             pending_approval = None;
-                            pending_question = None;
                             state.pending_question = None;
                             if let Some(s) = sink.as_ref() {
                                 StreamBuffer::clear(s);
@@ -894,6 +917,9 @@ impl CodingHarness {
                             };
                             if finished {
                                 session.mark_synced(state.messages.len());
+                                if state.pending_question.is_some() {
+                                    state.status = HarnessStatus::WaitingForInput;
+                                }
                                 if kind == CliKind::Antigravity {
                                     crate::antigravity::refresh_quota_if_stale(300);
                                 }
@@ -957,8 +983,14 @@ impl CodingHarness {
                             Ok(questions) => {
                                 state.pending_question = Some(questions.clone());
                                 state.events.push(HarnessEvent::UserQuestion { questions });
-                                state.status = HarnessStatus::WaitingForInput;
-                                pending_question = Some(call);
+                                let _ = call.reply.send(json!({
+                                    "schema_version": 1,
+                                    "status": "success",
+                                    "data": {
+                                        "asked": true,
+                                        "note": "The question is on the user's screen. End your turn now: make no more tool calls and don't guess the answer. Their reply arrives as your next message, starting with [answer].",
+                                    }
+                                }));
                                 self.persist(&mut state, &lanes).await?;
                             }
                             Err(message) => {
@@ -1115,7 +1147,13 @@ impl CodingHarness {
                             state.events.push(HarnessEvent::ToolCall { tool_name: name.clone(), arguments });
                             changed = true;
                         }
+                        let own = if mcp && matches!(done, Some("DONE") | Some("ERROR")) {
+                            parse.served.lock().ok().and_then(|mut served| served.get_mut(&name).and_then(|q| q.pop_front()))
+                        } else {
+                            None
+                        };
                         let result = match done {
+                            Some(_) if own.is_some() => own.unwrap_or_default(),
                             Some("DONE") => {
                                 let output = info.get("output").and_then(Value::as_str).unwrap_or("").to_string();
                                 serde_json::Deserializer::from_str(output.trim_start())
