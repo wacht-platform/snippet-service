@@ -1164,13 +1164,18 @@ async fn usage_summary(State(d): State<Shared>, Query(q): Query<UsageQuery>) -> 
         .into_iter()
         .collect();
     let chatgpt_rate = crate::chatgpt::read_global_usage().filter(|rate| rate.is_reported());
+    let claude_rate = crate::harness::claude_rate_limits().filter(|rate| rate.is_reported());
+    crate::antigravity::refresh_quota_if_stale(300);
+    let agy_quota = crate::antigravity::cached_quota().map(|(_, groups)| groups).unwrap_or_default();
     let mut order: Vec<String> = Vec::new();
     let mut providers: HashMap<String, serde_json::Value> = HashMap::new();
     for row in totals {
         let entry = providers.entry(row.provider.clone()).or_insert_with(|| {
             order.push(row.provider.clone());
-            let rate_limits = match (&chatgpt_rate, row.provider.as_str()) {
-                (Some(rate), "chatgpt") => vec![serde_json::to_value(rate).unwrap_or_default()],
+            let rate_limits: Vec<serde_json::Value> = match row.provider.as_str() {
+                "chatgpt" => chatgpt_rate.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect(),
+                "claude-code" => claude_rate.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect(),
+                "antigravity" => agy_quota.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect(),
                 _ => Vec::new(),
             };
             serde_json::json!({

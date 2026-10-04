@@ -477,6 +477,8 @@ pub struct RateLimitSnapshot {
     pub primary: Option<RateLimitWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary: Option<RateLimitWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]

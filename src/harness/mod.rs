@@ -851,7 +851,7 @@ mod transcript;
 use guards::*;
 use live_context::*;
 use prompts::*;
-pub use cli_agent::{CliAgentModel, cli_agent_status};
+pub use cli_agent::{CliAgentModel, claude_rate_limits, cli_agent_status};
 pub use state::*;
 use transcript::*;
 
