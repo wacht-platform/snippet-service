@@ -751,6 +751,7 @@ impl CodingHarness {
         let kind = CliKind::of(&profile.provider);
         let session_key = self.session_id().unwrap_or_else(|| "main".to_string());
         let mut session = CliSession::open(kind, &session_key, self.config.resume);
+        let mut last_mode_line = String::new();
         if kind == CliKind::Antigravity {
             session.tool_guide = guide;
         }
@@ -796,6 +797,15 @@ impl CodingHarness {
                     }
                 }
                 if let Some(p) = process.as_mut() {
+                    if session_key == crate::mission_control::SESSION_ID {
+                        let mode = crate::mission_autonomy::mode_line();
+                        if mode != last_mode_line
+                            && let Some(first) = outbox.first_mut()
+                        {
+                            *first = format!("<system-reminder>{mode}</system-reminder>\n\n{first}");
+                            last_mode_line = mode;
+                        }
+                    }
                     let prior_end = state.messages.len().saturating_sub(outbox.len());
                     if prior_end > session.synced.max(1)
                         && let Some(context) = missed_context(&state.messages[session.synced.max(1)..prior_end])
