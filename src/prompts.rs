@@ -135,7 +135,12 @@ pub fn mission_control_system_prompt() -> String {
     // Orchestrator only. Do not stack CODING_AGENT_LAYER — its
     // identities ("full filesystem", "own the task end to end") made Mission
     // Control advertise as a general engineer and skip list_sessions.
-    MISSION_CONTROL_LAYER.to_string()
+    let brief = crate::mission_duty::read_brief();
+    if brief.trim().is_empty() {
+        MISSION_CONTROL_LAYER.to_string()
+    } else {
+        format!("{}\n\n## Your brief (as of this session's start)\n\n{}", MISSION_CONTROL_LAYER.trim_end(), brief.trim())
+    }
 }
 
 /// The normal shared session contract plus a bounded researched identity.

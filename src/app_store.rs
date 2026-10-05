@@ -169,6 +169,25 @@ impl Store {
         })
     }
 
+    pub fn load_duty_json(&self) -> Result<Option<String>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare("SELECT state_json FROM mission_duty WHERE id = 1")?;
+            let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            Ok(rows.next().transpose()?)
+        })
+    }
+
+    pub fn save_duty_json(&self, json: &str) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO mission_duty (id, state_json) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET state_json = excluded.state_json",
+                params![json],
+            )?;
+            Ok(())
+        })
+    }
+
     // ---- recurring jobs ---------------------------------------------------
 
     pub fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StoreError> {

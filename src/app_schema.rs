@@ -38,6 +38,11 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              notification_policy TEXT NOT NULL
          );
 
+         CREATE TABLE IF NOT EXISTS mission_duty (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             state_json TEXT NOT NULL
+         );
+
          CREATE TABLE IF NOT EXISTS recurring_jobs (
              id TEXT PRIMARY KEY NOT NULL,
              title TEXT NOT NULL,

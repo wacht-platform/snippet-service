@@ -29,6 +29,7 @@ pub fn router() -> Router<Shared> {
         .route("/agents/build", post(build_agent_from_prompt))
         .route("/mission-control/overview", get(overview))
         .route("/mission-control/settings", get(settings).put(update_settings))
+        .route("/mission-control/duty", get(duty).post(update_duty))
         .route("/mission-control/open", post(open))
         .route("/mission-control/tasks", get(tasks).post(create_task))
         .route("/mission-control/tasks/{id}", get(task).put(update_task))
@@ -939,18 +940,19 @@ async fn open(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let home = match mission_control::ensure_home() {
-        Ok(path) => path,
-        Err(error) => return mission_error(error),
-    };
+    match open_mission_control(&d, req.profile).await {
+        Ok((id, home)) => Json(serde_json::json!({ "id": id, "folder": home })).into_response(),
+        Err(error) => mission_error(error),
+    }
+}
+
+pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<String>) -> Result<(String, std::path::PathBuf), String> {
+    let home = mission_control::ensure_home()?;
     let state_path = mission_control::session_state_path();
     let id = mission_control::SESSION_ID.to_string();
     // The conversation lives in the store; its path is only a key.
     let resume = d.store.has_conversation(&id).unwrap_or(false);
-    let profile = req
-        .profile
-        .clone()
-        .or_else(|| read_session_profile(&state_path));
+    let profile = requested_profile.or_else(|| read_session_profile(&state_path));
     write_session_sidecar(
         &state_path,
         &SessionSidecar {
@@ -965,7 +967,8 @@ async fn open(
         workspace
     };
     let mut sessions = d.sessions.lock().await;
-    if !sessions.contains_key(&id) {
+    let alive = sessions.get(&id).is_some_and(|s| !s.join.is_finished());
+    if !alive {
         let handle = start_mission_control_session(
             &cfg,
             state_path,
@@ -985,10 +988,11 @@ async fn open(
             }
         }
     }
+    drop(sessions);
     if let Err(error) = mission_control::set_mission_control_session(&d.mission_control_root, &id) {
         eprintln!("[mission-control] failed to persist active MC session: {error}");
     }
-    Json(serde_json::json!({ "id": id, "folder": home })).into_response()
+    Ok((id, home))
 }
 
 pub fn register_builtin_agents(d: &Shared) {
@@ -1106,6 +1110,76 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
 
 fn tracing_log_dispatch_failure(task_id: &str, error: &str) {
     eprintln!("[mission-control] dispatch {task_id} failed: {error}");
+}
+
+fn duty_view() -> serde_json::Value {
+    let state = crate::mission_duty::load();
+    serde_json::json!({
+        "on": state.settings.on,
+        "round_minutes": state.settings.round_minutes,
+        "quiet_start": state.settings.quiet_start,
+        "quiet_end": state.settings.quiet_end,
+        "in_quiet_hours": crate::mission_duty::in_quiet_hours(&state.settings),
+        "last_round_at": (state.last_round_at > 0).then_some(state.last_round_at),
+        "last_round_summary": state.last_round_summary,
+        "next_round_at": crate::mission_duty::next_round_at(&state),
+        "followups": state.followups,
+        "held_pings": state.held_pings.len(),
+        "pings_sent": state.pings_sent,
+        "has_brief": !crate::mission_duty::read_brief().trim().is_empty(),
+    })
+}
+
+#[derive(Deserialize)]
+struct DutyReq {
+    #[serde(default)]
+    on: Option<bool>,
+    #[serde(default)]
+    round_minutes: Option<u32>,
+    #[serde(default)]
+    quiet_start: Option<String>,
+    #[serde(default)]
+    quiet_end: Option<String>,
+}
+
+async fn duty(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(duty_view()).into_response()
+}
+
+async fn update_duty(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<DutyReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    for clock in [&req.quiet_start, &req.quiet_end].into_iter().flatten() {
+        if !clock.is_empty() && !crate::mission_duty::valid_clock(clock) {
+            return (StatusCode::BAD_REQUEST, format!("quiet hours must be HH:MM, got `{clock}`")).into_response();
+        }
+    }
+    let result = crate::mission_duty::update(|state| {
+        if let Some(on) = req.on {
+            if on && !state.settings.on {
+                state.last_round_at = 0;
+                state.last_digest.clear();
+            }
+            state.settings.on = on;
+        }
+        if let Some(minutes) = req.round_minutes {
+            state.settings.round_minutes = minutes.clamp(crate::mission_duty::MIN_ROUND_MINUTES, 24 * 60);
+        }
+        if let Some(start) = req.quiet_start {
+            state.settings.quiet_start = Some(start).filter(|s| !s.is_empty());
+        }
+        if let Some(end) = req.quiet_end {
+            state.settings.quiet_end = Some(end).filter(|s| !s.is_empty());
+        }
+    });
+    match result {
+        Ok(()) => Json(duty_view()).into_response(),
+        Err(error) => mission_error(error),
+    }
 }
 
 #[derive(Deserialize)]

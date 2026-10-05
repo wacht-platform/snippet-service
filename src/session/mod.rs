@@ -1187,7 +1187,13 @@ fn emit_device_event_with_store(
 fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value> {
     let kind = event.get("kind")?.as_str()?;
     let mut value = event.clone();
-    if matches!(kind, "waiting" | "done" | "error" | "idle") {
+    if matches!(kind, "done" | "idle")
+        && event.get("session").and_then(|s| s.as_str()) == Some(crate::mission_control::SESSION_ID)
+        && crate::mission_duty::is_on()
+    {
+        return None;
+    }
+    if matches!(kind, "waiting" | "done" | "error" | "idle" | "ping") {
         let session = event.get("session")?.as_str()?;
         value["destination"] = serde_json::json!({"type": "session", "id": session});
     } else if kind == "coordination_event" {
