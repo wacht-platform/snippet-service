@@ -154,7 +154,7 @@ fn round_envelope(
     out.push_str(&format!(
         "time: {}\nlast round: {}\n",
         chrono::Local::now().format("%a %d %b %H:%M"),
-        if since == 0 { "never (you just came on duty)".to_string() } else { ago(now - since) }
+        if since == 0 { "never (autonomous mode was just switched on)".to_string() } else { ago(now - since) }
     ));
     if mission_duty::in_quiet_hours(&state.settings) {
         out.push_str("quiet hours: yes — non-urgent pings are held until morning\n");
@@ -231,7 +231,7 @@ fn round_summary(
         parts.push(format!("{} follow-up{} due", due.len(), if due.len() == 1 { "" } else { "s" }));
     }
     if state.last_round_at == 0 {
-        parts.insert(0, "came on duty".to_string());
+        parts.insert(0, "autonomy switched on".to_string());
     }
     parts.join(" · ")
 }
