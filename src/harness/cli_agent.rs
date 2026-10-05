@@ -381,6 +381,14 @@ fn tool_guide(defs: &[NativeToolDefinition]) -> String {
     out
 }
 
+fn vault_names(arguments: &Value) -> Vec<String> {
+    arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .map(|command| crate::vault::Vault::load().referenced_names(command))
+        .unwrap_or_default()
+}
+
 fn error_result(code: &str, message: &str) -> Value {
     json!({"schema_version": 1, "status": "error", "error": {"code": code, "message": message}})
 }
@@ -463,9 +471,13 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
             if state.calls.send(McpCall { name, arguments, reply }).is_err() {
                 return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": "session ended"}}));
             }
-            let value = rx
+            let mut value = rx
                 .await
                 .unwrap_or_else(|_| error_result("interrupted", "The call was interrupted."));
+            let vault = crate::vault::Vault::load();
+            if !vault.is_empty() {
+                vault.scrub_value(&mut value);
+            }
             if let Ok(mut served) = state.served.lock() {
                 let queue = served.entry(name_for_record).or_default();
                 queue.push_back(value.clone());
@@ -759,6 +771,7 @@ impl CodingHarness {
         }
         let mut parse = CliParse { served, ..Default::default() };
         let mut pending_approval: Option<McpCall> = None;
+        let mut pending_vault = false;
         let mut approval_index = 0usize;
         let mut running = FuturesUnordered::new();
         let mut outbox: Vec<String> = Vec::new();
@@ -875,9 +888,10 @@ impl CodingHarness {
                         LoopInput::Approve | LoopInput::ApproveAll | LoopInput::Deny => {
                             let Some(call) = pending_approval.take() else { continue };
                             state.status = HarnessStatus::Running;
-                            if matches!(input, LoopInput::ApproveAll) {
+                            if matches!(input, LoopInput::ApproveAll) && !pending_vault {
                                 state.approval_mode = ApprovalMode::Auto;
                             }
+                            pending_vault = false;
                             if matches!(input, LoopInput::Deny) {
                                 let _ = call.reply.send(error_result(
                                     "user_denied",
@@ -1012,6 +1026,30 @@ impl CodingHarness {
                         name if meta_names.iter().any(|m| m == name) => {
                             let (value, _) = self.dispatch_meta(&mut state, &mut lanes, &mut watches, name, &call.arguments);
                             let _ = call.reply.send(value);
+                            self.persist(&mut state, &lanes).await?;
+                        }
+                        "bash" if !vault_names(&call.arguments).is_empty() => {
+                            let names = vault_names(&call.arguments).join(", ");
+                            if once {
+                                let _ = call.reply.send(error_result(
+                                    "vault_needs_confirmation",
+                                    &format!("Using vault secret(s) [{names}] requires user confirmation, which isn't available in a delegated/headless run. Don't run this here — report that this step needs the secret, so it's done on the main thread where the user can approve it."),
+                                ));
+                                continue;
+                            }
+                            approval_index += 1;
+                            state.events.push(HarnessEvent::ApprovalRequest {
+                                tool_name: "bash".to_string(),
+                                summary: format!(
+                                    "⚠ uses vault secret(s) [{names}] — {}",
+                                    super::prompts::approval_summary("bash", &call.arguments)
+                                ),
+                                index: approval_index,
+                                total: approval_index,
+                            });
+                            state.status = HarnessStatus::WaitingForInput;
+                            pending_approval = Some(call);
+                            pending_vault = true;
                             self.persist(&mut state, &lanes).await?;
                         }
                         name if state.approval_mode == ApprovalMode::Manual && MUTATING_TOOLS.contains(&name) => {
