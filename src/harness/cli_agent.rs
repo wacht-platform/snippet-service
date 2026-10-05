@@ -389,6 +389,15 @@ fn vault_names(arguments: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn unwrap_custom(name: String, arguments: Value) -> (String, Value) {
+    if name != "custom_tool" {
+        return (name, arguments);
+    }
+    let inner = arguments.get("name").and_then(Value::as_str).unwrap_or("custom_tool").to_string();
+    let args = arguments.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    (inner, args)
+}
+
 fn error_result(code: &str, message: &str) -> Value {
     json!({"schema_version": 1, "status": "error", "error": {"code": code, "message": message}})
 }
@@ -754,6 +763,21 @@ impl CodingHarness {
         let meta_defs = self.cli_meta_definitions(once, lanes_enabled);
         let meta_names: Vec<String> = meta_defs.iter().map(|d| d.name.clone()).collect();
         let mut bridge_tools = self.tools.definitions();
+        if self.tools.custom_dir().is_some() {
+            bridge_tools.push(NativeToolDefinition {
+                name: "custom_tool".into(),
+                description: "Run one of your custom tools by name, including one you created or changed during this conversation that isn't in your tool list yet.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "The custom tool's name."},
+                        "arguments": {"type": "object", "description": "Its arguments, as its parameters schema describes."}
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }),
+            });
+        }
         bridge_tools.extend(meta_defs);
         let guide = tool_guide(&bridge_tools);
         let steers: SteerQueue = Default::default();
@@ -772,6 +796,7 @@ impl CodingHarness {
         let mut parse = CliParse { served, ..Default::default() };
         let mut pending_approval: Option<McpCall> = None;
         let mut pending_vault = false;
+        let mut pending_custom: Option<crate::agent_tools::CustomTool> = None;
         let mut approval_index = 0usize;
         let mut running = FuturesUnordered::new();
         let mut outbox: Vec<String> = Vec::new();
@@ -892,6 +917,12 @@ impl CodingHarness {
                                 state.approval_mode = ApprovalMode::Auto;
                             }
                             pending_vault = false;
+                            let custom = pending_custom.take();
+                            if !matches!(input, LoopInput::Deny)
+                                && let (Some(tool), Some(dir)) = (custom.as_ref(), self.tools.custom_dir())
+                            {
+                                crate::agent_tools::approve(dir, tool);
+                            }
                             if matches!(input, LoopInput::Deny) {
                                 let _ = call.reply.send(error_result(
                                     "user_denied",
@@ -1003,7 +1034,49 @@ impl CodingHarness {
                     self.persist(&mut state, &lanes).await?;
                 }
                 call = mcp_rx.recv() => {
-                    let Some(call) = call else { continue };
+                    let Some(mut call) = call else { continue };
+                    if call.name == "custom_tool" {
+                        call.name = call.arguments.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                        call.arguments = call.arguments.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    }
+                    let custom = self
+                        .tools
+                        .custom_dir()
+                        .filter(|_| self.tools.is_custom(&call.name))
+                        .and_then(|dir| crate::agent_tools::prepare(dir, &call.name, &call.arguments));
+                    let custom = match custom {
+                        Some(Err(message)) => {
+                            let _ = call.reply.send(error_result("invalid_arguments", &format!("{}: {message}", call.name)));
+                            continue;
+                        }
+                        Some(Ok(custom)) => Some(custom),
+                        None => None,
+                    };
+                    if let Some(custom) = custom {
+                        let gated = custom.needs_first_approval || !custom.vault.is_empty();
+                        if gated && once {
+                            let _ = call.reply.send(error_result(
+                                "custom_tool_needs_approval",
+                                &format!("The custom tool `{}` needs the user's approval to run (it's new or changed, or uses vault secrets), which isn't available in a delegated/headless run. Report that it needs approving, so it runs on the main thread.", call.name),
+                            ));
+                        } else if gated || state.approval_mode == ApprovalMode::Manual {
+                            approval_index += 1;
+                            state.events.push(HarnessEvent::ApprovalRequest {
+                                tool_name: call.name.clone(),
+                                summary: crate::agent_tools::approval_summary(&custom),
+                                index: approval_index,
+                                total: approval_index,
+                            });
+                            state.status = HarnessStatus::WaitingForInput;
+                            pending_vault = gated;
+                            pending_custom = custom.needs_first_approval.then(|| custom.tool.clone());
+                            pending_approval = Some(call);
+                            self.persist(&mut state, &lanes).await?;
+                        } else {
+                            running.push(self.execute_cli_call(call));
+                        }
+                        continue;
+                    }
                     match call.name.as_str() {
                         "ask_user" => match parse_ask_user(&call.arguments) {
                             Ok(questions) => {
@@ -1188,7 +1261,7 @@ impl CodingHarness {
                         let params = info.get("parameters").cloned().unwrap_or(Value::Null);
                         let mcp = raw == "call_mcp_tool";
                         let (name, arguments) = if mcp {
-                            (
+                            unwrap_custom(
                                 params.get("ToolName").and_then(Value::as_str).unwrap_or("tool").to_string(),
                                 params.get("Arguments").cloned().unwrap_or(Value::Null),
                             )
@@ -1346,15 +1419,15 @@ impl CodingHarness {
                         }
                         Some("tool_use") => {
                             let raw = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                            let name = raw.strip_prefix(MCP_PREFIX).unwrap_or(raw).to_string();
+                            let (name, arguments) = unwrap_custom(
+                                raw.strip_prefix(MCP_PREFIX).unwrap_or(raw).to_string(),
+                                block.get("input").cloned().unwrap_or(Value::Null),
+                            );
                             if let Some(id) = block.get("id").and_then(Value::as_str) {
                                 tool_names.insert(id.to_string(), name.clone());
                             }
                             if !QUIET_TOOLS.contains(&name.as_str()) {
-                                state.events.push(HarnessEvent::ToolCall {
-                                    tool_name: name,
-                                    arguments: block.get("input").cloned().unwrap_or(Value::Null),
-                                });
+                                state.events.push(HarnessEvent::ToolCall { tool_name: name, arguments });
                                 changed = true;
                             }
                         }

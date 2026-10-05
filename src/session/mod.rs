@@ -367,12 +367,17 @@ impl AgentRuntime {
         // attribute turn ownership to the right identity.
         .with_agent_id_opt(identity.map(|(agent_id, _)| agent_id.to_string()));
 
-        let mut tools = coding_tools(i.exa_api_key.clone());
+        let custom_dir = crate::agent_tools::tools_dir(identity.map_or("snippet", |(agent_id, _)| agent_id));
+        if let Some(dir) = custom_dir.as_ref() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut tools = coding_tools(i.exa_api_key.clone()).with_custom_dir(custom_dir.clone());
         crate::mission_tools::add_worker_report_tool(&mut tools);
         tools.insert(crate::mission_tools::CreateRecurringJob);
         crate::coordination_tools::add_coordination_tools(&mut tools);
 
         let prompt_ctx = i.prompt_ctx;
+        let custom_section = custom_dir.as_deref().map(crate::agent_tools::prompt_section);
         let prompt = match identity {
             Some((agent_id, body)) => crate::prompts::specialized_agent_system_prompt(
                 crate::prompts::SpecializedAgentPromptContext {
@@ -382,6 +387,10 @@ impl AgentRuntime {
                 },
             ),
             None => conversation_prompt(&prompt_ctx),
+        };
+        let prompt = match custom_section {
+            Some(section) => format!("{prompt}\n\n{section}"),
+            None => prompt,
         };
 
         let base_model = i.base_model;
