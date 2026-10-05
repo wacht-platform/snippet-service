@@ -172,7 +172,7 @@ impl Tool for ScheduleFollowup {
             "scheduled": true,
             "id": followup.id,
             "in_minutes": minutes,
-            "note": if on { "You'll get a duty round with this note when it's due." } else { "Saved, but you are off duty: it fires only once the user turns duty on." },
+            "note": if on { "You'll get a round with this note when it's due." } else { "Saved, but autonomous mode is off: it fires only once the user switches autonomy on." },
         })))
     }
 }
