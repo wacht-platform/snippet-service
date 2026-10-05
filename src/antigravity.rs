@@ -150,7 +150,10 @@ pub fn prepare_home(key: &str, mcp_url: &str, prompt: &str) -> Result<PathBuf, S
         }
     }
     for (index, chunk) in rule_chunks(prompt).iter().enumerate() {
-        std::fs::write(rules.join(format!("{index:02}-snippet.md")), chunk)
+        std::fs::write(
+            rules.join(format!("{index:02}-snippet.md")),
+            format!("---\ntrigger: always_on\n---\n{chunk}"),
+        )
             .map_err(|e| format!("write rules: {e}"))?;
     }
     Ok(home)

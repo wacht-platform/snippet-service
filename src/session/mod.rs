@@ -950,7 +950,8 @@ pub fn park_failed_session_work(id: &str, prev_status: &str, state: &HarnessStat
         .lanes
         .iter()
         .any(|lane| lane.status == crate::lanes::LaneStatus::Running);
-    if status == "idle" && prev_status == "running" && !lanes_running {
+    let waiting_on_watch = !state.watches.is_empty();
+    if status == "idle" && prev_status == "running" && !lanes_running && !waiting_on_watch {
         if let Some(store) = store_for_sessions() {
             let _ = store.flag_unreported_tasks(id, &chrono::Utc::now().to_rfc3339());
         }
