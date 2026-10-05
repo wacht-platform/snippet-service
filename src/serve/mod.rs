@@ -41,7 +41,7 @@ pub(crate) use config_routes::*;
 mod coordination;
 pub use coordination::{COORDINATION_THREAD, queue_coordination_wake};
 mod direct;
-mod duty;
+mod autonomy;
 mod fs;
 mod git;
 mod lifecycle;
@@ -721,7 +721,7 @@ pub async fn run_serve(
     }
     {
         let d = daemon.clone();
-        tokio::spawn(async move { duty::duty_loop(d).await });
+        tokio::spawn(async move { autonomy::autonomy_loop(d).await });
     }
     {
         let d = daemon.clone();

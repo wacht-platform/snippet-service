@@ -29,7 +29,7 @@ pub fn router() -> Router<Shared> {
         .route("/agents/build", post(build_agent_from_prompt))
         .route("/mission-control/overview", get(overview))
         .route("/mission-control/settings", get(settings).put(update_settings))
-        .route("/mission-control/duty", get(duty).post(update_duty))
+        .route("/mission-control/autonomy", get(autonomy).post(update_autonomy))
         .route("/mission-control/open", post(open))
         .route("/mission-control/tasks", get(tasks).post(create_task))
         .route("/mission-control/tasks/{id}", get(task).put(update_task))
@@ -1112,26 +1112,26 @@ fn tracing_log_dispatch_failure(task_id: &str, error: &str) {
     eprintln!("[mission-control] dispatch {task_id} failed: {error}");
 }
 
-fn duty_view() -> serde_json::Value {
-    let state = crate::mission_duty::load();
+fn autonomy_view() -> serde_json::Value {
+    let state = crate::mission_autonomy::load();
     serde_json::json!({
         "on": state.settings.on,
         "round_minutes": state.settings.round_minutes,
         "quiet_start": state.settings.quiet_start,
         "quiet_end": state.settings.quiet_end,
-        "in_quiet_hours": crate::mission_duty::in_quiet_hours(&state.settings),
+        "in_quiet_hours": crate::mission_autonomy::in_quiet_hours(&state.settings),
         "last_round_at": (state.last_round_at > 0).then_some(state.last_round_at),
         "last_round_summary": state.last_round_summary,
-        "next_round_at": crate::mission_duty::next_round_at(&state),
+        "next_round_at": crate::mission_autonomy::next_round_at(&state),
         "followups": state.followups,
         "held_pings": state.held_pings.len(),
         "pings_sent": state.pings_sent,
-        "has_brief": !crate::mission_duty::read_brief().trim().is_empty(),
+        "has_brief": !crate::mission_autonomy::read_brief().trim().is_empty(),
     })
 }
 
 #[derive(Deserialize)]
-struct DutyReq {
+struct AutonomyReq {
     #[serde(default)]
     on: Option<bool>,
     #[serde(default)]
@@ -1142,23 +1142,23 @@ struct DutyReq {
     quiet_end: Option<String>,
 }
 
-async fn duty(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+async fn autonomy(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    Json(duty_view()).into_response()
+    Json(autonomy_view()).into_response()
 }
 
-async fn update_duty(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<DutyReq>) -> Response {
+async fn update_autonomy(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<AutonomyReq>) -> Response {
     if !d.authed(&a.token) {
         return unauthorized();
     }
     for clock in [&req.quiet_start, &req.quiet_end].into_iter().flatten() {
-        if !clock.is_empty() && !crate::mission_duty::valid_clock(clock) {
+        if !clock.is_empty() && !crate::mission_autonomy::valid_clock(clock) {
             return (StatusCode::BAD_REQUEST, format!("quiet hours must be HH:MM, got `{clock}`")).into_response();
         }
     }
-    let result = crate::mission_duty::update(|state| {
+    let result = crate::mission_autonomy::update(|state| {
         if let Some(on) = req.on {
             if on && !state.settings.on {
                 state.last_round_at = 0;
@@ -1167,7 +1167,7 @@ async fn update_duty(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
             state.settings.on = on;
         }
         if let Some(minutes) = req.round_minutes {
-            state.settings.round_minutes = minutes.clamp(crate::mission_duty::MIN_ROUND_MINUTES, 24 * 60);
+            state.settings.round_minutes = minutes.clamp(crate::mission_autonomy::MIN_ROUND_MINUTES, 24 * 60);
         }
         if let Some(start) = req.quiet_start {
             state.settings.quiet_start = Some(start).filter(|s| !s.is_empty());
@@ -1177,7 +1177,7 @@ async fn update_duty(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): 
         }
     });
     match result {
-        Ok(()) => Json(duty_view()).into_response(),
+        Ok(()) => Json(autonomy_view()).into_response(),
         Err(error) => mission_error(error),
     }
 }

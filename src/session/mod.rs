@@ -1189,7 +1189,7 @@ fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value
     let mut value = event.clone();
     if matches!(kind, "done" | "idle")
         && event.get("session").and_then(|s| s.as_str()) == Some(crate::mission_control::SESSION_ID)
-        && crate::mission_duty::is_on()
+        && crate::mission_autonomy::is_on()
     {
         return None;
     }

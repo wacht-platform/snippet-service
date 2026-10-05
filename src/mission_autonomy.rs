@@ -10,7 +10,7 @@ pub const MIN_ROUND_MINUTES: u32 = 10;
 const MAX_REMEMBERED_QUESTIONS: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DutySettings {
+pub struct AutonomySettings {
     #[serde(default)]
     pub on: bool,
     #[serde(default = "default_round_minutes")]
@@ -25,7 +25,7 @@ fn default_round_minutes() -> u32 {
     30
 }
 
-impl Default for DutySettings {
+impl Default for AutonomySettings {
     fn default() -> Self {
         Self {
             on: false,
@@ -52,9 +52,9 @@ pub struct HeldPing {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct DutyState {
+pub struct AutonomyState {
     #[serde(default)]
-    pub settings: DutySettings,
+    pub settings: AutonomySettings,
     #[serde(default)]
     pub last_round_at: i64,
     #[serde(default)]
@@ -99,20 +99,20 @@ fn store() -> Result<Store, String> {
     Store::open_cached(crate::store::default_db_path()).map_err(|e| e.to_string())
 }
 
-pub fn load() -> DutyState {
+pub fn load() -> AutonomyState {
     store()
         .ok()
-        .and_then(|s| s.load_duty_json().ok().flatten())
+        .and_then(|s| s.load_autonomy_json().ok().flatten())
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-pub fn save(state: &DutyState) -> Result<(), String> {
+pub fn save(state: &AutonomyState) -> Result<(), String> {
     let raw = serde_json::to_string(state).map_err(|e| e.to_string())?;
-    store()?.save_duty_json(&raw).map_err(|e| e.to_string())
+    store()?.save_autonomy_json(&raw).map_err(|e| e.to_string())
 }
 
-pub fn update<T>(f: impl FnOnce(&mut DutyState) -> T) -> Result<T, String> {
+pub fn update<T>(f: impl FnOnce(&mut AutonomyState) -> T) -> Result<T, String> {
     let mut state = load();
     let out = f(&mut state);
     save(&state)?;
@@ -147,7 +147,7 @@ pub fn valid_clock(value: &str) -> bool {
     parse_clock(Some(value)).is_some()
 }
 
-pub fn in_quiet_hours(settings: &DutySettings) -> bool {
+pub fn in_quiet_hours(settings: &AutonomySettings) -> bool {
     let (Some(start), Some(end)) = (
         parse_clock(settings.quiet_start.as_deref()),
         parse_clock(settings.quiet_end.as_deref()),
@@ -254,7 +254,7 @@ pub fn remember_question(key: &str) -> bool {
     .unwrap_or(false)
 }
 
-pub fn next_round_at(state: &DutyState) -> Option<i64> {
+pub fn next_round_at(state: &AutonomyState) -> Option<i64> {
     state
         .settings
         .on

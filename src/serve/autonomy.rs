@@ -8,22 +8,22 @@ use super::Shared;
 use crate::coordination::TaskStatus;
 use crate::harness::{HarnessStatus, LoopInput};
 use crate::mission_control::SESSION_ID;
-use crate::mission_duty;
+use crate::mission_autonomy;
 
 const TICK: Duration = Duration::from_secs(5);
 const STALL_SECS: i64 = 20 * 60;
 
-pub async fn duty_loop(daemon: Shared) {
+pub async fn autonomy_loop(daemon: Shared) {
     loop {
         tokio::time::sleep(TICK).await;
-        for queued in mission_duty::take_answers() {
+        for queued in mission_autonomy::take_answers() {
             daemon.deliver(&queued.session_id, LoopInput::Answer(queued.answer)).await;
         }
-        let state = mission_duty::load();
+        let state = mission_autonomy::load();
         if !state.settings.on {
             continue;
         }
-        mission_duty::release_held_pings();
+        mission_autonomy::release_held_pings();
         wake_for_worker_questions(&daemon).await;
         if mission_control_busy() {
             continue;
@@ -31,18 +31,18 @@ pub async fn duty_loop(daemon: Shared) {
         let now = chrono::Utc::now().timestamp();
         let tasks = daemon.store.list_tasks(None, None).unwrap_or_default();
         let digest = board_digest(&tasks);
-        let due = mission_duty::take_due_followups(now);
-        let interval_due = mission_duty::next_round_at(&state).is_some_and(|at| now >= at);
+        let due = mission_autonomy::take_due_followups(now);
+        let interval_due = mission_autonomy::next_round_at(&state).is_some_and(|at| now >= at);
         let changed = digest != state.last_digest;
         if due.is_empty() && !(interval_due && (changed || state.last_round_at == 0)) {
             if interval_due {
-                let _ = mission_duty::update(|s| s.last_round_at = now);
+                let _ = mission_autonomy::update(|s| s.last_round_at = now);
             }
             continue;
         }
         let envelope = round_envelope(&tasks, &state, &due, now);
         let summary = round_summary(&tasks, &state, &due);
-        let _ = mission_duty::update(|s| {
+        let _ = mission_autonomy::update(|s| {
             s.last_round_at = now;
             s.last_digest = digest;
             s.last_round_summary = Some(summary);
@@ -53,7 +53,7 @@ pub async fn duty_loop(daemon: Shared) {
 
 async fn deliver_to_mission_control(daemon: &Shared, text: String) {
     if let Err(error) = super::mission_control::open_mission_control(daemon, None).await {
-        eprintln!("[duty] could not open Mission Control: {error}");
+        eprintln!("[autonomy] could not open Mission Control: {error}");
         return;
     }
     daemon.deliver(SESSION_ID, LoopInput::UserMessage(text)).await;
@@ -128,7 +128,7 @@ async fn wake_for_worker_questions(daemon: &Shared) {
         let mut hasher = DefaultHasher::new();
         question.to_string().hash(&mut hasher);
         let key = format!("{}:{:x}", task.session_id, hasher.finish());
-        if !mission_duty::remember_question(&key) {
+        if !mission_autonomy::remember_question(&key) {
             continue;
         }
         let text = format!(
@@ -145,18 +145,18 @@ async fn wake_for_worker_questions(daemon: &Shared) {
 
 fn round_envelope(
     tasks: &[crate::coordination::Task],
-    state: &mission_duty::DutyState,
-    due: &[mission_duty::Followup],
+    state: &mission_autonomy::AutonomyState,
+    due: &[mission_autonomy::Followup],
     now: i64,
 ) -> String {
     let since = state.last_round_at;
-    let mut out = String::from("[duty_round]\n");
+    let mut out = String::from("[autonomous_round]\n");
     out.push_str(&format!(
         "time: {}\nlast round: {}\n",
         chrono::Local::now().format("%a %d %b %H:%M"),
         if since == 0 { "never (autonomous mode was just switched on)".to_string() } else { ago(now - since) }
     ));
-    if mission_duty::in_quiet_hours(&state.settings) {
+    if mission_autonomy::in_quiet_hours(&state.settings) {
         out.push_str("quiet hours: yes — non-urgent pings are held until morning\n");
     }
 
@@ -197,7 +197,7 @@ fn round_envelope(
             out.push_str(&format!("- {}\n", f.note));
         }
     }
-    let upcoming: Vec<&mission_duty::Followup> = state
+    let upcoming: Vec<&mission_autonomy::Followup> = state
         .followups
         .iter()
         .filter(|f| !due.iter().any(|d| d.id == f.id))
@@ -209,21 +209,21 @@ fn round_envelope(
         }
     }
 
-    let brief = mission_duty::read_brief();
+    let brief = mission_autonomy::read_brief();
     out.push_str("\n\n## Your brief\n");
     out.push_str(if brief.trim().is_empty() {
         "(empty — start one with update_brief: the user's goals, priorities, preferences and open threads)"
     } else {
         brief.trim()
     });
-    out.push_str("\n[/duty_round]");
+    out.push_str("\n[/autonomous_round]");
     out
 }
 
 fn round_summary(
     tasks: &[crate::coordination::Task],
-    state: &mission_duty::DutyState,
-    due: &[mission_duty::Followup],
+    state: &mission_autonomy::AutonomyState,
+    due: &[mission_autonomy::Followup],
 ) -> String {
     let open = tasks.iter().filter(|t| !t.status.is_terminal()).count();
     let mut parts = vec![format!("{open} open task{}", if open == 1 { "" } else { "s" })];

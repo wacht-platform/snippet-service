@@ -38,7 +38,7 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              notification_policy TEXT NOT NULL
          );
 
-         CREATE TABLE IF NOT EXISTS mission_duty (
+         CREATE TABLE IF NOT EXISTS mission_autonomy (
              id INTEGER PRIMARY KEY CHECK (id = 1),
              state_json TEXT NOT NULL
          );
@@ -86,5 +86,17 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              created_at INTEGER NOT NULL
          );
 "#,
-    )
+    )?;
+    let legacy: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mission_duty')",
+        [],
+        |row| row.get(0),
+    )?;
+    if legacy {
+        connection.execute_batch(
+            "INSERT OR IGNORE INTO mission_autonomy (id, state_json) SELECT id, state_json FROM mission_duty;
+             DROP TABLE mission_duty;",
+        )?;
+    }
+    Ok(())
 }

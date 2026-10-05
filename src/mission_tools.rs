@@ -107,7 +107,7 @@ impl Tool for AnswerWorker {
         if args.answer.trim().is_empty() {
             return Err(ToolError::msg("answer must not be empty"));
         }
-        crate::mission_duty::queue_answer(&session, args.answer.trim()).map_err(ToolError::msg)?;
+        crate::mission_autonomy::queue_answer(&session, args.answer.trim()).map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({"queued": true, "note": "The worker receives it within a few seconds and continues."})))
     }
 }
@@ -132,10 +132,10 @@ impl Tool for UpdateBrief {
         let args: UpdateBriefArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         match args.content {
             Some(content) => {
-                crate::mission_duty::write_brief(content.trim()).map_err(ToolError::msg)?;
+                crate::mission_autonomy::write_brief(content.trim()).map_err(ToolError::msg)?;
                 Ok(ToolResult::success(json!({"saved": true, "chars": content.trim().len()})))
             }
-            None => Ok(ToolResult::success(json!({"brief": crate::mission_duty::read_brief()}))),
+            None => Ok(ToolResult::success(json!({"brief": crate::mission_autonomy::read_brief()}))),
         }
     }
 }
@@ -152,7 +152,7 @@ impl Tool for ScheduleFollowup {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "schedule_followup".into(),
-            description: "Ask to be woken later about something specific: check a worker's progress, verify a result, remind the user, revisit a decision. You get a duty round with this note when it's due. Use it instead of waiting or polling.".into(),
+            description: "Ask to be woken later about something specific: check a worker's progress, verify a result, remind the user, revisit a decision. You get a round with this note when it's due. Use it instead of waiting or polling.".into(),
             input_schema: schema(json!({
                 "in_minutes": {"type": "integer", "description": "How many minutes from now (1 to 10080)."},
                 "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."}
@@ -166,8 +166,8 @@ impl Tool for ScheduleFollowup {
         }
         let minutes = args.in_minutes.clamp(1, 10080);
         let due_at = chrono::Utc::now().timestamp() + minutes * 60;
-        let followup = crate::mission_duty::schedule_followup(due_at, args.note.trim()).map_err(ToolError::msg)?;
-        let on = crate::mission_duty::is_on();
+        let followup = crate::mission_autonomy::schedule_followup(due_at, args.note.trim()).map_err(ToolError::msg)?;
+        let on = crate::mission_autonomy::is_on();
         Ok(ToolResult::success(json!({
             "scheduled": true,
             "id": followup.id,
@@ -202,7 +202,7 @@ impl Tool for PingUser {
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: PingUserArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         let kind = args.kind.as_deref().unwrap_or("update");
-        let outcome = crate::mission_duty::ping(args.title.trim(), args.message.trim(), kind).map_err(ToolError::msg)?;
+        let outcome = crate::mission_autonomy::ping(args.title.trim(), args.message.trim(), kind).map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({
             "ping": outcome,
             "note": if outcome == "held" { "Quiet hours: held until morning." } else { "Sent to the user's phone." },
