@@ -645,7 +645,8 @@ async fn run_lane(
             return Err(message);
         }
     };
-    let mut tools = coding_tools(exa_api_key.clone());
+    let mut tools = coding_tools(exa_api_key.clone())
+        .with_custom_dir(crate::agent_tools::tools_dir(agent.as_deref().unwrap_or("snippet")));
     if read_only {
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.

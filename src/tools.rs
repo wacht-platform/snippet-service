@@ -365,6 +365,7 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Box<dyn Tool>>,
+    custom_dir: Option<PathBuf>,
 }
 
 impl ToolRegistry {
@@ -380,8 +381,33 @@ impl ToolRegistry {
         self.tools.insert(name, Box::new(tool));
     }
 
+    pub fn with_custom_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.custom_dir = dir;
+        self
+    }
+
+    pub fn custom_dir(&self) -> Option<&Path> {
+        self.custom_dir.as_deref().filter(|_| self.tools.contains_key("bash"))
+    }
+
+    fn custom_tools(&self) -> Vec<crate::agent_tools::CustomTool> {
+        self.custom_dir()
+            .map(crate::agent_tools::load)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tool| !self.tools.contains_key(&tool.name))
+            .collect()
+    }
+
     pub fn definitions(&self) -> Vec<NativeToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        let mut defs: Vec<NativeToolDefinition> =
+            self.tools.values().map(|tool| tool.definition()).collect();
+        defs.extend(self.custom_tools().iter().map(crate::agent_tools::definition));
+        defs
+    }
+
+    pub fn is_custom(&self, name: &str) -> bool {
+        !self.tools.contains_key(name) && self.custom_tools().iter().any(|t| t.name == name)
     }
 
     /// Remove a tool by name (used to derive scoped registries, e.g. read-only
@@ -391,7 +417,7 @@ impl ToolRegistry {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.contains_key(name) || self.is_custom(name)
     }
 
     pub async fn execute(
@@ -400,12 +426,35 @@ impl ToolRegistry {
         name: &str,
         arguments: Value,
     ) -> Result<ToolResult, ToolError> {
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let tool = match self.tools.get(name) {
+            Some(tool) => tool,
+            None => return self.execute_custom(ctx, name, arguments).await,
+        };
         let mut result = tool.execute(ctx, arguments).await?;
         result.value = bound_tool_output(ctx, name, result.value);
+        Ok(result)
+    }
+
+    async fn execute_custom(
+        &self,
+        ctx: &ToolContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolResult, ToolError> {
+        let dir = self.custom_dir().ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let call = crate::agent_tools::prepare(dir, name, &arguments)
+            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?
+            .map_err(|e| ToolError::msg(format!("{name}: {e}")))?;
+        if call.needs_first_approval {
+            return Err(ToolError::msg(format!(
+                "custom tool `{name}` is new or changed and hasn't been approved by the user yet"
+            )));
+        }
+        let bash = self.tools.get("bash").ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let mut result = bash.execute(ctx, crate::agent_tools::bash_arguments(&call)).await?;
+        if let Some(data) = result.value.get_mut("data").and_then(Value::as_object_mut) {
+            data.insert("custom_tool".into(), Value::String(name.to_string()));
+        }
         Ok(result)
     }
 }

@@ -378,15 +378,37 @@ impl CodingHarness {
         // explicit user confirmation, regardless of approval mode or a prior
         // Approve-All. A delegated / headless run has no user to confirm, so it is
         // denied there — the step must run on the interactive thread.
+        let custom = self
+            .tools
+            .custom_dir()
+            .filter(|_| self.tools.is_custom(&tool_name))
+            .and_then(|dir| crate::agent_tools::prepare(dir, &tool_name, &call.arguments))
+            .and_then(Result::ok);
         let vault_secrets_used: Vec<String> = if tool_name == "bash" {
             call.arguments
                 .get("command")
                 .and_then(Value::as_str)
                 .map(|c| crate::vault::Vault::load().referenced_names(c))
                 .unwrap_or_default()
+        } else if let Some(custom) = custom.as_ref() {
+            custom.vault.clone()
         } else {
             Vec::new()
         };
+        let first_run = custom.as_ref().is_some_and(|c| c.needs_first_approval);
+        if first_run && !conversation_mode {
+            let result = json!({
+                "schema_version": 1,
+                "status": "error",
+                "error": {
+                    "code": "custom_tool_needs_approval",
+                    "message": format!("The custom tool `{tool_name}` is new or changed and needs the user's approval before its first run, which isn't available in a delegated/headless run. Report that it needs approving, so it's run once on the main thread.")
+                }
+            });
+            answer_call(state, &tool_name, &call_id, result);
+            let _ = self.persist(state, lanes).await;
+            return None;
+        }
         if !vault_secrets_used.is_empty() && !conversation_mode {
             let result = json!({
                 "schema_version": 1,
@@ -403,25 +425,25 @@ impl CodingHarness {
             let _ = self.persist(state, lanes).await;
             return None;
         }
-        let force_vault_approval = !vault_secrets_used.is_empty();
+        let force_vault_approval = !vault_secrets_used.is_empty() || first_run;
 
         // Manual mode (or any vault-secret call): pause for the user's decision.
         if force_vault_approval
             || (state.approval_mode == ApprovalMode::Manual
-                && MUTATING_TOOLS.contains(&tool_name.as_str()))
+                && (MUTATING_TOOLS.contains(&tool_name.as_str()) || custom.is_some()))
         {
             *approval_index += 1;
             // Discard stale decisions queued before this prompt existed — an
             // unconsumed leftover would instantly "approve" an unseen action.
             while approval_rx.try_recv().is_ok() {}
-            let summary = if force_vault_approval {
-                format!(
+            let summary = match custom.as_ref() {
+                Some(custom) => crate::agent_tools::approval_summary(custom),
+                None if force_vault_approval => format!(
                     "⚠ uses vault secret(s) [{}] — {}",
                     vault_secrets_used.join(", "),
                     approval_summary(&tool_name, &call.arguments)
-                )
-            } else {
-                approval_summary(&tool_name, &call.arguments)
+                ),
+                None => approval_summary(&tool_name, &call.arguments),
             };
             state.events.push(HarnessEvent::ApprovalRequest {
                 tool_name: tool_name.clone(),
@@ -442,6 +464,12 @@ impl CodingHarness {
                 decision,
                 Some(ApprovalDecision::Approve | ApprovalDecision::ApproveAll)
             );
+            if approved
+                && let (Some(custom), Some(dir)) = (custom.as_ref(), self.tools.custom_dir())
+                && custom.needs_first_approval
+            {
+                crate::agent_tools::approve(dir, &custom.tool);
+            }
             if !approved {
                 let result = json!({
                     "schema_version": 1,
