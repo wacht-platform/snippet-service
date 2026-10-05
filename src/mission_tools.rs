@@ -70,6 +70,144 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ArchiveMissionSession);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
+    registry.insert(UpdateBrief);
+    registry.insert(ScheduleFollowup);
+    registry.insert(PingUser);
+    registry.insert(AnswerWorker);
+}
+
+#[derive(Deserialize)]
+struct AnswerWorkerArgs {
+    session_id: String,
+    answer: String,
+}
+
+pub struct AnswerWorker;
+#[async_trait]
+impl Tool for AnswerWorker {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "answer_worker".into(),
+            description: "Answer the question a worker session is paused on, as if the user answered it there. Use it for a [worker_question] the brief, the task or the conversation already settles. Name the choice plainly and add a sentence of why when it helps.".into(),
+            input_schema: schema(json!({
+                "session_id": {"type": "string", "description": "The waiting session's id, from the [worker_question]."},
+                "answer": {"type": "string", "description": "The answer, e.g. \"Blue — the user wants colour files blue.\""}
+            }), &["session_id", "answer"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AnswerWorkerArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let session = args.session_id.trim().trim_start_matches("session:").to_string();
+        let waiting = crate::session::state_path_for_id(&session)
+            .and_then(|path| crate::session::read_session_state(&path))
+            .is_some_and(|state| state.status == crate::harness::HarnessStatus::WaitingForInput && state.pending_question.is_some());
+        if !waiting {
+            return Err(ToolError::msg(format!("session `{session}` isn't waiting on a question right now")));
+        }
+        if args.answer.trim().is_empty() {
+            return Err(ToolError::msg("answer must not be empty"));
+        }
+        crate::mission_duty::queue_answer(&session, args.answer.trim()).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"queued": true, "note": "The worker receives it within a few seconds and continues."})))
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateBriefArgs {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+pub struct UpdateBrief;
+#[async_trait]
+impl Tool for UpdateBrief {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "update_brief".into(),
+            description: "Read or rewrite your standing brief: the durable memory you keep across rounds and long conversations. Keep it current and compact (markdown): the user's goals and priorities, how they like to work, decisions they made, open threads, and what you are watching for. Omit content to read it; pass content to replace it whole.".into(),
+            input_schema: schema(json!({"content": {"type": "string", "description": "The full new brief. Omit to read the current one."}}), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: UpdateBriefArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        match args.content {
+            Some(content) => {
+                crate::mission_duty::write_brief(content.trim()).map_err(ToolError::msg)?;
+                Ok(ToolResult::success(json!({"saved": true, "chars": content.trim().len()})))
+            }
+            None => Ok(ToolResult::success(json!({"brief": crate::mission_duty::read_brief()}))),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ScheduleFollowupArgs {
+    in_minutes: i64,
+    note: String,
+}
+
+pub struct ScheduleFollowup;
+#[async_trait]
+impl Tool for ScheduleFollowup {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "schedule_followup".into(),
+            description: "Ask to be woken later about something specific: check a worker's progress, verify a result, remind the user, revisit a decision. You get a duty round with this note when it's due. Use it instead of waiting or polling.".into(),
+            input_schema: schema(json!({
+                "in_minutes": {"type": "integer", "description": "How many minutes from now (1 to 10080)."},
+                "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."}
+            }), &["in_minutes", "note"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ScheduleFollowupArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        if args.note.trim().is_empty() {
+            return Err(ToolError::msg("note must say what to do when the follow-up is due"));
+        }
+        let minutes = args.in_minutes.clamp(1, 10080);
+        let due_at = chrono::Utc::now().timestamp() + minutes * 60;
+        let followup = crate::mission_duty::schedule_followup(due_at, args.note.trim()).map_err(ToolError::msg)?;
+        let on = crate::mission_duty::is_on();
+        Ok(ToolResult::success(json!({
+            "scheduled": true,
+            "id": followup.id,
+            "in_minutes": minutes,
+            "note": if on { "You'll get a duty round with this note when it's due." } else { "Saved, but you are off duty: it fires only once the user turns duty on." },
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct PingUserArgs {
+    title: String,
+    message: String,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+pub struct PingUser;
+#[async_trait]
+impl Tool for PingUser {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ping_user".into(),
+            description: "Send the user a phone notification. Ping for a decision only they can make, finished work they asked for, a blocker or risk, or feedback you need. Never for routine progress. Batch related news into one ping. During quiet hours a non-urgent ping is held until morning; mark kind urgent only when waiting would cause real harm. Then also say it in your reply, which is what they read when they open the chat.".into(),
+            input_schema: schema(json!({
+                "title": {"type": "string", "description": "Short headline the notification shows, under 60 characters."},
+                "message": {"type": "string", "description": "One or two sentences: what happened and what you need from them, if anything."},
+                "kind": {"type": "string", "enum": ["decision", "done", "blocked", "update", "urgent"]}
+            }), &["title", "message"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: PingUserArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let kind = args.kind.as_deref().unwrap_or("update");
+        let outcome = crate::mission_duty::ping(args.title.trim(), args.message.trim(), kind).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({
+            "ping": outcome,
+            "note": if outcome == "held" { "Quiet hours: held until morning." } else { "Sent to the user's phone." },
+        })))
+    }
 }
 
 pub fn add_worker_report_tool(registry: &mut ToolRegistry) {
