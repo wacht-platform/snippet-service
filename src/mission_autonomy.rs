@@ -255,6 +255,13 @@ pub fn remember_question(key: &str) -> bool {
 }
 
 pub fn mode_line() -> String {
+    format!(
+        "{} You have no shell (no bash): you coordinate through sessions, tasks and agents, and use read_file for a quick look at a specific file.",
+        mode_status()
+    )
+}
+
+fn mode_status() -> String {
     let state = load();
     let settings = &state.settings;
     if !settings.on {

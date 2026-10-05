@@ -1050,6 +1050,18 @@ impl CodingHarness {
     async fn execute_cli_call(&self, call: McpCall) {
         let value = match self.tools.execute(&self.context, &call.name, call.arguments).await {
             Ok(result) => result.value,
+            Err(ToolError::UnknownTool(name)) => {
+                let available: Vec<String> = self.tools.definitions().into_iter().map(|d| d.name).collect();
+                let hint = if self.context.workspace_root() == crate::mission_control::workspace_path() {
+                    " You are Mission Control and have no shell: to check on, run or inspect anything in a project, ask the session that owns it (create_mission_task to that session, or inspect_session); for a quick look at a specific file, use read_file."
+                } else {
+                    ""
+                };
+                error_result(
+                    "unknown_tool",
+                    &format!("`{name}` isn't a tool in this session.{hint} Tools you have: {}.", available.join(", ")),
+                )
+            }
             Err(error) => {
                 let text = error.to_string();
                 let argument_error = matches!(error, ToolError::Json(_) | ToolError::InvalidArguments { .. })

@@ -703,7 +703,8 @@ impl Store {
             && (self
                 .get_session_row(session)?
                 .is_some_and(|row| matches!(row.status.as_str(), "running" | "waiting_for_input"))
-                || self.session_has_running_lanes(session)?)
+                || self.session_has_running_lanes(session)?
+                || self.session_has_watches(session)?)
         {
             return Err(StoreError::WorkerBusy {
                 id: id.to_string(),
