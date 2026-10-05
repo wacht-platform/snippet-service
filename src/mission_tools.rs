@@ -74,6 +74,85 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ScheduleFollowup);
     registry.insert(PingUser);
     registry.insert(AnswerWorker);
+    registry.insert(ReadFile);
+}
+
+#[derive(Deserialize)]
+struct ReadFileArgs {
+    path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+pub struct ReadFile;
+#[async_trait]
+impl Tool for ReadFile {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file, or list a folder, without changing anything: an artifact or report a worker cites, a config or identity file, or a large tool output that was saved to a file. Returns numbered lines; use offset and limit for long files. For anything beyond a quick check, ask the session that owns the work.".into(),
+            input_schema: schema(json!({
+                "path": {"type": "string", "description": "Absolute path, or relative to your own folder."},
+                "offset": {"type": "integer", "description": "First line to read, 1-based. Default 1."},
+                "limit": {"type": "integer", "description": "How many lines. Default 200, at most 1000."}
+            }), &["path"]),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ReadFileArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let raw = args.path.trim();
+        let expanded = match raw.strip_prefix("~/") {
+            Some(rest) => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest),
+            None => PathBuf::from(raw),
+        };
+        let path = if expanded.is_absolute() { expanded } else { ctx.workspace_root().join(expanded) };
+        if path.starts_with("/proc") || path.starts_with("/sys") || path.starts_with("/dev") {
+            return Err(ToolError::msg("read_file reads files, not processes or devices. To check on a running job, ask the session that owns it: route it a task to watch the job and report back."));
+        }
+        let meta = std::fs::metadata(&path).map_err(|e| ToolError::msg(format!("{}: {e}", path.display())))?;
+        if meta.is_dir() {
+            let mut entries: Vec<String> = std::fs::read_dir(&path)
+                .map_err(|e| ToolError::msg(format!("{}: {e}", path.display())))?
+                .flatten()
+                .map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let kind = entry.file_type().map(|t| if t.is_dir() { "/" } else { "" }).unwrap_or("");
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    format!("{name}{kind}\t{size}")
+                })
+                .collect();
+            entries.sort();
+            let total = entries.len();
+            entries.truncate(500);
+            return Ok(ToolResult::success(json!({"path": path.display().to_string(), "entries": entries, "total": total})));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| ToolError::msg(format!("{}: {e}", path.display())))?;
+        if bytes.iter().take(8000).any(|b| *b == 0) {
+            return Ok(ToolResult::success(json!({"path": path.display().to_string(), "binary": true, "bytes": bytes.len()})));
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let start = args.offset.unwrap_or(1).max(1);
+        let limit = args.limit.unwrap_or(200).clamp(1, 1000);
+        let shown: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .skip(start - 1)
+            .take(limit)
+            .map(|(i, line)| {
+                let line: String = line.chars().take(2000).collect();
+                format!("{:>6}\t{line}", i + 1)
+            })
+            .collect();
+        Ok(ToolResult::success(json!({
+            "path": path.display().to_string(),
+            "total_lines": lines.len(),
+            "from": start,
+            "content": shown.join("\n"),
+        })))
+    }
 }
 
 #[derive(Deserialize)]
