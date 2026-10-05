@@ -254,6 +254,25 @@ pub fn remember_question(key: &str) -> bool {
     .unwrap_or(false)
 }
 
+pub fn mode_line() -> String {
+    let state = load();
+    let settings = &state.settings;
+    if !settings.on {
+        return "Autonomous mode is off. The user is driving: answer them in your replies, use ask_user for a question, and act on what they ask and on the reports that arrive.".to_string();
+    }
+    let quiet = match (&settings.quiet_start, &settings.quiet_end) {
+        (Some(start), Some(end)) => format!(
+            ", quiet hours {start}–{end}{}",
+            if in_quiet_hours(settings) { " (in effect now)" } else { "" }
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "Autonomous mode is on: rounds every {} minutes{quiet}. The user may be away and doesn't watch this chat: reach them with ping_user, never ask_user (it would block you and stop your rounds until they answer). When they message you directly they are here, so answer in your reply as usual.",
+        settings.round_minutes
+    )
+}
+
 pub fn next_round_at(state: &AutonomyState) -> Option<i64> {
     state
         .settings

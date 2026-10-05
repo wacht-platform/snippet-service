@@ -87,6 +87,10 @@ fn sections(
         None,
     ));
 
+    if workspace == crate::mission_control::workspace_path() {
+        out.push(("autonomy", crate::mission_autonomy::mode_line(), None));
+    }
+
     let browser = browser_summary
         .filter(|summary| crate::session::browser_summary_is_connected(summary))
         .unwrap_or_default();
