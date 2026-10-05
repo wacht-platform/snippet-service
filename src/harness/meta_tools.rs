@@ -393,10 +393,12 @@ impl CodingHarness {
         if conversation_mode {
             // User-facing: meta tools (note/ask_user/delegate); no terminate tool —
             // a plain reply ends the turn. `complete_goal` is added only while a goal runs.
-            definitions.extend(meta::conversation_meta_definitions_for(
-                goal_active,
-                self.config.allow_lane_control,
-            ));
+            let mission_control = self.context.workspace_root() == crate::mission_control::workspace_path();
+            definitions.extend(
+                meta::conversation_meta_definitions_for(goal_active, self.config.allow_lane_control)
+                    .into_iter()
+                    .filter(|d| !(mission_control && d.name == "monitor")),
+            );
         } else {
             // Headless (lanes / one-shot run): an explicit terminate_loop carries a
             // structured summary back to the caller.
