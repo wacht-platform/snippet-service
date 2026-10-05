@@ -396,20 +396,53 @@ impl CodingHarness {
             Vec::new()
         };
         let first_run = custom.as_ref().is_some_and(|c| c.needs_first_approval);
-        if first_run && !conversation_mode {
+        let mut lane_approved = false;
+        if !conversation_mode
+            && (first_run || !vault_secrets_used.is_empty())
+            && let Some(route) = self.config.lane_approval.as_ref()
+        {
+            let summary = match custom.as_ref() {
+                Some(custom) => crate::agent_tools::approval_summary(custom),
+                None => format!(
+                    "⚠ uses vault secret(s) [{}] — {}",
+                    vault_secrets_used.join(", "),
+                    approval_summary(&tool_name, &call.arguments)
+                ),
+            };
+            if !route.ask(&tool_name, &summary).await {
+                let result = json!({
+                    "schema_version": 1,
+                    "status": "error",
+                    "error": {
+                        "code": "user_denied",
+                        "message": "The user denied this action. Do not retry it as-is — adjust your approach, or report what you needed."
+                    }
+                });
+                answer_call(state, &tool_name, &call_id, result);
+                let _ = self.persist(state, lanes).await;
+                return None;
+            }
+            if let (Some(custom), Some(dir)) = (custom.as_ref(), self.tools.custom_dir())
+                && custom.needs_first_approval
+            {
+                crate::agent_tools::approve(dir, &custom.tool);
+            }
+            lane_approved = true;
+        }
+        if first_run && !conversation_mode && !lane_approved {
             let result = json!({
                 "schema_version": 1,
                 "status": "error",
                 "error": {
                     "code": "custom_tool_needs_approval",
-                    "message": format!("The custom tool `{tool_name}` is new or changed and needs the user's approval before its first run, which isn't available in a delegated/headless run. Report that it needs approving, so it's run once on the main thread.")
+                    "message": format!("The custom tool `{tool_name}` is new and needs the user's approval before its first run, which isn't available in a delegated/headless run. Report that it needs approving, so it's run once on the main thread.")
                 }
             });
             answer_call(state, &tool_name, &call_id, result);
             let _ = self.persist(state, lanes).await;
             return None;
         }
-        if !vault_secrets_used.is_empty() && !conversation_mode {
+        if !vault_secrets_used.is_empty() && !conversation_mode && !lane_approved {
             let result = json!({
                 "schema_version": 1,
                 "status": "error",
@@ -428,9 +461,10 @@ impl CodingHarness {
         let force_vault_approval = !vault_secrets_used.is_empty() || first_run;
 
         // Manual mode (or any vault-secret call): pause for the user's decision.
-        if force_vault_approval
-            || (state.approval_mode == ApprovalMode::Manual
-                && (MUTATING_TOOLS.contains(&tool_name.as_str()) || custom.is_some()))
+        if !lane_approved
+            && (force_vault_approval
+                || (state.approval_mode == ApprovalMode::Manual
+                    && (MUTATING_TOOLS.contains(&tool_name.as_str()) || custom.is_some())))
         {
             *approval_index += 1;
             // Discard stale decisions queued before this prompt existed — an

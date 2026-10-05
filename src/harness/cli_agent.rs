@@ -752,7 +752,14 @@ impl CodingHarness {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<crate::lanes::LaneProgress>();
         let lanes_enabled = !once && self.config.allow_lane_control && factory.is_some();
         let had_interrupted_lanes = state.lanes.iter().any(|lane| lane.status == LaneStatus::Running);
-        let mut lanes = self.new_lane_manager(factory, lane_tx, progress_tx, &state);
+        let (lane_approval_tx, mut lane_approval_rx) =
+            mpsc::unbounded_channel::<crate::lanes::LaneApprovalRequest>();
+        let mut lanes = self
+            .new_lane_manager(factory, lane_tx, progress_tx, &state)
+            .with_approvals((!once).then_some(lane_approval_tx));
+        let mut lane_approvals: std::collections::VecDeque<crate::lanes::LaneApprovalRequest> =
+            std::collections::VecDeque::new();
+        let mut lane_prompt_shown = false;
         if had_interrupted_lanes {
             lanes.resume_interrupted();
         }
@@ -798,7 +805,8 @@ impl CodingHarness {
         let mut pending_vault = false;
         let mut pending_custom: Option<crate::agent_tools::CustomTool> = None;
         let mut approval_index = 0usize;
-        let mut running = FuturesUnordered::new();
+        let mut running: FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> =
+            FuturesUnordered::new();
         let mut outbox: Vec<String> = Vec::new();
 
         if state.status == HarnessStatus::Running
@@ -812,6 +820,26 @@ impl CodingHarness {
         self.persist(&mut state, &lanes).await?;
 
         loop {
+            if state.status == HarnessStatus::Running {
+                lane_prompt_shown = false;
+            }
+            if !lane_prompt_shown
+                && pending_approval.is_none()
+                && state.pending_question.is_none()
+                && state.status == HarnessStatus::Idle
+                && outbox.is_empty()
+                && let Some(request) = lane_approvals.front()
+            {
+                state.events.push(HarnessEvent::ApprovalRequest {
+                    tool_name: request.tool_name.clone(),
+                    summary: format!("lane «{}» · {}", request.lane, request.summary),
+                    index: 1,
+                    total: lane_approvals.len(),
+                });
+                state.status = HarnessStatus::WaitingForInput;
+                lane_prompt_shown = true;
+                self.persist(&mut state, &lanes).await?;
+            }
             if !outbox.is_empty() {
                 if process.is_none() {
                     generation += 1;
@@ -911,6 +939,17 @@ impl CodingHarness {
                             self.persist(&mut state, &lanes).await?;
                         }
                         LoopInput::Approve | LoopInput::ApproveAll | LoopInput::Deny => {
+                            if pending_approval.is_none() && lane_prompt_shown {
+                                if let Some(request) = lane_approvals.pop_front() {
+                                    let _ = request.reply.send(!matches!(input, LoopInput::Deny));
+                                }
+                                lane_prompt_shown = false;
+                                if state.status == HarnessStatus::WaitingForInput && state.pending_question.is_none() {
+                                    state.status = HarnessStatus::Idle;
+                                }
+                                self.persist(&mut state, &lanes).await?;
+                                continue;
+                            }
                             let Some(call) = pending_approval.take() else { continue };
                             state.status = HarnessStatus::Running;
                             if matches!(input, LoopInput::ApproveAll) && !pending_vault {
@@ -929,7 +968,7 @@ impl CodingHarness {
                                     "The user denied this action. Do not retry it as-is — adjust your approach or ask what they'd prefer.",
                                 ));
                             } else {
-                                running.push(self.execute_cli_call(call));
+                                running.push(Box::pin(self.execute_cli_call(call)));
                             }
                             self.persist(&mut state, &lanes).await?;
                         }
@@ -1019,6 +1058,7 @@ impl CodingHarness {
                         _ => {}
                     }
                 }
+                Some(request) = lane_approval_rx.recv() => lane_approvals.push_back(request),
                 Some(result) = lane_rx.recv() => {
                     self.inject_lane_result(&mut state, &mut lanes, &result);
                     self.wake_with_last_message(&mut state, &mut outbox);
@@ -1055,10 +1095,19 @@ impl CodingHarness {
                     if let Some(custom) = custom {
                         let gated = custom.needs_first_approval || !custom.vault.is_empty();
                         if gated && once {
-                            let _ = call.reply.send(error_result(
-                                "custom_tool_needs_approval",
-                                &format!("The custom tool `{}` needs the user's approval to run (it's new or changed, or uses vault secrets), which isn't available in a delegated/headless run. Report that it needs approving, so it runs on the main thread.", call.name),
-                            ));
+                            match self.config.lane_approval.clone() {
+                                Some(route) => {
+                                    let summary = crate::agent_tools::approval_summary(&custom);
+                                    let first = custom.needs_first_approval.then(|| custom.tool.clone());
+                                    running.push(Box::pin(self.lane_gated_call(call, route, summary, first)));
+                                }
+                                None => {
+                                    let _ = call.reply.send(error_result(
+                                        "custom_tool_needs_approval",
+                                        &format!("The custom tool `{}` needs the user's approval to run (it's new, or uses vault secrets), which isn't available in this run. Report that it needs approving, so it runs on the main thread.", call.name),
+                                    ));
+                                }
+                            }
                         } else if gated || state.approval_mode == ApprovalMode::Manual {
                             approval_index += 1;
                             state.events.push(HarnessEvent::ApprovalRequest {
@@ -1073,7 +1122,7 @@ impl CodingHarness {
                             pending_approval = Some(call);
                             self.persist(&mut state, &lanes).await?;
                         } else {
-                            running.push(self.execute_cli_call(call));
+                            running.push(Box::pin(self.execute_cli_call(call)));
                         }
                         continue;
                     }
@@ -1104,10 +1153,21 @@ impl CodingHarness {
                         "bash" if !vault_names(&call.arguments).is_empty() => {
                             let names = vault_names(&call.arguments).join(", ");
                             if once {
-                                let _ = call.reply.send(error_result(
-                                    "vault_needs_confirmation",
-                                    &format!("Using vault secret(s) [{names}] requires user confirmation, which isn't available in a delegated/headless run. Don't run this here — report that this step needs the secret, so it's done on the main thread where the user can approve it."),
-                                ));
+                                match self.config.lane_approval.clone() {
+                                    Some(route) => {
+                                        let summary = format!(
+                                            "⚠ uses vault secret(s) [{names}] — {}",
+                                            super::prompts::approval_summary("bash", &call.arguments)
+                                        );
+                                        running.push(Box::pin(self.lane_gated_call(call, route, summary, None)));
+                                    }
+                                    None => {
+                                        let _ = call.reply.send(error_result(
+                                            "vault_needs_confirmation",
+                                            &format!("Using vault secret(s) [{names}] requires user confirmation, which isn't available in a delegated/headless run. Don't run this here — report that this step needs the secret, so it's done on the main thread where the user can approve it."),
+                                        ));
+                                    }
+                                }
                                 continue;
                             }
                             approval_index += 1;
@@ -1137,7 +1197,7 @@ impl CodingHarness {
                             pending_approval = Some(call);
                             self.persist(&mut state, &lanes).await?;
                         }
-                        _ => running.push(self.execute_cli_call(call)),
+                        _ => running.push(Box::pin(self.execute_cli_call(call))),
                     }
                 }
                 Some(()) = running.next(), if !running.is_empty() => {}
@@ -1156,6 +1216,26 @@ impl CodingHarness {
         if state.status == HarnessStatus::Idle {
             state.status = HarnessStatus::Running;
         }
+    }
+
+    async fn lane_gated_call(
+        &self,
+        call: McpCall,
+        route: crate::lanes::LaneApprovalRoute,
+        summary: String,
+        first_run: Option<crate::agent_tools::CustomTool>,
+    ) {
+        if !route.ask(&call.name, &summary).await {
+            let _ = call.reply.send(error_result(
+                "user_denied",
+                "The user denied this action. Do not retry it as-is — adjust your approach, or report what you needed.",
+            ));
+            return;
+        }
+        if let (Some(tool), Some(dir)) = (first_run.as_ref(), self.tools.custom_dir()) {
+            crate::agent_tools::approve(dir, tool);
+        }
+        self.execute_cli_call(call).await;
     }
 
     async fn execute_cli_call(&self, call: McpCall) {

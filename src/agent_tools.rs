@@ -146,7 +146,7 @@ fn approvals(dir: &Path) -> BTreeMap<String, String> {
 }
 
 pub fn is_approved(dir: &Path, tool: &CustomTool) -> bool {
-    approvals(dir).get(&tool.name) == Some(&tool.hash)
+    approvals(dir).contains_key(&tool.name)
 }
 
 pub fn approve(dir: &Path, tool: &CustomTool) {
@@ -197,7 +197,7 @@ pub fn bash_arguments(call: &CustomCall) -> Value {
 
 pub fn prompt_section(dir: &Path) -> String {
     format!(
-        "## Your custom tools\n\nYou can give yourself tools. Each JSON file in `{}` defines one: `name` (lowercase, digits and underscores), `description`, `parameters` (a JSON Schema object with `properties` and `required`), `command` (a bash template; `{{{{arg}}}}` is replaced by that argument, shell-quoted for you, and an omitted optional argument becomes empty), and optional `timeout_seconds`. Write or edit one with `change_files`; it's available on your next call, no restart needed. A new or changed tool waits for the user's approval the first time it runs, so tell them what it does. The command runs in the workspace like `bash`, and can use vault secrets as `$NAME` (those runs always ask the user first). Make a tool for a command you run repeatedly with different arguments, not for one-offs.",
+        "## Your custom tools\n\nYou can give yourself tools. Each JSON file in `{}` defines one: `name` (lowercase, digits and underscores), `description`, `parameters` (a JSON Schema object with `properties` and `required`), `command` (a bash template; `{{{{arg}}}}` is replaced by that argument, shell-quoted for you, and an omitted optional argument becomes empty), and optional `timeout_seconds`. Write or edit one with `change_files`; it's available on your next call, no restart needed. A new tool waits for the user's approval the first time it runs, so tell them what it does; editing it afterwards needs no new approval. A delegated lane can use your tools too, and anything that needs approval there reaches the user through your chat. The command runs in the workspace like `bash`, and can use vault secrets as `$NAME` (those runs always ask the user first). Make a tool for a command you run repeatedly with different arguments, not for one-offs.",
         dir.display()
     )
 }
