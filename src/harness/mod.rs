@@ -89,6 +89,7 @@ pub struct HarnessConfig {
     pub progress_id: Option<String>,
     /// Mission Control coordinates durable sessions rather than spawning lanes.
     pub allow_lane_control: bool,
+    pub lane_approval: Option<crate::lanes::LaneApprovalRoute>,
 }
 
 impl Default for HarnessConfig {
@@ -112,6 +113,7 @@ impl Default for HarnessConfig {
             progress_tx: None,
             progress_id: None,
             allow_lane_control: true,
+            lane_approval: None,
         }
     }
 }

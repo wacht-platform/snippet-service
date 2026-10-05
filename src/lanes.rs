@@ -118,8 +118,39 @@ const MAX_FINISHED_LANES: usize = 32;
 /// Owns lane lifecycle for one conversation run. Lives in the interactive loop's
 /// local scope (not in the immutable `CodingHarness`). Aborts any still-running
 /// lanes when dropped (the run was interrupted / ended).
+#[derive(Debug)]
+pub struct LaneApprovalRequest {
+    pub lane: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaneApprovalRoute {
+    pub lane: String,
+    pub tx: mpsc::UnboundedSender<LaneApprovalRequest>,
+}
+
+impl LaneApprovalRoute {
+    pub async fn ask(&self, tool_name: &str, summary: &str) -> bool {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let request = LaneApprovalRequest {
+            lane: self.lane.clone(),
+            tool_name: tool_name.to_string(),
+            summary: summary.to_string(),
+            reply,
+        };
+        if self.tx.send(request).is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+}
+
 pub struct LaneManager {
     factory: Option<ModelFactory>,
+    approval_tx: Option<mpsc::UnboundedSender<LaneApprovalRequest>>,
     workspace_root: PathBuf,
     lane_root: PathBuf,
     result_tx: mpsc::UnboundedSender<LaneResult>,
@@ -150,6 +181,7 @@ impl LaneManager {
     ) -> Self {
         Self {
             factory,
+            approval_tx: None,
             workspace_root,
             lane_root,
             result_tx,
@@ -159,6 +191,11 @@ impl LaneManager {
             exa_api_key,
             handles: Vec::new(),
         }
+    }
+
+    pub fn with_approvals(mut self, tx: Option<mpsc::UnboundedSender<LaneApprovalRequest>>) -> Self {
+        self.approval_tx = tx;
+        self
     }
 
     /// Restore prior records (e.g. on resume) so the display reflects history.
@@ -346,6 +383,7 @@ impl LaneManager {
         let title = title.to_string();
         let lane_id = id.to_string();
         let exa_api_key = self.exa_api_key.clone();
+        let approval = self.approval_tx.clone().map(|tx| LaneApprovalRoute { lane: title.clone(), tx });
 
         let handle = tokio::spawn(async move {
             let result = tokio::time::timeout(
@@ -362,6 +400,7 @@ impl LaneManager {
                     agent,
                     profile,
                     progress_tx,
+                    approval,
                 ),
             )
             .await
@@ -628,6 +667,7 @@ async fn run_lane(
     agent: Option<String>,
     profile: Option<String>,
     progress_tx: mpsc::UnboundedSender<LaneProgress>,
+    approval: Option<LaneApprovalRoute>,
 ) -> Result<(String, String), String> {
     let mut model = factory(profile.as_deref())?;
     let mut log = LaneLog::open(&owner).ok();
@@ -677,6 +717,7 @@ async fn run_lane(
             exa_api_key,
             progress_tx: Some(progress_tx),
             progress_id: Some(owner.clone()),
+            lane_approval: approval,
             ..HarnessConfig::default()
         },
         tools,

@@ -447,7 +447,7 @@ impl ToolRegistry {
             .map_err(|e| ToolError::msg(format!("{name}: {e}")))?;
         if call.needs_first_approval {
             return Err(ToolError::msg(format!(
-                "custom tool `{name}` is new or changed and hasn't been approved by the user yet"
+                "custom tool `{name}` is new and hasn't been approved by the user yet"
             )));
         }
         let bash = self.tools.get("bash").ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;

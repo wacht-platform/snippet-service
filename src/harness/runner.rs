@@ -143,7 +143,14 @@ impl CodingHarness {
             .lanes
             .iter()
             .any(|lane| lane.status == LaneStatus::Running);
-        let mut lanes = self.new_lane_manager(factory, lane_tx, progress_tx, &state);
+        let (lane_approval_tx, mut lane_approval_rx) =
+            mpsc::unbounded_channel::<crate::lanes::LaneApprovalRequest>();
+        let mut lanes = self
+            .new_lane_manager(factory, lane_tx, progress_tx, &state)
+            .with_approvals(Some(lane_approval_tx));
+        let mut lane_approvals: std::collections::VecDeque<crate::lanes::LaneApprovalRequest> =
+            std::collections::VecDeque::new();
+        let mut lane_prompt_shown = false;
         // Child tasks do not survive a process restart, but each lane's harness
         // state does. Relaunch every lane that was persisted as running from its
         // last saved boundary and wake the parent so it can track the resumed work.
@@ -286,6 +293,7 @@ impl CodingHarness {
             }
 
             if state.status == HarnessStatus::Running {
+                lane_prompt_shown = false;
                 if !model.is_configured() {
                     state.events.push(HarnessEvent::ModelError {
                         message:
@@ -369,7 +377,8 @@ impl CodingHarness {
                                 // Queue/unqueue/drop land after this step — `state`
                                 // is borrowed by the in-flight tool/model call.
                                 Some(other) => pending_inputs.push(other),
-                            }
+                            },
+                            Some(request) = lane_approval_rx.recv() => lane_approvals.push_back(request),
                         }
                     }
                 };
@@ -511,6 +520,20 @@ impl CodingHarness {
                 // Idle or WaitingForInput. When a goal is Active and we're Idle (not
                 // blocked on a question), DRIVE the loop forward instead of waiting —
                 // but a queued real input or a lane report is handled first (biased).
+                if !lane_prompt_shown
+                    && state.pending_question.is_none()
+                    && let Some(request) = lane_approvals.front()
+                {
+                    state.events.push(HarnessEvent::ApprovalRequest {
+                        tool_name: request.tool_name.clone(),
+                        summary: format!("lane «{}» · {}", request.lane, request.summary),
+                        index: 1,
+                        total: lane_approvals.len(),
+                    });
+                    state.status = HarnessStatus::WaitingForInput;
+                    lane_prompt_shown = true;
+                    self.persist(&mut state, &lanes).await?;
+                }
                 let goal_driving = state.status == HarnessStatus::Idle
                     && matches!(&state.goal, Some(g) if g.status == GoalStatus::Active);
                 tokio::select! {
@@ -566,8 +589,17 @@ impl CodingHarness {
                                 }
                             }
                         }
-                        // No tool call is pending while idle — nothing to approve.
-                        Some(LoopInput::Approve) | Some(LoopInput::ApproveAll) | Some(LoopInput::Deny) => {}
+                        // Idle: the only thing to approve is a lane's request.
+                        Some(decision @ (LoopInput::Approve | LoopInput::ApproveAll | LoopInput::Deny)) => {
+                            if lane_prompt_shown && let Some(request) = lane_approvals.pop_front() {
+                                let _ = request.reply.send(!matches!(decision, LoopInput::Deny));
+                                lane_prompt_shown = false;
+                                if state.status == HarnessStatus::WaitingForInput && state.pending_question.is_none() {
+                                    state.status = HarnessStatus::Idle;
+                                }
+                                self.persist(&mut state, &lanes).await?;
+                            }
+                        }
                         Some(LoopInput::Queue(item)) => {
                             queue_held(&mut state, item);
                             self.persist(&mut state, &lanes).await?;
@@ -595,6 +627,7 @@ impl CodingHarness {
                             break;
                         }
                     },
+                    Some(request) = lane_approval_rx.recv() => lane_approvals.push_back(request),
                     Some(result) = lane_rx.recv() => {
                         self.inject_lane_result(&mut state, &mut lanes, &result);
                         // A lane reporting in while idle is new information to act on.
