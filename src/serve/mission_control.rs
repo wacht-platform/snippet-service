@@ -332,6 +332,9 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
     let now = chrono::Utc::now().to_rfc3339();
     // Checked before the claim so a task waiting on someone else's paths stays
     // queued without being claimed and released every tick.
+    if let Some(offered) = await_claim(d, task_id, &now)? {
+        return Ok(offered);
+    }
     if let Some(waiting) = wait_for_path_owners(d, task_id, &now, false)? {
         return Ok(waiting);
     }
@@ -554,6 +557,81 @@ fn wait_for_path_owners(
 
 /// If the agent holding the task's lease is paused, draining or disabled, leave
 /// the task queued until it is active again, and tell Mission Control once.
+/// A task starts only once its agent has claimed it. Until then the agent is on
+/// the roster as `offered` and its inbox gets the offer, once.
+fn await_claim(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, String> {
+    let Some(task) = d.store.get_task(task_id).map_err(|error| error.to_string())? else {
+        return Err(format!("unknown task {task_id}"));
+    };
+    if task.status != TaskStatus::Todo || mission_control::is_session_id(&task.session_id) {
+        return Ok(None);
+    }
+    let roster = d.store.list_task_agents(task_id).map_err(|error| error.to_string())?;
+    let current: Vec<_> = roster.iter().filter(|m| m.removed_at.is_none()).collect();
+    if current.iter().any(|m| m.status == "active") {
+        return Ok(None);
+    }
+    let agent = match current.iter().find(|m| m.status == "offered") {
+        Some(member) => member.agent_id.clone(),
+        None => {
+            let agent = crate::session::state_path_for_id(&task.session_id)
+                .and_then(|path| crate::session::read_session_sidecar(&path))
+                .and_then(|sidecar| sidecar.agent_id)
+                .unwrap_or_else(|| crate::coordination::SNIPPET_AGENT_ID.to_string());
+            if d.store.get_agent(&agent).ok().flatten().is_none() {
+                return Ok(None);
+            }
+            d.store
+                .add_task_agent_full(task_id, &agent, "implementer", None, "", "offered", now)
+                .map_err(|error| error.to_string())?;
+            agent
+        }
+    };
+    if agent == mission_control::SESSION_ID {
+        return Ok(None);
+    }
+    let marker = crate::coordination::offer_marker(&agent);
+    if task.notifications.iter().any(|n| n.target == marker) {
+        return Ok(Some(task));
+    }
+    d.store
+        .send_direct_message(
+            ("agent", mission_control::SESSION_ID),
+            ("agent", &agent),
+            &task_offer_body(&task),
+            &uuid::Uuid::new_v4().to_string(),
+            now,
+        )
+        .map_err(|error| error.to_string())?;
+    d.store
+        .update_task_in(task_id, now, |t| {
+            t.notifications.push(crate::coordination::NotificationMarker {
+                target: marker.clone(),
+                kind: "offered".into(),
+                message: now.to_string(),
+                delivered: true,
+            })
+        })
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn task_offer_body(task: &Task) -> String {
+    let owned = if task.owned_paths.is_empty() {
+        "none".to_string()
+    } else {
+        task.owned_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    };
+    format!(
+        "[task_offer]\ntask_id: {}\ntitle: {}\ntarget_session: {}\nhandoff: {:?}\nowned_paths: {owned}\nbriefing:\n{}\n[/task_offer]\nMission Control is offering you this task. It starts only when you claim it: review it, then claim it with claim_and_dispatch_task (task_id above), ask Mission Control first with send_agent_message if something is unclear, or decline it with decline_task and your reason.",
+        task.id,
+        task.title,
+        task.session_id,
+        task.handoff_mode,
+        task.description.trim(),
+    )
+}
+
 fn wait_for_worker(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, String> {
     let roster = d.store.list_task_agents(task_id).map_err(|error| error.to_string())?;
     let Some(worker) = roster

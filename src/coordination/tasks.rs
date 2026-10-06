@@ -157,6 +157,10 @@ pub struct NotificationMarker {
     pub delivered: bool,
 }
 
+pub fn offer_marker(agent_id: &str) -> String {
+    format!("offer:{agent_id}")
+}
+
 /// Create a task's initial dispatch state in one value, so a caller cannot
 /// forget `handoff_mode` and leave delivery semantics unset.
 impl Task {
@@ -1078,7 +1082,7 @@ impl Store {
             if status == "active" {
                 tx.execute(
                     "UPDATE task_agents SET status = 'waiting'
-                     WHERE task_id = ?1 AND agent_id <> ?2 AND status = 'active'",
+                     WHERE task_id = ?1 AND agent_id <> ?2 AND status IN ('active', 'offered')",
                     params![task_id, agent_id],
                 )?;
             }
@@ -1135,6 +1139,11 @@ impl Store {
                 "UPDATE task_agents SET status = 'waiting'
                  WHERE task_id = ?1 AND agent_id = ?2 AND removed_at IS NULL",
                 params![task_id, from_agent_id],
+            )?;
+            tx.execute(
+                "UPDATE task_agents SET status = 'waiting'
+                 WHERE task_id = ?1 AND agent_id <> ?2 AND status = 'offered' AND removed_at IS NULL",
+                params![task_id, to_agent_id],
             )?;
             let updated = tx.execute(
                 "UPDATE task_agents SET status = 'active'

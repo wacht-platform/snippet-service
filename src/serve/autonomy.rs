@@ -42,7 +42,8 @@ pub async fn autonomy_loop(daemon: Shared) {
             }
             continue;
         }
-        let envelope = round_envelope(&tasks, &state, &due, now);
+        let offers = pending_offers(&daemon, &tasks);
+        let envelope = round_envelope(&tasks, &state, &due, &offers, now);
         let summary = round_summary(&tasks, &state, &due);
         let _ = mission_autonomy::update(|s| {
             s.last_round_at = now;
@@ -145,10 +146,26 @@ async fn wake_for_worker_questions(daemon: &Shared) {
     }
 }
 
+fn pending_offers(daemon: &Shared, tasks: &[crate::coordination::Task]) -> std::collections::HashMap<String, String> {
+    tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Todo)
+        .filter_map(|t| {
+            let roster = daemon.store.list_task_agents(&t.id).ok()?;
+            let current: Vec<_> = roster.iter().filter(|m| m.removed_at.is_none()).collect();
+            if current.iter().any(|m| m.status == "active") {
+                return None;
+            }
+            current.iter().find(|m| m.status == "offered").map(|m| (t.id.clone(), m.agent_id.clone()))
+        })
+        .collect()
+}
+
 fn round_envelope(
     tasks: &[crate::coordination::Task],
     state: &mission_autonomy::AutonomyState,
     due: &[mission_autonomy::Followup],
+    offers: &std::collections::HashMap<String, String>,
     now: i64,
 ) -> String {
     let since = state.last_round_at;
@@ -179,6 +196,9 @@ fn round_envelope(
             let idle = secs_since(&t.updated_at, now);
             let session = session_status(&t.session_id);
             let note = match session.as_ref().map(|s| s.status) {
+                _ if offers.contains_key(&t.id) => {
+                    format!("offered to {}, not claimed yet ({})", offers[&t.id], ago(idle))
+                }
                 Some(HarnessStatus::Running) => "worker running".to_string(),
                 Some(HarnessStatus::WaitingForInput) => "worker waiting for input".to_string(),
                 _ if t.status == TaskStatus::InProgress && idle > STALL_SECS => {
