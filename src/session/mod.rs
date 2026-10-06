@@ -293,6 +293,7 @@ struct AgentRuntime {
     prompt: String,
     /// Mission Control coordinates durable sessions; it does not spawn lanes.
     allow_lane_control: bool,
+    hidden_meta: &'static [&'static str],
     /// Whether the project memory block and reflection apply. Only a session
     /// that works in a project has a project to remember.
     memory: bool,
@@ -344,6 +345,9 @@ impl AgentRuntime {
         }
         crate::mission_tools::add_mission_control_tools(&mut tools);
         crate::coordination_tools::add_coordination_tools(&mut tools);
+        for name in ["message_mission_control", "claim_and_dispatch_task", "transfer_task_session_lease"] {
+            tools.remove(name);
+        }
 
         Ok(Self {
             factory: None,
@@ -351,6 +355,7 @@ impl AgentRuntime {
             tools,
             prompt: mission_control_system_prompt(),
             allow_lane_control: false,
+            hidden_meta: &["monitor", "set_session_title"],
             memory: false,
         })
     }
@@ -382,6 +387,7 @@ impl AgentRuntime {
         crate::mission_tools::add_worker_report_tool(&mut tools);
         tools.insert(crate::mission_tools::CreateRecurringJob);
         crate::coordination_tools::add_coordination_tools(&mut tools);
+        tools.remove("claim_and_dispatch_task");
 
         let prompt_ctx = i.prompt_ctx;
         let custom_section = custom_dir.as_deref().map(crate::agent_tools::prompt_section);
@@ -425,6 +431,7 @@ impl AgentRuntime {
             tools,
             prompt,
             allow_lane_control: true,
+            hidden_meta: &[],
             memory: true,
         })
     }
@@ -482,6 +489,7 @@ impl AgentRuntime {
             ),
             // Nothing to delegate: no lane control in a coordination session.
             allow_lane_control: false,
+            hidden_meta: &["monitor", "present_file", "set_session_title", "update_plan"],
             memory: false,
         })
     }
@@ -587,6 +595,7 @@ fn start_session_with_role(
                 memory_enabled: memory_enabled && runtime.memory,
                 memory_reflect,
                 allow_lane_control: runtime.allow_lane_control,
+                hidden_meta: runtime.hidden_meta,
                 ..HarnessConfig::default()
             },
             runtime.tools,

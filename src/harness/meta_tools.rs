@@ -196,7 +196,7 @@ impl CodingHarness {
                 Err(error) => (tool_error(error), MetaControl::Continue),
             },
             "delegate_task" => match parse_delegate_brief(arguments) {
-                Ok(mut brief) => {
+                Ok(brief) => {
                     // Follow-up to an existing lane: resume it with the new brief,
                     // context intact.
                     if let Some(lane_id) = brief.lane_id.as_deref() {
@@ -222,9 +222,6 @@ impl CodingHarness {
                             }
                             Err(error) => (tool_error(error), MetaControl::Continue),
                         };
-                    }
-                    if self.context.workspace_root() == crate::mission_control::workspace_path() {
-                        brief.read_only = true;
                     }
                     match lanes.spawn(
                         &brief.title,
@@ -396,11 +393,10 @@ impl CodingHarness {
         if conversation_mode {
             // User-facing: meta tools (note/ask_user/delegate); no terminate tool —
             // a plain reply ends the turn. `complete_goal` is added only while a goal runs.
-            let mission_control = self.context.workspace_root() == crate::mission_control::workspace_path();
             definitions.extend(
                 meta::conversation_meta_definitions_for(goal_active, self.config.allow_lane_control)
                     .into_iter()
-                    .filter(|d| !(mission_control && d.name == "monitor")),
+                    .filter(|d| !self.config.hidden_meta.contains(&d.name.as_str())),
             );
         } else {
             // Headless (lanes / one-shot run): an explicit terminate_loop carries a
