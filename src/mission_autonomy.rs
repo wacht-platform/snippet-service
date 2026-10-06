@@ -19,6 +19,8 @@ pub struct AutonomySettings {
     pub quiet_start: Option<String>,
     #[serde(default)]
     pub quiet_end: Option<String>,
+    #[serde(default)]
+    pub utc_offset_minutes: Option<i32>,
 }
 
 fn default_round_minutes() -> u32 {
@@ -32,6 +34,7 @@ impl Default for AutonomySettings {
             round_minutes: default_round_minutes(),
             quiet_start: Some("22:00".into()),
             quiet_end: Some("08:00".into()),
+            utc_offset_minutes: None,
         }
     }
 }
@@ -147,6 +150,14 @@ pub fn valid_clock(value: &str) -> bool {
     parse_clock(Some(value)).is_some()
 }
 
+pub fn user_now(settings: &AutonomySettings) -> chrono::DateTime<chrono::FixedOffset> {
+    let offset = settings
+        .utc_offset_minutes
+        .and_then(|m| chrono::FixedOffset::east_opt(m * 60))
+        .unwrap_or_else(|| *Local::now().offset());
+    chrono::Utc::now().with_timezone(&offset)
+}
+
 pub fn in_quiet_hours(settings: &AutonomySettings) -> bool {
     let (Some(start), Some(end)) = (
         parse_clock(settings.quiet_start.as_deref()),
@@ -154,7 +165,7 @@ pub fn in_quiet_hours(settings: &AutonomySettings) -> bool {
     ) else {
         return false;
     };
-    let now = Local::now().time();
+    let now = user_now(settings).time();
     let now = NaiveTime::from_hms_opt(now.hour(), now.minute(), 0).unwrap_or(now);
     if start == end {
         false
@@ -269,8 +280,9 @@ fn mode_status() -> String {
     }
     let quiet = match (&settings.quiet_start, &settings.quiet_end) {
         (Some(start), Some(end)) => format!(
-            ", quiet hours {start}–{end}{}",
-            if in_quiet_hours(settings) { " (in effect now)" } else { "" }
+            ", quiet hours {start}–{end} in the user's time (UTC{}){}",
+            user_now(settings).format("%:z"),
+            if in_quiet_hours(settings) { ", in effect" } else { "" }
         ),
         _ => String::new(),
     };
