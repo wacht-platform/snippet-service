@@ -1589,7 +1589,7 @@ impl Tool for CreateRecurringJob {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_recurring_job".into(),
-            description: "Schedule a recurring goal or prompt by writing ~/.snippet/recurring/<id>.json. If session_id is omitted, schedules work on the current session. The daemon detects that file and each fire sets an autonomous GOAL on the target session (driven to complete_goal; the agent's complete_goal summary is surfaced to the user as the run outcome). schedule is `every 5m|15m|1h|1d` (min 5 minutes), `daily HH:MM`, `at HH:MM` (one-off), or `in 30m` (one-off). prompt and/or plan_path required — plan_path is a markdown/plan file the session rereads each fire. FIRST RUN IS IMMEDIATE: the job fires on the next daemon tick (≤15s) unless that session is busy, in which case it queues until the current goal completes.".into(),
+            description: "Schedule work that repeats: each run sets a goal on the target session (the current one if session_id is omitted), and its complete_goal summary is shown to the user. schedule: `every 5m|15m|1h|1d` (at least 5 minutes), `daily HH:MM`, or one-off `at HH:MM` / `in 30m`. Give a prompt, a plan_path the session rereads each run, or both. The first run starts within seconds unless the session is busy.".into(),
             input_schema: schema(
                 json!({
                     "title": {"type": "string"},

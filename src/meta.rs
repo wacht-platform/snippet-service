@@ -111,22 +111,7 @@ fn present_file_tool() -> NativeToolDefinition {
 fn monitor_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "monitor".to_string(),
-        description: "Watch a file and be WOKEN with whatever text gets appended to it — the way \
-            to wait on output you don't control (a build log, test output, a long process's log, \
-            a file another program writes). Register the watch, then END YOUR TURN: going idle is \
-            how you wait; each append arrives later as a [file_watch] message carrying the new \
-            text. Do NOT poll the file in a loop. \
-            ALWAYS set a `filter` regex — a bare watch wakes you on EVERY line the process writes \
-            and each wake costs a full model turn, so watching a chatty build/test log without a \
-            filter burns tokens fast. Filter for only the lines you actually need to act on: the \
-            OUTCOME and failures — e.g. \"error|ERROR|FAILED|panic|Exception\" for problems, \
-            \"BUILD SUCCESSFUL|passed|Compiled|Done|listening on\" for completion. Best of all, \
-            when YOU launch the process (via bash background:true), append your OWN sentinel and \
-            filter on it — e.g. run `<cmd>; echo \"__DONE__ exit=$?\" >> build.log` and set \
-            filter \"__DONE__\", so you wake exactly ONCE when it finishes (with the exit code) \
-            instead of on every log line. Non-matching output is consumed silently. Appends are \
-            debounced, so one burst = one wake. Remove the watch once it has served its purpose. \
-            Actions: add (default) | remove | list."
+        description: "Watch a file and be woken with the text appended to it: how you wait on output you don't control (a build or test log, a long process's log). Register the watch, then end your turn; each matching append arrives as a [file_watch] message. Always set a `filter` regex for the lines you need (failures and completion), since every wake costs a model turn; best is a sentinel you append yourself, e.g. `<cmd>; echo \"__DONE__ exit=$?\" >> build.log` with filter `__DONE__`. Remove the watch when it has served its purpose. Actions: add (default), remove, list."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -146,7 +131,7 @@ fn monitor_tool() -> NativeToolDefinition {
                 },
                 "filter": {
                     "type": "string",
-                    "description": "Regex — wake ONLY when the appended text matches. Strongly recommended on every watch: without it you wake on every line (one model turn each), which wastes tokens on a chatty log. Target outcomes/failures (e.g. \"error|FAILED|__DONE__\"), ideally a completion sentinel you appended yourself. Omit only for a rarely-written file where every line matters."
+                    "description": "Regex: wake only when the appended text matches, ideally your own completion sentinel."
                 },
                 "watch_id": {
                     "type": "string",
@@ -248,19 +233,7 @@ fn update_plan_tool() -> NativeToolDefinition {
 fn ask_user_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "ask_user".to_string(),
-        description: "The only channel for asking the user anything (clarification, choice, \
-            confirmation, missing fact). Never end a turn with a question in plain text — use this \
-            tool. Last resort: prefer resolving via other tools, context, or a sensible default. \
-            Ends the turn and pauses until answered; one pending question set at a time. Each \
-            question needs `text` and `answer_kind.kind` chosen by the SHAPE of the answer: \
-            free_text (open-ended), single_choice (one of a known set; provide `choices`), \
-            multi_choice (any number of a known set; provide `choices`), yes_no (literal yes/no), \
-            or confirm (irreversible action gate). Make choices easy to decide: give each a short \
-            `label` and a one-line `description` of what it means or costs, and mark the one you \
-            would pick with `recommended: true`. The user can always write their own answer \
-            instead. When asking SEVERAL questions together, give each a `header` of one or two \
-            words (shown as its tab). `id` is OPTIONAL — only useful to distinguish multiple \
-            questions; omit it for a single question."
+        description: "Ask the user something: a clarification, a choice, a confirmation or a missing fact. Never end a turn with a plain-text question; use this, and only after context, tools or a sensible default can't settle it. It ends your turn until they answer. Pick each question's `answer_kind.kind` by the shape of the answer: free_text, single_choice or multi_choice (with `choices`: a short `label`, a one-line `description`, `recommended: true` on your pick), yes_no, or confirm (a gate before an irreversible action). Give each question a one- or two-word `header` when you ask several."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -272,20 +245,20 @@ fn ask_user_tool() -> NativeToolDefinition {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "OPTIONAL — defaults to the question's index. Only needed to distinguish multiple questions asked together; if you provide ids they must be unique."},
+                            "id": {"type": "string", "description": "Optional; only to tell several questions apart."},
                             "text": {"type": "string", "description": "Question text shown to the user."},
-                            "header": {"type": "string", "description": "OPTIONAL — one or two words naming the question (at most 16 characters), shown as its tab when several questions are asked together."},
+                            "header": {"type": "string", "description": "One or two words naming the question when several are asked together."},
                             "answer_kind": {
                                 "type": "object",
                                 "properties": {
                                     "kind": {
                                         "type": "string",
                                         "enum": ["free_text", "single_choice", "multi_choice", "yes_no", "confirm"],
-                                        "description": "Discriminator selecting the answer shape."
+                                        "description": "The answer's shape."
                                     },
                                     "choices": {
                                         "type": "array",
-                                        "description": "single_choice / multi_choice: REQUIRED options, ordered by likelihood. Each has a `value` and a short `label`.",
+                                        "description": "Required for single_choice and multi_choice, most likely first.",
                                         "items": {
                                             "type": "object",
                                             "properties": {
@@ -320,32 +293,14 @@ fn ask_user_tool() -> NativeToolDefinition {
 fn delegate_task_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "delegate_task".to_string(),
-        description: "Hand a scoped, self-contained unit of work to a background lane — a fresh \
-            coding sub-agent that runs to completion in PARALLEL and reports back (its findings \
-            cited with exact file:line). Delegating makes you an ORCHESTRATOR: spawn SEVERAL lanes \
-            to cover breadth and keep YOUR OWN context lean (the lanes hold the detail; you keep the \
-            conclusions). REACH FOR THIS when the work splits into independent areas (fan them out \
-            instead of grinding serially), or a self-contained investigation/build will take many \
-            steps. The brief must name BOTH the scope to inspect/act on AND the concrete deliverable \
-            expected; a vague brief produces vague work. \
-            Ending your turn IS how you WAIT for lanes — you go idle and each report wakes you (no \
-            polling). Go idle while lanes run; each report wakes you. Do not add a routine progress note or announce delegation. \
-            Just don't present your COMPLETE/final answer while lanes you need are still running (your [delegated_lanes] \
-            context lists them). Fold each report in and synthesize once they're in — progressively \
-            or all at once. Only skip delegation for trivial one-step actions you can just do yourself. \
-            CONTINUING: pass `lane_id` (from an earlier delegation) to send a FOLLOW-UP to a finished \
-            lane — it resumes with its full context intact, so use it for 'now also check X' or \
-            'apply the fix you proposed' instead of re-briefing a fresh lane from scratch. \
-            SCOPING: set access='read_only' for pure investigation/search/review lanes (their \
-            file-editing tools are removed) — prefer it whenever the lane shouldn't change anything; \
-            several read-only lanes can safely fan out in parallel while you keep editing."
+        description: "Hand a self-contained piece of work to a background lane: a fresh sub-agent that runs in parallel and reports back with file:line evidence. Use it to fan out independent areas or a long investigation while keeping your own context lean. The brief names the scope and the concrete deliverable. Carry on with your own share of the work meanwhile; when only waiting is left, end your turn, and each report wakes you. Don't present a final answer while lanes you need are still running. Pass `lane_id` to send a follow-up to a finished lane with its context intact. Set access `read_only` for investigation and review (its file-editing tools are removed)."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "A short, specific label YOU choose for this lane (2–5 words) that says what it's doing — e.g. 'audit auth flow', 'extract CLI modules', 'review error handling'. Shown to the user and in your [delegated_lanes] context, so make it descriptive, not generic ('investigate', 'task 1'). Required for a new lane; ignored when lane_id is set."
+                    "description": "A 2–5 word label for the lane, shown to the user (e.g. 'audit auth flow'). Required for a new lane."
                 },
                 "description": {
                     "type": "string",
@@ -366,7 +321,7 @@ fn delegate_task_tool() -> NativeToolDefinition {
                 },
                 "profile": {
                     "type": "string",
-                    "description": "Optional inference profile name from setups in config. Defaults to your active model to preserve prompt cache affinity and avoid cold-start latency."
+                    "description": "Optional inference profile; omit to stay on your model and its prompt cache."
                 }
             },
             "required": ["description"],

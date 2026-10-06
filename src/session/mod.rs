@@ -345,7 +345,14 @@ impl AgentRuntime {
         }
         crate::mission_tools::add_mission_control_tools(&mut tools);
         crate::coordination_tools::add_coordination_tools(&mut tools);
-        for name in ["message_mission_control", "claim_and_dispatch_task", "transfer_task_session_lease"] {
+        for name in [
+            "message_mission_control",
+            "claim_and_dispatch_task",
+            "transfer_task_session_lease",
+            "post_coordination_message",
+            "read_coordination_board",
+            "record_coordination_note",
+        ] {
             tools.remove(name);
         }
 
@@ -355,7 +362,7 @@ impl AgentRuntime {
             tools,
             prompt: mission_control_system_prompt(),
             allow_lane_control: false,
-            hidden_meta: &["monitor", "set_session_title"],
+            hidden_meta: &["monitor", "set_session_title", "update_plan"],
             memory: false,
         })
     }
@@ -387,7 +394,14 @@ impl AgentRuntime {
         crate::mission_tools::add_worker_report_tool(&mut tools);
         tools.insert(crate::mission_tools::CreateRecurringJob);
         crate::coordination_tools::add_coordination_tools(&mut tools);
-        tools.remove("claim_and_dispatch_task");
+        for name in [
+            "claim_and_dispatch_task",
+            "post_coordination_message",
+            "read_coordination_board",
+            "record_coordination_note",
+        ] {
+            tools.remove(name);
+        }
 
         let prompt_ctx = i.prompt_ctx;
         let custom_section = custom_dir.as_deref().map(crate::agent_tools::prompt_section);
