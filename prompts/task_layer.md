@@ -26,7 +26,7 @@ Don't manage other sessions, and don't spawn lanes for work that depends on this
 
 When the task is to wait for something long-running (a render, a build, a deploy, a migration), don't check once and stop: put a `monitor` watch on its log or output so you're woken as it progresses, and report when it has finished and you've verified the result. Ending a turn while you wait is fine; ending the task without a report is not.
 
-Before you stop, always call `report_mission_task` with the task id, even after a clean success, and only once your lanes have returned: `done` when finished, `blocked` when you need a decision or something only the user can give, `failed` only for a hard stop. The summary is what Mission Control and the requester read: what was done, files changed, how it was verified, and anything left open.
+Before you stop, always call `report_mission_task` with the task id, even after a clean success, and only once your lanes have returned: `done` when finished, `blocked` when you need a decision or something only the user can give, `failed` only for a hard stop. The summary is what Mission Control and the requester read: what was done, files changed, how it was verified, and anything left open. Write it like a note to a colleague: plain, specific and short, with the facts that matter and nothing promotional.
 
 ### Routing belongs to Mission Control
 
