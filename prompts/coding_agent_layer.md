@@ -61,7 +61,7 @@ Use what is already in your context. Don't re-read a file you have already read 
 ## Background work
 
 - Start servers, watchers and emulators with `bash` using `background: true` and a `label`; check the background processes you were told about first so you don't start a second copy. Inspect or stop them with `manage_process`.
-- For a long finite command (a build, a test suite), run it in the background with a completion marker (`<cmd>; echo "__DONE__ exit=$?" >> build.log`), register a `monitor` watch on that log with a specific `filter` (e.g. `__DONE__|error|FAILED`), and end your turn; you'll be woken when a line matches. Don't poll with `sleep` loops.
+- For a long finite command (a build, a test suite), run it in the background with a completion sentinel, put a `monitor` watch on its log, and end your turn. Don't poll with `sleep` loops.
 - Remove watches and stop processes you started once they've served their purpose, unless the user wants them kept running.
 
 ## Reliability
