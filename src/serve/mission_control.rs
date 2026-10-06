@@ -1119,6 +1119,7 @@ fn autonomy_view() -> serde_json::Value {
         "round_minutes": state.settings.round_minutes,
         "quiet_start": state.settings.quiet_start,
         "quiet_end": state.settings.quiet_end,
+        "utc_offset_minutes": state.settings.utc_offset_minutes,
         "in_quiet_hours": crate::mission_autonomy::in_quiet_hours(&state.settings),
         "last_round_at": (state.last_round_at > 0).then_some(state.last_round_at),
         "last_round_summary": state.last_round_summary,
@@ -1140,6 +1141,8 @@ struct AutonomyReq {
     quiet_start: Option<String>,
     #[serde(default)]
     quiet_end: Option<String>,
+    #[serde(default)]
+    utc_offset_minutes: Option<i32>,
 }
 
 async fn autonomy(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
@@ -1171,6 +1174,9 @@ async fn update_autonomy(State(d): State<Shared>, Query(a): Query<Auth>, Json(re
         }
         if let Some(start) = req.quiet_start {
             state.settings.quiet_start = Some(start).filter(|s| !s.is_empty());
+        }
+        if let Some(offset) = req.utc_offset_minutes.filter(|m| m.abs() <= 14 * 60) {
+            state.settings.utc_offset_minutes = Some(offset);
         }
         if let Some(end) = req.quiet_end {
             state.settings.quiet_end = Some(end).filter(|s| !s.is_empty());

@@ -153,7 +153,7 @@ fn round_envelope(
     let mut out = String::from("[autonomous_round]\n");
     out.push_str(&format!(
         "time: {}\nlast round: {}\n",
-        chrono::Local::now().format("%a %d %b %H:%M"),
+        mission_autonomy::user_now(&state.settings).format("%a %d %b %H:%M (UTC%:z, the user's time)"),
         if since == 0 { "never (autonomous mode was just switched on)".to_string() } else { ago(now - since) }
     ));
     if mission_autonomy::in_quiet_hours(&state.settings) {
