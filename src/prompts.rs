@@ -165,8 +165,10 @@ fn identity_overlay(agent_id: &str, identity: &str) -> String {
 
 /// A delegated lane's prompt: the execution contract, plus the identity of the
 /// agent it was assigned, when there is one.
+const LANE_NOTE: &str = "## Working as a lane\n\nYou are a delegated lane: you run until the work is done and report once with `terminate_loop`. There is no user here to ask, no `monitor` and no `update_plan`, so where the guidance above mentions them, adapt: decide sensibly and say in your report what you assumed, and run a long command in the foreground with a generous timeout (or poll its log a few times) rather than ending your turn to wait. If something only the user can decide blocks you, stop and report it as the blocker.";
+
 pub fn lane_prompt(context: &PromptContext, identity: Option<(&str, &str)>) -> String {
-    let base = coding_prompt(context);
+    let base = format!("{}\n\n{LANE_NOTE}", coding_prompt(context));
     match identity {
         Some((agent_id, body)) => format!("{base}\n\n{}", identity_overlay(agent_id, body)),
         None => base,

@@ -541,11 +541,10 @@ async fn start_mcp_server(
 
 impl CodingHarness {
     fn cli_meta_definitions(&self, once: bool, lanes: bool) -> Vec<NativeToolDefinition> {
-        let mission_control = self.context.workspace_root() == crate::mission_control::workspace_path();
         meta::conversation_meta_definitions_for(false, lanes)
             .into_iter()
             .filter(|d| !once || !matches!(d.name.as_str(), "ask_user" | "monitor"))
-            .filter(|d| !(mission_control && d.name == "monitor"))
+            .filter(|d| !self.config.hidden_meta.contains(&d.name.as_str()))
             .collect()
     }
 
