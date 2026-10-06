@@ -256,6 +256,12 @@ pub fn write_session_sidecar(state_path: &Path, sidecar: &SessionSidecar) {
 /// report every session as a plain standard session — the routing agent would
 /// then treat Mission Control as ordinary work.
 pub fn read_session_sidecar(state_path: &Path) -> Option<SessionSidecar> {
+    if crate::mission_control::is_session_id(&session_id_for_state_path(state_path)) {
+        return Some(SessionSidecar {
+            role: SessionRole::MissionControl,
+            agent_id: None,
+        });
+    }
     let row = store_session_row(state_path)?;
     let role = if row.role == "mission_control" {
         SessionRole::MissionControl

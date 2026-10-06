@@ -808,6 +808,7 @@ impl CodingHarness {
         let mut running: FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> =
             FuturesUnordered::new();
         let mut outbox: Vec<String> = Vec::new();
+        let mut held_envelopes: Vec<String> = Vec::new();
 
         if state.status == HarnessStatus::Running
             && let Some(text) = state.messages.iter().rev().find_map(|m| match m {
@@ -906,6 +907,10 @@ impl CodingHarness {
                             if text.is_empty() {
                                 continue;
                             }
+                            if state.pending_question.is_some() && is_daemon_envelope(&text) {
+                                held_envelopes.push(text);
+                                continue;
+                            }
                             if state.pending_question.is_some() {
                                 let mid_turn = state.status == HarnessStatus::Running && process.is_some();
                                 state.status = HarnessStatus::WaitingForInput;
@@ -935,6 +940,13 @@ impl CodingHarness {
                             } else {
                                 self.accept_user_message(&mut state, &mut vars, text.clone()).await;
                                 outbox.push(text);
+                            }
+                            if state.pending_question.is_none() {
+                                for held in held_envelopes.drain(..) {
+                                    state.events.push(HarnessEvent::Steer { text: held.clone() });
+                                    state.messages.push(HarnessMessage::User { content: held.clone() });
+                                    outbox.push(held);
+                                }
                             }
                             self.persist(&mut state, &lanes).await?;
                         }
