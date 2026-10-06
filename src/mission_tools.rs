@@ -462,7 +462,10 @@ impl Tool for InspectSession {
         // Store-or-file: MC inspecting a session that lives in the database must
         // not fail just because it has no state file.
         let state = read_session_state(&path)
-            .ok_or_else(|| ToolError::msg("session state unreadable"))?;
+            .ok_or_else(|| ToolError::msg(format!(
+                "no session `{}`: it may have been deleted, or the id was not copied from list_sessions. Use an id exactly as list_sessions returns it, or open a new session in that folder with create_mission_session.",
+                args.session_id
+            )))?;
         let from = state.events.len().saturating_sub(args.event_limit.min(100));
         let recent: Vec<Value> = state.events[from..]
             .iter()
@@ -652,7 +655,10 @@ impl Tool for CreateMissionTask {
         let path = state_path_for_id(&args.session_id)
             .ok_or_else(|| ToolError::msg("unknown target session"))?;
         let state = read_session_state(&path)
-            .ok_or_else(|| ToolError::msg("session state unreadable"))?;
+            .ok_or_else(|| ToolError::msg(format!(
+                "no session `{}`: it may have been deleted, or the id was not copied from list_sessions. Use an id exactly as list_sessions returns it, or open a new session in that folder with create_mission_session.",
+                args.session_id
+            )))?;
         // Store the CANONICAL id.
         let session_id = crate::session::session_id_for_state_path(&path);
         // The worker, in order of specificity: what the caller named, then the
