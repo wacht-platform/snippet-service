@@ -267,7 +267,7 @@ pub fn remember_question(key: &str) -> bool {
 
 pub fn mode_line() -> String {
     format!(
-        "{} You have no shell (no bash): you coordinate through sessions, tasks and agents, and use read_file for a quick look at a specific file.",
+        "{} You coordinate through sessions, tasks and agents; your bash is only for small read-only lookups (decoding a file, a quick df or git status), never for project work.",
         mode_status()
     )
 }

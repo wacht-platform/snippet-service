@@ -329,6 +329,7 @@ impl AgentRuntime {
             .with_agent_id(crate::mission_control::SESSION_ID);
 
         let mut tools = ToolRegistry::new();
+        tools.insert(crate::builtins::BashTool);
         tools.insert(crate::builtins::ViewImageTool);
         // Mission Control may research current docs and issues while routing work.
         if let Some(key) = i.exa_api_key.clone().filter(|k| !k.trim().is_empty()) {

@@ -196,7 +196,7 @@ impl CodingHarness {
                 Err(error) => (tool_error(error), MetaControl::Continue),
             },
             "delegate_task" => match parse_delegate_brief(arguments) {
-                Ok(brief) => {
+                Ok(mut brief) => {
                     // Follow-up to an existing lane: resume it with the new brief,
                     // context intact.
                     if let Some(lane_id) = brief.lane_id.as_deref() {
@@ -222,6 +222,9 @@ impl CodingHarness {
                             }
                             Err(error) => (tool_error(error), MetaControl::Continue),
                         };
+                    }
+                    if self.context.workspace_root() == crate::mission_control::workspace_path() {
+                        brief.read_only = true;
                     }
                     match lanes.spawn(
                         &brief.title,
