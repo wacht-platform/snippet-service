@@ -1146,6 +1146,17 @@ impl Tool for ClaimAndDispatchTask {
             created_at: now,
         };
         let _ = db.append_event(&event);
+        let _ = db.record_board_entry(
+            &actor_id,
+            crate::coordination::BoardEntryKind::Dispatched,
+            &crate::coordination::NewBoardEntry {
+                session_id: Some(&queued.session_id),
+                workspace: None,
+                summary: &format!("{task_id} — claimed: {}", task.title),
+                correlation_id: Some(task_id),
+                created_at: &event.created_at,
+            },
+        );
 
         Ok(ToolResult::success(json!({
             "queued": true,
@@ -1154,6 +1165,89 @@ impl Tool for ClaimAndDispatchTask {
             "profile": queued.profile,
             "active_agent": actor_id,
             "note": "Lease taken; the daemon dispatches the task to its session within seconds.",
+        })))
+    }
+}
+
+#[derive(Deserialize)]
+struct DeclineTaskArgs {
+    task_id: String,
+    reason: String,
+}
+
+pub struct DeclineTask;
+
+#[async_trait]
+impl Tool for DeclineTask {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "decline_task".into(),
+            description: "Turn down a task you were offered, with your reason: it isn't your kind of work, the target session is wrong, the briefing can't be done as written. You leave the roster, the task waits as blocked, and Mission Control is told why so it can reassign or reshape it. Ask Mission Control first instead when a question would settle it.".into(),
+            input_schema: schema(
+                json!({
+                    "task_id": {"type": "string", "description": "The full task id from the offer."},
+                    "reason": {"type": "string", "description": "Why, and what would make it work (another agent, session or scope)."}
+                }),
+                &["task_id", "reason"],
+            ),
+        }
+    }
+
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: DeclineTaskArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let task_id = args.task_id.trim();
+        let reason = args.reason.trim();
+        if task_id.is_empty() || reason.is_empty() {
+            return Err(ToolError::msg("task_id and reason must not be empty"));
+        }
+        let (actor_kind, actor_id) = actor(ctx)?;
+        if actor_kind != "agent" {
+            return Err(ToolError::msg("declining a task needs an agent identity; this session has none"));
+        }
+        let db = db(ctx)?;
+        let task = db
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("lookup task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
+        if task.status.is_terminal() || task.status == crate::coordination::TaskStatus::InProgress {
+            return Err(ToolError::msg(format!(
+                "task `{task_id}` is {}; only work that hasn't started can be declined",
+                task.status
+            )));
+        }
+        let now = now_rfc3339();
+        db.remove_task_agent(task_id, &actor_id, &now)
+            .map_err(|e| ToolError::msg(format!("leave the roster: {e}")))?;
+        let message = format!("{actor_id} declined the task: {reason}");
+        db.move_task(task_id, crate::coordination::TaskStatus::Blocked, &message, &now)
+            .map_err(|e| ToolError::msg(format!("park task: {e}")))?;
+        let marker = crate::coordination::offer_marker(&actor_id);
+        db.update_task_in(task_id, &now, |t| {
+            t.notifications.retain(|n| n.target != marker);
+            t.notify_once("declined", &message);
+        })
+            .map_err(|e| ToolError::msg(format!("notify Mission Control: {e}")))?;
+        let event = CoordinationEvent {
+            event_id: Uuid::new_v4().to_string(),
+            thread_id: task.thread_id.clone(),
+            partition_key: format!("thread:{}", task.thread_id),
+            sequence: 0,
+            event_type: "task.declined".into(),
+            actor_kind: actor_kind.to_string(),
+            actor_id: actor_id.clone(),
+            payload_version: 1,
+            payload: stamp_origin(ctx, json!({"body": message, "task_id": task_id, "agent_id": actor_id})),
+            causation_id: None,
+            correlation_id: Some(task_id.to_string()),
+            idempotency_key: Uuid::new_v4().to_string(),
+            created_at: now,
+        };
+        let _ = db.append_event(&event);
+        Ok(ToolResult::success(json!({
+            "declined": true,
+            "task_id": task_id,
+            "note": "Mission Control has been told why; the task waits as blocked until it is reassigned or reshaped.",
         })))
     }
 }

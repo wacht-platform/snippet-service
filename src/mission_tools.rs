@@ -751,7 +751,7 @@ impl Tool for CreateMissionTask {
             agent_id: agent_id.clone(),
             work_session_id: None,
             scope: String::new(),
-            status: "active".into(),
+            status: "offered".into(),
             role: "implementer".into(),
             added_at: task.created_at.clone(),
             removed_at: None,
@@ -774,7 +774,7 @@ impl Tool for CreateMissionTask {
                 "task": task_view(&task),
                 "agent_id": agent_id,
                 "profile": profile,
-                "note": "Persisted as pending. The daemon dispatches it, and restarts the target session on `profile` when one is given."
+                "note": format!("Offered to `{agent_id}`. The daemon sends the offer to its inbox; the task starts once the agent claims it (and restarts the target session on `profile` when one is given). Don't message the agent to claim it.")
             }),
         ))
     }
@@ -987,6 +987,7 @@ impl Tool for AssignTaskAgent {
             Some("waiting") => "waiting",
             _ => if has_active { "waiting" } else { "active" },
         };
+        let status = if status == "active" && task.status != TaskStatus::InProgress { "offered" } else { status };
         if status == "active" {
             require_working_agent(&store, agent_id)?;
         }
@@ -1850,7 +1851,7 @@ mod tests {
         assert_eq!(roster.len(), 2);
         let s = roster.iter().find(|m| m.agent_id == "snippet").unwrap();
         let r = roster.iter().find(|m| m.agent_id == "reviewer").unwrap();
-        assert_eq!(s.status, "active");
+        assert_eq!(s.status, "offered");
         assert_eq!(r.status, "waiting");
 
         let res = UpdateMissionTask

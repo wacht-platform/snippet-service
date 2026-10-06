@@ -483,6 +483,7 @@ impl AgentRuntime {
         crate::coordination_tools::add_coordination_tools(&mut tools);
         // Read-only view of what exists, so a dispatch targets a real session.
         crate::mission_tools::add_coordination_session_tools(&mut tools);
+        tools.insert(crate::coordination_tools::DeclineTask);
 
         // The environment layer states this session has bash and full filesystem
         // access. It does not, so the flag both selects the coordination layer and
