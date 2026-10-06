@@ -265,6 +265,11 @@ pub fn remember_question(key: &str) -> bool {
     .unwrap_or(false)
 }
 
+pub fn clock_line() -> String {
+    let now = user_now(&load().settings);
+    format!("For the user it's {}:xx on {} (UTC{}).", now.format("%H"), now.format("%a %d %b"), now.format("%:z"))
+}
+
 pub fn mode_line() -> String {
     format!(
         "{} You coordinate through sessions, tasks and agents; your bash is only for small read-only lookups (decoding a file, a quick df or git status), never for project work.",
@@ -287,7 +292,7 @@ fn mode_status() -> String {
         _ => String::new(),
     };
     format!(
-        "Autonomous mode is on: rounds every {} minutes{quiet}. The user may be away and doesn't watch this chat: reach them with ping_user, never ask_user (it would block you and stop your rounds until they answer). When they message you directly they are here, so answer in your reply as usual.",
+        "Autonomous mode is on: rounds every {} minutes{quiet}. The user may be away and doesn't watch this chat: reach them with ping_user to keep working while they think, or ask_user when nothing worthwhile can move without their answer (it blocks you and your rounds until they reply). When they message you directly they are here, so answer in your reply as usual.",
         settings.round_minutes
     )
 }

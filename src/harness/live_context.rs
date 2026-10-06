@@ -89,6 +89,7 @@ fn sections(
 
     if workspace == crate::mission_control::workspace_path() {
         out.push(("autonomy", crate::mission_autonomy::mode_line(), None));
+        out.push(("clock", crate::mission_autonomy::clock_line(), None));
     }
 
     let browser = browser_summary
