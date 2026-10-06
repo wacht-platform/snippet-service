@@ -1080,6 +1080,9 @@ pub async fn dispatch_loop(daemon: Shared) {
 }
 
 async fn deliver_mission_control_reports(daemon: &Daemon) {
+    if mission_control::awaiting_user() {
+        return;
+    }
     let Ok(tasks) = daemon.store.list_tasks(None, None) else {
         return;
     };

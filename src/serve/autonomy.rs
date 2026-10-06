@@ -24,7 +24,9 @@ pub async fn autonomy_loop(daemon: Shared) {
             continue;
         }
         mission_autonomy::release_held_pings();
-        wake_for_worker_questions(&daemon).await;
+        if !crate::mission_control::awaiting_user() {
+            wake_for_worker_questions(&daemon).await;
+        }
         if mission_control_busy() {
             continue;
         }

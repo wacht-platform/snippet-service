@@ -866,7 +866,7 @@ impl CodingHarness {
                 }
                 if let Some(p) = process.as_mut() {
                     if session_key == crate::mission_control::SESSION_ID {
-                        let mode = crate::mission_autonomy::mode_line();
+                        let mode = format!("{} {}", crate::mission_autonomy::clock_line(), crate::mission_autonomy::mode_line());
                         if mode != last_mode_line
                             && let Some(first) = outbox.first_mut()
                         {
