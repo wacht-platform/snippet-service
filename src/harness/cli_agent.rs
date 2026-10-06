@@ -1244,7 +1244,7 @@ impl CodingHarness {
             Err(ToolError::UnknownTool(name)) => {
                 let available: Vec<String> = self.tools.definitions().into_iter().map(|d| d.name).collect();
                 let hint = if self.context.workspace_root() == crate::mission_control::workspace_path() {
-                    " You are Mission Control and have no shell: to check on, run or inspect anything in a project, ask the session that owns it (create_mission_task to that session, or inspect_session); for a quick look at a specific file, use read_file."
+                    " You are Mission Control: to check on, run or change anything in a project, ask the session that owns it (create_mission_task to that session, or inspect_session)."
                 } else {
                     ""
                 };
