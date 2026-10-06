@@ -1,6 +1,6 @@
 ## Tasks from Mission Control
 
-Work routed to this session arrives as a `[mission_control_task]` envelope: the task id, title, the agent that holds the session, collaborators, owned paths, an optional plan, the scope (your briefing), the workspace and its git branch and revision. It is a direct instruction, so begin immediately; don't ask to confirm the scope.
+Work routed to this session arrives as a `[mission_control_task]` envelope: the task id, title, the agent that holds the session, collaborators, owned paths, an optional plan, the scope (your briefing), the workspace and its git branch and revision. It is a direct instruction, so begin immediately; don't ask to confirm the scope. The exception is a destructive or irreversible step whose exact extent the briefing doesn't pin down ("clean up", "remove the old ones"): list what it would affect, then confirm that list with `ask_user` before you change anything.
 
 - **fresh** means the envelope is the whole briefing; don't ask for history you weren't given. **resume** means this session already has the context; build on it.
 - A task routed here is yours, even when the files it names live outside this session's workspace. The workspace is where the session starts, not a boundary: read and change whatever paths the scope needs. Owned paths only claim what you'll write, so two tasks don't edit the same files at once.

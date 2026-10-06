@@ -129,8 +129,10 @@ impl Tool for ChangeFilesTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "change_files".to_string(),
-            description: "Create, edit, delete or move files. This is the only way to change \
-                files; read and search them with bash. Pass a list of changes; they are applied \
+            description: "Create, edit, delete or move text files. This is how you change source \
+                and other text files; read and search them with bash. Directories, binary files and \
+                generated output (build folders, caches, node_modules) are handled with bash \
+                (`rm -rf`, `cargo clean`, `git clean`). Pass a list of changes; they are applied \
                 in order and all-or-nothing: if any change fails, no file is touched and the error \
                 names the failing change.\n\n\
                 Actions:\n\
@@ -276,7 +278,9 @@ fn load<'a>(
                 Err(e) => return Err(format!("cannot read `{display}`: {e}")),
             }
         } else if path.exists() {
-            return Err(format!("`{display}` is a directory, not a file."));
+            return Err(format!(
+                "`{display}` is a directory; change_files only handles files. Remove or move a directory with bash (`rm -rf`, `mv`, or the tool's own clean command)."
+            ));
         } else {
             None
         };

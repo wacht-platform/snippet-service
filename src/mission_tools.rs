@@ -167,7 +167,7 @@ impl Tool for AnswerWorker {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "answer_worker".into(),
-            description: "Answer the question a worker session is paused on, as if the user answered it there. Use it for a [worker_question] the brief, the task or the conversation already settles. Name the choice plainly and add a sentence of why when it helps.".into(),
+            description: "Answer the question a worker session is paused on, as if the user answered it there. Use it for a [worker_question] the brief, the task or the conversation already settles. A confirmation of a destructive or irreversible step is the user's alone and is refused. Name the choice plainly and add a sentence of why when it helps.".into(),
             input_schema: schema(json!({
                 "session_id": {"type": "string", "description": "The waiting session's id, from the [worker_question]."},
                 "answer": {"type": "string", "description": "The answer, e.g. \"Blue — the user wants colour files blue.\""}
@@ -177,11 +177,21 @@ impl Tool for AnswerWorker {
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: AnswerWorkerArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         let session = args.session_id.trim().trim_start_matches("session:").to_string();
-        let waiting = crate::session::state_path_for_id(&session)
+        let pending = crate::session::state_path_for_id(&session)
             .and_then(|path| crate::session::read_session_state(&path))
-            .is_some_and(|state| state.status == crate::harness::HarnessStatus::WaitingForInput && state.pending_question.is_some());
-        if !waiting {
+            .filter(|state| state.status == crate::harness::HarnessStatus::WaitingForInput)
+            .and_then(|state| state.pending_question);
+        let Some(pending) = pending else {
             return Err(ToolError::msg(format!("session `{session}` isn't waiting on a question right now")));
+        };
+        let asks_confirmation = pending
+            .get("questions")
+            .and_then(Value::as_array)
+            .is_some_and(|qs| qs.iter().any(|q| q.pointer("/answer_kind/kind").and_then(Value::as_str) == Some("confirm")));
+        if asks_confirmation {
+            return Err(ToolError::msg(
+                "this worker is asking the user to confirm a destructive or irreversible step, and only the user can give that. Tell them what the worker found and what you recommend (ping_user in autonomous mode); they answer in the worker's session.",
+            ));
         }
         if args.answer.trim().is_empty() {
             return Err(ToolError::msg("answer must not be empty"));
