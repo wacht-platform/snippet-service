@@ -861,3 +861,11 @@ pub(crate) use transcript::notice_text;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn is_daemon_envelope(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or("").trim();
+    first.len() > 2
+        && first.starts_with('[')
+        && first.ends_with(']')
+        && first[1..first.len() - 1].chars().all(|c| c.is_ascii_lowercase() || c == '_')
+}

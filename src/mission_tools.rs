@@ -223,6 +223,8 @@ impl Tool for UpdateBrief {
 struct ScheduleFollowupArgs {
     in_minutes: i64,
     note: String,
+    #[serde(default)]
+    next_wake: bool,
 }
 
 pub struct ScheduleFollowup;
@@ -231,10 +233,11 @@ impl Tool for ScheduleFollowup {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "schedule_followup".into(),
-            description: "Ask to be woken later about something specific: check a worker's progress, verify a result, remind the user, revisit a decision. You get a round with this note when it's due. Use it instead of waiting or polling.".into(),
+            description: "Ask to be woken later, whether or not anything changes: check a worker's progress, verify a result, remind the user, revisit a decision, or simply your next look at everything. You get a round with this note when it's due. Use it instead of waiting or polling. Set next_wake for your next general check-in; it replaces the previous one, so there is only ever one.".into(),
             input_schema: schema(json!({
                 "in_minutes": {"type": "integer", "description": "How many minutes from now (1 to 10080)."},
-                "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."}
+                "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."},
+                "next_wake": {"type": "boolean", "description": "This is your next general check-in; replaces any earlier one."}
             }), &["in_minutes", "note"]),
         }
     }
@@ -245,7 +248,7 @@ impl Tool for ScheduleFollowup {
         }
         let minutes = args.in_minutes.clamp(1, 10080);
         let due_at = chrono::Utc::now().timestamp() + minutes * 60;
-        let followup = crate::mission_autonomy::schedule_followup(due_at, args.note.trim()).map_err(ToolError::msg)?;
+        let followup = crate::mission_autonomy::schedule_followup(due_at, args.note.trim(), args.next_wake).map_err(ToolError::msg)?;
         let on = crate::mission_autonomy::is_on();
         Ok(ToolResult::success(json!({
             "scheduled": true,

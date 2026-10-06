@@ -215,7 +215,11 @@ impl CodingHarness {
                             if text.is_empty() {
                                 continue;
                             }
-                            had_user_msg = true;
+                            let hold = !was_running
+                                && state.status == HarnessStatus::WaitingForInput
+                                && state.pending_question.is_some()
+                                && is_daemon_envelope(&text);
+                            had_user_msg |= !hold;
                             if was_running {
                                 // Mid-run steer: the step continues; fold it in.
                                 state.messages.push(HarnessMessage::User {
@@ -223,6 +227,12 @@ impl CodingHarness {
                                 });
                                 state.events.push(HarnessEvent::Steer { text });
                                 self.bump_activity();
+                            } else if hold {
+                                state.queued_inputs.push(QueuedInput {
+                                    id: uuid::Uuid::new_v4().simple().to_string(),
+                                    text,
+                                });
+                                needs_persist = true;
                             } else {
                                 // The step ENDED while this was queued: it's the
                                 // next real request (or the answer to the question
@@ -544,6 +554,17 @@ impl CodingHarness {
                             if text.is_empty() {
                                 continue;
                             }
+                            if state.status == HarnessStatus::WaitingForInput
+                                && state.pending_question.is_some()
+                                && is_daemon_envelope(&text)
+                            {
+                                state.queued_inputs.push(QueuedInput {
+                                    id: uuid::Uuid::new_v4().simple().to_string(),
+                                    text,
+                                });
+                                self.persist(&mut state, &lanes).await?;
+                                continue;
+                            }
                             self.accept_user_message(&mut state, &mut vars, text).await;
                             consecutive_errors = 0;
                             self.persist(&mut state, &lanes).await?;
@@ -737,3 +758,4 @@ pub(super) fn backoff_delay(attempt: usize, base_ms: u64, max_ms: u64) -> Durati
         .min(max_ms.max(1));
     Duration::from_millis(delay)
 }
+

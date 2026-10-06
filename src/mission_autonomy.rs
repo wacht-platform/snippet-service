@@ -44,6 +44,8 @@ pub struct Followup {
     pub id: String,
     pub due_at: i64,
     pub note: String,
+    #[serde(default)]
+    pub next_wake: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -222,14 +224,18 @@ pub fn release_held_pings() {
     }
 }
 
-pub fn schedule_followup(due_at: i64, note: &str) -> Result<Followup, String> {
+pub fn schedule_followup(due_at: i64, note: &str, next_wake: bool) -> Result<Followup, String> {
     let followup = Followup {
         id: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
         due_at,
         note: note.to_string(),
+        next_wake,
     };
     let saved = followup.clone();
     update(move |state| {
+        if next_wake {
+            state.followups.retain(|f| !f.next_wake);
+        }
         state.followups.push(followup);
         state.followups.sort_by_key(|f| f.due_at);
     })?;
@@ -270,6 +276,19 @@ pub fn clock_line() -> String {
     format!("For the user it's {}:xx on {} (UTC{}).", now.format("%H"), now.format("%a %d %b"), now.format("%:z"))
 }
 
+fn next_wake_status(state: &AutonomyState) -> String {
+    let now = chrono::Utc::now().timestamp();
+    match state.followups.iter().filter(|f| f.next_wake).min_by_key(|f| f.due_at) {
+        Some(f) => {
+            let at = chrono::DateTime::from_timestamp(f.due_at.max(now), 0)
+                .map(|t| t.with_timezone(user_now(&state.settings).offset()).format("%a %H:%M").to_string())
+                .unwrap_or_default();
+            format!(" Your next wake-up is set for {at} (the user's time): {}.", f.note)
+        }
+        None => " You have no next wake-up set: set one with schedule_followup (next_wake) before you end this turn.".to_string(),
+    }
+}
+
 pub fn mode_line() -> String {
     format!(
         "{} You coordinate through sessions, tasks and agents; your bash is only for small read-only lookups (decoding a file, a quick df or git status), never for project work.",
@@ -292,8 +311,9 @@ fn mode_status() -> String {
         _ => String::new(),
     };
     format!(
-        "Autonomous mode is on: rounds every {} minutes{quiet}. The user may be away and doesn't watch this chat: reach them with ping_user to keep working while they think, or ask_user when nothing worthwhile can move without their answer (it blocks you and your rounds until they reply). When they message you directly they are here, so answer in your reply as usual.",
-        settings.round_minutes
+        "Autonomous mode is on: rounds every {} minutes{quiet}.{} The user may be away and doesn't watch this chat: reach them with ping_user to keep working while they think, or ask_user when nothing worthwhile can move without their answer (it blocks you and your rounds until they reply). When they message you directly they are here, so answer in your reply as usual.",
+        settings.round_minutes,
+        next_wake_status(&state)
     )
 }
 

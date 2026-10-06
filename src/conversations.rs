@@ -872,8 +872,8 @@ impl Store {
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO sessions (id, workspace_key, workspace, title, status,
-                created_at, updated_at, state_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                created_at, updated_at, state_json, role)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
              ON CONFLICT(id) DO UPDATE SET
                 workspace = excluded.workspace,
                 title = excluded.title,
@@ -888,7 +888,8 @@ impl Store {
                     status,
                     created_at,
                     now,
-                    scalar_json
+                    scalar_json,
+                    if crate::mission_control::is_session_id(id) { "mission_control" } else { "standard" }
                 ],
             )?;
             Ok(())
