@@ -487,15 +487,25 @@ pub struct ListMissionTasks;
 #[async_trait]
 impl Tool for ListMissionTasks {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "list_mission_tasks".into(), description: "List Mission Control's durable task board, including queued, active, blocked, failed, and completed work. Read status, result, notifications, and dispatch_failures — those are how you see errors and temporary failures to resume.".into(), input_schema: schema(json!({}), &[]) }
+        NativeToolDefinition { name: "list_mission_tasks".into(), description: "List Mission Control's task board: open work (queued, active, blocked) and work finished in the last day. Read status, result, notifications, and dispatch_failures — those are how you see errors and temporary failures to resume. Pass include_finished to see older finished and cancelled tasks too.".into(), input_schema: schema(json!({"include_finished": {"type": "boolean", "description": "Also list tasks that finished or were cancelled more than a day ago."}}), &[]) }
     }
-    async fn execute(&self, ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let include_finished = arguments.get("include_finished").and_then(Value::as_bool).unwrap_or(false);
         let tasks = db(ctx)?
             .list_tasks(None, None)
             .map_err(|e| ToolError::msg(format!("list tasks: {e}")))?;
-        Ok(ToolResult::success(
-            json!({"tasks": tasks.iter().map(task_view).collect::<Vec<_>>() }),
-        ))
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+        let recent = |task: &&Task| {
+            let finished = task.completed_at.as_deref().unwrap_or(&task.updated_at);
+            chrono::DateTime::parse_from_rfc3339(finished).map_or(true, |at| at >= cutoff)
+        };
+        let shown: Vec<Value> = tasks
+            .iter()
+            .filter(|task| include_finished || !task.status.is_terminal() || recent(task))
+            .map(task_view)
+            .collect();
+        let hidden = tasks.len() - shown.len();
+        Ok(ToolResult::success(json!({"tasks": shown, "older_finished_hidden": hidden})))
     }
 }
 
