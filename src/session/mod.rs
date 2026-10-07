@@ -393,6 +393,8 @@ impl AgentRuntime {
         let mut tools = coding_tools(i.exa_api_key.clone()).with_custom_dir(custom_dir.clone());
         crate::mission_tools::add_worker_report_tool(&mut tools);
         tools.insert(crate::mission_tools::CreateRecurringJob);
+        tools.insert(crate::mission_tools::ListRecurringJobs);
+        tools.insert(crate::mission_tools::CancelRecurringJob);
         crate::coordination_tools::add_coordination_tools(&mut tools);
         for name in [
             "claim_and_dispatch_task",
