@@ -65,6 +65,8 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(AssignTaskAgent);
     registry.insert(TransferMissionTaskLease);
     registry.insert(CreateRecurringJob);
+    registry.insert(ListRecurringJobs);
+    registry.insert(CancelRecurringJob);
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
     registry.insert(ArchiveMissionSession);
@@ -1582,8 +1584,56 @@ struct CreateRecurringArgs {
     plan_path: Option<String>,
 }
 
-/// Writes `~/.snippet/recurring/<id>.json`. The serve tick is the only reader —
-/// creating the file *is* scheduling. The target session picks it up as SetGoal.
+pub struct ListRecurringJobs;
+#[async_trait]
+impl Tool for ListRecurringJobs {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "list_recurring_jobs".into(),
+            description: "List the recurring jobs: id, title, target session, schedule, plan file, next run. Check it before scheduling something that may already exist.".into(),
+            input_schema: schema(json!({}), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
+        let jobs = crate::recurring::list_jobs(&crate::recurring::default_root()).map_err(ToolError::msg)?;
+        let rows: Vec<Value> = jobs
+            .iter()
+            .map(|job| json!({
+                "id": job.id,
+                "title": job.title,
+                "session_id": job.session_id,
+                "schedule": job.schedule.display(),
+                "plan_path": job.plan_path,
+                "enabled": job.enabled,
+                "next_run_at": job.next_run_at,
+            }))
+            .collect();
+        Ok(ToolResult::success(json!({"jobs": rows})))
+    }
+}
+
+#[derive(Deserialize)]
+struct CancelRecurringArgs {
+    id: String,
+}
+
+pub struct CancelRecurringJob;
+#[async_trait]
+impl Tool for CancelRecurringJob {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "cancel_recurring_job".into(),
+            description: "Stop a recurring job for good, by its id from list_recurring_jobs.".into(),
+            input_schema: schema(json!({"id": {"type": "string"}}), &["id"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: CancelRecurringArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        crate::recurring::delete_job(&crate::recurring::default_root(), args.id.trim()).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"cancelled": true, "id": args.id.trim()})))
+    }
+}
+
 pub struct CreateRecurringJob;
 #[async_trait]
 impl Tool for CreateRecurringJob {
@@ -1630,6 +1680,21 @@ impl Tool for CreateRecurringJob {
             ));
         }
         let schedule = crate::recurring::Schedule::parse(&args.schedule).map_err(ToolError::msg)?;
+        let title = args.title.trim().to_lowercase();
+        let plan = args.plan_path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        let existing = crate::recurring::list_jobs(&crate::recurring::default_root()).unwrap_or_default();
+        if let Some(twin) = existing.iter().find(|job| {
+            job.enabled
+                && job.session_id == session_id
+                && (job.title.trim().to_lowercase() == title || (plan.is_some() && job.plan_path.as_deref() == plan))
+        }) {
+            return Err(ToolError::msg(format!(
+                "session `{session_id}` already has a recurring job for this: `{}` ({}, {}). Keep it, or cancel_recurring_job it first if this one should replace it.",
+                twin.title,
+                twin.id,
+                twin.schedule.display()
+            )));
+        }
         let job = crate::recurring::create_job(
             &crate::recurring::default_root(),
             args.title.trim(),
@@ -1647,9 +1712,8 @@ impl Tool for CreateRecurringJob {
                 "schedule": job.schedule.display(),
                 "plan_path": job.plan_path,
                 "next_run_at": job.next_run_at,
-                "path": format!("~/.snippet/recurring/{}.json", job.id),
             },
-            "note": "Job file written. The daemon tick will SetGoal on that session when due; if it is already on a goal, this fire queues and starts immediately after complete_goal.",
+            "note": "Scheduled. The first run starts within seconds (or right after the session's current goal), so don't also create a task for it.",
         })))
     }
 }
