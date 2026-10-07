@@ -542,7 +542,8 @@ impl HarnessState {
         let event_index = cp.event_index.min(self.events.len());
         self.events.truncate(event_index);
         if cp.compactions == self.compactions {
-            let message_index = cp.message_index.min(self.messages.len());
+            let keep_system = usize::from(matches!(self.messages.first(), Some(HarnessMessage::System { .. })));
+            let message_index = cp.message_index.min(self.messages.len()).max(keep_system);
             self.messages.truncate(message_index);
         } else {
             self.messages.push(HarnessMessage::System {

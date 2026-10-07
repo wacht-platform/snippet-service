@@ -675,6 +675,21 @@ impl CodingHarness {
     /// the continue/self-check directive as a fresh user turn. Called from the idle
     /// point when a goal is Active and nothing else is pending.
     pub(super) fn drive_goal_turn(&self, state: &mut HarnessState, vars: &mut LoopVars) {
+        if idle_goal_turns(&state.messages) >= GOAL_IDLE_TURNS_LIMIT {
+            if let Some(goal) = state.goal.as_mut() {
+                goal.status = GoalStatus::Paused;
+                goal.resume_at = 0;
+                let text = goal.text.clone();
+                state.events.push(HarnessEvent::SystemDecision {
+                    step: "goal_paused".to_string(),
+                    reasoning: format!(
+                        "stopped: {GOAL_IDLE_TURNS_LIMIT} goal turns in a row without doing anything and without complete_goal — {text}"
+                    ),
+                });
+            }
+            state.status = HarnessStatus::Idle;
+            return;
+        }
         let (text, dir, n) = match state.goal.as_mut() {
             Some(g) => {
                 g.autonomous_turns += 1;
@@ -795,3 +810,23 @@ impl CodingHarness {
     }
 }
 
+const GOAL_IDLE_TURNS_LIMIT: usize = 2;
+
+/// Goal turns at the end of the history in which the agent made no tool call.
+fn idle_goal_turns(messages: &[HarnessMessage]) -> usize {
+    let mut idle = 0;
+    let mut acted = false;
+    for message in messages.iter().rev() {
+        match message {
+            HarnessMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty() => acted = true,
+            HarnessMessage::User { content } if content.starts_with("[goal]") => {
+                if acted {
+                    break;
+                }
+                idle += 1;
+            }
+            _ => {}
+        }
+    }
+    idle
+}
