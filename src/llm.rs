@@ -72,7 +72,10 @@ fn extract_provider_message(body: &str) -> Option<String> {
             return pick(s);
         }
     }
-    v.get("message").and_then(Value::as_str).and_then(pick)
+    v.get("message")
+        .or_else(|| v.get("detail"))
+        .and_then(Value::as_str)
+        .and_then(pick)
 }
 
 /// Friendly text for a transport-level failure (no HTTP response at all).

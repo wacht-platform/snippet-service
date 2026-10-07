@@ -16,7 +16,6 @@ pub enum RuntimeSignal {
     /// specific guidance for what was detected (redirect / sed -i / tee / cat).
     ShellDiscipline { message: String },
     /// The same shell-discipline nudge fired again — escalate to reflect-and-switch.
-    ShellDisciplineEscalated { count: usize },
     /// The same unchanged file was read several times this request.
     RepeatedRead { path: String, count: usize },
     /// The same file was rewritten from scratch several times this request.
@@ -64,11 +63,6 @@ impl RuntimeSignal {
                  as final. Continue with a tool call, or keep the next reply shorter."
                     .to_string(),
             Self::ShellDiscipline { message } => message.clone(),
-            Self::ShellDisciplineEscalated { count } => format!(
-                "You have used the shell to change files {count} times despite the earlier \
-                 note. Stop and switch: change files only with `change_files`; keep the shell for \
-                 reading, searching and running things."
-            ),
             Self::RepeatedRead { path, count } => format!(
                 "You have read `{path}` {count} times this task and it hasn't changed; its \
                  content is already in your context above. Work from what you read."
