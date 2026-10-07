@@ -175,12 +175,14 @@ fn is_tee_to_tracked(toks: &[String]) -> bool {
         .any(|t| is_tracked_write_target(t))
 }
 
-const NUDGE_WRITE_MSG: &str = "You wrote file content through the shell. Change files with `change_files` \
-(create, replace, delete, move): it is exact, all-or-nothing, and shows the changed lines. Keep the shell for \
-reading, searching and running things.";
+const NUDGE_WRITE_MSG: &str = "You wrote a tracked file through the shell. That's right for generated output \
+or a mechanical change across many files; for a hand edit to source, `change_files` is exact and shows the \
+changed lines. Either way, check the result now (`git diff --stat`, or `rg` for what should and shouldn't be \
+there) before you build on it.";
 
-const NUDGE_SED_MSG: &str = "`sed -i` edits a file in place and silently does nothing when the pattern misses. Use \
-`change_files` with a `replace` instead: it fails loudly on a miss and shows the changed lines.";
+const NUDGE_SED_MSG: &str = "`sed -i` silently does nothing when its pattern misses, and can match more than you \
+meant. For a one-off edit, `change_files` fails loudly on a miss; for a bulk mechanical edit, count the matches \
+first (`rg -c`) and check the diff after (`git diff --stat`).";
 
 /// Classify a `bash` command. Nudge beats Allow; never blocks.
 pub fn classify_shell_command(command: &str) -> ShellVerdict {

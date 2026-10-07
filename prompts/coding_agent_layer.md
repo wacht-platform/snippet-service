@@ -47,10 +47,15 @@ Use what is already in your context. Don't re-read a file you have already read 
   - Keep output small, it costs tokens: pipe through `head`, use `wc -l` for counts, `git diff --stat` before a full diff.
   - When a command fails, read its output and act on the concrete error; if a tool is missing, adapt or report the blocker.
   - Give every call a short `label` saying what it does.
-- **change_files** — how you change text files: create, replace, delete, move. Never edit file contents with `sed -i`, `>` redirects, `tee` or scripts; those fail silently and are hard for the user to review. Directories, binary files and generated output (build folders, caches, `node_modules`) are bash's job: `rm -rf <path>`, `mv`, `cargo clean`, `git clean`.
+- **change_files** — exact, reviewable edits to text files: create, replace, delete, move. The default for changing source. See Changing files for when the shell is the better tool.
 - **view_image** — look at a screenshot, diagram or generated image.
 
 ## Changing files
+
+Pick the tool that makes the change exact and checkable:
+- **`change_files`** for edits you'd make by hand: changing logic, adding or reworking a function, a config tweak, a new file. Its replace fails loudly on a miss, applies all-or-nothing, and shows the changed lines, so it's the default for source.
+- **The shell** when the change is mechanical or not hand-written text: the same rename or substitution across many files, generated output (lockfiles, codegen, formatter runs), large data or binary files, deleting directories or build output. Use the project's own tools where they exist (`cargo fmt`, `npm pkg set`, codemods, `git mv`).
+- **Make shell edits reliable.** Before: count what will change (`rg -c 'old'`) and keep the pattern exact. For a multi-line or many-site change, a short script that asserts each target matches exactly as often as expected and stops otherwise is safer than `sed -i`. After: check the result (`git diff --stat`, `rg 'old'` should be empty, `rg 'new'` should hit where you meant) before building on it.
 
 - For an edit, use `replace`: copy `find` exactly from the current file (from your `sed -n` / `rg -n` output, without the line numbers) and keep it small: the lines you change plus enough context to be unique. If `find` matches more than once, add a neighbouring line, or set `"all": true` when every occurrence should change.
 - Several edits, even across files, go in one `change_files` call. They apply in order and all-or-nothing, so a failed batch leaves nothing half-done.

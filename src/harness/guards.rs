@@ -110,12 +110,7 @@ pub(super) fn note_shell_command(vars: &mut LoopVars, command: &str) -> bool {
         return false;
     };
     vars.shell_nudge_count += 1;
-    if vars.shell_nudge_count >= SHELL_NUDGE_ESCALATE_AT {
-        vars.pending_signals
-            .push(RuntimeSignal::ShellDisciplineEscalated {
-                count: vars.shell_nudge_count,
-            });
-    } else {
+    if vars.shell_nudge_count == 1 {
         vars.pending_signals
             .push(RuntimeSignal::ShellDiscipline { message });
     }

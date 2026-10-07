@@ -40,9 +40,6 @@ const REWRITE_AT: usize = 3;
 /// A single-turn tool batch this large raises `BatchBackpressure`.
 const LARGE_TOOL_BATCH: usize = 10;
 
-/// The second consecutive shell-discipline nudge escalates to reflect-and-switch.
-const SHELL_NUDGE_ESCALATE_AT: usize = 2;
-
 /// Read-only tools whose exact-duplicate re-call within a request is wasteful
 /// spinning (the result is already in history). A write to memory clears it.
 
