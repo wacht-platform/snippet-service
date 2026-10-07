@@ -252,7 +252,7 @@ fn build_responses_request(
                 instructions = content.clone();
                 if config.x_search {
                     instructions.push_str(
-                        "\n\nFor current discussion on X/Twitter, the built-in X search runs automatically; use `web_search` for the open web; use browser tools only for logged-in sites.",
+                        "\n\nYou have xAI's built-in X search (x_keyword_search, x_semantic_search, x_user_search, x_thread_fetch). It isn't in your function list because xAI runs it for you, but it is available on every turn: use it whenever you need posts, threads, accounts or live counts from X, and try it before concluding anything about X. If a search comes back empty, say so; never assume it's unavailable because an earlier turn said so. Use `web_search` for the open web, and browser tools only for logged-in sites.",
                     );
                 }
             }
