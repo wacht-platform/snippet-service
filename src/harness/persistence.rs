@@ -23,7 +23,13 @@ impl CodingHarness {
         // Refresh the system prefix so resumed sessions pick up the latest
         // workspace memory (guarded: no-op if messages[0] isn't System).
         if let Some(HarnessMessage::System { content }) = state.messages.first_mut() {
-            *content = seeded_system;
+            if *content != seeded_system {
+                *content = seeded_system;
+                state.history_rewritten = true;
+            }
+        } else {
+            state.messages.insert(0, HarnessMessage::System { content: seeded_system });
+            state.history_rewritten = true;
         }
         // A crash mid tool-batch persists an assistant `tool_calls` message whose
         // later calls never got results; strict providers (Anthropic, DeepSeek)
