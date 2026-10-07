@@ -998,6 +998,35 @@ impl CodingHarness {
                             self.persist(&mut state, &lanes).await?;
                             state.status = HarnessStatus::Idle;
                         }
+                        LoopInput::SteerQueued(id) => {
+                            let Some(text) = take_queued(&mut state, &id) else {
+                                self.persist(&mut state, &lanes).await?;
+                                continue;
+                            };
+                            if state.status == HarnessStatus::Running && process.is_some() {
+                                state.events.push(HarnessEvent::Steer { text: text.clone() });
+                                state.messages.push(HarnessMessage::User { content: text.clone() });
+                                self.bump_activity();
+                                if kind == CliKind::Antigravity {
+                                    if let Ok(mut queue) = steers.lock() {
+                                        queue.push(text);
+                                    }
+                                } else {
+                                    outbox.push(text);
+                                }
+                            } else {
+                                if state.pending_question.is_some() {
+                                    state.status = HarnessStatus::WaitingForInput;
+                                }
+                                self.accept_user_message(&mut state, &mut vars, text.clone()).await;
+                                let message = match state.messages.last() {
+                                    Some(HarnessMessage::User { content }) => content.clone(),
+                                    _ => text,
+                                };
+                                outbox.push(message);
+                            }
+                            self.persist(&mut state, &lanes).await?;
+                        }
                         other => {
                             if self.apply_input(&mut state, other) {
                                 break;
