@@ -591,7 +591,19 @@ fn await_claim(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, Str
         return Ok(None);
     }
     let marker = crate::coordination::offer_marker(&agent);
-    if task.notifications.iter().any(|n| n.target == marker) {
+    if let Some(offered_at) = task.notifications.iter().find(|n| n.target == marker).map(|n| n.message.clone()) {
+        if let Some(error) = inbox_failure_since(&agent, &offered_at) {
+            let note = format!(
+                "The offer to {agent} is stuck: its inbox can't run ({error}). Start the work now by handing {agent} the lease (transfer_mission_task_lease), offer it to another agent, or wait until it recovers."
+            );
+            if !task.notifications.iter().any(|n| n.kind == "offer_stuck") {
+                return d
+                    .store
+                    .update_task_in(task_id, now, |t| t.notify_once("offer_stuck", &note))
+                    .map(Some)
+                    .map_err(|error| error.to_string());
+            }
+        }
         return Ok(Some(task));
     }
     d.store
@@ -614,6 +626,19 @@ fn await_claim(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, Str
         })
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+/// The model error an agent's inbox ended on after `since`, if its last turn failed.
+fn inbox_failure_since(agent: &str, since: &str) -> Option<String> {
+    let path = crate::session::state_path_for_id(&crate::session::inbox_session_id(agent))?;
+    let state = crate::session::read_session_state(&path)?;
+    if state.updated_at.as_str() < since {
+        return None;
+    }
+    match state.events.last()? {
+        crate::harness::HarnessEvent::ModelError { message } => Some(message.clone()),
+        _ => None,
+    }
 }
 
 fn task_offer_body(task: &Task) -> String {
