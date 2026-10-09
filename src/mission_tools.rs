@@ -1050,7 +1050,7 @@ impl Tool for InviteTaskAgent {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "invite_task_agent".into(),
-            description: "Bring a specialist onto the task you are working as a collaborator: it joins the task room as a waiting member and is woken with your ask. Use it for a review, a second opinion or expertise you need while you keep the session. It does not hand over the session; transfer_task_session_lease does that. Only for a task dispatched to this session.".into(),
+            description: "Bring a specialist onto the task you are working as a collaborator: it joins the task room as a waiting member and is woken with your ask. Use it for a review, a second opinion or expertise you need while you keep the session. It does not hand over the session; Mission Control does that when asked. Only for a task dispatched to this session.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string"},
@@ -1070,7 +1070,7 @@ impl Tool for InviteTaskAgent {
             return Err(ToolError::msg("task_id, agent_id and ask must not be empty"));
         }
         if agent_id == crate::mission_control::SESSION_ID {
-            return Err(ToolError::msg("Mission Control is not a task collaborator; use message_mission_control"));
+            return Err(ToolError::msg("Mission Control is not a task collaborator; send_agent_message to mission-control instead"));
         }
         let Some(caller) = ctx.durable_session_id() else {
             return Err(ToolError::msg("only the session working a task can invite collaborators"));

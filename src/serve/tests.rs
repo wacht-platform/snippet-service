@@ -217,7 +217,7 @@ use super::*;
         assert!(envelope.contains("from_kind: human"));
         assert!(envelope.contains("body: please investigate X"));
         // The reply contract is what stops a silent no-op.
-        assert!(envelope.contains("post_coordination_message"));
+        assert!(envelope.contains("send_agent_message to the sender"));
         assert!(envelope.contains("[/coordination_board_message]"));
     }
 
