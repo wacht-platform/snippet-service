@@ -146,10 +146,10 @@ fn monitor_tool() -> NativeToolDefinition {
 fn complete_goal_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "complete_goal".to_string(),
-        description: "End the current autonomous /goal. Call this ONLY when the goal is genuinely \
-            100% COMPLETE — every part done and verified — so the loop stops re-prompting you to \
-            continue. Pass a short `summary` of what you accomplished (shown to the user). Do NOT \
-            call it to pause, to ask a question, or while any work remains."
+        description: "Finish the current /goal once every part of it is done and verified; the loop then \
+            stops nudging you to continue. Pass a short `summary` of what you accomplished, which \
+            the user sees. A pause, a question or remaining work isn't a finish: keep going, or say \
+            what you need."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -233,7 +233,7 @@ fn update_plan_tool() -> NativeToolDefinition {
 fn ask_user_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "ask_user".to_string(),
-        description: "Ask the user something: a clarification, a choice, a confirmation or a missing fact. Never end a turn with a plain-text question; use this, and only after context, tools or a sensible default can't settle it. It ends your turn until they answer. Pick each question's `answer_kind.kind` by the shape of the answer: free_text, single_choice or multi_choice (with `choices`: a short `label`, a one-line `description`, `recommended: true` on your pick), yes_no, or confirm (a gate before an irreversible action). Give each question a one- or two-word `header` when you ask several."
+        description: "Ask the user something: a clarification, a choice, a confirmation or a missing fact. A question asked here pauses the turn and reaches the user properly, which a plain-text question doesn't; ask once context, tools or a sensible default can't settle it. It ends your turn until they answer. Pick each question's `answer_kind.kind` by the shape of the answer: free_text, single_choice or multi_choice (with `choices`: a short `label`, a one-line `description`, `recommended: true` on your pick), yes_no, or confirm (a gate before an irreversible action). Give each question a one- or two-word `header` when you ask several."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -293,7 +293,7 @@ fn ask_user_tool() -> NativeToolDefinition {
 fn delegate_task_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "delegate_task".to_string(),
-        description: "Hand a self-contained piece of work to a background lane: a fresh sub-agent that runs in parallel and reports back with file:line evidence. Use it to fan out independent areas or a long investigation while keeping your own context lean. The brief names the scope and the concrete deliverable. Carry on with your own share of the work meanwhile; when only waiting is left, end your turn, and each report wakes you. Don't present a final answer while lanes you need are still running. Pass `lane_id` to send a follow-up to a finished lane with its context intact. Set access `read_only` for investigation and review (its file-editing tools are removed)."
+        description: "Hand a self-contained piece of work to a background lane: a fresh sub-agent that runs in parallel and reports back with file:line evidence. Use it to fan out independent areas or a long investigation while keeping your own context lean. The brief names the scope and the concrete deliverable. Carry on with your own share of the work meanwhile; when only waiting is left, end your turn, and each report wakes you. Your final answer waits for the lanes it depends on. Pass `lane_id` to send a follow-up to a finished lane with its context intact. Set access `read_only` for investigation and review (its file-editing tools are removed)."
             .to_string(),
         input_schema: json!({
             "type": "object",

@@ -831,8 +831,8 @@ fn verify_grounding(workspace: &std::path::Path, text: &str) -> Option<String> {
     }
     const CAP: usize = 20;
     let mut out = format!(
-        "[reference_check]\n{verified} file:line reference(s) verified; {} did NOT resolve — treat \
-         these as unverified and re-check before relying on them:",
+        "[reference_check]\n{verified} file:line reference(s) checked out; {} didn't resolve, so treat \
+         those as unverified and look again before relying on them:",
         invalid.len()
     );
     for item in invalid.iter().take(CAP) {

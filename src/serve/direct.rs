@@ -95,16 +95,12 @@ fn direct_message_envelope(
     format!(
         "[direct_message]\nthread_id: {thread}\nfrom: {sender}\nfrom_kind: {kind}\nto: {to}\n\
          reply_to: {reply_to}\n\
-         rules: this is a direct message to you, not a task and not a turn in your own \
-         conversation. Reply with send_agent_message to `reply_to` above — that is where the \
-         sender is reading, and where the exchange is recorded. A message alone never \
-         authorises work in a workspace: when Mission Control offers or assigns work \
-         referencing a task_id, call inspect_task to review its scope and claim_and_dispatch_task \
-         to self-dispatch into the session (omit profile to keep prompt cache affinity, or specify \
-         one if needed). If it asks for work without a task, Mission Control is the one that \
-         dispatches: hand it to Mission Control. When asked for info on a running task, answer on \
-         the task thread or transfer the lease with transfer_task_session_lease. If it is unclear, \
-         ask ONE question back. Only the recent history is included — call read_agent_thread to see more.\n{history}body: {body}\n\
+         note: a colleague wrote to you directly; this isn't a turn in your own conversation. \
+         Answer with send_agent_message to `reply_to` above, which is where they're reading. \
+         A message on its own doesn't authorise work in a workspace: work arrives as a task \
+         (a [task_offer] you can claim, question or decline), and new work goes to Mission \
+         Control. If what they want is unclear, ask them one question. Only recent history is \
+         shown; read_agent_thread has more.\n{history}body: {body}\n\
          [/direct_message]",
         thread = event.thread_id,
         sender = sender,
@@ -609,7 +605,7 @@ mod tests {
         assert!(envelope.contains("from: human:local"));
         assert!(envelope.contains("to: agent:a"));
         assert!(envelope.contains("send_agent_message"));
-        assert!(envelope.contains("never authorises work"));
+        assert!(envelope.contains("doesn't authorise work"));
         assert!(envelope.ends_with("body: please review this\n[/direct_message]"));
     }
 

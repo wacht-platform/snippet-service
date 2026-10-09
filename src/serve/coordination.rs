@@ -694,13 +694,11 @@ pub fn board_message_envelope_with_task(
     }
     format!(
         "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n{task_meta}\
-         rules: board message on the shared task board, not an ordinary chat turn. \
-         Decide whether it needs a response, coordination, or an action in your scope; \
-         reply on this same thread with post_coordination_message if coordination is required. \
-         Call inspect_task to inspect the complete task plan, roster, or dependencies. \
-         If NO action, response, or coordination is needed from you right now, you may NO-OP \
-         (do not reply or post unnecessarily). Only the recent history is included — call \
-         read_coordination_thread to see more.\n{history}body: {body}\n\
+         note: a teammate posted on the shared task board; this isn't a turn in your own \
+         conversation. If it needs your input or changes what you're doing, reply on this \
+         thread (post_task_coordination on a task thread, post_coordination_message elsewhere) or act on it; if not, there's no \
+         need to answer. inspect_task shows the task's plan and roster; only recent history is \
+         shown here, and read_coordination_thread has more.\n{history}body: {body}\n\
          [/coordination_board_message]",
         event.thread_id,
         event.actor_id,

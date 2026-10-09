@@ -6,7 +6,7 @@ use super::*;
 pub(super) const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
     (
         "user_requests",
-        "Chronological numbered list (1., 2., 3., ...) of ALL user requests, instructions, preferences, and bug reports across the entire conversation history. Retain every single past user request so the original intent is never lost.",
+        "Chronological numbered list (1., 2., 3., ...) of every user request, instruction, preference and bug report across the whole conversation, so the original intent survives compaction.",
         true,
     ),
     (
@@ -48,7 +48,7 @@ input = "the current memory (rules, learnings, notes table of contents, all with
 output = "ONE apply_memory_delta call: small, precise changes. Code merges them; you never rewrite memory wholesale"
 
 [kinds]
-rules = "short imperative directives obeyed every session. Add one ONLY when the user stated a lasting preference or requirement in this task. global=true when it applies to every project (writing style, general workflow), else project scope"
+rules = "short directives the user wants followed every session. Add one when the user stated a lasting preference or requirement in this task, not for one-off instructions. global=true when it applies to every project (writing style, general workflow), else project scope"
 learnings = "one-line reusable lessons: situation → approach → why. Add one when the task showed a technique or pitfall worth reapplying. global=true when it transfers to any project"
 notes = "project knowledge, one topic per note: where things live, how to build/test/deploy, architecture, conventions, gotchas. Filed in a kebab-case section tree (e.g. build, architecture/harness). Each note has a title and a one-line summary that the table of contents shows, so write the summary to answer 'should I open this?'"
 
@@ -136,11 +136,11 @@ role = "you compress a coding agent's whole conversation into ONE dense Antigrav
 stakes = "the raw messages are then archived and discarded — this context summary is all that survives in active working memory. Anything you leave out is lost from immediate working memory; anything you pad is re-sent on every future turn and wastes tokens. Maximize signal per token."
 
 [user_requests]  # CRITICAL: chronological timeline of user intent
-timeline = "maintain the 'user_requests' section as a strictly numbered list (1., 2., 3., ...) in chronological order. Carry forward all user requests from the PRIOR SUMMARY if present, and append any new user prompts from the conversation. Never lose a past user request, instruction, correction, or preference."
+timeline = "maintain the 'user_requests' section as a strictly numbered list (1., 2., 3., ...) in chronological order. Carry forward all user requests from the PRIOR SUMMARY if present, and append any new user prompts from the conversation. Every past user request, instruction, correction and preference stays in it."
 
 [preserve]  # carry these forward — verbatim where the exact value/wording matters
 task_overview = "core user objective, hard constraints, and success criteria"
-progress = "for EVERY task you mention as started, underway, or in progress, explicitly record: completed scope, remaining scope, and a measurable amount/percentage/count when available; if the amount is unknown, say that plainly. Never leave a task as merely 'started'."
+progress = "for every task you mention as started, underway, or in progress, explicitly record: completed scope, remaining scope, and a measurable amount/percentage/count when available; if the amount is unknown, say that plainly. A task gets more than a bare 'started'."
 technical_decisions = "key architectural findings, discovered root causes, technical decisions, and exact verbatim error strings, symbol names, and IDs"
 active_context = "current workspace state: which files were created/changed, what works, what's broken or unverified, git branch, and active background tasks"
 next_steps = "prioritized, ordered next actions so the agent can resume immediately without re-deriving"

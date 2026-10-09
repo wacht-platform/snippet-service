@@ -976,7 +976,7 @@ impl CodingHarness {
                             if matches!(input, LoopInput::Deny) {
                                 let _ = call.reply.send(error_result(
                                     "user_denied",
-                                    "The user denied this action. Do not retry it as-is — adjust your approach or ask what they'd prefer.",
+                                    "The user denied this action. Retrying it as-is would just meet the same answer, so adjust your approach or ask what they'd prefer.",
                                 ));
                             } else {
                                 running.push(Box::pin(self.execute_cli_call(call)));
@@ -1204,7 +1204,7 @@ impl CodingHarness {
                                     None => {
                                         let _ = call.reply.send(error_result(
                                             "vault_needs_confirmation",
-                                            &format!("Using vault secret(s) [{names}] requires user confirmation, which isn't available in a delegated/headless run. Don't run this here — report that this step needs the secret, so it's done on the main thread where the user can approve it."),
+                                            &format!("Using vault secret(s) [{names}] requires user confirmation, which isn't available in a delegated/headless run. Report that this step needs the secret, so it's done on the main thread where the user can approve it."),
                                         ));
                                     }
                                 }
@@ -1268,7 +1268,7 @@ impl CodingHarness {
         if !route.ask(&call.name, &summary).await {
             let _ = call.reply.send(error_result(
                 "user_denied",
-                "The user denied this action. Do not retry it as-is — adjust your approach, or report what you needed.",
+                "The user denied this action. Retrying it as-is would just meet the same answer, so adjust your approach, or report what you needed.",
             ));
             return;
         }

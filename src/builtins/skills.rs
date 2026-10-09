@@ -19,7 +19,7 @@ impl Tool for SearchSkillsTool {
         NativeToolDefinition {
             name: "search_skills".to_string(),
             description:
-                "Find a reusable Agent Skill relevant to the task. Skills are installed procedures / playbooks / recipes (a specific workflow, a tool or API integration, a generation or formatting routine). They are NOT preloaded into your context, so search here BEFORE improvising anything that sounds like an established procedure — a matching skill gives you the exact steps. Returns candidate skills (name + description); load the best one with `skill(name)` to get its full instructions. An empty query lists everything available."
+                "Find a reusable Agent Skill relevant to the task. Skills are installed procedures / playbooks / recipes (a specific workflow, a tool or API integration, a generation or formatting routine). They aren't preloaded, so it's worth a quick search before improvising anything that sounds like an established procedure: a matching skill gives you the exact steps. Returns candidate skills (name + description); load the best one with `skill(name)` to get its full instructions. An empty query lists everything available."
                     .to_string(),
             input_schema: object_schema(
                 json!({
