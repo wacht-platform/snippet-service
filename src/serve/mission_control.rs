@@ -480,7 +480,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
     };
     let identity = super::coordination::identity_overlay(d, active_worker, &session_id);
     let text = format!(
-        "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}scope:\n{}\n\nBegin now. Before you stop, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
+        "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}scope:\n{}\n\nThis is yours now; take it from here. If the scope looks wrong, unclear or there's a better way, say so to Mission Control (message_mission_control) before you build. When it's done, blocked or stuck, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
         task.id,
         task.title,
         task.created_by_kind,
