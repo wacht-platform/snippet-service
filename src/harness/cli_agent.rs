@@ -1106,6 +1106,10 @@ impl CodingHarness {
                 }
                 Some(progress) = progress_rx.recv() => {
                     lanes.record_progress(&progress);
+                    if progress.kind == "message" {
+                        self.inject_lane_message(&mut state, &lanes, &progress);
+                        self.wake_with_last_message(&mut state, &mut outbox);
+                    }
                     self.persist(&mut state, &lanes).await?;
                 }
                 Some(event) = watch_rx.recv() => {

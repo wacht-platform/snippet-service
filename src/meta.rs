@@ -293,7 +293,7 @@ fn ask_user_tool() -> NativeToolDefinition {
 fn delegate_task_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "delegate_task".to_string(),
-        description: "Hand a self-contained piece of work to a background lane: a fresh sub-agent that runs in parallel and reports back with file:line evidence. Use it to fan out independent areas or a long investigation while keeping your own context lean. The brief names the scope and the concrete deliverable. Carry on with your own share of the work meanwhile; when only waiting is left, end your turn, and each report wakes you. Your final answer waits for the lanes it depends on. Pass `lane_id` to send a follow-up to a finished lane with its context intact. Set access `read_only` for investigation and review (its file-editing tools are removed)."
+        description: "Hand a self-contained piece of work to a background lane: a fresh sub-agent that runs in parallel and reports back with file:line evidence. Use it to fan out independent areas or a long investigation while keeping your own context lean. The brief names the scope and the concrete deliverable. Carry on with your own share of the work meanwhile; when only waiting is left, end your turn, and each report wakes you. Your final answer waits for the lanes it depends on. Pass `lane_id` to talk to a lane you started: a running lane gets your description as a message (an answer to its question, a change of plan), and a finished one picks up again as a follow-up with its context intact. Set access `read_only` for investigation and review (its file-editing tools are removed)."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -304,11 +304,11 @@ fn delegate_task_tool() -> NativeToolDefinition {
                 },
                 "description": {
                     "type": "string",
-                    "description": "The brief. State what to inspect/do, what to ignore, and the concrete output expected (e.g. a file to write or a finding to report). Minimum ~80 chars. With lane_id: the follow-up instruction."
+                    "description": "The brief. State what to inspect/do, what to ignore, and the concrete output expected (e.g. a file to write or a finding to report). Minimum ~80 chars. With lane_id: your message to that lane, any length."
                 },
                 "lane_id": {
                     "type": "string",
-                    "description": "Continue this FINISHED lane with the description as a follow-up (context intact) instead of starting a new lane."
+                    "description": "Talk to this lane instead of starting a new one: a running lane gets the description as a message; a finished one continues with it as a follow-up, context intact."
                 },
                 "access": {
                     "type": "string",
@@ -411,7 +411,10 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         .join(" ")
         .chars()
         .count();
-    if collapsed_len < MIN_DELEGATE_DESCRIPTION_CHARS {
+    if lane_id.is_some() && description.is_empty() {
+        return Err("delegate_task with a lane_id needs a description: the message for that lane.".to_string());
+    }
+    if lane_id.is_none() && collapsed_len < MIN_DELEGATE_DESCRIPTION_CHARS {
         return Err(format!(
             "delegate_task needs a brief describing what the lane should do and what it should \
              produce (at least {MIN_DELEGATE_DESCRIPTION_CHARS} characters — a sentence or two)."

@@ -200,6 +200,24 @@ impl CodingHarness {
                     // Follow-up to an existing lane: resume it with the new brief,
                     // context intact.
                     if let Some(lane_id) = brief.lane_id.as_deref() {
+                        if lanes.records().iter().any(|r| r.id == lane_id && r.status == LaneStatus::Running) {
+                            return match lanes.message(lane_id, &brief.description) {
+                                Ok(title) => (
+                                    json!({
+                                        "schema_version": 1,
+                                        "status": "success",
+                                        "data": {
+                                            "messaged": true,
+                                            "lane_id": lane_id,
+                                            "title": title,
+                                            "note": "The lane is still working; it gets this between steps, or straight away if it's waiting on you. Its report still arrives as a [lane_report].",
+                                        }
+                                    }),
+                                    MetaControl::Continue,
+                                ),
+                                Err(error) => (tool_error(error), MetaControl::Continue),
+                            };
+                        }
                         return match lanes.follow_up(lane_id, &brief.description) {
                             Ok(title) => {
                                 state.events.push(HarnessEvent::LaneSpawned {
