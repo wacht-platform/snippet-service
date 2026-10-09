@@ -161,6 +161,55 @@ fn pending_offers(daemon: &Shared, tasks: &[crate::coordination::Task]) -> std::
         .collect()
 }
 
+const DORMANT_AFTER_SECS: i64 = 2 * 3600;
+const DORMANT_WINDOW_SECS: i64 = 7 * 86400;
+
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() > max { format!("{}…", flat.chars().take(max).collect::<String>()) } else { flat }
+}
+
+fn waiting_and_dormant(tasks: &[crate::coordination::Task], now: i64) -> (Vec<String>, Vec<String>) {
+    let busy: std::collections::HashSet<&str> =
+        tasks.iter().filter(|t| !t.status.is_terminal()).map(|t| t.session_id.as_str()).collect();
+    let mut sessions = crate::session::list_routable_sessions();
+    sessions.sort_by_key(|s| -s.last_active);
+    let mut waiting = Vec::new();
+    let mut dormant = Vec::new();
+    for session in sessions {
+        let idle = now - session.last_active;
+        if idle > DORMANT_WINDOW_SECS {
+            continue;
+        }
+        let Some(state) = session_status(&session.id) else { continue };
+        let last_said = state.events.iter().rev().find_map(|event| match event {
+            crate::harness::HarnessEvent::AssistantText { text } => Some(one_line(text, 220)),
+            _ => None,
+        });
+        if state.status == HarnessStatus::WaitingForInput {
+            let question = state.pending_question.as_ref().map(question_text).unwrap_or_default();
+            waiting.push(format!(
+                "- {} · {} · waiting {} · asked: {}",
+                session.title, session.id, ago(idle), one_line(&question, 220)
+            ));
+            continue;
+        }
+        if busy.contains(session.id.as_str()) || idle < DORMANT_AFTER_SECS || state.status == HarnessStatus::Running {
+            continue;
+        }
+        if dormant.len() < 8 {
+            dormant.push(format!(
+                "- {} · {} · quiet {} · last said: {}",
+                session.title,
+                session.id,
+                ago(idle),
+                last_said.unwrap_or_else(|| "(nothing)".to_string())
+            ));
+        }
+    }
+    (waiting, dormant)
+}
+
 fn round_envelope(
     tasks: &[crate::coordination::Task],
     state: &mission_autonomy::AutonomyState,
@@ -229,6 +278,27 @@ fn round_envelope(
         for f in upcoming.into_iter().take(10) {
             out.push_str(&format!("- in {} min: {}\n", ((f.due_at - now) / 60).max(0), f.note));
         }
+    }
+
+    let finished: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Done && secs_since(&t.updated_at, now) < 2 * 86400)
+        .take(8)
+        .map(|t| format!("- {} · {} · finished {}", t.title, t.id, ago(secs_since(&t.updated_at, now))))
+        .collect();
+    if !finished.is_empty() {
+        out.push_str("\n\n## Finished in the last two days (any next step or follow-up due?)\n");
+        out.push_str(&finished.join("\n"));
+    }
+
+    let (waiting, dormant) = waiting_and_dormant(tasks, now);
+    if !waiting.is_empty() {
+        out.push_str("\n\n## Sessions waiting on the user\n");
+        out.push_str(&waiting.join("\n"));
+    }
+    if !dormant.is_empty() {
+        out.push_str("\n\n## Recent work that went quiet (no open task)\n");
+        out.push_str(&dormant.join("\n"));
     }
 
     let brief = mission_autonomy::read_brief();
