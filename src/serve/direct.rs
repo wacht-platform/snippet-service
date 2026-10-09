@@ -208,6 +208,17 @@ async fn deliver_direct(
             .get("body")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        if answers_own_message(d, event, &session_id) && !session_running(&session_id) {
+            if let Some((tx, _path, _stream)) = d.ensure_live(&session_id).await {
+                let envelope = format!(
+                    "[agent_reply]\nfrom: {}:{}\nthread_id: {}\nnote: this answers the message this session sent; carry on with what you were doing, using it. No reply is needed unless you have a follow-up.\nbody: {body}\n[/agent_reply]",
+                    event.actor_kind, event.actor_id, event.thread_id
+                );
+                if tx.send(LoopInput::UserMessage(envelope)).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
         super::record_agent_message(d, &session_id, &event.actor_id, body, false).await;
         return Ok(());
     }
@@ -235,6 +246,26 @@ async fn deliver_direct(
     tx.send(LoopInput::UserMessage(envelope))
         .map_err(|error| format!("deliver direct message: {error}"))?;
     Ok(())
+}
+
+fn session_running(session_id: &str) -> bool {
+    crate::session::state_path_for_id(session_id)
+        .and_then(|path| crate::session::read_session_state(&path))
+        .is_some_and(|state| state.status == crate::harness::HarnessStatus::Running)
+}
+
+/// Whether this session's own agent started the conversation being answered,
+/// as opposed to a person writing from the session.
+fn answers_own_message(d: &crate::serve::Daemon, event: &crate::coordination::types::CoordinationEvent, session_id: &str) -> bool {
+    d.store
+        .recent_direct_thread_events(&event.thread_id, 20)
+        .unwrap_or_default()
+        .iter()
+        .any(|prior| {
+            prior.sequence < event.sequence
+                && prior.actor_kind != "human"
+                && prior.payload.get("origin_session").and_then(|v| v.as_str()) == Some(session_id)
+        })
 }
 
 /// Deliver every accepted-but-undelivered direct message.
