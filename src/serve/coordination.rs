@@ -695,8 +695,8 @@ pub fn board_message_envelope_with_task(
     format!(
         "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n{task_meta}\
          note: a teammate posted on the shared task board; this isn't a turn in your own \
-         conversation. If it needs your input or changes what you're doing, reply on this \
-         thread (post_task_coordination on a task thread, post_coordination_message elsewhere) or act on it; if not, there's no \
+         conversation. If it needs your input or changes what you're doing, reply (post_task_coordination on a task thread, \
+         send_agent_message to the sender elsewhere) or act on it; if not, there's no \
          need to answer. inspect_task shows the task's plan and roster; only recent history is \
          shown here, and read_coordination_thread has more.\n{history}body: {body}\n\
          [/coordination_board_message]",

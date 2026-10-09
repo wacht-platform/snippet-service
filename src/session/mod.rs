@@ -352,6 +352,8 @@ impl AgentRuntime {
             "post_coordination_message",
             "read_coordination_board",
             "record_coordination_note",
+            "read_agent_inbox",
+            "archive_mission_session",
         ] {
             tools.remove(name);
         }
@@ -392,11 +394,11 @@ impl AgentRuntime {
         }
         let mut tools = coding_tools(i.exa_api_key.clone()).with_custom_dir(custom_dir.clone());
         crate::mission_tools::add_worker_report_tool(&mut tools);
-        tools.insert(crate::mission_tools::CreateRecurringJob);
-        tools.insert(crate::mission_tools::ListRecurringJobs);
-        tools.insert(crate::mission_tools::CancelRecurringJob);
         crate::coordination_tools::add_coordination_tools(&mut tools);
         for name in [
+            "message_mission_control",
+            "transfer_task_session_lease",
+            "read_agent_inbox",
             "claim_and_dispatch_task",
             "post_coordination_message",
             "read_coordination_board",
@@ -486,6 +488,13 @@ impl AgentRuntime {
         // Read-only view of what exists, so a dispatch targets a real session.
         crate::mission_tools::add_coordination_session_tools(&mut tools);
         tools.insert(crate::coordination_tools::DeclineTask);
+        for name in [
+            "message_mission_control",
+            "transfer_task_session_lease",
+            "post_coordination_message",
+        ] {
+            tools.remove(name);
+        }
 
         // The environment layer states this session has bash and full filesystem
         // access. It does not, so the flag both selects the coordination layer and
@@ -506,7 +515,7 @@ impl AgentRuntime {
             ),
             // Nothing to delegate: no lane control in a coordination session.
             allow_lane_control: false,
-            hidden_meta: &["monitor", "present_file", "set_session_title", "update_plan"],
+            hidden_meta: &["ask_user", "monitor", "present_file", "set_session_title", "update_plan"],
             memory: false,
         })
     }

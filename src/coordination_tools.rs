@@ -1067,7 +1067,7 @@ impl Tool for ClaimAndDispatchTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "claim_and_dispatch_task".into(),
-            description: "Take the lease on a queued or blocked task and queue it for dispatch into its target session; the daemon delivers it within seconds, with your identity. Refuses finished work and work already running (use transfer_task_session_lease for that). Specify `profile` to select an inference profile, or omit it to keep the session's model and its prompt cache.".into(),
+            description: "Take the lease on a queued or blocked task and queue it for dispatch into its target session; the daemon delivers it within seconds, with your identity. Refuses finished work and work already running. Specify `profile` to select an inference profile, or omit it to keep the session's model and its prompt cache.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string", "description": "The task ID to claim"},
