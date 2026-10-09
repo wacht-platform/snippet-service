@@ -357,6 +357,34 @@ impl CodingHarness {
             self.config.exa_api_key.clone(),
         )
         .with_records(state.lanes.clone())
+        .with_parent(self.context.clone())
+    }
+
+    /// A running lane wrote to this agent mid-work.
+    pub(super) fn inject_lane_message(
+        &self,
+        state: &mut HarnessState,
+        lanes: &LaneManager,
+        progress: &crate::lanes::LaneProgress,
+    ) {
+        let title = lanes
+            .records()
+            .iter()
+            .find(|r| r.id == progress.id)
+            .map(|r| r.title.clone())
+            .unwrap_or_else(|| progress.id.clone());
+        state.messages.push(HarnessMessage::User {
+            content: format!(
+                "[lane_message]\nlane: \"{title}\" ({id})\nnote: one of your lanes wrote to you while working. If it asks something, answer with delegate_task, lane_id {id}, and your answer as the description; it may be waiting on you. If it's an update, use it; no reply is needed.\nbody: {body}\n[/lane_message]",
+                id = progress.id,
+                body = progress.text.trim(),
+            ),
+        });
+        state.events.push(HarnessEvent::AgentMessage {
+            agent_id: format!("lane «{title}»"),
+            body: progress.text.trim().to_string(),
+            outbound: false,
+        });
     }
 
     /// Non-blocking drain of steers + lane reports between iterations. Returns
@@ -386,6 +414,9 @@ impl CodingHarness {
         }
         while let Ok(progress) = progress_rx.try_recv() {
             lanes.record_progress(&progress);
+            if progress.kind == "message" {
+                self.inject_lane_message(state, lanes, &progress);
+            }
         }
         while let Ok(event) = watch_rx.try_recv() {
             self.inject_watch_event(state, watches, &event);

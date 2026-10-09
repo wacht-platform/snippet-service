@@ -208,10 +208,26 @@ async fn deliver_direct(
             .get("body")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        let lane = reply_lane(d, event, &session_id);
+        if let Some(lane) = lane.as_deref() {
+            let envelope = format!(
+                "[agent_reply]\nfrom: {}:{}\nthread_id: {}\nnote: this answers the message you sent; carry on with your piece, using it. No reply is needed unless you have a follow-up.\nbody: {body}\n[/agent_reply]",
+                event.actor_kind, event.actor_id, event.thread_id
+            );
+            if crate::lanes::deliver_to_lane(&session_id, lane, envelope) {
+                return Ok(());
+            }
+        }
         if answers_own_message(d, event, &session_id) && !session_running(&session_id) {
             if let Some((tx, _path, _stream)) = d.ensure_live(&session_id).await {
+                let note = match lane.as_deref() {
+                    Some(lane) => format!(
+                        "this answers a message your lane {lane} sent, and that lane has finished. Use it yourself, or pass it on with delegate_task (lane_id {lane}) if the lane should act on it."
+                    ),
+                    None => "this answers the message this session sent; carry on with what you were doing, using it. No reply is needed unless you have a follow-up.".to_string(),
+                };
                 let envelope = format!(
-                    "[agent_reply]\nfrom: {}:{}\nthread_id: {}\nnote: this answers the message this session sent; carry on with what you were doing, using it. No reply is needed unless you have a follow-up.\nbody: {body}\n[/agent_reply]",
+                    "[agent_reply]\nfrom: {}:{}\nthread_id: {}\nnote: {note}\nbody: {body}\n[/agent_reply]",
                     event.actor_kind, event.actor_id, event.thread_id
                 );
                 if tx.send(LoopInput::UserMessage(envelope)).is_ok() {
@@ -254,9 +270,36 @@ fn session_running(session_id: &str) -> bool {
         .is_some_and(|state| state.status == crate::harness::HarnessStatus::Running)
 }
 
+/// The lane that sent the latest message from this session on the thread, when
+/// a lane rather than the session itself is the one waiting for the answer.
+fn reply_lane(d: &crate::serve::Daemon, event: &crate::coordination::types::CoordinationEvent, session_id: &str) -> Option<String> {
+    asked_from_session(d, event, session_id)?
+        .payload
+        .get("origin_lane")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// The message from this session that `event` answers: the latest one sent
+/// from it to the replier.
+fn asked_from_session(
+    d: &crate::serve::Daemon,
+    event: &crate::coordination::types::CoordinationEvent,
+    session_id: &str,
+) -> Option<crate::coordination::types::CoordinationEvent> {
+    let replier = crate::coordination::actor_ref(&event.actor_kind, &event.actor_id);
+    d.store
+        .latest_message_from_session(session_id, &replier, &event.created_at)
+        .ok()
+        .flatten()
+}
+
 /// Whether this session's own agent started the conversation being answered,
 /// as opposed to a person writing from the session.
 fn answers_own_message(d: &crate::serve::Daemon, event: &crate::coordination::types::CoordinationEvent, session_id: &str) -> bool {
+    if asked_from_session(d, event, session_id).is_some() {
+        return true;
+    }
     d.store
         .recent_direct_thread_events(&event.thread_id, 20)
         .unwrap_or_default()

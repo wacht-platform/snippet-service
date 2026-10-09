@@ -51,15 +51,23 @@ fn db(ctx: &ToolContext) -> Result<Store, ToolError> {
 /// the session posts as `agent`, a plain session posts as `session`. Both are
 /// addressable, but only the former is an identity the directory knows.
 fn actor(ctx: &ToolContext) -> Result<(&'static str, String), ToolError> {
+    // A lane speaks as the agent it was given, else as whoever its parent
+    // session speaks for.
+    if ctx.lane_origin().is_some()
+        && let Some(agent_id) = ctx.agent_id()
+    {
+        return Ok(("agent", agent_id.to_string()));
+    }
+    let session = ctx.durable_session_id().or(ctx.lane_origin().map(|(session, _)| session));
     // The lease holder on work dispatched here comes first: a lease can move an
     // agent into a session that belongs to someone else, or to no one.
-    if let Some(agent_id) = ctx.durable_session_id().and_then(|session| lease_holder(ctx, session)) {
+    if let Some(agent_id) = session.and_then(|session| lease_holder(ctx, session)) {
         return Ok(("agent", agent_id));
     }
     if let Some(agent_id) = ctx.agent_id() {
         return Ok(("agent", agent_id.to_string()));
     }
-    if let Some(session_id) = ctx.durable_session_id() {
+    if let Some(session_id) = session {
         return Ok(("session", session_id.to_string()));
     }
     Err(ToolError::msg("posting to the coordination board requires a session identity"))
@@ -97,6 +105,20 @@ fn require_thread_access(db: &Store, ctx: &ToolContext, actor_id: &str, thread_i
 
 /// The specialized agent holding the lease on a task this session is running.
 /// The default worker is not one: it has no identity beyond the session's own.
+pub(crate) fn speaks_as(ctx: &ToolContext) -> Option<(&'static str, String)> {
+    actor(ctx).ok()
+}
+
+/// The task in progress in a session, if any: its id and title.
+pub(crate) fn session_task(ctx: &ToolContext, session_id: &str) -> Option<(String, String)> {
+    let db = db(ctx).ok()?;
+    db.list_tasks(Some(session_id), Some(&crate::coordination::TaskStatus::InProgress))
+        .ok()?
+        .into_iter()
+        .find(|task| task.reporting_session.as_deref() == Some(session_id))
+        .map(|task| (task.id, task.title))
+}
+
 fn lease_holder(ctx: &ToolContext, session_id: &str) -> Option<String> {
     let db = db(ctx).ok()?;
     let tasks = db
@@ -472,15 +494,19 @@ impl Tool for SendAgentMessage {
         // The session this message is asked FROM, taken from the context rather
         // than the model's arguments: the model must not be able to claim a
         // different origin any more than it can claim a different sender.
-        let origin = ctx.durable_session_id().map(str::to_string);
+        let origin = ctx
+            .durable_session_id()
+            .or(ctx.lane_origin().map(|(session, _)| session))
+            .map(str::to_string);
         let saved = db
-            .send_direct_message_from(
+            .send_direct_message_with_origin(
                 (&sender_kind, &sender_id),
                 (to_kind, to_id),
                 args.body.trim(),
                 &key,
                 &chrono::Utc::now().to_rfc3339(),
                 origin.as_deref(),
+                ctx.lane_origin().map(|(_, lane)| lane),
             )
             .map_err(|e| ToolError::msg(format!("send message: {e}")))?;
         crate::session::emit_device_event(json!({

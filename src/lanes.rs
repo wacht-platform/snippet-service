@@ -5,8 +5,9 @@
 //! plain coding-agent prompt to `complete`, and reports a [`LaneResult`] back over
 //! a channel. Multiple lanes run in parallel.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -16,8 +17,8 @@ use crate::harness::{CodingHarness, HarnessConfig};
 use crate::lane_log::LaneLog;
 use crate::llm::AgentModel;
 use crate::prompts::{PromptContext, lane_prompt};
-use crate::tools::ToolContext;
-use crate::tools::coding_tools;
+use crate::llm::NativeToolDefinition;
+use crate::tools::{Tool, ToolContext, ToolError, ToolResult, coding_tools};
 
 /// Builds a fresh model instance for a child lane run. Accepts an optional
 /// inference profile name; when None, it constructs the parent session's active model
@@ -100,6 +101,154 @@ pub struct LaneResult {
     pub error: Option<String>,
 }
 
+/// Messages waiting for a running lane: from the agent that delegated it, or
+/// replies from agents it wrote to. The lane picks them up between steps, or
+/// straight away while it waits in `message_parent`.
+#[derive(Debug, Default)]
+pub struct LaneMailbox {
+    queue: Mutex<VecDeque<String>>,
+    notify: tokio::sync::Notify,
+}
+
+impl LaneMailbox {
+    pub fn push(&self, text: String) {
+        self.queue.lock().unwrap().push_back(text);
+        self.notify.notify_one();
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        self.queue.lock().unwrap().drain(..).collect()
+    }
+
+    async fn wait(&self, timeout: std::time::Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let waiting = self.drain();
+            if !waiting.is_empty() {
+                return waiting;
+            }
+            if tokio::time::timeout_at(deadline, self.notify.notified()).await.is_err() {
+                return self.drain();
+            }
+        }
+    }
+}
+
+static LIVE_LANES: LazyLock<Mutex<HashMap<String, Arc<LaneMailbox>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lane_key(session_id: &str, lane_id: &str) -> String {
+    format!("{session_id}#{lane_id}")
+}
+
+/// Hand a message to a lane that is running right now. False when the lane
+/// has finished, so the caller can deliver it to the parent session instead.
+pub fn deliver_to_lane(session_id: &str, lane_id: &str, text: String) -> bool {
+    let Some(mailbox) = LIVE_LANES.lock().unwrap().get(&lane_key(session_id, lane_id)).cloned() else {
+        return false;
+    };
+    mailbox.push(text);
+    true
+}
+
+struct LiveLane(Option<String>);
+
+impl LiveLane {
+    fn register(session_id: Option<&str>, lane_id: &str, mailbox: &Arc<LaneMailbox>) -> Self {
+        let key = session_id.map(|session| lane_key(session, lane_id));
+        if let Some(key) = &key {
+            LIVE_LANES.lock().unwrap().insert(key.clone(), mailbox.clone());
+        }
+        Self(key)
+    }
+}
+
+impl Drop for LiveLane {
+    fn drop(&mut self) {
+        if let Some(key) = &self.0 {
+            LIVE_LANES.lock().unwrap().remove(key);
+        }
+    }
+}
+
+const PARENT_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A lane's line back to the agent that delegated it.
+pub struct MessageParent {
+    lane_id: String,
+    progress_tx: mpsc::UnboundedSender<LaneProgress>,
+    mailbox: Arc<LaneMailbox>,
+}
+
+#[derive(Deserialize)]
+struct MessageParentArgs {
+    message: String,
+    #[serde(default)]
+    wait: bool,
+}
+
+#[async_trait::async_trait]
+impl Tool for MessageParent {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "message_parent".into(),
+            description: "Write to the agent that handed you this work, while you're still on it: a question you can't settle yourself, a finding that changes its plan or another lane's, or a heads-up before something hard to undo. With wait: true you pause for its answer (up to 10 minutes) and get it back here; otherwise carry on, and an answer arrives as a [parent_message].".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "wait": {"type": "boolean", "description": "Pause for the answer, when you can't sensibly go on without one."}
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, arguments: serde_json::Value) -> Result<ToolResult, ToolError> {
+        let args: MessageParentArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let message = args.message.trim();
+        if message.is_empty() {
+            return Err(ToolError::msg("message must not be empty"));
+        }
+        self.progress_tx
+            .send(LaneProgress {
+                id: self.lane_id.clone(),
+                kind: "message".to_string(),
+                text: message.to_string(),
+            })
+            .map_err(|_| ToolError::msg("the agent that handed you this has gone; put it in your report"))?;
+        if !args.wait {
+            return Ok(ToolResult::success(serde_json::json!({
+                "sent": true,
+                "note": "Sent. Carry on; an answer, if one comes, arrives as a [parent_message].",
+            })));
+        }
+        let answers = self.mailbox.wait(PARENT_REPLY_WAIT).await;
+        if answers.is_empty() {
+            return Ok(ToolResult::success(serde_json::json!({
+                "sent": true,
+                "answer": null,
+                "note": "No answer yet. Go on with your best judgment and say in your report what you assumed; a later answer arrives as a [parent_message].",
+            })));
+        }
+        Ok(ToolResult::success(serde_json::json!({
+            "sent": true,
+            "answer": answers.join("\n\n"),
+        })))
+    }
+}
+
+/// Who a lane works for, gathered from the parent session when the lane starts.
+struct LaneLink {
+    origin_session: Option<String>,
+    agent_id: Option<String>,
+    store_path: Option<PathBuf>,
+    context: String,
+    mailbox: Arc<LaneMailbox>,
+}
+
 /// Max lanes running at once — a runaway/cost guard so "spawn several" can't
 /// balloon into dozens of concurrent coding-agent runs.
 const MAX_ACTIVE_LANES: usize = 8;
@@ -159,6 +308,8 @@ pub struct LaneManager {
     counter: usize,
     exa_api_key: Option<String>,
     handles: Vec<(String, tokio::task::JoinHandle<()>)>,
+    parent: Option<ToolContext>,
+    mailboxes: HashMap<String, Arc<LaneMailbox>>,
 }
 
 impl Drop for LaneManager {
@@ -190,6 +341,82 @@ impl LaneManager {
             counter: 0,
             exa_api_key,
             handles: Vec::new(),
+            parent: None,
+            mailboxes: HashMap::new(),
+        }
+    }
+
+    pub fn with_parent(mut self, parent: ToolContext) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// Pass a message to a running lane. It reads it between steps, or as the
+    /// answer when it is waiting on one.
+    pub fn message(&mut self, lane_id: &str, text: &str) -> Result<String, String> {
+        let Some(record) = self.records.iter().find(|r| r.id == lane_id) else {
+            return Err(format!("no lane `{lane_id}` in this conversation."));
+        };
+        if record.status != LaneStatus::Running {
+            return Err(format!("lane `{lane_id}` isn't running."));
+        }
+        let Some(mailbox) = self.mailboxes.get(lane_id) else {
+            return Err(format!("lane `{lane_id}` can't take messages right now."));
+        };
+        mailbox.push(format!("[parent_message]\n{}\n[/parent_message]", text.trim()));
+        Ok(record.title.clone())
+    }
+
+    fn link_for(&mut self, id: &str, agent: Option<&str>) -> LaneLink {
+        let mailbox = Arc::new(LaneMailbox::default());
+        self.mailboxes.insert(id.to_string(), mailbox.clone());
+        let parent = self.parent.as_ref();
+        let origin_session = parent.and_then(|p| p.durable_session_id()).map(str::to_string);
+        let speaker = parent.and_then(crate::coordination_tools::speaks_as);
+        let task = match (parent, origin_session.as_deref()) {
+            (Some(p), Some(session)) => crate::coordination_tools::session_task(p, session),
+            _ => None,
+        };
+        let mut context = String::from("You're a co-worker taking one piece of a larger job.");
+        match &speaker {
+            Some(("agent", who)) => context.push_str(&format!(" It was handed to you by the agent `{who}`")),
+            _ => context.push_str(" It was handed to you by the agent working in the parent session"),
+        }
+        if let Some((task_id, title)) = &task {
+            context.push_str(&format!(", who is working on the task \"{title}\" ({task_id})"));
+        }
+        context.push('.');
+        if let Some(agent) = agent {
+            context.push_str(&format!(" You bring the expertise of `{agent}`, and you speak as `{agent}`."));
+        }
+        let siblings: Vec<String> = self
+            .records
+            .iter()
+            .filter(|r| r.status == LaneStatus::Running && r.id != id)
+            .map(|r| {
+                let access = if r.read_only { ", read-only" } else { "" };
+                format!("- \"{}\" ({}{access})", r.title, r.id)
+            })
+            .collect();
+        if siblings.is_empty() {
+            context.push_str(" No other lanes are running alongside you.");
+        } else {
+            context.push_str(&format!(
+                " Other lanes are working alongside you on their own pieces; keep to yours and leave their files alone:\n{}",
+                siblings.join("\n")
+            ));
+        }
+        context.push_str(
+            "\n\nYou aren't on your own. When you hit a question you can't settle, find something that changes the plan or touches another lane's piece, or are about to do something hard to undo, tell the agent that handed you this with `message_parent`. When something needs a peer, Mission Control, or the rest of your own work (your inbox knows it), use `send_agent_message`; the answer comes back to you here. Keep it to what matters: most of the job is doing your piece well.",
+        );
+        LaneLink {
+            origin_session,
+            agent_id: agent
+                .map(str::to_string)
+                .or_else(|| parent.and_then(|p| p.agent_id()).map(str::to_string)),
+            store_path: parent.and_then(|p| p.store_path()),
+            context,
+            mailbox,
         }
     }
 
@@ -304,7 +531,7 @@ impl LaneManager {
         };
         if record.status == LaneStatus::Running {
             return Err(format!(
-                "lane `{lane_id}` is still running — its report will arrive as a [lane_report]; follow up after that."
+                "lane `{lane_id}` is still running — its report will arrive as a [lane_report]."
             ));
         }
         // A lane lost to a restart has no live task but its state file survives —
@@ -384,8 +611,10 @@ impl LaneManager {
         let lane_id = id.to_string();
         let exa_api_key = self.exa_api_key.clone();
         let approval = self.approval_tx.clone().map(|tx| LaneApprovalRoute { lane: title.clone(), tx });
+        let link = self.link_for(id, agent.as_deref());
 
         let handle = tokio::spawn(async move {
+            let _live = LiveLane::register(link.origin_session.as_deref(), &lane_id, &link.mailbox);
             let result = tokio::time::timeout(
                 LANE_TIMEOUT,
                 run_lane(
@@ -401,6 +630,7 @@ impl LaneManager {
                     profile,
                     progress_tx,
                     approval,
+                    link,
                 ),
             )
             .await
@@ -668,6 +898,7 @@ async fn run_lane(
     profile: Option<String>,
     progress_tx: mpsc::UnboundedSender<LaneProgress>,
     approval: Option<LaneApprovalRoute>,
+    link: LaneLink,
 ) -> Result<(String, String), String> {
     let mut model = factory(profile.as_deref())?;
     let mut log = LaneLog::open(&owner).ok();
@@ -676,7 +907,15 @@ async fn run_lane(
     }
     let workspace_for_grounding = workspace_root.clone();
     let context = match ToolContext::with_owner(workspace_root, &owner) {
-        Ok(context) => context,
+        Ok(context) => {
+            let context = context
+                .with_agent_id_opt(link.agent_id.clone())
+                .with_store_path(link.store_path.clone().unwrap_or_else(crate::store::default_db_path));
+            match link.origin_session.as_deref() {
+                Some(session) => context.with_lane_origin(session, &owner),
+                None => context,
+            }
+        }
         Err(error) => {
             let message = error.to_string();
             if let Some(log) = log.as_mut() {
@@ -687,6 +926,12 @@ async fn run_lane(
     };
     let mut tools = coding_tools(exa_api_key.clone())
         .with_custom_dir(crate::agent_tools::tools_dir(agent.as_deref().unwrap_or("snippet")));
+    tools.insert(MessageParent {
+        lane_id: owner.clone(),
+        progress_tx: progress_tx.clone(),
+        mailbox: link.mailbox.clone(),
+    });
+    tools.insert(crate::coordination_tools::SendAgentMessage);
     if read_only {
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.
@@ -718,6 +963,7 @@ async fn run_lane(
             progress_tx: Some(progress_tx),
             progress_id: Some(owner.clone()),
             lane_approval: approval,
+            lane_mailbox: Some(link.mailbox.clone()),
             ..HarnessConfig::default()
         },
         tools,
@@ -729,7 +975,8 @@ async fn run_lane(
         ""
     };
     let brief = format!(
-        "{brief}\n\n---\n{role}You are working on this for another agent, who reads only your final summary. Finish with terminate_loop, and in that summary cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so they can go straight there without searching again."
+        "{brief}\n\n---\n{}\n\n{role}When you're done, finish with terminate_loop. The agent that handed you this reads that summary, so cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so it can go straight there without searching again.",
+        link.context
     );
     let run = match model.cli_agent_profile() {
         Some(cli) => harness.run_cli_lane(cli, brief).await,

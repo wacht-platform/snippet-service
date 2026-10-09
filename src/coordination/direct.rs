@@ -124,6 +124,20 @@ impl Store {
         created_at: &str,
         origin_session: Option<&str>,
     ) -> Result<CoordinationEvent, StoreError> {
+        self.send_direct_message_with_origin(sender, recipient, body, idempotency_key, created_at, origin_session, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_direct_message_with_origin(
+        &self,
+        sender: (&str, &str),
+        recipient: (&str, &str),
+        body: &str,
+        idempotency_key: &str,
+        created_at: &str,
+        origin_session: Option<&str>,
+        origin_lane: Option<&str>,
+    ) -> Result<CoordinationEvent, StoreError> {
         let thread_id = direct_thread_id(sender, recipient);
         let title = format!(
             "{} ↔ {}",
@@ -165,6 +179,9 @@ impl Store {
                 });
                 if let Some(session) = origin_session.filter(|s| !s.trim().is_empty()) {
                     payload["origin_session"] = serde_json::json!(session);
+                }
+                if let Some(lane) = origin_lane.filter(|l| !l.trim().is_empty()) {
+                    payload["origin_lane"] = serde_json::json!(lane);
                 }
                 payload
             },
@@ -227,7 +244,10 @@ impl Store {
                  FROM board_events e
                  JOIN board_threads t ON t.id = e.thread_id AND t.scope = 'direct'
                  JOIN board_participants p
-                   ON p.thread_id = e.thread_id AND p.actor_id <> e.actor_id
+                   ON p.thread_id = e.thread_id
+                  AND (p.actor_id <> e.actor_id
+                       OR (json_extract(e.payload_json, '$.origin_session') IS NOT NULL
+                           AND json_extract(e.payload_json, '$.origin_session') <> ('inbox-' || p.actor_id)))
                  LEFT JOIN message_deliveries d
                    ON d.event_id = e.event_id
                   AND d.recipient_kind = p.actor_kind
@@ -408,6 +428,30 @@ impl Store {
                 event_from_row,
             )?;
             rows.collect()
+        })
+    }
+
+    /// The latest message a session (or one of its lanes) sent to `recipient`
+    /// before `before`. A reply to a session lands on a different thread from
+    /// the question when the session spoke as an agent, so it is found by origin.
+    pub fn latest_message_from_session(
+        &self,
+        session_id: &str,
+        recipient: &str,
+        before: &str,
+    ) -> Result<Option<CoordinationEvent>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {EVENT_COLUMNS} FROM board_events
+                 WHERE event_type = 'direct_message.sent'
+                   AND actor_kind <> 'human'
+                   AND json_extract(payload_json, '$.origin_session') = ?1
+                   AND json_extract(payload_json, '$.recipient') = ?2
+                   AND created_at < ?3
+                 ORDER BY created_at DESC LIMIT 1"
+            ))?;
+            let mut rows = stmt.query_map(params![session_id, recipient, before], event_from_row)?;
+            rows.next().transpose()
         })
     }
 

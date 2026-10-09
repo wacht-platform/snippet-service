@@ -92,6 +92,9 @@ pub struct ToolContext {
     /// The directory agent id this session runs as (specialized sessions only),
     /// so board writes and direct messages are attributed to the agent.
     agent_id: Option<String>,
+    /// For a lane: the session that delegated it and the lane's id, so its
+    /// messages are answerable and replies find their way back into the lane.
+    lane_origin: Option<(String, String)>,
     /// The shell's working directory, carried across `bash` calls. Relative
     /// paths in the file tools resolve against it too, so there is one "here".
     current_dir: Arc<Mutex<PathBuf>>,
@@ -149,6 +152,7 @@ impl ToolContext {
             mission_control_root: None,
             store_path: None,
             agent_id: None,
+            lane_origin: None,
         })
     }
 
@@ -230,6 +234,15 @@ impl ToolContext {
 
     pub fn agent_id(&self) -> Option<&str> {
         self.agent_id.as_deref()
+    }
+
+    pub fn with_lane_origin(mut self, session_id: impl Into<String>, lane_id: impl Into<String>) -> Self {
+        self.lane_origin = Some((session_id.into(), lane_id.into()));
+        self
+    }
+
+    pub fn lane_origin(&self) -> Option<(&str, &str)> {
+        self.lane_origin.as_ref().map(|(session, lane)| (session.as_str(), lane.as_str()))
     }
 
 

@@ -49,6 +49,12 @@ impl CodingHarness {
         let (_approval_tx, mut approval_rx) = mpsc::unbounded_channel::<ApprovalDecision>();
         for iteration in start..=self.config.runtime_backstop_iterations {
             state.iterations = iteration;
+            if let Some(mailbox) = &self.config.lane_mailbox {
+                for text in mailbox.drain() {
+                    state.messages.push(HarnessMessage::User { content: text.clone() });
+                    state.events.push(HarnessEvent::Steer { text });
+                }
+            }
             self.persist(&mut state, &lanes).await?;
 
             match self
@@ -659,6 +665,12 @@ impl CodingHarness {
                     }
                     Some(progress) = progress_rx.recv() => {
                         lanes.record_progress(&progress);
+                        if progress.kind == "message" {
+                            self.inject_lane_message(&mut state, &lanes, &progress);
+                            if state.status == HarnessStatus::Idle {
+                                state.status = HarnessStatus::Running;
+                            }
+                        }
                         self.persist(&mut state, &lanes).await?;
                     }
                     Some(event) = watch_rx.recv() => {
