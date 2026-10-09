@@ -333,40 +333,34 @@ fn goal_dir_phrase(dir: &str) -> String {
 
 fn goal_start_directive(text: &str) -> String {
     format!(
-        "[goal] The user has set you an AUTONOMOUS GOAL to drive to completion on your own — \
-you'll be re-prompted each turn to keep going.\n\n\
-GOAL: {text}\n\n\
-Do this now:\n\
-1. Set up a GOAL WORKSPACE — create a new folder (or reuse a relevant existing one) under \
-`.snippet/goals/`. This is durable scratch space that SURVIVES compaction: keep your \
-findings, decisions, and any artifacts there.\n\
-2. Lay out the work with `update_plan`, and write its path and the plan into that folder too.\n\
-3. Start executing toward 100% completion.\n\n\
-Rules: keep going on your own; do NOT stop to ask for confirmation on ordinary steps. When the \
-goal is genuinely 100% complete, call `complete_goal` with a short summary. If you hit a hard \
-blocker you truly cannot resolve, say exactly what you need. Begin."
+        "[goal] The user has given you a goal to carry through on your own: {text}\n\n\
+You'll get a nudge after each turn to keep going, so work through it end to end without \
+checking in on ordinary steps.\n\
+1. Pick a goal folder under `.snippet/goals/` (a new one, or a relevant existing one). It \
+survives compaction, so keep your plan, findings, decisions and artifacts there.\n\
+2. Lay out the steps with `update_plan` and save the plan in that folder too.\n\
+3. Start on the first step.\n\n\
+When the goal is fully done, call `complete_goal` with a short summary. If you hit something \
+only the user can resolve, say exactly what you need."
     )
 }
 
 fn goal_continue_directive(text: &str, dir: &str) -> String {
     format!(
-        "[goal] Continue toward your goal: {text}\n\
-    Re-read your plan/todos/findings in {where}, pick the next unfinished step, and do it — update \
-    the todos as you go. Keep going; don't stop or recap unless something material changed. When it's \
-    100% complete, call `complete_goal`.",
+        "[goal] Carry on with your goal: {text}\n\
+Your plan and notes are in {where}. Pick up the next unfinished step and do it, keeping the \
+plan current as you go; no recap needed unless something material changed. When it's fully \
+done, call `complete_goal`.",
         where = goal_dir_phrase(dir)
     )
 }
 
 fn goal_selfcheck_directive(text: &str, dir: &str, n: usize) -> String {
     format!(
-        "[goal] SELF-CHECK — you've taken {n} autonomous turns on this goal. Step back and evaluate \
-    honestly:\n\
-    - Are you making REAL progress toward: {text}?\n\
-    - Is your approach working, or are you looping/stuck?\n\
-    - Re-read your plan/todos in {where}.\n\
-    Then decide: if it's actually complete, call `complete_goal`; if you're genuinely blocked, state \
-    exactly what you need; otherwise correct course if needed and CONTINUE. Proceed.",
+        "[goal] Time for a check-in: you've taken {n} turns on this goal: {text}\n\
+Re-read your plan in {where} and be honest with yourself: is this making real progress, or \
+going in circles? If it's done, call `complete_goal`. If you're blocked on something only the \
+user can give, say exactly what. Otherwise adjust course if needed and carry on.",
         where = goal_dir_phrase(dir)
     )
 }

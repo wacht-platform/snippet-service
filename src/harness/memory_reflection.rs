@@ -32,8 +32,8 @@ impl CodingHarness {
                 )
             } else {
                 format!(
-                    "CONVERSATION TO COMPACT — fold ALL of it into one Antigravity-style <CONTEXT_SUMMARY>:\n{window_text}\n\n\
-                     Call write_table ONCE with every section filled.{}",
+                    "Conversation to compact; fold all of it into one Antigravity-style <CONTEXT_SUMMARY>:\n{window_text}\n\n\
+                     Call write_table once, with every section filled.{}",
                     if feedback.is_empty() {
                         String::new()
                     } else {

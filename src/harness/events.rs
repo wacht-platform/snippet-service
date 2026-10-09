@@ -737,7 +737,7 @@ impl CodingHarness {
         let appended = crate::vault::Vault::load().scrub_str(event.appended.trim_end());
         state.messages.push(HarnessMessage::User {
             content: format!(
-                "[file_watch]\nsubject = \"{}\"\npath = \"{}\"\nappended:{skipped_note}\n{}\n[orchestration] Act on this if it needs action; stay quiet and end the turn if it doesn't. Remove the watch (monitor action:\"remove\") once it has served its purpose.\n[follow_up_id = \"{}\"]  # internal handle for monitor remove ONLY — refer to this work by its SUBJECT to the user, never by this id\n[/file_watch]",
+                "[file_watch]\nsubject = \"{}\"\npath = \"{}\"\nappended:{skipped_note}\n{}\n[orchestration] Act on this if it needs action; stay quiet and end the turn if it doesn't. Remove the watch (monitor action:\"remove\") once it has served its purpose.\n[follow_up_id = \"{}\"]  # internal handle for monitor remove; to the user, call this work by its subject\n[/file_watch]",
                 event.label, event.path, appended, event.id
             ),
         });
@@ -790,14 +790,14 @@ impl CodingHarness {
                 "{outstanding} lane(s) still out — fold this in (or note progress) and keep waiting; don't finalize yet."
             )
         } else {
-            "ALL delegated lanes have now reported. You hold the complete picture: synthesize the results \
-             into the deliverable now (verify load-bearing findings against the cited file:line first). \
-             Don't restart the investigation yourself; follow up a specific lane if something is missing."
+            "Every lane has reported, so you have the full picture: bring the results together into \
+             the deliverable now, checking the findings it rests on against their file:line first. If \
+             something is missing, follow up the lane that owns it rather than redoing the work."
                 .to_string()
         };
         state.messages.push(HarnessMessage::User {
             content: format!(
-                "[lane_report]\nsubject = \"{}\"\nstatus = {:?}\n{}\n[orchestration] {}\n[follow_up_id = \"{}\"]  # internal handle for a delegate_task follow-up ONLY — refer to this work by its SUBJECT to the user, never by this id\n[/lane_report]",
+                "[lane_report]\nsubject = \"{}\"\nstatus = {:?}\n{}\n[orchestration] {}\n[follow_up_id = \"{}\"]  # internal handle for a delegate_task follow-up; to the user, call this work by its subject\n[/lane_report]",
                 result.title, result.status, body, cue, result.id
             ),
         });

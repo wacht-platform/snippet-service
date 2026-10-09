@@ -460,7 +460,7 @@ impl Tool for SendAgentMessage {
                 .unwrap_or(false);
             if !resolves {
                 return Err(ToolError::msg(format!(
-                    "unknown session `{to_id}`. Use the `reply_to` value from the envelope EXACTLY as written — do not shorten it. That value names the session the sender is reading."
+                    "unknown session `{to_id}`. Copy the `reply_to` value from the envelope as written, in full: it names the session the sender is reading."
                 )));
             }
         }
@@ -832,7 +832,7 @@ impl Tool for PostTaskCoordination {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "post_task_coordination".into(),
-            description: "Coordinate with fellow agents assigned to this task board item. Posts context, plan proposals, or status to the task thread. All assigned agents and Mission Control receive notification of board changes. If no action or response is needed from an agent when reading, they can choose to NO-OP.".into(),
+            description: "Coordinate with fellow agents assigned to this task board item. Posts context, plan proposals, or status to the task thread. Everyone on the task and Mission Control see it; a post that needs nothing from them can simply be read.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string", "description": "The task ID on the task board"},
