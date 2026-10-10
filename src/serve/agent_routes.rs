@@ -34,35 +34,6 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
     };
     match d.store.list_agents_page(after, q.limit.clamp(1, 500)) {
         Ok(agents) => {
-            let assignments = match d.store.list_agent_assigned_sessions() {
-                Ok(rows) => rows,
-                Err(error) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {error}"))
-                        .into_response();
-                }
-            };
-            let mut grouped: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-            for (agent_id, id, title, conversation, last_active) in assignments {
-                grouped.entry(agent_id).or_default().push(serde_json::json!({
-                    "id": id,
-                    "title": title,
-                    "conversation": conversation,
-                    "last_active": last_active,
-                }));
-            }
-            let agents = agents
-                .into_iter()
-                .map(|agent| {
-                    let mut value = serde_json::to_value(&agent).unwrap_or_default();
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert(
-                            "assigned_sessions".into(),
-                            serde_json::Value::Array(grouped.remove(&agent.id).unwrap_or_default()),
-                        );
-                    }
-                    value
-                })
-                .collect::<Vec<_>>();
             Json(agents).into_response()
         }
         Err(error) => {
