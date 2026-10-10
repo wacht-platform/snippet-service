@@ -86,6 +86,9 @@ pub struct LaneRecord {
     /// Inference profile name chosen for this lane (omitted when using active model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// The id the lane's own transcript is stored under, for a read-only view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 /// Terminal report delivered back to the parent loop when a lane finishes.
@@ -367,6 +370,12 @@ impl LaneManager {
         Ok(record.title.clone())
     }
 
+    fn transcript_id(&self, id: &str) -> Option<String> {
+        let path = self.lane_root.join(format!("{id}.json"));
+        path.starts_with(crate::config::workspaces_root())
+            .then(|| crate::session::session_id_for_state_path(&path))
+    }
+
     fn link_for(&mut self, id: &str, agent: Option<&str>) -> LaneLink {
         let mailbox = Arc::new(LaneMailbox::default());
         self.mailboxes.insert(id.to_string(), mailbox.clone());
@@ -497,6 +506,7 @@ impl LaneManager {
             read_only,
             agent: agent.clone(),
             profile: profile.clone(),
+            transcript: self.transcript_id(&id),
         });
         self.launch(&id, title, brief, false, read_only, agent, profile);
         Ok(id)
@@ -838,6 +848,11 @@ impl LaneManager {
         // Some writers use `lane-N.meta.json` beside `lane-N.json`.
         let _ = std::fs::remove_file(self.lane_root.join(format!("{id}.meta.json")));
         let _ = std::fs::remove_file(self.lane_root.join(format!("{id}.json")));
+        if let Some(transcript) = self.transcript_id(id)
+            && let Ok(store) = crate::store::Store::open_cached(crate::store::default_db_path())
+        {
+            let _ = store.delete_conversation(&transcript);
+        }
     }
 
     /// Remove `lane-*.json` / `lane-*.meta.json` under lane_root that are not
@@ -1156,6 +1171,7 @@ mod tests {
             read_only: true,
             agent: None,
             profile: None,
+            transcript: None,
         }
     }
 
