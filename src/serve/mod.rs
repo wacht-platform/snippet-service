@@ -264,6 +264,9 @@ impl Daemon {
         PathBuf,
         crate::llm::StreamHandle,
     )> {
+        if crate::session::is_lane_session_id(id) {
+            return None;
+        }
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(id) {
             return Some((s.input_tx.clone(), s.state_path.clone(), s.stream.clone()));

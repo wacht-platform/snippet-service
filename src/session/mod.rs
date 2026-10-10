@@ -690,6 +690,13 @@ pub fn inbox_session_id(agent_id: &str) -> String {
 }
 
 /// Whether a session id names an agent inbox rather than a project session.
+/// A delegated lane's transcript, stored like a session but never run as one:
+/// the lane runs inside its parent session.
+pub fn is_lane_session_id(id: &str) -> bool {
+    id.rsplit_once('/')
+        .is_some_and(|(dir, name)| (dir == "lanes" || dir.ends_with("/lanes")) && name.starts_with("lane-"))
+}
+
 pub fn is_inbox_session_id(id: &str) -> bool {
     id.strip_prefix("inbox-")
         .is_some_and(|agent_id| {
@@ -887,7 +894,7 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
 pub fn list_device_sessions() -> Vec<SessionInfo> {
     all_device_sessions()
         .into_iter()
-        .filter(|s| !is_inbox_session_id(&s.id))
+        .filter(|s| !is_inbox_session_id(&s.id) && !is_lane_session_id(&s.id))
         .collect()
 }
 

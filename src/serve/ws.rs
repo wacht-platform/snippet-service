@@ -101,6 +101,24 @@ pub(crate) async fn attach_ws(
     if !d.authed(&q.token) {
         return unauthorized();
     }
+    let compact = q
+        .compact
+        .as_deref()
+        .is_some_and(|v| v != "0" && v != "false");
+    if crate::session::is_lane_session_id(&q.session) {
+        let Some(state_path) = state_path_for_id(&q.session)
+            .filter(|path| crate::session::read_session_meta(path).is_some())
+        else {
+            return (StatusCode::NOT_FOUND, "no such lane").into_response();
+        };
+        let stream: crate::llm::StreamHandle =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::llm::StreamBuffer::default()));
+        let daemon = d.clone();
+        let session = q.session.clone();
+        return ws.on_upgrade(move |socket| {
+            handle_ws(socket, daemon, session, state_path, stream, None, compact, true)
+        });
+    }
     match d.ensure_live(&q.session).await {
         Some((_, state_path, stream)) => {
             let terms = {
@@ -109,12 +127,8 @@ pub(crate) async fn attach_ws(
             };
             let daemon = d.clone();
             let session = q.session.clone();
-            let compact = q
-                .compact
-                .as_deref()
-                .is_some_and(|v| v != "0" && v != "false");
             ws.on_upgrade(move |socket| {
-                handle_ws(socket, daemon, session, state_path, stream, terms, compact)
+                handle_ws(socket, daemon, session, state_path, stream, terms, compact, false)
             })
         }
         None => (StatusCode::NOT_FOUND, "no such session").into_response(),
@@ -129,6 +143,7 @@ async fn handle_ws(
     stream: crate::llm::StreamHandle,
     terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
     compact: bool,
+    read_only: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Option<usize>)>();
@@ -392,6 +407,9 @@ async fn handle_ws(
                             }
                         }
                     }
+                }
+                if read_only {
+                    continue;
                 }
                 if let Ok(input) = serde_json::from_str::<LoopInput>(t.as_str()) {
                     daemon.deliver(&session, input).await;

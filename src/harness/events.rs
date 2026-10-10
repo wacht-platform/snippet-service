@@ -345,8 +345,7 @@ impl CodingHarness {
             .config
             .state_path
             .as_ref()
-            .and_then(|path| path.parent())
-            .map(|parent| parent.join("lanes"))
+            .map(|path| path.with_extension("").join("lanes"))
             .unwrap_or_else(|| self.context.workspace_root().join(".snippet/lanes"));
         LaneManager::new(
             factory,
