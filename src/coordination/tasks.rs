@@ -898,6 +898,29 @@ impl Store {
         })
     }
 
+    /// Task counts per agent and status. Open work counts whatever its age;
+    /// finished work counts only when it changed at or after `finished_since`.
+    pub fn agent_task_counts(
+        &self,
+        finished_since: &str,
+    ) -> Result<Vec<(String, String, u64)>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ta.agent_id, t.status, COUNT(*)
+                 FROM task_agents ta
+                 JOIN tasks t ON t.id = ta.task_id
+                 WHERE ta.removed_at IS NULL
+                   AND (t.status IN ('todo', 'in_progress', 'blocked')
+                        OR t.updated_at >= ?1)
+                 GROUP BY ta.agent_id, t.status",
+            )?;
+            let rows = stmt.query_map(params![finished_since], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as u64))
+            })?;
+            rows.collect()
+        })
+    }
+
     /// Patch the mutable fields. `None` leaves a field untouched, so a caller can
     /// change one thing without having to read-modify-write the whole row.
     pub fn update_task(

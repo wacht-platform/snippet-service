@@ -34,6 +34,33 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
     };
     match d.store.list_agents_page(after, q.limit.clamp(1, 500)) {
         Ok(agents) => {
+            let since = (chrono::Utc::now() - chrono::Duration::days(7)).to_rfc3339();
+            let counts = match d.store.agent_task_counts(&since) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("store: {error}"))
+                        .into_response();
+                }
+            };
+            let mut grouped: HashMap<String, serde_json::Map<String, serde_json::Value>> =
+                HashMap::new();
+            for (agent_id, status, count) in counts {
+                grouped.entry(agent_id).or_default().insert(status, count.into());
+            }
+            let agents = agents
+                .into_iter()
+                .map(|agent| {
+                    let mut value = serde_json::to_value(&agent).unwrap_or_default();
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "task_counts".into(),
+                            serde_json::Value::Object(grouped.remove(&agent.id).unwrap_or_default()),
+                        );
+                        object.insert("task_counts_since".into(), since.clone().into());
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
             Json(agents).into_response()
         }
         Err(error) => {
