@@ -65,6 +65,7 @@ fn content_hash(bytes: &[u8]) -> u64 {
 
 pub type BrowserSummaryProvider = Arc<dyn Fn() -> String + Send + Sync>;
 
+
 #[derive(Clone)]
 pub struct ToolContext {
     workspace_root: PathBuf,
@@ -76,10 +77,6 @@ pub struct ToolContext {
     /// external edits, another lane, or a concurrent process). Optimistic
     /// concurrency; replaces the former lock registry.
     seen: Arc<Mutex<HashMap<PathBuf, u64>>>,
-    /// Entry ids written via memory_write this session (main). Surfaced in live
-    /// context as [memory_updated] so the agent can memory_read them now — the
-    /// system-prefix index is cache-fixed until resume.
-    memory_writes: Arc<Mutex<Vec<String>>>,
     mission_control: bool,
     /// Durable session identity (state path relative to the workspaces root).
     /// Set for daemon-managed sessions; lets `report_mission_task` verify the
@@ -88,6 +85,19 @@ pub struct ToolContext {
     /// Same store the daemon dispatcher uses. Set for Mission Control so tools
     /// do not recompute the root from HOME independently.
     mission_control_root: Option<PathBuf>,
+    /// Absolute path to the SQLite store (`~/.snippet/snippet.db`). Set for every
+    /// daemon-managed session so coordination tools reach the same database the
+    /// daemon writes.
+    store_path: Option<PathBuf>,
+    /// The directory agent id this session runs as (specialized sessions only),
+    /// so board writes and direct messages are attributed to the agent.
+    agent_id: Option<String>,
+    /// For a lane: the session that delegated it and the lane's id, so its
+    /// messages are answerable and replies find their way back into the lane.
+    lane_origin: Option<(String, String)>,
+    /// The shell's working directory, carried across `bash` calls. Relative
+    /// paths in the file tools resolve against it too, so there is one "here".
+    current_dir: Arc<Mutex<PathBuf>>,
 }
 
 impl ToolContext {
@@ -132,19 +142,36 @@ impl ToolContext {
             root
         };
         Ok(Self {
+            current_dir: Arc::new(Mutex::new(root.clone())),
             workspace_root: root,
             owner: owner.into(),
             browser_summary,
             seen: Arc::new(Mutex::new(HashMap::new())),
-            memory_writes: Arc::new(Mutex::new(Vec::new())),
             mission_control: false,
             durable_session_id: None,
             mission_control_root: None,
+            store_path: None,
+            agent_id: None,
+            lane_origin: None,
         })
     }
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Where the next `bash` call starts and relative file paths resolve.
+    pub fn current_dir(&self) -> PathBuf {
+        self.current_dir
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_current_dir(&self, dir: PathBuf) {
+        if dir.is_dir() {
+            *self.current_dir.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+        }
     }
 
     pub fn owner(&self) -> &str {
@@ -162,6 +189,13 @@ impl ToolContext {
         self
     }
 
+    /// Bind a durable id that may be absent, so a caller wiring several kinds of
+    /// session can apply it uniformly rather than branching on `Option` itself.
+    pub fn with_durable_session_id_opt(mut self, id: Option<String>) -> Self {
+        self.durable_session_id = id;
+        self
+    }
+
     pub fn durable_session_id(&self) -> Option<&str> {
         self.durable_session_id.as_deref()
     }
@@ -170,27 +204,47 @@ impl ToolContext {
         self.mission_control_root.clone()
     }
 
-    /// Record a successful memory_write id for live-context [memory_updated].
-    pub fn note_memory_write(&self, id: &str) {
-        let id = id.trim();
-        if id.is_empty() {
-            return;
-        }
-        let mut w = self.memory_writes.lock().unwrap();
-        if !w.iter().any(|x| x == id) {
-            w.push(id.to_string());
-            // Cap so a noisy session can't bloat the live-context line.
-            if w.len() > 12 {
-                let drain = w.len() - 12;
-                w.drain(0..drain);
-            }
-        }
+    /// Bind the store path for this session's tools.
+    pub fn with_store_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.store_path = Some(path.into());
+        self
     }
 
-    /// Ids written this session (oldest→newest), for live context.
-    pub fn memory_writes_snapshot(&self) -> Vec<String> {
-        self.memory_writes.lock().unwrap().clone()
+    pub fn store_path(&self) -> Option<PathBuf> {
+        self.store_path.clone()
     }
+
+    pub fn store(&self) -> Result<crate::store::Store, crate::store::StoreError> {
+        let path = self.store_path.clone().unwrap_or_else(crate::store::default_db_path);
+        crate::store::Store::open_cached(path)
+    }
+
+    /// Bind the directory agent id this session runs as.
+    pub fn with_agent_id(mut self, id: impl Into<String>) -> Self {
+        self.agent_id = Some(id.into());
+        self
+    }
+
+    /// Bind an optional agent id, so a caller wiring several kinds of session
+    /// applies it uniformly instead of branching on `Option` itself.
+    pub fn with_agent_id_opt(mut self, id: Option<String>) -> Self {
+        self.agent_id = id;
+        self
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+
+    pub fn with_lane_origin(mut self, session_id: impl Into<String>, lane_id: impl Into<String>) -> Self {
+        self.lane_origin = Some((session_id.into(), lane_id.into()));
+        self
+    }
+
+    pub fn lane_origin(&self) -> Option<(&str, &str)> {
+        self.lane_origin.as_ref().map(|(session, lane)| (session.as_str(), lane.as_str()))
+    }
+
 
     pub fn browser_summary(&self) -> Option<String> {
         self.browser_summary.as_ref().map(|provider| provider())
@@ -222,6 +276,17 @@ impl ToolContext {
         self.remember(path);
     }
 
+    /// Whether `path` is tracked in `seen` and matches its current bytes on disk.
+    pub fn is_file_unchanged(&self, path: &Path) -> bool {
+        let stored = self.seen.lock().unwrap().get(path).copied();
+        if let Some(stored) = stored {
+            if let Ok(current) = std::fs::read(path) {
+                return content_hash(&current) == stored;
+            }
+        }
+        false
+    }
+
     /// Record that this context just wrote `path`, so its own follow-up writes
     /// aren't flagged stale.
     pub fn record_change(&self, path: &Path) {
@@ -241,7 +306,7 @@ impl ToolContext {
         // No workspace jail: the working directory is just the base for relative
         // paths. Absolute paths and `~` resolve as given, so the agent can read or
         // edit any file you point it at (bash already has full access anyway).
-        Ok(normalize_workspace_path(&self.workspace_root, raw))
+        Ok(normalize_workspace_path(&self.current_dir(), raw))
     }
 }
 
@@ -313,6 +378,7 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Box<dyn Tool>>,
+    custom_dir: Option<PathBuf>,
 }
 
 impl ToolRegistry {
@@ -328,8 +394,33 @@ impl ToolRegistry {
         self.tools.insert(name, Box::new(tool));
     }
 
+    pub fn with_custom_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.custom_dir = dir;
+        self
+    }
+
+    pub fn custom_dir(&self) -> Option<&Path> {
+        self.custom_dir.as_deref().filter(|_| self.tools.contains_key("bash"))
+    }
+
+    fn custom_tools(&self) -> Vec<crate::agent_tools::CustomTool> {
+        self.custom_dir()
+            .map(crate::agent_tools::load)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|tool| !self.tools.contains_key(&tool.name))
+            .collect()
+    }
+
     pub fn definitions(&self) -> Vec<NativeToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        let mut defs: Vec<NativeToolDefinition> =
+            self.tools.values().map(|tool| tool.definition()).collect();
+        defs.extend(self.custom_tools().iter().map(crate::agent_tools::definition));
+        defs
+    }
+
+    pub fn is_custom(&self, name: &str) -> bool {
+        !self.tools.contains_key(name) && self.custom_tools().iter().any(|t| t.name == name)
     }
 
     /// Remove a tool by name (used to derive scoped registries, e.g. read-only
@@ -339,7 +430,7 @@ impl ToolRegistry {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.contains_key(name) || self.is_custom(name)
     }
 
     pub async fn execute(
@@ -348,26 +439,49 @@ impl ToolRegistry {
         name: &str,
         arguments: Value,
     ) -> Result<ToolResult, ToolError> {
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let tool = match self.tools.get(name) {
+            Some(tool) => tool,
+            None => return self.execute_custom(ctx, name, arguments).await,
+        };
         let mut result = tool.execute(ctx, arguments).await?;
         result.value = bound_tool_output(ctx, name, result.value);
+        Ok(result)
+    }
+
+    async fn execute_custom(
+        &self,
+        ctx: &ToolContext,
+        name: &str,
+        arguments: Value,
+    ) -> Result<ToolResult, ToolError> {
+        let dir = self.custom_dir().ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let call = crate::agent_tools::prepare(dir, name, &arguments)
+            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?
+            .map_err(|e| ToolError::msg(format!("{name}: {e}")))?;
+        if call.needs_first_approval {
+            return Err(ToolError::msg(format!(
+                "custom tool `{name}` is new and hasn't been approved by the user yet"
+            )));
+        }
+        let bash = self.tools.get("bash").ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let mut result = bash.execute(ctx, crate::agent_tools::bash_arguments(&call)).await?;
+        if let Some(data) = result.value.get_mut("data").and_then(Value::as_object_mut) {
+            data.insert("custom_tool".into(), Value::String(name.to_string()));
+        }
         Ok(result)
     }
 }
 
 /// Inline ceiling before a tool result is spilled to a scratch file the agent
-/// pages with `read_file`. Ported from wacht's `apply_output_postprocess`.
+/// reads with the shell. Ported from wacht's `apply_output_postprocess`.
 const MAX_INLINE_OUTPUT_CHARS: usize = 60_000;
 
 /// Keep tool output bounded: when a result renders larger than the inline
 /// ceiling, write the full payload to `<workspace>/.snippet/scratch/` and return
-/// a small preview envelope pointing at it. `read_file`/`read_image` page
-/// themselves, so they're exempt.
+/// a small preview envelope pointing at it. `bash` truncates and saves its own
+/// output and `view_image` carries an image, so they're exempt.
 fn bound_tool_output(ctx: &ToolContext, name: &str, value: Value) -> Value {
-    if matches!(name, "read_file" | "read_image") {
+    if matches!(name, "view_image" | "bash") {
         return value;
     }
     let rendered = serde_json::to_string_pretty(&value).unwrap_or_default();
@@ -403,8 +517,8 @@ fn bound_tool_output(ctx: &ToolContext, name: &str, value: Value) -> Value {
                 "original_stats": stats,
                 "hint": format!(
                     "Output exceeded the inline limit; the full result was saved to `{rel}`. \
-                     Page it with read_file using start_char/end_char windows, or rerun with a \
-                     narrower command."
+                     Read the part you need with `sed -n`, `head` or `rg` in bash, or rerun \
+                     with a narrower command."
                 ),
             })
         }

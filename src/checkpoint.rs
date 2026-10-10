@@ -121,6 +121,24 @@ pub fn snapshot(workspace: &Path, label: &str) -> Option<String> {
 /// Snapshot with a diagnostic error so callers can record why checkpoint creation
 /// was skipped. Keep `snapshot` as the quiet compatibility wrapper for restores.
 pub fn snapshot_diagnostic(workspace: &Path, label: &str) -> Result<String, String> {
+    let lock = shadow_lock(workspace);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    snapshot_unlocked(workspace, label)
+}
+
+fn shadow_lock(workspace: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+    type Locks = std::collections::HashMap<PathBuf, std::sync::Arc<std::sync::Mutex<()>>>;
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<Locks>> = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(workspace.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+fn snapshot_unlocked(workspace: &Path, label: &str) -> Result<String, String> {
     if !git_available() {
         return Err("git is not available".to_string());
     }
@@ -172,6 +190,8 @@ pub fn prune(workspace: &Path, keep: &[String], dropped: &[String]) {
     if !git_available() || !shadow_dir(workspace).exists() {
         return;
     }
+    let lock = shadow_lock(workspace);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     // Ensure each retained checkpoint has its own ref — covers ids that were only
     // reachable via the old chain, so deleting the chain below won't lose them.
     for id in keep {
@@ -199,8 +219,10 @@ pub fn restore(workspace: &Path, commit: &str) -> Result<(), String> {
     if !git_available() {
         return Err("git is not available — checkpoints need git installed.".to_string());
     }
+    let lock = shadow_lock(workspace);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     ensure_init(workspace)?;
-    let _ = snapshot(workspace, "pre-restore safety snapshot");
+    let _ = snapshot_unlocked(workspace, "pre-restore safety snapshot");
     git(workspace, &["read-tree", "-u", "--reset", commit])?;
     Ok(())
 }

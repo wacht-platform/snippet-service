@@ -5,8 +5,9 @@
 //! plain coding-agent prompt to `complete`, and reports a [`LaneResult`] back over
 //! a channel. Multiple lanes run in parallel.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -15,14 +16,14 @@ use tokio::sync::mpsc;
 use crate::harness::{CodingHarness, HarnessConfig};
 use crate::lane_log::LaneLog;
 use crate::llm::AgentModel;
-use crate::prompts::coding_system_prompt;
-use crate::tools::ToolContext;
-use crate::tools::coding_tools;
+use crate::prompts::{PromptContext, lane_prompt};
+use crate::llm::NativeToolDefinition;
+use crate::tools::{Tool, ToolContext, ToolError, ToolResult, coding_tools};
 
-/// Builds a fresh model instance for a child lane run. The TUI supplies one that
-/// constructs an `OpenAiCompatibleModel` from config; one-shot library callers
-/// leave it `None`, which disables delegation.
-pub type ModelFactory = Arc<dyn Fn() -> Box<dyn AgentModel> + Send + Sync>;
+/// Builds a fresh model instance for a child lane run. Accepts an optional
+/// inference profile name; when None, it constructs the parent session's active model
+/// to preserve prompt cache affinity.
+pub type ModelFactory = Arc<dyn Fn(Option<&str>) -> Result<Box<dyn AgentModel>, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +80,15 @@ pub struct LaneRecord {
     /// Investigation lane: file-mutation tools removed. Sticky across follow-ups.
     #[serde(default)]
     pub read_only: bool,
+    /// Specialized agent identity or role name (e.g. 'reviewer', 'researcher').
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Inference profile name chosen for this lane (omitted when using active model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// The id the lane's own transcript is stored under, for a read-only view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 /// Terminal report delivered back to the parent loop when a lane finishes.
@@ -89,9 +99,157 @@ pub struct LaneResult {
     pub status: LaneStatus,
     /// Concise final summary (the lane's terminate_loop text) — shown in the TUI.
     pub summary: Option<String>,
-    /// Full report for the parent agent: action log + findings + summary.
+    /// Full report for the parent agent: action log + summary.
     pub report: Option<String>,
     pub error: Option<String>,
+}
+
+/// Messages waiting for a running lane: from the agent that delegated it, or
+/// replies from agents it wrote to. The lane picks them up between steps, or
+/// straight away while it waits in `message_parent`.
+#[derive(Debug, Default)]
+pub struct LaneMailbox {
+    queue: Mutex<VecDeque<String>>,
+    notify: tokio::sync::Notify,
+}
+
+impl LaneMailbox {
+    pub fn push(&self, text: String) {
+        self.queue.lock().unwrap().push_back(text);
+        self.notify.notify_one();
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        self.queue.lock().unwrap().drain(..).collect()
+    }
+
+    async fn wait(&self, timeout: std::time::Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let waiting = self.drain();
+            if !waiting.is_empty() {
+                return waiting;
+            }
+            if tokio::time::timeout_at(deadline, self.notify.notified()).await.is_err() {
+                return self.drain();
+            }
+        }
+    }
+}
+
+static LIVE_LANES: LazyLock<Mutex<HashMap<String, Arc<LaneMailbox>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn lane_key(session_id: &str, lane_id: &str) -> String {
+    format!("{session_id}#{lane_id}")
+}
+
+/// Hand a message to a lane that is running right now. False when the lane
+/// has finished, so the caller can deliver it to the parent session instead.
+pub fn deliver_to_lane(session_id: &str, lane_id: &str, text: String) -> bool {
+    let Some(mailbox) = LIVE_LANES.lock().unwrap().get(&lane_key(session_id, lane_id)).cloned() else {
+        return false;
+    };
+    mailbox.push(text);
+    true
+}
+
+struct LiveLane(Option<String>);
+
+impl LiveLane {
+    fn register(session_id: Option<&str>, lane_id: &str, mailbox: &Arc<LaneMailbox>) -> Self {
+        let key = session_id.map(|session| lane_key(session, lane_id));
+        if let Some(key) = &key {
+            LIVE_LANES.lock().unwrap().insert(key.clone(), mailbox.clone());
+        }
+        Self(key)
+    }
+}
+
+impl Drop for LiveLane {
+    fn drop(&mut self) {
+        if let Some(key) = &self.0 {
+            LIVE_LANES.lock().unwrap().remove(key);
+        }
+    }
+}
+
+const PARENT_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// A lane's line back to the agent that delegated it.
+pub struct MessageParent {
+    lane_id: String,
+    progress_tx: mpsc::UnboundedSender<LaneProgress>,
+    mailbox: Arc<LaneMailbox>,
+}
+
+#[derive(Deserialize)]
+struct MessageParentArgs {
+    message: String,
+    #[serde(default)]
+    wait: bool,
+}
+
+#[async_trait::async_trait]
+impl Tool for MessageParent {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "message_parent".into(),
+            description: "Write to the agent that handed you this work, while you're still on it: a question you can't settle yourself, a finding that changes its plan or another lane's, or a heads-up before something hard to undo. With wait: true you pause for its answer (up to 10 minutes) and get it back here; otherwise carry on, and an answer arrives as a [parent_message].".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "wait": {"type": "boolean", "description": "Pause for the answer, when you can't sensibly go on without one."}
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, arguments: serde_json::Value) -> Result<ToolResult, ToolError> {
+        let args: MessageParentArgs =
+            serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let message = args.message.trim();
+        if message.is_empty() {
+            return Err(ToolError::msg("message must not be empty"));
+        }
+        self.progress_tx
+            .send(LaneProgress {
+                id: self.lane_id.clone(),
+                kind: "message".to_string(),
+                text: message.to_string(),
+            })
+            .map_err(|_| ToolError::msg("the agent that handed you this has gone; put it in your report"))?;
+        if !args.wait {
+            return Ok(ToolResult::success(serde_json::json!({
+                "sent": true,
+                "note": "Sent. Carry on; an answer, if one comes, arrives as a [parent_message].",
+            })));
+        }
+        let answers = self.mailbox.wait(PARENT_REPLY_WAIT).await;
+        if answers.is_empty() {
+            return Ok(ToolResult::success(serde_json::json!({
+                "sent": true,
+                "answer": null,
+                "note": "No answer yet. Go on with your best judgment and say in your report what you assumed; a later answer arrives as a [parent_message].",
+            })));
+        }
+        Ok(ToolResult::success(serde_json::json!({
+            "sent": true,
+            "answer": answers.join("\n\n"),
+        })))
+    }
+}
+
+/// Who a lane works for, gathered from the parent session when the lane starts.
+struct LaneLink {
+    origin_session: Option<String>,
+    agent_id: Option<String>,
+    store_path: Option<PathBuf>,
+    context: String,
+    mailbox: Arc<LaneMailbox>,
 }
 
 /// Max lanes running at once — a runaway/cost guard so "spawn several" can't
@@ -112,8 +270,39 @@ const MAX_FINISHED_LANES: usize = 32;
 /// Owns lane lifecycle for one conversation run. Lives in the interactive loop's
 /// local scope (not in the immutable `CodingHarness`). Aborts any still-running
 /// lanes when dropped (the run was interrupted / ended).
+#[derive(Debug)]
+pub struct LaneApprovalRequest {
+    pub lane: String,
+    pub tool_name: String,
+    pub summary: String,
+    pub reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaneApprovalRoute {
+    pub lane: String,
+    pub tx: mpsc::UnboundedSender<LaneApprovalRequest>,
+}
+
+impl LaneApprovalRoute {
+    pub async fn ask(&self, tool_name: &str, summary: &str) -> bool {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let request = LaneApprovalRequest {
+            lane: self.lane.clone(),
+            tool_name: tool_name.to_string(),
+            summary: summary.to_string(),
+            reply,
+        };
+        if self.tx.send(request).is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+}
+
 pub struct LaneManager {
     factory: Option<ModelFactory>,
+    approval_tx: Option<mpsc::UnboundedSender<LaneApprovalRequest>>,
     workspace_root: PathBuf,
     lane_root: PathBuf,
     result_tx: mpsc::UnboundedSender<LaneResult>,
@@ -122,6 +311,8 @@ pub struct LaneManager {
     counter: usize,
     exa_api_key: Option<String>,
     handles: Vec<(String, tokio::task::JoinHandle<()>)>,
+    parent: Option<ToolContext>,
+    mailboxes: HashMap<String, Arc<LaneMailbox>>,
 }
 
 impl Drop for LaneManager {
@@ -144,6 +335,7 @@ impl LaneManager {
     ) -> Self {
         Self {
             factory,
+            approval_tx: None,
             workspace_root,
             lane_root,
             result_tx,
@@ -152,7 +344,94 @@ impl LaneManager {
             counter: 0,
             exa_api_key,
             handles: Vec::new(),
+            parent: None,
+            mailboxes: HashMap::new(),
         }
+    }
+
+    pub fn with_parent(mut self, parent: ToolContext) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// Pass a message to a running lane. It reads it between steps, or as the
+    /// answer when it is waiting on one.
+    pub fn message(&mut self, lane_id: &str, text: &str) -> Result<String, String> {
+        let Some(record) = self.records.iter().find(|r| r.id == lane_id) else {
+            return Err(format!("no lane `{lane_id}` in this conversation."));
+        };
+        if record.status != LaneStatus::Running {
+            return Err(format!("lane `{lane_id}` isn't running."));
+        }
+        let Some(mailbox) = self.mailboxes.get(lane_id) else {
+            return Err(format!("lane `{lane_id}` can't take messages right now."));
+        };
+        mailbox.push(format!("[parent_message]\n{}\n[/parent_message]", text.trim()));
+        Ok(record.title.clone())
+    }
+
+    fn transcript_id(&self, id: &str) -> Option<String> {
+        let path = self.lane_root.join(format!("{id}.json"));
+        path.starts_with(crate::config::workspaces_root())
+            .then(|| crate::session::session_id_for_state_path(&path))
+    }
+
+    fn link_for(&mut self, id: &str, agent: Option<&str>) -> LaneLink {
+        let mailbox = Arc::new(LaneMailbox::default());
+        self.mailboxes.insert(id.to_string(), mailbox.clone());
+        let parent = self.parent.as_ref();
+        let origin_session = parent.and_then(|p| p.durable_session_id()).map(str::to_string);
+        let speaker = parent.and_then(crate::coordination_tools::speaks_as);
+        let task = match (parent, origin_session.as_deref()) {
+            (Some(p), Some(session)) => crate::coordination_tools::session_task(p, session),
+            _ => None,
+        };
+        let mut context = String::from("You're a co-worker taking one piece of a larger job.");
+        match &speaker {
+            Some(("agent", who)) => context.push_str(&format!(" It was handed to you by the agent `{who}`")),
+            _ => context.push_str(" It was handed to you by the agent working in the parent session"),
+        }
+        if let Some((task_id, title)) = &task {
+            context.push_str(&format!(", who is working on the task \"{title}\" ({task_id})"));
+        }
+        context.push('.');
+        if let Some(agent) = agent {
+            context.push_str(&format!(" You bring the expertise of `{agent}`, and you speak as `{agent}`."));
+        }
+        let siblings: Vec<String> = self
+            .records
+            .iter()
+            .filter(|r| r.status == LaneStatus::Running && r.id != id)
+            .map(|r| {
+                let access = if r.read_only { ", read-only" } else { "" };
+                format!("- \"{}\" ({}{access})", r.title, r.id)
+            })
+            .collect();
+        if siblings.is_empty() {
+            context.push_str(" No other lanes are running alongside you.");
+        } else {
+            context.push_str(&format!(
+                " Other lanes are working alongside you on their own pieces; keep to yours and leave their files alone:\n{}",
+                siblings.join("\n")
+            ));
+        }
+        context.push_str(
+            "\n\nYou aren't on your own. When you hit a question you can't settle, find something that changes the plan or touches another lane's piece, or are about to do something hard to undo, tell the agent that handed you this with `message_parent`. When something needs a peer, Mission Control, or the rest of your own work (your inbox knows it), use `send_agent_message`; the answer comes back to you here. Keep it to what matters: most of the job is doing your piece well.",
+        );
+        LaneLink {
+            origin_session,
+            agent_id: agent
+                .map(str::to_string)
+                .or_else(|| parent.and_then(|p| p.agent_id()).map(str::to_string)),
+            store_path: parent.and_then(|p| p.store_path()),
+            context,
+            mailbox,
+        }
+    }
+
+    pub fn with_approvals(mut self, tx: Option<mpsc::UnboundedSender<LaneApprovalRequest>>) -> Self {
+        self.approval_tx = tx;
+        self
     }
 
     /// Restore prior records (e.g. on resume) so the display reflects history.
@@ -188,7 +467,14 @@ impl LaneManager {
 
     /// Spawn a lane. Returns the new lane id, or an error string (fed back to the
     /// model as a tool error) when delegation is unavailable.
-    pub fn spawn(&mut self, title: &str, brief: &str, read_only: bool) -> Result<String, String> {
+    pub fn spawn(
+        &mut self,
+        title: &str,
+        brief: &str,
+        read_only: bool,
+        agent: Option<String>,
+        profile: Option<String>,
+    ) -> Result<String, String> {
         if self.factory.is_none() {
             return Err(
                 "delegate_task is unavailable in this run (no model factory; interactive mode only)."
@@ -218,8 +504,11 @@ impl LaneManager {
             activity_at: None,
             activity_log: Vec::new(),
             read_only,
+            agent: agent.clone(),
+            profile: profile.clone(),
+            transcript: self.transcript_id(&id),
         });
-        self.launch(&id, title, brief, false, read_only);
+        self.launch(&id, title, brief, false, read_only, agent, profile);
         Ok(id)
     }
 
@@ -252,7 +541,7 @@ impl LaneManager {
         };
         if record.status == LaneStatus::Running {
             return Err(format!(
-                "lane `{lane_id}` is still running — its report will arrive as a [lane_report]; follow up after that."
+                "lane `{lane_id}` is still running — its report will arrive as a [lane_report]."
             ));
         }
         // A lane lost to a restart has no live task but its state file survives —
@@ -263,8 +552,13 @@ impl LaneManager {
         record.summary = None;
         record.report = None;
         record.error = None;
-        let (title, read_only) = (record.title.clone(), record.read_only);
-        self.launch(lane_id, &title, brief, true, read_only);
+        let (title, read_only, agent, profile) = (
+            record.title.clone(),
+            record.read_only,
+            record.agent.clone(),
+            record.profile.clone(),
+        );
+        self.launch(lane_id, &title, brief, true, read_only, agent, profile);
         Ok(title)
     }
 
@@ -307,7 +601,16 @@ impl LaneManager {
     }
 
     /// Shared spawn: run the lane on a tokio task and report back over the channel.
-    fn launch(&mut self, id: &str, title: &str, brief: &str, resume: bool, read_only: bool) {
+    fn launch(
+        &mut self,
+        id: &str,
+        title: &str,
+        brief: &str,
+        resume: bool,
+        read_only: bool,
+        agent: Option<String>,
+        profile: Option<String>,
+    ) {
         let factory = self.factory.clone().expect("checked by callers");
         let result_tx = self.result_tx.clone();
         let progress_tx = self.progress_tx.clone();
@@ -317,8 +620,11 @@ impl LaneManager {
         let title = title.to_string();
         let lane_id = id.to_string();
         let exa_api_key = self.exa_api_key.clone();
+        let approval = self.approval_tx.clone().map(|tx| LaneApprovalRoute { lane: title.clone(), tx });
+        let link = self.link_for(id, agent.as_deref());
 
         let handle = tokio::spawn(async move {
+            let _live = LiveLane::register(link.origin_session.as_deref(), &lane_id, &link.mailbox);
             let result = tokio::time::timeout(
                 LANE_TIMEOUT,
                 run_lane(
@@ -330,7 +636,11 @@ impl LaneManager {
                     exa_api_key,
                     resume,
                     read_only,
+                    agent,
+                    profile,
                     progress_tx,
+                    approval,
+                    link,
                 ),
             )
             .await
@@ -390,13 +700,13 @@ impl LaneManager {
 
     /// Relaunch lanes that were running when the parent process stopped.
     pub fn resume_interrupted(&mut self) {
-        let ids: Vec<(String, String, bool)> = self
+        let ids: Vec<(String, String, bool, Option<String>, Option<String>)> = self
             .records
             .iter()
             .filter(|r| r.status == LaneStatus::Running)
-            .map(|r| (r.id.clone(), r.title.clone(), r.read_only))
+            .map(|r| (r.id.clone(), r.title.clone(), r.read_only, r.agent.clone(), r.profile.clone()))
             .collect();
-        for (id, title, read_only) in ids {
+        for (id, title, read_only, agent, profile) in ids {
             self.record_progress(&LaneProgress {
                 id: id.clone(),
                 kind: "restart".to_string(),
@@ -410,7 +720,7 @@ impl LaneManager {
                 .unwrap_or_else(|| {
                     "Continue the delegated task from the saved lane state.".to_string()
                 });
-            self.launch(&id, &title, &handoff, true, read_only);
+            self.launch(&id, &title, &handoff, true, read_only, agent, profile);
         }
     }
 
@@ -538,6 +848,11 @@ impl LaneManager {
         // Some writers use `lane-N.meta.json` beside `lane-N.json`.
         let _ = std::fs::remove_file(self.lane_root.join(format!("{id}.meta.json")));
         let _ = std::fs::remove_file(self.lane_root.join(format!("{id}.json")));
+        if let Some(transcript) = self.transcript_id(id)
+            && let Ok(store) = crate::store::Store::open_cached(crate::store::default_db_path())
+        {
+            let _ = store.delete_conversation(&transcript);
+        }
     }
 
     /// Remove `lane-*.json` / `lane-*.meta.json` under lane_root that are not
@@ -594,16 +909,28 @@ async fn run_lane(
     exa_api_key: Option<String>,
     resume: bool,
     read_only: bool,
+    agent: Option<String>,
+    profile: Option<String>,
     progress_tx: mpsc::UnboundedSender<LaneProgress>,
+    approval: Option<LaneApprovalRoute>,
+    link: LaneLink,
 ) -> Result<(String, String), String> {
-    let mut model = factory();
+    let mut model = factory(profile.as_deref())?;
     let mut log = LaneLog::open(&owner).ok();
     if let Some(log) = log.as_mut() {
         let _ = log.write_start(&owner, &brief, read_only);
     }
     let workspace_for_grounding = workspace_root.clone();
     let context = match ToolContext::with_owner(workspace_root, &owner) {
-        Ok(context) => context,
+        Ok(context) => {
+            let context = context
+                .with_agent_id_opt(link.agent_id.clone())
+                .with_store_path(link.store_path.clone().unwrap_or_else(crate::store::default_db_path));
+            match link.origin_session.as_deref() {
+                Some(session) => context.with_lane_origin(session, &owner),
+                None => context,
+            }
+        }
         Err(error) => {
             let message = error.to_string();
             if let Some(log) = log.as_mut() {
@@ -612,45 +939,65 @@ async fn run_lane(
             return Err(message);
         }
     };
-    let mut tools = coding_tools(
-        exa_api_key.clone(),
-        crate::memory::MemoryLimits::read_only(),
-    );
+    let mut tools = coding_tools(exa_api_key.clone())
+        .with_custom_dir(crate::agent_tools::tools_dir(agent.as_deref().unwrap_or("snippet")));
+    tools.insert(MessageParent {
+        lane_id: owner.clone(),
+        progress_tx: progress_tx.clone(),
+        mailbox: link.mailbox.clone(),
+    });
+    tools.insert(crate::coordination_tools::SendAgentMessage);
     if read_only {
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.
         // The shell remains for inspection — the brief tells the lane its role.
-        for tool in ["write_file", "edit_file", "append_file"] {
-            tools.remove(tool);
-        }
+        tools.remove("change_files");
     }
+    let identity = agent.as_deref().map(|agent_name| {
+        let body = crate::coordination::AgentHome::new(
+            crate::coordination::agents_root(&crate::config::snippet_home().join("mission-control")),
+            agent_name,
+        )
+        .ok()
+        .and_then(|home| home.read_identity().ok())
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!("You are working as the specialized agent `{agent_name}`: bring its domain focus and perspective to this work.")
+        });
+        (agent_name.to_string(), body)
+    });
     let harness = CodingHarness::new(
         HarnessConfig {
-            system_prompt: coding_system_prompt(),
+            system_prompt: lane_prompt(
+                &PromptContext::detect(&workspace_for_grounding, true, false, false),
+                identity.as_ref().map(|(id, body)| (id.as_str(), body.as_str())),
+            ),
             state_path: Some(state_path),
             resume,
             exa_api_key,
             progress_tx: Some(progress_tx),
             progress_id: Some(owner.clone()),
+            lane_approval: approval,
+            lane_mailbox: Some(link.mailbox.clone()),
             ..HarnessConfig::default()
         },
         tools,
         context,
     );
-    // Lanes report to an orchestrator: make findings navigable with exact locations.
     let role = if read_only {
-        "You are a READ-ONLY investigation lane: your file-editing tools are removed; do not attempt \
-         to mutate the workspace (including via shell) — investigate and report. "
+        "This is a read-only investigation: your file-editing tools are removed, and you must not change the workspace through the shell either. Investigate and report. "
     } else {
         ""
     };
     let brief = format!(
-        "{brief}\n\n[lane_reporting]\n{role}You are a delegated lane reporting back to an orchestrator agent. \
-         In your final terminate_loop summary, cite EXACT file:line references (e.g. `src/foo.rs:42`) \
-         for every location, symbol, definition, or finding you identify — report WHERE things are, not \
-         just that they exist, so the orchestrator can navigate straight to them without re-searching."
+        "{brief}\n\n---\n{}\n\n{role}When you're done, finish with terminate_loop. The agent that handed you this reads that summary, so cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so it can go straight there without searching again.",
+        link.context
     );
-    let outcome = match harness.run(&mut *model, brief).await {
+    let run = match model.cli_agent_profile() {
+        Some(cli) => harness.run_cli_lane(cli, brief).await,
+        None => harness.run(&mut *model, brief).await,
+    };
+    let outcome = match run {
         Ok(outcome) => outcome,
         Err(error) => {
             let message = error.to_string();
@@ -746,8 +1093,8 @@ fn verify_grounding(workspace: &std::path::Path, text: &str) -> Option<String> {
     }
     const CAP: usize = 20;
     let mut out = format!(
-        "[reference_check]\n{verified} file:line reference(s) verified; {} did NOT resolve — treat \
-         these as unverified and re-check before relying on them:",
+        "[reference_check]\n{verified} file:line reference(s) checked out; {} didn't resolve, so treat \
+         those as unverified and look again before relying on them:",
         invalid.len()
     );
     for item in invalid.iter().take(CAP) {
@@ -760,41 +1107,30 @@ fn verify_grounding(workspace: &std::path::Path, text: &str) -> Option<String> {
     Some(out)
 }
 
-/// Build the parent-facing report for a finished lane: its final summary, the
-/// full log of tool calls it made, and the findings/notes it recorded — so the
-/// parent agent sees everything the lane did, not just a one-line summary.
+/// Build the parent-facing report for a finished lane: its final summary and
+/// the files it changed. The call-by-call activity is kept in the lane's own
+/// log (and shown in the app); repeating it here only cost the parent tokens.
 fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
     use crate::harness::HarnessEvent;
 
-    let mut actions: Vec<String> = Vec::new();
-    let mut findings: Vec<String> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     for event in &outcome.events {
-        match event {
-            HarnessEvent::ToolCall {
-                tool_name,
-                arguments,
-            } => {
-                // Track files the lane actually operated on — the concrete results.
-                if matches!(
-                    tool_name.as_str(),
-                    "write_file" | "edit_file" | "append_file"
-                ) {
-                    if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
-                        if !changed.iter().any(|p| p == path) {
-                            changed.push(path.to_string());
-                        }
-                    }
-                }
-                actions.push(action_label(tool_name, arguments));
+        let HarnessEvent::ToolCall { tool_name, arguments } = event else {
+            continue;
+        };
+        if tool_name != "change_files" {
+            continue;
+        }
+        let paths = arguments
+            .get("changes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("path").and_then(|v| v.as_str()));
+        for path in paths {
+            if !changed.iter().any(|p| p == path) {
+                changed.push(path.to_string());
             }
-            // The lane's deliberate self-notes are findings; mid-run progress
-            // chatter (AssistantText) is low-signal and redundant with the
-            // summary, so it's left out to keep the report token-dense.
-            HarnessEvent::Note { entry } => {
-                findings.push(truncate_text(entry, 240));
-            }
-            _ => {}
         }
     }
 
@@ -804,70 +1140,13 @@ fn summarize_lane_outcome(outcome: &crate::harness::HarnessOutcome) -> String {
         .unwrap_or_else(|| "lane completed without a summary".to_string());
 
     let mut out = format!("Summary:\n{summary}");
-
     if !changed.is_empty() {
         out.push_str(&format!("\n\nFiles changed/created ({}):", changed.len()));
         for path in &changed {
             out.push_str(&format!("\n- {path}"));
         }
     }
-
-    if !actions.is_empty() {
-        const CAP: usize = 80;
-        out.push_str(&format!(
-            "\n\nActions taken ({} tool calls):",
-            actions.len()
-        ));
-        for (i, action) in actions.iter().take(CAP).enumerate() {
-            out.push_str(&format!("\n{}. {action}", i + 1));
-        }
-        if actions.len() > CAP {
-            out.push_str(&format!("\n… and {} more", actions.len() - CAP));
-        }
-    }
-
-    if !findings.is_empty() {
-        const FCAP: usize = 40;
-        out.push_str("\n\nNotes:");
-        for finding in findings.iter().take(FCAP) {
-            out.push_str(&format!("\n- {finding}"));
-        }
-        if findings.len() > FCAP {
-            out.push_str(&format!("\n… and {} more", findings.len() - FCAP));
-        }
-    }
-
     out
-}
-
-/// One-line label for a tool call in a lane's action log (tool + key argument).
-fn action_label(tool_name: &str, args: &serde_json::Value) -> String {
-    let arg = |key: &str| args.get(key).and_then(|v| v.as_str()).unwrap_or("");
-    let detail = match tool_name {
-        "bash" => arg("command"),
-        "read_file" | "read_image" | "write_file" | "append_file" | "edit_file"
-        | "view_outline" | "list_files" => arg("path"),
-        "search_content" | "search_files" | "web_search" => arg("query"),
-        "web_read" => arg("url"),
-        "delegate_task" => arg("title"),
-        _ => "",
-    };
-    let detail = truncate_text(detail, 120);
-    if detail.is_empty() {
-        tool_name.to_string()
-    } else {
-        format!("{tool_name}: {detail}")
-    }
-}
-
-fn truncate_text(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        let head: String = text.chars().take(max).collect();
-        format!("{head}…")
-    }
 }
 
 #[cfg(test)]
@@ -890,6 +1169,9 @@ mod tests {
             activity_at: None,
             activity_log: Vec::new(),
             read_only: true,
+            agent: None,
+            profile: None,
+            transcript: None,
         }
     }
 
@@ -930,10 +1212,27 @@ mod tests {
         object.remove("activity_at");
         object.remove("activity_log");
         object.remove("read_only");
+        object.remove("agent");
+        object.remove("profile");
         let restored: LaneRecord = serde_json::from_value(value).unwrap();
         assert!(restored.activity.is_none());
         assert!(restored.activity_log.is_empty());
         assert!(!restored.read_only);
+        assert!(restored.agent.is_none());
+        assert!(restored.profile.is_none());
+    }
+
+    #[test]
+    fn lane_record_serializes_and_deserializes_agent_and_profile() {
+        let mut record = test_record();
+        record.agent = Some("reviewer".to_string());
+        record.profile = Some("claude-haiku".to_string());
+        let val = serde_json::to_value(&record).unwrap();
+        assert_eq!(val["agent"], "reviewer");
+        assert_eq!(val["profile"], "claude-haiku");
+        let restored: LaneRecord = serde_json::from_value(val).unwrap();
+        assert_eq!(restored.agent.as_deref(), Some("reviewer"));
+        assert_eq!(restored.profile.as_deref(), Some("claude-haiku"));
     }
 
     fn finished_record(id: &str, finished_at: &str) -> LaneRecord {
