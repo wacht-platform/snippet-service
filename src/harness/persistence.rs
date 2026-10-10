@@ -67,10 +67,19 @@ impl CodingHarness {
         // resume). Within a session it stays fixed; the files show the live
         // state.
         let seeded_system = if self.config.memory_enabled {
+            let guidance = if self.config.system_prompt.contains("## Keeping memory") {
+                String::new()
+            } else {
+                format!(
+                    "\n\n{}\n\n{}",
+                    crate::prompts::MEMORY_GUIDANCE_LAYER.trim(),
+                    crate::prompts::MEMORY_WRITE_LAYER.trim()
+                )
+            };
             format!(
-                "{}\n\n{}",
+                "{}{guidance}\n\n{}",
                 self.config.system_prompt,
-                crate::memory::Memory::open(self.context.workspace_root()).render_prompt()
+                crate::memory::render_prompt(&self.memory_scopes())
             )
         } else {
             self.config.system_prompt.clone()
@@ -195,6 +204,27 @@ impl CodingHarness {
             .state_path
             .as_deref()
             .map(crate::session::session_id_for_state_path)
+    }
+
+    /// The memory repos this session reads and writes, most general first. A
+    /// lane shares its parent session's memory.
+    pub(super) fn memory_scopes(&self) -> Vec<crate::memory::MemoryRepo> {
+        let agent = self
+            .context
+            .agent_id()
+            .map(str::to_string)
+            .or_else(|| (self.context.owner() == "mission_control").then(|| "mission-control".to_string()));
+        let session = match self.context.lane_origin() {
+            Some((parent, _)) => Some(parent.to_string()),
+            None => self.session_id(),
+        };
+        let workspace = self.context.workspace_root();
+        let project = !workspace.starts_with(crate::config::snippet_home());
+        crate::memory::scopes_for(
+            project.then_some(workspace),
+            agent.as_deref(),
+            session.as_deref(),
+        )
     }
 
     pub(super) fn store(&self) -> Option<crate::store::Store> {

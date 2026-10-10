@@ -1,652 +1,432 @@
-//! Durable agent memory as plain files the agent reads with the shell and edits
-//! with `change_files`. The daemon does the bookkeeping: it assigns ids to new
-//! bullets, counts note reads, generates the table of contents, and applies the
-//! reflection pass's helpful/harmful marks and deltas.
+//! Durable agent memory as git repositories in the Agent Memory Repo format
+//! (https://github.com/AgentMemoryRepo/agentmemoryrepo).
 //!
 //! ```text
-//! ~/.snippet/projects/<repo>-<id>/memory/   one per repository, shared by
-//!                                           all its worktrees and subfolders
-//!   rules.md                      always-obeyed bullets:  - [r1] text
-//!   learnings.md                  reusable lessons:       - [l1] (+2/-0) text
-//!   notes/<section>/<id>.md       one topic per note, title + summary header
-//!   notes/<section>/_section.md   one-line summary of the section
-//! ~/.snippet/memory/
-//!   rules.md, learnings.md        the same, for every project (ids gr1, gl1)
+//! ~/.snippet/memory/                          global: the user, every project
+//! ~/.snippet/projects/<repo>-<id>/memory/     project: one per repository
+//! ~/.snippet/agents/<agent>/memory/           agent: a specialist's own expertise
+//! ~/.snippet/session-memory/<session>/        session: one conversation's working memory
 //! ```
+//!
+//! Every repo has a short `MEMORY.md` entry point (entries, then `## Index` of
+//! `[[links]]`) and topic files of one-line entries with `[key: value]`
+//! metadata. Agents edit the files and commit with git themselves; the daemon
+//! creates the repos, migrates the old rules/learnings/notes layout once, and
+//! commits the writes it makes itself (reflection).
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
 
-const RULES_FILE: &str = "rules.md";
-const LEARNINGS_FILE: &str = "learnings.md";
-const NOTES_DIR: &str = "notes";
-const SECTION_FILE: &str = "_section.md";
+pub const ENTRY_FILE: &str = "MEMORY.md";
+const INDEX_HEADING: &str = "## Index";
+const ENTRY_PROMPT_CHARS: usize = 4_000;
+const MAX_ENTRY_CHARS: usize = 400;
+pub const DREAM_PREFIX: &str = "Dream:";
 
-const MAX_ID_LEN: usize = 64;
-const MAX_TITLE_CHARS: usize = 80;
-const MAX_SUMMARY_CHARS: usize = 200;
-const MAX_BODY_CHARS: usize = 12_000;
-const MAX_BULLET_CHARS: usize = 300;
-const MAX_SECTION_DEPTH: usize = 3;
-const RULES_PROMPT_CHARS: usize = 2_000;
-const LEARNINGS_PROMPT_CHARS: usize = 4_000;
-const TOC_PROMPT_CHARS: usize = 6_000;
-const SIMILAR_AT: f64 = 0.6;
+static GIT_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Rule,
-    Learning,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKind {
+    Global,
+    Project,
+    Agent,
+    Session,
 }
 
-impl Kind {
-    fn prefix(self) -> char {
-        match self {
-            Kind::Rule => 'r',
-            Kind::Learning => 'l',
+impl ScopeKind {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "global" => Some(Self::Global),
+            "project" => Some(Self::Project),
+            "agent" => Some(Self::Agent),
+            "session" => Some(Self::Session),
+            _ => None,
         }
     }
 
-    fn file(self) -> &'static str {
+    fn purpose(self) -> &'static str {
         match self {
-            Kind::Rule => RULES_FILE,
-            Kind::Learning => LEARNINGS_FILE,
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Kind::Rule => "Rules",
-            Kind::Learning => "Learnings",
-        }
-    }
-
-    fn noun(self) -> &'static str {
-        match self {
-            Kind::Rule => "rule",
-            Kind::Learning => "learning",
+            Self::Global => "the user: preferences, standing directives and facts that hold in every project",
+            Self::Project => "this repository: where things live, how to build, test and deploy, conventions and decisions; shared by every worktree and session of the repo",
+            Self::Agent => "your own expertise as this agent: techniques, checks and lessons that carry across every job you take",
+            Self::Session => "this conversation: decisions made, constraints, and the state of the work, so it survives compaction and restarts",
         }
     }
 }
 
+/// One memory repository.
 #[derive(Debug, Clone)]
-pub struct Bullet {
-    pub id: String,
-    pub section: String,
-    pub helpful: u32,
-    pub harmful: u32,
-    pub text: String,
+pub struct MemoryRepo {
+    pub kind: ScopeKind,
+    /// Stable address: `global`, `project:<dir>`, `agent:<id>`, `session:<id>`.
+    pub key: String,
+    pub label: String,
+    pub root: PathBuf,
 }
 
-impl Bullet {
-    fn counters(&self) -> String {
-        if self.helpful > 0 || self.harmful > 0 {
-            format!("(+{}/-{}) ", self.helpful, self.harmful)
-        } else {
-            String::new()
-        }
-    }
-
-    fn line(&self) -> String {
-        let section = if self.section.is_empty() {
-            String::new()
-        } else {
-            format!("{}: ", self.section)
-        };
-        format!("- [{}] {}{section}{}", self.id, self.counters(), self.text)
-    }
-
-    fn score(&self) -> i64 {
-        self.helpful as i64 - self.harmful as i64
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryCommit {
+    pub hash: String,
+    pub date: i64,
+    pub subject: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct Note {
-    pub id: String,
-    pub section: String,
-    pub path: PathBuf,
-    pub title: String,
-    pub summary: String,
-    pub updated: String,
-    pub read: u32,
-    pub helpful: u32,
-    pub harmful: u32,
-    pub body: String,
-}
-
-impl Note {
-    fn counters(&self) -> String {
-        let mut parts = Vec::new();
-        if self.helpful > 0 || self.harmful > 0 {
-            parts.push(format!("+{}/-{}", self.helpful, self.harmful));
-        }
-        if self.read > 0 {
-            parts.push(format!("read {}×", self.read));
-        }
-        if self.harmful > self.helpful {
-            parts.push("disputed".to_string());
-        }
-        if parts.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", parts.join(" · "))
-        }
-    }
-
-    fn render_file(&self) -> String {
-        let mut header = format!("---\ntitle: {}\nsummary: {}\n", self.title, self.summary);
-        for (key, value) in [("read", self.read), ("helpful", self.helpful), ("harmful", self.harmful)] {
-            if value > 0 {
-                header.push_str(&format!("{key}: {value}\n"));
-            }
-        }
-        format!("{header}---\n\n{}\n", self.body.trim_end())
-    }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct NoteEdit {
-    pub title: Option<String>,
-    pub summary: Option<String>,
-    pub body: Option<String>,
-    pub section: Option<String>,
-}
-
-enum Target {
-    Bullet { global: bool, kind: Kind },
-    Note,
-}
-
-pub struct Memory {
-    workspace: PathBuf,
-    global: PathBuf,
-}
-
-impl Memory {
-    pub fn open(workspace_root: &Path) -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+impl MemoryRepo {
+    pub fn global() -> Self {
         Self {
-            workspace: project_memory_dir(workspace_root),
-            global: home.join(".snippet").join("memory"),
+            kind: ScopeKind::Global,
+            key: "global".to_string(),
+            label: "Global".to_string(),
+            root: crate::config::snippet_home().join("memory"),
         }
     }
 
-    /// Serialise writers across sessions: worktrees of one repository share a
-    /// store, so two reflection passes can land at once. Released on drop.
-    fn lock(&self, global: bool) -> Option<fs::File> {
-        use std::os::fd::AsRawFd;
-        let dir = self.store(global);
-        fs::create_dir_all(dir).ok()?;
-        let file = fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(".lock"))
-            .ok()?;
-        (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file)
+    pub fn project(workspace: &Path) -> Self {
+        let root = project_memory_dir(workspace);
+        let dir = root
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        Self::project_dir(&dir, root)
     }
 
-    fn store(&self, global: bool) -> &Path {
-        if global {
-            &self.global
-        } else {
-            &self.workspace
+    fn project_dir(dir: &str, root: PathBuf) -> Self {
+        let label = dir.rsplit_once('-').map(|(name, _)| name).unwrap_or(dir).to_string();
+        Self {
+            kind: ScopeKind::Project,
+            key: format!("project:{dir}"),
+            label,
+            root,
         }
     }
 
-    fn notes_dir(&self) -> PathBuf {
-        self.workspace.join(NOTES_DIR)
+    pub fn agent(agent_id: &str) -> Option<Self> {
+        if !safe_component(agent_id) {
+            return None;
+        }
+        Some(Self {
+            kind: ScopeKind::Agent,
+            key: format!("agent:{agent_id}"),
+            label: agent_id.to_string(),
+            root: crate::coordination::agents_root(&crate::config::snippet_home().join("mission-control"))
+                .join(agent_id)
+                .join("memory"),
+        })
     }
 
-    /// Give every hand-written bullet an id, writing a file back only when
-    /// something changed.
-    pub fn normalize(&self) {
-        for global in [false, true] {
-            let _lock = self.lock(global);
-            for kind in [Kind::Rule, Kind::Learning] {
-                let Ok(text) = fs::read_to_string(self.store(global).join(kind.file())) else {
-                    continue;
-                };
-                let (bullets, assigned) = load_bullets(&text, global, kind);
-                if assigned {
-                    let _ = self.save_bullets(global, kind, &bullets);
-                }
+    pub fn session(session_id: &str) -> Self {
+        Self {
+            kind: ScopeKind::Session,
+            key: format!("session:{session_id}"),
+            label: session_id.to_string(),
+            root: session_root().join(session_dir_name(session_id)),
+        }
+    }
+
+    /// Resolve an address from [`MemoryRepo::key`].
+    pub fn from_key(key: &str) -> Option<Self> {
+        let (kind, rest) = key.split_once(':').unwrap_or((key, ""));
+        match kind {
+            "global" if rest.is_empty() => Some(Self::global()),
+            "project" if safe_component(rest) => {
+                let root = crate::config::snippet_home().join("projects").join(rest).join("memory");
+                Some(Self::project_dir(rest, root))
+            }
+            "agent" => Self::agent(rest),
+            "session" if !rest.is_empty() => Some(Self::session(rest)),
+            _ => None,
+        }
+    }
+
+    /// Every memory repo that exists on this machine.
+    pub fn all() -> Vec<Self> {
+        let mut out = Vec::new();
+        let global = Self::global();
+        if global.root.is_dir() {
+            out.push(global);
+        }
+        let home = crate::config::snippet_home();
+        for entry in read_dirs(&home.join("projects")) {
+            let root = entry.join("memory");
+            if root.is_dir() {
+                let dir = entry.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                out.push(Self::project_dir(&dir, root));
             }
         }
+        let agents = crate::coordination::agents_root(&home.join("mission-control"));
+        for entry in read_dirs(&agents) {
+            if entry.join("memory").is_dir()
+                && let Some(repo) = entry.file_name().and_then(|n| Self::agent(&n.to_string_lossy()))
+            {
+                out.push(repo);
+            }
+        }
+        for entry in read_dirs(&session_root()) {
+            if let Some(name) = entry.file_name() {
+                let id = session_id_from_dir(&name.to_string_lossy());
+                out.push(Self::session(&id));
+            }
+        }
+        out
     }
 
-    pub fn bullets(&self, global: bool, kind: Kind) -> Vec<Bullet> {
-        let text = fs::read_to_string(self.store(global).join(kind.file())).unwrap_or_default();
-        load_bullets(&text, global, kind).0
+    pub fn exists(&self) -> bool {
+        self.root.join(".git").exists() && self.root.join(ENTRY_FILE).is_file()
     }
 
-    fn save_bullets(&self, global: bool, kind: Kind, bullets: &[Bullet]) -> Result<(), String> {
-        let path = self.store(global).join(kind.file());
-        if bullets.is_empty() {
-            let _ = fs::remove_file(&path);
+    /// Create the repo (migrating the old layout once) if it is not one yet.
+    pub fn ensure(&self) -> Result<(), String> {
+        let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if self.exists() {
             return Ok(());
         }
-        let mut out = format!("# {}\n", kind.title());
-        let mut sections: Vec<&str> = Vec::new();
-        for bullet in bullets {
-            if !sections.contains(&bullet.section.as_str()) {
-                sections.push(&bullet.section);
-            }
+        fs::create_dir_all(&self.root).map_err(|e| format!("create {}: {e}", self.root.display()))?;
+        let migrated = migrate_legacy(&self.root, &self.title())?;
+        if !self.root.join(ENTRY_FILE).is_file() {
+            write_atomic(&self.root.join(ENTRY_FILE), &format!("# {}\n\n{INDEX_HEADING}\n", self.title()))?;
         }
-        for section in sections {
-            out.push('\n');
-            if !section.is_empty() {
-                out.push_str(&format!("## {section}\n"));
-            }
-            for bullet in bullets.iter().filter(|b| b.section == section) {
-                out.push_str(&format!("- [{}] {}{}\n", bullet.id, bullet.counters(), bullet.text));
-            }
+        if !self.root.join(".gitignore").is_file() {
+            write_atomic(&self.root.join(".gitignore"), ".lock\n.tmp-*\n")?;
         }
-        write_atomic(&path, &out)
-    }
-
-    pub fn notes(&self) -> Vec<Note> {
-        let mut notes = Vec::new();
-        collect_notes(&self.notes_dir(), "", &mut notes);
-        notes.sort_by(|a, b| (&a.section, &a.id).cmp(&(&b.section, &b.id)));
-        notes
-    }
-
-    fn find_note(&self, id: &str) -> Result<Note, String> {
-        self.notes()
-            .into_iter()
-            .find(|n| n.id == id)
-            .ok_or_else(|| format!("no memory note `{id}`"))
-    }
-
-    fn section_dir(&self, section: &str) -> PathBuf {
-        let mut path = self.notes_dir();
-        for part in section.split('/').filter(|p| !p.is_empty()) {
-            path.push(part);
+        if !self.root.join(".git").exists() {
+            self.git(&["init", "-q", "-b", "main"])?;
         }
-        path
-    }
-
-    fn section_summary(&self, section: &str) -> String {
-        fs::read_to_string(self.section_dir(section).join(SECTION_FILE))
-            .unwrap_or_default()
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("")
-            .to_string()
-    }
-
-    fn save_note(&self, note: &Note) -> Result<(), String> {
-        write_atomic(&note.path, &note.render_file())
-    }
-
-    fn save_counters(&self, note: &Note) -> Result<(), String> {
-        let modified = fs::metadata(&note.path).and_then(|m| m.modified()).ok();
-        self.save_note(note)?;
-        if let Some(time) = modified
-            && let Ok(file) = fs::File::options().write(true).open(&note.path)
-        {
-            let _ = file.set_modified(time);
-        }
+        self.git(&["config", "user.name", "Snippet"])?;
+        self.git(&["config", "user.email", "memory@snippet.local"])?;
+        self.git(&["config", "commit.gpgsign", "false"])?;
+        self.git(&["add", "-A"])?;
+        let message = if migrated { "Migrate to Agent Memory Repo format" } else { "Create memory repo" };
+        let _ = self.git(&["commit", "-q", "-m", message]);
         Ok(())
     }
 
-    /// The notes among `paths`, by id.
-    pub fn note_ids(&self, paths: &[PathBuf]) -> Vec<String> {
-        let notes = self.notes();
-        let mut ids = Vec::new();
-        for path in paths {
-            if let Some(note) = notes.iter().find(|n| &n.path == path)
-                && !ids.contains(&note.id)
-            {
-                ids.push(note.id.clone());
-            }
-        }
-        ids
-    }
-
-    /// Count one read of each note among `paths`.
-    pub fn record_reads(&self, paths: &[PathBuf]) {
-        let notes_dir = self.notes_dir();
-        if !paths.iter().any(|p| p.starts_with(&notes_dir)) {
-            return;
-        }
-        let _lock = self.lock(false);
-        for mut note in self.notes().into_iter().filter(|n| paths.contains(&n.path)) {
-            note.read += 1;
-            let _ = self.save_counters(&note);
+    fn title(&self) -> String {
+        match self.kind {
+            ScopeKind::Global => "Memory: global".to_string(),
+            ScopeKind::Project => format!("Memory: project {}", self.label),
+            ScopeKind::Agent => format!("Memory: agent {}", self.label),
+            ScopeKind::Session => "Memory: session".to_string(),
         }
     }
 
-    pub fn add_note(
-        &self,
-        section: &str,
-        id: &str,
-        title: &str,
-        summary: &str,
-        body: &str,
-    ) -> Result<String, String> {
-        let section = clean_section(section)?;
-        let id = clean_note_id(id)?;
-        let title = one_line(title, "title", MAX_TITLE_CHARS)?;
-        let summary = one_line(summary, "summary", MAX_SUMMARY_CHARS)?;
-        let body = clean_body(body)?;
-        let _lock = self.lock(false);
-        let notes = self.notes();
-        if let Some(existing) = notes.iter().find(|n| n.id == id) {
-            return Err(format!(
-                "note `{id}` already exists in {}/ — update it instead",
-                existing.section
-            ));
-        }
-        let words = tokens(&format!("{title} {summary}"));
-        if let Some((note, overlap)) = notes
-            .iter()
-            .map(|n| (n, similarity(&words, &tokens(&format!("{} {}", n.title, n.summary)))))
-            .filter(|(_, s)| *s >= SIMILAR_AT)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-        {
-            return Err(format!(
-                "too similar to note `{}` \"{}\" ({:.0}% overlap) — update that note instead",
-                note.id,
-                note.title,
-                overlap * 100.0
-            ));
-        }
-        let note = Note {
-            path: self.section_dir(&section).join(format!("{id}.md")),
-            id: id.clone(),
-            section: section.clone(),
-            title,
-            summary,
-            updated: String::new(),
-            read: 0,
-            helpful: 0,
-            harmful: 0,
-            body,
-        };
-        self.save_note(&note)?;
-        Ok(format!("added note `{id}` in {section}/"))
+    pub fn entry_point(&self) -> String {
+        fs::read_to_string(self.root.join(ENTRY_FILE)).unwrap_or_default()
     }
 
-    pub fn update_note(&self, id: &str, edit: NoteEdit) -> Result<String, String> {
-        let _lock = self.lock(false);
-        let mut note = self.find_note(id)?;
-        let old_path = note.path.clone();
-        let mut changed = Vec::new();
-        if let Some(title) = edit.title {
-            note.title = one_line(&title, "title", MAX_TITLE_CHARS)?;
-            changed.push("title");
+    pub fn git(&self, args: &[&str]) -> Result<String, String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(args)
+            .output()
+            .map_err(|e| format!("git: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
-        if let Some(summary) = edit.summary {
-            note.summary = one_line(&summary, "summary", MAX_SUMMARY_CHARS)?;
-            changed.push("summary");
-        }
-        if let Some(body) = edit.body {
-            note.body = clean_body(&body)?;
-            changed.push("body");
-        }
-        if let Some(section) = edit.section {
-            note.section = clean_section(&section)?;
-            note.path = self.section_dir(&note.section).join(format!("{}.md", note.id));
-            changed.push("section");
-        }
-        if changed.is_empty() {
-            return Err("nothing to change — give title, summary, body or section".to_string());
-        }
-        self.save_note(&note)?;
-        if note.path != old_path {
-            let _ = fs::remove_file(&old_path);
-            prune_empty_dirs(old_path.parent(), &self.notes_dir());
-        }
-        Ok(format!("updated note `{id}` ({})", changed.join(", ")))
     }
 
-    pub fn set_section(&self, section: &str, summary: &str) -> Result<String, String> {
-        let section = clean_section(section)?;
-        let summary = one_line(summary, "summary", MAX_SUMMARY_CHARS)?;
-        let _lock = self.lock(false);
-        write_atomic(&self.section_dir(&section).join(SECTION_FILE), &format!("{summary}\n"))?;
-        Ok(format!("section {section}/ summary set"))
+    /// Commit everything changed in the repo. Returns whether a commit was made.
+    pub fn commit_all(&self, message: &str) -> Result<bool, String> {
+        let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if self.git(&["status", "--porcelain"])?.trim().is_empty() {
+            return Ok(false);
+        }
+        self.git(&["add", "-A"])?;
+        self.git(&["commit", "-q", "-m", message])?;
+        Ok(true)
     }
 
-    pub fn add_bullet(
-        &self,
-        kind: Kind,
-        global: bool,
-        section: &str,
-        text: &str,
-    ) -> Result<String, String> {
-        let text = one_line(text, kind.noun(), MAX_BULLET_CHARS)?;
-        let section = clean_label(section)?;
-        let _lock = self.lock(global);
-        let words = tokens(&text);
-        if let Some((bullet, overlap)) = self
-            .bullets(false, kind)
-            .into_iter()
-            .chain(self.bullets(true, kind))
-            .map(|b| {
-                let s = similarity(&words, &tokens(&b.text));
-                (b, s)
+    pub fn history(&self, limit: usize) -> Vec<MemoryCommit> {
+        let limit = format!("-{limit}");
+        self.git(&["log", &limit, "--format=%H%x1f%ct%x1f%s"])
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\x1f');
+                Some(MemoryCommit {
+                    hash: parts.next()?.to_string(),
+                    date: parts.next()?.parse().ok()?,
+                    subject: parts.next().unwrap_or("").to_string(),
+                })
             })
-            .filter(|(_, s)| *s >= SIMILAR_AT)
-            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .collect()
+    }
+
+    /// Files in the repo, relative to its root, sorted.
+    pub fn files(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        collect_files(&self.root, &self.root, &mut out);
+        out.sort();
+        out
+    }
+
+    pub fn read_file(&self, rel: &str) -> Result<String, String> {
+        let path = self.resolve(rel)?;
+        fs::read_to_string(&path).map_err(|e| format!("read {rel}: {e}"))
+    }
+
+    fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
+        let rel = rel.trim().trim_start_matches('/');
+        if rel.is_empty()
+            || rel.split('/').any(|p| p.is_empty() || p == "." || p == ".." || p == ".git")
         {
-            return Err(format!(
-                "too similar to [{}] \"{}\" ({:.0}% overlap) — update that {} instead",
-                bullet.id,
-                bullet.text,
-                overlap * 100.0,
-                kind.noun()
-            ));
+            return Err(format!("invalid memory path: {rel}"));
         }
-        let mut bullets = self.bullets(global, kind);
-        let id = format!("{}{}", bullet_prefix(global, kind), max_number(&bullets, global, kind) + 1);
-        bullets.push(Bullet {
-            id: id.clone(),
-            section,
-            helpful: 0,
-            harmful: 0,
-            text,
-        });
-        self.save_bullets(global, kind, &bullets)?;
-        Ok(format!("added {} [{id}]", kind.noun()))
+        Ok(self.root.join(rel))
     }
 
-    pub fn update_bullet(
-        &self,
-        id: &str,
-        text: Option<&str>,
-        section: Option<&str>,
-    ) -> Result<String, String> {
-        let Target::Bullet { global, kind } = classify(id) else {
-            return Err(format!("`{id}` is not a rule or learning id"));
+    /// Unix time of the last dream commit, if any.
+    pub fn last_dream(&self) -> Option<i64> {
+        self.git(&["log", "-1", "--format=%ct", "--grep", &format!("^{DREAM_PREFIX}")])
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+    }
+
+    /// Commits since the last dream that were not dreams themselves, and the
+    /// time of the newest.
+    pub fn activity_since_dream(&self) -> (usize, Option<i64>) {
+        let since = self.last_dream().map(|t| format!("--since=@{}", t + 1));
+        let mut args = vec!["log", "--format=%ct%x1f%s"];
+        if let Some(since) = since.as_deref() {
+            args.push(since);
+        }
+        let log = self.git(&args).unwrap_or_default();
+        let mut count = 0;
+        let mut newest = None;
+        for line in log.lines() {
+            let (time, subject) = line.split_once('\x1f').unwrap_or((line, ""));
+            if subject.starts_with(DREAM_PREFIX) || subject == "Create memory repo" {
+                continue;
+            }
+            count += 1;
+            let t: Option<i64> = time.parse().ok();
+            newest = newest.max(t);
+        }
+        (count, newest)
+    }
+
+    /// Add one entry to `file` (creating it, and linking it from the index,
+    /// when it is new). Used by the reflection pass; agents edit directly.
+    pub fn add_entry(&self, file: &str, entry: &str) -> Result<String, String> {
+        let entry = normalize_entry(entry)?;
+        let file = topic_file(file)?;
+        let path = self.resolve(&file)?;
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().any(|l| l.trim() == entry) {
+            return Ok(format!("{file}: already has it"));
+        }
+        let updated = if file == ENTRY_FILE {
+            insert_before_index(&existing, &entry)
+        } else if existing.trim().is_empty() {
+            format!("# {}\n\n{entry}\n", heading_for(&file))
+        } else {
+            format!("{}\n{entry}\n", existing.trim_end())
         };
-        if text.is_none() && section.is_none() {
-            return Err("nothing to change — give text or section".to_string());
+        write_atomic(&path, &updated)?;
+        if file != ENTRY_FILE {
+            self.link_from_index(&file)?;
         }
-        let _lock = self.lock(global);
-        let mut bullets = self.bullets(global, kind);
-        let bullet = bullets
-            .iter_mut()
-            .find(|b| b.id == id)
-            .ok_or_else(|| format!("no {} `{id}`", kind.noun()))?;
-        if let Some(text) = text {
-            bullet.text = one_line(text, kind.noun(), MAX_BULLET_CHARS)?;
-        }
-        if let Some(section) = section {
-            bullet.section = clean_label(section)?;
-        }
-        self.save_bullets(global, kind, &bullets)?;
-        Ok(format!("updated {} [{id}]", kind.noun()))
+        Ok(format!("{file}: added {}", clip(&entry, 80)))
     }
 
-    pub fn remove(&self, id: &str) -> Result<String, String> {
-        match classify(id) {
-            Target::Bullet { global, kind } => {
-                let _lock = self.lock(global);
-                let mut bullets = self.bullets(global, kind);
-                let before = bullets.len();
-                bullets.retain(|b| b.id != id);
-                if bullets.len() == before {
-                    return Err(format!("no {} `{id}`", kind.noun()));
-                }
-                self.save_bullets(global, kind, &bullets)?;
-                Ok(format!("removed {} [{id}]", kind.noun()))
-            }
-            Target::Note => {
-                let _lock = self.lock(false);
-                let note = self.find_note(id)?;
-                fs::remove_file(&note.path).map_err(|e| e.to_string())?;
-                prune_empty_dirs(note.path.parent(), &self.notes_dir());
-                Ok(format!("removed note `{id}`"))
-            }
-        }
+    /// Replace the entry in `file` that contains `matching` with `entry`.
+    pub fn replace_entry(&self, file: &str, matching: &str, entry: &str) -> Result<String, String> {
+        let entry = normalize_entry(entry)?;
+        let file = topic_file(file)?;
+        self.rewrite_line(&file, matching, Some(&entry))
     }
 
-    pub fn mark(&self, id: &str, helpful: bool) -> Result<String, String> {
-        let verdict = if helpful { "helpful" } else { "harmful" };
-        match classify(id) {
-            Target::Bullet { global, kind } => {
-                let _lock = self.lock(global);
-                let mut bullets = self.bullets(global, kind);
-                let bullet = bullets
-                    .iter_mut()
-                    .find(|b| b.id == id)
-                    .ok_or_else(|| format!("no {} `{id}`", kind.noun()))?;
-                if helpful {
-                    bullet.helpful += 1;
-                } else {
-                    bullet.harmful += 1;
-                }
-                let (h, x) = (bullet.helpful, bullet.harmful);
-                if kind == Kind::Learning && x >= 2 && x > h {
-                    bullets.retain(|b| b.id != id);
-                    self.save_bullets(global, kind, &bullets)?;
-                    return Ok(format!(
-                        "marked [{id}] {verdict}; it has hurt more than helped (+{h}/-{x}), so it was removed"
-                    ));
-                }
-                self.save_bullets(global, kind, &bullets)?;
-                Ok(format!("marked [{id}] {verdict} (+{h}/-{x})"))
-            }
-            Target::Note => {
-                let _lock = self.lock(false);
-                let mut note = self.find_note(id)?;
-                if helpful {
-                    note.helpful += 1;
-                } else {
-                    note.harmful += 1;
-                }
-                self.save_counters(&note)?;
-                Ok(format!("marked `{id}` {verdict} (+{}/-{})", note.helpful, note.harmful))
-            }
-        }
+    pub fn remove_entry(&self, file: &str, matching: &str) -> Result<String, String> {
+        let file = topic_file(file)?;
+        self.rewrite_line(&file, matching, None)
     }
 
-    fn rules_block(&self, budget: Option<usize>) -> String {
-        let rules: Vec<Bullet> = self
-            .bullets(true, Kind::Rule)
-            .into_iter()
-            .chain(self.bullets(false, Kind::Rule))
+    fn rewrite_line(&self, file: &str, matching: &str, with: Option<&str>) -> Result<String, String> {
+        let matching = matching.trim();
+        if matching.len() < 8 {
+            return Err("match text is too short to identify one entry".to_string());
+        }
+        let path = self.resolve(file)?;
+        let text = fs::read_to_string(&path).map_err(|e| format!("read {file}: {e}"))?;
+        let hits: Vec<usize> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("- ") && l.contains(matching))
+            .map(|(i, _)| i)
             .collect();
-        budgeted_lines(&rules, budget, "rules")
-    }
-
-    fn learnings_block(&self, budget: Option<usize>) -> String {
-        let mut learnings: Vec<Bullet> = self
-            .bullets(true, Kind::Learning)
-            .into_iter()
-            .chain(self.bullets(false, Kind::Learning))
-            .collect();
-        learnings.sort_by_key(|b| std::cmp::Reverse(b.score()));
-        budgeted_lines(&learnings, budget, "learnings")
-    }
-
-    fn toc(&self, budget: usize) -> String {
-        let notes = self.notes();
-        if notes.is_empty() {
-            return "(no notes yet)\n".to_string();
-        }
-        let mut sections: Vec<&str> = notes.iter().map(|n| n.section.as_str()).collect();
-        sections.dedup();
-        let render = |detail: u8| {
-            let mut out = String::new();
-            for section in &sections {
-                let in_section: Vec<&Note> = notes.iter().filter(|n| n.section == *section).collect();
-                let name = if section.is_empty() {
-                    "notes/".to_string()
-                } else {
-                    format!("{section}/")
-                };
-                let summary = self.section_summary(section);
-                let head = if summary.is_empty() {
-                    name
-                } else {
-                    format!("{name} — {summary}")
-                };
-                if detail == 0 {
-                    out.push_str(&format!("{head} ({} notes)\n", in_section.len()));
-                    continue;
-                }
-                out.push_str(&head);
-                out.push('\n');
-                for note in in_section {
-                    let summary = if detail == 2 && !note.summary.is_empty() {
-                        format!(": {}", note.summary)
-                    } else {
-                        String::new()
-                    };
-                    out.push_str(&format!("  {} — {}{summary}{}\n", note.id, note.title, note.counters()));
-                }
-            }
-            out
+        let [hit] = hits.as_slice() else {
+            return Err(format!("{} entries in {file} match", hits.len()));
         };
-        for detail in [2, 1] {
-            let out = render(detail);
-            if out.chars().count() <= budget {
-                return out;
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        match with {
+            Some(entry) => lines[*hit] = entry.to_string(),
+            None => {
+                lines.remove(*hit);
             }
         }
-        format!("{}(too many notes to list — `ls` a section folder to see its notes)\n", render(0))
+        write_atomic(&path, &(lines.join("\n") + "\n"))?;
+        Ok(match with {
+            Some(entry) => format!("{file}: replaced with {}", clip(entry, 80)),
+            None => format!("{file}: removed {}", clip(matching, 80)),
+        })
     }
 
-    /// Everything, unabridged and with note dates: the reflection pass's view.
-    pub fn full_listing(&self) -> String {
-        self.normalize();
-        let mut notes = String::new();
-        for note in self.notes() {
-            notes.push_str(&format!(
-                "{} [{}/] — {}: {}{} (updated {})\n",
-                note.id, note.section, note.title, note.summary, note.counters(), note.updated
-            ));
+    fn link_from_index(&self, file: &str) -> Result<(), String> {
+        let link = format!("[[{}]]", file.trim_end_matches(".md"));
+        let path = self.root.join(ENTRY_FILE);
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        if text.contains(&link) {
+            return Ok(());
         }
-        format!(
-            "RULES\n{}\nLEARNINGS\n{}\nNOTES\n{}",
-            or_none(self.rules_block(None)),
-            or_none(self.learnings_block(None)),
-            or_none(notes)
-        )
+        let updated = if text.contains(INDEX_HEADING) {
+            format!("{}\n- {link}\n", text.trim_end())
+        } else {
+            format!("{}\n\n{INDEX_HEADING}\n- {link}\n", text.trim_end())
+        };
+        write_atomic(&path, &updated)
     }
+}
 
-    pub fn render_prompt(&self) -> String {
-        self.normalize();
-        format!(
-            "[memory]\nthis project: {ws}\nevery project: {global}\n\nRULES — always obey:\n{}\nLEARNINGS — apply the ones that fit:\n{}\nNOTES — table of contents of {ws}/notes (id — title: summary):\n{}",
-            or_none(self.rules_block(Some(RULES_PROMPT_CHARS))),
-            or_none(self.learnings_block(Some(LEARNINGS_PROMPT_CHARS))),
-            self.toc(TOC_PROMPT_CHARS),
-            ws = self.workspace.display(),
-            global = self.global.display(),
-        )
-        .trim_end()
-        .to_string()
+/// The repos a session reads, most general first. Each is created on demand.
+pub fn scopes_for(workspace: Option<&Path>, agent: Option<&str>, session: Option<&str>) -> Vec<MemoryRepo> {
+    let mut repos = vec![MemoryRepo::global()];
+    if let Some(workspace) = workspace {
+        repos.push(MemoryRepo::project(workspace));
     }
+    if let Some(repo) = agent.and_then(MemoryRepo::agent) {
+        repos.push(repo);
+    }
+    if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
+        repos.push(MemoryRepo::session(session));
+    }
+    repos.retain(|repo| repo.ensure().is_ok());
+    repos
+}
+
+/// The `[memory]` block appended to the system prompt.
+pub fn render_prompt(repos: &[MemoryRepo]) -> String {
+    let mut out = String::from("[memory]\n");
+    for repo in repos {
+        let scope = match repo.kind {
+            ScopeKind::Global => "Global".to_string(),
+            ScopeKind::Project => format!("Project ({})", repo.label),
+            ScopeKind::Agent => format!("Agent ({})", repo.label),
+            ScopeKind::Session => "Session".to_string(),
+        };
+        out.push_str(&format!(
+            "\n### {scope} memory — {}\nHolds {}.\n\n{}\n",
+            repo.root.display(),
+            repo.kind.purpose(),
+            clip(repo.entry_point().trim(), ENTRY_PROMPT_CHARS)
+        ));
+    }
+    out.trim_end().to_string()
 }
 
 /// The project memory folder for a workspace, keyed by its repository so every
@@ -674,7 +454,7 @@ fn project_memory_dir(workspace: &Path) -> PathBuf {
 
 fn repository_root(workspace: &Path) -> PathBuf {
     let workspace = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
-    let common = std::process::Command::new("git")
+    let common = Command::new("git")
         .arg("-C")
         .arg(&workspace)
         .args(["rev-parse", "--git-common-dir"])
@@ -694,370 +474,225 @@ fn repository_root(workspace: &Path) -> PathBuf {
     }
 }
 
-fn load_bullets(text: &str, global: bool, kind: Kind) -> (Vec<Bullet>, bool) {
-    let mut bullets = parse_bullets(text);
-    let prefix = bullet_prefix(global, kind);
-    let mut next = max_number(&bullets, global, kind);
-    let mut seen = HashSet::new();
-    let mut assigned = false;
-    for bullet in bullets.iter_mut() {
-        let owned = bullet
-            .id
-            .strip_prefix(&prefix)
-            .is_some_and(|n| n.parse::<u32>().is_ok());
-        if !owned || !seen.insert(bullet.id.clone()) {
-            next += 1;
-            bullet.id = format!("{prefix}{next}");
-            seen.insert(bullet.id.clone());
-            assigned = true;
-        }
-    }
-    (bullets, assigned)
+fn session_root() -> PathBuf {
+    crate::config::snippet_home().join("session-memory")
 }
 
-fn max_number(bullets: &[Bullet], global: bool, kind: Kind) -> u32 {
-    let prefix = bullet_prefix(global, kind);
-    bullets
-        .iter()
-        .filter_map(|b| b.id.strip_prefix(&prefix).and_then(|n| n.parse::<u32>().ok()))
-        .max()
-        .unwrap_or(0)
-}
-
-fn budgeted_lines(bullets: &[Bullet], budget: Option<usize>, what: &str) -> String {
-    let mut out = String::new();
-    let mut shown = 0;
-    for bullet in bullets {
-        let line = bullet.line();
-        if budget.is_some_and(|b| out.chars().count() + line.chars().count() > b) {
-            break;
-        }
-        out.push_str(&line);
-        out.push('\n');
-        shown += 1;
-    }
-    if shown < bullets.len() {
-        out.push_str(&format!(
-            "… {} more {what} not shown: over the length budget, merge or trim them\n",
-            bullets.len() - shown
-        ));
-    }
-    out
-}
-
-fn or_none(block: String) -> String {
-    if block.trim().is_empty() {
-        "(none yet)\n".to_string()
-    } else {
-        block
-    }
-}
-
-fn bullet_prefix(global: bool, kind: Kind) -> String {
-    format!("{}{}", if global { "g" } else { "" }, kind.prefix())
-}
-
-fn classify(id: &str) -> Target {
-    let id = id.trim();
-    let (global, rest) = match id.strip_prefix('g') {
-        Some(rest) if is_bullet_id(rest) => (true, rest),
-        _ => (false, id),
-    };
-    if is_bullet_id(rest) {
-        let kind = if rest.starts_with('r') { Kind::Rule } else { Kind::Learning };
-        Target::Bullet { global, kind }
-    } else {
-        Target::Note
-    }
-}
-
-fn is_bullet_id(id: &str) -> bool {
-    let mut chars = id.chars();
-    matches!(chars.next(), Some('r' | 'l'))
-        && !chars.as_str().is_empty()
-        && chars.all(|c| c.is_ascii_digit())
-}
-
-fn clean_note_id(id: &str) -> Result<String, String> {
-    let id = id.trim();
-    if id.is_empty() || id.len() > MAX_ID_LEN {
-        return Err(format!("note id must be 1-{MAX_ID_LEN} chars"));
-    }
-    if !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-        return Err(format!("note id `{id}` must be kebab-case: lowercase letters, digits and '-'"));
-    }
-    if matches!(classify(id), Target::Bullet { .. }) {
-        return Err(format!("`{id}` looks like a rule/learning id; pick a descriptive note id"));
-    }
-    Ok(id.to_string())
-}
-
-fn clean_section(section: &str) -> Result<String, String> {
-    let section = section.trim().trim_matches('/');
-    if section.is_empty() {
-        return Err("a note needs a section, e.g. `build` or `architecture/harness`".to_string());
-    }
-    let parts: Vec<&str> = section.split('/').collect();
-    if parts.len() > MAX_SECTION_DEPTH {
-        return Err(format!("sections nest at most {MAX_SECTION_DEPTH} levels deep"));
-    }
-    for part in &parts {
-        if part.is_empty()
-            || part.starts_with('_')
-            || !part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        {
-            return Err(format!(
-                "section `{section}` must be kebab-case names joined by '/', e.g. `build/ci`"
-            ));
-        }
-    }
-    Ok(parts.join("/"))
-}
-
-fn clean_label(label: &str) -> Result<String, String> {
-    let label = label.trim();
-    if label.contains('\n') || label.chars().count() > 40 {
-        return Err("a bullet section is a short one-line label (at most 40 chars)".to_string());
-    }
-    Ok(label.to_string())
-}
-
-fn one_line(text: &str, what: &str, max: usize) -> Result<String, String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Err(format!("{what} is empty"));
-    }
-    if text.contains('\n') {
-        return Err(format!("{what} must be one line"));
-    }
-    let n = text.chars().count();
-    if n > max {
-        return Err(format!("{what} is {n} chars; keep it under {max}"));
-    }
-    Ok(text.to_string())
-}
-
-fn clean_body(body: &str) -> Result<String, String> {
-    let body = body.trim();
-    if body.is_empty() {
-        return Err("note body is empty".to_string());
-    }
-    let n = body.chars().count();
-    if n > MAX_BODY_CHARS {
-        return Err(format!(
-            "note body is {n} chars, over the {MAX_BODY_CHARS}-char limit — split it into focused notes"
-        ));
-    }
-    Ok(body.to_string())
-}
-
-fn parse_bullets(text: &str) -> Vec<Bullet> {
-    let mut section = String::new();
-    let mut bullets = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(heading) = line.strip_prefix("## ") {
-            section = heading.trim().to_string();
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) else {
-            continue;
-        };
-        let (id, rest) = match rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
-            Some((id, rest)) if matches!(classify(id), Target::Bullet { .. }) => {
-                (id.to_string(), rest.trim_start())
-            }
-            _ => (String::new(), rest),
-        };
-        let (helpful, harmful, text) = parse_counters(rest);
-        if !text.is_empty() {
-            bullets.push(Bullet {
-                id,
-                section: section.clone(),
-                helpful,
-                harmful,
-                text,
-            });
-        }
-    }
-    bullets
-}
-
-fn parse_counters(rest: &str) -> (u32, u32, String) {
-    if let Some(inner) = rest.strip_prefix("(+")
-        && let Some((counts, text)) = inner.split_once(')')
-        && let Some((h, x)) = counts.split_once("/-")
-        && let (Ok(h), Ok(x)) = (h.parse(), x.parse())
-    {
-        return (h, x, text.trim().to_string());
-    }
-    (0, 0, rest.trim().to_string())
-}
-
-fn collect_notes(dir: &Path, section: &str, out: &mut Vec<Note>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name.starts_with('_') {
-            continue;
-        }
-        if path.is_dir() {
-            let child = if section.is_empty() {
-                name
-            } else {
-                format!("{section}/{name}")
-            };
-            collect_notes(&path, &child, out);
-        } else if let Some(id) = name.strip_suffix(".md")
-            && let Ok(text) = fs::read_to_string(&path)
-        {
-            let updated = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .map(|t| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d").to_string())
-                .unwrap_or_default();
-            out.push(parse_note(id, section, path, updated, &text));
-        }
-    }
-}
-
-fn parse_note(id: &str, section: &str, path: PathBuf, updated: String, text: &str) -> Note {
-    let mut note = Note {
-        id: id.to_string(),
-        section: section.to_string(),
-        path,
-        title: String::new(),
-        summary: String::new(),
-        updated,
-        read: 0,
-        helpful: 0,
-        harmful: 0,
-        body: text.trim().to_string(),
-    };
-    if let Some(rest) = text.trim_start().strip_prefix("---\n")
-        && let Some((header, body)) = rest.split_once("\n---")
-    {
-        for line in header.lines() {
-            let Some((key, value)) = line.split_once(':') else {
-                continue;
-            };
-            let value = value.trim().to_string();
-            match key.trim() {
-                "title" => note.title = value,
-                "summary" => note.summary = value,
-                "read" => note.read = value.parse().unwrap_or(0),
-                "helpful" => note.helpful = value.parse().unwrap_or(0),
-                "harmful" => note.harmful = value.parse().unwrap_or(0),
-                _ => {}
-            }
-        }
-        note.body = body.trim().to_string();
-    }
-    if note.title.is_empty() {
-        note.title = note
-            .body
-            .lines()
-            .map(|l| l.trim_start_matches('#').trim())
-            .find(|l| !l.is_empty())
-            .unwrap_or(id)
-            .chars()
-            .take(MAX_TITLE_CHARS)
-            .collect();
-    }
-    note
-}
-
-fn prune_empty_dirs(mut dir: Option<&Path>, stop: &Path) {
-    while let Some(d) = dir {
-        if d == stop || !d.starts_with(stop) {
-            return;
-        }
-        let has_notes = fs::read_dir(d)
-            .map(|rd| {
-                rd.flatten().any(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    e.path().is_dir() || (name.ends_with(".md") && !name.starts_with('_'))
-                })
-            })
-            .unwrap_or(true);
-        if has_notes {
-            return;
-        }
-        let _ = fs::remove_file(d.join(SECTION_FILE));
-        if fs::remove_dir(d).is_err() {
-            return;
-        }
-        dir = d.parent();
-    }
-}
-
-/// Markdown files a shell command names, resolved against `cwd`.
-pub fn markdown_paths_in_command(command: &str, cwd: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    let separators = |c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')');
-    for word in command.split(separators) {
-        let word = word.trim_matches(|c| c == '\'' || c == '"');
-        if !word.ends_with(".md") {
-            continue;
-        }
-        let expanded = match word.strip_prefix("~/") {
-            Some(rest) => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest),
-            None => PathBuf::from(word),
-        };
-        let path = normalize_path(&if expanded.is_absolute() { expanded } else { cwd.join(expanded) });
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    paths
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "that", "this", "from", "into", "when", "then", "than", "are",
-    "was", "were", "has", "have", "use", "using", "not", "don", "you", "your", "its", "all", "any",
-    "can", "should", "must", "always", "never",
-];
-
-fn tokens(text: &str) -> HashSet<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w))
-        .map(str::to_string)
+fn session_dir_name(session_id: &str) -> String {
+    session_id
+        .chars()
+        .map(|c| match c {
+            '/' => '~',
+            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') => c,
+            _ => '_',
+        })
         .collect()
 }
 
-fn similarity(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
+fn session_id_from_dir(dir: &str) -> String {
+    dir.replace('~', "/")
+}
+
+/// Remove a session's memory when the session itself is deleted.
+pub fn delete_session_memory(session_id: &str) {
+    let _ = fs::remove_dir_all(MemoryRepo::session(session_id).root);
+}
+
+fn safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn read_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files(root, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            out.push(rel.to_string_lossy().to_string());
+        }
     }
-    let shared = a.intersection(b).count() as f64;
-    shared / a.union(b).count() as f64
+}
+
+fn topic_file(file: &str) -> Result<String, String> {
+    let file = file.trim().trim_start_matches('/');
+    let file = if file.is_empty() { ENTRY_FILE.to_string() } else { file.to_string() };
+    let file = if file.ends_with(".md") { file } else { format!("{file}.md") };
+    if file.split('/').any(|p| p.is_empty() || p == "." || p == ".." || p.starts_with('.')) {
+        return Err(format!("invalid memory file: {file}"));
+    }
+    Ok(file)
+}
+
+fn heading_for(file: &str) -> String {
+    let stem = file.trim_end_matches(".md").rsplit('/').next().unwrap_or(file);
+    let words = stem.replace(['-', '_'], " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Notes".to_string(),
+    }
+}
+
+fn normalize_entry(entry: &str) -> Result<String, String> {
+    let text = entry.trim().trim_start_matches("- ").trim();
+    if text.is_empty() {
+        return Err("entry is empty".to_string());
+    }
+    if text.contains('\n') {
+        return Err("an entry is one line".to_string());
+    }
+    if text.chars().count() > MAX_ENTRY_CHARS {
+        return Err(format!("entry is longer than {MAX_ENTRY_CHARS} characters; move detail to a topic file"));
+    }
+    Ok(format!("- {text}"))
+}
+
+fn insert_before_index(text: &str, entry: &str) -> String {
+    match text.find(INDEX_HEADING) {
+        Some(at) => {
+            let (head, tail) = text.split_at(at);
+            format!("{}\n{entry}\n\n{tail}", head.trim_end())
+        }
+        None => format!("{}\n{entry}\n", text.trim_end()),
+    }
+}
+
+/// Fold the pre-git layout (rules.md, learnings.md, notes/) into the Agent
+/// Memory Repo format: rules become MEMORY.md entries, learnings stay a topic
+/// file, and every note is linked from the index. Returns whether anything
+/// was migrated.
+fn migrate_legacy(root: &Path, title: &str) -> Result<bool, String> {
+    let rules_path = root.join("rules.md");
+    let learnings_path = root.join("learnings.md");
+    let notes_dir = root.join("notes");
+    let has_legacy = rules_path.is_file() || learnings_path.is_file() || notes_dir.is_dir();
+    if !has_legacy || root.join(ENTRY_FILE).is_file() {
+        return Ok(false);
+    }
+    let rules = fs::read_to_string(&rules_path).unwrap_or_default();
+    let mut entry = format!("# {title}\n");
+    let rule_lines = legacy_lines(&rules);
+    if !rule_lines.is_empty() {
+        entry.push('\n');
+    }
+    for line in rule_lines {
+        entry.push_str(&line);
+        entry.push('\n');
+    }
+    let mut index = Vec::new();
+    if learnings_path.is_file() {
+        let learnings = fs::read_to_string(&learnings_path).unwrap_or_default();
+        let body: Vec<String> = legacy_lines(&learnings);
+        write_atomic(&learnings_path, &format!("# Learnings\n\n{}\n", body.join("\n")))?;
+        index.push("- [[learnings]] — reusable lessons: situation → approach → why".to_string());
+    }
+    for file in ["patterns.md"] {
+        if root.join(file).is_file() {
+            index.push(format!("- [[{}]]", file.trim_end_matches(".md")));
+        }
+    }
+    let mut notes = Vec::new();
+    collect_files(root, &notes_dir, &mut notes);
+    notes.sort();
+    for note in notes {
+        if !note.ends_with(".md") || note.rsplit('/').next().is_some_and(|n| n.starts_with('_')) {
+            continue;
+        }
+        let summary = fs::read_to_string(root.join(&note))
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix("summary:").map(|s| s.trim().to_string()))
+            })
+            .unwrap_or_default();
+        let link = format!("[[{}]]", note.trim_end_matches(".md"));
+        index.push(if summary.is_empty() { format!("- {link}") } else { format!("- {link} — {summary}") });
+    }
+    entry.push_str(&format!("\n{INDEX_HEADING}\n"));
+    for line in index {
+        entry.push_str(&line);
+        entry.push('\n');
+    }
+    write_atomic(&root.join(ENTRY_FILE), &entry)?;
+    let _ = fs::remove_file(&rules_path);
+    for section in {
+        let mut found = Vec::new();
+        collect_files(root, &notes_dir, &mut found);
+        found
+    } {
+        if section.rsplit('/').next() == Some("_section.md") {
+            let _ = fs::remove_file(root.join(section));
+        }
+    }
+    Ok(true)
+}
+
+/// Bullets of an old rules/learnings file as spec entries: the `[id]` and
+/// `(+n/-m)` counters dropped, bare lines made bullets, `##` headings kept.
+fn legacy_lines(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("# ") {
+            continue;
+        }
+        if line.starts_with("## ") {
+            if !out.is_empty() {
+                out.push(String::new());
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        let mut rest = line.trim_start_matches("- ").trim();
+        if rest.starts_with('[')
+            && let Some(end) = rest.find(']')
+        {
+            rest = rest[end + 1..].trim();
+        }
+        if rest.starts_with("(+")
+            && let Some(end) = rest.find(')')
+        {
+            rest = rest[end + 1..].trim();
+        }
+        if !rest.is_empty() {
+            out.push(format!("- {rest}"));
+        }
+    }
+    out
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    format!("{cut}…")
 }
 
 fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let mut tmp = path.to_path_buf();
-    tmp.set_file_name(format!(
-        ".{}.tmp",
+    let tmp = path.with_file_name(format!(
+        ".tmp-{}",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("memory")
     ));
     fs::write(&tmp, content).map_err(|e| e.to_string())?;

@@ -387,6 +387,7 @@ pub(crate) async fn delete_session(
         }
     }
     crate::session::remove_session_files(&sp);
+    crate::memory::delete_session_memory(&req.session);
     Json(serde_json::json!({"deleted": true})).into_response()
 }
 
