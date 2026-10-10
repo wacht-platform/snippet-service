@@ -441,7 +441,7 @@ pub(super) struct UploadReq {
 
 // POST /fs/upload {data_base64, name?} — save an uploaded file (e.g. an image the
 // user posts from the app) to a temp dir and return its absolute path, which the
-// agent can then view with `read_image` (or read).
+// agent can then view with `view_image` (or read).
 pub(super) async fn upload_fs_file(
     State(d): State<Shared>,
     Query(a): Query<Auth>,

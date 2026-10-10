@@ -1,7 +1,6 @@
-//! Shell-discipline classifier for the `bash` tool. Never blocks — shell is
-//! often the right tool. It only nudges toward the dedicated file tools when a
-//! command does something they do better (writing file content, whole-file
-//! `cat`). The loop escalates a repeated nudge into a reflect-and-switch steer.
+//! Shell-discipline classifier for the `bash` tool. Never blocks — the shell is
+//! how the agent reads and searches. It only nudges toward `change_files` when a
+//! command writes file content. The loop escalates a repeated nudge into a reflect-and-switch steer.
 //!
 //! Ported from wacht `executor/agent_loop/shell_guard.rs`. The only adaptation
 //! for snippet's local single-workspace model is `is_tracked_write_target`:
@@ -176,39 +175,14 @@ fn is_tee_to_tracked(toks: &[String]) -> bool {
         .any(|t| is_tracked_write_target(t))
 }
 
-// Bare `cat <single file>`, no pipe/redirect. Piped `cat ... | grep` is fine.
-fn is_bare_cat_read(command: &str, segs: &[String]) -> bool {
-    if segs.len() != 1 || command.contains('>') {
-        return false;
-    }
-    let toks = tokens(&segs[0]);
-    if toks.first().map(String::as_str) != Some("cat") {
-        return false;
-    }
-    let positionals: Vec<&String> = toks
-        .iter()
-        .skip(1)
-        .filter(|t| !t.starts_with('-'))
-        .collect();
-    if positionals.len() != 1 {
-        return false;
-    }
-    let target = unquote(positionals[0]);
-    if target.is_empty() || target.starts_with('<') || target.contains('$') {
-        return false;
-    }
-    true
-}
+const NUDGE_WRITE_MSG: &str = "You wrote a tracked file through the shell. That's right for generated output \
+or a mechanical change across many files; for a hand edit to source, `change_files` is exact and shows the \
+changed lines. Either way, check the result now (`git diff --stat`, or `rg` for what should and shouldn't be \
+there) before you build on it.";
 
-const NUDGE_WRITE_MSG: &str = "you wrote file content through the shell. Prefer `write_file` (create/overwrite), \
-`append_file` (add lines), or `edit_file` (change a substring) — they honor read-before-edit and the trailing-newline \
-guarantee that shell `>`/`>>`/`tee` skip. Shell stays great for inspection (grep, pipes, find).";
-
-const NUDGE_SED_MSG: &str = "`sed -i` edits a file in place. Prefer `read_file` then `edit_file` (anchor `old_string` \
-on the exact bytes you read) — keeps read-discipline intact. Shell stays great for inspection.";
-
-const NUDGE_CAT_MSG: &str = "you used `cat` to read a whole file. Prefer `read_file`: it returns total_lines/total_chars and the \
-`slice_hash` you need before `edit_file`, and pages large files cleanly. Reserve shell for filtering (grep, pipes) and paging windows.";
+const NUDGE_SED_MSG: &str = "`sed -i` silently does nothing when its pattern misses, and can match more than you \
+meant. For a one-off edit, `change_files` fails loudly on a miss; for a bulk mechanical edit, count the matches \
+first (`rg -c`) and check the diff after (`git diff --stat`).";
 
 /// Classify a `bash` command. Nudge beats Allow; never blocks.
 pub fn classify_shell_command(command: &str) -> ShellVerdict {
@@ -233,10 +207,6 @@ pub fn classify_shell_command(command: &str) -> ShellVerdict {
         if is_tee_to_tracked(&toks) {
             return ShellVerdict::Nudge(NUDGE_WRITE_MSG.to_string());
         }
-    }
-
-    if is_bare_cat_read(command, &segs) {
-        return ShellVerdict::Nudge(NUDGE_CAT_MSG.to_string());
     }
 
     ShellVerdict::Allow

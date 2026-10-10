@@ -75,6 +75,100 @@ enum Command {
         #[command(subcommand)]
         action: VaultAction,
     },
+    /// Search and read the archived history of an agent session — the messages
+    /// compaction moved out of its context. Scoped to $SNIPPET_SESSION_ID (set in
+    /// the agent's shell) unless --session is given.
+    History {
+        #[command(subcommand)]
+        action: HistoryAction,
+    },
+    /// Message internal agents and give one work in a session, through the
+    /// running serve daemon. The daemon owns delivery, so a message accepted here
+    /// is still delivered after a restart.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+    #[command(hide = true)]
+    AgyHook,
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentAction {
+    /// List the agents in the coordination directory.
+    List {
+        /// Print the response as raw JSON.
+        /// Print the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send a direct message to an agent.
+    Message {
+        /// Recipient agent id, as shown by `snippet agent list`.
+        agent_id: String,
+        /// The message body. Omit to read it from stdin.
+        body: Vec<String>,
+        /// Send as this agent instead of the local human.
+        #[arg(long)]
+        from_agent: Option<String>,
+        /// A retry with the same key does not duplicate the message.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
+    /// Read a direct conversation, oldest first.
+    Thread {
+        /// The peer agent id (or `human` for the local human).
+        peer: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// Show only messages after this sequence.
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        /// The local participant: `human` (default) or an agent id.
+        #[arg(long)]
+        as_actor: Option<String>,
+        /// Print the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List your direct conversations with unread counts.
+    Inbox {
+        /// The local participant: `human` (default) or an agent id.
+        #[arg(long)]
+        as_actor: Option<String>,
+        /// Print the response as raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryAction {
+    /// Full-text search, best matches first.
+    Search {
+        /// Words to look for.
+        query: String,
+        /// Maximum number of matches.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Session to search (defaults to $SNIPPET_SESSION_ID).
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Print archived messages in full, by id or as an id range.
+    Show {
+        /// Message ids from `snippet history search`.
+        ids: Vec<i64>,
+        /// First id of a range.
+        #[arg(long)]
+        from: Option<i64>,
+        /// Last id of a range.
+        #[arg(long)]
+        to: Option<i64>,
+        /// Session to read (defaults to $SNIPPET_SESSION_ID).
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -260,6 +354,327 @@ fn vault_cli(action: VaultAction) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Create and inspect the snippet store.
+///
+/// Opening the database is what creates it — `Store::open` runs the
+/// schema migration — so `init` is deliberately just an open plus a report, not a
+/// separate creation path that could drift from what the daemon does at startup.
+fn history_cli(action: HistoryAction) -> Result<(), Box<dyn std::error::Error>> {
+    use snippet::history_archive::{recall_turn_range, recall_turns, render_turn, search_history};
+    let session = |explicit: Option<String>| {
+        explicit
+            .or_else(|| std::env::var("SNIPPET_SESSION_ID").ok())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("no session: pass --session <id> (inside an agent shell $SNIPPET_SESSION_ID is set)")
+    };
+    let store = snippet::store::Store::open(snippet::store::default_db_path())?;
+    match action {
+        HistoryAction::Search {
+            query,
+            limit,
+            session: explicit,
+        } => {
+            let hits = search_history(&store, &session(explicit)?, &query, limit.clamp(1, 50))?;
+            if hits.is_empty() {
+                println!("no matches for {query:?}");
+            }
+            for hit in hits {
+                let who = hit.tool_name.as_deref().unwrap_or(&hit.role);
+                println!("#{}  {who}  {}", hit.archive_id, hit.summary);
+                let snippet = hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !snippet.is_empty() {
+                    println!("    {snippet}");
+                }
+            }
+        }
+        HistoryAction::Show {
+            ids,
+            from,
+            to,
+            session: explicit,
+        } => {
+            let session = session(explicit)?;
+            let turns = match (from, to) {
+                (Some(from), Some(to)) => recall_turn_range(&store, &session, from, to, 50)?,
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err("pass both --from and --to for a range".into());
+                }
+                (None, None) if ids.is_empty() => {
+                    return Err("pass message ids, or --from and --to".into());
+                }
+                (None, None) => recall_turns(&store, &session, &ids)?,
+            };
+            if turns.is_empty() {
+                println!("no archived messages with those ids in this session");
+            }
+            for turn in turns {
+                println!("{}", render_turn(&turn));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The CLI's acting participant: the local human unless an agent is named.
+///
+/// The daemon refuses an unknown sender, so naming an agent here can only speak
+/// as an identity the directory already knows.
+fn cli_actor(as_actor: Option<&str>) -> (String, String) {
+    match as_actor.map(str::trim).filter(|actor| !actor.is_empty()) {
+        None | Some("human") | Some("local") => ("human".to_string(), "local".to_string()),
+        Some(agent) => ("agent".to_string(), agent.to_string()),
+    }
+}
+
+/// Resolve a `thread <peer>` argument to a participant reference. `human` is the
+/// local human, which is what an agent uses to read its conversation with you.
+fn peer_actor(peer: &str) -> (String, String) {
+    match peer.trim() {
+        "human" | "local" => ("human".to_string(), "local".to_string()),
+        other => ("agent".to_string(), other.to_string()),
+    }
+}
+
+fn print_json(value: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+/// Call one daemon route, authenticating with the published token.
+async fn daemon_http(
+    state: &ServeState,
+    method: &str,
+    route: &str,
+    query: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let mut url = browser_route_url(state.base_url(), route)?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("token", &state.token);
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
+    let request = match method {
+        "GET" => client.get(url),
+        "POST" => client.post(url),
+        other => return Err(format!("unsupported daemon method `{other}`").into()),
+    };
+    let request = match body {
+        Some(value) => request.json(&value),
+        None => request,
+    };
+    let response = request.send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .unwrap_or_else(|_| serde_json::json!({ "error": text }));
+    if !status.is_success() {
+        // An error body is a bare string, not an object, so it is read directly
+        // before falling back to an `error` field.
+        let detail = value
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(text);
+        return Err(format!("daemon returned {status}: {detail}").into());
+    }
+    Ok(value)
+}
+
+/// Message internal agents and dispatch work, over the running daemon.
+///
+/// These commands go through the daemon rather than writing SQLite directly: the
+/// daemon owns delivery, wake-up, and the retry ledger, so a message this CLI
+/// accepts is still delivered after a restart.
+async fn agent_cli(action: AgentAction) -> Result<(), Box<dyn std::error::Error>> {
+    let state = browser_connection().map_err(|error| {
+        format!(
+            "{error}\n\nis the daemon running? start it with `snippet serve`, then check `snippet serve --status`"
+        )
+    })?;
+    match action {
+        AgentAction::List { json } => {
+            let value = daemon_http(&state, "GET", "agents", &[], None).await?;
+            if json {
+                return print_json(&value);
+            }
+            let agents = value.as_array().cloned().unwrap_or_default();
+            if agents.is_empty() {
+                println!("no agents in the directory");
+            }
+            for agent in agents {
+                let id = agent.get("id").and_then(serde_json::Value::as_str).unwrap_or("?");
+                let name = agent
+                    .get("display_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(id);
+                let kind = agent.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+                let role = agent.get("role").and_then(serde_json::Value::as_str).unwrap_or("");
+                let status = agent
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                println!("{id:<24} {name:<20} {kind:<14} {role:<12} {status}");
+            }
+            Ok(())
+        }
+        AgentAction::Message {
+            agent_id,
+            body,
+            from_agent,
+            idempotency_key,
+        } => {
+            let body = if body.is_empty() {
+                use std::io::Read;
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                text.trim().to_string()
+            } else {
+                body.join(" ")
+            };
+            if body.trim().is_empty() {
+                return Err("message body must not be empty".into());
+            }
+            let (from_kind, from_id) = cli_actor(from_agent.as_deref());
+            let mut payload = serde_json::json!({
+                "from_kind": from_kind,
+                "from_id": from_id,
+                "to_kind": "agent",
+                "to_id": agent_id,
+                "body": body.trim(),
+            });
+            if let Some(key) = idempotency_key {
+                payload["idempotency_key"] = serde_json::json!(key);
+            }
+            let value = daemon_http(
+                &state,
+                "POST",
+                "coordination/direct/messages",
+                &[],
+                Some(payload),
+            )
+            .await?;
+            let thread = value
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let sequence = value
+                .get("sequence")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            println!("✓ sent to {agent_id} (thread {thread}, seq {sequence})");
+            Ok(())
+        }
+        AgentAction::Thread {
+            peer,
+            limit,
+            after,
+            as_actor,
+            json,
+        } => {
+            let (actor_kind, actor_id) = cli_actor(as_actor.as_deref());
+            let (peer_kind, peer_id) = peer_actor(&peer);
+            let value = daemon_http(
+                &state,
+                "GET",
+                "coordination/direct/messages",
+                &[
+                    ("actor_kind", actor_kind),
+                    ("actor_id", actor_id),
+                    ("peer_kind", peer_kind),
+                    ("peer_id", peer_id),
+                    ("after_sequence", after.to_string()),
+                    ("limit", limit.to_string()),
+                ],
+                None,
+            )
+            .await?;
+            if json {
+                return print_json(&value);
+            }
+            let events = value
+                .get("events")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if events.is_empty() {
+                println!("no messages yet");
+            }
+            for event in events {
+                let sequence = event
+                    .get("sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let kind = event
+                    .get("actor_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let id = event
+                    .get("actor_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let at = event
+                    .get("created_at")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let body = event
+                    .pointer("/payload/body")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                println!("[{sequence}] {kind}:{id}  {at}\n  {body}");
+            }
+            Ok(())
+        }
+        AgentAction::Inbox { as_actor, json } => {
+            let (actor_kind, actor_id) = cli_actor(as_actor.as_deref());
+            let value = daemon_http(
+                &state,
+                "GET",
+                "coordination/direct/threads",
+                &[("actor_kind", actor_kind), ("actor_id", actor_id)],
+                None,
+            )
+            .await?;
+            if json {
+                return print_json(&value);
+            }
+            let threads = value.as_array().cloned().unwrap_or_default();
+            if threads.is_empty() {
+                println!("no conversations yet");
+            }
+            for thread in threads {
+                let title = thread
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let peer = thread
+                    .get("peer_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let unread = thread
+                    .get("unread")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let badge = if unread > 0 {
+                    format!("{unread} unread")
+                } else {
+                    "read".to_string()
+                };
+                println!("{title:<40} peer={peer:<16} {badge}");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Read a line from the TTY with echo disabled (crossterm raw mode) — no extra
 /// password-prompt dependency needed.
 fn rpassword_read() -> Result<String, Box<dyn std::error::Error>> {
@@ -305,6 +720,22 @@ fn runtime() -> Result<tokio::runtime::Runtime, Box<dyn std::error::Error>> {
 struct ServeState {
     url: String,
     token: String,
+    /// The daemon's local address. Preferred by the CLI: a CLI on the same
+    /// machine should not reach its own daemon through the public tunnel.
+    #[serde(default)]
+    api_url: Option<String>,
+}
+
+impl ServeState {
+    /// The base URL the CLI talks to: the local address when published, else the
+    /// public one.
+    fn base_url(&self) -> &str {
+        self.api_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or(&self.url)
+    }
 }
 
 fn serve_state_path() -> PathBuf {
@@ -492,14 +923,14 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "Once per connection: list --json for device_name, then tabs.query for TAB_ID; reuse both until invalidated.",
             "Keep output small: pipe list/snapshot/manual JSON through jq and return only fields needed for the next action.",
             "Choose by question: page.eval for a known value/state; filtered page.snapshot for semantic DOM discovery and refs; page.screenshot only when pixels matter or DOM is insufficient (canvas/WebGL, charts/maps, overlays/clipping, responsive layout, colors/spacing, drag geometry, or final visual confirmation).",
-            "Snapshot answers WHAT exists and gives refs; screenshot answers HOW it looks but has no refs and costs image tokens. Screenshot once at the relevant state, inspect it, then return to eval/snapshot for actions; never loop screenshots or use them as OCR for ordinary DOM text.",
+            "Snapshot answers WHAT exists and gives refs; screenshot answers HOW it looks but has no refs and costs image tokens. Screenshot once at the relevant state, inspect it, then return to eval/snapshot for actions; screenshots in a loop, or as OCR for ordinary DOM text, cost far more than they tell you.",
             "Need text rather than refs/pixels: use page.eval with targeted element.innerText. For broad extraction, get counts/headings or structured section snippets first, then narrow; do not dump body.innerText into model context unless explicitly required. Full text should be chunked or processed outside context. Virtualized lists require scroll+collect+dedupe; use frameId for iframes.",
-            "Multiple CLI calls are allowed and often required. Use a short adaptive loop: inspect -> act -> verify -> recalculate -> continue, reading each result before choosing the next call. Do not pack uncertain UI actions into one blind shell pipeline; group only deterministic reads or a harmless action plus tiny verification.",
+            "Multiple CLI calls are allowed and often required. Use a short adaptive loop: inspect -> act -> verify -> recalculate -> continue, reading each result before choosing the next call. Uncertain UI actions go one at a time; a single pipeline suits only deterministic reads, or a harmless action plus a tiny check.",
             "One action, then one small state check. Re-snapshot only after navigation/DOM change or a stale-ref error.",
-            "Use page.type for the whole string (it replaces unless append:true). Never follow type with page.key of the same characters — that doubles them (5 then key 5 → 55). page.key is named keys/shortcuts or one extra printable. Tiny icon buttons often have data-testid; filter snapshot for testid and do not ignore 16–24px controls. Use refs for DOM, coordinates/mouse for canvas or elements without refs.",
+            "Use page.type for the whole string (it replaces unless append:true). Following type with page.key of the same characters doubles them (5 then key 5 → 55). page.key is named keys/shortcuts or one extra printable. Tiny icon buttons often have data-testid; filter snapshot for testid, and keep 16–24px controls in view. Use refs for DOM, coordinates/mouse for canvas or elements without refs.",
             "Reliable, graceful scrolling may take multiple calls: measure -> calculated wheel -> verify -> recalculate, repeated until target visible, end reached, or no progress. Known destination -> page.scroll{ref}; normal document -> page.scroll{x,y}; nested/virtual/wheel-driven pane -> locate its visible rect and scroll metrics with a SMALL page.eval, then page.mouse.wheel at a viewport point inside that rect; hover there first if needed. Calculate step from the pane and remaining distance: sign(target-current)*min(abs(remaining), max(120, floor(clientSize*0.7))); reduce to ~0.25 pane near a target. Wait and verify scrollTop plus visible content between inputs. Use deltaX for horizontal panes.",
             "Wheel coordinates are viewport CSS pixels, not document coordinates: require 0<=x<innerWidth and 0<=y<innerHeight, and keep the point inside the intended visible scroller. Use one moderate delta (~0.5-0.9 viewport) at a time. If unchanged, check end-of-scroll, wrong axis, overlay, iframe, or wrong scroll owner instead of repeating.",
-            "Never invent methods or use Runtime.evaluate directly. Query one contract with: snippet browser manual --json | jq '.methods[\"METHOD\"]'.",
+            "Stick to the methods listed here rather than inventing new ones or calling Runtime.evaluate directly. Query one contract with: snippet browser manual --json | jq '.methods[\"METHOD\"]'.",
             "Network/console: start, reproduce once, get a small limit, stop."
         ],
         "methods": {
@@ -510,8 +941,8 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "tabs.remove": "Requires {tabId:number} or {tabIds:[number]}.",
             "page.snapshot": "Use when you need semantic DOM discovery or actionable refs: text, roles, labels, states, and rects. It answers WHAT exists, not visual appearance. Requires {tabId:number}; returns refs such as e42. Output can be large: pipe through jq and keep only matching ref/text/label/rect fields.",
             "page.click": "Requires {tabId:number,ref:string}; optional mode dom or cdp.",
-            "page.type": "Requires {tabId:number,ref:string,text:string}; optional append. Writes the whole string (replaces unless append:true), including contenteditable/Draft.js via insertText. Do not also page.key the same characters — that doubles them.",
-            "page.key": "Requires {tabId:number,ref:string,key:string}; optional code. Named keys handle Enter/Escape/Tab/arrows/shortcuts; one printable character inserts into editable controls and reports inserted. Prefer page.type for bulk text; never type then key the same text. Enter also requestSubmit()s the enclosing form. Ref must be fresh.",
+            "page.type": "Requires {tabId:number,ref:string,text:string}; optional append. Writes the whole string (replaces unless append:true), including contenteditable/Draft.js via insertText. Adding page.key with the same characters doubles them.",
+            "page.key": "Requires {tabId:number,ref:string,key:string}; optional code. Named keys handle Enter/Escape/Tab/arrows/shortcuts; one printable character inserts into editable controls and reports inserted. Prefer page.type for bulk text; typing and then keying the same text doubles it. Enter also requestSubmit()s the enclosing form. Ref must be fresh.",
             "page.drag": "Requires {tabId:number,from:string,to:string}; drags between snapshot refs; optional mode cdp.",
             "page.dragHtml5": "Requires {tabId:number,from:string,to:string}; uses HTML5 drag events between snapshot refs.",
             "page.dragCoordinates": "Requires {tabId:number,x1:number,y1:number,x2:number,y2:number}; viewport CSS pixels, optional steps 2-100.",
@@ -522,7 +953,7 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "page.mouse.move": "Requires {tabId:number,x:number,y:number}; optional steps and fromX/fromY.",
             "page.mouse.down": "Requires {tabId:number,x:number,y:number}; optional button.",
             "page.mouse.up": "Requires {tabId:number,x:number,y:number}; optional button.",
-            "page.mouse.wheel": "Requires {tabId:number} and non-zero deltaX or deltaY; x/y are VIEWPORT CSS pixels, not document coordinates. Validate 0<=x<innerWidth and 0<=y<innerHeight and place the point inside the intended visible scroller rect. Best for nested, virtualized, hover-sensitive, or wheel-driven UI; move the mouse into the pane first if needed. Calculate a graceful step from remaining distance and pane size: direction=sign(target-current), magnitude=min(abs(remaining), max(120, floor(clientSize*0.7))); use ~0.25 pane near the target and never overshoot a known end. Send one event, allow smooth/lazy rendering to settle, then verify scrollTop AND newly visible content. A transport-level scrolled:true only means the wheel event was sent. Stop when target is visible or no progress; if unchanged, inspect max scroll, axis, overlay, iframe/frameId, or another scroll owner instead of repeating.",
+            "page.mouse.wheel": "Requires {tabId:number} and non-zero deltaX or deltaY; x/y are VIEWPORT CSS pixels, not document coordinates. Validate 0<=x<innerWidth and 0<=y<innerHeight and place the point inside the intended visible scroller rect. Best for nested, virtualized, hover-sensitive, or wheel-driven UI; move the mouse into the pane first if needed. Calculate a graceful step from remaining distance and pane size: direction=sign(target-current), magnitude=min(abs(remaining), max(120, floor(clientSize*0.7))); use ~0.25 pane near the target and stop at a known end. Send one event, allow smooth/lazy rendering to settle, then verify scrollTop AND newly visible content. A transport-level scrolled:true only means the wheel event was sent. Stop when target is visible or no progress; if unchanged, inspect max scroll, axis, overlay, iframe/frameId, or another scroll owner instead of repeating.",
             "page.listFrames": "Requires {tabId:number}; returns frame ids. Pass frameId to page.snapshot and content-script actions.",
             "page.upload": "Requires {tabId:number,ref:string,files:[{name,type,data}]}; data is base64.",
             "page.getCookies": "Requires {tabId:number}; returns cookies for the tab URL.",
@@ -534,7 +965,7 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "page.getConsole": "Chrome only; optional {limit:number,consume:boolean}; returns buffered console events. consume defaults true.",
             "page.stopConsole": "Chrome only; stops capture and releases its debugger use.",
             "page.eval": "Requires {tabId:number,expression:string}; do not call Runtime.evaluate. Best for known state and text extraction: targeted el.innerText approximates rendered text; textContent includes hidden/unrendered text. For broad pages, first return character/line counts, headings, or structured h1/h2/h3/p/li/table snippets and narrow by keyword. Only extract full body when explicitly needed; chunk or process large text outside model context. Virtualized/lazy lists expose only mounted rows, so scroll+collect+dedupe; iframes need listFrames/frameId; open shadow roots need recursive traversal; canvas text needs screenshot or app-state inspection. Return a small scalar/object by default.",
-            "page.screenshot": "Use only when pixels matter or DOM is insufficient: canvas/WebGL, charts/maps, overlays/clipping, responsive layout, colors/spacing, drag geometry, or final visual confirmation. It answers HOW the page looks but provides no refs and costs image tokens. Set the relevant tab/scroll/dialog state first; capture once, inspect it, then act via a fresh snapshot ref or verified coordinates. Do not use as OCR for ordinary DOM text or repeat after every action. Requires {tabId:number}; Firefox requires the tab to be active.",
+            "page.screenshot": "Use only when pixels matter or DOM is insufficient: canvas/WebGL, charts/maps, overlays/clipping, responsive layout, colors/spacing, drag geometry, or final visual confirmation. It answers HOW the page looks but provides no refs and costs image tokens. Set the relevant tab/scroll/dialog state first; capture once, inspect it, then act via a fresh snapshot ref or verified coordinates. Ordinary DOM text reads better from a snapshot, and one capture per state is plenty. Requires {tabId:number}; Firefox requires the tab to be active.",
             "netwatch.start": "Requires {tabId:number}; starts bounded metadata-only network capture for that tab.",
             "netwatch.pause": "Pauses capture while retaining the watcher and buffered events.",
             "netwatch.resume": "Resumes capture for the active watcher.",
@@ -542,7 +973,7 @@ fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             "netwatch.stop": "Stops capture and releases the Chrome debugger attachment."
         },
         "errors": {
-            "missing_tabId": "Stop. Run tabs.query and use the returned numeric id; never guess an id.",
+            "missing_tabId": "Stop. Run tabs.query and use the returned numeric id; a guessed id points at nothing.",
             "method_not_allowed": "Stop. Use only a method listed by browser list capabilities or this manual; do not retry a renamed/invented method.",
             "stale_ref": "Run page.snapshot again and use a fresh ref.",
             "inactive_firefox_tab": "Activate the target tab, then retry page.eval or page.screenshot once.",
@@ -754,7 +1185,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(Command::Vault { action }) => return vault_cli(action),
+        Some(Command::History { action }) => return history_cli(action),
+        Some(Command::Agent { action }) => return runtime()?.block_on(agent_cli(action)),
         Some(Command::Browser { action }) => return runtime()?.block_on(browser_cli(action)),
+        Some(Command::AgyHook) => return Ok(snippet::antigravity::run_hook()?),
         Some(Command::Serve {
             port,
             token,

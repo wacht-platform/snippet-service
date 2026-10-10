@@ -10,106 +10,6 @@ use std::sync::{Arc, Mutex};
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
 const MAX_TERMS: usize = 8;
-const NOTIFY_PAYLOAD_CAP: usize = 512;
-
-/// A PTY-originated desktop notification (BEL, OSC 9, OSC 777).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TermNotify {
-    pub pane: String,
-    pub message: String,
-}
-
-/// Detect BEL / OSC 9 / OSC 777 in the raw stream so the daemon can
-/// push them over `/events` even when no client is painting the pane.
-#[derive(Default)]
-struct NotifyScan {
-    /// 0 ground, 1 saw ESC, 2 collecting OSC payload.
-    esc: u8,
-    payload: Vec<u8>,
-}
-
-impl NotifyScan {
-    fn feed(&mut self, bytes: &[u8], out: &mut Vec<String>) {
-        for &b in bytes {
-            match self.esc {
-                0 if b == 0x07 => out.push(String::new()),
-                0 if b == 0x1b => self.esc = 1,
-                1 if b == b']' => {
-                    self.esc = 2;
-                    self.payload.clear();
-                }
-                1 => self.esc = 0,
-                2 if b == 0x07 => {
-                    if let Some(msg) = parse_osc_notify(&self.payload) {
-                        out.push(msg);
-                    }
-                    self.payload.clear();
-                    self.esc = 0;
-                }
-                2 if b == 0x1b => self.esc = 3,
-                2 => {
-                    if self.payload.len() < NOTIFY_PAYLOAD_CAP {
-                        self.payload.push(b);
-                    }
-                }
-                // OSC terminated by ST (`ESC \`).
-                3 if b == b'\\' => {
-                    if let Some(msg) = parse_osc_notify(&self.payload) {
-                        out.push(msg);
-                    }
-                    self.payload.clear();
-                    self.esc = 0;
-                }
-                3 => {
-                    // Not ST — treat the ESC as starting a new sequence.
-                    self.payload.clear();
-                    self.esc = if b == b']' {
-                        2
-                    } else if b == 0x1b {
-                        1
-                    } else {
-                        0
-                    };
-                }
-                _ => self.esc = 0,
-            }
-        }
-    }
-}
-
-fn parse_osc_notify(payload: &[u8]) -> Option<String> {
-    // OSC 9 ; message
-    if let Some(rest) = payload.strip_prefix(b"9;") {
-        return Some(osc_message(rest));
-    }
-    // OSC 777 ; notify ; title ; body   (urxvt / notify-send)
-    if let Some(rest) = payload.strip_prefix(b"777;") {
-        let text = std::str::from_utf8(rest).unwrap_or("");
-        let mut parts = text.splitn(3, ';');
-        let kind = parts.next().unwrap_or("");
-        if !kind.eq_ignore_ascii_case("notify") {
-            return None;
-        }
-        let title = parts.next().unwrap_or("").trim();
-        let body = parts.next().unwrap_or("").trim();
-        return Some(match (title.is_empty(), body.is_empty()) {
-            (true, true) => String::new(),
-            (false, true) => title.to_string(),
-            (true, false) => body.to_string(),
-            (false, false) => format!("{title}: {body}"),
-        });
-    }
-    None
-}
-
-fn osc_message(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect()
-}
 
 /// Detect CSI 6n / CSI 5n in the raw stream and answer them. `vt100` 0.15
 /// swallows DSR and never replies, which is why fish left the cursor dead.
@@ -187,8 +87,6 @@ impl Fanout {
 /// Several human PTYs for one session. Frames carry `id` (default `"0"`).
 pub struct SessionTerms {
     cwd: PathBuf,
-    /// Daemon session id so BEL / OSC can push on `/events` immediately.
-    session_id: String,
     next_id: Mutex<u32>,
     terms: Mutex<HashMap<String, Arc<SessionTerm>>>,
     /// Pane ids that must send a full snapshot on the next attach poll
@@ -196,8 +94,6 @@ pub struct SessionTerms {
     /// missed them (or rebuilt its screen) needs the whole scrollback.
     snap_ids: Mutex<std::collections::HashSet<String>>,
     fanout: Mutex<Fanout>,
-    /// BEL / OSC 9 / OSC 777 seen since the last `/events` drain.
-    notifies: Mutex<Vec<TermNotify>>,
     /// Incremental frames drained while no /attach client was subscribed.
     /// The next `subscribe` takes these so a harvest for notifications
     /// cannot steal bytes from a later attach.
@@ -220,70 +116,14 @@ impl Drop for TermClient {
 
 impl SessionTerms {
     pub fn new(cwd: PathBuf) -> Arc<Self> {
-        Self::new_for_session(cwd, String::new())
-    }
-
-    pub fn new_for_session(cwd: PathBuf, session_id: String) -> Arc<Self> {
         Arc::new(Self {
             cwd,
-            session_id,
             next_id: Mutex::new(1),
             terms: Mutex::new(HashMap::new()),
             snap_ids: Mutex::new(std::collections::HashSet::new()),
             fanout: Mutex::new(Fanout::new()),
-            notifies: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
         })
-    }
-
-    /// Drain the PTY (so idle shells still fire BEL / OSC) and take
-    /// any notifications queued since the last harvest.
-    pub fn harvest(&self) -> Vec<TermNotify> {
-        self.pump();
-        self.take_notifies()
-    }
-
-    /// Drain PTY-originated notifications (BEL / OSC 9 / OSC 777).
-    pub fn take_notifies(&self) -> Vec<TermNotify> {
-        match self.notifies.lock() {
-            Ok(mut g) => std::mem::take(&mut *g),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    fn push_notifies(&self, pane: &str, messages: Vec<String>) {
-        if messages.is_empty() {
-            return;
-        }
-        if let Ok(mut g) = self.notifies.lock() {
-            for message in &messages {
-                g.push(TermNotify {
-                    pane: pane.to_string(),
-                    message: message.clone(),
-                });
-            }
-            // Bound the mailbox so a looping `echo -e '\a'` cannot grow forever
-            // if no /events client is attached.
-            if g.len() > 32 {
-                let drop = g.len() - 32;
-                g.drain(..drop);
-            }
-        }
-        if self.session_id.is_empty() {
-            return;
-        }
-        let (title, folder, status) = crate::session::session_notify_meta(&self.session_id);
-        for message in messages {
-            crate::session::emit_device_event(serde_json::json!({
-                "session": self.session_id,
-                "title": title,
-                "workspace": folder,
-                "kind": "term",
-                "status": status,
-                "message": message,
-                "pane": pane,
-            }));
-        }
     }
 
     pub fn subscribe(self: &Arc<Self>) -> TermClient {
@@ -316,6 +156,24 @@ impl SessionTerms {
 
     pub fn get(&self, id: &str) -> Option<Arc<SessionTerm>> {
         self.terms.lock().ok()?.get(id).cloned()
+    }
+
+    /// Ids of the live shells, with their alive state.
+    ///
+    /// Used by `/shells` so a (re)connecting client can rebuild its tabs from
+    /// what already exists. Without it a reconnect would show an empty strip
+    /// while the ptys kept running — the tabs would silently disappear.
+    pub fn list(&self) -> Vec<(String, bool)> {
+        let g = match self.terms.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<(String, bool)> = g
+            .iter()
+            .map(|(id, t)| (id.clone(), t.is_alive()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     pub fn request_snapshot(&self, id: &str) {
@@ -357,7 +215,10 @@ impl SessionTerms {
     }
 
     /// Drain the PTY once and copy the same bytes to every subscriber.
-    fn pump(&self) {
+    /// Drain every PTY so a shell that writes while nobody is attached cannot
+    /// fill its kernel buffer and block. Idle shells are the reason this is
+    /// driven by the tick rather than only by a client poll.
+    pub fn pump(&self) {
         let panes: Vec<(String, Arc<SessionTerm>)> = {
             let g = match self.terms.lock() {
                 Ok(g) => g,
@@ -368,8 +229,7 @@ impl SessionTerms {
         let mut frames = Vec::new();
         for (id, t) in panes {
             let was_alive = t.is_alive();
-            let (chunk, notes) = t.poll_out();
-            self.push_notifies(&id, notes);
+            let chunk = t.poll_out();
             let (_, cols, rows, alive) = t.snapshot();
             if chunk.is_empty() && alive {
                 continue;
@@ -424,8 +284,7 @@ impl SessionTerms {
         panes
             .into_iter()
             .map(|(id, t)| {
-                let (chunk, notes) = t.poll_out();
-                self.push_notifies(&id, notes);
+                let chunk = t.poll_out();
                 let (_, cols, rows, alive) = t.snapshot();
                 (id, chunk, cols, rows, alive)
             })
@@ -459,7 +318,6 @@ struct Inner {
     scrollback: VecDeque<u8>,
     alive: bool,
     dsr: DsrScan,
-    notify: NotifyScan,
 }
 
 impl SessionTerm {
@@ -474,7 +332,6 @@ impl SessionTerm {
                 scrollback: VecDeque::with_capacity(4096),
                 alive: false,
                 dsr: DsrScan::default(),
-                notify: NotifyScan::default(),
             }),
         })
     }
@@ -529,13 +386,13 @@ impl SessionTerm {
 
     /// Drain newly available PTY output into scrollback and return it
     /// plus any BEL / OSC 9 / OSC 777 messages found in this chunk.
-    pub fn poll_out(&self) -> (Vec<u8>, Vec<String>) {
+    pub fn poll_out(&self) -> Vec<u8> {
         let mut g = match self.inner.lock() {
             Ok(g) => g,
-            Err(_) => return (Vec::new(), Vec::new()),
+            Err(_) => return Vec::new(),
         };
         let Some(master) = g.master.as_mut() else {
-            return (Vec::new(), Vec::new());
+            return Vec::new();
         };
         let mut buf = [0u8; 8192];
         let mut out = Vec::new();
@@ -582,9 +439,7 @@ impl SessionTerm {
                 }
             }
         }
-        let mut notes = Vec::new();
-        g.notify.feed(&out, &mut notes);
-        (out, notes)
+        out
     }
 
     pub fn snapshot(&self) -> (Vec<u8>, u16, u16, bool) {
@@ -879,17 +734,6 @@ mod tests {
     }
 
     #[test]
-    fn notify_scan_bell_and_osc() {
-        let mut s = NotifyScan::default();
-        let mut out = Vec::new();
-        s.feed(b"ok\x07", &mut out);
-        s.feed(b"\x1b]9;build done\x07", &mut out);
-        s.feed(b"\x1b]777;notify;cargo;finished\x1b\\", &mut out);
-        s.feed(b"\x1b]0;window title\x07", &mut out);
-        assert_eq!(out, vec!["", "build done", "cargo: finished"]);
-    }
-
-    #[test]
     fn resize_keeps_visible_cells() {
         let mut s = VtScreen::new(20, 4);
         s.feed(b"hello");
@@ -910,7 +754,7 @@ mod tests {
         let mut got = String::new();
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let (chunk, _) = term.poll_out();
+            let chunk = term.poll_out();
             got.push_str(&String::from_utf8_lossy(&chunk));
             if got.contains("SNIPPET_PTY_OK") {
                 term.kill();
@@ -937,7 +781,7 @@ mod tests {
     fn pump(term: &SessionTerm, vt: &mut VtScreen, ms: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
         loop {
-            let (chunk, _) = term.poll_out();
+            let chunk = term.poll_out();
             if !chunk.is_empty() {
                 vt.feed(&chunk);
                 let replies = vt.take_replies();
@@ -1027,7 +871,7 @@ mod tests {
         fn pump_one(t: &SessionTerm, vt: &mut VtScreen, ms: u64) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
             loop {
-                let (chunk, _) = t.poll_out();
+                let chunk = t.poll_out();
                 if !chunk.is_empty() {
                     vt.feed(&chunk);
                     let replies = vt.take_replies();

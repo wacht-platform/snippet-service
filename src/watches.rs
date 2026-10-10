@@ -124,7 +124,7 @@ impl WatchManager {
             ));
         }
         // Start the tail at the CURRENT end of file: "monitor this" means wake on
-        // what happens next, not re-deliver history the agent can read_file itself.
+        // what happens next, not re-deliver history the agent can read itself.
         let offset = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
         self.counter += 1;
         let record = WatchRecord {

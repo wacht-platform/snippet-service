@@ -712,7 +712,7 @@ async fn parse_openai_sse(
     })
 }
 
-/// Build the wire message list. Image messages (from read_image results) are held
+/// Build the wire message list. Image messages (from view_image results) are held
 /// and flushed only after the contiguous run of `tool` messages ends — OpenAI
 /// requires every tool result to immediately follow the assistant tool-call turn
 /// with no other message interleaved.
@@ -720,6 +720,22 @@ fn build_chat_messages(messages: &[HarnessMessage]) -> Vec<ChatMessage> {
     let mut out: Vec<ChatMessage> = Vec::new();
     let mut pending_images: Vec<ChatMessage> = Vec::new();
     for (index, message) in messages.iter().enumerate() {
+        if let (HarnessMessage::System { content }, true) = (message, index > 0) {
+            let note = crate::llm::system_reminder(content);
+            match out.last_mut() {
+                Some(last)
+                    if matches!(last.role.as_str(), "tool" | "user")
+                        && matches!(last.content, Some(Value::String(_))) =>
+                {
+                    if let Some(Value::String(text)) = last.content.as_mut() {
+                        text.push_str("\n\n");
+                        text.push_str(&note);
+                    }
+                }
+                _ => out.push(ChatMessage::text("user", &note)),
+            }
+            continue;
+        }
         for chat_message in chat_messages_from_harness(index, message) {
             let is_image = chat_message.role == "user"
                 && matches!(chat_message.content, Some(Value::Array(_)));
@@ -792,10 +808,9 @@ fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<Cha
         HarnessMessage::System { content } if index == 0 => {
             vec![ChatMessage::text("system", content)]
         }
-        HarnessMessage::System { content } => vec![ChatMessage::text(
-            "user",
-            &format!("[steering]\n{content}\n[/steering]"),
-        )],
+        HarnessMessage::System { content } => {
+            vec![ChatMessage::text("user", &crate::llm::system_reminder(content))]
+        }
         HarnessMessage::User { content } => vec![ChatMessage::text("user", content)],
         HarnessMessage::Assistant {
             content,
@@ -826,7 +841,7 @@ fn chat_messages_from_harness(index: usize, message: &HarnessMessage) -> Vec<Cha
         } => {
             let (cleaned, image) = crate::llm::split_inlined_image(content);
             let body =
-                serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                crate::llm::render_tool_result(&cleaned);
             if tool_call_id.is_empty() {
                 // Legacy state written before native function calling — render as
                 // a text block so old sessions still load.

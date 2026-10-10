@@ -75,6 +75,7 @@ impl AgentModel for AnthropicModel {
         let response: AnthropicResponse = serde_json::from_slice(&bytes)?;
         let mut content_text = None;
         let mut calls = Vec::new();
+        let mut thinking_blocks = Vec::new();
 
         for block in response.content {
             match block {
@@ -89,10 +90,15 @@ impl AgentModel for AnthropicModel {
                         ..Default::default()
                     });
                 }
-                AnthropicResponseContent::Thinking {}
-                | AnthropicResponseContent::RedactedThinking {} => {}
+                AnthropicResponseContent::Thinking { thinking, signature } => {
+                    thinking_blocks.push(json!({"type": "thinking", "thinking": thinking, "signature": signature}));
+                }
+                AnthropicResponseContent::RedactedThinking { data } => {
+                    thinking_blocks.push(json!({"type": "redacted_thinking", "data": data}));
+                }
             }
         }
+        attach_thinking(&mut calls, thinking_blocks, &self.config.model);
 
         Ok(ModelOutput {
             calls,
@@ -127,7 +133,13 @@ impl AnthropicModel {
         force_tool: bool,
         stream: bool,
     ) -> AnthropicRequest {
-        let (system_prompt, mut anthropic_messages) = prepare_messages(messages);
+        let thinking_budget = if force_tool && !tools.is_empty() {
+            None
+        } else {
+            anthropic_thinking_budget(self.config.reasoning_effort.as_deref())
+        };
+        let replay = thinking_budget.is_some().then_some(self.config.model.as_str());
+        let (system_prompt, mut anthropic_messages) = prepare_messages(messages, replay);
         let system = system_prompt.map(|prompt| {
             vec![AnthropicSystemContent {
                 content_type: "text",
@@ -164,7 +176,9 @@ impl AnthropicModel {
                 }
                 // A bare tool_use block is never the last durable block (its
                 // results follow it); skip rather than stamping it.
-                AnthropicContent::ToolUse { .. } => false,
+                AnthropicContent::ToolUse { .. }
+                | AnthropicContent::Thinking { .. }
+                | AnthropicContent::RedactedThinking { .. } => false,
             };
             let mut placed = false;
             // The live context may share the final message with preceding blocks
@@ -205,18 +219,9 @@ impl AnthropicModel {
         // Extended thinking: when reasoning is requested, enable it with a budget
         // and bump max_tokens above the budget. Anthropic requires temperature to be
         // unset (defaults to 1) when thinking is on, and forbids forced tool_choice
-        // with thinking — so drop both in that case.
-        //
-        // Thinking is only enabled on TOOL-LESS requests: with tools, Anthropic
-        // requires the assistant's `thinking` block (with its signature) to be
-        // replayed ahead of `tool_use` on the follow-up request, and this adapter
-        // doesn't capture/persist thinking blocks — every post-tool-call request
-        // would 400 (fatal) and agentic use breaks entirely.
-        let thinking_budget = if tools.is_empty() {
-            anthropic_thinking_budget(self.config.reasoning_effort.as_deref())
-        } else {
-            None
-        };
+        // with thinking — forced requests run without it. With tools, the thinking
+        // blocks of the assistant turn that made the tool calls are replayed ahead
+        // of its tool_use blocks (captured on the first call, same model only).
         let (thinking, max_tokens, temperature, tool_choice) = match thinking_budget {
             Some(budget) => (
                 Some(json!({ "type": "enabled", "budget_tokens": budget })),
@@ -275,7 +280,7 @@ impl AnthropicModel {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        return parse_anthropic_sse(response, sink).await;
+                        return parse_anthropic_sse(response, sink, &self.config.model).await;
                     }
                     let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                     let response_body = response.text().await.unwrap_or_default();
@@ -407,6 +412,7 @@ impl AnthropicModel {
 async fn parse_anthropic_sse(
     response: reqwest::Response,
     sink: &StreamHandle,
+    model: &str,
 ) -> Result<ModelOutput, ToolError> {
     // Tool-use blocks indexed by their content-block position; text is gathered
     // separately. `partial` holds the streamed argument JSON until block stop.
@@ -417,6 +423,7 @@ async fn parse_anthropic_sse(
     }
     let mut text = String::new();
     let mut tools: std::collections::BTreeMap<u64, PendingTool> = std::collections::BTreeMap::new();
+    let mut thinking: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
     let mut stop_reason: Option<String> = None;
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
@@ -448,6 +455,16 @@ async fn parse_anthropic_sse(
             Some("content_block_start") => {
                 let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let block = event.get("content_block");
+                match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
+                    Some("thinking") => {
+                        thinking.insert(index, json!({"type": "thinking", "thinking": "", "signature": ""}));
+                    }
+                    Some("redacted_thinking") => {
+                        let data = block.and_then(|b| b.get("data")).cloned().unwrap_or(json!(""));
+                        thinking.insert(index, json!({"type": "redacted_thinking", "data": data}));
+                    }
+                    _ => {}
+                }
                 if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
                     tools.insert(
                         index,
@@ -487,6 +504,17 @@ async fn parse_anthropic_sse(
                             .and_then(Value::as_str)
                         {
                             StreamBuffer::append_thinking(sink, chunk);
+                            if let Some(text) = thinking.get_mut(&index).and_then(|b| b.get_mut("thinking")) {
+                                *text = json!(format!("{}{chunk}", text.as_str().unwrap_or("")));
+                            }
+                        }
+                    }
+                    Some("signature_delta") => {
+                        if let (Some(block), Some(sig)) = (
+                            thinking.get_mut(&index),
+                            delta.and_then(|d| d.get("signature")).and_then(Value::as_str),
+                        ) {
+                            block["signature"] = json!(format!("{}{sig}", block["signature"].as_str().unwrap_or("")));
                         }
                     }
                     Some("input_json_delta") => {
@@ -560,7 +588,7 @@ async fn parse_anthropic_sse(
         ));
     }
 
-    let calls = tools
+    let mut calls: Vec<GeneratedToolCall> = tools
         .into_values()
         .map(|tool| GeneratedToolCall {
             tool_name: tool.name,
@@ -569,6 +597,7 @@ async fn parse_anthropic_sse(
             ..Default::default()
         })
         .collect();
+    attach_thinking(&mut calls, thinking.into_values().collect(), model);
 
     Ok(ModelOutput {
         calls,
@@ -673,6 +702,42 @@ pub(crate) fn anthropic_messages_url(base_url: &str) -> String {
     }
 }
 
+const THINKING_PREFIX: &str = "anthropic-thinking:";
+
+fn attach_thinking(calls: &mut [GeneratedToolCall], blocks: Vec<Value>, model: &str) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(first) = calls.first_mut() {
+        first.signature = Some(format!("{THINKING_PREFIX}{}", Value::Array(blocks)));
+        first.origin_model = Some(model.to_string());
+    }
+}
+
+fn replayed_thinking(calls: &[crate::llm::ToolCallRecord], model: &str) -> Vec<AnthropicContent> {
+    let Some(first) = calls.first() else { return Vec::new() };
+    if first.origin_model.as_deref() != Some(model) {
+        return Vec::new();
+    }
+    let Some(raw) = first.signature.as_deref().and_then(|s| s.strip_prefix(THINKING_PREFIX)) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<Value>>(raw)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+            Some("thinking") => Some(AnthropicContent::Thinking {
+                thinking: block.get("thinking").and_then(Value::as_str).unwrap_or("").to_string(),
+                signature: block.get("signature").and_then(Value::as_str).unwrap_or("").to_string(),
+            }),
+            Some("redacted_thinking") => Some(AnthropicContent::RedactedThinking {
+                data: block.get("data").and_then(Value::as_str).unwrap_or("").to_string(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 fn anthropic_thinking_budget(effort: Option<&str>) -> Option<u32> {
     match effort?.to_ascii_lowercase().as_str() {
         "low" => Some(2048),
@@ -708,10 +773,17 @@ enum AnthropicContent {
     ToolResult {
         tool_use_id: String,
         // String for text-only results, or an array of blocks (text + image) when
-        // a read_image result carries an inlined image.
+        // a view_image result carries an inlined image.
         content: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<Value>,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
     },
 }
 
@@ -753,11 +825,16 @@ enum AnthropicResponseContent {
         name: String,
         input: Value,
     },
-    // Extended-thinking blocks (tool-less requests can enable thinking); the
-    // buffered path has nowhere to show them, but parsing must not fail on them.
-    // Fields intentionally ignored.
-    Thinking {},
-    RedactedThinking {},
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default)]
+        signature: String,
+    },
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -770,7 +847,10 @@ struct AnthropicUsage {
     cache_read_input_tokens: u64,
 }
 
-fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<AnthropicMessage>) {
+fn prepare_messages(
+    harness_msgs: &[HarnessMessage],
+    replay_model: Option<&str>,
+) -> (Option<String>, Vec<AnthropicMessage>) {
     let mut system_prompt = None;
     let mut prepared = Vec::new();
 
@@ -780,8 +860,7 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                 system_prompt = Some(content.clone());
             }
             HarnessMessage::System { content } => {
-                let text = format!("[steering]\n{content}\n[/steering]");
-                push_block(&mut prepared, "user", text_block(text));
+                push_block(&mut prepared, "user", text_block(crate::llm::system_reminder(content)));
             }
             HarnessMessage::User { content } => {
                 push_block(&mut prepared, "user", text_block(content.clone()));
@@ -790,7 +869,13 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                 content,
                 tool_calls,
             } => {
-                // Assistant turn: optional text, then a tool_use block per call.
+                // Assistant turn: replayed thinking, optional text, then a tool_use
+                // block per call.
+                if let Some(model) = replay_model {
+                    for block in replayed_thinking(tool_calls, model) {
+                        push_block(&mut prepared, "assistant", block);
+                    }
+                }
                 if !content.is_empty() {
                     push_block(&mut prepared, "assistant", text_block(content.clone()));
                 }
@@ -817,7 +902,7 @@ fn prepare_messages(harness_msgs: &[HarnessMessage]) -> (Option<String>, Vec<Ant
                 // a giant base64 string in the text.
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
                 let body =
-                    serde_json::to_string_pretty(&cleaned).unwrap_or_else(|_| cleaned.to_string());
+                    crate::llm::render_tool_result(&cleaned);
                 if tool_call_id.is_empty() {
                     // Legacy state (pre native function calling) — render as text.
                     let text = format!(

@@ -1,10 +1,10 @@
 use super::*;
 
-// Single TUI palette — same AMOLED Black as the Flutter client.
 #[derive(Clone, Copy)]
 pub(super) struct Theme {
     pub(super) accent: Color,
     pub(super) text: Color,
+    pub(super) soft: Color,
     pub(super) muted: Color,
     pub(super) faint: Color,
     pub(super) success: Color,
@@ -12,25 +12,33 @@ pub(super) struct Theme {
     pub(super) warn: Color,
     pub(super) lane: Color,
     pub(super) code: Color,
+    pub(super) surface1: Color,
+    pub(super) surface2: Color,
+    pub(super) surface3: Color,
+    pub(super) border2: Color,
 }
 
-const AMOLED: Theme = Theme {
-    accent: Color::Rgb(96, 165, 250),
-    text: Color::Rgb(229, 231, 235),
-    muted: Color::Rgb(156, 163, 175),
-    faint: Color::Rgb(107, 114, 128),
-    success: Color::Rgb(52, 211, 153),
-    danger: Color::Rgb(248, 113, 113),
-    warn: Color::Rgb(251, 191, 36),
-    lane: Color::Rgb(96, 165, 250),
-    code: Color::Rgb(209, 213, 219),
+const DARK: Theme = Theme {
+    accent: Color::Rgb(0x8B, 0x8D, 0xFF),
+    text: Color::Rgb(0xEE, 0xEE, 0xF1),
+    soft: Color::Rgb(0xC4, 0xC4, 0xCC),
+    muted: Color::Rgb(0x8F, 0x8F, 0x9B),
+    faint: Color::Rgb(0x6B, 0x6B, 0x77),
+    success: Color::Rgb(0x4C, 0xC3, 0x8A),
+    danger: Color::Rgb(0xEB, 0x57, 0x57),
+    warn: Color::Rgb(0xD9, 0x9E, 0x45),
+    lane: Color::Rgb(0xD9, 0x9E, 0x45),
+    code: Color::Rgb(0xC4, 0xC4, 0xCC),
+    surface1: Color::Rgb(0x17, 0x17, 0x1A),
+    surface2: Color::Rgb(0x1E, 0x1E, 0x22),
+    surface3: Color::Rgb(0x26, 0x26, 0x2B),
+    border2: Color::Rgb(0x32, 0x32, 0x38),
 };
 
 pub(super) fn theme() -> Theme {
-    AMOLED
+    DARK
 }
 
-/// Persisted config names still load; every name is AMOLED.
 pub(super) fn set_theme_by_name(_name: &str) -> bool {
     true
 }
@@ -62,6 +70,21 @@ pub(super) fn lane() -> Color {
 pub(super) fn code() -> Color {
     theme().code
 }
+pub(super) fn soft() -> Color {
+    theme().soft
+}
+pub(super) fn surface1() -> Color {
+    theme().surface1
+}
+pub(super) fn surface2() -> Color {
+    theme().surface2
+}
+pub(super) fn surface3() -> Color {
+    theme().surface3
+}
+pub(super) fn border2() -> Color {
+    theme().border2
+}
 
 pub(super) fn subtle() -> Style {
     Style::default().fg(muted())
@@ -69,4 +92,96 @@ pub(super) fn subtle() -> Style {
 
 pub(super) fn blue() -> Color {
     accent()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG relative luminance. Every palette entry is `Color::Rgb`.
+    fn luminance(c: Color) -> f64 {
+        let (r, g, b) = match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("palette entries must be Rgb, got {other:?}"),
+        };
+        fn ch(v: u8) -> f64 {
+            let v = v as f64 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+    }
+
+    fn contrast(a: Color, b: Color) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// How colourful a value is, 0.0 (grey) to 1.0.
+    fn saturation(c: Color) -> f64 {
+        let (r, g, b) = match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => return 0.0,
+        };
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        if mx == 0 {
+            0.0
+        } else {
+            (mx - mn) as f64 / mx as f64
+        }
+    }
+
+    /// The neutral ramp must descend in luminance, or the hierarchy inverts.
+    #[test]
+    fn the_neutral_ramp_descends() {
+        let t = theme();
+        let ramp = [
+            ("text", t.text),
+            ("soft", t.soft),
+            ("muted", t.muted),
+            ("faint", t.faint),
+        ];
+        for pair in ramp.windows(2) {
+            let (hi_name, hi) = pair[0];
+            let (lo_name, lo) = pair[1];
+            assert!(
+                luminance(hi) > luminance(lo),
+                "{hi_name} must be lighter than {lo_name}, but {:.3} <= {:.3}",
+                luminance(hi),
+                luminance(lo),
+            );
+        }
+    }
+
+    /// Adjacent steps must actually separate, not merely be ordered: two greys a
+    /// hundredth of a ratio apart read as the same tone.
+    #[test]
+    fn adjacent_ramp_steps_separate() {
+        let t = theme();
+        for (a, b, name) in [
+            (t.text, t.soft, "text/soft"),
+            (t.soft, t.muted, "soft/muted"),
+            (t.muted, t.faint, "muted/faint"),
+        ] {
+            let c = contrast(a, b);
+            assert!(c >= 1.25, "{name} separates by only {c:.2}");
+        }
+    }
+
+    #[test]
+    fn the_accent_is_a_distinct_readable_hue() {
+        let t = theme();
+        assert!(saturation(t.accent) > 0.3, "the accent must read as a colour");
+        for (surface, name) in [(Color::Rgb(0x10, 0x10, 0x12), "bg"), (t.surface1, "surface1"), (t.surface2, "surface2")] {
+            let c = contrast(t.accent, surface);
+            assert!(c >= 4.5, "accent on {name} = {c:.2}");
+            let c = contrast(t.faint, surface);
+            assert!(c >= 3.0, "faint on {name} = {c:.2}");
+        }
+    }
 }

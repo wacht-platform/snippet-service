@@ -18,8 +18,9 @@
 
 ## What it does
 
-- Durable coding sessions with checkpoints, rewind, history compaction, and persistent workspace memory.
-- Read, write, edit, search, shell, browser-control, file, git, and web-search tools.
+- Durable coding sessions with checkpoints, rewind, and history compaction; compacted messages stay searchable with `snippet history`.
+- Persistent memory per repository — rules, learnings, and a generated table of contents of notes — shared by all of its worktrees.
+- A small tool set: a stateful shell, one all-or-nothing file-change tool, image viewing, web search, and browser control.
 - Multiple provider profiles with global and per-conversation model selection.
 - Anthropic, OpenAI, Gemini, OpenRouter, OpenAI-compatible endpoints, local models, and ChatGPT subscription login.
 - Delegated background lanes with live progress and recovery after reconnects.
@@ -117,6 +118,28 @@ supports_images = false
 Supported provider values include `anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, and `openai-compatible`. Profile settings also cover temperature, image support, context size, compaction thresholds, prompt caching, and user-agent options.
 
 Optional top-level integrations include `exa_api_key` for web search and `assemblyai_api_key` for remote voice transcription. Keys remain on the daemon and are not returned by the configuration API.
+
+## Memory and history
+
+The agent keeps durable memory as plain markdown it reads and edits like any other file:
+
+```text
+~/.snippet/projects/<repo>-<id>/memory/   one per repository, shared by its worktrees
+  rules.md                  standing directives, one `- [r1] …` line each
+  learnings.md              reusable lessons with helpful/harmful counts
+  notes/<section>/<id>.md   one topic per note, behind a title/summary header
+~/.snippet/memory/          rules.md and learnings.md that apply to every project
+```
+
+Each session's prompt carries the rules, the most helpful learnings, and a table of contents generated from the notes. After a request that did real work, a reflection pass marks what helped or hurt and records what is worth keeping. Set `memory_enabled = false` or `memory_reflect = false` in `~/.snippet/config.toml` to turn memory or the reflection pass off.
+
+Messages moved out of context by compaction are archived and searchable from the agent's shell:
+
+```sh
+snippet history search 'E0308'
+snippet history show 412 413
+snippet history show --from 410 --to 420
+```
 
 ## Data and security
 

@@ -595,7 +595,7 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
             HarnessMessage::System { content } => push_content(
                 &mut contents,
                 "user",
-                vec![json!({ "text": format!("[steering]\n{content}\n[/steering]") })],
+                vec![json!({ "text": crate::llm::system_reminder(content) })],
             ),
             HarnessMessage::User { content } => {
                 push_content(&mut contents, "user", vec![json!({ "text": content })])
@@ -637,11 +637,7 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
                 tool_name, content, ..
             } => {
                 let (cleaned, image) = crate::llm::split_inlined_image(content);
-                let response = if cleaned.is_object() {
-                    cleaned
-                } else {
-                    json!({ "result": cleaned })
-                };
+                let response = json!({ "output": crate::llm::render_tool_result(&cleaned) });
                 let mut parts = vec![json!({
                     "functionResponse": { "name": tool_name, "response": response }
                 })];
