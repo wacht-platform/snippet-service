@@ -190,6 +190,7 @@ impl CodingHarness {
                 // without this, a lone SetMode while parked never persisted and
                 // the desktop chip stayed stale until some later event.
                 let mut needs_persist = false;
+                let mut woke = false;
                 for input in std::mem::take(&mut pending_inputs) {
                     match input {
                         // Buffered /compact must actually run — `apply_input`
@@ -262,6 +263,7 @@ impl CodingHarness {
                                 needs_persist = true;
                             }
                             self.apply_input(&mut state, other);
+                            woke |= !was_running && state.status == HarnessStatus::Running;
                         }
                     }
                 }
@@ -272,7 +274,7 @@ impl CodingHarness {
                     self.run_manual_compaction(model, &mut state, &lanes)
                         .await?;
                 }
-                if had_user_msg || was_running {
+                if had_user_msg || was_running || woke {
                     state.status = HarnessStatus::Running;
                     // Running path persists below; still flush meta now so a
                     // mid-run /mode flip reaches clients before the next step ends.

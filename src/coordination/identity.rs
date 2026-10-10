@@ -69,7 +69,11 @@ impl AgentHome {
     }
 
     pub fn read_identity(&self) -> Result<String, IdentityError> {
-        let bytes = std::fs::read(self.identity_path())?;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(self.identity_path())?
+            .take(MAX_IDENTITY_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
         if bytes.len() > MAX_IDENTITY_BYTES {
             return Err(IdentityError::TooLarge(bytes.len()));
         }

@@ -300,6 +300,7 @@ pub(crate) async fn create_agent(
         "# {}\n\nAgent handle: @{}\n\nThis identity is awaiting its first build and research pass.\n",
         agent.display_name, agent.handle
     );
+    let fresh_home = !home.root().exists();
     if let Err(error) = home.ensure_layout(&default_identity) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -309,8 +310,27 @@ pub(crate) async fn create_agent(
     }
     match d.store.create_agent(&agent) {
         Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(),
-        Err(error) => (StatusCode::CONFLICT, format!("create agent: {error}")).into_response(),
+        Err(error) => {
+            if fresh_home {
+                let _ = std::fs::remove_dir_all(home.root());
+            }
+            let status = if is_unique_violation(&error) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, format!("create agent: {error}")).into_response()
+        }
     }
+}
+
+fn is_unique_violation(error: &crate::store::StoreError) -> bool {
+    matches!(
+        error,
+        crate::store::StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+            if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                || e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
 }
 
 #[derive(Deserialize)]
