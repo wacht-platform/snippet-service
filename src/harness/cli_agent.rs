@@ -194,6 +194,7 @@ struct CliParse {
     calls: Vec<crate::llm::TokenUsage>,
     claude_call: Option<crate::llm::TokenUsage>,
     served: ServedResults,
+    envelope_marker: Option<PathBuf>,
 }
 
 pub struct CliAgentModel {
@@ -508,6 +509,11 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
             }
             let failed = value.get("status").and_then(Value::as_str) == Some("error");
             let mut content = vec![json!({"type": "text", "text": value.to_string()})];
+            if let Some(marker) = crate::antigravity::envelope_marker(&format!("/mcp/{}", state.token))
+                && std::fs::remove_file(&marker).is_ok()
+            {
+                content.push(json!({"type": "text", "text": "<system-reminder>Your previous call_mcp_tool call was rejected before it ran because it left out toolSummary or toolAction. Include both on every call.</system-reminder>"}));
+            }
             let steers: Vec<String> = state.steers.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
             if !steers.is_empty() {
                 content.push(json!({"type": "text", "text": format!(
@@ -1097,7 +1103,11 @@ impl CodingHarness {
         if kind == CliKind::Antigravity {
             session.tool_guide = guide;
         }
-        let mut parse = CliParse { served, ..Default::default() };
+        let mut parse = CliParse {
+            served,
+            envelope_marker: crate::antigravity::envelope_marker(&mcp_url),
+            ..Default::default()
+        };
         let mut pending_approval: Option<McpCall> = None;
         let mut pending_vault = false;
         let mut pending_custom: Option<crate::agent_tools::CustomTool> = None;
@@ -1886,6 +1896,23 @@ impl CodingHarness {
                                 .is_some_and(|m| m.contains("missing properties") && (m.contains("toolSummary") || m.contains("toolAction")));
                         let quiet = schema_read || redirected || envelope_rejected || QUIET_TOOLS.contains(&name.as_str());
                         let mut changed = false;
+                        if envelope_rejected {
+                            if let Some(marker) = parse.envelope_marker.as_ref() {
+                                if let Some(dir) = marker.parent() {
+                                    let _ = std::fs::create_dir_all(dir);
+                                }
+                                let _ = std::fs::write(marker, &name);
+                            }
+                            if parse.agy_tools.remove(&index)
+                                && let Some(at) = state.events.iter().rposition(|e| {
+                                    matches!(e, HarnessEvent::ToolCall { tool_name, .. } if *tool_name == name)
+                                })
+                            {
+                                state.events.remove(at);
+                                state.events_rewritten = true;
+                                changed = true;
+                            }
+                        }
                         let announce = mcp || done.is_some_and(|d| d == "DONE" || d == "ERROR");
                         if announce && !quiet && parse.agy_tools.insert(index) {
                             state.events.push(HarnessEvent::ToolCall { tool_name: name.clone(), arguments });

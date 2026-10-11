@@ -1331,10 +1331,19 @@ async fn open_session(
             ))),
             Some(d.browser.summary_provider()),
         );
-        if persisted.is_none() {
-            if let Some(name) = req.profile.as_ref() {
-                write_session_profile(&sp, name); // seed the initial override
-            }
+        if persisted.is_none()
+            && let Some(name) = req.profile.clone()
+        {
+            let sp = sp.clone();
+            tokio::spawn(async move {
+                for _ in 0..100 {
+                    if crate::session::read_session_meta(&sp).is_some() {
+                        write_session_profile(&sp, &name);
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
         }
         sessions.insert(id.clone(), live_from_handle(handle, profile));
     }
