@@ -6,34 +6,54 @@ impl CodingHarness {
         model: &mut dyn AgentModel,
         window_text: &str,
     ) -> Result<String, ToolError> {
-        // The whole table is written in ONE call. Extra turns exist only to fill a
-        // missing required section or compress to budget — and a pure over-budget
-        // retry re-sends only the (small) table, never the full window again. This
-        // is the token fix: the old per-section loop re-sent the entire window on
-        // every one of up to 16 turns (~window × 16); now it's ~window × 1.
         const MAX_TURNS: usize = 4;
-        const BUDGET_CHARS: usize = 21_000; // ~6k tokens at ~3.5 chars/token
+        const BUDGET_CHARS: usize = 9_000;
+        const MEMORY_CHARS: usize = 16_000;
 
-        let tools = summarizer_tools();
-        // The last full table we assembled (used for a cheap, window-free trim turn).
+        let repos = if self.config.memory_enabled && self.context.lane_origin().is_none() {
+            self.memory_scopes()
+        } else {
+            Vec::new()
+        };
+        let source = self
+            .session_id()
+            .map(|id| format!("snippet://session/{id}"))
+            .unwrap_or_else(|| "snippet://session".to_string());
+        let mut memory_open = !repos.is_empty();
+        let mut saved: Vec<String> = Vec::new();
+        let mut touched: Vec<String> = Vec::new();
         let mut over_budget_table: Option<String> = None;
         let mut feedback = String::new();
+        let mut result: Option<String> = None;
 
         for _turn in 1..=MAX_TURNS {
-            // Over-budget retry: hand back only the table to compress — the raw
-            // window isn't needed to shrink an existing table, and re-sending it is
-            // the whole cost we're avoiding. Every other turn sends the window.
             let user = if let Some(table) = &over_budget_table {
                 format!(
-                    "Compress this context summary to fit the ~6k-token budget. Drop the lowest-value \
-                     detail from the largest/oldest sections; keep every exact path, id, error string, \
-                     decision, the complete user_requests list, and the recent thread. Return the FULL summary via write_table.\n\n\
+                    "Compress this context summary to fit the ~2.5k-token budget. Cut the oldest, lowest-value \
+                     detail; keep the complete user_requests list, exact values and next steps. Return the FULL summary via write_table.\n\n\
                      CURRENT SUMMARY:\n{table}\n\n{feedback}"
                 )
             } else {
+                let memory = if memory_open {
+                    format!(
+                        "MEMORY REPOS:\n{}\n\n",
+                        clip(&render_repos(&repos), MEMORY_CHARS)
+                    )
+                } else if !saved.is_empty() {
+                    format!(
+                        "ALREADY SAVED TO MEMORY (point to these, do not resave):\n{}\n\n",
+                        saved.join("\n")
+                    )
+                } else {
+                    String::new()
+                };
+                let ask = if memory_open {
+                    "Call update_memory with what lasts, and write_table with every required section."
+                } else {
+                    "Call write_table once, with every required section filled."
+                };
                 format!(
-                    "Conversation to compact; fold all of it into one Antigravity-style <CONTEXT_SUMMARY>:\n{window_text}\n\n\
-                     Call write_table once, with every section filled.{}",
+                    "{memory}Conversation to compact:\n{window_text}\n\n{ask}{}",
                     if feedback.is_empty() {
                         String::new()
                     } else {
@@ -47,17 +67,34 @@ impl CodingHarness {
                 },
                 HarnessMessage::User { content: user },
             ];
+            let mut tools = summarizer_tools();
+            if memory_open {
+                tools.extend(memory_reflector_tools());
+            }
             let output = model.generate(&messages, &tools, true, None).await?;
-            let Some(call) = output
-                .calls
-                .first()
-                .filter(|c| c.tool_name == "write_table")
-            else {
-                feedback = "Call write_table once, filling every section.".to_string();
+
+            if memory_open
+                && let Some(call) = output.calls.iter().find(|c| c.tool_name == "update_memory")
+            {
+                memory_open = false;
+                let (applied, errors) = apply_changes(&repos, &call.arguments, &source);
+                for (key, line) in applied {
+                    self.debug_log(&format!("compaction memory: {key} {line}"));
+                    if !touched.contains(&key) {
+                        touched.push(key);
+                    }
+                    saved.push(line);
+                }
+                for error in errors {
+                    self.debug_log(&format!("compaction memory rejected: {error}"));
+                }
+            }
+
+            let Some(call) = output.calls.iter().find(|c| c.tool_name == "write_table") else {
+                feedback = "Call write_table once, filling every required section.".to_string();
                 continue;
             };
 
-            // Pull each section out of the single call.
             let mut sections: BTreeMap<&'static str, String> = BTreeMap::new();
             for (name, ..) in SUMMARY_SECTIONS {
                 if let Some(v) = call
@@ -71,7 +108,6 @@ impl CodingHarness {
                 }
             }
 
-            // Fallback: if user_requests was omitted by the model, restore the pre-extracted list
             if sections
                 .get("user_requests")
                 .map(|s| s.trim().is_empty())
@@ -92,7 +128,6 @@ impl CodingHarness {
 
             let missing = required_missing(&sections);
             if !missing.is_empty() {
-                // Model left a required section empty — needs the window again.
                 over_budget_table = None;
                 feedback = format!(
                     "Required section(s) empty: {}. Fill them from the conversation.",
@@ -108,14 +143,25 @@ impl CodingHarness {
                 feedback = format!("Currently ~{over} chars over budget.");
                 continue;
             }
-            return Ok(assembled);
+            result = Some(assembled);
+            break;
         }
 
-        // Turn cap hit: use the last over-budget table (hard-trimmed) if we have one,
-        // else give up so the caller falls back to heuristic compaction.
+        for repo in repos.iter().filter(|r| touched.contains(&r.key)) {
+            if let Err(e) = repo.commit_all("Save working state before compaction") {
+                self.debug_log(&format!("compaction memory commit {}: {e}", repo.key));
+            }
+        }
+        if !touched.is_empty() {
+            self.tidy_memory();
+        }
+
+        if let Some(table) = result {
+            return Ok(table);
+        }
         if let Some(table) = over_budget_table {
             return Ok(table.chars().take(BUDGET_CHARS).collect::<String>()
-                + "\n…[trimmed to the 6k-token budget]");
+                + "\n…[trimmed to the summary budget]");
         }
         Err(ToolError::msg("summarizer did not produce a valid table"))
     }

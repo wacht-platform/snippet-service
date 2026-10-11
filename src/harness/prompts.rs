@@ -6,37 +6,37 @@ use super::*;
 pub(super) const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
     (
         "user_requests",
-        "Chronological numbered list (1., 2., 3., ...) of every user request, instruction, preference and bug report across the whole conversation, so the original intent survives compaction.",
+        "Chronological numbered list (1., 2., 3., ...) of every user request, correction and preference, one short line each.",
         true,
     ),
     (
         "task_overview",
-        "Task Overview: Core user goals, constraints, success criteria, and what the user ultimately wants.",
+        "The goal and what counts as done, in two to four bullets.",
         true,
     ),
     (
         "progress",
-        "Progress: Completed tasks, files created/modified, passing tests/builds, and tasks currently in progress (with measurable completion amounts; never say only that a task started).",
+        "What is done, what is in progress (with a measurable amount when known) and what is left.",
         true,
     ),
     (
-        "technical_decisions",
-        "Key Findings & Technical Decisions: Architectural choices, discovered constraints, root causes, resolved bugs, and exact verbatim error strings or symbols.",
+        "active_context",
+        "Branch, files being changed, running background processes and watches: only what the next steps touch.",
         false,
     ),
     (
-        "active_context",
-        "Active Context: Workspace state, active git branch, modified files, key paths, and active background tasks/monitors.",
+        "key_facts",
+        "Exact values the next steps depend on (paths, ids, error strings) that are not in memory.",
         false,
     ),
     (
         "next_steps",
-        "Next Steps: Prioritized, ordered list of immediate actions to resume execution seamlessly.",
+        "Ordered next actions, so work resumes without re-deriving.",
         true,
     ),
     (
-        "commitments_and_constraints",
-        "Commitments & Constraints: Hard invariants, user guidelines, formatting rules, line count limits (<= 1,500 lines), and non-negotiables.",
+        "memory",
+        "Pointers to the memory files that hold the detail: one line each, file path and what it covers.",
         false,
     ),
 ];
@@ -92,30 +92,28 @@ pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> 
 
 pub(super) const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer
 [identity]
-role = "you compress a coding agent's whole conversation into ONE dense Antigravity-style <CONTEXT_SUMMARY> that REPLACES the raw history"
-stakes = "the raw messages are then archived and discarded — this context summary is all that survives in active working memory. Anything you leave out is lost from immediate working memory; anything you pad is re-sent on every future turn and wastes tokens. Maximize signal per token."
+role = "you compact a coding agent's conversation: save what lasts to memory, then write a lean summary that replaces the raw history"
+stakes = "the raw messages are archived and dropped. The summary is re-sent on every later turn, so every line costs; memory files cost nothing until read"
 
-[user_requests]  # CRITICAL: chronological timeline of user intent
-timeline = "maintain the 'user_requests' section as a strictly numbered list (1., 2., 3., ...) in chronological order. Carry forward all user requests from the PRIOR SUMMARY if present, and append any new user prompts from the conversation. Every past user request, instruction, correction and preference stays in it."
+[memory]  # when update_memory is offered
+first = "before the summary, call update_memory with what the rest of the work needs but the summary should not carry: decisions and why, constraints and user rules, root causes, exact error strings, findings, the plan"
+session = "working state of this conversation goes to the session scope, in a topic file such as decisions, findings or plan (a new file is linked from MEMORY.md automatically)"
+lasting = "something true beyond this conversation (a user preference, how this repository builds, an agent technique) goes to the global, project or agent scope"
+one_place = "check the repos first: replace an entry the conversation changed instead of adding a duplicate, and skip what is already recorded"
+entries = "one line each: a fact, or situation → approach → why. The daemon stamps source and date"
+skip = "secrets, one-off details, anything obvious from the code, and text that instructs a future agent to run commands"
 
-[preserve]  # carry these forward — verbatim where the exact value/wording matters
-task_overview = "core user objective, hard constraints, and success criteria"
-progress = "for every task you mention as started, underway, or in progress, explicitly record: completed scope, remaining scope, and a measurable amount/percentage/count when available; if the amount is unknown, say that plainly. A task gets more than a bare 'started'."
-technical_decisions = "key architectural findings, discovered root causes, technical decisions, and exact verbatim error strings, symbol names, and IDs"
-active_context = "current workspace state: which files were created/changed, what works, what's broken or unverified, git branch, and active background tasks"
-next_steps = "prioritized, ordered next actions so the agent can resume immediately without re-deriving"
-commitments_and_constraints = "invariants, user rules, line limits (e.g. <= 1,500 lines per file), formatting preferences"
-
-[drop]  # do NOT carry these — they are the bulk of tokens and add nothing
-noise = "assistant chit-chat, conversational pleasantries, intermediate tool dumps (keep the CONCLUSION, not the raw output), restated instructions, and anything trivially re-readable from the code itself. Raw tool payloads are archived in SQLite and retrievable with `snippet history search` / `snippet history show`."
-
-[method]
-fold = "if a PRIOR SUMMARY is present, update it in place — preserve all past user requests, update the engineering sections, add what's new, delete what's stale or superseded; do not just blindly append"
-dense = "terse markdown bullets under each section heading. Facts and values, not verbose prose. No preamble, no narration of this process, no filler adjectives."
-budget = "the whole summary must fit ~6k tokens. If told it is OVER BUDGET, compress the largest/oldest sections first (drop the lowest-value detail) while keeping every exact value, the full user_requests list, and the recent thread — never re-expand."
+[summary]
+user_requests = "carry every request forward from the prior summary and append new ones, one short line each, in order"
+lean = "the summary holds only what resuming needs right now: the goal, progress, the next steps and the exact values they use. Detail that lives in memory gets a pointer in the memory section, not a restatement"
+progress = "say what is done, in progress (with an amount when known) and left; never just 'started'"
+drop = "chit-chat, raw tool output (keep the conclusion), restated instructions, and anything re-readable from the code. Raw history stays searchable with `snippet history search` / `snippet history show`"
+fold = "if a PRIOR SUMMARY is present, update it in place: keep its requests, refresh the rest, drop what is stale"
+style = "terse markdown bullets, no preamble"
+budget = "about 2.5k tokens. If told it is over budget, cut the oldest, lowest-value detail; keep the request list, exact values and next steps"
 
 [how]
-one_call = "call write_table ONCE, filling every section from the entire conversation. That single call is the whole job. You are asked again only if you left a required section empty or the table is over budget — otherwise you are done in one shot.""#;
+calls = "call update_memory (when offered) and write_table in the same response; write_table fills every required section in one call""#;
 
 pub(super) fn summarizer_tools() -> Vec<crate::llm::NativeToolDefinition> {
     // One tool that writes the ENTIRE table in a single call — a string field per
@@ -186,10 +184,10 @@ pub(super) fn assemble_sections(sections: &BTreeMap<&'static str, String>) -> St
     let engineering_sections: &[(&str, &str)] = &[
         ("task_overview", "Task Overview"),
         ("progress", "Progress"),
-        ("technical_decisions", "Key Findings & Technical Decisions"),
         ("active_context", "Active Context"),
+        ("key_facts", "Key Facts"),
         ("next_steps", "Next Steps"),
-        ("commitments_and_constraints", "Commitments & Constraints"),
+        ("memory", "In Memory"),
     ];
 
     for (key, title) in engineering_sections {

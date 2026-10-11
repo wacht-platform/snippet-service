@@ -297,19 +297,19 @@ impl Tool for PingUser {
 pub fn add_worker_report_tool(registry: &mut ToolRegistry) {
     registry.insert(ReportMissionTask);
     registry.insert(InviteTaskAgent);
+    registry.insert(ViewTaskBoard);
 }
 
 /// Read-only session awareness, for a session that ROUTES work rather than doing
 /// it.
 ///
-/// Deliberately only the two read tools: a coordination session needs to know
-/// which sessions exist and what a given one is doing so it can dispatch into the
-/// right place, but the task board stays Mission Control's — the runtime owns
-/// task state, and a peer agent reading it would invite it to start managing work
-/// it does not own.
+/// Read tools only: a coordination session needs to know which sessions exist,
+/// what a given one is doing and who is on which task so it can dispatch into
+/// the right place, but changing the task board stays Mission Control's.
 pub fn add_coordination_session_tools(registry: &mut ToolRegistry) {
     registry.insert(ListSessions);
     registry.insert(InspectSession);
+    registry.insert(ViewTaskBoard);
 }
 
 pub struct ListSessions;
@@ -511,6 +511,53 @@ impl Tool for ListMissionTasks {
             .collect();
         let hidden = tasks.len() - shown.len();
         Ok(ToolResult::success(json!({"tasks": shown, "older_finished_hidden": hidden})))
+    }
+}
+
+pub struct ViewTaskBoard;
+#[async_trait]
+impl Tool for ViewTaskBoard {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "view_task_board".into(),
+            description: "Who is doing what: every open task and those finished in the last day, with status, the session doing it and the agents on it. Use it to check whether someone is already on something, or to find the task to message (send_agent_message to task:<id>). inspect_task gives one task's detail.".into(),
+            input_schema: schema(json!({}), &[]),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
+        let db = db(ctx)?;
+        let tasks = db
+            .list_tasks(None, None)
+            .map_err(|e| ToolError::msg(format!("list tasks: {e}")))?;
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+        let shown: Vec<Value> = tasks
+            .iter()
+            .filter(|task| {
+                !task.status.is_terminal() || {
+                    let finished = task.completed_at.as_deref().unwrap_or(&task.updated_at);
+                    chrono::DateTime::parse_from_rfc3339(finished).map_or(true, |at| at >= cutoff)
+                }
+            })
+            .map(|task| {
+                let team: Vec<String> = db
+                    .list_task_agents(&task.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|m| m.removed_at.is_none())
+                    .map(|m| format!("{} ({})", m.agent_id, m.role))
+                    .collect();
+                json!({
+                    "id": task.id,
+                    "title": task.title,
+                    "status": task.status,
+                    "session_id": task.session_id,
+                    "team": team,
+                    "requested_by": task.created_by_id,
+                    "updated_at": task.updated_at,
+                })
+            })
+            .collect();
+        Ok(ToolResult::success(json!({"tasks": shown})))
     }
 }
 

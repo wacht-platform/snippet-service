@@ -613,7 +613,7 @@ Goal: web server
         sections.insert("user_requests", "1. Initial goal\n2. Add test".to_string());
         sections.insert("task_overview", "Core goal and constraints".to_string());
         sections.insert("progress", "Implemented feature; all tests passing".to_string());
-        sections.insert("technical_decisions", "Used SQLite FTS5 for search".to_string());
+        sections.insert("key_facts", "Used SQLite FTS5 for search".to_string());
         sections.insert("next_steps", "1. Deploy to staging".to_string());
 
         let assembled = assemble_sections(&sections);
@@ -622,7 +622,7 @@ Goal: web server
         assert!(assembled.contains("# Previous Session Summary:\n<summary>\n"));
         assert!(assembled.contains("### 1. Task Overview\nCore goal and constraints\n\n"));
         assert!(assembled.contains("### 2. Progress\nImplemented feature; all tests passing\n\n"));
-        assert!(assembled.contains("### 3. Key Findings & Technical Decisions\nUsed SQLite FTS5 for search\n\n"));
+        assert!(assembled.contains("### 3. Key Facts\nUsed SQLite FTS5 for search\n\n"));
         assert!(assembled.contains("### 4. Next Steps\n1. Deploy to staging\n\n"));
         assert!(assembled.ends_with("</summary>\n</CONTEXT_SUMMARY>"));
     }
