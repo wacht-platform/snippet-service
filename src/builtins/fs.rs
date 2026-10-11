@@ -58,6 +58,52 @@ impl Tool for ViewImageTool {
 
 pub struct ChangeFilesTool;
 
+/// Repair the shapes models commonly send instead of the schema: `changes`
+/// as a JSON string, a single change at the top level, null entries, a
+/// missing `action` (inferred from the fields present), or a shared top-level
+/// `path`. A well-formed call passes through unchanged.
+fn normalize_changes(arguments: Value) -> Value {
+    let Value::Object(mut top) = arguments else { return arguments };
+    if let Some(Value::String(raw)) = top.get("changes") {
+        if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+            top.insert("changes".into(), parsed);
+        }
+    }
+    if !top.contains_key("changes") && top.contains_key("path") {
+        let single: serde_json::Map<String, Value> = top.clone();
+        top = serde_json::Map::new();
+        top.insert("changes".into(), Value::Array(vec![Value::Object(single)]));
+    }
+    let shared_path = top.get("path").cloned();
+    if let Some(Value::Array(changes)) = top.get_mut("changes") {
+        changes.retain(|c| c.is_object());
+        for change in changes.iter_mut() {
+            let Value::Object(fields) = change else { continue };
+            if !fields.contains_key("path") {
+                if let Some(path) = shared_path.clone() {
+                    fields.insert("path".into(), path);
+                }
+            }
+            if !fields.contains_key("action") {
+                let has = |keys: &[&str]| keys.iter().any(|k| fields.contains_key(*k));
+                let action = if has(&["find", "old_string", "old", "search"]) {
+                    Some("replace")
+                } else if has(&["to", "new_path", "destination"]) {
+                    Some("move")
+                } else if has(&["content", "text"]) {
+                    Some("create")
+                } else {
+                    None
+                };
+                if let Some(action) = action {
+                    fields.insert("action".into(), Value::String(action.into()));
+                }
+            }
+        }
+    }
+    Value::Object(top)
+}
+
 #[derive(Debug, Deserialize)]
 struct ChangeFilesArgs {
     changes: Vec<Change>,
@@ -147,7 +193,11 @@ impl Tool for ChangeFilesTool {
                 - delete: remove a file.\n\
                 - move: rename `path` to `to`.\n\n\
                 The result shows the changed lines with their line numbers, so there is no need to \
-                re-read a file just to check an edit."
+                re-read a file just to check an edit.\n\n\
+                For a large rewrite, many sites at once, or text that's awkward to carry as `find`/`with` \
+                (long blocks, heavy quoting), a short script run with bash is often the better tool: \
+                read the file, check the target text appears exactly as often as expected and stop if \
+                not, replace, write it back, then confirm with `git diff --stat`."
                 .to_string(),
             input_schema: object_schema(
                 json!({
@@ -176,9 +226,11 @@ impl Tool for ChangeFilesTool {
     }
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: ChangeFilesArgs = expect_object("change_files", arguments)?;
+        let args: ChangeFilesArgs = expect_object("change_files", normalize_changes(arguments))?;
         if args.changes.is_empty() {
-            return Err(ToolError::msg("`changes` is empty: pass at least one change."));
+            return Err(ToolError::msg(
+                "`changes` arrived empty, so the edit's content didn't come through. Send the change again. For a large edit, a short script that reads the file, checks the target text is there exactly as expected, replaces it and writes the file back is more reliable than one very long find/with.",
+            ));
         }
         let mut staged: HashMap<PathBuf, Staged> = HashMap::new();
         let mut order: Vec<PathBuf> = Vec::new();
