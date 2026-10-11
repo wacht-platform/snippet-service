@@ -23,7 +23,7 @@ pub const ENTRY_FILE: &str = "MEMORY.md";
 const INDEX_HEADING: &str = "## Index";
 const ENTRY_PROMPT_CHARS: usize = 4_000;
 const MAX_ENTRY_CHARS: usize = 400;
-pub const DREAM_PREFIX: &str = "Dream:";
+pub const CONSOLIDATE_PREFIX: &str = "Consolidate:";
 
 static GIT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -281,17 +281,17 @@ impl MemoryRepo {
         Ok(self.root.join(rel))
     }
 
-    /// Unix time of the last dream commit, if any.
-    pub fn last_dream(&self) -> Option<i64> {
-        self.git(&["log", "-1", "--format=%ct", "--grep", &format!("^{DREAM_PREFIX}")])
+    /// Unix time of the last consolidation commit, if any.
+    pub fn last_consolidated(&self) -> Option<i64> {
+        self.git(&["log", "-1", "--format=%ct", "--grep", &format!("^{CONSOLIDATE_PREFIX}")])
             .ok()
             .and_then(|s| s.trim().parse().ok())
     }
 
-    /// Commits since the last dream that were not dreams themselves, and the
+    /// Commits since the last consolidation that were not consolidations themselves, and the
     /// time of the newest.
-    pub fn activity_since_dream(&self) -> (usize, Option<i64>) {
-        let since = self.last_dream().map(|t| format!("--since=@{}", t + 1));
+    pub fn activity_since_consolidation(&self) -> (usize, Option<i64>) {
+        let since = self.last_consolidated().map(|t| format!("--since=@{}", t + 1));
         let mut args = vec!["log", "--format=%ct%x1f%s"];
         if let Some(since) = since.as_deref() {
             args.push(since);
@@ -301,7 +301,7 @@ impl MemoryRepo {
         let mut newest = None;
         for line in log.lines() {
             let (time, subject) = line.split_once('\x1f').unwrap_or((line, ""));
-            if subject.starts_with(DREAM_PREFIX) || subject == "Create memory repo" {
+            if subject.starts_with(CONSOLIDATE_PREFIX) || subject == "Create memory repo" {
                 continue;
             }
             count += 1;
