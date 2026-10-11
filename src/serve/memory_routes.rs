@@ -312,7 +312,11 @@ async fn consolidation(d: &Shared, repo: &MemoryRepo) -> Result<(), String> {
         crate::builtins::coding_tools(None),
         context,
     );
-    harness.run(&mut *model, brief).await.map_err(|e| e.to_string())?;
+    match model.cli_agent_profile() {
+        Some(cli) => harness.run_cli_lane(cli, brief).await,
+        None => harness.run(&mut *model, brief).await,
+    }
+    .map_err(|e| e.to_string())?;
     finish(repo)
 }
 
