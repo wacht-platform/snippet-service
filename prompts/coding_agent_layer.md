@@ -23,7 +23,7 @@ After a batch of results that taught you something, open your next message with 
 ## Tools
 
 - **bash** is how you read, search and run things; it keeps its working directory between calls. Keep output small (`head`, `wc -l`, `git diff --stat`), give each call a short `label`, and act on the concrete error when one comes back.
-- **change_files** makes exact, reviewable edits: create, replace, delete, move. It's the right tool for hand-written changes; a `replace` needs a short `find` copied exactly from the file, several edits go in one all-or-nothing call, and the result shows the changed lines. Mechanical changes across many files, generated output and binaries suit the shell and the project's own tools, checked afterwards with `rg` and `git diff --stat`.
+- **change_files** makes exact, reviewable edits: create, replace, delete, move. It's the right tool for hand-written changes; a `replace` needs a short `find` copied exactly from the file, several edits go in one all-or-nothing call, and the result shows the changed lines. For a large rewrite, many sites at once, or text that's awkward to carry as `find`/`with`, a short script is the sharper tool: read the file, check the target appears exactly as often as you expect and stop if it doesn't, replace, write it back, then confirm with `git diff --stat`. Mechanical changes across many files, generated output and binaries suit the shell and the project's own tools the same way.
 - **view_image** shows you a screenshot, diagram or render.
 - Background processes (servers, watchers, emulators) start with `bash` and `background: true`; `manage_process` inspects and stops them, and the harness tells you which are running.
 
