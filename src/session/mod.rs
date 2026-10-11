@@ -933,14 +933,47 @@ pub fn list_routable_sessions() -> Vec<SessionInfo> {
 /// The session-list label. New state stores this in `title`; the initial request
 /// fallback is only for old states while they are being migrated.
 fn effective_title(state: &HarnessState) -> String {
+    if let Some(title) = state.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        return title.chars().take(120).collect();
+    }
     state
-        .title
-        .as_deref()
-        .or_else(|| state.initial_request())
-        .map(str::trim)
+        .initial_request()
+        .map(request_label)
         .filter(|t| !t.is_empty())
         .map(|t| t.chars().take(120).collect())
         .unwrap_or_default()
+}
+
+/// A readable label for a session that has no title yet, from its first
+/// message. A session started by the daemon opens with an envelope (a task,
+/// an agent's message, a scheduled run), whose raw first line is no title:
+/// use the envelope's own title, job or sender instead.
+fn request_label(request: &str) -> String {
+    let text = request.trim();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(name).map(str::trim))
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(job) = text.strip_prefix("**Scheduled run — ").and_then(|rest| rest.split("**").next()) {
+        return format!("Scheduled: {}", job.trim());
+    }
+    let envelope = text.starts_with('[') || text.contains("[mission_control_task]");
+    if !envelope {
+        return text.lines().next().unwrap_or("").trim().to_string();
+    }
+    if let Some(title) = field("title:").or_else(|| field("task_title:")).or_else(|| field("task:")).or_else(|| field("job:")) {
+        return title;
+    }
+    if let Some(from) = field("from_id:").or_else(|| field("from:")) {
+        return format!("Message from {from}");
+    }
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('['))
+        .unwrap_or("")
+        .to_string()
 }
 
 /// The status string exposed on the session list / events APIs. Uses the enum's
