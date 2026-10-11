@@ -569,6 +569,7 @@ impl Tool for SendAgentMessage {
         let db = db(ctx)?;
         let mut body = args.body.trim().to_string();
         let task_session;
+        let mut about_task: Option<String> = None;
         let (requested_kind, requested_id) = match recipient.strip_prefix("task:") {
             Some(task_id) => {
                 let task = db
@@ -588,6 +589,7 @@ impl Tool for SendAgentMessage {
                     )));
                 }
                 body = format!("[about task {}: {}]\n{body}", task.id, task.title);
+                about_task = Some(task.id.clone());
                 task_session = task.session_id;
                 ("session", task_session.as_str())
             }
@@ -667,6 +669,7 @@ impl Tool for SendAgentMessage {
                 &chrono::Utc::now().to_rfc3339(),
                 origin.as_deref(),
                 ctx.lane_origin().map(|(_, lane)| lane),
+                about_task.as_deref(),
             )
             .map_err(|e| ToolError::msg(format!("send message: {e}")))?;
         crate::session::emit_device_event(json!({

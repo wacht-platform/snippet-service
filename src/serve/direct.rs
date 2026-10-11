@@ -208,6 +208,21 @@ async fn deliver_direct(
             .get("body")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        if event.payload.get("about_task").and_then(|v| v.as_str()).is_some() {
+            let Some((tx, _path, _stream)) = d.ensure_live(&session_id).await else {
+                return Err(format!("could not start session `{session_id}`"));
+            };
+            let history: Vec<_> = d
+                .store
+                .recent_direct_thread_events(&event.thread_id, DIRECT_HISTORY_ON_WAKE + 1)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|prior| prior.sequence < event.sequence)
+                .collect();
+            tx.send(LoopInput::UserMessage(direct_message_envelope(event, &history)))
+                .map_err(|error| format!("deliver task message: {error}"))?;
+            return Ok(());
+        }
         let lane = reply_lane(d, event, &session_id);
         if let Some(lane) = lane.as_deref() {
             let envelope = format!(
