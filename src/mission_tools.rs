@@ -781,6 +781,20 @@ async fn create_task(
             )
             .map_err(ToolError::msg)?;
         }
+        let recent_cutoff = chrono::Utc::now() - chrono::Duration::minutes(5);
+        if let Some(existing) = store
+            .list_tasks(Some(&session_id), None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| !t.status.is_terminal())
+            .filter(|t| t.title.trim().eq_ignore_ascii_case(args.title.trim()))
+            .find(|t| chrono::DateTime::parse_from_rfc3339(&t.created_at).is_ok_and(|at| at >= recent_cutoff))
+        {
+            return Ok(ToolResult::success(json!({
+                "task": task_view(&existing),
+                "note": "This task was already filed a moment ago and is on its way; nothing new was created.",
+            })));
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let handoff_mode = match args.handoff_mode.as_deref() {
             None | Some("resume") => HandoffMode::Resume,

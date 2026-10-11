@@ -77,6 +77,7 @@ pub fn validated_owned_paths(
     let mut out = Vec::new();
     for raw in raw_paths {
         let path = PathBuf::from(raw);
+        let path = if path.is_relative() { root.join(path) } else { path };
         let mut prefix = path.clone();
         let mut suffix = Vec::new();
         let resolved = loop {
