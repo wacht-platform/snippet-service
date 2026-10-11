@@ -43,7 +43,8 @@ pub async fn autonomy_loop(daemon: Shared) {
             continue;
         }
         let offers = pending_offers(&daemon, &tasks);
-        let envelope = round_envelope(&tasks, &state, &due, &offers, now);
+        let waiting = waiting_on(&daemon, &tasks);
+        let envelope = round_envelope(&tasks, &state, &due, &offers, &waiting, now);
         let summary = round_summary(&tasks, &state, &due);
         let _ = mission_autonomy::update(|s| {
             s.last_round_at = now;
@@ -210,11 +211,33 @@ fn waiting_and_dormant(tasks: &[crate::coordination::Task], now: i64) -> (Vec<St
     (waiting, dormant)
 }
 
+/// Blocked tasks that are only waiting on unfinished blockers, with the
+/// blockers' titles: planned work that starts by itself, not stuck work.
+fn waiting_on(daemon: &Shared, tasks: &[crate::coordination::Task]) -> std::collections::HashMap<String, Vec<String>> {
+    tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Blocked)
+        .filter_map(|t| {
+            let titles: Vec<String> = daemon
+                .store
+                .blockers_of(&t.id)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| tasks.iter().find(|other| &other.id == id))
+                .filter(|other| other.status != TaskStatus::Done)
+                .map(|other| other.title.clone())
+                .collect();
+            (!titles.is_empty()).then(|| (t.id.clone(), titles))
+        })
+        .collect()
+}
+
 fn round_envelope(
     tasks: &[crate::coordination::Task],
     state: &mission_autonomy::AutonomyState,
     due: &[mission_autonomy::Followup],
     offers: &std::collections::HashMap<String, String>,
+    waiting: &std::collections::HashMap<String, Vec<String>>,
     now: i64,
 ) -> String {
     let since = state.last_round_at;
@@ -245,6 +268,9 @@ fn round_envelope(
             let idle = secs_since(&t.updated_at, now);
             let session = session_status(&t.session_id);
             let note = match session.as_ref().map(|s| s.status) {
+                _ if waiting.contains_key(&t.id) => {
+                    format!("waiting on {} — starts by itself", waiting[&t.id].join(", "))
+                }
                 _ if offers.contains_key(&t.id) => {
                     format!("offered to {}, not claimed yet ({})", offers[&t.id], ago(idle))
                 }
