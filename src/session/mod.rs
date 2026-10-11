@@ -948,7 +948,7 @@ fn effective_title(state: &HarnessState) -> String {
 /// message. A session started by the daemon opens with an envelope (a task,
 /// an agent's message, a scheduled run), whose raw first line is no title:
 /// use the envelope's own title, job or sender instead.
-fn request_label(request: &str) -> String {
+pub(crate) fn request_label(request: &str) -> String {
     let text = request.trim();
     let field = |name: &str| {
         text.lines()

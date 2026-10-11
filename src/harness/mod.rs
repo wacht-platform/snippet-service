@@ -602,13 +602,16 @@ fn normalize_state_title(state: &mut HarnessState) {
         .title
         .as_deref()
         .map(str::trim)
-        .is_none_or(str::is_empty);
+        .is_none_or(|t| t.is_empty() || (t.starts_with('[') && t.contains("]\n")));
     if title_is_empty {
         if let Some(request) = state
             .initial_request()
             .filter(|text| !text.trim().is_empty())
         {
-            state.title = Some(request.to_string());
+            let label: String = crate::session::request_label(request).chars().take(120).collect();
+            if !label.trim().is_empty() {
+                state.title = Some(label);
+            }
         }
     }
     // The legacy field is an input-only migration bridge. Once its value has
