@@ -6,8 +6,7 @@
 //! any commit at all and no dream for `DAILY`. Session memory counts toward
 //! the project and agent it belongs to, since Dreaming is where durable facts
 //! leave a session. Dreams only start while no session is running, one at a
-//! time, so they never compete with the user's own work. A dream asked for
-//! from the app runs at the next wake regardless.
+//! time, so they never compete with the user's own work.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -16,7 +15,7 @@ use std::time::Duration;
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 
@@ -31,14 +30,12 @@ const DAILY: i64 = 20 * 3600;
 const SETTLE: i64 = 30 * 60;
 
 static RUNNING: Mutex<Option<String>> = Mutex::new(None);
-static REQUESTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub fn router() -> Router<Shared> {
     Router::new()
         .route("/memory/scopes", get(list_scopes))
         .route("/memory/file", get(read_file))
         .route("/memory/history", get(history))
-        .route("/memory/dream", post(request_dream))
 }
 
 #[derive(Deserialize)]
@@ -60,7 +57,6 @@ async fn list_scopes(State(d): State<Shared>, Query(a): Query<Auth>) -> Response
         return unauthorized();
     }
     let running = RUNNING.lock().unwrap().clone();
-    let requested = REQUESTED.lock().unwrap().clone();
     let scopes: Vec<_> = MemoryRepo::all()
         .into_iter()
         .filter(MemoryRepo::exists)
@@ -80,7 +76,6 @@ async fn list_scopes(State(d): State<Shared>, Query(a): Query<Auth>) -> Response
                 "last_dream": repo.last_dream(),
                 "pending": pending,
                 "dreaming": running.as_deref() == Some(repo.key.as_str()),
-                "dream_requested": requested.contains(&repo.key),
             })
         })
         .collect();
@@ -123,24 +118,6 @@ async fn history(State(d): State<Shared>, Query(q): Query<KeyQuery>) -> Response
         Ok(repo) => Json(repo.history(q.limit.unwrap_or(50).clamp(1, 500))).into_response(),
         Err(response) => response,
     }
-}
-
-async fn request_dream(State(d): State<Shared>, Query(q): Query<KeyQuery>) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    let repo = match repo_for(&q.key) {
-        Ok(repo) => repo,
-        Err(response) => return response,
-    };
-    if repo.kind == ScopeKind::Session {
-        return (StatusCode::BAD_REQUEST, "session memory is consolidated by its project's dream").into_response();
-    }
-    let mut requested = REQUESTED.lock().unwrap();
-    if !requested.contains(&repo.key) {
-        requested.push(repo.key.clone());
-    }
-    (StatusCode::ACCEPTED, Json(serde_json::json!({"queued": repo.key}))).into_response()
 }
 
 /// Which project and agent a session's memory feeds.
@@ -188,16 +165,12 @@ async fn any_session_running(d: &Shared) -> bool {
 pub async fn dreaming_loop(d: Shared) {
     loop {
         tokio::time::sleep(TICK).await;
-        let requested = REQUESTED.lock().unwrap().first().cloned();
-        let next = match requested {
-            Some(key) => MemoryRepo::from_key(&key).map(|repo| (repo, true)),
-            None if any_session_running(&d).await => None,
-            None => due_repo().map(|repo| (repo, false)),
-        };
-        let Some((repo, _manual)) = next else {
+        if any_session_running(&d).await {
+            continue;
+        }
+        let Some(repo) = due_repo() else {
             continue;
         };
-        REQUESTED.lock().unwrap().retain(|k| k != &repo.key);
         *RUNNING.lock().unwrap() = Some(repo.key.clone());
         let result = dream(&d, &repo).await;
         *RUNNING.lock().unwrap() = None;
