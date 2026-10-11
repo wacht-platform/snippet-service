@@ -523,6 +523,143 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
+enum ForkCleanup {
+    ClaudeCode,
+    Antigravity(String),
+}
+
+/// A tool bridge that lists the session's tools but refuses every call, for a
+/// reflection fork that must see the same tool list (so the prompt cache
+/// matches) without being able to act.
+async fn start_refusing_bridge(tools: Vec<NativeToolDefinition>) -> Result<String, String> {
+    let (url, mut calls) = start_mcp_server(tools, Default::default(), Default::default()).await?;
+    tokio::spawn(async move {
+        while let Some(call) = calls.recv().await {
+            let _ = call.reply.send(error_result(
+                "unavailable",
+                "Tools are off during reflection. Reply with only the JSON object.",
+            ));
+        }
+    });
+    Ok(url)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cli_reflection(
+    mut cmd: Command,
+    kind: CliKind,
+    line: Value,
+    repos: &[crate::memory::MemoryRepo],
+    source: &str,
+    owner: &str,
+    provider: &str,
+    model: &str,
+    cleanup: ForkCleanup,
+) -> Result<(), String> {
+    let mut child = cmd.spawn().map_err(|e| format!("start {}: {e}", kind.label()))?;
+    let mut stdin = child.stdin.take().ok_or("stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("stdout unavailable")?;
+    stdin
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .map_err(|e| format!("send reflection: {e}"))?;
+    let _ = stdin.flush().await;
+    let mut reader = BufReader::new(stdout).lines();
+    let mut reply = String::new();
+    let mut fork_id: Option<String> = None;
+    let read = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        while let Ok(Some(raw)) = reader.next_line().await {
+            let Ok(event) = serde_json::from_str::<Value>(&raw) else { continue };
+            match kind {
+                CliKind::ClaudeCode => {
+                    if event.get("type").and_then(Value::as_str) == Some("system")
+                        && event.get("subtype").and_then(Value::as_str) == Some("init")
+                    {
+                        fork_id = event.get("session_id").and_then(Value::as_str).map(str::to_string);
+                    }
+                    if event.get("type").and_then(Value::as_str) == Some("result") {
+                        reply = event.get("result").and_then(Value::as_str).unwrap_or("").to_string();
+                        let usage = event.get("usage").cloned().unwrap_or(Value::Null);
+                        let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                        let prompt = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+                        crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
+                            prompt_tokens: prompt,
+                            completion_tokens: n("output_tokens"),
+                            total_tokens: prompt + n("output_tokens"),
+                            cache_read_tokens: n("cache_read_input_tokens"),
+                            cache_creation_tokens: n("cache_creation_input_tokens"),
+                            ..Default::default()
+                        });
+                        eprintln!(
+                            "memory reflection {owner}: {} cached, {} new input tokens",
+                            n("cache_read_input_tokens"),
+                            n("input_tokens") + n("cache_creation_input_tokens")
+                        );
+                        break;
+                    }
+                }
+                CliKind::Antigravity => {
+                    if let Some(usage) = event
+                        .pointer("/step_update/usage")
+                        .filter(|_| event.pointer("/step_update/state").and_then(Value::as_str) == Some("DONE"))
+                    {
+                        let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                        let prompt = n("input_tokens") + n("cache_read_tokens");
+                        crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
+                            prompt_tokens: prompt,
+                            completion_tokens: n("output_tokens"),
+                            total_tokens: prompt + n("output_tokens"),
+                            cache_read_tokens: n("cache_read_tokens"),
+                            ..Default::default()
+                        });
+                    }
+                    if event.get("event").and_then(Value::as_str) == Some("result") {
+                        reply = event.pointer("/result/response").and_then(Value::as_str).unwrap_or("").to_string();
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    drop(stdin);
+    let _ = child.kill().await;
+    match cleanup {
+        ForkCleanup::ClaudeCode => {
+            if let Some(id) = fork_id.as_deref() {
+                remove_claude_transcript(id);
+            }
+        }
+        ForkCleanup::Antigravity(id) => crate::antigravity::remove_conversation(&id),
+    }
+    read.map_err(|_| "reflection timed out".to_string())?;
+    let changes = super::memory_reflection::parse_reflection(&reply).ok_or("no JSON changes in the reply")?;
+    let (applied, errors) = super::memory_reflection::apply_changes(repos, &changes, source);
+    for (key, entry) in &applied {
+        eprintln!("memory reflection {owner}: {key} {entry}");
+    }
+    for error in &errors {
+        eprintln!("memory reflection {owner} rejected: {error}");
+    }
+    let touched: Vec<String> = applied.into_iter().map(|(key, _)| key).collect();
+    super::memory_reflection::commit_reflection(repos, &touched);
+    Ok(())
+}
+
+/// Delete a forked Claude Code conversation's transcript so reflection forks
+/// do not pile up next to the real ones.
+fn remove_claude_transcript(id: &str) {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
+    let projects = home.join(".claude").join("projects");
+    let Ok(dirs) = std::fs::read_dir(&projects) else { return };
+    for dir in dirs.flatten() {
+        let file = dir.path().join(format!("{id}.jsonl"));
+        if file.is_file() {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
 async fn start_mcp_server(
     tools: Vec<NativeToolDefinition>,
     steers: SteerQueue,
@@ -572,6 +709,66 @@ impl CodingHarness {
             prompt.push_str(&session.tool_guide);
         }
         prompt
+    }
+
+    /// Reflect on the turn that just ended in a throwaway fork of the CLI
+    /// conversation, in the background. Claude Code forks with --fork-session;
+    /// agy has no fork, so its conversation file is copied under a new id. The
+    /// fork runs with the session's own flags, system prompt and tool list
+    /// (served by a bridge that refuses every call), so Claude Code reads the
+    /// whole conversation from its prompt cache, and the main conversation and
+    /// transcript are never touched.
+    fn start_cli_reflection(
+        &self,
+        profile: &InferenceProfileConfig,
+        state: &HarnessState,
+        session: &CliSession,
+        bridge_url: &str,
+        reflecting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), String> {
+        let repos = self.memory_scopes();
+        if repos.is_empty() {
+            return Err("no memory scopes".to_string());
+        }
+        let source_id = session.id.clone().ok_or("no CLI conversation yet")?;
+        let prompt = self.cli_system_prompt(state, session);
+        let (mut cmd, fork_cleanup) = match session.kind {
+            CliKind::ClaudeCode => {
+                let mut cmd = self.claude_command(profile, &prompt, bridge_url, session)?;
+                cmd.arg("--fork-session");
+                (cmd, ForkCleanup::ClaudeCode)
+            }
+            CliKind::Antigravity => {
+                let fork_id = crate::antigravity::fork_conversation(&source_id)?;
+                let fork = CliSession {
+                    kind: session.kind,
+                    key: format!("{}~reflect", session.key),
+                    id: Some(fork_id.clone()),
+                    started: true,
+                    synced: 0,
+                    tool_guide: session.tool_guide.clone(),
+                };
+                (self.antigravity_command(profile, &prompt, bridge_url, &fork)?, ForkCleanup::Antigravity(fork_id))
+            }
+        };
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        let kind = session.kind;
+        let line = kind.user_line(&super::memory_reflection::reflection_instruction(&repos));
+        let source = self
+            .session_id()
+            .map(|id| format!("snippet://session/{id}"))
+            .unwrap_or_else(|| "snippet://session".to_string());
+        let owner = self.session_id().unwrap_or_default();
+        let provider = profile.provider.clone();
+        let model = if profile.model.trim().is_empty() { "default".to_string() } else { profile.model.trim().to_string() };
+        tokio::spawn(async move {
+            let outcome = run_cli_reflection(cmd, kind, line, &repos, &source, &owner, &provider, &model, fork_cleanup).await;
+            if let Err(e) = outcome {
+                eprintln!("memory reflection {owner}: {e}");
+            }
+            reflecting.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+        Ok(())
     }
 
     fn session_memory_path(&self) -> Option<String> {
@@ -838,6 +1035,10 @@ impl CodingHarness {
             });
         }
         bridge_tools.extend(meta_defs);
+        let reflect_tools = bridge_tools.clone();
+        let mut reflect_url: Option<String> = None;
+        let reflecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut turn_mark = 0usize;
         let guide = tool_guide(&bridge_tools);
         let steers: SteerQueue = Default::default();
         let served: ServedResults = Default::default();
@@ -876,6 +1077,7 @@ impl CodingHarness {
             outbox.push(text);
         }
         self.persist(&mut state, &lanes).await?;
+        turn_mark = turn_mark.max(state.events.len());
 
         loop {
             if state.status == HarnessStatus::Running {
@@ -1244,6 +1446,32 @@ impl CodingHarness {
                                         if self.config.memory_enabled && self.context.lane_origin().is_none() {
                                             self.tidy_memory();
                                         }
+                                        let tool_results = state.events[turn_mark.min(state.events.len())..]
+                                            .iter()
+                                            .filter(|e| matches!(e, HarnessEvent::ToolResult { .. }))
+                                            .count();
+                                        if !once
+                                            && tool_results >= 3
+                                            && self.config.memory_enabled
+                                            && self.config.memory_reflect
+                                            && self.context.lane_origin().is_none()
+                                            && self.context.owner() == "main"
+                                            && session.started
+                                            && session.id.is_some()
+                                            && !reflecting.swap(true, std::sync::atomic::Ordering::SeqCst)
+                                        {
+                                            if reflect_url.is_none() {
+                                                reflect_url = start_refusing_bridge(reflect_tools.clone()).await.ok();
+                                            }
+                                            let started = match reflect_url.as_deref() {
+                                                Some(url) => self.start_cli_reflection(&profile, &state, &session, url, reflecting.clone()),
+                                                None => Err("no tool bridge for reflection".to_string()),
+                                            };
+                                            if let Err(e) = started {
+                                                reflecting.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                self.debug_log(&format!("memory reflection not started: {e}"));
+                                            }
+                                        }
                                         let window = match cli_window {
                                             0 => self.config.context_window_tokens,
                                             reported => reported.min(self.config.context_window_tokens.max(1)),
@@ -1254,6 +1482,7 @@ impl CodingHarness {
                                         }
                                     }
                                 }
+                                turn_mark = state.events.len();
                                 session.mark_synced(state.messages.len());
                                 if state.pending_question.is_some() {
                                     state.status = HarnessStatus::WaitingForInput;
