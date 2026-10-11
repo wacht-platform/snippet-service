@@ -531,12 +531,6 @@ impl CodingHarness {
                     .map(str::to_string)
             })
             .flatten();
-        let markdown_read = match call.arguments.get("command").and_then(Value::as_str) {
-            Some(command) if tool_name == "bash" && self.config.memory_enabled => {
-                crate::memory::markdown_paths_in_command(command, &self.context.current_dir())
-            }
-            _ => Vec::new(),
-        };
         let bash_command = (tool_name == "bash")
             .then(|| call.arguments.get("command").and_then(Value::as_str).map(str::to_string))
             .flatten();
@@ -570,9 +564,6 @@ impl CodingHarness {
         {
             note_bash_command(vars, &command, &cwd_before);
             collapse_repeated_output(vars, command, &mut result);
-        }
-        if !is_err && !markdown_read.is_empty() {
-            crate::memory::Memory::open(self.context.workspace_root()).record_reads(&markdown_read);
         }
         answer_call(state, &tool_name, &call_id, result);
         // Flush after every tool result so a mid-batch kill still keeps completed

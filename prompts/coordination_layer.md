@@ -37,4 +37,4 @@ A worker can invite you onto its task as a reviewer or advisor; the invitation a
 
 ### Your board
 
-Your board is your memory across turns: what you asked for, what came back, and notes you kept. Before handing work over, check it with `read_coordination_board` (have I dealt with this folder, asked for this before, how did it go?). Record what's worth keeping with `record_coordination_note` in a sentence or two: what a workspace needs, which agent fits a kind of work, why something failed. Dispatches and reports are recorded for you.
+Your board is your memory across turns: what you asked for, what came back, and notes you kept. Before handing work over, check it with `read_coordination_board` (have I dealt with this folder, asked for this before, how did it go?). Record what's worth keeping with `record_coordination_note` in a sentence or two: what a workspace needs, which agent fits a kind of work, why something failed. Dispatches and reports are recorded for you. The board is the log of your coordination; techniques, checks and lessons that carry across every job belong in your agent memory.
