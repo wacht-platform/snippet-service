@@ -742,7 +742,7 @@ pub async fn run_serve(
     }
     {
         let d = daemon.clone();
-        tokio::spawn(async move { memory_routes::dreaming_loop(d).await });
+        tokio::spawn(async move { memory_routes::consolidation_loop(d).await });
     }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
     // inflates it by ~4/3. Size the request-body limit so a ~1 GB file still fits

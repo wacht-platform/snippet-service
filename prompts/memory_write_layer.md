@@ -7,4 +7,4 @@ Save what will help a later session: preferences and directives the user states,
 - **Edit in place.** Update or remove an entry that turned out wrong or stale instead of adding a contradicting one.
 - **Commit after every edit.** Edit with `change_files`, then in the same repo: `git -C <repo> add <changed files> && git -C <repo> commit -m "Remember <short description>"`. Stage only the files you changed; never `git add -A`, never force, never rewrite history, never add a remote or push. If `git status --porcelain` shows changes you did not make (another session may be writing), commit only your own files; if a commit fails because a lock is held, retry once.
 
-A reflection pass also curates memory after each task, and a background Dreaming pass periodically consolidates each repo: merging duplicates, dropping stale entries and promoting durable facts out of session memory.
+A reflection pass also curates memory after each task, and a background consolidation pass periodically tidies each repo: merging duplicates, dropping stale entries and promoting durable facts out of session memory.
