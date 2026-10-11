@@ -591,6 +591,18 @@ impl CodingHarness {
         ))
     }
 
+    fn agy_compaction_prompt(&self) -> String {
+        let save = match self.session_memory_path() {
+            Some(path) => format!(
+                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. "
+            ),
+            None => String::new(),
+        };
+        format!(
+            "[compaction] This conversation is about to be compacted: it will continue in a fresh conversation that starts from your summary. {save}Then reply with only the summary, about 2k tokens: the user's requests in order (one line each), the goal and what counts as done, progress (done, in progress, left), the next steps and the exact values they need, pointing to memory files instead of restating what they hold."
+        )
+    }
+
     fn compact_command(&self) -> String {
         let pointer = match self.session_memory_path() {
             Some(path) => format!(" The detail is saved in session memory at {path}; point to its files instead of restating them."),
@@ -877,14 +889,18 @@ impl CodingHarness {
                 && outbox.is_empty()
             {
                 compact_wanted = false;
-                if kind == CliKind::ClaudeCode && session.started {
+                if session.started && session.id.is_some() {
                     state.compacting = true;
                     state.status = HarnessStatus::Running;
                     state.events.push(HarnessEvent::SystemDecision {
                         step: "history_compaction_pass".to_string(),
                         reasoning: "Saving working state to memory, then compacting the conversation.".to_string(),
                     });
-                    match self.compaction_save_prompt() {
+                    let save = match kind {
+                        CliKind::ClaudeCode => self.compaction_save_prompt(),
+                        CliKind::Antigravity => Some(self.agy_compaction_prompt()),
+                    };
+                    match save {
                         Some(prompt) => {
                             compaction = CliCompaction::Saving;
                             outbox.push(prompt);
@@ -1180,6 +1196,36 @@ impl CodingHarness {
                                         .unwrap_or(cli_window);
                                 }
                                 match compaction {
+                                    CliCompaction::Saving if kind == CliKind::Antigravity => {
+                                        state.final_text = final_before.clone();
+                                        let summary = state.messages.iter().rev().find_map(|m| match m {
+                                            HarnessMessage::Assistant { content, .. } if !content.trim().is_empty() => Some(content.trim().to_string()),
+                                            _ => None,
+                                        });
+                                        if let Some(mut p) = process.take() {
+                                            let _ = p.child.start_kill();
+                                        }
+                                        generation += 1;
+                                        session.id = None;
+                                        session.started = false;
+                                        session.synced = state.messages.len();
+                                        session.save();
+                                        let pointer = self.compaction_pointer().unwrap_or_default();
+                                        after_compaction = Some(match summary {
+                                            Some(summary) => format!("This conversation continues from an earlier one that was compacted. Summary of it:\n{summary}\n\n{pointer}"),
+                                            None => format!("This conversation continues from an earlier one that was compacted. {pointer}"),
+                                        });
+                                        last_task_note.clear();
+                                        state.compactions += 1;
+                                        state.last_prompt_tokens = 0;
+                                        state.events.push(HarnessEvent::SystemDecision {
+                                            step: "history_compacted".to_string(),
+                                            reasoning: "Compacted the conversation: working state saved to memory, and a fresh conversation starts from its summary.".to_string(),
+                                        });
+                                        state.compacting = false;
+                                        compaction = CliCompaction::Idle;
+                                        state.status = HarnessStatus::Idle;
+                                    }
                                     CliCompaction::Saving => {
                                         state.final_text = final_before.clone();
                                         state.status = HarnessStatus::Running;
@@ -1203,7 +1249,7 @@ impl CodingHarness {
                                             reported => reported.min(self.config.context_window_tokens.max(1)),
                                         };
                                         let threshold = window.saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64) / 100;
-                                        if !once && kind == CliKind::ClaudeCode && threshold > 0 && state.last_prompt_tokens >= threshold {
+                                        if !once && threshold > 0 && state.last_prompt_tokens >= threshold {
                                             compact_wanted = true;
                                         }
                                     }
