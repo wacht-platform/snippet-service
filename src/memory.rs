@@ -22,6 +22,7 @@ use std::sync::Mutex;
 pub const ENTRY_FILE: &str = "MEMORY.md";
 const INDEX_HEADING: &str = "## Index";
 const ENTRY_PROMPT_CHARS: usize = 4_000;
+const ARCHIVE_DIR: &str = "session-memory-archive";
 const MAX_ENTRY_CHARS: usize = 400;
 const IGNORED: &[&str] = &[".lock", ".tmp-*", ".snippet/"];
 pub const CONSOLIDATE_PREFIX: &str = "Consolidate:";
@@ -182,6 +183,16 @@ impl MemoryRepo {
     /// Create the repo (migrating the old layout once) if it is not one yet.
     pub fn ensure(&self) -> Result<(), String> {
         let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if self.kind == ScopeKind::Session && !self.exists() {
+            let archived = self.archive_path();
+            if archived.join(ENTRY_FILE).is_file() {
+                if let Some(parent) = self.root.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::remove_dir_all(&self.root);
+                fs::rename(&archived, &self.root).map_err(|e| format!("restore {}: {e}", archived.display()))?;
+            }
+        }
         if self.exists() {
             return self.ignore_scratch();
         }
@@ -398,13 +409,14 @@ impl MemoryRepo {
         })
     }
 
-    /// After a turn: link every topic file nothing links to from the index,
-    /// then commit whatever the session left uncommitted. Returns the files it
-    /// linked and whether it committed.
+    /// After a turn: drop expired entries, link every topic file nothing links
+    /// to from the index, then commit whatever the session left uncommitted.
+    /// Returns the files it linked and whether it committed.
     pub fn tidy(&self) -> Result<(Vec<String>, bool), String> {
         if !self.exists() {
             return Ok((Vec::new(), false));
         }
+        let expired = self.prune_expired(&chrono::Utc::now().format("%Y-%m-%d").to_string())?;
         let files = self.files();
         let text: String = files
             .iter()
@@ -419,12 +431,73 @@ impl MemoryRepo {
                 linked.push(file.clone());
             }
         }
-        let committed = self.commit_all(if linked.is_empty() {
-            "Remember edits left uncommitted"
-        } else {
-            "Remember edits and link new topic files"
+        let committed = self.commit_all(match (linked.is_empty(), expired.is_empty()) {
+            (true, true) => "Remember edits left uncommitted",
+            (true, false) => "Remove expired entries",
+            (false, _) => "Remember edits and link new topic files",
         })?;
         Ok((linked, committed))
+    }
+
+    /// Remove every entry whose metadata says it expired before `today`
+    /// (YYYY-MM-DD). Returns the removed lines; the caller commits.
+    pub fn prune_expired(&self, today: &str) -> Result<Vec<String>, String> {
+        static EXPIRES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"\[[^\]]*\bexpires:\s*(\d{4}-\d{2}-\d{2})[^\]]*\]\s*$").expect("valid regex")
+        });
+        let mut removed = Vec::new();
+        for file in self.files().into_iter().filter(|f| f.ends_with(".md")) {
+            let path = self.resolve(&file)?;
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let mut kept = Vec::new();
+            let mut changed = false;
+            for line in text.lines() {
+                let expired = line.trim_start().starts_with("- ")
+                    && EXPIRES
+                        .captures(line)
+                        .and_then(|c| c.get(1))
+                        .is_some_and(|date| date.as_str() < today);
+                if expired {
+                    removed.push(format!("{file}: {}", line.trim()));
+                    changed = true;
+                } else {
+                    kept.push(line);
+                }
+            }
+            if changed {
+                let mut updated = kept.join("\n");
+                if text.ends_with('\n') {
+                    updated.push('\n');
+                }
+                write_atomic(&path, &updated)?;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn archive_path(&self) -> PathBuf {
+        let name = self.root.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        crate::config::snippet_home().join(ARCHIVE_DIR).join(name)
+    }
+
+    /// Move a session repo out of the active set. Its git history comes along,
+    /// and [`MemoryRepo::ensure`] brings it back if the session resumes.
+    pub fn archive(&self) -> Result<(), String> {
+        let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if self.kind != ScopeKind::Session || !self.root.is_dir() {
+            return Ok(());
+        }
+        let target = self.archive_path();
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        let _ = fs::remove_dir_all(&target);
+        fs::rename(&self.root, &target).map_err(|e| format!("archive {}: {e}", self.root.display()))
+    }
+
+    /// Unix time of the newest commit.
+    pub fn last_commit_at(&self) -> Option<i64> {
+        self.git(&["log", "-1", "--format=%ct"]).ok().and_then(|s| s.trim().parse().ok())
     }
 
     fn link_from_index(&self, file: &str) -> Result<(), String> {
@@ -554,7 +627,9 @@ fn session_id_from_dir(dir: &str) -> String {
 
 /// Remove a session's memory when the session itself is deleted.
 pub fn delete_session_memory(session_id: &str) {
-    let _ = fs::remove_dir_all(MemoryRepo::session(session_id).root);
+    let repo = MemoryRepo::session(session_id);
+    let _ = fs::remove_dir_all(repo.archive_path());
+    let _ = fs::remove_dir_all(repo.root);
 }
 
 fn safe_component(s: &str) -> bool {

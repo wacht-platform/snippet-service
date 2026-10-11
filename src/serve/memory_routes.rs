@@ -30,10 +30,14 @@ const DAILY: i64 = 20 * 3600;
 const SETTLE: i64 = 30 * 60;
 
 const RETRY_AFTER: i64 = 3600;
+const SWEEP_EVERY: i64 = 3600;
+const RETIRE_AFTER: i64 = 14 * 24 * 3600;
+const ENTRY_BUDGET_CHARS: usize = 3_000;
 
 static RUNNING: Mutex<Option<String>> = Mutex::new(None);
 /// Repos whose last consolidation failed, and when; they wait `RETRY_AFTER`.
 static FAILED: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
+static LAST_SWEEP: Mutex<i64> = Mutex::new(0);
 
 pub fn router() -> Router<Shared> {
     Router::new()
@@ -172,6 +176,8 @@ pub async fn consolidation_loop(d: Shared) {
         if any_session_running(&d).await {
             continue;
         }
+        let live: Vec<String> = d.sessions.lock().await.keys().cloned().collect();
+        sweep(&live);
         let Some(repo) = due_repo() else {
             continue;
         };
@@ -183,6 +189,57 @@ pub async fn consolidation_loop(d: Shared) {
         if let Err(e) = result {
             eprintln!("consolidation {}: {e}", repo.key);
             failed.push((repo.key.clone(), now()));
+        }
+    }
+}
+
+/// Hourly housekeeping that needs no model: drop expired entries everywhere,
+/// and archive session memory that has been idle for two weeks once a global
+/// consolidation has read its last change, unless the session is live here.
+fn sweep(live: &[String]) {
+    let now = now();
+    {
+        let mut last = LAST_SWEEP.lock().unwrap();
+        if now - *last < SWEEP_EVERY {
+            return;
+        }
+        *last = now;
+    }
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let global_consolidated = MemoryRepo::global().last_consolidated();
+    for repo in MemoryRepo::all() {
+        if !repo.exists() {
+            continue;
+        }
+        match repo.prune_expired(&today) {
+            Ok(removed) if !removed.is_empty() => {
+                if let Err(e) = repo.commit_all("Remove expired entries") {
+                    eprintln!("memory sweep {}: {e}", repo.key);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("memory sweep {}: {e}", repo.key),
+        }
+        if repo.kind != ScopeKind::Session {
+            continue;
+        }
+        let id = repo.key.trim_start_matches("session:");
+        if live.iter().any(|session| session == id) {
+            continue;
+        }
+        let last_commit = repo.last_commit_at();
+        let last_active = state_path_for_id(id)
+            .and_then(|sp| read_session_meta(&sp))
+            .and_then(|state| chrono::DateTime::parse_from_rfc3339(&state.updated_at).ok())
+            .map(|t| t.timestamp())
+            .max(last_commit);
+        let idle = last_active.is_some_and(|t| now - t > RETIRE_AFTER);
+        let read = last_commit.zip(global_consolidated).is_some_and(|(commit, consolidated)| consolidated > commit);
+        if idle && read {
+            match repo.archive() {
+                Ok(()) => eprintln!("memory sweep: archived idle session memory {id}"),
+                Err(e) => eprintln!("memory sweep {}: {e}", repo.key),
+            }
         }
     }
 }
@@ -238,11 +295,13 @@ const CONSOLIDATE_SYSTEM: &str = r#"You run memory consolidation: a background p
 - `MEMORY.md` is the entry point every session loads, so it stays short: only what every session needs, then `## Index` with a `[[link]]` to each topic file.
 - Topic files hold one-line bullets, each ending in metadata such as `[source: snippet://session/<id>; added: YYYY-MM-DD]`.
 - `[[path]]` links start at the repo root and omit `.md`.
+- An entry may carry `expires: YYYY-MM-DD` in its metadata; the daemon deletes it after that date.
 
-Your job has two parts:
+Your job has three parts:
 
 1. **Add.** Read the session memories you are given and the recent changes. Spot durable facts and patterns that will help future sessions (lasting preferences, decisions, where things live, how to build and test, lessons learned the hard way) and promote them into this repo as entries, keeping their source. Leave out progress notes and one-off details.
-2. **Clean.** Merge duplicate entries, remove entries that are outdated, and resolve contradictions by checking sources and dates (the newer, better-sourced entry wins). Move detail out of an overgrown `MEMORY.md` into topic files, fix broken links, and make sure every topic file is in the index.
+2. **Clean.** Merge duplicate entries, remove entries that are outdated, and resolve contradictions by checking sources and dates (the newer, better-sourced entry wins). Delete progress notes and task state that leaked into this repo. Keep `MEMORY.md` under 3,000 characters by moving detail into topic files; when a topic file grows past about 8,000 characters, merge near-duplicates and prune what no longer earns its place, or split it by subject. Fix broken links, and make sure every topic file is in the index and every index link points to a file. Delete a topic file that ends up empty, along with its index line.
+3. **Expire.** When an entry is plainly temporary (an outage, a deadline, a workaround until a fix ships) and has no `expires:` yet, add one, so it removes itself.
 
 Rules:
 - Edit only this repository. Session memories are read-only inputs.
@@ -267,8 +326,18 @@ async fn consolidation(d: &Shared, repo: &MemoryRepo) -> Result<(), String> {
         repo.root.display(),
         repo.label,
         chrono::Utc::now().format("%Y-%m-%d"),
-        repo.files().iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("\n"),
+        repo.files()
+            .iter()
+            .map(|f| format!("- {f} ({} chars)", repo.read_file(f).map(|t| t.chars().count()).unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
+    let entry_chars = repo.entry_point().chars().count();
+    if entry_chars > ENTRY_BUDGET_CHARS {
+        brief.push_str(&format!(
+            "\nMEMORY.md is {entry_chars} characters, over its {ENTRY_BUDGET_CHARS}-character budget: move detail into topic files.\n"
+        ));
+    }
     let since = last.map(|t| format!("--since=@{}", t + 1));
     let mut log_args = vec!["log", "--format=- %cs %s"];
     if let Some(since) = since.as_deref() {
