@@ -1065,6 +1065,8 @@ async fn open(
     }
 }
 
+pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: read it and trust the worker's verification (check a claim only if the report is vague or the stakes are high, with a command or two); done → give the user the outcome, steps waiting on this one start by themselves; blocked → unblock it; failed → retry once or re-route. Then stop.";
+
 pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<String>) -> Result<(String, std::path::PathBuf), String> {
     let home = mission_control::ensure_home()?;
     let state_path = mission_control::session_state_path();
@@ -1211,8 +1213,8 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
                 continue;
             }
             let text = format!(
-                "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]",
-                task.id, task.title, marker.kind, marker.message
+                "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]\n{}",
+                task.id, task.title, marker.kind, marker.message, WORKFLOW_REPORT
             );
             daemon
                 .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))

@@ -57,10 +57,20 @@ pub async fn tick_loop(daemon: Shared) {
                 .filter(|p| p.is_dir());
             match job.render_goal(workspace.as_deref()) {
                 Ok(text) => {
+                    let seen = state_path_for_id(&job.session_id)
+                        .and_then(|sp| crate::session::read_session_state(&sp))
+                        .map(|s| s.events.len())
+                        .unwrap_or(0);
                     daemon
                         .deliver(&job.session_id, LoopInput::SetGoal(text))
                         .await;
                     let _ = recurring::mark_fired(&daemon.recurring_root, &job.id, now);
+                    tokio::spawn(report_run_to_mission_control(
+                        daemon.clone(),
+                        job.title.clone(),
+                        job.session_id.clone(),
+                        seen,
+                    ));
                 }
                 Err(error) => {
                     let _ = recurring::mark_error(&daemon.recurring_root, &job.id, &error);
@@ -73,6 +83,40 @@ pub async fn tick_loop(daemon: Shared) {
             Duration::from_secs(15)
         };
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// Wait for a scheduled run to finish and send its outcome to Mission Control,
+/// so it learns how the run went from a report rather than by reading the
+/// session. Only while autonomous mode is on: otherwise nobody acts on it.
+async fn report_run_to_mission_control(daemon: Shared, title: String, session_id: String, seen: usize) {
+    let Some(sp) = state_path_for_id(&session_id) else { return };
+    for _ in 0..(4 * 60 * 3) {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let Some(state) = crate::session::read_session_state(&sp) else { continue };
+        let outcome = state.events.iter().skip(seen).find_map(|event| match event {
+            crate::harness::HarnessEvent::SystemDecision { step, reasoning }
+                if matches!(step.as_str(), "goal_completed" | "goal_cancelled" | "goal_paused") =>
+            {
+                Some((step.trim_start_matches("goal_").to_string(), reasoning.clone()))
+            }
+            _ => None,
+        });
+        let Some((status, summary)) = outcome else { continue };
+        if !crate::mission_autonomy::is_on() {
+            return;
+        }
+        let label = if title.trim().is_empty() { "untitled job" } else { title.trim() };
+        let text = format!(
+            "[recurring_run_report]\njob: {label}\nsession_id: {session_id}\nstatus: {status}\nsummary: {}\n[/recurring_run_report]\nWorkflow W6 · recurring run report: pass on what's worth the user's attention, note it in your brief if it changes anything, then stop. Don't read the session's files or logs; this report is the outcome.",
+            summary.trim()
+        );
+        if super::mission_control::open_mission_control(&daemon, None).await.is_ok() {
+            daemon
+                .deliver(crate::mission_control::SESSION_ID, LoopInput::UserMessage(text))
+                .await;
+        }
+        return;
     }
 }
 
