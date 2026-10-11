@@ -478,9 +478,25 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         (Some(branch), Some(head)) => format!("branch: {branch} at {head}\n"),
         _ => String::new(),
     };
+    let inputs: Vec<String> = d
+        .store
+        .blockers_of(&task.id)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|id| d.store.get_task(id).ok().flatten())
+        .map(|blocker| {
+            let summary = blocker.result.as_ref().map(|r| r.summary.trim().to_string()).unwrap_or_default();
+            format!("- {} ({}, {}): {}", blocker.title, blocker.id, blocker.status, if summary.is_empty() { "no report".to_string() } else { summary })
+        })
+        .collect();
+    let inputs_line = if inputs.is_empty() {
+        String::new()
+    } else {
+        format!("inputs (tasks this one waited on, with their reports):\n{}\n", inputs.join("\n"))
+    };
     let identity = super::coordination::identity_overlay(d, active_worker, &session_id);
     let text = format!(
-        "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}scope:\n{}\n\nThis is yours now; take it from here. If the scope looks wrong, unclear or there's a better way, say so to Mission Control (send_agent_message to mission-control) before you build. When it's done, blocked or stuck, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
+        "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}{inputs_line}scope:\n{}\n\nThis is yours now: deliver it end to end, verified, in this session. If the scope looks wrong, unclear or there's a better way, say so to Mission Control (send_agent_message to mission-control) before you build. When something long-running is in flight, put a monitor watch on it rather than ending the task. When it's done, blocked or failed, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
         task.id,
         task.title,
         task.created_by_kind,

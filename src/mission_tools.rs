@@ -298,6 +298,7 @@ pub fn add_worker_report_tool(registry: &mut ToolRegistry) {
     registry.insert(ReportMissionTask);
     registry.insert(InviteTaskAgent);
     registry.insert(ViewTaskBoard);
+    registry.insert(FileFollowUpTask);
 }
 
 /// Read-only session awareness, for a session that ROUTES work rather than doing
@@ -685,18 +686,34 @@ struct CreateTaskArgs {
     profile: Option<String>,
     #[serde(default)]
     reply_to: Option<String>,
+    #[serde(default)]
+    blocked_by: Vec<String>,
 }
 pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "create_mission_task".into(),
             })?;
+        create_task(ctx, args, ("agent", crate::mission_control::SESSION_ID)).await
+    }
+}
+
+/// File a task: validate the target, record the worker on the roster, link
+/// any blockers, and leave the offer and delivery to the daemon. A task with
+/// an unfinished blocker waits as blocked and starts by itself once every
+/// blocker is done.
+async fn create_task(
+    ctx: &ToolContext,
+    args: CreateTaskArgs,
+    created_by: (&str, &str),
+) -> Result<ToolResult, ToolError> {
+    {
         if args.title.trim().is_empty() || args.description.trim().is_empty() {
             return Err(ToolError::msg("title and description must be non-empty"));
         }
@@ -777,8 +794,22 @@ impl Tool for CreateMissionTask {
         let workspace = std::path::PathBuf::from(&state.workspace);
         let owned_paths = crate::serve::validated_owned_paths(&args.owned_paths, &workspace)
             .map_err(ToolError::msg)?;
-        // A task created by Mission Control is attributed to it, so the board
-        // shows who filed the work rather than an anonymous row.
+        let mut blockers: Vec<Task> = Vec::new();
+        for blocker in args.blocked_by.iter().map(|b| b.trim()).filter(|b| !b.is_empty()) {
+            let found = store
+                .get_task(blocker)
+                .map_err(|e| ToolError::msg(format!("look up blocker: {e}")))?
+                .ok_or_else(|| ToolError::msg(format!("blocked_by names no task `{blocker}`")))?;
+            if matches!(found.status, TaskStatus::Failed | TaskStatus::Cancelled) {
+                return Err(ToolError::msg(format!(
+                    "blocker `{blocker}` is {}; it will never finish, so this task would never start",
+                    found.status
+                )));
+            }
+            if found.status != TaskStatus::Done {
+                blockers.push(found);
+            }
+        }
         let mut task = Task::dispatched_to(
             id,
             session_id.clone(),
@@ -786,11 +817,14 @@ impl Tool for CreateMissionTask {
             args.description.trim().to_string(),
             owned_paths,
             handoff_mode,
-            "agent",
-            crate::mission_control::SESSION_ID,
+            created_by.0,
+            created_by.1,
             now_rfc3339(),
         );
         task.profile = profile.clone();
+        if !blockers.is_empty() {
+            task.status = TaskStatus::Blocked;
+        }
         // The ROSTER is what carries the worker identity forward: it names who
         // does the work and gives that agent its seat in the task room. Written
         // with the task in one transaction, or the dispatch loop could deliver
@@ -808,6 +842,16 @@ impl Tool for CreateMissionTask {
         store
             .create_task_with_agents(&task, &[worker])
             .map_err(|e| ToolError::msg(format!("create task: {e}")))?;
+        for blocker in &blockers {
+            store
+                .link_tasks(&crate::coordination::TaskLink {
+                    from_task_id: blocker.id.clone(),
+                    to_task_id: task.id.clone(),
+                    kind: crate::coordination::TaskLinkKind::Blocks,
+                    created_at: task.created_at.clone(),
+                })
+                .map_err(|e| ToolError::msg(format!("link blocker: {e}")))?;
+        }
         if let Some(reply_to) = args
             .reply_to
             .as_deref()
@@ -818,14 +862,72 @@ impl Tool for CreateMissionTask {
                 .set_task_requester(&task.id, reply_to)
                 .map_err(|e| ToolError::msg(format!("record requester: {e}")))?;
         }
+        let note = if blockers.is_empty() {
+            format!("Offered to `{agent_id}`. The daemon sends the offer to its inbox; the task starts once the agent claims it (and restarts the target session on `profile` when one is given). The offer reaches the agent by itself.")
+        } else {
+            format!(
+                "Waiting on {}. It is offered to `{agent_id}` and starts by itself once every blocker is done; nothing to do meanwhile.",
+                blockers.iter().map(|b| format!("\"{}\" ({})", b.title, b.id)).collect::<Vec<_>>().join(", ")
+            )
+        };
         Ok(ToolResult::success(
             json!({
                 "task": task_view(&task),
                 "agent_id": agent_id,
                 "profile": profile,
-                "note": format!("Offered to `{agent_id}`. The daemon sends the offer to its inbox; the task starts once the agent claims it (and restarts the target session on `profile` when one is given). The offer reaches the agent by itself.")
+                "waiting_on": blockers.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
+                "note": note
             }),
         ))
+    }
+}
+
+pub struct FileFollowUpTask;
+#[async_trait]
+impl Tool for FileFollowUpTask {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "file_follow_up_task".into(),
+            description: "File a small follow-up to the task you hold, such as a review after your PR, a deploy after your build, or a cleanup you found but that is outside your scope. By default it waits on your current task and starts by itself when you report it done. The description is the whole briefing for whoever picks it up. Anything big, risky or that changes the plan goes to mission-control by message instead.".into(),
+            input_schema: schema(
+                json!({
+                    "title": {"type": "string"},
+                    "description": {"type": "string", "description": "the goal, what done looks like, and the context it needs"},
+                    "session_id": {"type": "string", "description": "optional; the session to run it in. Defaults to this one"},
+                    "after_current": {"type": "boolean", "description": "default true: wait until the task you hold is done"},
+                    "agent_id": {"type": "string", "description": "optional; a specialist to offer it to"}
+                }),
+                &["title", "description"],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let text = |key: &str| arguments.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        let own = ctx
+            .durable_session_id()
+            .or(ctx.lane_origin().map(|(session, _)| session))
+            .ok_or_else(|| ToolError::msg("file_follow_up_task needs a session"))?
+            .to_string();
+        let current = crate::coordination_tools::session_task(ctx, &own);
+        let after_current = arguments.get("after_current").and_then(Value::as_bool).unwrap_or(true);
+        let blocked_by = match (&current, after_current) {
+            (Some((id, _)), true) => vec![id.clone()],
+            _ => Vec::new(),
+        };
+        let speaker = crate::coordination_tools::speaks_as(ctx);
+        let (kind, who) = speaker.unwrap_or(("session", own.clone()));
+        let args = CreateTaskArgs {
+            title: text("title").unwrap_or_default(),
+            description: text("description").unwrap_or_default(),
+            session_id: text("session_id").unwrap_or(own),
+            handoff_mode: Some("resume".into()),
+            owned_paths: Vec::new(),
+            agent_id: text("agent_id"),
+            profile: None,
+            reply_to: None,
+            blocked_by,
+        };
+        create_task(ctx, args, (kind, &who)).await
     }
 }
 
