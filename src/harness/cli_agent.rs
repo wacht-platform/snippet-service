@@ -1883,7 +1883,10 @@ impl CodingHarness {
                             (raw.to_string(), params)
                         };
                         let schema_read = raw == "view_file"
-                            && arguments.get("AbsolutePath").and_then(Value::as_str).is_some_and(|p| p.contains("/antigravity-cli/mcp/"));
+                            && arguments
+                                .get("AbsolutePath")
+                                .and_then(Value::as_str)
+                                .is_some_and(|p| p.contains("/.gemini/antigravity-cli/"));
                         let redirected = done == Some("ERROR")
                             && info
                                 .pointer("/error/message")
