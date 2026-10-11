@@ -431,3 +431,113 @@ fn parse_duration_secs(text: &str) -> i64 {
         })
         .sum()
 }
+
+fn conversations_dir() -> Option<PathBuf> {
+    Some(real_home()?.join(".gemini").join("antigravity-cli"))
+}
+
+/// Copy a conversation under a new id, so a throwaway turn can run on it
+/// without touching the original. agy keys a conversation by its id inside the
+/// file as well as in the file name, so every copy of the id (a fixed-length
+/// UUID, in rows and in serialized blobs) is rewritten.
+pub fn fork_conversation(source: &str) -> Result<String, String> {
+    let root = conversations_dir().ok_or("HOME is not set")?;
+    let from = root.join("conversations").join(format!("{source}.db"));
+    if !from.is_file() {
+        return Err(format!("no agy conversation file for {source}"));
+    }
+    let fork = uuid::Uuid::new_v4().to_string();
+    let to = root.join("conversations").join(format!("{fork}.db"));
+    std::fs::copy(&from, &to).map_err(|e| format!("copy conversation: {e}"))?;
+    let rewrite = || -> Result<(), rusqlite::Error> {
+        let conn = rusqlite::Connection::open(&to)?;
+        conn.execute(
+            "UPDATE trajectory_meta SET cascade_id = ?1 WHERE cascade_id = ?2",
+            rusqlite::params![fork, source],
+        )?;
+        let (old, new) = (source.as_bytes(), fork.as_bytes());
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for table in tables {
+            let columns: Vec<String> = conn
+                .prepare(&format!("PRAGMA table_info(\"{table}\")"))?
+                .query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?;
+            for column in columns {
+                let rows: Vec<(i64, rusqlite::types::Value)> = conn
+                    .prepare(&format!("SELECT rowid, \"{column}\" FROM \"{table}\""))?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<_, _>>()?;
+                for (rowid, value) in rows {
+                    let replaced = match value {
+                        rusqlite::types::Value::Blob(bytes) if contains(&bytes, old) => {
+                            rusqlite::types::Value::Blob(replace_bytes(&bytes, old, new))
+                        }
+                        rusqlite::types::Value::Text(text) if text.contains(source) => {
+                            rusqlite::types::Value::Text(text.replace(source, &fork))
+                        }
+                        _ => continue,
+                    };
+                    conn.execute(
+                        &format!("UPDATE \"{table}\" SET \"{column}\" = ?1 WHERE rowid = ?2"),
+                        rusqlite::params![replaced, rowid],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = rewrite() {
+        let _ = std::fs::remove_file(&to);
+        return Err(format!("rewrite forked conversation: {e}"));
+    }
+    let brain = root.join("brain");
+    if brain.join(source).is_dir() {
+        let _ = copy_dir(&brain.join(source), &brain.join(&fork));
+    }
+    Ok(fork)
+}
+
+pub fn remove_conversation(id: &str) {
+    if let Some(root) = conversations_dir() {
+        for suffix in ["db", "db-wal", "db-shm"] {
+            let _ = std::fs::remove_file(root.join("conversations").join(format!("{id}.{suffix}")));
+        }
+        let _ = std::fs::remove_dir_all(root.join("brain").join(id));
+    }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn replace_bytes(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if haystack[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)?.flatten() {
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
+}
