@@ -75,8 +75,8 @@ pub struct HarnessConfig {
     pub tool_prune_prefix_pct: u8,
     /// Start fresh runs in manual approval mode (bash + file edits wait for y/n).
     pub manual_approval: bool,
-    /// Inject the `[memory]` block (rules, learnings, notes table of contents)
-    /// into the system prefix each session.
+    /// Inject the `[memory]` block (each scope's path and MEMORY.md) into the
+    /// system prefix each session.
     pub memory_enabled: bool,
     /// Run the reflection pass after a request that did real work (main session only).
     pub memory_reflect: bool,

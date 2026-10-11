@@ -45,6 +45,7 @@ mod autonomy;
 mod fs;
 mod git;
 mod lifecycle;
+mod memory_routes;
 pub mod maintenance;
 pub(crate) use maintenance::*;
 mod mission_control;
@@ -739,6 +740,10 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { coordination::coordination_wake_loop(d).await });
     }
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { memory_routes::consolidation_loop(d).await });
+    }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
     // inflates it by ~4/3. Size the request-body limit so a ~1 GB file still fits
     // once encoded (≈1.33 GB) plus headroom for the JSON envelope. Every other route
@@ -763,6 +768,7 @@ pub async fn run_serve(
         .route("/notifications", get(notification_replay))
         .route("/notifications/replay", get(notification_replay))
         .merge(recurring::router())
+        .merge(memory_routes::router())
         .merge(mission_control::router())
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))

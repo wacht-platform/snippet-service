@@ -365,7 +365,7 @@ impl AgentRuntime {
             prompt: mission_control_system_prompt(),
             allow_lane_control: false,
             hidden_meta: &["monitor", "set_session_title", "update_plan"],
-            memory: false,
+            memory: true,
         })
     }
 
@@ -516,7 +516,7 @@ impl AgentRuntime {
             // Nothing to delegate: no lane control in a coordination session.
             allow_lane_control: false,
             hidden_meta: &["ask_user", "monitor", "present_file", "set_session_title", "update_plan"],
-            memory: false,
+            memory: true,
         })
     }
 

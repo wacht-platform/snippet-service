@@ -67,10 +67,20 @@ impl CodingHarness {
         // resume). Within a session it stays fixed; the files show the live
         // state.
         let seeded_system = if self.config.memory_enabled {
+            let prompt = &self.config.system_prompt;
+            let read = crate::prompts::MEMORY_GUIDANCE_LAYER.trim();
+            let write = crate::prompts::MEMORY_WRITE_LAYER.trim();
+            let mut guidance = String::new();
+            if !prompt.contains(read) {
+                guidance.push_str(&format!("\n\n{read}"));
+            }
+            if !prompt.contains(write) && self.context.lane_origin().is_none() {
+                guidance.push_str(&format!("\n\n{write}"));
+            }
             format!(
-                "{}\n\n{}",
+                "{}{guidance}\n\n{}",
                 self.config.system_prompt,
-                crate::memory::Memory::open(self.context.workspace_root()).render_prompt()
+                crate::memory::render_prompt(&self.memory_scopes())
             )
         } else {
             self.config.system_prompt.clone()
@@ -195,6 +205,41 @@ impl CodingHarness {
             .state_path
             .as_deref()
             .map(crate::session::session_id_for_state_path)
+    }
+
+    /// The memory repos this session reads and writes, most general first. A
+    /// lane shares its parent session's memory.
+    pub(super) fn memory_scopes(&self) -> Vec<crate::memory::MemoryRepo> {
+        let agent = self
+            .context
+            .agent_id()
+            .map(str::to_string)
+            .or_else(|| (self.context.owner() == "mission_control").then(|| "mission-control".to_string()));
+        let session = match self.context.lane_origin() {
+            Some((parent, _)) => Some(parent.to_string()),
+            None => self.session_id(),
+        };
+        let workspace = self.context.workspace_root();
+        let project = !workspace.starts_with(crate::config::snippet_home());
+        crate::memory::scopes_for(
+            project.then_some(workspace),
+            agent.as_deref(),
+            session.as_deref(),
+        )
+    }
+
+    /// Index and commit what the agent wrote to memory this turn.
+    pub(super) fn tidy_memory(&self) {
+        for repo in self.memory_scopes() {
+            match repo.tidy() {
+                Ok((linked, committed)) if committed || !linked.is_empty() => self.debug_log(&format!(
+                    "memory tidy {}: linked {:?}, committed {committed}",
+                    repo.key, linked
+                )),
+                Ok(_) => {}
+                Err(e) => self.debug_log(&format!("memory tidy {}: {e}", repo.key)),
+            }
+        }
     }
 
     pub(super) fn store(&self) -> Option<crate::store::Store> {

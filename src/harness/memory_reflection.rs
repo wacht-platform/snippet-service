@@ -120,10 +120,11 @@ impl CodingHarness {
         Err(ToolError::msg("summarizer did not produce a valid table"))
     }
 
-    /// ACE-style curation after a request that did real work: the model sees
-    /// the memory, the ids the agent read and the request's transcript, and
-    /// answers with one delta that `Memory` merges deterministically. A delta
-    /// with rejected operations gets one retry carrying only the errors.
+    /// Curation after a request that did real work: the model sees every memory
+    /// repo this session uses and the request's transcript, and answers with one
+    /// set of entry changes. Each change is applied and each touched repo is
+    /// committed with the session as the source. A set with rejected changes
+    /// gets one retry carrying only the errors.
     pub(super) async fn reflect_on_request(
         &self,
         model: &mut dyn AgentModel,
@@ -141,22 +142,24 @@ impl CodingHarness {
         if tool_results < MIN_TOOL_RESULTS {
             return Ok(());
         }
-        let memory = crate::memory::Memory::open(self.context.workspace_root());
-        let read = memory.note_ids(&note_paths_read(window, self.context.workspace_root()));
+        let repos = self.memory_scopes();
+        if repos.is_empty() {
+            return Ok(());
+        }
+        let source = self
+            .session_id()
+            .map(|id| format!("snippet://session/{id}"))
+            .unwrap_or_else(|| "snippet://session".to_string());
         let transcript = render_reflection_window(window);
         let tools = memory_reflector_tools();
         let mut feedback = String::new();
         let prev_effort = model.swap_reasoning_effort(Some("off".to_string()));
+        let mut touched: Vec<String> = Vec::new();
 
         for _ in 0..MAX_TURNS {
             let user = format!(
-                "CURRENT MEMORY:\n{}\n\nNOTES THE AGENT READ THIS TASK (mark each helpful or harmful if it mattered; mark rules and learnings that clearly shaped the work too): {}\n\nTASK TRANSCRIPT:\n{transcript}{feedback}\n\nCall apply_memory_delta once.",
-                clip(&memory.full_listing(), MEMORY_CHARS),
-                if read.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    read.join(", ")
-                },
+                "MEMORY REPOS:\n{}\n\nTASK TRANSCRIPT:\n{transcript}{feedback}\n\nCall update_memory once.",
+                clip(&render_repos(&repos), MEMORY_CHARS),
             );
             let messages = vec![
                 HarnessMessage::System {
@@ -174,27 +177,104 @@ impl CodingHarness {
             let Some(call) = output
                 .calls
                 .first()
-                .filter(|c| c.tool_name == "apply_memory_delta")
+                .filter(|c| c.tool_name == "update_memory")
             else {
-                feedback = "\n\nLAST ATTEMPT: no apply_memory_delta call was made.".to_string();
+                feedback = "\n\nLAST ATTEMPT: no update_memory call was made.".to_string();
                 continue;
             };
-            let (applied, errors) = apply_delta(&memory, &call.arguments);
-            for line in &applied {
-                self.debug_log(&format!("memory reflection: {line}"));
+            let (applied, errors) = apply_changes(&repos, &call.arguments, &source);
+            for (key, line) in &applied {
+                self.debug_log(&format!("memory reflection: {key} {line}"));
+                if !touched.contains(key) {
+                    touched.push(key.clone());
+                }
             }
             if errors.is_empty() {
                 break;
             }
             feedback = format!(
-                "\n\nALREADY APPLIED (do not resend):\n{}\n\nREJECTED — fix these and resend only them, or send an empty delta to drop them:\n{}",
-                if applied.is_empty() { "(nothing)".to_string() } else { applied.join("\n") },
+                "\n\nALREADY APPLIED (do not resend):\n{}\n\nREJECTED — fix these and resend only them, or send no changes to drop them:\n{}",
+                if applied.is_empty() {
+                    "(nothing)".to_string()
+                } else {
+                    applied.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
+                },
                 errors.join("\n")
             );
         }
         model.swap_reasoning_effort(prev_effort);
+        for repo in repos.iter().filter(|r| touched.contains(&r.key)) {
+            if let Err(e) = repo.commit_all("Remember lessons from a session") {
+                self.debug_log(&format!("memory reflection commit {}: {e}", repo.key));
+            }
+        }
         Ok(())
     }
+}
+
+fn render_repos(repos: &[crate::memory::MemoryRepo]) -> String {
+    const FILE_CHARS: usize = 6_000;
+    let mut out = String::new();
+    for repo in repos {
+        let scope = match repo.kind {
+            crate::memory::ScopeKind::Global => "global",
+            crate::memory::ScopeKind::Project => "project",
+            crate::memory::ScopeKind::Agent => "agent",
+            crate::memory::ScopeKind::Session => "session",
+        };
+        out.push_str(&format!("\n=== scope: {scope} ({}) ===\n", repo.label));
+        for file in repo.files().into_iter().filter(|f| f.ends_with(".md")) {
+            let text = repo.read_file(&file).unwrap_or_default();
+            out.push_str(&format!("--- {file} ---\n{}\n", clip(text.trim(), FILE_CHARS)));
+        }
+    }
+    out
+}
+
+/// Apply one update_memory call. Returns what was applied (repo key, line) and
+/// what was rejected.
+fn apply_changes(
+    repos: &[crate::memory::MemoryRepo],
+    arguments: &Value,
+    source: &str,
+) -> (Vec<(String, String)>, Vec<String>) {
+    let mut applied = Vec::new();
+    let mut errors = Vec::new();
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let changes = arguments
+        .get("changes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for change in changes {
+        let text = |key: &str| change.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+        let scope = text("scope");
+        let file = text("file");
+        let Some(repo) = crate::memory::ScopeKind::parse(&scope)
+            .and_then(|kind| repos.iter().find(|r| r.kind == kind))
+        else {
+            errors.push(format!("{scope}: no such scope in this session"));
+            continue;
+        };
+        let stamped = |entry: String| {
+            if entry.contains("[source:") {
+                entry
+            } else {
+                format!("{} [source: {source}; added: {today}]", entry.trim())
+            }
+        };
+        let result = match text("op").as_str() {
+            "add" => repo.add_entry(&file, &stamped(text("entry"))),
+            "replace" => repo.replace_entry(&file, &text("match"), &stamped(text("entry"))),
+            "remove" => repo.remove_entry(&file, &text("match")),
+            other => Err(format!("op must be add, replace or remove, not {other:?}")),
+        };
+        match result {
+            Ok(line) => applied.push((repo.key.clone(), format!("{scope} {line}"))),
+            Err(e) => errors.push(format!("{scope} {file}: {e}")),
+        }
+    }
+    (applied, errors)
 }
 
 /// The messages of the request that just ended: from its checkpoint when one
@@ -213,25 +293,6 @@ fn request_window(state: &HarnessState) -> &[HarnessMessage] {
         })
         .unwrap_or(0);
     &state.messages[start..]
-}
-
-/// Markdown files the agent's shell commands named during the request.
-fn note_paths_read(window: &[HarnessMessage], workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    for message in window {
-        let HarnessMessage::Assistant { tool_calls, .. } = message else {
-            continue;
-        };
-        for call in tool_calls.iter().filter(|c| c.name == "bash") {
-            let command = call.arguments.get("command").and_then(Value::as_str).unwrap_or("");
-            for path in crate::memory::markdown_paths_in_command(command, workspace) {
-                if !paths.contains(&path) {
-                    paths.push(path);
-                }
-            }
-        }
-    }
-    paths
 }
 
 fn render_reflection_window(window: &[HarnessMessage]) -> String {
@@ -272,87 +333,4 @@ fn render_reflection_window(window: &[HarnessMessage]) -> String {
     }
     out.push_str(&lines.join("\n"));
     out
-}
-
-/// Merge one reflector delta through the same operations the CLI uses.
-/// Returns what was applied and what was rejected, one line each.
-fn apply_delta(memory: &crate::memory::Memory, delta: &Value) -> (Vec<String>, Vec<String>) {
-    use crate::memory::{Kind, NoteEdit};
-    let mut applied = Vec::new();
-    let mut errors = Vec::new();
-    let items = |key: &str| delta.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
-    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
-    let mut record = |what: String, result: Result<String, String>| match result {
-        Ok(msg) => applied.push(msg),
-        Err(e) => errors.push(format!("{what}: {e}")),
-    };
-
-    for section in items("sections") {
-        let name = text(&section, "section").unwrap_or_default();
-        let summary = text(&section, "summary").unwrap_or_default();
-        record(format!("section {name}"), memory.set_section(&name, &summary));
-    }
-    for note in items("notes") {
-        let id = text(&note, "id").unwrap_or_default();
-        let result = match text(&note, "op").as_deref() {
-            Some("add") => memory.add_note(
-                &text(&note, "section").unwrap_or_default(),
-                &id,
-                &text(&note, "title").unwrap_or_default(),
-                &text(&note, "summary").unwrap_or_default(),
-                &text(&note, "body").unwrap_or_default(),
-            ),
-            Some("update") => memory.update_note(
-                &id,
-                NoteEdit {
-                    title: text(&note, "title"),
-                    summary: text(&note, "summary"),
-                    body: text(&note, "body"),
-                    section: text(&note, "section"),
-                },
-            ),
-            _ => Err("op must be add or update".to_string()),
-        };
-        record(format!("note {id}"), result);
-    }
-    for bullet in items("bullets") {
-        let result = match text(&bullet, "op").as_deref() {
-            Some("add") => {
-                let kind = match text(&bullet, "kind").as_deref() {
-                    Some("rule") => Some(Kind::Rule),
-                    Some("learning") => Some(Kind::Learning),
-                    _ => None,
-                };
-                match kind {
-                    Some(kind) => memory.add_bullet(
-                        kind,
-                        bullet.get("global").and_then(Value::as_bool).unwrap_or(false),
-                        &text(&bullet, "section").unwrap_or_default(),
-                        &text(&bullet, "text").unwrap_or_default(),
-                    ),
-                    None => Err("kind must be rule or learning".to_string()),
-                }
-            }
-            Some("update") => memory.update_bullet(
-                &text(&bullet, "id").unwrap_or_default(),
-                text(&bullet, "text").as_deref(),
-                text(&bullet, "section").as_deref(),
-            ),
-            _ => Err("op must be add or update".to_string()),
-        };
-        let what = text(&bullet, "id")
-            .or_else(|| text(&bullet, "text"))
-            .unwrap_or_default();
-        record(format!("bullet {}", clip(&what, 60)), result);
-    }
-    for mark in items("marks") {
-        let id = text(&mark, "id").unwrap_or_default();
-        let helpful = text(&mark, "verdict").as_deref() != Some("harmful");
-        record(format!("mark {id}"), memory.mark(&id, helpful));
-    }
-    for id in items("remove") {
-        let id = id.as_str().unwrap_or_default().to_string();
-        record(format!("remove {id}"), memory.remove(&id));
-    }
-    (applied, errors)
 }
