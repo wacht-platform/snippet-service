@@ -193,11 +193,7 @@ impl Tool for ChangeFilesTool {
                 - delete: remove a file.\n\
                 - move: rename `path` to `to`.\n\n\
                 The result shows the changed lines with their line numbers, so there is no need to \
-                re-read a file just to check an edit.\n\n\
-                For a large rewrite, many sites at once, or text that's awkward to carry as `find`/`with` \
-                (long blocks, heavy quoting), a short script run with bash is often the better tool: \
-                read the file, check the target text appears exactly as often as expected and stop if \
-                not, replace, write it back, then confirm with `git diff --stat`."
+                re-read a file just to check an edit."
                 .to_string(),
             input_schema: object_schema(
                 json!({
@@ -229,7 +225,7 @@ impl Tool for ChangeFilesTool {
         let args: ChangeFilesArgs = expect_object("change_files", normalize_changes(arguments))?;
         if args.changes.is_empty() {
             return Err(ToolError::msg(
-                "`changes` arrived empty, so the edit's content didn't come through. Send the change again. For a large edit, a short script that reads the file, checks the target text is there exactly as expected, replaces it and writes the file back is more reliable than one very long find/with.",
+                "`changes` arrived empty, so the edit's content didn't come through. Send the change again.",
             ));
         }
         let mut staged: HashMap<PathBuf, Staged> = HashMap::new();
