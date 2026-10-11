@@ -347,7 +347,7 @@ fn tool_prompt_preamble(kind: CliKind) -> String {
             "## Tools in this runtime\n\nThe tools named in this prompt are served to you as `{MCP_PREFIX}<name>`: where it says `bash`, call `{MCP_PREFIX}bash`, and so on. These are your only tools: you have no built-in ones in this session. Read and search files with `bash` (cat, sed -n, rg, ls), and make every change, command, question and delegation through the snippet tools."
         ),
         CliKind::Antigravity => format!(
-            "## Tools in this runtime\n\nThe tools named in these instructions are served by the `{}` MCP server: call them with call_mcp_tool, ServerName `{}` and ToolName exactly as named here (`bash`, `change_files`, `update_plan`, `ask_user`, `delegate_task`, and the rest). These are your only working tools: every built-in tool of yours is switched off in this session. Read and search files with the snippet `bash` tool (cat, sed -n, rg, ls), research with its `web_search` and `web_read`, and make every change, command, question and delegation through the snippet tools. The one exception: when a tool result says its output was saved to a file inside your own Antigravity folder, read that file with view_file.",
+            "## Tools in this runtime\n\nThe tools named in these instructions are served by the `{}` MCP server: call them with call_mcp_tool, ServerName `{}` and ToolName exactly as named here (`bash`, `change_files`, `update_plan`, `ask_user`, `delegate_task`, and the rest). Every call_mcp_tool call also needs `toolSummary` (a few words on what the call does) and `toolAction` (a short verb phrase, such as `Running tests`); a call without them is rejected before it runs. These are your only working tools: every built-in tool of yours is switched off in this session. Read and search files with the snippet `bash` tool (cat, sed -n, rg, ls), research with its `web_search` and `web_read`, and make every change, command, question and delegation through the snippet tools. The one exception: when a tool result says its output was saved to a file inside your own Antigravity folder, read that file with view_file.",
             crate::antigravity::MCP_SERVER_NAME,
             crate::antigravity::MCP_SERVER_NAME,
         ),
@@ -355,7 +355,7 @@ fn tool_prompt_preamble(kind: CliKind) -> String {
 }
 
 fn tool_guide(defs: &[NativeToolDefinition]) -> String {
-    let mut out = String::from("## Snippet tools and their arguments\n\nCall each through call_mcp_tool with ServerName `snippet_snippet`. Pass every required argument by its exact name; optional ones in brackets.\n");
+    let mut out = String::from("## Snippet tools and their arguments\n\nCall each through call_mcp_tool with ServerName `snippet_snippet`, plus `toolSummary` and `toolAction` on every call. Pass every required argument by its exact name; optional ones in brackets.\n");
     for def in defs {
         let schema = &def.input_schema;
         let required: Vec<&str> = schema
@@ -1879,7 +1879,12 @@ impl CodingHarness {
                                 .pointer("/error/message")
                                 .and_then(Value::as_str)
                                 .is_some_and(|m| m.contains("denied by pre-tool hook"));
-                        let quiet = schema_read || redirected || QUIET_TOOLS.contains(&name.as_str());
+                        let envelope_rejected = done == Some("ERROR")
+                            && info
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .is_some_and(|m| m.contains("missing properties") && (m.contains("toolSummary") || m.contains("toolAction")));
+                        let quiet = schema_read || redirected || envelope_rejected || QUIET_TOOLS.contains(&name.as_str());
                         let mut changed = false;
                         let announce = mcp || done.is_some_and(|d| d == "DONE" || d == "ERROR");
                         if announce && !quiet && parse.agy_tools.insert(index) {
