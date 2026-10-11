@@ -69,7 +69,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(CancelRecurringJob);
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
-    registry.insert(ArchiveMissionSession);
+    registry.insert(CleanUpSessions);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
     registry.insert(UpdateBrief);
@@ -169,7 +169,7 @@ impl Tool for AnswerWorker {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "answer_worker".into(),
-            description: "Answer the question a worker session is paused on, as if the user answered it there. Use it for a [worker_question] the brief, the task or the conversation already settles. Check with the user first only when the confirmation puts an extremely critical detail at stake (unrecoverable data, production, secrets, money, git history, scope beyond the request). Name the choice plainly and add a sentence of why when it helps.".into(),
+            description: "Answer the question a worker session is paused on, as if the user answered it there: for a [worker_question] the user's request, the task or your brief already settles. A question that only the user can settle (lost data, production, secrets, money, history, scope beyond the request) goes to them first. Name the choice plainly, with a sentence of why when it helps.".into(),
             input_schema: schema(json!({
                 "session_id": {"type": "string", "description": "The waiting session's id, from the [worker_question]."},
                 "answer": {"type": "string", "description": "The answer, e.g. \"Blue — the user wants colour files blue.\""}
@@ -235,7 +235,7 @@ impl Tool for ScheduleFollowup {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "schedule_followup".into(),
-            description: "Ask to be woken later, whether or not anything changes: check a worker's progress, verify a result, remind the user, revisit a decision, or simply your next look at everything. You get a round with this note when it's due. Use it instead of waiting or polling. Set next_wake for your next general check-in; it replaces the previous one, so there is only ever one.".into(),
+            description: "Be woken at a time: a deploy window, a check you promised the user, a job that won't report on its own, the morning after quiet hours. You get a round with this note when it's due. Running tasks report by themselves, so their progress needs no wake-up. next_wake marks your one general next look, replacing the previous one.".into(),
             input_schema: schema(json!({
                 "in_minutes": {"type": "integer", "description": "How many minutes from now (1 to 10080)."},
                 "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."},
@@ -781,6 +781,20 @@ async fn create_task(
             )
             .map_err(ToolError::msg)?;
         }
+        let recent_cutoff = chrono::Utc::now() - chrono::Duration::minutes(5);
+        if let Some(existing) = store
+            .list_tasks(Some(&session_id), None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| !t.status.is_terminal())
+            .filter(|t| t.title.trim().eq_ignore_ascii_case(args.title.trim()))
+            .find(|t| chrono::DateTime::parse_from_rfc3339(&t.created_at).is_ok_and(|at| at >= recent_cutoff))
+        {
+            return Ok(ToolResult::success(json!({
+                "task": task_view(&existing),
+                "note": "This task was already filed a moment ago and is on its way; nothing new was created.",
+            })));
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let handoff_mode = match args.handoff_mode.as_deref() {
             None | Some("resume") => HandoffMode::Resume,
@@ -1303,7 +1317,7 @@ impl Tool for TransferMissionTaskLease {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "transfer_mission_task_lease".into(),
-            description: "Transfer the active session lease of a task to a specified agent. Exactly one agent works in the session at a time; other assigned agents are set to waiting.".into(),
+            description: "Hand a running task's session from the agent working it to another agent, as a handover between colleagues. Exactly one agent works in the session at a time; the others wait. Not for starting work: an offered task starts when its agent claims it.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string"},
@@ -1326,6 +1340,11 @@ impl Tool for TransferMissionTaskLease {
         require_working_agent(&store, to_agent)?;
         let roster = store.list_task_agents(task_id).unwrap_or_default();
         let current_active = roster.iter().find(|m| m.status == "active" && m.removed_at.is_none()).map(|m| m.agent_id.as_str()).unwrap_or("none");
+        if task.status != TaskStatus::InProgress || current_active == "none" {
+            return Err(ToolError::msg(
+                "a lease hands running work from one agent to another. This task hasn't been claimed yet: the offered agent takes it on from its inbox. To give it to someone else instead, assign that agent (assign_task_agent) and retry the task.",
+            ));
+        }
         let now = now_rfc3339();
 
         if !roster.iter().any(|m| m.agent_id == to_agent && m.removed_at.is_none()) {
@@ -1484,6 +1503,96 @@ impl Tool for ArchiveMissionSession {
         Ok(ToolResult::success(
             json!({"archived": true, "session_id": session.id}),
         ))
+    }
+}
+
+/// Sessions that have gone quiet: not running, idle for a while, and with no
+/// open task routed to them. Mission Control's own session, agents' inboxes
+/// and lanes are never candidates.
+fn stale_sessions(store: &Store, idle_days: i64) -> Vec<crate::session::SessionInfo> {
+    let now = chrono::Utc::now().timestamp();
+    let open: std::collections::HashSet<String> = store
+        .list_tasks(None, None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| !t.status.is_terminal())
+        .map(|t| t.session_id)
+        .collect();
+    list_routable_sessions()
+        .into_iter()
+        .filter(|s| !matches!(s.status.as_str(), "running" | "waiting_for_input"))
+        .filter(|s| now - s.last_active > idle_days * 86_400)
+        .filter(|s| !open.contains(&s.id))
+        .filter(|s| !mission_control::is_session_id(&s.id) && !crate::session::is_inbox_session_id(&s.id))
+        .collect()
+}
+
+pub struct CleanUpSessions;
+#[async_trait]
+impl Tool for CleanUpSessions {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "clean_up_sessions".into(),
+            description: "Keep the session list tidy. `list` (the default) returns sessions that have gone stale: not running, idle for `idle_days` (default 14) and with no open task, each with its title, workspace and how long it's been idle. `delete` removes the sessions you name, the same way deleting one in the app does: the conversation and its session memory go for good, while project and global memory keep what was learned. Deletion is the user's call, so show them the exact list and delete what they confirm; sessions that are running or have open work are refused.".into(),
+            input_schema: schema(
+                json!({
+                    "action": {"type": "string", "enum": ["list", "delete"]},
+                    "idle_days": {"type": "integer", "minimum": 1, "description": "list: how long a session must have been idle (default 14)"},
+                    "session_ids": {"type": "array", "items": {"type": "string"}, "description": "delete: the sessions the user confirmed, exactly as listed"}
+                }),
+                &[],
+            ),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let store = db(ctx)?;
+        let action = arguments.get("action").and_then(Value::as_str).unwrap_or("list");
+        let now = chrono::Utc::now().timestamp();
+        if action == "list" {
+            let idle_days = arguments.get("idle_days").and_then(Value::as_i64).unwrap_or(14).max(1);
+            let stale: Vec<Value> = stale_sessions(&store, idle_days)
+                .into_iter()
+                .map(|s| json!({
+                    "session_id": s.id,
+                    "title": s.title,
+                    "workspace": s.folder,
+                    "idle_days": (now - s.last_active) / 86_400,
+                    "agent_id": s.agent_id,
+                }))
+                .collect();
+            return Ok(ToolResult::success(json!({"stale": stale, "idle_days": idle_days})));
+        }
+        if action != "delete" {
+            return Err(ToolError::msg("action must be list or delete"));
+        }
+        let ids: Vec<String> = arguments
+            .get("session_ids")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return Err(ToolError::msg("delete needs session_ids"));
+        }
+        let eligible: std::collections::HashSet<String> =
+            stale_sessions(&store, 0).into_iter().map(|s| s.id).collect();
+        let info = crate::serve::sidecar::read_daemon_info()
+            .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
+        let client = reqwest::Client::new();
+        let mut deleted = Vec::new();
+        let mut refused = Vec::new();
+        for id in ids {
+            if !eligible.contains(&id) {
+                refused.push(json!({"session_id": id, "reason": "running, has open work, or isn't a deletable session"}));
+                continue;
+            }
+            let url = format!("{}/session/delete?token={}", info.api_url.trim_end_matches('/'), info.token);
+            match client.post(&url).json(&json!({"session": id})).send().await {
+                Ok(response) if response.status().is_success() => deleted.push(id),
+                Ok(response) => refused.push(json!({"session_id": id, "reason": format!("delete failed: HTTP {}", response.status())})),
+                Err(e) => refused.push(json!({"session_id": id, "reason": format!("delete failed: {e}")})),
+            }
+        }
+        Ok(ToolResult::success(json!({"deleted": deleted, "refused": refused})))
     }
 }
 
@@ -1792,7 +1901,7 @@ impl Tool for CreateRecurringJob {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_recurring_job".into(),
-            description: "Schedule work that repeats: each run sets a goal on the target session (the current one if session_id is omitted), and its complete_goal summary is shown to the user. schedule: `every 5m|15m|1h|1d` (at least 5 minutes), `daily HH:MM`, or one-off `at HH:MM` / `in 30m`. Give a prompt, a plan_path the session rereads each run, or both. The first run starts within seconds unless the session is busy.".into(),
+            description: "Schedule work that repeats: each run sets a goal on the target session (the current one if session_id is omitted), and its complete_goal summary is shown to the user and reported to you as a [recurring_run_report]. schedule: `every 5m|15m|1h|1d` (at least 5 minutes), `daily HH:MM`, or one-off `at HH:MM` / `in 30m`. Give a prompt, a plan_path the session rereads each run, or both. The first run starts within seconds unless the session is busy.".into(),
             input_schema: schema(
                 json!({
                     "title": {"type": "string"},
@@ -2085,6 +2194,8 @@ mod tests {
         assert_eq!(updated.title, "Updated title");
         assert_eq!(updated.plan, "Step 1: Code\nStep 2: Review");
 
+        db.add_task_agent_full("t-mc", "snippet", "implementer", None, "", "active", &now_rfc3339()).unwrap();
+        db.update_task_in("t-mc", &now_rfc3339(), |t| t.status = TaskStatus::InProgress).unwrap();
         let res = TransferMissionTaskLease
             .execute(&ctx, json!({"task_id": "t-mc", "to_agent_id": "reviewer"}))
             .await
