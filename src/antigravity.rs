@@ -92,6 +92,13 @@ fn decision(raw: &str, in_snippet: bool) -> Value {
     })
 }
 
+/// Where a rejected call_mcp_tool envelope is marked for the bridge serving
+/// `mcp_url`, so the next result it serves carries a reminder.
+pub fn envelope_marker(mcp_url: &str) -> Option<PathBuf> {
+    let token = mcp_url.trim_end_matches('/').rsplit('/').next().filter(|t| !t.is_empty())?;
+    Some(crate::config::snippet_home().join("antigravity").join("envelope").join(token))
+}
+
 pub fn prepare_home(key: &str, mcp_url: &str, prompt: &str) -> Result<PathBuf, String> {
     let real = real_home().ok_or("HOME is not set")?.join(".gemini");
     let home = crate::config::snippet_home().join("antigravity/homes").join(key);

@@ -194,6 +194,7 @@ struct CliParse {
     calls: Vec<crate::llm::TokenUsage>,
     claude_call: Option<crate::llm::TokenUsage>,
     served: ServedResults,
+    envelope_marker: Option<PathBuf>,
 }
 
 pub struct CliAgentModel {
@@ -347,7 +348,7 @@ fn tool_prompt_preamble(kind: CliKind) -> String {
             "## Tools in this runtime\n\nThe tools named in this prompt are served to you as `{MCP_PREFIX}<name>`: where it says `bash`, call `{MCP_PREFIX}bash`, and so on. These are your only tools: you have no built-in ones in this session. Read and search files with `bash` (cat, sed -n, rg, ls), and make every change, command, question and delegation through the snippet tools."
         ),
         CliKind::Antigravity => format!(
-            "## Tools in this runtime\n\nThe tools named in these instructions are served by the `{}` MCP server: call them with call_mcp_tool, ServerName `{}` and ToolName exactly as named here (`bash`, `change_files`, `update_plan`, `ask_user`, `delegate_task`, and the rest). These are your only working tools: every built-in tool of yours is switched off in this session. Read and search files with the snippet `bash` tool (cat, sed -n, rg, ls), research with its `web_search` and `web_read`, and make every change, command, question and delegation through the snippet tools. The one exception: when a tool result says its output was saved to a file inside your own Antigravity folder, read that file with view_file.",
+            "## Tools in this runtime\n\nThe tools named in these instructions are served by the `{}` MCP server: call them with call_mcp_tool, ServerName `{}` and ToolName exactly as named here (`bash`, `change_files`, `update_plan`, `ask_user`, `delegate_task`, and the rest). Every call_mcp_tool call also needs `toolSummary` (a few words on what the call does) and `toolAction` (a short verb phrase, such as `Running tests`); a call without them is rejected before it runs. These are your only working tools: every built-in tool of yours is switched off in this session. Read and search files with the snippet `bash` tool (cat, sed -n, rg, ls), research with its `web_search` and `web_read`, and make every change, command, question and delegation through the snippet tools. The one exception: when a tool result says its output was saved to a file inside your own Antigravity folder, read that file with view_file.",
             crate::antigravity::MCP_SERVER_NAME,
             crate::antigravity::MCP_SERVER_NAME,
         ),
@@ -355,7 +356,7 @@ fn tool_prompt_preamble(kind: CliKind) -> String {
 }
 
 fn tool_guide(defs: &[NativeToolDefinition]) -> String {
-    let mut out = String::from("## Snippet tools and their arguments\n\nCall each through call_mcp_tool with ServerName `snippet_snippet`. Pass every required argument by its exact name; optional ones in brackets.\n");
+    let mut out = String::from("## Snippet tools and their arguments\n\nCall each through call_mcp_tool with ServerName `snippet_snippet`, plus `toolSummary` and `toolAction` on every call. Pass every required argument by its exact name; optional ones in brackets.\n");
     for def in defs {
         let schema = &def.input_schema;
         let required: Vec<&str> = schema
@@ -508,6 +509,11 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
             }
             let failed = value.get("status").and_then(Value::as_str) == Some("error");
             let mut content = vec![json!({"type": "text", "text": value.to_string()})];
+            if let Some(marker) = crate::antigravity::envelope_marker(&format!("/mcp/{}", state.token))
+                && std::fs::remove_file(&marker).is_ok()
+            {
+                content.push(json!({"type": "text", "text": "<system-reminder>Your previous call_mcp_tool call was rejected before it ran because it left out toolSummary or toolAction. Include both on every call.</system-reminder>"}));
+            }
             let steers: Vec<String> = state.steers.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
             if !steers.is_empty() {
                 content.push(json!({"type": "text", "text": format!(
@@ -1097,7 +1103,11 @@ impl CodingHarness {
         if kind == CliKind::Antigravity {
             session.tool_guide = guide;
         }
-        let mut parse = CliParse { served, ..Default::default() };
+        let mut parse = CliParse {
+            served,
+            envelope_marker: crate::antigravity::envelope_marker(&mcp_url),
+            ..Default::default()
+        };
         let mut pending_approval: Option<McpCall> = None;
         let mut pending_vault = false;
         let mut pending_custom: Option<crate::agent_tools::CustomTool> = None;
@@ -1879,8 +1889,30 @@ impl CodingHarness {
                                 .pointer("/error/message")
                                 .and_then(Value::as_str)
                                 .is_some_and(|m| m.contains("denied by pre-tool hook"));
-                        let quiet = schema_read || redirected || QUIET_TOOLS.contains(&name.as_str());
+                        let envelope_rejected = done == Some("ERROR")
+                            && info
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .is_some_and(|m| m.contains("missing properties") && (m.contains("toolSummary") || m.contains("toolAction")));
+                        let quiet = schema_read || redirected || envelope_rejected || QUIET_TOOLS.contains(&name.as_str());
                         let mut changed = false;
+                        if envelope_rejected {
+                            if let Some(marker) = parse.envelope_marker.as_ref() {
+                                if let Some(dir) = marker.parent() {
+                                    let _ = std::fs::create_dir_all(dir);
+                                }
+                                let _ = std::fs::write(marker, &name);
+                            }
+                            if parse.agy_tools.remove(&index)
+                                && let Some(at) = state.events.iter().rposition(|e| {
+                                    matches!(e, HarnessEvent::ToolCall { tool_name, .. } if *tool_name == name)
+                                })
+                            {
+                                state.events.remove(at);
+                                state.events_rewritten = true;
+                                changed = true;
+                            }
+                        }
                         let announce = mcp || done.is_some_and(|d| d == "DONE" || d == "ERROR");
                         if announce && !quiet && parse.agy_tools.insert(index) {
                             state.events.push(HarnessEvent::ToolCall { tool_name: name.clone(), arguments });
