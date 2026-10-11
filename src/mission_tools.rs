@@ -320,7 +320,7 @@ impl Tool for ListSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_sessions".into(),
-            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity. Use it to find the session that owns a piece of work. Agent builds need no session.".into(),
+            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity, and the profile a session is pinned to (none means the active default). Use it to find the session that owns a piece of work, and one already on the model the work needs.".into(),
             input_schema: schema(json!({}), &[]),        }
     }
     async fn execute(
@@ -631,6 +631,8 @@ struct CreateSessionArgs {
     /// `worktree` isolates the session on its own branch; `folder` works in
     /// the folder itself.
     workspace: crate::session::WorkspaceMode,
+    #[serde(default)]
+    profile: Option<String>,
 }
 pub struct CreateMissionSession;
 #[async_trait]
@@ -638,13 +640,14 @@ impl Tool for CreateMissionSession {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "create_mission_session".into(),
-            description: "Open a durable project chat in an existing folder. Use only for ordinary project work when no existing session owns the folder. An agent build is done with register_agent, since agent homes are separate from project sessions. `workspace` is required: `worktree` gives the session its own git worktree and branch (isolated from other sessions' edits; only in a git repo), `folder` works directly in the folder.".into(),
+            description: "Open a durable project chat in a folder: when no session has worked on the scope, or when work needs a different model than the session that has (pass `profile`), since a session moved to another model loses its prompt cache. `workspace` is required: `worktree` gives the session its own git worktree and branch (isolated from other sessions' edits; only in a git repo), `folder` works directly in the folder. Agents are built with register_agent, not here.".into(),
             input_schema: schema(
                 json!({
                     "folder": {"type": "string"},
                     "title": {"type": "string"},
                     "new_conversation": {"type": "boolean"},
-                    "workspace": {"type": "string", "enum": ["worktree", "folder"]}
+                    "workspace": {"type": "string", "enum": ["worktree", "folder"]},
+                    "profile": {"type": "string", "description": "optional; pin the session to this inference profile (list_profiles), for work that needs that model"}
                 }),
                 &["folder", "workspace"],
             ),
@@ -660,9 +663,17 @@ impl Tool for CreateMissionSession {
         if args.folder.trim().is_empty() {
             return Err(ToolError::msg("folder must be a non-empty path"));
         }
-        let session =
+        let profile = args.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
+        if let Some(name) = profile.as_deref() {
+            check_profile(name).await?;
+        }
+        let mut session =
             create_blank_session(&folder, &args.title, args.new_conversation, args.workspace)
             .map_err(ToolError::msg)?;
+        if let (Some(name), Some(path)) = (profile.as_deref(), state_path_for_id(&session.id)) {
+            crate::session::write_session_profile(&path, name);
+            session.profile = Some(name.to_string());
+        }
         Ok(ToolResult::success(json!({
             "session": session,
             "note": "Created idle. Give it work with create_mission_task(session_id, handoff_mode=fresh); the work itself happens in that session.",
@@ -703,7 +714,7 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. The target session is restarted on that model, so omit it unless a specific model is wanted — leaving it alone preserves the session's own choice. An unknown name is rejected."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's for rescuing a rate-limited session. Work that simply needs another model belongs in a session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
