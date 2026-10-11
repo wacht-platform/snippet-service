@@ -166,26 +166,18 @@ impl CodingHarness {
         Err(ToolError::msg("summarizer did not produce a valid table"))
     }
 
-    /// Curation after a request that did real work: the model sees every memory
-    /// repo this session uses and the request's transcript, and answers with one
-    /// set of entry changes. Each change is applied and each touched repo is
-    /// committed with the session as the source. A set with rejected changes
-    /// gets one retry carrying only the errors.
+    /// Curation after a request that did real work, as a branch of the
+    /// conversation itself: the same messages, tools and reasoning settings the
+    /// session just used, plus one instruction, so the provider serves the whole
+    /// prefix from its prompt cache. The branch is never saved to the history.
+    /// The model answers with JSON changes, which are applied and committed with
+    /// the session as the source.
     pub(super) async fn reflect_on_request(
         &self,
         model: &mut dyn AgentModel,
         state: &HarnessState,
     ) -> Result<(), ToolError> {
-        const MIN_TOOL_RESULTS: usize = 3;
-        const MAX_TURNS: usize = 2;
-        const MEMORY_CHARS: usize = 20_000;
-
-        let window = request_window(state);
-        let tool_results = window
-            .iter()
-            .filter(|m| matches!(m, HarnessMessage::ToolResult { .. }))
-            .count();
-        if tool_results < MIN_TOOL_RESULTS {
+        if !reflection_due(request_window(state)) {
             return Ok(());
         }
         let repos = self.memory_scopes();
@@ -196,39 +188,24 @@ impl CodingHarness {
             .session_id()
             .map(|id| format!("snippet://session/{id}"))
             .unwrap_or_else(|| "snippet://session".to_string());
-        let transcript = render_reflection_window(window);
-        let tools = memory_reflector_tools();
-        let mut feedback = String::new();
-        let prev_effort = model.swap_reasoning_effort(Some("off".to_string()));
+        let goal_active = state
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == GoalStatus::Active);
+        let definitions = self.definitions_for(true, goal_active);
+        let mut messages = state.messages.clone();
+        messages.push(HarnessMessage::User {
+            content: reflection_instruction(&repos),
+        });
         let mut touched: Vec<String> = Vec::new();
-
-        for _ in 0..MAX_TURNS {
-            let user = format!(
-                "MEMORY REPOS:\n{}\n\nTASK TRANSCRIPT:\n{transcript}{feedback}\n\nCall update_memory once.",
-                clip(&render_repos(&repos), MEMORY_CHARS),
-            );
-            let messages = vec![
-                HarnessMessage::System {
-                    content: MEMORY_REFLECTOR_SYSTEM.to_string(),
-                },
-                HarnessMessage::User { content: user },
-            ];
-            let output = match model.generate(&messages, &tools, true, None).await {
-                Ok(output) => output,
-                Err(e) => {
-                    model.swap_reasoning_effort(prev_effort);
-                    return Err(e);
-                }
+        for _ in 0..2 {
+            let output = model.generate(&messages, &definitions, false, None).await?;
+            let reply = output.content_text.clone().unwrap_or_default();
+            let Some(changes) = parse_reflection(&reply) else {
+                self.debug_log("memory reflection: no JSON changes in the reply");
+                break;
             };
-            let Some(call) = output
-                .calls
-                .first()
-                .filter(|c| c.tool_name == "update_memory")
-            else {
-                feedback = "\n\nLAST ATTEMPT: no update_memory call was made.".to_string();
-                continue;
-            };
-            let (applied, errors) = apply_changes(&repos, &call.arguments, &source);
+            let (applied, errors) = apply_changes(&repos, &changes, &source);
             for (key, line) in &applied {
                 self.debug_log(&format!("memory reflection: {key} {line}"));
                 if !touched.contains(key) {
@@ -238,23 +215,78 @@ impl CodingHarness {
             if errors.is_empty() {
                 break;
             }
-            feedback = format!(
-                "\n\nALREADY APPLIED (do not resend):\n{}\n\nREJECTED — fix these and resend only them, or send no changes to drop them:\n{}",
-                if applied.is_empty() {
-                    "(nothing)".to_string()
-                } else {
-                    applied.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
-                },
-                errors.join("\n")
-            );
+            messages.push(HarnessMessage::Assistant {
+                content: reply,
+                tool_calls: Vec::new(),
+            });
+            messages.push(HarnessMessage::User {
+                content: reflection_retry(&applied, &errors),
+            });
         }
-        model.swap_reasoning_effort(prev_effort);
-        for repo in repos.iter().filter(|r| touched.contains(&r.key)) {
-            if let Err(e) = repo.commit_all("Remember lessons from a session") {
-                self.debug_log(&format!("memory reflection commit {}: {e}", repo.key));
+        commit_reflection(&repos, &touched);
+        Ok(())
+    }
+}
+
+/// Whether a finished request did enough work to be worth reflecting on.
+pub(super) fn reflection_due(window: &[HarnessMessage]) -> bool {
+    window
+        .iter()
+        .filter(|m| matches!(m, HarnessMessage::ToolResult { .. }))
+        .count()
+        >= 3
+}
+
+pub(super) fn reflection_instruction(repos: &[crate::memory::MemoryRepo]) -> String {
+    let mut files = String::new();
+    for repo in repos {
+        let scope = scope_name(&repo.kind);
+        let names: Vec<String> = repo.files().into_iter().filter(|f| f.ends_with(".md")).collect();
+        files.push_str(&format!("- {scope} ({}): {}\n", repo.root.display(), names.join(", ")));
+        if repo.kind == crate::memory::ScopeKind::Session {
+            for file in names {
+                let text = repo.read_file(&file).unwrap_or_default();
+                files.push_str(&format!("  --- {file} ---\n{}\n", clip(text.trim(), 4_000)));
             }
         }
-        Ok(())
+    }
+    format!("{REFLECTION_INSTRUCTION}\n\nMemory files now:\n{files}")
+}
+
+pub(super) fn reflection_retry(applied: &[(String, String)], errors: &[String]) -> String {
+    format!(
+        "[reflection] Already applied (do not resend):\n{}\n\nRejected; fix these and resend only them as the same JSON, or send {{\"changes\": []}} to drop them:\n{}",
+        if applied.is_empty() {
+            "(nothing)".to_string()
+        } else {
+            applied.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n")
+        },
+        errors.join("\n")
+    )
+}
+
+/// The `{"changes": [...]}` object in a reflection reply, fenced or bare.
+pub(super) fn parse_reflection(text: &str) -> Option<Value> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    let value: Value = serde_json::from_str(text.get(start..=end)?).ok()?;
+    value.get("changes").is_some_and(Value::is_array).then_some(value)
+}
+
+pub(super) fn commit_reflection(repos: &[crate::memory::MemoryRepo], touched: &[String]) {
+    for repo in repos.iter().filter(|r| touched.contains(&r.key)) {
+        if let Err(e) = repo.commit_all("Remember lessons from a session") {
+            eprintln!("memory reflection commit {}: {e}", repo.key);
+        }
+    }
+}
+
+fn scope_name(kind: &crate::memory::ScopeKind) -> &'static str {
+    match kind {
+        crate::memory::ScopeKind::Global => "global",
+        crate::memory::ScopeKind::Project => "project",
+        crate::memory::ScopeKind::Agent => "agent",
+        crate::memory::ScopeKind::Session => "session",
     }
 }
 
@@ -279,7 +311,7 @@ fn render_repos(repos: &[crate::memory::MemoryRepo]) -> String {
 
 /// Apply one update_memory call. Returns what was applied (repo key, line) and
 /// what was rejected.
-fn apply_changes(
+pub(super) fn apply_changes(
     repos: &[crate::memory::MemoryRepo],
     arguments: &Value,
     source: &str,
@@ -333,7 +365,7 @@ fn is_date(text: &str) -> bool {
 
 /// The messages of the request that just ended: from its checkpoint when one
 /// was taken since the last compaction, else from the last user message.
-fn request_window(state: &HarnessState) -> &[HarnessMessage] {
+pub(super) fn request_window(state: &HarnessState) -> &[HarnessMessage] {
     let start = state
         .checkpoints
         .last()
@@ -349,42 +381,3 @@ fn request_window(state: &HarnessState) -> &[HarnessMessage] {
     &state.messages[start..]
 }
 
-fn render_reflection_window(window: &[HarnessMessage]) -> String {
-    const BUDGET_CHARS: usize = 60_000;
-    let mut lines: Vec<String> = window
-        .iter()
-        .filter_map(|m| {
-            let line = match m {
-                HarnessMessage::User { content } => format!("USER: {}", clip(content, 1_500)),
-                HarnessMessage::Assistant { content, tool_calls } => {
-                    let mut s = String::new();
-                    if !content.trim().is_empty() {
-                        s.push_str(&format!("ASSISTANT: {}", clip(content, 1_500)));
-                    }
-                    for c in tool_calls {
-                        s.push_str(&format!("\nCALL {}({})", c.name, clip(&c.arguments.to_string(), 500)));
-                    }
-                    s
-                }
-                HarnessMessage::ToolResult { tool_name, content, .. } => {
-                    format!("RESULT {tool_name}: {}", clip(&crate::llm::render_tool_result(content), 800))
-                }
-                HarnessMessage::Summary { content, .. } => format!("EARLIER (summary): {}", clip(content, 4_000)),
-                HarnessMessage::System { .. } => String::new(),
-            };
-            (!line.trim().is_empty()).then_some(line)
-        })
-        .collect();
-    let mut total: usize = lines.iter().map(|l| l.chars().count() + 1).sum();
-    let mut dropped = 0;
-    while total > BUDGET_CHARS && lines.len() > 1 {
-        total -= lines.remove(0).chars().count() + 1;
-        dropped += 1;
-    }
-    let mut out = String::new();
-    if dropped > 0 {
-        out.push_str(&format!("[…{dropped} earliest messages omitted]\n"));
-    }
-    out.push_str(&lines.join("\n"));
-    out
-}
