@@ -136,7 +136,7 @@ async fn wake_for_worker_questions(daemon: &Shared) {
             continue;
         }
         let text = format!(
-            "[worker_question]\ntask_id: {}\ntask: {}\nsession_id: {}\nquestion:\n{}\n[/worker_question]\nThe worker is paused on this question. Answer it yourself with answer_worker (session_id {}) when the brief, the task or the conversation already settles it; otherwise ping the user with the question and what you'd recommend.",
+            "[worker_question]\ntask_id: {}\ntask: {}\nsession_id: {}\nquestion:\n{}\n[/worker_question]\nWorkflow W5 · worker question: the worker is paused on it. Answer with answer_worker (session_id {}) when the user's request, the task or your brief settles it; otherwise ask the user once with your recommendation. Then stop.",
             task.id,
             task.title,
             task.session_id,
@@ -334,7 +334,7 @@ fn round_envelope(
     } else {
         brief.trim()
     });
-    out.push_str("\n[/autonomous_round]");
+    out.push_str("\n[/autonomous_round]\nWorkflow W4 · round: act, wait or ask, then stop. Running and waiting tasks report on their own: don't inspect them, read their logs or schedule a check for them. A round where you only waited needs no reply.");
     out
 }
 
