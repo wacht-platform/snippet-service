@@ -124,7 +124,7 @@ impl Store {
         created_at: &str,
         origin_session: Option<&str>,
     ) -> Result<CoordinationEvent, StoreError> {
-        self.send_direct_message_with_origin(sender, recipient, body, idempotency_key, created_at, origin_session, None)
+        self.send_direct_message_with_origin(sender, recipient, body, idempotency_key, created_at, origin_session, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -137,6 +137,7 @@ impl Store {
         created_at: &str,
         origin_session: Option<&str>,
         origin_lane: Option<&str>,
+        about_task: Option<&str>,
     ) -> Result<CoordinationEvent, StoreError> {
         let thread_id = direct_thread_id(sender, recipient);
         let title = format!(
@@ -182,6 +183,9 @@ impl Store {
                 }
                 if let Some(lane) = origin_lane.filter(|l| !l.trim().is_empty()) {
                     payload["origin_lane"] = serde_json::json!(lane);
+                }
+                if let Some(task) = about_task.filter(|t| !t.trim().is_empty()) {
+                    payload["about_task"] = serde_json::json!(task);
                 }
                 payload
             },

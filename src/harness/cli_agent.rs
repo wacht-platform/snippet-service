@@ -20,6 +20,14 @@ use crate::llm::{ModelOutput, StreamBuffer, StreamHandle};
 const MCP_SERVER: &str = "snippet";
 const MCP_PREFIX: &str = "mcp__snippet__";
 const QUIET_TOOLS: [&str; 3] = ["update_plan", "ask_user", "set_session_title"];
+const COMMAND_MARK: &str = "\u{1}command\u{1}";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CliCompaction {
+    Idle,
+    Saving,
+    Compacting,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliKind {
@@ -566,6 +574,52 @@ impl CodingHarness {
         prompt
     }
 
+    fn session_memory_path(&self) -> Option<String> {
+        if !self.config.memory_enabled || self.context.lane_origin().is_some() {
+            return None;
+        }
+        self.memory_scopes()
+            .into_iter()
+            .find(|repo| repo.kind == crate::memory::ScopeKind::Session)
+            .map(|repo| repo.root.display().to_string())
+    }
+
+    fn compaction_save_prompt(&self) -> Option<String> {
+        let path = self.session_memory_path()?;
+        Some(format!(
+            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. Then reply with one line saying what you saved."
+        ))
+    }
+
+    fn agy_compaction_prompt(&self) -> String {
+        let save = match self.session_memory_path() {
+            Some(path) => format!(
+                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. "
+            ),
+            None => String::new(),
+        };
+        format!(
+            "[compaction] This conversation is about to be compacted: it will continue in a fresh conversation that starts from your summary. {save}Then reply with only the summary, about 2k tokens: the user's requests in order (one line each), the goal and what counts as done, progress (done, in progress, left), the next steps and the exact values they need, pointing to memory files instead of restating what they hold."
+        )
+    }
+
+    fn compact_command(&self) -> String {
+        let pointer = match self.session_memory_path() {
+            Some(path) => format!(" The detail is saved in session memory at {path}; point to its files instead of restating them."),
+            None => String::new(),
+        };
+        format!(
+            "/compact Keep the summary lean, about 2k tokens: the user's requests in order (one line each), the goal and what counts as done, progress (done, in progress, left), the next steps and the exact values they need.{pointer}"
+        )
+    }
+
+    fn compaction_pointer(&self) -> Option<String> {
+        let path = self.session_memory_path()?;
+        Some(format!(
+            "This conversation was compacted. Its working state is in session memory at {path}: read MEMORY.md and the files its index links before relying on detail the summary leaves out."
+        ))
+    }
+
     fn effort_arg(profile: &InferenceProfileConfig) -> Option<&str> {
         profile
             .reasoning_effort
@@ -595,7 +649,6 @@ impl CodingHarness {
             .args(["--allowedTools", &format!("mcp__{MCP_SERVER}")])
             .args(["--permission-prompts", "none"])
             .args(["--setting-sources", ""])
-            .arg("--disable-slash-commands")
             .env("MCP_TOOL_TIMEOUT", "3600000")
             .env("MCP_TIMEOUT", "30000");
         if !profile.model.trim().is_empty() {
@@ -796,6 +849,11 @@ impl CodingHarness {
         let session_key = self.session_id().unwrap_or_else(|| "main".to_string());
         let mut session = CliSession::open(kind, &session_key, self.config.resume);
         let mut last_mode_line = String::new();
+        let mut last_task_note = String::new();
+        let mut compaction = CliCompaction::Idle;
+        let mut compact_wanted = false;
+        let mut after_compaction: Option<String> = None;
+        let mut cli_window: u64 = 0;
         if kind == CliKind::Antigravity {
             session.tool_guide = guide;
         }
@@ -822,6 +880,38 @@ impl CodingHarness {
         loop {
             if state.status == HarnessStatus::Running {
                 lane_prompt_shown = false;
+            }
+            if compact_wanted
+                && compaction == CliCompaction::Idle
+                && state.status == HarnessStatus::Idle
+                && state.pending_question.is_none()
+                && pending_approval.is_none()
+                && outbox.is_empty()
+            {
+                compact_wanted = false;
+                if session.started && session.id.is_some() {
+                    state.compacting = true;
+                    state.status = HarnessStatus::Running;
+                    state.events.push(HarnessEvent::SystemDecision {
+                        step: "history_compaction_pass".to_string(),
+                        reasoning: "Saving working state to memory, then compacting the conversation.".to_string(),
+                    });
+                    let save = match kind {
+                        CliKind::ClaudeCode => self.compaction_save_prompt(),
+                        CliKind::Antigravity => Some(self.agy_compaction_prompt()),
+                    };
+                    match save {
+                        Some(prompt) => {
+                            compaction = CliCompaction::Saving;
+                            outbox.push(prompt);
+                        }
+                        None => {
+                            compaction = CliCompaction::Compacting;
+                            outbox.push(format!("{COMMAND_MARK}{}", self.compact_command()));
+                        }
+                    }
+                    self.persist(&mut state, &lanes).await?;
+                }
             }
             if !lane_prompt_shown
                 && pending_approval.is_none()
@@ -881,8 +971,30 @@ impl CodingHarness {
                     {
                         *first = format!("{context}{first}");
                     }
+                    let note = crate::coordination_tools::task_awareness(&self.context);
+                    let mut reminder: Vec<String> = after_compaction.take().into_iter().collect();
+                    if note != last_task_note {
+                        reminder.push(if note.is_empty() {
+                            "You have no open task now.".to_string()
+                        } else {
+                            note.clone()
+                        });
+                        last_task_note = note;
+                    }
+                    if !reminder.is_empty()
+                        && let Some(first) = outbox.iter_mut().find(|t| !t.starts_with(COMMAND_MARK))
+                    {
+                        *first = format!("<system-reminder>{}</system-reminder>\n\n{first}", reminder.join("\n\n"));
+                    }
                     session.mark_synced(state.messages.len());
                     for text in std::mem::take(&mut outbox) {
+                        let text = match text.strip_prefix(COMMAND_MARK) {
+                            Some(command) => command.to_string(),
+                            None if kind == CliKind::ClaudeCode && text.trim_start().starts_with('/') => {
+                                format!(" {}", text.trim_start())
+                            }
+                            None => text,
+                        };
                         let line = kind.user_line(&text);
                         let sent = p.stdin.write_all(format!("{line}\n").as_bytes()).await;
                         if sent.is_err() || p.stdin.flush().await.is_err() {
@@ -1027,6 +1139,9 @@ impl CodingHarness {
                             }
                             self.persist(&mut state, &lanes).await?;
                         }
+                        LoopInput::Compact => {
+                            compact_wanted = true;
+                        }
                         other => {
                             if self.apply_input(&mut state, other) {
                                 break;
@@ -1044,6 +1159,27 @@ impl CodingHarness {
                             {
                                 session.adopt(id);
                             }
+                            if event.get("type").and_then(Value::as_str) == Some("system")
+                                && event.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+                            {
+                                let meta = event.get("compact_metadata");
+                                let tokens = |key: &str| meta.and_then(|m| m.get(key)).and_then(Value::as_u64).unwrap_or(0);
+                                let trigger = meta.and_then(|m| m.get("trigger")).and_then(Value::as_str).unwrap_or("auto");
+                                state.compactions += 1;
+                                state.last_prompt_tokens = tokens("post_tokens");
+                                state.events.push(HarnessEvent::SystemDecision {
+                                    step: "history_compacted".to_string(),
+                                    reasoning: format!(
+                                        "Compacted the conversation ({trigger}) from {} to {} tokens.",
+                                        tokens("pre_tokens"),
+                                        tokens("post_tokens")
+                                    ),
+                                });
+                                last_task_note.clear();
+                                after_compaction = self.compaction_pointer();
+                                self.persist(&mut state, &lanes).await?;
+                            }
+                            let final_before = state.final_text.clone();
                             let (changed, finished) = match kind {
                                 CliKind::ClaudeCode => (
                                     self.apply_cli_event(&mut state, &event, sink.as_ref(), &mut parse),
@@ -1052,6 +1188,72 @@ impl CodingHarness {
                                 CliKind::Antigravity => self.apply_agy_event(&mut state, &event, sink.as_ref(), &mut parse),
                             };
                             if finished {
+                                if let Some(usage) = event.get("modelUsage").and_then(Value::as_object) {
+                                    cli_window = usage
+                                        .values()
+                                        .filter_map(|m| m.get("contextWindow").and_then(Value::as_u64))
+                                        .max()
+                                        .unwrap_or(cli_window);
+                                }
+                                match compaction {
+                                    CliCompaction::Saving if kind == CliKind::Antigravity => {
+                                        state.final_text = final_before.clone();
+                                        let summary = state.messages.iter().rev().find_map(|m| match m {
+                                            HarnessMessage::Assistant { content, .. } if !content.trim().is_empty() => Some(content.trim().to_string()),
+                                            _ => None,
+                                        });
+                                        if let Some(mut p) = process.take() {
+                                            let _ = p.child.start_kill();
+                                        }
+                                        generation += 1;
+                                        session.id = None;
+                                        session.started = false;
+                                        session.synced = state.messages.len();
+                                        session.save();
+                                        let pointer = self.compaction_pointer().unwrap_or_default();
+                                        after_compaction = Some(match summary {
+                                            Some(summary) => format!("This conversation continues from an earlier one that was compacted. Summary of it:\n{summary}\n\n{pointer}"),
+                                            None => format!("This conversation continues from an earlier one that was compacted. {pointer}"),
+                                        });
+                                        last_task_note.clear();
+                                        state.compactions += 1;
+                                        state.last_prompt_tokens = 0;
+                                        state.events.push(HarnessEvent::SystemDecision {
+                                            step: "history_compacted".to_string(),
+                                            reasoning: "Compacted the conversation: working state saved to memory, and a fresh conversation starts from its summary.".to_string(),
+                                        });
+                                        state.compacting = false;
+                                        compaction = CliCompaction::Idle;
+                                        state.status = HarnessStatus::Idle;
+                                    }
+                                    CliCompaction::Saving => {
+                                        state.final_text = final_before.clone();
+                                        state.status = HarnessStatus::Running;
+                                        compaction = CliCompaction::Compacting;
+                                        outbox.push(format!("{COMMAND_MARK}{}", self.compact_command()));
+                                    }
+                                    CliCompaction::Compacting => {
+                                        state.final_text = final_before.clone();
+                                        state.compacting = false;
+                                        compaction = CliCompaction::Idle;
+                                        if state.status == HarnessStatus::Running {
+                                            state.status = HarnessStatus::Idle;
+                                        }
+                                    }
+                                    CliCompaction::Idle => {
+                                        if self.config.memory_enabled && self.context.lane_origin().is_none() {
+                                            self.tidy_memory();
+                                        }
+                                        let window = match cli_window {
+                                            0 => self.config.context_window_tokens,
+                                            reported => reported.min(self.config.context_window_tokens.max(1)),
+                                        };
+                                        let threshold = window.saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64) / 100;
+                                        if !once && threshold > 0 && state.last_prompt_tokens >= threshold {
+                                            compact_wanted = true;
+                                        }
+                                    }
+                                }
                                 session.mark_synced(state.messages.len());
                                 if state.pending_question.is_some() {
                                     state.status = HarnessStatus::WaitingForInput;

@@ -157,6 +157,7 @@ impl CodingHarness {
             self.context.workspace_root(),
             &self.context.current_dir(),
             self.context.browser_summary(),
+            crate::coordination_tools::task_awareness(&self.context),
         ) {
             state.messages.push(HarnessMessage::System { content: reminder });
         }

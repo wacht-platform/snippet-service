@@ -62,29 +62,7 @@ impl CodingHarness {
         &self,
         initial_request: Option<String>,
     ) -> Result<HarnessState, ToolError> {
-        // Build the memory block once and fold it into the system prefix, so it
-        // rides in the cached prompt and refreshes every session (including
-        // resume). Within a session it stays fixed; the files show the live
-        // state.
-        let seeded_system = if self.config.memory_enabled {
-            let prompt = &self.config.system_prompt;
-            let read = crate::prompts::MEMORY_GUIDANCE_LAYER.trim();
-            let write = crate::prompts::MEMORY_WRITE_LAYER.trim();
-            let mut guidance = String::new();
-            if !prompt.contains(read) {
-                guidance.push_str(&format!("\n\n{read}"));
-            }
-            if !prompt.contains(write) && self.context.lane_origin().is_none() {
-                guidance.push_str(&format!("\n\n{write}"));
-            }
-            format!(
-                "{}{guidance}\n\n{}",
-                self.config.system_prompt,
-                crate::memory::render_prompt(&self.memory_scopes())
-            )
-        } else {
-            self.config.system_prompt.clone()
-        };
+        let seeded_system = self.seeded_system_prompt();
 
         if self.config.resume
             && let Some(state) = self.load_from_store().await?
@@ -229,6 +207,26 @@ impl CodingHarness {
     }
 
     /// Index and commit what the agent wrote to memory this turn.
+    pub(super) fn seeded_system_prompt(&self) -> String {
+        if !self.config.memory_enabled {
+            return self.config.system_prompt.clone();
+        }
+        let prompt = &self.config.system_prompt;
+        let read = crate::prompts::MEMORY_GUIDANCE_LAYER.trim();
+        let write = crate::prompts::MEMORY_WRITE_LAYER.trim();
+        let mut guidance = String::new();
+        if !prompt.contains(read) {
+            guidance.push_str(&format!("\n\n{read}"));
+        }
+        if !prompt.contains(write) && self.context.lane_origin().is_none() {
+            guidance.push_str(&format!("\n\n{write}"));
+        }
+        format!(
+            "{prompt}{guidance}\n\n{}",
+            crate::memory::render_prompt(&self.memory_scopes())
+        )
+    }
+
     pub(super) fn tidy_memory(&self) {
         for repo in self.memory_scopes() {
             match repo.tidy() {
