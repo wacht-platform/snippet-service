@@ -51,6 +51,7 @@ fn task_view(task: &Task) -> Value {
         "notifications": task.notifications, "updated_at": task.updated_at,
         "dispatch_failures": task.dispatch_failures,
         "profile": task.profile,
+        "work_plan": task.work_plan,
     })
 }
 
@@ -553,6 +554,15 @@ impl Tool for ViewTaskBoard {
                     "status": task.status,
                     "session_id": task.session_id,
                     "team": team,
+                    "plan": if task.work_plan.is_empty() {
+                        Value::Null
+                    } else {
+                        json!(format!(
+                            "{}/{} steps done",
+                            task.work_plan.iter().filter(|s| s.status == "done").count(),
+                            task.work_plan.len()
+                        ))
+                    },
                     "requested_by": task.created_by_id,
                     "updated_at": task.updated_at,
                 })

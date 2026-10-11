@@ -104,7 +104,8 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              -- Inference profile the target session should run on. Set by the
              -- dispatcher; NULL leaves the session's own model alone.
              profile TEXT,
-             plan TEXT NOT NULL DEFAULT ''
+             plan TEXT NOT NULL DEFAULT '',
+             work_plan_json TEXT NOT NULL DEFAULT '[]'
          );
          CREATE INDEX IF NOT EXISTS tasks_status_priority
              ON tasks(status, priority DESC, created_at);
@@ -217,6 +218,9 @@ fn add_missing_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
     }
     if !existing.iter().any(|column| column == "plan") {
         connection.execute("ALTER TABLE tasks ADD COLUMN plan TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    if !existing.iter().any(|column| column == "work_plan_json") {
+        connection.execute("ALTER TABLE tasks ADD COLUMN work_plan_json TEXT NOT NULL DEFAULT '[]'", [])?;
     }
     let task_agent_columns: Vec<String> = {
         let mut stmt = connection.prepare("PRAGMA table_info(task_agents)")?;
