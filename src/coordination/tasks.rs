@@ -99,6 +99,17 @@ pub struct Task {
     /// applied at dispatch — restarting a running session, not waiting for one.
     /// `None` leaves the session on whatever it already has.
     pub profile: Option<String>,
+    /// The working plan the session doing the task keeps with `update_plan`,
+    /// mirrored here so the board shows how far along it is.
+    #[serde(default)]
+    pub work_plan: Vec<WorkStep>,
+}
+
+/// One step of a task's working plan.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct WorkStep {
+    pub step: String,
+    pub status: String,
 }
 
 /// Structured handoff information passed into a task.
@@ -207,6 +218,7 @@ impl Task {
             title,
             description,
             plan: String::new(),
+            work_plan: Vec::new(),
             status: TaskStatus::Todo,
             priority,
             created_by_kind: "human".into(),
@@ -250,6 +262,7 @@ impl Task {
             title,
             description,
             plan: String::new(),
+            work_plan: Vec::new(),
             status: TaskStatus::Todo,
             priority: 0,
             created_by_kind: created_by_kind.to_string(),
@@ -397,13 +410,14 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
         owned_paths: decode_json_vec(row.get(18)?, 18)?,
         profile: row.get(19)?,
         plan: row.get(20)?,
+        work_plan: decode_json_vec(row.get(21)?, 21)?,
     })
 }
 
 const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
      created_by_id, created_at, updated_at, completed_at, thread_id, session_id,
      handoff_json, handoff_mode, reporting_session, dispatch_failures, result_json,
-     notifications_json, owned_paths_json, profile, plan";
+     notifications_json, owned_paths_json, profile, plan, work_plan_json";
 
 /// Persist every mutable column of a task. Takes the connection so it composes
 /// into the read-modify-write transaction in `update_task_in` — a separate
@@ -794,6 +808,52 @@ impl Store {
     /// Tasks parked by the dispatch retry ceiling are excluded: they are blocked
     /// with no dependencies, and re-queuing them would spin the loop forever.
     /// A user resets those explicitly.
+    /// Record the working plan of the session doing a task. Written apart
+    /// from `update_task_in` so it leaves `updated_at` alone: a plan update is
+    /// progress, not a change on the board, and must not start a round. The
+    /// first plan for a task also leaves a notification for Mission Control.
+    /// Returns whether this was the first plan.
+    pub fn set_task_work_plan(&self, task_id: &str, steps: &[WorkStep]) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let current: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT work_plan_json, notifications_json FROM tasks WHERE id = ?1",
+                    params![task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((existing, notifications)) = current else {
+                return Ok(false);
+            };
+            let first = existing.trim().is_empty() || existing.trim() == "[]";
+            let plan = serde_json::to_string(steps).unwrap_or_else(|_| "[]".into());
+            if first && !steps.is_empty() {
+                let mut markers: Vec<NotificationMarker> =
+                    serde_json::from_str(&notifications).unwrap_or_default();
+                let summary = steps
+                    .iter()
+                    .map(|s| format!("[{}] {}", s.status, s.step))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                markers.push(NotificationMarker {
+                    target: "mission_control".into(),
+                    kind: "plan".into(),
+                    message: summary,
+                    delivered: false,
+                });
+                tx.execute(
+                    "UPDATE tasks SET work_plan_json = ?2, notifications_json = ?3 WHERE id = ?1",
+                    params![task_id, plan, serde_json::to_string(&markers).unwrap_or_else(|_| "[]".into())],
+                )?;
+            } else {
+                tx.execute("UPDATE tasks SET work_plan_json = ?2 WHERE id = ?1", params![task_id, plan])?;
+            }
+            tx.commit()?;
+            Ok(first && !steps.is_empty())
+        })
+    }
+
     pub fn unblock_ready_tasks(
         &self,
         now: &str,

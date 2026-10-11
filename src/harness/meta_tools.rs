@@ -60,6 +60,7 @@ impl CodingHarness {
                         .filter(|s| !s.is_empty())
                         .map(str::to_string);
                     state.plan = steps.clone();
+                    self.mirror_plan_to_task(&steps);
                     state.events.push(HarnessEvent::PlanUpdated { steps, explanation });
                     (
                         json!({"schema_version": 1, "status": "success", "data": {"done": done, "total": total}}),
@@ -422,6 +423,29 @@ impl CodingHarness {
             definitions.push(meta::terminate_loop_tool());
         }
         definitions
+    }
+
+    /// Copy this session's plan onto the task it is working, so the board and
+    /// Mission Control see how far along it is. Lanes keep their own plans.
+    fn mirror_plan_to_task(&self, steps: &[PlanStep]) {
+        if self.context.lane_origin().is_some() {
+            return;
+        }
+        let Some(session) = self.context.durable_session_id() else { return };
+        let Some((task_id, _)) = crate::coordination_tools::session_task(&self.context, session) else { return };
+        let path = self.context.store_path().map(std::path::PathBuf::from).unwrap_or_else(crate::store::default_db_path);
+        let Ok(store) = crate::store::Store::open_cached(path) else { return };
+        let work: Vec<crate::coordination::WorkStep> = steps
+            .iter()
+            .map(|s| crate::coordination::WorkStep {
+                step: s.step.clone(),
+                status: serde_json::to_value(&s.status)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let _ = store.set_task_work_plan(&task_id, &work);
     }
 }
 
