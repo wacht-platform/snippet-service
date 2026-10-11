@@ -232,6 +232,21 @@ fn waiting_on(daemon: &Shared, tasks: &[crate::coordination::Task]) -> std::coll
         .collect()
 }
 
+/// " · plan 3/5, now: <step>" for a task whose worker has laid out a plan.
+fn plan_progress(task: &crate::coordination::Task) -> String {
+    if task.work_plan.is_empty() {
+        return String::new();
+    }
+    let done = task.work_plan.iter().filter(|s| s.status == "done").count();
+    let now = task
+        .work_plan
+        .iter()
+        .find(|s| s.status == "in_progress")
+        .map(|s| format!(", now: {}", one_line(&s.step, 80)))
+        .unwrap_or_default();
+    format!(" · plan {done}/{}{now}", task.work_plan.len())
+}
+
 fn round_envelope(
     tasks: &[crate::coordination::Task],
     state: &mission_autonomy::AutonomyState,
@@ -281,7 +296,8 @@ fn round_envelope(
                 }
                 _ => format!("updated {}", ago(idle)),
             };
-            format!("- {} · {} · {} · {}", t.status, t.title, t.id, note)
+            let progress = plan_progress(t);
+            format!("- {} · {} · {} · {}{progress}", t.status, t.title, t.id, note)
         })
         .collect();
     out.push_str("\n\n## Open work\n");
