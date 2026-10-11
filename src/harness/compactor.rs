@@ -477,7 +477,7 @@ impl CodingHarness {
     }
 
     /// Agentic compaction: the model maintains ONE living "context table", updating
-    /// its sections from the prior table + new activity, fit to a ~6k-token budget.
+    /// its sections from the prior table + new activity, after saving what lasts to memory.
     /// Falls back to the heuristic compaction if the model is unavailable.
     pub(super) async fn compact_history_agentic(
         &self,
@@ -611,6 +611,7 @@ impl CodingHarness {
             .collect();
         // The whole conversation is now the table — no verbatim tail (except the
         // pending user message(s) above).
+        let system_prompt = self.refresh_memory_block(system_prompt);
         state.messages = vec![
             HarnessMessage::System {
                 content: system_prompt,
@@ -638,5 +639,19 @@ impl CodingHarness {
         state.tool_payloads_pruned = false;
         state.compacting = false;
         Ok(())
+    }
+
+    fn refresh_memory_block(&self, system_prompt: String) -> String {
+        if !self.config.memory_enabled {
+            return system_prompt;
+        }
+        match system_prompt.rfind("\n\n[memory]\n") {
+            Some(at) => format!(
+                "{}\n\n{}",
+                &system_prompt[..at],
+                crate::memory::render_prompt(&self.memory_scopes())
+            ),
+            None => system_prompt,
+        }
     }
 }
