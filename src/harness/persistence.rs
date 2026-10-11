@@ -227,6 +227,20 @@ impl CodingHarness {
         )
     }
 
+    /// Index and commit what the agent wrote to memory this turn.
+    pub(super) fn tidy_memory(&self) {
+        for repo in self.memory_scopes() {
+            match repo.tidy() {
+                Ok((linked, committed)) if committed || !linked.is_empty() => self.debug_log(&format!(
+                    "memory tidy {}: linked {:?}, committed {committed}",
+                    repo.key, linked
+                )),
+                Ok(_) => {}
+                Err(e) => self.debug_log(&format!("memory tidy {}: {e}", repo.key)),
+            }
+        }
+    }
+
     pub(super) fn store(&self) -> Option<crate::store::Store> {
         let path = self.context.store_path()?;
         crate::store::Store::open(path).ok()
