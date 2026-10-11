@@ -377,17 +377,55 @@ impl MemoryRepo {
         })
     }
 
+    /// After a turn: link every topic file nothing links to from the index,
+    /// then commit whatever the session left uncommitted. Returns the files it
+    /// linked and whether it committed.
+    pub fn tidy(&self) -> Result<(Vec<String>, bool), String> {
+        if !self.exists() {
+            return Ok((Vec::new(), false));
+        }
+        let files = self.files();
+        let text: String = files
+            .iter()
+            .filter(|f| f.ends_with(".md"))
+            .map(|f| self.read_file(f).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut linked = Vec::new();
+        for file in files.iter().filter(|f| f.ends_with(".md") && f.as_str() != ENTRY_FILE) {
+            if !text.contains(&format!("[[{}]]", file.trim_end_matches(".md"))) {
+                self.link_from_index(file)?;
+                linked.push(file.clone());
+            }
+        }
+        let committed = self.commit_all(if linked.is_empty() {
+            "Remember edits left uncommitted"
+        } else {
+            "Remember edits and link new topic files"
+        })?;
+        Ok((linked, committed))
+    }
+
     fn link_from_index(&self, file: &str) -> Result<(), String> {
+        let title = self
+            .read_file(file)
+            .ok()
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("# ").map(|s| s.trim().to_string())))
+            .filter(|t| !t.is_empty());
         let link = format!("[[{}]]", file.trim_end_matches(".md"));
         let path = self.root.join(ENTRY_FILE);
         let text = fs::read_to_string(&path).unwrap_or_default();
         if text.contains(&link) {
             return Ok(());
         }
+        let line = match title {
+            Some(title) => format!("- {link} — {title}"),
+            None => format!("- {link}"),
+        };
         let updated = if text.contains(INDEX_HEADING) {
-            format!("{}\n- {link}\n", text.trim_end())
+            format!("{}\n{line}\n", text.trim_end())
         } else {
-            format!("{}\n\n{INDEX_HEADING}\n- {link}\n", text.trim_end())
+            format!("{}\n\n{INDEX_HEADING}\n{line}\n", text.trim_end())
         };
         write_atomic(&path, &updated)
     }
