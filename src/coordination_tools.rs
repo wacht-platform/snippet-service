@@ -1199,7 +1199,7 @@ impl Tool for InspectTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "inspect_task".into(),
-            description: "Inspect the full details of a task: its plan, description, roster of assigned agents with active lease holder, linked blockers, owned paths, and result. Use this whenever you need full visibility and context for a task.".into(),
+            description: "Inspect the full details of a task: its briefing plan and the worker's working plan with each step's status, description, roster of assigned agents with active lease holder, linked blockers, owned paths, and result. Use this whenever you need full visibility and context for a task.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string", "description": "The task ID to inspect"}
@@ -1231,6 +1231,7 @@ impl Tool for InspectTask {
             "description": task.description,
             "status": task.status,
             "plan": task.plan,
+            "work_plan": task.work_plan,
             "profile": task.profile,
             "session_id": task.session_id,
             "owned_paths": task.owned_paths,

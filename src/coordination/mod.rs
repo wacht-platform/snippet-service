@@ -25,7 +25,7 @@ pub use direct::{
 pub use identity::{AgentHome, IdentityError};
 pub use tasks::{offer_marker, 
     HandoffMode, NotificationMarker, Task, TaskAgent, TaskFilter, TaskHandoff, TaskLink,
-    TaskLinkKind, TaskResult, TaskStatus,
+    TaskLinkKind, TaskResult, TaskStatus, WorkStep,
 };
 
 /// The built-in general coding agent. Mission Control dispatches to it unless a
