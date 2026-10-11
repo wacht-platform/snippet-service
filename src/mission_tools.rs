@@ -718,7 +718,10 @@ async fn create_task(
             return Err(ToolError::msg("title and description must be non-empty"));
         }
         let store = db(ctx)?;
-        let root = root(ctx)?;
+        let root = ctx
+            .mission_control_root()
+            .map(PathBuf::from)
+            .unwrap_or_else(mission_control::workspace_path);
         // An agent's INBOX is a mailbox, not a workspace. It runs the
         // coordination runtime — no file or shell tools, and no
         // `report_mission_task` — so work routed there cannot be done and cannot
