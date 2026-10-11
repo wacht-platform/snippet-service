@@ -67,15 +67,16 @@ impl CodingHarness {
         // resume). Within a session it stays fixed; the files show the live
         // state.
         let seeded_system = if self.config.memory_enabled {
-            let guidance = if self.config.system_prompt.contains("## Keeping memory") {
-                String::new()
-            } else {
-                format!(
-                    "\n\n{}\n\n{}",
-                    crate::prompts::MEMORY_GUIDANCE_LAYER.trim(),
-                    crate::prompts::MEMORY_WRITE_LAYER.trim()
-                )
-            };
+            let prompt = &self.config.system_prompt;
+            let read = crate::prompts::MEMORY_GUIDANCE_LAYER.trim();
+            let write = crate::prompts::MEMORY_WRITE_LAYER.trim();
+            let mut guidance = String::new();
+            if !prompt.contains(read) {
+                guidance.push_str(&format!("\n\n{read}"));
+            }
+            if !prompt.contains(write) && self.context.lane_origin().is_none() {
+                guidance.push_str(&format!("\n\n{write}"));
+            }
             format!(
                 "{}{guidance}\n\n{}",
                 self.config.system_prompt,

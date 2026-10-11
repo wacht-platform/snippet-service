@@ -11,8 +11,8 @@
 //! Every repo has a short `MEMORY.md` entry point (entries, then `## Index` of
 //! `[[links]]`) and topic files of one-line entries with `[key: value]`
 //! metadata. Agents edit the files and commit with git themselves; the daemon
-//! creates the repos, migrates the old rules/learnings/notes layout once, and
-//! commits the writes it makes itself (reflection).
+//! creates the repos and commits the writes it makes itself (reflection and
+//! the end-of-turn tidy).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -185,7 +185,6 @@ impl MemoryRepo {
             return Ok(());
         }
         fs::create_dir_all(&self.root).map_err(|e| format!("create {}: {e}", self.root.display()))?;
-        let migrated = migrate_legacy(&self.root, &self.title())?;
         if !self.root.join(ENTRY_FILE).is_file() {
             write_atomic(&self.root.join(ENTRY_FILE), &format!("# {}\n\n{INDEX_HEADING}\n", self.title()))?;
         }
@@ -199,8 +198,7 @@ impl MemoryRepo {
         self.git(&["config", "user.email", "memory@snippet.local"])?;
         self.git(&["config", "commit.gpgsign", "false"])?;
         self.git(&["add", "-A"])?;
-        let message = if migrated { "Migrate to Agent Memory Repo format" } else { "Create memory repo" };
-        let _ = self.git(&["commit", "-q", "-m", message]);
+        let _ = self.git(&["commit", "-q", "-m", "Create memory repo"]);
         Ok(())
     }
 
@@ -611,110 +609,6 @@ fn insert_before_index(text: &str, entry: &str) -> String {
         }
         None => format!("{}\n{entry}\n", text.trim_end()),
     }
-}
-
-/// Fold the pre-git layout (rules.md, learnings.md, notes/) into the Agent
-/// Memory Repo format: rules become MEMORY.md entries, learnings stay a topic
-/// file, and every note is linked from the index. Returns whether anything
-/// was migrated.
-fn migrate_legacy(root: &Path, title: &str) -> Result<bool, String> {
-    let rules_path = root.join("rules.md");
-    let learnings_path = root.join("learnings.md");
-    let notes_dir = root.join("notes");
-    let has_legacy = rules_path.is_file() || learnings_path.is_file() || notes_dir.is_dir();
-    if !has_legacy || root.join(ENTRY_FILE).is_file() {
-        return Ok(false);
-    }
-    let rules = fs::read_to_string(&rules_path).unwrap_or_default();
-    let mut entry = format!("# {title}\n");
-    let rule_lines = legacy_lines(&rules);
-    if !rule_lines.is_empty() {
-        entry.push('\n');
-    }
-    for line in rule_lines {
-        entry.push_str(&line);
-        entry.push('\n');
-    }
-    let mut index = Vec::new();
-    if learnings_path.is_file() {
-        let learnings = fs::read_to_string(&learnings_path).unwrap_or_default();
-        let body: Vec<String> = legacy_lines(&learnings);
-        write_atomic(&learnings_path, &format!("# Learnings\n\n{}\n", body.join("\n")))?;
-        index.push("- [[learnings]] — reusable lessons: situation → approach → why".to_string());
-    }
-    for file in ["patterns.md"] {
-        if root.join(file).is_file() {
-            index.push(format!("- [[{}]]", file.trim_end_matches(".md")));
-        }
-    }
-    let mut notes = Vec::new();
-    collect_files(root, &notes_dir, &mut notes);
-    notes.sort();
-    for note in notes {
-        if !note.ends_with(".md") || note.rsplit('/').next().is_some_and(|n| n.starts_with('_')) {
-            continue;
-        }
-        let summary = fs::read_to_string(root.join(&note))
-            .ok()
-            .and_then(|text| {
-                text.lines()
-                    .find_map(|l| l.strip_prefix("summary:").map(|s| s.trim().to_string()))
-            })
-            .unwrap_or_default();
-        let link = format!("[[{}]]", note.trim_end_matches(".md"));
-        index.push(if summary.is_empty() { format!("- {link}") } else { format!("- {link} — {summary}") });
-    }
-    entry.push_str(&format!("\n{INDEX_HEADING}\n"));
-    for line in index {
-        entry.push_str(&line);
-        entry.push('\n');
-    }
-    write_atomic(&root.join(ENTRY_FILE), &entry)?;
-    let _ = fs::remove_file(&rules_path);
-    for section in {
-        let mut found = Vec::new();
-        collect_files(root, &notes_dir, &mut found);
-        found
-    } {
-        if section.rsplit('/').next() == Some("_section.md") {
-            let _ = fs::remove_file(root.join(section));
-        }
-    }
-    Ok(true)
-}
-
-/// Bullets of an old rules/learnings file as spec entries: the `[id]` and
-/// `(+n/-m)` counters dropped, bare lines made bullets, `##` headings kept.
-fn legacy_lines(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("# ") {
-            continue;
-        }
-        if line.starts_with("## ") {
-            if !out.is_empty() {
-                out.push(String::new());
-            }
-            out.push(line.to_string());
-            continue;
-        }
-        let mut rest = line.trim_start_matches("- ").trim();
-        if rest.starts_with('[')
-            && let Some(end) = rest.find(']')
-        {
-            rest = rest[end + 1..].trim();
-        }
-        if rest.starts_with("(+")
-            && let Some(end) = rest.find(')')
-        {
-            rest = rest[end + 1..].trim();
-        }
-        if !rest.is_empty() {
-            out.push(format!("- {rest}"));
-        }
-    }
-    out
 }
 
 fn clip(text: &str, max: usize) -> String {
