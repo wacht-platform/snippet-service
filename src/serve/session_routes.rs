@@ -487,13 +487,21 @@ pub(crate) async fn fork_session(
     };
 
     match crate::session::write_forked_conversation(&sp, &state, point) {
-        Ok(forked) => Json(serde_json::json!({
+        Ok(forked) => {
+            crate::harness::fork_cli_conversations(
+                &crate::session::session_id_for_state_path(&sp),
+                &crate::session::session_id_for_state_path(&forked.state_path),
+                state.messages.len(),
+                forked.message_end,
+            );
+            Json(serde_json::json!({
             "id": forked.id,
             "title": forked.title,
             "event_end": forked.event_end,
             "message_end": forked.message_end,
-        }))
-        .into_response(),
+            }))
+            .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }
