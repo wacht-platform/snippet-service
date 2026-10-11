@@ -1303,7 +1303,7 @@ impl Tool for TransferMissionTaskLease {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "transfer_mission_task_lease".into(),
-            description: "Transfer the active session lease of a task to a specified agent. Exactly one agent works in the session at a time; other assigned agents are set to waiting.".into(),
+            description: "Hand a running task's session from the agent working it to another agent, as a handover between colleagues. Exactly one agent works in the session at a time; the others wait. Not for starting work: an offered task starts when its agent claims it.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string"},
@@ -1326,6 +1326,11 @@ impl Tool for TransferMissionTaskLease {
         require_working_agent(&store, to_agent)?;
         let roster = store.list_task_agents(task_id).unwrap_or_default();
         let current_active = roster.iter().find(|m| m.status == "active" && m.removed_at.is_none()).map(|m| m.agent_id.as_str()).unwrap_or("none");
+        if task.status != TaskStatus::InProgress || current_active == "none" {
+            return Err(ToolError::msg(
+                "a lease hands running work from one agent to another. This task hasn't been claimed yet: the offered agent takes it on from its inbox. To give it to someone else instead, assign that agent (assign_task_agent) and retry the task.",
+            ));
+        }
         let now = now_rfc3339();
 
         if !roster.iter().any(|m| m.agent_id == to_agent && m.removed_at.is_none()) {
@@ -2085,6 +2090,8 @@ mod tests {
         assert_eq!(updated.title, "Updated title");
         assert_eq!(updated.plan, "Step 1: Code\nStep 2: Review");
 
+        db.add_task_agent_full("t-mc", "snippet", "implementer", None, "", "active", &now_rfc3339()).unwrap();
+        db.update_task_in("t-mc", &now_rfc3339(), |t| t.status = TaskStatus::InProgress).unwrap();
         let res = TransferMissionTaskLease
             .execute(&ctx, json!({"task_id": "t-mc", "to_agent_id": "reviewer"}))
             .await
