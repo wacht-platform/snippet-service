@@ -29,7 +29,11 @@ const BURST: usize = 6;
 const DAILY: i64 = 20 * 3600;
 const SETTLE: i64 = 30 * 60;
 
+const RETRY_AFTER: i64 = 3600;
+
 static RUNNING: Mutex<Option<String>> = Mutex::new(None);
+/// Repos whose last consolidation failed, and when; they wait `RETRY_AFTER`.
+static FAILED: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
 
 pub fn router() -> Router<Shared> {
     Router::new()
@@ -174,8 +178,11 @@ pub async fn consolidation_loop(d: Shared) {
         *RUNNING.lock().unwrap() = Some(repo.key.clone());
         let result = consolidation(&d, &repo).await;
         *RUNNING.lock().unwrap() = None;
+        let mut failed = FAILED.lock().unwrap();
+        failed.retain(|(key, _)| key != &repo.key);
         if let Err(e) = result {
             eprintln!("consolidation {}: {e}", repo.key);
+            failed.push((repo.key.clone(), now()));
         }
     }
 }
@@ -199,6 +206,14 @@ fn due_repo() -> Option<MemoryRepo> {
     let mut best: Option<(usize, MemoryRepo)> = None;
     for repo in MemoryRepo::all() {
         if repo.kind == ScopeKind::Session || !repo.exists() {
+            continue;
+        }
+        let backing_off = FAILED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(key, at)| key == &repo.key && now - at < RETRY_AFTER);
+        if backing_off {
             continue;
         }
         let last = repo.last_consolidated();
@@ -282,7 +297,7 @@ async fn consolidation(d: &Shared, repo: &MemoryRepo) -> Result<(), String> {
     let _ = std::fs::remove_file(&state_path);
     let mut model = {
         let config = d.config.lock().unwrap();
-        config.for_workspace(repo.root.clone()).delegate_profile().build_model()
+        config.for_workspace(repo.root.clone()).model.build_model()
     };
     let context = crate::ToolContext::with_owner(repo.root.clone(), "consolidating").map_err(|e| e.to_string())?;
     let harness = CodingHarness::new(
@@ -297,9 +312,8 @@ async fn consolidation(d: &Shared, repo: &MemoryRepo) -> Result<(), String> {
         crate::builtins::coding_tools(None),
         context,
     );
-    let run = harness.run(&mut *model, brief).await.map_err(|e| e.to_string());
-    finish(repo)?;
-    run.map(|_| ())
+    harness.run(&mut *model, brief).await.map_err(|e| e.to_string())?;
+    finish(repo)
 }
 
 /// Commit anything the consolidation left uncommitted, and mark the consolidation even when it
