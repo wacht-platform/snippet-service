@@ -70,6 +70,7 @@ struct CliSession {
     started: bool,
     synced: usize,
     tool_guide: String,
+    forking: bool,
 }
 
 impl CliSession {
@@ -83,8 +84,9 @@ impl CliSession {
             .map(|id| id.trim().to_string())
             .filter(|id| reuse && !id.is_empty());
         let synced = lines.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+        let forking = lines.next().is_some_and(|flag| flag.trim() == "fork");
         let session = match (kind, existing) {
-            (_, Some(id)) => Self { kind, key, id: Some(id), started: true, synced, tool_guide: String::new() },
+            (_, Some(id)) => Self { kind, key, id: Some(id), started: true, synced, tool_guide: String::new(), forking },
             (CliKind::ClaudeCode, None) => Self {
                 kind,
                 key,
@@ -92,8 +94,9 @@ impl CliSession {
                 started: false,
                 synced: 0,
                 tool_guide: String::new(),
+                forking: false,
             },
-            (CliKind::Antigravity, None) => Self { kind, key, id: None, started: false, synced: 0, tool_guide: String::new() },
+            (CliKind::Antigravity, None) => Self { kind, key, id: None, started: false, synced: 0, tool_guide: String::new(), forking: false },
         };
         if !session.started {
             session.save();
@@ -111,7 +114,8 @@ impl CliSession {
         let file = Self::sidecar(self.kind, &self.key);
         match self.id.as_deref() {
             Some(id) => {
-                let _ = std::fs::write(file, format!("{id}\n{}", self.synced));
+                let flag = if self.forking { "\nfork" } else { "" };
+                let _ = std::fs::write(file, format!("{id}\n{}{flag}", self.synced));
             }
             None => {
                 let _ = std::fs::remove_file(file);
@@ -523,6 +527,35 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
+/// Give a forked Snippet session its own copy of the source's CLI
+/// conversation, so it resumes with the real history and its prompt cache
+/// instead of a replayed digest. Only for a fork at the latest point: neither
+/// CLI can branch an earlier message, so an earlier fork keeps the replay.
+/// Claude Code forks on the session's first run (--fork-session); agy's
+/// conversation file is copied now.
+pub fn fork_cli_conversations(source: &str, fork: &str, source_len: usize, fork_len: usize) {
+    if fork_len < source_len {
+        return;
+    }
+    for kind in [CliKind::ClaudeCode, CliKind::Antigravity] {
+        let raw = std::fs::read_to_string(CliSession::sidecar(kind, &sanitize_key(source))).unwrap_or_default();
+        let mut lines = raw.lines();
+        let Some(id) = lines.next().map(str::trim).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        let synced: usize = lines.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
+        let target = CliSession::sidecar(kind, &sanitize_key(fork));
+        let written = match kind {
+            CliKind::ClaudeCode => std::fs::write(&target, format!("{id}\n{synced}\nfork")).map_err(|e| e.to_string()),
+            CliKind::Antigravity => crate::antigravity::fork_conversation(id)
+                .and_then(|copy| std::fs::write(&target, format!("{copy}\n{synced}")).map_err(|e| e.to_string())),
+        };
+        if let Err(e) = written {
+            eprintln!("fork {} conversation for {fork}: {e}", kind.label());
+        }
+    }
+}
+
 enum ForkCleanup {
     ClaudeCode,
     Antigravity(String),
@@ -735,7 +768,9 @@ impl CodingHarness {
         let (mut cmd, fork_cleanup) = match session.kind {
             CliKind::ClaudeCode => {
                 let mut cmd = self.claude_command(profile, &prompt, bridge_url, session)?;
-                cmd.arg("--fork-session");
+                if !session.forking {
+                    cmd.arg("--fork-session");
+                }
                 (cmd, ForkCleanup::ClaudeCode)
             }
             CliKind::Antigravity => {
@@ -747,6 +782,7 @@ impl CodingHarness {
                     started: true,
                     synced: 0,
                     tool_guide: session.tool_guide.clone(),
+                    forking: false,
                 };
                 (self.antigravity_command(profile, &prompt, bridge_url, &fork)?, ForkCleanup::Antigravity(fork_id))
             }
@@ -856,6 +892,9 @@ impl CodingHarness {
         }
         if let Some(id) = session.id.as_deref() {
             cmd.args([if session.started { "--resume" } else { "--session-id" }, id]);
+            if session.forking {
+                cmd.arg("--fork-session");
+            }
         }
         Ok(cmd)
     }
@@ -1360,6 +1399,16 @@ impl CodingHarness {
                                 && kind == CliKind::Antigravity
                             {
                                 session.adopt(id);
+                            }
+                            if session.forking
+                                && kind == CliKind::ClaudeCode
+                                && event.get("type").and_then(Value::as_str) == Some("system")
+                                && event.get("subtype").and_then(Value::as_str) == Some("init")
+                                && let Some(id) = event.get("session_id").and_then(Value::as_str)
+                            {
+                                session.forking = false;
+                                session.id = Some(id.to_string());
+                                session.save();
                             }
                             if event.get("type").and_then(Value::as_str) == Some("system")
                                 && event.get("subtype").and_then(Value::as_str) == Some("compact_boundary")

@@ -215,7 +215,7 @@ pub struct ForkedConversation {
     pub message_end: usize,
 }
 
-/// Fork `source_state_path` at `point` into a new `conversations/<uuid>.json`.
+/// Fork `source_state_path` at `point` into a new `conversations/<uuid>`.
 /// Copies the model-profile sidecar when present. Does **not** start a live loop.
 pub fn write_forked_conversation(
     source_state_path: &Path,
@@ -249,7 +249,7 @@ pub fn write_forked_conversation_in(
     };
 
     let name = uuid::Uuid::new_v4().to_string();
-    let dest = conv_dir.join(format!("{name}.json"));
+    let dest = conv_dir.join(&name);
     let root = workspaces_root();
     let id = dest
         .strip_prefix(&root)
