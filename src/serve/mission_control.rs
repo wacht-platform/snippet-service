@@ -77,6 +77,7 @@ pub fn validated_owned_paths(
     let mut out = Vec::new();
     for raw in raw_paths {
         let path = PathBuf::from(raw);
+        let path = if path.is_relative() { root.join(path) } else { path };
         let mut prefix = path.clone();
         let mut suffix = Vec::new();
         let resolved = loop {
@@ -610,7 +611,7 @@ fn await_claim(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, Str
     if let Some(offered_at) = task.notifications.iter().find(|n| n.target == marker).map(|n| n.message.clone()) {
         if let Some(error) = inbox_failure_since(&agent, &offered_at) {
             let note = format!(
-                "The offer to {agent} is stuck: its inbox can't run ({error}). Start the work now by handing {agent} the lease (transfer_mission_task_lease), offer it to another agent, or wait until it recovers."
+                "The offer to {agent} is stuck: its inbox can't run ({error}). Offer the task to another agent (assign_task_agent, then retry_mission_task), or wait until it recovers."
             );
             if !task.notifications.iter().any(|n| n.kind == "offer_stuck") {
                 return d
