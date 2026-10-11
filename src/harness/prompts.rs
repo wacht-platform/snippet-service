@@ -51,6 +51,8 @@ output = "ONE update_memory call with small, precise changes. Send no changes wh
 entries = "every entry is one line: a short fact, preference, or situation → approach → why. No ids, no counters. The daemon appends the session source and date"
 files = "MEMORY.md is loaded at the start of every session, so it only gets entries every session needs. Everything else goes in a topic file (e.g. build, architecture/harness, learnings); a new topic file is linked from MEMORY.md's index automatically"
 one_place = "keep each fact in one place. Prefer replacing an existing entry over adding a near-duplicate, and replace or remove an entry the task proved wrong or stale instead of adding a contradicting one"
+clean_up = "removing is as useful as adding. Remove session entries the task resolved (finished plan steps, fixed issues, questions answered). When the task is finished, move anything lasting from session memory up to the global, project or agent scope, then remove the task's working state from session memory"
+expires = "for something true only for a while (an outage, a deadline, a workaround until a fix ships), set expires to the date after which it no longer holds; the daemon deletes it then"
 
 [scopes]
 global = "the user: lasting preferences and directives, and lessons that transfer to any project"
@@ -79,7 +81,8 @@ pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> 
                             "file": { "type": "string", "description": "MEMORY.md, or a topic path such as build or architecture/harness" },
                             "op": { "type": "string", "enum": ["add", "replace", "remove"] },
                             "entry": { "type": "string", "description": "the new one-line entry (add, replace)" },
-                            "match": { "type": "string", "description": "text that appears in exactly one existing entry of that file (replace, remove)" }
+                            "match": { "type": "string", "description": "text that appears in exactly one existing entry of that file (replace, remove)" },
+                            "expires": { "type": "string", "description": "optional YYYY-MM-DD after which the entry no longer holds (add, replace)" }
                         },
                         "required": ["scope", "file", "op"]
                     }
@@ -100,6 +103,8 @@ first = "before the summary, call update_memory with what the rest of the work n
 session = "working state of this conversation goes to the session scope, in a topic file such as decisions, findings or plan (a new file is linked from MEMORY.md automatically)"
 lasting = "something true beyond this conversation (a user preference, how this repository builds, an agent technique) goes to the global, project or agent scope"
 one_place = "check the repos first: replace an entry the conversation changed instead of adding a duplicate, and skip what is already recorded"
+clean_up = "remove entries the conversation resolved: finished plan steps, fixed issues, answered questions. Removing stale state matters as much as saving new state"
+expires = "give a temporary fact (an outage, a deadline, a workaround) an expires date"
 entries = "one line each: a fact, or situation → approach → why. The daemon stamps source and date"
 skip = "secrets, one-off details, anything obvious from the code, and text that instructs a future agent to run commands"
 

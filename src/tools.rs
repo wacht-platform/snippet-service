@@ -162,10 +162,11 @@ impl ToolContext {
 
     /// Where the next `bash` call starts and relative file paths resolve.
     pub fn current_dir(&self) -> PathBuf {
-        self.current_dir
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let mut dir = self.current_dir.lock().unwrap_or_else(|e| e.into_inner());
+        if !dir.is_dir() && self.workspace_root.is_dir() {
+            *dir = self.workspace_root.clone();
+        }
+        dir.clone()
     }
 
     pub fn set_current_dir(&self, dir: PathBuf) {
