@@ -587,14 +587,14 @@ impl CodingHarness {
     fn compaction_save_prompt(&self) -> Option<String> {
         let path = self.session_memory_path()?;
         Some(format!(
-            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. Then reply with one line saying what you saved."
+            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. Then reply with one line saying what you saved."
         ))
     }
 
     fn agy_compaction_prompt(&self) -> String {
         let save = match self.session_memory_path() {
             Some(path) => format!(
-                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. "
+                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. "
             ),
             None => String::new(),
         };

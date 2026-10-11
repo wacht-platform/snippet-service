@@ -302,9 +302,13 @@ fn apply_changes(
             errors.push(format!("{scope}: no such scope in this session"));
             continue;
         };
+        let expires = text("expires");
+        let expires = expires.trim();
         let stamped = |entry: String| {
             if entry.contains("[source:") {
                 entry
+            } else if is_date(expires) {
+                format!("{} [source: {source}; added: {today}; expires: {expires}]", entry.trim())
             } else {
                 format!("{} [source: {source}; added: {today}]", entry.trim())
             }
@@ -321,6 +325,10 @@ fn apply_changes(
         }
     }
     (applied, errors)
+}
+
+fn is_date(text: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
 }
 
 /// The messages of the request that just ended: from its checkpoint when one
