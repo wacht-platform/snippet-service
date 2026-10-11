@@ -23,6 +23,7 @@ pub const ENTRY_FILE: &str = "MEMORY.md";
 const INDEX_HEADING: &str = "## Index";
 const ENTRY_PROMPT_CHARS: usize = 4_000;
 const MAX_ENTRY_CHARS: usize = 400;
+const IGNORED: &[&str] = &[".lock", ".tmp-*", ".snippet/"];
 pub const CONSOLIDATE_PREFIX: &str = "Consolidate:";
 
 static GIT_LOCK: Mutex<()> = Mutex::new(());
@@ -182,15 +183,13 @@ impl MemoryRepo {
     pub fn ensure(&self) -> Result<(), String> {
         let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if self.exists() {
-            return Ok(());
+            return self.ignore_scratch();
         }
         fs::create_dir_all(&self.root).map_err(|e| format!("create {}: {e}", self.root.display()))?;
         if !self.root.join(ENTRY_FILE).is_file() {
             write_atomic(&self.root.join(ENTRY_FILE), &format!("# {}\n\n{INDEX_HEADING}\n", self.title()))?;
         }
-        if !self.root.join(".gitignore").is_file() {
-            write_atomic(&self.root.join(".gitignore"), ".lock\n.tmp-*\n")?;
-        }
+        self.ignore_scratch()?;
         if !self.root.join(".git").exists() {
             self.git(&["init", "-q", "-b", "main"])?;
         }
@@ -200,6 +199,30 @@ impl MemoryRepo {
         self.git(&["add", "-A"])?;
         let _ = self.git(&["commit", "-q", "-m", "Create memory repo"]);
         Ok(())
+    }
+
+    /// Keep lock files, temp files and the scratch `.snippet/` folder (shell
+    /// logs written by agents working in the repo) out of history.
+    fn ignore_scratch(&self) -> Result<(), String> {
+        let path = self.root.join(".gitignore");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let missing: Vec<&str> = IGNORED
+            .iter()
+            .copied()
+            .filter(|rule| !text.lines().any(|l| l.trim() == *rule))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut updated = text.trim_end().to_string();
+        for rule in missing {
+            if !updated.is_empty() {
+                updated.push('\n');
+            }
+            updated.push_str(rule);
+        }
+        updated.push('\n');
+        write_atomic(&path, &updated)
     }
 
     fn title(&self) -> String {
