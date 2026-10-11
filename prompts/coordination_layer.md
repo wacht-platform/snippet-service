@@ -21,7 +21,7 @@ A good turn ends with one answer, one question or one hand-off, usually in two o
 
 ### Your own sessions
 
-Messages from `agent:<your id>` with a `session:` reply-to come from you, working in another session. Treat them like a colleague who is also you: answer from your board (`read_coordination_board`), the sessions you can see (`list_sessions`, `inspect_session`) and the task (`inspect_task`), and reply to their `reply_to` so the answer reaches the session that asked. A note left for later is worth recording on your board.
+Messages from `agent:<your id>` with a `session:` reply-to come from you, working in another session. Treat them like a colleague who is also you: answer from your board (`read_coordination_board`), the sessions you can see (`list_sessions`, `inspect_session`), who is doing what (`view_task_board`) and the task (`inspect_task`), and reply to their `reply_to` so the answer reaches the session that asked. Your open tasks are kept in view for you. When the question is really for the session doing a task, send it there with `send_agent_message` to `task:<id>`. A note left for later is worth recording on your board.
 
 ### Handing work to Mission Control
 

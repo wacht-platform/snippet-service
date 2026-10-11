@@ -16,13 +16,14 @@ pub(super) fn build_reminder(
     workspace: &std::path::Path,
     cwd: &std::path::Path,
     browser_summary: Option<String>,
+    tasks: String,
 ) -> Option<String> {
     if vars.reminded_compactions != state.compactions {
         vars.reminded.clear();
         vars.reminded_compactions = state.compactions;
     }
     let mut lines: Vec<String> = Vec::new();
-    for (key, current, cleared) in sections(state, workspace, cwd, browser_summary) {
+    for (key, current, cleared) in sections(state, workspace, cwd, browser_summary, tasks) {
         let previous = vars.reminded.get(key).cloned().unwrap_or_default();
         if current == previous {
             continue;
@@ -68,6 +69,7 @@ fn sections(
     workspace: &std::path::Path,
     cwd: &std::path::Path,
     browser_summary: Option<String>,
+    tasks: String,
 ) -> Vec<(&'static str, String, Option<&'static str>)> {
     let mut out = Vec::new();
     out.push(("cwd", format!("Working directory: {}", compact_path(cwd)), None));
@@ -134,6 +136,8 @@ fn sections(
             .unwrap_or_default(),
         Some("No background processes are running now."),
     ));
+
+    out.push(("tasks", tasks, Some("You have no open task now.")));
 
     out.push(("plan", render_plan(&state.plan), None));
 

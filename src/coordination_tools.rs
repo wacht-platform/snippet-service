@@ -119,6 +119,140 @@ pub(crate) fn session_task(ctx: &ToolContext, session_id: &str) -> Option<(Strin
         .map(|task| (task.id, task.title))
 }
 
+pub(crate) fn task_awareness(ctx: &ToolContext) -> String {
+    use crate::coordination::TaskStatus;
+    if ctx.agent_id() == Some(crate::mission_control::SESSION_ID) {
+        return String::new();
+    }
+    let path = ctx
+        .store_path()
+        .unwrap_or_else(crate::store::default_db_path);
+    let Ok(db) = Store::open_cached(path) else {
+        return String::new();
+    };
+    let session = ctx
+        .durable_session_id()
+        .or(ctx.lane_origin().map(|(session, _)| session));
+    let label = |status: &TaskStatus| status.as_str().replace('_', " ");
+    let mut out: Vec<String> = Vec::new();
+
+    let current: Vec<crate::coordination::Task> = session
+        .and_then(|session| db.list_tasks(Some(session), None).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|task| !task.status.is_terminal() && task.status != TaskStatus::Todo)
+        .collect();
+    let mut agent = ctx.agent_id().map(str::to_string);
+    for task in &current {
+        let roster: Vec<_> = db
+            .list_task_agents(&task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.removed_at.is_none())
+            .collect();
+        if agent.is_none() {
+            agent = roster
+                .iter()
+                .find(|m| m.status == "active")
+                .map(|m| m.agent_id.clone());
+        }
+        let briefing = task
+            .handoff
+            .as_ref()
+            .map(|h| h.description.as_str())
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or(task.description.as_str());
+        let mut text = format!(
+            "Task you're on: \"{}\" (task {}, {}), from {}.\nBriefing: {}",
+            sanitize_line(&task.title),
+            task.id,
+            label(&task.status),
+            task.created_by_id,
+            clip_chars(&sanitize_line(briefing), 400)
+        );
+        if !roster.is_empty() {
+            let team: Vec<String> = roster
+                .iter()
+                .map(|m| {
+                    if m.status == "active" {
+                        format!("{} ({}, holds the session)", m.agent_id, m.role)
+                    } else {
+                        format!("{} ({})", m.agent_id, m.role)
+                    }
+                })
+                .collect();
+            text.push_str(&format!("\nTeam: {}", team.join("; ")));
+        }
+        let waits: Vec<String> = db
+            .task_links(&task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.kind == crate::coordination::TaskLinkKind::Blocks && l.to_task_id == task.id)
+            .filter_map(|l| db.get_task(&l.from_task_id).ok().flatten())
+            .filter(|t| !t.status.is_terminal())
+            .map(|t| format!("\"{}\" (task {}, {})", sanitize_line(&t.title), t.id, label(&t.status)))
+            .collect();
+        if !waits.is_empty() {
+            text.push_str(&format!("\nWaiting on: {}", waits.join("; ")));
+        }
+        out.push(text);
+    }
+    if !current.is_empty() {
+        out.push(
+            "Share milestones and blockers with everyone on the task via post_task_coordination; report with report_mission_task when done.".to_string(),
+        );
+    }
+
+    if let Some(agent) = agent.as_deref() {
+        let others: Vec<String> = db
+            .list_tasks_page(
+                &crate::coordination::TaskFilter {
+                    status: None,
+                    agent_id: Some(agent),
+                },
+                None,
+                50,
+            )
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| !t.status.is_terminal() && !current.iter().any(|c| c.id == t.id))
+            .take(8)
+            .map(|t| {
+                let place = if t.session_id.is_empty() {
+                    "not dispatched yet".to_string()
+                } else {
+                    format!("session {}", t.session_id)
+                };
+                format!(
+                    "- \"{}\" (task {}, {}, {place})",
+                    sanitize_line(&t.title),
+                    t.id,
+                    label(&t.status)
+                )
+            })
+            .collect();
+        if !others.is_empty() {
+            out.push(format!(
+                "Your other open tasks as {agent} (inspect_task for detail; send_agent_message to task:<id> reaches the session doing it):\n{}",
+                others.join("\n")
+            ));
+        }
+    }
+    out.join("\n")
+}
+
+fn sanitize_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    }
+}
+
 fn lease_holder(ctx: &ToolContext, session_id: &str) -> Option<String> {
     let db = db(ctx).ok()?;
     let tasks = db
@@ -399,10 +533,10 @@ impl Tool for SendAgentMessage {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "send_agent_message".into(),
-            description: "Send a direct message to another agent, or reply where you were asked. When the message you are answering came from a session, reply to `session:<id>` — the exact `reply_to` value from its envelope, copied as written — so the answer lands in the conversation where it was asked. Use `human` only when the message did not name a session. Otherwise address an agent by its agent id (list_coordination_agents shows the directory). It is a conversation, not a command: it never creates a task, transfers ownership, or authorises a workspace change. Task and status messages belong on a task room instead.".into(),
+            description: "Send a direct message to another agent, or reply where you were asked. When the message you are answering came from a session, reply to `session:<id>` — the exact `reply_to` value from its envelope, copied as written — so the answer lands in the conversation where it was asked. Use `human` only when the message did not name a session. Otherwise address an agent by its agent id (list_coordination_agents shows the directory), or `task:<id>` to reach the session working on that task. It is a conversation, not a command: it never creates a task, transfers ownership, or authorises a workspace change. Task and status messages belong on a task room instead.".into(),
             input_schema: schema(
                 json!({
-                    "recipient_agent_id":{"type":"string","description":"agent id from list_coordination_agents"},
+                    "recipient_agent_id":{"type":"string","description":"agent id from list_coordination_agents, `task:<id>`, `session:<id>` or `human`"},
                     "body":{"type":"string"},
                     "idempotency_key":{"type":"string","description":"optional; a retry with the same key does not duplicate"}
                 }),
@@ -433,6 +567,32 @@ impl Tool for SendAgentMessage {
             },
         };
         let db = db(ctx)?;
+        let mut body = args.body.trim().to_string();
+        let task_session;
+        let (requested_kind, requested_id) = match recipient.strip_prefix("task:") {
+            Some(task_id) => {
+                let task = db
+                    .get_task(task_id.trim())
+                    .map_err(|e| ToolError::msg(format!("look up task: {e}")))?
+                    .ok_or_else(|| ToolError::msg(format!("no task `{}`", task_id.trim())))?;
+                if task.status.is_terminal() {
+                    return Err(ToolError::msg(format!(
+                        "task `{}` is {}; nobody is working on it. Message the agent instead.",
+                        task.id, task.status
+                    )));
+                }
+                if task.session_id.is_empty() {
+                    return Err(ToolError::msg(format!(
+                        "task `{}` has not been dispatched to a session yet. Ask mission-control about it.",
+                        task.id
+                    )));
+                }
+                body = format!("[about task {}: {}]\n{body}", task.id, task.title);
+                task_session = task.session_id;
+                ("session", task_session.as_str())
+            }
+            None => (requested_kind, requested_id),
+        };
         // An agent always answers where it was asked. When the message it is
         // answering came from a SESSION, that session is where the human is
         // reading — so a reply addressed to the person is routed there instead of
@@ -502,7 +662,7 @@ impl Tool for SendAgentMessage {
             .send_direct_message_with_origin(
                 (&sender_kind, &sender_id),
                 (to_kind, to_id),
-                args.body.trim(),
+                &body,
                 &key,
                 &chrono::Utc::now().to_rfc3339(),
                 origin.as_deref(),
