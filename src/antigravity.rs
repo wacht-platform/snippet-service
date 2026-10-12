@@ -56,11 +56,12 @@ fn decision(raw: &str, in_snippet: bool) -> Value {
         return json!({"decision": "allow"});
     }
     if name == "view_file" {
+        let path = payload.pointer("/toolCall/args/AbsolutePath").and_then(Value::as_str);
         let own = real_home()
             .map(|home| home.join(".gemini"))
-            .zip(payload.pointer("/toolCall/args/AbsolutePath").and_then(Value::as_str))
+            .zip(path)
             .is_some_and(|(root, path)| Path::new(path).starts_with(root));
-        if own {
+        if own || path.is_some_and(is_image) {
             return json!({"decision": "allow"});
         }
     }
@@ -90,6 +91,15 @@ fn decision(raw: &str, in_snippet: bool) -> Value {
         "decision": "deny",
         "reason": format!("In this snippet session `{name}` is handled by snippet: call {instead} through call_mcp_tool on the `{MCP_SERVER_NAME}` server instead."),
     })
+}
+
+/// Whether a file is an image agy's own viewer can show the model.
+pub fn is_image(path: &str) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .is_ok_and(|n| crate::builtins::fs::sniff_image_mime(&head[..n]).is_some())
 }
 
 /// Where a rejected call_mcp_tool envelope is marked for the bridge serving
