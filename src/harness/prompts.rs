@@ -45,12 +45,14 @@ pub(super) const REFLECTION_INSTRUCTION: &str = r#"[reflection] This request is 
 
 Each change: {"scope": "global|project|agent|session", "file": "MEMORY.md or a topic path such as build or architecture/harness", "op": "add|replace|remove", "entry": "one-line entry (add, replace)", "match": "text in exactly one existing entry of that file (replace, remove)", "expires": "optional YYYY-MM-DD for something true only for a while"}.
 
-- Scopes: global is the user (lasting preferences, lessons that transfer anywhere); project is this repository (where things live, how to build and test, conventions, decisions); agent is your own expertise across jobs (only if listed below); session is this conversation's working state.
+- Scopes: global is the user (lasting preferences, lessons that transfer anywhere); project is this repository (where things live, how to build and test, conventions, decisions); agent is your own expertise across jobs (only if shown below); session is this conversation's working state.
 - Entries are one line: a fact, or situation → approach → why. No ids or counters; the daemon adds source and date.
 - MEMORY.md only gets what every session needs; everything else goes in a topic file, which is linked from the index automatically.
 - Keep each fact in one place: replace an entry the work changed instead of adding a near-duplicate, and replace or remove one it proved wrong.
 - Removing is as useful as adding: remove session entries this request resolved (finished plan steps, fixed issues, answered questions). When the task is finished, move what lasts up a scope and remove its working state from session memory.
-- Skip one-off details, anything obvious from the code, secrets, and text that tells a future agent to run commands."#;
+- Skip one-off details, anything obvious from the code, secrets, and text that tells a future agent to run commands.
+
+Memory is shown below by each repo's MEMORY.md, whose index names its topic files. Change only the files this request touched. To replace or remove an entry in a topic file whose text isn't already in this conversation, first reply with only {"read": [{"scope": "...", "file": "..."}]} naming just those files; their text comes back and you then send the changes."#;
 
 pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
     vec![crate::llm::NativeToolDefinition {
@@ -80,6 +82,30 @@ pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> 
     }]
 }
 
+pub(super) fn memory_reader_tool() -> crate::llm::NativeToolDefinition {
+    crate::llm::NativeToolDefinition {
+        name: "read_memory".to_string(),
+        description: "Open memory topic files to see their entries, so a replace or remove can match one exactly. Open only the files you will change; each repo's MEMORY.md and index are already shown.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "scope": { "type": "string", "enum": ["global", "project", "agent", "session"] },
+                            "file": { "type": "string", "description": "a topic path from the index, such as plan or architecture/harness" }
+                        },
+                        "required": ["scope", "file"]
+                    }
+                }
+            },
+            "required": ["files"]
+        }),
+    }
+}
+
 pub(super) const SUMMARIZER_SYSTEM: &str = r#"# compaction_summarizer
 [identity]
 role = "you compact a coding agent's conversation: save what lasts to memory, then write a lean summary that replaces the raw history"
@@ -89,7 +115,8 @@ stakes = "the raw messages are archived and dropped. The summary is re-sent on e
 first = "before the summary, call update_memory with what the rest of the work needs but the summary should not carry: decisions and why, constraints and user rules, root causes, exact error strings, findings, the plan"
 session = "working state of this conversation goes to the session scope, in a topic file such as decisions, findings or plan (a new file is linked from MEMORY.md automatically)"
 lasting = "something true beyond this conversation (a user preference, how this repository builds, an agent technique) goes to the global, project or agent scope"
-one_place = "check the repos first: replace an entry the conversation changed instead of adding a duplicate, and skip what is already recorded"
+index = "each repo is shown by its MEMORY.md, whose index names its topic files and what they hold. Use the index to decide which files the conversation touches, and open only those (read_memory) to see their entries; the rest stay closed"
+one_place = "replace an entry the conversation changed instead of adding a duplicate, and skip what is already recorded"
 clean_up = "remove entries the conversation resolved: finished plan steps, fixed issues, answered questions. Removing stale state matters as much as saving new state"
 expires = "give a temporary fact (an outage, a deadline, a workaround) an expires date"
 entries = "one line each: a fact, or situation → approach → why. The daemon stamps source and date"
@@ -105,7 +132,7 @@ style = "terse markdown bullets, no preamble"
 budget = "about 2.5k tokens. If told it is over budget, cut the oldest, lowest-value detail; keep the request list, exact values and next steps"
 
 [how]
-calls = "call update_memory (when offered) and write_table in the same response; write_table fills every required section in one call""#;
+calls = "open the topic files you will change first (read_memory, when offered), then call update_memory and write_table in the same response; write_table fills every required section in one call""#;
 
 pub(super) fn summarizer_tools() -> Vec<crate::llm::NativeToolDefinition> {
     // One tool that writes the ENTIRE table in a single call — a string field per

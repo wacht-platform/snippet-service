@@ -604,63 +604,81 @@ async fn run_cli_reflection(
         .map_err(|e| format!("send reflection: {e}"))?;
     let _ = stdin.flush().await;
     let mut reader = BufReader::new(stdout).lines();
-    let mut reply = String::new();
     let mut fork_id: Option<String> = None;
-    let read = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-        while let Ok(Some(raw)) = reader.next_line().await {
-            let Ok(event) = serde_json::from_str::<Value>(&raw) else { continue };
-            match kind {
-                CliKind::ClaudeCode => {
-                    if event.get("type").and_then(Value::as_str) == Some("system")
-                        && event.get("subtype").and_then(Value::as_str) == Some("init")
-                    {
-                        fork_id = event.get("session_id").and_then(Value::as_str).map(str::to_string);
+    let mut reads = 0;
+    let outcome = loop {
+        let mut reply = String::new();
+        let read = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            while let Ok(Some(raw)) = reader.next_line().await {
+                let Ok(event) = serde_json::from_str::<Value>(&raw) else { continue };
+                match kind {
+                    CliKind::ClaudeCode => {
+                        if event.get("type").and_then(Value::as_str) == Some("system")
+                            && event.get("subtype").and_then(Value::as_str) == Some("init")
+                        {
+                            fork_id = event.get("session_id").and_then(Value::as_str).map(str::to_string);
+                        }
+                        if event.get("type").and_then(Value::as_str) == Some("result") {
+                            reply = event.get("result").and_then(Value::as_str).unwrap_or("").to_string();
+                            let usage = event.get("usage").cloned().unwrap_or(Value::Null);
+                            let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                            let prompt = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+                            crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
+                                prompt_tokens: prompt,
+                                completion_tokens: n("output_tokens"),
+                                total_tokens: prompt + n("output_tokens"),
+                                cache_read_tokens: n("cache_read_input_tokens"),
+                                cache_creation_tokens: n("cache_creation_input_tokens"),
+                                ..Default::default()
+                            });
+                            eprintln!(
+                                "memory reflection {owner}: {} cached, {} new input tokens",
+                                n("cache_read_input_tokens"),
+                                n("input_tokens") + n("cache_creation_input_tokens")
+                            );
+                            break;
+                        }
                     }
-                    if event.get("type").and_then(Value::as_str) == Some("result") {
-                        reply = event.get("result").and_then(Value::as_str).unwrap_or("").to_string();
-                        let usage = event.get("usage").cloned().unwrap_or(Value::Null);
-                        let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-                        let prompt = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
-                        crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
-                            prompt_tokens: prompt,
-                            completion_tokens: n("output_tokens"),
-                            total_tokens: prompt + n("output_tokens"),
-                            cache_read_tokens: n("cache_read_input_tokens"),
-                            cache_creation_tokens: n("cache_creation_input_tokens"),
-                            ..Default::default()
-                        });
-                        eprintln!(
-                            "memory reflection {owner}: {} cached, {} new input tokens",
-                            n("cache_read_input_tokens"),
-                            n("input_tokens") + n("cache_creation_input_tokens")
-                        );
-                        break;
-                    }
-                }
-                CliKind::Antigravity => {
-                    if let Some(usage) = event
-                        .pointer("/step_update/usage")
-                        .filter(|_| event.pointer("/step_update/state").and_then(Value::as_str) == Some("DONE"))
-                    {
-                        let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-                        let prompt = n("input_tokens") + n("cache_read_tokens");
-                        crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
-                            prompt_tokens: prompt,
-                            completion_tokens: n("output_tokens"),
-                            total_tokens: prompt + n("output_tokens"),
-                            cache_read_tokens: n("cache_read_tokens"),
-                            ..Default::default()
-                        });
-                    }
-                    if event.get("event").and_then(Value::as_str) == Some("result") {
-                        reply = event.pointer("/result/response").and_then(Value::as_str).unwrap_or("").to_string();
-                        break;
+                    CliKind::Antigravity => {
+                        if let Some(usage) = event
+                            .pointer("/step_update/usage")
+                            .filter(|_| event.pointer("/step_update/state").and_then(Value::as_str) == Some("DONE"))
+                        {
+                            let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+                            let prompt = n("input_tokens") + n("cache_read_tokens");
+                            crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
+                                prompt_tokens: prompt,
+                                completion_tokens: n("output_tokens"),
+                                total_tokens: prompt + n("output_tokens"),
+                                cache_read_tokens: n("cache_read_tokens"),
+                                ..Default::default()
+                            });
+                        }
+                        if event.get("event").and_then(Value::as_str) == Some("result") {
+                            reply = event.pointer("/result/response").and_then(Value::as_str).unwrap_or("").to_string();
+                            break;
+                        }
                     }
                 }
             }
+        })
+        .await;
+        if read.is_err() {
+            break Err("reflection timed out".to_string());
         }
-    })
-    .await;
+        if reads < super::memory_reflection::REFLECTION_READS
+            && let Some(files) = super::memory_reflection::parse_reflection_read(&reply)
+        {
+            reads += 1;
+            let next = kind.user_line(&super::memory_reflection::reflection_opened(repos, &files));
+            if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
+                break Err(format!("send opened files: {e}"));
+            }
+            let _ = stdin.flush().await;
+            continue;
+        }
+        break Ok(reply);
+    };
     drop(stdin);
     let _ = child.kill().await;
     match cleanup {
@@ -671,7 +689,7 @@ async fn run_cli_reflection(
         }
         ForkCleanup::Antigravity(id) => crate::antigravity::remove_conversation(&id),
     }
-    read.map_err(|_| "reflection timed out".to_string())?;
+    let reply = outcome?;
     let changes = super::memory_reflection::parse_reflection(&reply).ok_or("no JSON changes in the reply")?;
     let (applied, errors) = super::memory_reflection::apply_changes(repos, &changes, source);
     for (key, entry) in &applied {
@@ -826,14 +844,14 @@ impl CodingHarness {
     fn compaction_save_prompt(&self) -> Option<String> {
         let path = self.session_memory_path()?;
         Some(format!(
-            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. Then reply with one line saying what you saved."
+            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. Then reply with one line saying what you saved."
         ))
     }
 
     fn agy_compaction_prompt(&self) -> String {
         let save = match self.session_memory_path() {
             Some(path) => format!(
-                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. "
+                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. "
             ),
             None => String::new(),
         };
