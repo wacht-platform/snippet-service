@@ -52,7 +52,7 @@ Each change: {"scope": "global|project|agent|session", "file": "MEMORY.md or a t
 - Removing is as useful as adding: remove session entries this request resolved (finished plan steps, fixed issues, answered questions). When the task is finished, move what lasts up a scope and remove its working state from session memory.
 - Skip one-off details, anything obvious from the code, secrets, and text that tells a future agent to run commands.
 
-Memory is shown below by each repo's MEMORY.md, whose index names its topic files. Change only the files this request touched. To replace or remove an entry in a topic file whose text isn't already in this conversation, first reply with only {"read": [{"scope": "...", "file": "..."}]} naming just those files; their text comes back and you then send the changes."#;
+Memory is shown below by each repo's MEMORY.md, whose index names its topic files. Change only the files this stretch of work touched. Before changing a topic file whose entries aren't already in this conversation (add, replace or remove), first reply with only {"read": [{"scope": "...", "file": "..."}]} naming just those files; their text comes back and you then send the changes, replacing entries your new ones change or contradict."#;
 
 pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> {
     vec![crate::llm::NativeToolDefinition {
