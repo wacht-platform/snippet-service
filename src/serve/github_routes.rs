@@ -32,6 +32,7 @@ pub fn router() -> Router<Shared> {
         .route("/github/pr/reply", post(reply))
         .route("/github/pr/thread", post(resolve_thread))
         .route("/github/commit/diff", get(commit_diff))
+        .route("/github/pr/state", post(pr_state))
 }
 
 async fn gh(dir: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
@@ -106,12 +107,21 @@ async fn status(State(d): State<Shared>, Query(q): Query<SessionQuery>) -> Respo
         .await
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    let settings = gh_json(&dir, &["api", "repos/{owner}/{repo}"]).await.unwrap_or(Value::Null);
+    let allowed = |key: &str| settings.get(key).and_then(Value::as_bool).unwrap_or(true);
     Json(json!({
         "available": true,
         "repo": repo.get("nameWithOwner"),
         "url": repo.get("url"),
         "permission": repo.get("viewerPermission"),
         "viewer": viewer,
+        "merge_methods": {
+            "merge": allowed("allow_merge_commit"),
+            "squash": allowed("allow_squash_merge"),
+            "rebase": allowed("allow_rebase_merge"),
+        },
+        "auto_merge": settings.get("allow_auto_merge").and_then(Value::as_bool).unwrap_or(false),
+        "delete_branch_on_merge": settings.get("delete_branch_on_merge").and_then(Value::as_bool).unwrap_or(false),
     }))
     .into_response()
 }
@@ -147,7 +157,7 @@ async fn list(State(d): State<Shared>, Query(q): Query<ListQuery>) -> Response {
     }
 }
 
-const DETAIL_FIELDS: &str = "number,title,body,author,state,isDraft,headRefName,baseRefName,additions,deletions,changedFiles,files,commits,reviews,comments,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus,url,createdAt,updatedAt,labels,reviewRequests,headRefOid";
+const DETAIL_FIELDS: &str = "number,title,body,author,state,isDraft,headRefName,baseRefName,additions,deletions,changedFiles,files,commits,reviews,comments,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus,url,createdAt,updatedAt,labels,reviewRequests,headRefOid,autoMergeRequest,isCrossRepository";
 
 #[derive(Deserialize)]
 struct PrQuery {
@@ -337,7 +347,26 @@ struct MergeReq {
     /// merge (default), squash or rebase
     method: Option<String>,
     #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    /// The head commit the user reviewed; the merge is refused if it moved.
+    #[serde(default)]
+    head: Option<String>,
+    /// Merge once requirements are met instead of now.
+    #[serde(default)]
+    auto: bool,
+    /// Turn off a pending auto-merge.
+    #[serde(default)]
+    disable_auto: bool,
+    /// Merge without waiting for requirements (admins only).
+    #[serde(default)]
+    admin: bool,
+    /// Delete the remote head branch once merged.
+    #[serde(default)]
     delete_branch: bool,
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 async fn merge(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<MergeReq>) -> Response {
@@ -348,18 +377,78 @@ async fn merge(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<M
         Ok(dir) => dir,
         Err(r) => return r,
     };
+    let number = req.number.to_string();
+    if req.disable_auto {
+        return match gh(&dir, &["pr", "merge", &number, "--disable-auto"], None).await {
+            Ok(_) => Json(json!({ "auto": false })).into_response(),
+            Err(e) => fail(StatusCode::BAD_GATEWAY, e),
+        };
+    }
     let flag = match req.method.as_deref().unwrap_or("merge") {
         "squash" => "--squash",
         "rebase" => "--rebase",
         _ => "--merge",
     };
-    let number = req.number.to_string();
-    let mut args = vec!["pr", "merge", number.as_str(), flag];
-    if req.delete_branch {
-        args.push("--delete-branch");
+    let mut args: Vec<String> = vec!["pr".into(), "merge".into(), number.clone(), flag.into()];
+    if let Some(subject) = req.subject.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        args.extend(["--subject".into(), subject.to_string()]);
     }
+    if let Some(body) = req.body.as_deref() {
+        args.extend(["--body".into(), body.to_string()]);
+    }
+    if let Some(head) = req.head.as_deref().filter(|h| h.chars().all(|c| c.is_ascii_hexdigit()) && !h.is_empty()) {
+        args.extend(["--match-head-commit".into(), head.to_string()]);
+    }
+    if req.auto {
+        args.push("--auto".into());
+    } else if req.admin {
+        args.push("--admin".into());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(e) = gh(&dir, &refs, None).await {
+        return fail(StatusCode::BAD_GATEWAY, e);
+    }
+    if req.auto {
+        return Json(json!({ "auto": true })).into_response();
+    }
+    let mut deleted = false;
+    if req.delete_branch
+        && let Some(branch) = req.branch.as_deref().filter(|b| !b.is_empty() && !b.contains(".."))
+    {
+        let path = format!("repos/{{owner}}/{{repo}}/git/refs/heads/{branch}");
+        deleted = gh(&dir, &["api", "-X", "DELETE", &path], None).await.is_ok();
+    }
+    Json(json!({ "merged": true, "branch_deleted": deleted })).into_response()
+}
+
+#[derive(Deserialize)]
+struct StateReq {
+    session: String,
+    number: u64,
+    /// ready, draft, close, reopen, update or update_rebase
+    action: String,
+}
+
+async fn pr_state(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<StateReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match session_dir(&req.session) {
+        Ok(dir) => dir,
+        Err(r) => return r,
+    };
+    let number = req.number.to_string();
+    let args: Vec<&str> = match req.action.as_str() {
+        "ready" => vec!["pr", "ready", &number],
+        "draft" => vec!["pr", "ready", &number, "--undo"],
+        "close" => vec!["pr", "close", &number],
+        "reopen" => vec!["pr", "reopen", &number],
+        "update" => vec!["pr", "update-branch", &number],
+        "update_rebase" => vec!["pr", "update-branch", &number, "--rebase"],
+        _ => return fail(StatusCode::BAD_REQUEST, "unknown action"),
+    };
     match gh(&dir, &args, None).await {
-        Ok(_) => Json(json!({ "merged": true })).into_response(),
+        Ok(_) => Json(json!({ "done": true })).into_response(),
         Err(e) => fail(StatusCode::BAD_GATEWAY, e),
     }
 }
