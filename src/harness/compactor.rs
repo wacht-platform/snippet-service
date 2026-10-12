@@ -456,6 +456,7 @@ impl CodingHarness {
         // transcript must be rewritten rather than appended to.
         state.history_rewritten = true;
         state.compactions += 1;
+        state.reflected_events = Some(state.events.len());
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(
@@ -626,6 +627,7 @@ impl CodingHarness {
         // there is — the stored rows must be replaced wholesale.
         state.history_rewritten = true;
         state.compactions += 1;
+        state.reflected_events = Some(state.events.len());
         state.events.push(HarnessEvent::SystemDecision {
             step: "history_compacted".to_string(),
             reasoning: format!(

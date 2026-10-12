@@ -496,6 +496,10 @@ pub struct HarnessState {
     /// tell whether their message position still exists.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub compactions: u64,
+    /// Event count when memory was last curated (a reflection or a
+    /// compaction), so the next reflection covers everything after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflected_events: Option<usize>,
     /// Set by the few writers that rewrite history in place — compaction,
     /// checkpoint rewind, interrupt rollback, tool-payload pruning. Those are the
     /// only cases where the append-only store cannot be appended to, so the flag
