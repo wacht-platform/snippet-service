@@ -1167,7 +1167,7 @@ impl CodingHarness {
         let guide = tool_guide(&bridge_tools);
         let steers: SteerQueue = Default::default();
         let served: ServedResults = Default::default();
-        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone(), served.clone(), CliKind::of(&profile.provider) == CliKind::ClaudeCode).await.map_err(ToolError::msg)?;
+        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone(), served.clone(), true).await.map_err(ToolError::msg)?;
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<CliLine>();
         let mut process: Option<CliProcess> = None;
         let mut generation = 0u64;
