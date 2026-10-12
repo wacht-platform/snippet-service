@@ -1970,6 +1970,12 @@ impl CodingHarness {
                                 params.get("ToolName").and_then(Value::as_str).unwrap_or("tool").to_string(),
                                 params.get("Arguments").cloned().unwrap_or(Value::Null),
                             )
+                        } else if let Some(path) = (raw == "view_file")
+                            .then(|| params.get("AbsolutePath").and_then(Value::as_str))
+                            .flatten()
+                            .filter(|p| !p.contains("/.gemini/antigravity-cli/") && crate::antigravity::is_image(p))
+                        {
+                            ("view_image".to_string(), json!({ "path": path }))
                         } else {
                             (raw.to_string(), params)
                         };
