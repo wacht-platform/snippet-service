@@ -72,13 +72,6 @@ impl CodingHarness {
                 .await;
         }
 
-        // Fresh session in this folder: keep snippet's `.snippet/` workspace scratch
-        // (bg processes, lanes) out of the user's git history. Main agent only —
-        // lanes share the workspace and would just race on the same file.
-        if self.context.owner() == "main" {
-            ensure_snippet_gitignored(self.context.workspace_root());
-        }
-
         let now = Utc::now().to_rfc3339();
         let request = initial_request
             .map(|r| r.trim().to_string())
@@ -409,12 +402,12 @@ pub(super) fn stamp_activity_times(state: &mut HarnessState) {
     }
 }
 
-/// On a fresh session in a git work tree, make sure snippet's `.snippet/` scratch
+/// Whenever a session starts in a git work tree, make sure snippet's `.snippet/` scratch
 /// (bg-process registry, lane state) is gitignored so it never lands in the user's
 /// history. Best-effort and idempotent: creates `.gitignore` if it's missing,
 /// appends the entry if absent, no-ops if already covered. Skips folders that
 /// aren't in a git repo — a `.gitignore` there would be pointless clutter.
-pub(super) fn ensure_snippet_gitignored(workspace: &Path) {
+pub(crate) fn ensure_snippet_gitignored(workspace: &Path) {
     if !in_git_work_tree(workspace) {
         return;
     }
@@ -423,7 +416,14 @@ pub(super) fn ensure_snippet_gitignored(workspace: &Path) {
         content.lines().any(|line| {
             matches!(
                 line.trim(),
-                ".snippet" | ".snippet/" | "/.snippet" | "/.snippet/"
+                ".snippet"
+                    | ".snippet/"
+                    | "/.snippet"
+                    | "/.snippet/"
+                    | ".snippet/*"
+                    | "/.snippet/*"
+                    | ".snippet/**"
+                    | "/.snippet/**"
             )
         })
     };
