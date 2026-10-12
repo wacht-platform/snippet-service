@@ -856,6 +856,7 @@ mod live_context;
 mod memory_reflection;
 mod meta_tools;
 mod persistence;
+pub(crate) use persistence::ensure_snippet_gitignored;
 mod prompts;
 mod runner;
 pub mod state;
