@@ -304,6 +304,7 @@ struct McpState {
     calls: mpsc::UnboundedSender<McpCall>,
     steers: SteerQueue,
     served: ServedResults,
+    images: bool,
 }
 
 struct CliProcess {
@@ -411,6 +412,55 @@ fn unwrap_custom(name: String, arguments: Value) -> (String, Value) {
     (inner, args)
 }
 
+const IMAGE_PATH_KEY: &str = "__image_path";
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+fn image_block(path: &str) -> Option<(&'static str, String)> {
+    use base64::Engine;
+    if std::fs::metadata(path).ok()?.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let mime = crate::builtins::fs::sniff_image_mime(&bytes)?;
+    Some((mime, base64::engine::general_purpose::STANDARD.encode(&bytes)))
+}
+
+/// A user message for the CLI, with the app's `[attached image — …: /path]`
+/// markers turned into the images themselves for Claude Code, and into a
+/// pointer to its own file viewer for agy, whose input takes text only.
+fn user_line_with_attachments(kind: CliKind, text: &str) -> Value {
+    static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[attached (image|file) — [^\]/]*(/[^\]]+)\]").expect("valid regex")
+    });
+    if !MARKER.is_match(text) {
+        return kind.user_line(text);
+    }
+    let mut images = Vec::new();
+    let text = MARKER
+        .replace_all(text, |caps: &regex::Captures| {
+            let path = caps[2].trim().to_string();
+            let kind_word = &caps[1];
+            if kind_word == "image" {
+                images.push(path.clone());
+                if kind == CliKind::Antigravity {
+                    return format!("[attached image: {path} — open it with view_file to see it]");
+                }
+            }
+            format!("[attached {kind_word}: {path}]")
+        })
+        .into_owned();
+    if kind != CliKind::ClaudeCode {
+        return kind.user_line(&text);
+    }
+    let mut content = vec![json!({"type": "text", "text": text})];
+    for path in &images {
+        if let Some((mime, data)) = image_block(path) {
+            content.push(json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}));
+        }
+    }
+    json!({"type": "user", "message": {"role": "user", "content": content}})
+}
+
 fn error_result(code: &str, message: &str) -> Value {
     json!({"schema_version": 1, "status": "error", "error": {"code": code, "message": message}})
 }
@@ -496,6 +546,10 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
             let mut value = rx
                 .await
                 .unwrap_or_else(|_| error_result("interrupted", "The call was interrupted."));
+            let image_path = value
+                .as_object_mut()
+                .and_then(|o| o.remove(IMAGE_PATH_KEY))
+                .and_then(|v| v.as_str().map(str::to_string));
             let vault = crate::vault::Vault::load();
             if !vault.is_empty() {
                 vault.scrub_value(&mut value);
@@ -509,6 +563,12 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
             }
             let failed = value.get("status").and_then(Value::as_str) == Some("error");
             let mut content = vec![json!({"type": "text", "text": value.to_string()})];
+            if let Some(path) = image_path {
+                match image_block(&path).filter(|_| state.images) {
+                    Some((mime, data)) => content.push(json!({"type": "image", "data": data, "mimeType": mime})),
+                    None => content.push(json!({"type": "text", "text": format!("To see the image itself, open {path} with your own file viewer (view_file).")})),
+                }
+            }
             if let Some(marker) = crate::antigravity::envelope_marker(&format!("/mcp/{}", state.token))
                 && std::fs::remove_file(&marker).is_ok()
             {
@@ -571,7 +631,7 @@ enum ForkCleanup {
 /// reflection fork that must see the same tool list (so the prompt cache
 /// matches) without being able to act.
 async fn start_refusing_bridge(tools: Vec<NativeToolDefinition>) -> Result<String, String> {
-    let (url, mut calls) = start_mcp_server(tools, Default::default(), Default::default()).await?;
+    let (url, mut calls) = start_mcp_server(tools, Default::default(), Default::default(), false).await?;
     tokio::spawn(async move {
         while let Some(call) = calls.recv().await {
             let _ = call.reply.send(error_result(
@@ -722,10 +782,11 @@ async fn start_mcp_server(
     tools: Vec<NativeToolDefinition>,
     steers: SteerQueue,
     served: ServedResults,
+    images: bool,
 ) -> Result<(String, mpsc::UnboundedReceiver<McpCall>), String> {
     let (calls, rx) = mpsc::unbounded_channel();
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let state = McpState { token: token.clone(), tools, calls, steers, served };
+    let state = McpState { token: token.clone(), tools, calls, steers, served, images };
     let app = Router::new()
         .route(
             "/mcp/{token}",
@@ -1106,7 +1167,7 @@ impl CodingHarness {
         let guide = tool_guide(&bridge_tools);
         let steers: SteerQueue = Default::default();
         let served: ServedResults = Default::default();
-        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone(), served.clone()).await.map_err(ToolError::msg)?;
+        let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone(), served.clone(), CliKind::of(&profile.provider) == CliKind::ClaudeCode).await.map_err(ToolError::msg)?;
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<CliLine>();
         let mut process: Option<CliProcess> = None;
         let mut generation = 0u64;
@@ -1265,7 +1326,7 @@ impl CodingHarness {
                             }
                             None => text,
                         };
-                        let line = kind.user_line(&text);
+                        let line = user_line_with_attachments(kind, &text);
                         let sent = p.stdin.write_all(format!("{line}\n").as_bytes()).await;
                         if sent.is_err() || p.stdin.flush().await.is_err() {
                             state.events.push(HarnessEvent::ModelError {
@@ -1793,6 +1854,17 @@ impl CodingHarness {
 
     async fn execute_cli_call(&self, call: McpCall) {
         let value = match self.tools.execute(&self.context, &call.name, call.arguments).await {
+            Ok(mut result) if call.name == "view_image" => {
+                let resolved = result
+                    .value
+                    .pointer("/data/path")
+                    .and_then(Value::as_str)
+                    .and_then(|p| self.context.resolve_workspace_path(p).ok());
+                if let (Some(path), Some(object)) = (resolved, result.value.as_object_mut()) {
+                    object.insert(IMAGE_PATH_KEY.to_string(), json!(path.display().to_string()));
+                }
+                result.value
+            }
             Ok(result) => result.value,
             Err(ToolError::UnknownTool(name)) => {
                 let available: Vec<String> = self.tools.definitions().into_iter().map(|d| d.name).collect();
