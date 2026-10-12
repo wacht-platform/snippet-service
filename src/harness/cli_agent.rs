@@ -666,6 +666,8 @@ async fn run_cli_reflection(
     let mut reader = BufReader::new(stdout).lines();
     let mut fork_id: Option<String> = None;
     let mut reads = 0;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut held = false;
     let outcome = loop {
         let mut reply = String::new();
         let read = tokio::time::timeout(std::time::Duration::from_secs(300), async {
@@ -731,12 +733,29 @@ async fn run_cli_reflection(
         {
             reads += 1;
             eprintln!("memory reflection {owner} opened: {}", super::memory_reflection::opened_names(&files));
+            seen.extend(files.iter().map(super::memory_reflection::file_key));
             let next = kind.user_line(&super::memory_reflection::reflection_opened(repos, &files));
             if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
                 break Err(format!("send opened files: {e}"));
             }
             let _ = stdin.flush().await;
             continue;
+        }
+        if !held
+            && let Some(changes) = super::memory_reflection::parse_reflection(&reply)
+        {
+            let unseen = super::memory_reflection::unseen_files(repos, &changes, &seen);
+            if !unseen.is_empty() {
+                held = true;
+                eprintln!("memory reflection {owner} held back, opened: {}", super::memory_reflection::opened_names(&unseen));
+                seen.extend(unseen.iter().map(super::memory_reflection::file_key));
+                let next = kind.user_line(&super::memory_reflection::reflection_held(repos, &unseen));
+                if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
+                    break Err(format!("send opened files: {e}"));
+                }
+                let _ = stdin.flush().await;
+                continue;
+            }
         }
         break Ok(reply);
     };
