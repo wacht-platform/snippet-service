@@ -418,3 +418,59 @@ pub fn content_type(path: &Path) -> &'static str {
 pub const CSP: &str = "sandbox allow-scripts allow-popups allow-forms allow-modals allow-downloads; \
 default-src 'self' 'unsafe-inline' data: blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://unpkg.com https://fonts.googleapis.com https://fonts.gstatic.com; \
 img-src 'self' data: blob: https:; connect-src 'self'; frame-ancestors *";
+
+/// Zip `sources` (files, or folders kept as folders) into a temporary file
+/// for download, returning its path. Zips older than an hour are cleared.
+pub fn zip_to_temp(name: &str, sources: &[PathBuf]) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let dir = crate::config::snippet_home().join("tmp").join("zips");
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    if let Ok(entries) = fs::read_dir(&dir) {
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for entry in entries.flatten() {
+            if entry.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < hour_ago) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let stem = slug(name.trim_end_matches(".zip"));
+    let out = dir.join(format!("{stem}-{}.zip", chrono::Utc::now().timestamp_millis()));
+    let file = fs::File::create(&out).map_err(|e| format!("create zip: {e}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut used = std::collections::HashSet::new();
+    let mut add = |zip: &mut zip::ZipWriter<fs::File>, entry: String, path: &Path| -> Result<(), String> {
+        let mut entry = entry;
+        let mut n = 2;
+        while !used.insert(entry.clone()) {
+            entry = match entry.rsplit_once('.') {
+                Some((base, ext)) if !base.is_empty() => format!("{base}-{n}.{ext}"),
+                _ => format!("{entry}-{n}"),
+            };
+            n += 1;
+        }
+        zip.start_file(entry, options).map_err(|e| e.to_string())?;
+        zip.write_all(&fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?)
+            .map_err(|e| e.to_string())
+    };
+    for source in sources {
+        let base = source
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        if source.is_dir() {
+            let mut files = Vec::new();
+            collect(source, source, &mut files);
+            files.sort();
+            for rel in files {
+                add(&mut zip, format!("{base}/{rel}"), &source.join(&rel))?;
+            }
+        } else if source.is_file() {
+            add(&mut zip, base, source)?;
+        }
+    }
+    zip.finish().map_err(|e| format!("finish zip: {e}"))?;
+    Ok(out)
+}
