@@ -150,6 +150,7 @@ mod assistant_dedup_tests {
             history_rewritten: false,
             events_rewritten: false,
             compactions: 0,
+            reflected_events: None,
         }
     }
 
@@ -380,6 +381,7 @@ mod tool_prune_tests {
             history_rewritten: false,
             events_rewritten: false,
             compactions: 0,
+            reflected_events: None,
         }
     }
 

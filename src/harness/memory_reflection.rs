@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 impl CodingHarness {
     pub(super) async fn run_agentic_summary(
@@ -22,6 +23,8 @@ impl CodingHarness {
         let mut memory_open = !repos.is_empty();
         let mut opened = String::new();
         let mut reads = 0;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut held = false;
         let mut saved: Vec<String> = Vec::new();
         let mut touched: Vec<String> = Vec::new();
         let mut over_budget_table: Option<String> = None;
@@ -89,8 +92,24 @@ impl CodingHarness {
                 reads += 1;
                 let files = call.arguments.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
                 self.memory_log(&format!("compaction memory opened: {}", opened_names(&files)));
+                seen.extend(files.iter().map(file_key));
                 opened.push_str(&read_topic_files(&repos, &files));
                 if !output.calls.iter().any(|c| c.tool_name == "update_memory" || c.tool_name == "write_table") {
+                    continue;
+                }
+            }
+
+            if memory_open
+                && !held
+                && let Some(call) = output.calls.iter().find(|c| c.tool_name == "update_memory")
+            {
+                let unseen = unseen_files(&repos, &call.arguments, &seen);
+                if !unseen.is_empty() {
+                    held = true;
+                    self.memory_log(&format!("compaction memory held back, opened: {}", opened_names(&unseen)));
+                    seen.extend(unseen.iter().map(file_key));
+                    opened.push_str(&read_topic_files(&repos, &unseen));
+                    feedback = "Your update_memory changed files whose entries you hadn't seen, so nothing was saved yet; they are under OPENED TOPIC FILES now. Call update_memory again with the full changes, replacing entries your new ones change or contradict, and write_table.".to_string();
                     continue;
                 }
             }
@@ -198,13 +217,13 @@ impl CodingHarness {
         &self,
         model: &mut dyn AgentModel,
         state: &HarnessState,
-    ) -> Result<(), ToolError> {
-        if !reflection_due(request_window(state)) {
-            return Ok(());
-        }
+    ) -> Result<bool, ToolError> {
+        let Some(since) = reflection_scope(state) else {
+            return Ok(false);
+        };
         let repos = self.memory_scopes();
         if repos.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let source = self
             .session_id()
@@ -217,11 +236,13 @@ impl CodingHarness {
         let definitions = self.definitions_for(true, goal_active);
         let mut messages = state.messages.clone();
         messages.push(HarnessMessage::User {
-            content: reflection_instruction(&repos),
+            content: reflection_instruction(&repos, &since),
         });
         let mut touched: Vec<String> = Vec::new();
         let mut reads = 0;
         let mut retries = 0;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut held = false;
         loop {
             let output = model.generate(&messages, &definitions, false, None).await?;
             let reply = output.content_text.clone().unwrap_or_default();
@@ -230,6 +251,7 @@ impl CodingHarness {
             {
                 reads += 1;
                 self.memory_log(&format!("memory reflection opened: {}", opened_names(&files)));
+                seen.extend(files.iter().map(file_key));
                 messages.push(HarnessMessage::Assistant {
                     content: reply,
                     tool_calls: Vec::new(),
@@ -243,6 +265,20 @@ impl CodingHarness {
                 self.memory_log("memory reflection: no JSON changes in the reply");
                 break;
             };
+            let unseen = unseen_files(&repos, &changes, &seen);
+            if !held && !unseen.is_empty() {
+                held = true;
+                self.memory_log(&format!("memory reflection held back, opened: {}", opened_names(&unseen)));
+                seen.extend(unseen.iter().map(file_key));
+                messages.push(HarnessMessage::Assistant {
+                    content: reply,
+                    tool_calls: Vec::new(),
+                });
+                messages.push(HarnessMessage::User {
+                    content: reflection_held(&repos, &unseen),
+                });
+                continue;
+            }
             let (applied, errors) = apply_changes(&repos, &changes, &source);
             for (key, line) in &applied {
                 self.memory_log(&format!("memory reflection: {key} {line}"));
@@ -269,7 +305,7 @@ impl CodingHarness {
             self.memory_log("memory reflection: nothing changed");
         }
         commit_reflection(&repos, &touched);
-        Ok(())
+        Ok(true)
     }
 
     fn memory_log(&self, line: &str) {
@@ -278,19 +314,44 @@ impl CodingHarness {
     }
 }
 
-/// Whether a finished request did enough work to be worth reflecting on.
-pub(super) fn reflection_due(window: &[HarnessMessage]) -> bool {
-    window
-        .iter()
-        .filter(|m| matches!(m, HarnessMessage::ToolResult { .. }))
-        .count()
-        >= 3
+/// When enough has happened since memory was last curated (three tool calls or
+/// three user messages), the opening of the first user message in that stretch,
+/// so the reflection knows where its part of the conversation starts.
+pub(super) fn reflection_scope(state: &HarnessState) -> Option<String> {
+    let start = match state.reflected_events {
+        Some(at) => at.min(state.events.len()),
+        None => state
+            .events
+            .iter()
+            .rposition(|e| matches!(e, HarnessEvent::UserInput { .. }))
+            .unwrap_or(0),
+    };
+    let events = &state.events[start..];
+    let tools = events.iter().filter(|e| matches!(e, HarnessEvent::ToolResult { .. })).count();
+    let asks = events.iter().filter(|e| matches!(e, HarnessEvent::UserInput { .. })).count();
+    if tools < 3 && asks < 3 {
+        return None;
+    }
+    Some(
+        events
+            .iter()
+            .find_map(|e| match e {
+                HarnessEvent::UserInput { text } => Some(clip(text.trim(), 160)),
+                _ => None,
+            })
+            .unwrap_or_default(),
+    )
 }
 
 pub(super) const REFLECTION_READS: usize = 2;
 
-pub(super) fn reflection_instruction(repos: &[crate::memory::MemoryRepo]) -> String {
-    format!("{REFLECTION_INSTRUCTION}\n\nMemory now, by each repo's MEMORY.md and index:\n{}", render_indexes(repos))
+pub(super) fn reflection_instruction(repos: &[crate::memory::MemoryRepo], since: &str) -> String {
+    let scope = if since.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nCover everything since memory was last curated: from the user's message that begins \"{since}\" to now, including requests too small to have been reflected on.")
+    };
+    format!("{REFLECTION_INSTRUCTION}{scope}\n\nMemory now, by each repo's MEMORY.md and index:\n{}", render_indexes(repos))
 }
 
 pub(super) fn reflection_opened(repos: &[crate::memory::MemoryRepo], files: &[Value]) -> String {
@@ -309,6 +370,48 @@ pub(super) fn opened_names(files: &[Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+pub(super) fn file_key(item: &Value) -> String {
+    let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let file = text("file");
+    format!("{}:{}", text("scope"), crate::memory::topic_file(&file).unwrap_or(file))
+}
+
+/// Existing topic files the changes write to whose entries the pass hasn't
+/// opened, as `{"scope", "file"}`. MEMORY.md is always in view, so it never
+/// counts.
+pub(super) fn unseen_files(repos: &[crate::memory::MemoryRepo], changes: &Value, seen: &HashSet<String>) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut keys: HashSet<String> = HashSet::new();
+    for change in changes.get("changes").and_then(Value::as_array).into_iter().flatten() {
+        let text = |key: &str| change.get(key).and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let (scope, file) = (text("scope"), text("file"));
+        let Ok(topic) = crate::memory::topic_file(&file) else { continue };
+        if topic == crate::memory::ENTRY_FILE {
+            continue;
+        }
+        let key = format!("{scope}:{topic}");
+        if seen.contains(&key) || keys.contains(&key) {
+            continue;
+        }
+        let has_entries = crate::memory::ScopeKind::parse(&scope)
+            .and_then(|kind| repos.iter().find(|r| r.kind == kind))
+            .and_then(|repo| repo.read_file(&topic).ok())
+            .is_some_and(|body| body.lines().any(|l| l.trim_start().starts_with("- ")));
+        if has_entries {
+            keys.insert(key);
+            out.push(json!({"scope": scope, "file": file}));
+        }
+    }
+    out
+}
+
+pub(super) fn reflection_held(repos: &[crate::memory::MemoryRepo], files: &[Value]) -> String {
+    format!(
+        "[reflection] Some changes go to files whose entries you hadn't seen, so nothing was applied yet. Here they are:\n{}\nSend the complete {{\"changes\": [...]}} again: replace or remove the entries these files already have where your new ones change or contradict them, and add only what's new.",
+        read_topic_files(repos, files)
+    )
 }
 
 /// The files a reflection reply asks to open first, from `{"read": [...]}`.
@@ -450,21 +553,4 @@ fn is_date(text: &str) -> bool {
     chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
 }
 
-/// The messages of the request that just ended: from its checkpoint when one
-/// was taken since the last compaction, else from the last user message.
-pub(super) fn request_window(state: &HarnessState) -> &[HarnessMessage] {
-    let start = state
-        .checkpoints
-        .last()
-        .filter(|c| c.compactions == state.compactions && c.message_index <= state.messages.len())
-        .map(|c| c.message_index)
-        .or_else(|| {
-            state
-                .messages
-                .iter()
-                .rposition(|m| matches!(m, HarnessMessage::User { .. }))
-        })
-        .unwrap_or(0);
-    &state.messages[start..]
-}
 
