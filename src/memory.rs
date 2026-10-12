@@ -665,7 +665,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-fn topic_file(file: &str) -> Result<String, String> {
+pub(crate) fn topic_file(file: &str) -> Result<String, String> {
     let file = file.trim().trim_start_matches('/');
     let file = if file.is_empty() { ENTRY_FILE.to_string() } else { file.to_string() };
     let file = if file.ends_with(".md") { file } else { format!("{file}.md") };
