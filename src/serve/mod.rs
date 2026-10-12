@@ -47,6 +47,7 @@ mod git;
 mod lifecycle;
 mod memory_routes;
 mod artifact_routes;
+mod github_routes;
 pub mod maintenance;
 pub(crate) use maintenance::*;
 mod mission_control;
@@ -771,6 +772,7 @@ pub async fn run_serve(
         .merge(recurring::router())
         .merge(memory_routes::router())
         .merge(artifact_routes::router())
+        .merge(github_routes::router())
         .merge(mission_control::router())
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
