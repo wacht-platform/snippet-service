@@ -776,6 +776,7 @@ pub async fn run_serve(
         .merge(mission_control::router())
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
+        .route("/fs/files", get(list_fs_files))
         .route(
             "/fs/upload",
             post(upload_fs_file).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),

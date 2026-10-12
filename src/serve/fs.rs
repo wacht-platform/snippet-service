@@ -62,6 +62,64 @@ pub(super) async fn browse_fs(State(d): State<Shared>, Query(q): Query<FsQuery>)
 }
 
 #[derive(Serialize)]
+struct FsFiles {
+    root: String,
+    files: Vec<String>,
+    truncated: bool,
+}
+
+const FS_FILES_CAP: usize = 20_000;
+
+// GET /fs/files?path= — every file under a workspace, honouring .gitignore.
+pub(super) async fn list_fs_files(State(d): State<Shared>, Query(q): Query<FsQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let Some(root) = q.path.filter(|p| !p.is_empty()).map(PathBuf::from) else {
+        return (StatusCode::BAD_REQUEST, "path required").into_response();
+    };
+    if !root.is_dir() {
+        return (StatusCode::NOT_FOUND, "not a directory").into_response();
+    }
+    let walk_root = root.clone();
+    let listed = tokio::task::spawn_blocking(move || {
+        let mut files = Vec::new();
+        let mut truncated = false;
+        let walker = ignore::WalkBuilder::new(&walk_root)
+            .hidden(true)
+            .git_ignore(true)
+            .git_exclude(true)
+            .require_git(false)
+            .max_depth(Some(24))
+            .build();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            if files.len() >= FS_FILES_CAP {
+                truncated = true;
+                break;
+            }
+            if let Ok(rel) = entry.path().strip_prefix(&walk_root) {
+                files.push(rel.to_string_lossy().to_string());
+            }
+        }
+        files.sort();
+        (files, truncated)
+    })
+    .await;
+    match listed {
+        Ok((files, truncated)) => Json(FsFiles {
+            root: root.display().to_string(),
+            files,
+            truncated,
+        })
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Serialize)]
 struct FileContent {
     path: String,
     content: String,
