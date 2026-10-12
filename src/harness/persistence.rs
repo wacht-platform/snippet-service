@@ -139,7 +139,7 @@ impl CodingHarness {
             history_rewritten: false,
             events_rewritten: false,
             compactions: 0,
-            reflected_events: None,
+            reflected_events: Some(0),
         };
         self.persist_state(&mut state).await?;
         if request.is_some() {
