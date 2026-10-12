@@ -82,7 +82,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/mode",
-        "Toggle manual approval (bash & file edits ask y/n)",
+        "Switch approval between Ask (bash & file edits ask y/n) and YOLO (/mode ask, /mode yolo)",
     ),
     (
         "/term",
