@@ -168,6 +168,15 @@ pub enum HarnessEvent {
         path: String,
         caption: Option<String>,
     },
+    /// The agent presented an artifact: a new one, or a new version of one.
+    ArtifactPresented {
+        id: String,
+        version: u32,
+        title: String,
+        artifact_kind: String,
+        caption: Option<String>,
+        path: String,
+    },
     /// A runtime-injected correction after recoverable failures.
     SystemDecision {
         step: String,

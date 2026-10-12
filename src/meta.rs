@@ -90,18 +90,23 @@ fn set_session_title_tool() -> NativeToolDefinition {
 fn present_file_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "present_file".to_string(),
-        description: "Present a file to the user: it appears in the conversation as an openable \
-            file card (in both the TUI and the app). Use it when a deliverable IS a file — a \
-            report you wrote, a generated artifact, a diff, an image — instead of pasting its \
-            contents into chat. The file must already exist (write it first). Present only the \
-            file(s) that are the deliverable, not every file you touched. Presenting does not \
-            end your turn — you still deliver your answer text as usual."
+        description: "Hand the user a file or show them an artifact. Sending is the default: a \
+            file they'll open or take away (an export, a render, a patch) appears as one line in the \
+            conversation, and several in a turn are grouped. An artifact is for one deliverable they'll \
+            look at and you'll iterate on (a report, a dashboard, a prototype, a diagram): give it a \
+            `title` and it opens in a viewer that renders HTML, markdown, images and CSV; present it \
+            again with the `artifact_id` you got back to add a version instead of making a new one. \
+            Write HTML artifacts as self-contained pages (inline CSS and JS, libraries from cdnjs or \
+            jsdelivr). For a batch of files, write them into one folder and present the folder: it \
+            becomes a single collection. The path must exist. Presenting doesn't end your turn."
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "The file to present — workspace-relative or absolute."},
-                "caption": {"type": "string", "description": "Optional one-line caption shown with the file."}
+                "path": {"type": "string", "description": "The file or folder to present, workspace-relative or absolute."},
+                "caption": {"type": "string", "description": "Optional one-line caption shown with it."},
+                "title": {"type": "string", "description": "Makes it an artifact with this title."},
+                "artifact_id": {"type": "string", "description": "Adds a version to this existing artifact."}
             },
             "required": ["path"]
         }),
