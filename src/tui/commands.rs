@@ -856,7 +856,15 @@ impl App {
                 }
             }
             "/mode" => {
-                let manual = !self.options.config.manual_approval;
+                let manual = match parts.get(1).map(|a| a.to_ascii_lowercase()) {
+                    Some(a) if a == "ask" || a == "manual" => true,
+                    Some(a) if a == "yolo" || a == "auto" => false,
+                    Some(other) => {
+                        self.status = format!("Unknown mode `{other}`. Use /mode ask or /mode yolo");
+                        return;
+                    }
+                    None => !self.options.config.manual_approval,
+                };
                 self.options.config.manual_approval = manual;
                 let _ = self.save_config_file();
                 let mode = if manual {
@@ -865,7 +873,11 @@ impl App {
                     crate::harness::ApprovalMode::Auto
                 };
                 let _ = self.send_loop_input(LoopInput::SetMode(mode));
-                self.status = String::new();
+                self.status = if manual {
+                    "Approval: Ask".to_string()
+                } else {
+                    "Approval: YOLO".to_string()
+                };
             }
             "/compact" => {
                 if self.agent_alive() {

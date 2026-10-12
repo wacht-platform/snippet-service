@@ -738,9 +738,13 @@ pub(crate) fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
         Span::styled("  ·  ", faint_style),
         Span::styled(folder_name.to_string(), Style::default().fg(muted())),
     ];
-    if st.is_some_and(|s| s.approval_mode == crate::harness::ApprovalMode::Manual) {
+    if let Some(s) = st {
         left.push(Span::styled("  ·  ", faint_style));
-        left.push(Span::styled("manual approval", Style::default().fg(warn())));
+        if s.approval_mode == crate::harness::ApprovalMode::Manual {
+            left.push(Span::styled("ask", Style::default().fg(warn())));
+        } else {
+            left.push(Span::styled("yolo", Style::default().fg(muted())));
+        }
     }
 
     let mut right: Vec<Span<'static>> = Vec::new();
