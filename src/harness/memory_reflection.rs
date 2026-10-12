@@ -88,6 +88,7 @@ impl CodingHarness {
             {
                 reads += 1;
                 let files = call.arguments.get("files").and_then(Value::as_array).cloned().unwrap_or_default();
+                self.memory_log(&format!("compaction memory opened: {}", opened_names(&files)));
                 opened.push_str(&read_topic_files(&repos, &files));
                 if !output.calls.iter().any(|c| c.tool_name == "update_memory" || c.tool_name == "write_table") {
                     continue;
@@ -100,14 +101,14 @@ impl CodingHarness {
                 memory_open = false;
                 let (applied, errors) = apply_changes(&repos, &call.arguments, &source);
                 for (key, line) in applied {
-                    self.debug_log(&format!("compaction memory: {key} {line}"));
+                    self.memory_log(&format!("compaction memory: {key} {line}"));
                     if !touched.contains(&key) {
                         touched.push(key);
                     }
                     saved.push(line);
                 }
                 for error in errors {
-                    self.debug_log(&format!("compaction memory rejected: {error}"));
+                    self.memory_log(&format!("compaction memory rejected: {error}"));
                 }
             }
 
@@ -170,7 +171,7 @@ impl CodingHarness {
 
         for repo in repos.iter().filter(|r| touched.contains(&r.key)) {
             if let Err(e) = repo.commit_all("Save working state before compaction") {
-                self.debug_log(&format!("compaction memory commit {}: {e}", repo.key));
+                self.memory_log(&format!("compaction memory commit {}: {e}", repo.key));
             }
         }
         if !touched.is_empty() {
@@ -228,6 +229,7 @@ impl CodingHarness {
                 && let Some(files) = parse_reflection_read(&reply)
             {
                 reads += 1;
+                self.memory_log(&format!("memory reflection opened: {}", opened_names(&files)));
                 messages.push(HarnessMessage::Assistant {
                     content: reply,
                     tool_calls: Vec::new(),
@@ -238,15 +240,18 @@ impl CodingHarness {
                 continue;
             }
             let Some(changes) = parse_reflection(&reply) else {
-                self.debug_log("memory reflection: no JSON changes in the reply");
+                self.memory_log("memory reflection: no JSON changes in the reply");
                 break;
             };
             let (applied, errors) = apply_changes(&repos, &changes, &source);
             for (key, line) in &applied {
-                self.debug_log(&format!("memory reflection: {key} {line}"));
+                self.memory_log(&format!("memory reflection: {key} {line}"));
                 if !touched.contains(key) {
                     touched.push(key.clone());
                 }
+            }
+            for error in &errors {
+                self.memory_log(&format!("memory reflection rejected: {error}"));
             }
             if errors.is_empty() || retries == 1 {
                 break;
@@ -260,8 +265,16 @@ impl CodingHarness {
                 content: reflection_retry(&applied, &errors),
             });
         }
+        if touched.is_empty() {
+            self.memory_log("memory reflection: nothing changed");
+        }
         commit_reflection(&repos, &touched);
         Ok(())
+    }
+
+    fn memory_log(&self, line: &str) {
+        self.debug_log(line);
+        eprintln!("{} {line}", self.session_id().unwrap_or_default());
     }
 }
 
@@ -285,6 +298,17 @@ pub(super) fn reflection_opened(repos: &[crate::memory::MemoryRepo], files: &[Va
         "[reflection] The files you asked for:\n{}\nNow reply with only the {{\"changes\": [...]}} object.",
         read_topic_files(repos, files)
     )
+}
+
+pub(super) fn opened_names(files: &[Value]) -> String {
+    files
+        .iter()
+        .map(|f| {
+            let text = |key: &str| f.get(key).and_then(Value::as_str).unwrap_or("?").to_string();
+            format!("{}:{}", text("scope"), text("file"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The files a reflection reply asks to open first, from `{"read": [...]}`.
