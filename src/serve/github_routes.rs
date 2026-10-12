@@ -29,6 +29,9 @@ pub fn router() -> Router<Shared> {
         .route("/github/pr/review", post(review))
         .route("/github/pr/comment", post(comment))
         .route("/github/pr/merge", post(merge))
+        .route("/github/pr/reply", post(reply))
+        .route("/github/pr/thread", post(resolve_thread))
+        .route("/github/commit/diff", get(commit_diff))
 }
 
 async fn gh(dir: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
@@ -163,35 +166,61 @@ async fn detail(State(d): State<Shared>, Query(q): Query<PrQuery>) -> Response {
     };
     let number = q.number.to_string();
     let view_args = ["pr", "view", number.as_str(), "--json", DETAIL_FIELDS];
-    let threads_path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments?per_page=100");
-    let threads_args = ["api", threads_path.as_str()];
+    let number_field = format!("n={number}");
+    let query_field = format!("query={THREADS_QUERY}");
+    let threads_args = [
+        "api",
+        "graphql",
+        "-F",
+        "owner={owner}",
+        "-F",
+        "repo={repo}",
+        "-F",
+        number_field.as_str(),
+        "-f",
+        query_field.as_str(),
+    ];
     let (view, threads) = tokio::join!(gh_json(&dir, &view_args), gh_json(&dir, &threads_args));
     let mut pr = match view {
         Ok(pr) => pr,
         Err(e) => return fail(StatusCode::BAD_GATEWAY, e),
     };
-    let inline: Vec<Value> = threads
+    let threads: Vec<Value> = threads
         .ok()
-        .and_then(|t| t.as_array().cloned())
+        .and_then(|t| t.pointer("/data/repository/pullRequest/reviewThreads/nodes").and_then(Value::as_array).cloned())
         .unwrap_or_default()
         .into_iter()
-        .map(|c| {
+        .map(|t| {
+            let comments: Vec<Value> = t
+                .pointer("/comments/nodes")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| {
+                    json!({
+                        "id": c.get("databaseId"),
+                        "body": c.get("body"),
+                        "author": c.pointer("/author/login"),
+                        "created_at": c.get("createdAt"),
+                        "review_id": c.pointer("/pullRequestReview/id"),
+                    })
+                })
+                .collect();
             json!({
-                "id": c.get("id"),
-                "in_reply_to": c.get("in_reply_to_id"),
-                "path": c.get("path"),
-                "line": c.get("line").filter(|l| !l.is_null()).or(c.get("original_line")),
-                "side": c.get("side"),
-                "outdated": c.get("line").is_none_or(Value::is_null),
-                "body": c.get("body"),
-                "author": c.pointer("/user/login"),
-                "created_at": c.get("created_at"),
-                "url": c.get("html_url"),
+                "id": t.get("id"),
+                "path": t.get("path"),
+                "line": t.get("line").filter(|l| !l.is_null()).or(t.get("originalLine")),
+                "start_line": t.get("startLine").filter(|l| !l.is_null()).or(t.get("originalStartLine")),
+                "side": t.get("diffSide"),
+                "resolved": t.get("isResolved"),
+                "outdated": t.get("isOutdated"),
+                "comments": comments,
             })
         })
         .collect();
     if let Some(obj) = pr.as_object_mut() {
-        obj.insert("inline_comments".to_string(), Value::Array(inline));
+        obj.insert("threads".to_string(), Value::Array(threads));
     }
     Json(pr).into_response()
 }
@@ -215,6 +244,8 @@ struct InlineComment {
     path: String,
     line: u64,
     side: Option<String>,
+    start_line: Option<u64>,
+    start_side: Option<String>,
     body: String,
 }
 
@@ -250,12 +281,18 @@ async fn review(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<
         .iter()
         .filter(|c| !c.body.trim().is_empty())
         .map(|c| {
-            json!({
+            let side = c.side.clone().unwrap_or_else(|| "RIGHT".to_string());
+            let mut comment = json!({
                 "path": c.path,
                 "line": c.line,
-                "side": c.side.clone().unwrap_or_else(|| "RIGHT".to_string()),
+                "side": side,
                 "body": c.body,
-            })
+            });
+            if let Some(start) = c.start_line.filter(|start| *start < c.line) {
+                comment["start_line"] = json!(start);
+                comment["start_side"] = json!(c.start_side.clone().unwrap_or(side));
+            }
+            comment
         })
         .collect();
     let payload = json!({ "event": event, "body": req.body, "comments": comments }).to_string();
@@ -323,6 +360,87 @@ async fn merge(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<M
     }
     match gh(&dir, &args, None).await {
         Ok(_) => Json(json!({ "merged": true })).into_response(),
+        Err(e) => fail(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+const THREADS_QUERY: &str = "query($owner: String!, $repo: String!, $n: Int!) { repository(owner: $owner, name: $repo) { pullRequest(number: $n) { reviewThreads(first: 100) { nodes { id isResolved isOutdated path line originalLine startLine originalStartLine diffSide comments(first: 50) { nodes { databaseId body createdAt author { login } pullRequestReview { id } } } } } } } }";
+
+#[derive(Deserialize)]
+struct ReplyReq {
+    session: String,
+    number: u64,
+    comment_id: u64,
+    body: String,
+}
+
+async fn reply(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ReplyReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.body.trim().is_empty() {
+        return fail(StatusCode::BAD_REQUEST, "the reply is empty");
+    }
+    let dir = match session_dir(&req.session) {
+        Ok(dir) => dir,
+        Err(r) => return r,
+    };
+    let path = format!("repos/{{owner}}/{{repo}}/pulls/{}/comments/{}/replies", req.number, req.comment_id);
+    let payload = json!({ "body": req.body }).to_string();
+    match gh(&dir, &["api", "-X", "POST", &path, "--input", "-"], Some(&payload)).await {
+        Ok(_) => Json(json!({ "posted": true })).into_response(),
+        Err(e) => fail(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ThreadReq {
+    session: String,
+    thread_id: String,
+    resolved: bool,
+}
+
+async fn resolve_thread(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<ThreadReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match session_dir(&req.session) {
+        Ok(dir) => dir,
+        Err(r) => return r,
+    };
+    let mutation = if req.resolved {
+        "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"
+    } else {
+        "mutation($id: ID!) { unresolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }"
+    };
+    let id_field = format!("id={}", req.thread_id);
+    match gh(&dir, &["api", "graphql", "-F", &id_field, "-f", &format!("query={mutation}")], None).await {
+        Ok(_) => Json(json!({ "resolved": req.resolved })).into_response(),
+        Err(e) => fail(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CommitQuery {
+    token: Option<String>,
+    session: String,
+    sha: String,
+}
+
+async fn commit_diff(State(d): State<Shared>, Query(q): Query<CommitQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    if q.sha.is_empty() || !q.sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return fail(StatusCode::BAD_REQUEST, "bad commit id");
+    }
+    let dir = match session_dir(&q.session) {
+        Ok(dir) => dir,
+        Err(r) => return r,
+    };
+    let path = format!("repos/{{owner}}/{{repo}}/commits/{}", q.sha);
+    match gh(&dir, &["api", "-H", "Accept: application/vnd.github.diff", &path], None).await {
+        Ok(text) => Json(json!({ "diff": text })).into_response(),
         Err(e) => fail(StatusCode::BAD_GATEWAY, e),
     }
 }
