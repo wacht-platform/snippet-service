@@ -666,6 +666,8 @@ async fn run_cli_reflection(
     let mut reader = BufReader::new(stdout).lines();
     let mut fork_id: Option<String> = None;
     let mut reads = 0;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut held = false;
     let outcome = loop {
         let mut reply = String::new();
         let read = tokio::time::timeout(std::time::Duration::from_secs(300), async {
@@ -731,12 +733,29 @@ async fn run_cli_reflection(
         {
             reads += 1;
             eprintln!("memory reflection {owner} opened: {}", super::memory_reflection::opened_names(&files));
+            seen.extend(files.iter().map(super::memory_reflection::file_key));
             let next = kind.user_line(&super::memory_reflection::reflection_opened(repos, &files));
             if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
                 break Err(format!("send opened files: {e}"));
             }
             let _ = stdin.flush().await;
             continue;
+        }
+        if !held
+            && let Some(changes) = super::memory_reflection::parse_reflection(&reply)
+        {
+            let unseen = super::memory_reflection::unseen_files(repos, &changes, &seen);
+            if !unseen.is_empty() {
+                held = true;
+                eprintln!("memory reflection {owner} held back, opened: {}", super::memory_reflection::opened_names(&unseen));
+                seen.extend(unseen.iter().map(super::memory_reflection::file_key));
+                let next = kind.user_line(&super::memory_reflection::reflection_held(repos, &unseen));
+                if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
+                    break Err(format!("send opened files: {e}"));
+                }
+                let _ = stdin.flush().await;
+                continue;
+            }
         }
         break Ok(reply);
     };
@@ -844,6 +863,7 @@ impl CodingHarness {
         session: &CliSession,
         bridge_url: &str,
         reflecting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        since: &str,
     ) -> Result<(), String> {
         let repos = self.memory_scopes();
         if repos.is_empty() {
@@ -875,7 +895,7 @@ impl CodingHarness {
         };
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
         let kind = session.kind;
-        let line = kind.user_line(&super::memory_reflection::reflection_instruction(&repos));
+        let line = kind.user_line(&super::memory_reflection::reflection_instruction(&repos, since));
         let source = self
             .session_id()
             .map(|id| format!("snippet://session/{id}"))
@@ -1163,7 +1183,6 @@ impl CodingHarness {
         let reflect_tools = bridge_tools.clone();
         let mut reflect_url: Option<String> = None;
         let reflecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut turn_mark = 0usize;
         let guide = tool_guide(&bridge_tools);
         let steers: SteerQueue = Default::default();
         let served: ServedResults = Default::default();
@@ -1206,7 +1225,6 @@ impl CodingHarness {
             outbox.push(text);
         }
         self.persist(&mut state, &lanes).await?;
-        turn_mark = turn_mark.max(state.events.len());
 
         loop {
             if state.status == HarnessStatus::Running {
@@ -1507,6 +1525,7 @@ impl CodingHarness {
                                 let tokens = |key: &str| meta.and_then(|m| m.get(key)).and_then(Value::as_u64).unwrap_or(0);
                                 let trigger = meta.and_then(|m| m.get("trigger")).and_then(Value::as_str).unwrap_or("auto");
                                 state.compactions += 1;
+                                state.reflected_events = Some(state.events.len());
                                 state.last_prompt_tokens = tokens("post_tokens");
                                 state.events.push(HarnessEvent::SystemDecision {
                                     step: "history_compacted".to_string(),
@@ -1558,6 +1577,7 @@ impl CodingHarness {
                                         });
                                         last_task_note.clear();
                                         state.compactions += 1;
+                                        state.reflected_events = Some(state.events.len());
                                         state.last_prompt_tokens = 0;
                                         state.events.push(HarnessEvent::SystemDecision {
                                             step: "history_compacted".to_string(),
@@ -1585,12 +1605,9 @@ impl CodingHarness {
                                         if self.config.memory_enabled && self.context.lane_origin().is_none() {
                                             self.tidy_memory();
                                         }
-                                        let tool_results = state.events[turn_mark.min(state.events.len())..]
-                                            .iter()
-                                            .filter(|e| matches!(e, HarnessEvent::ToolResult { .. }))
-                                            .count();
+                                        let scope = super::memory_reflection::reflection_scope(&state);
                                         if !once
-                                            && tool_results >= 3
+                                            && let Some(since) = scope
                                             && self.config.memory_enabled
                                             && self.config.memory_reflect
                                             && self.context.lane_origin().is_none()
@@ -1603,12 +1620,15 @@ impl CodingHarness {
                                                 reflect_url = start_refusing_bridge(reflect_tools.clone()).await.ok();
                                             }
                                             let started = match reflect_url.as_deref() {
-                                                Some(url) => self.start_cli_reflection(&profile, &state, &session, url, reflecting.clone()),
+                                                Some(url) => self.start_cli_reflection(&profile, &state, &session, url, reflecting.clone(), &since),
                                                 None => Err("no tool bridge for reflection".to_string()),
                                             };
-                                            if let Err(e) = started {
-                                                reflecting.store(false, std::sync::atomic::Ordering::SeqCst);
-                                                self.debug_log(&format!("memory reflection not started: {e}"));
+                                            match started {
+                                                Ok(()) => state.reflected_events = Some(state.events.len()),
+                                                Err(e) => {
+                                                    reflecting.store(false, std::sync::atomic::Ordering::SeqCst);
+                                                    self.debug_log(&format!("memory reflection not started: {e}"));
+                                                }
                                             }
                                         }
                                         let window = match cli_window {
@@ -1621,7 +1641,6 @@ impl CodingHarness {
                                         }
                                     }
                                 }
-                                turn_mark = state.events.len();
                                 session.mark_synced(state.messages.len());
                                 if state.pending_question.is_some() {
                                     state.status = HarnessStatus::WaitingForInput;
