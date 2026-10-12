@@ -677,6 +677,10 @@ pub struct SessionInfo {
     /// The worktree's branch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The inference profile this session is pinned to, when it isn't on the
+    /// active default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// The inbox session id for an agent: `inbox-<agent-id>`.
@@ -859,6 +863,7 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                 // Read before `row.id` is moved out below — struct-literal
                 // fields evaluate in the order written.
                 worker_agent_id: workers.get(&row.id).cloned(),
+                profile: row.profile.clone().filter(|p| !p.trim().is_empty()),
                 id: row.id,
                 folder: row.workspace,
                 title: row.title.unwrap_or_default(),
@@ -1596,6 +1601,7 @@ pub fn create_blank_session_in(
         agent_id: None,
         // Nor is anyone working in it yet — a dispatch sets this, not creation.
         worker_agent_id: None,
+        profile: None,
     })
 }
 
