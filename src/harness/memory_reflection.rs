@@ -198,13 +198,13 @@ impl CodingHarness {
         &self,
         model: &mut dyn AgentModel,
         state: &HarnessState,
-    ) -> Result<(), ToolError> {
-        if !reflection_due(request_window(state)) {
-            return Ok(());
-        }
+    ) -> Result<bool, ToolError> {
+        let Some(since) = reflection_scope(state) else {
+            return Ok(false);
+        };
         let repos = self.memory_scopes();
         if repos.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let source = self
             .session_id()
@@ -217,7 +217,7 @@ impl CodingHarness {
         let definitions = self.definitions_for(true, goal_active);
         let mut messages = state.messages.clone();
         messages.push(HarnessMessage::User {
-            content: reflection_instruction(&repos),
+            content: reflection_instruction(&repos, &since),
         });
         let mut touched: Vec<String> = Vec::new();
         let mut reads = 0;
@@ -269,7 +269,7 @@ impl CodingHarness {
             self.memory_log("memory reflection: nothing changed");
         }
         commit_reflection(&repos, &touched);
-        Ok(())
+        Ok(true)
     }
 
     fn memory_log(&self, line: &str) {
@@ -278,19 +278,44 @@ impl CodingHarness {
     }
 }
 
-/// Whether a finished request did enough work to be worth reflecting on.
-pub(super) fn reflection_due(window: &[HarnessMessage]) -> bool {
-    window
-        .iter()
-        .filter(|m| matches!(m, HarnessMessage::ToolResult { .. }))
-        .count()
-        >= 3
+/// When enough has happened since memory was last curated (three tool calls or
+/// three user messages), the opening of the first user message in that stretch,
+/// so the reflection knows where its part of the conversation starts.
+pub(super) fn reflection_scope(state: &HarnessState) -> Option<String> {
+    let start = match state.reflected_events {
+        Some(at) => at.min(state.events.len()),
+        None => state
+            .events
+            .iter()
+            .rposition(|e| matches!(e, HarnessEvent::UserInput { .. }))
+            .unwrap_or(0),
+    };
+    let events = &state.events[start..];
+    let tools = events.iter().filter(|e| matches!(e, HarnessEvent::ToolResult { .. })).count();
+    let asks = events.iter().filter(|e| matches!(e, HarnessEvent::UserInput { .. })).count();
+    if tools < 3 && asks < 3 {
+        return None;
+    }
+    Some(
+        events
+            .iter()
+            .find_map(|e| match e {
+                HarnessEvent::UserInput { text } => Some(clip(text.trim(), 160)),
+                _ => None,
+            })
+            .unwrap_or_default(),
+    )
 }
 
 pub(super) const REFLECTION_READS: usize = 2;
 
-pub(super) fn reflection_instruction(repos: &[crate::memory::MemoryRepo]) -> String {
-    format!("{REFLECTION_INSTRUCTION}\n\nMemory now, by each repo's MEMORY.md and index:\n{}", render_indexes(repos))
+pub(super) fn reflection_instruction(repos: &[crate::memory::MemoryRepo], since: &str) -> String {
+    let scope = if since.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nCover everything since memory was last curated: from the user's message that begins \"{since}\" to now, including requests too small to have been reflected on.")
+    };
+    format!("{REFLECTION_INSTRUCTION}{scope}\n\nMemory now, by each repo's MEMORY.md and index:\n{}", render_indexes(repos))
 }
 
 pub(super) fn reflection_opened(repos: &[crate::memory::MemoryRepo], files: &[Value]) -> String {
@@ -450,21 +475,4 @@ fn is_date(text: &str) -> bool {
     chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok()
 }
 
-/// The messages of the request that just ended: from its checkpoint when one
-/// was taken since the last compaction, else from the last user message.
-pub(super) fn request_window(state: &HarnessState) -> &[HarnessMessage] {
-    let start = state
-        .checkpoints
-        .last()
-        .filter(|c| c.compactions == state.compactions && c.message_index <= state.messages.len())
-        .map(|c| c.message_index)
-        .or_else(|| {
-            state
-                .messages
-                .iter()
-                .rposition(|m| matches!(m, HarnessMessage::User { .. }))
-        })
-        .unwrap_or(0);
-    &state.messages[start..]
-}
 

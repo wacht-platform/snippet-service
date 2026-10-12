@@ -452,9 +452,15 @@ impl CodingHarness {
                             && self.config.memory_enabled
                             && self.config.memory_reflect
                             && self.context.owner() == "main"
-                            && let Err(e) = self.reflect_on_request(model, &state).await
                         {
-                            self.debug_log(&format!("memory reflection failed (non-fatal): {e}"));
+                            match self.reflect_on_request(model, &state).await {
+                                Ok(true) => {
+                                    state.reflected_events = Some(state.events.len());
+                                    self.persist(&mut state, &lanes).await?;
+                                }
+                                Ok(false) => {}
+                                Err(e) => self.debug_log(&format!("memory reflection failed (non-fatal): {e}")),
+                            }
                         }
                     }
                     StepResult::ModelError { message, retryable } => {
