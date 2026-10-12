@@ -563,6 +563,7 @@ fn start_session_with_role(
     // Config-derived values, snapshotted here because `config` is a borrow and
     // the session task must be `'static`.
     let workspace = config.workspace.clone();
+    crate::harness::ensure_snippet_gitignored(&workspace);
     let model_config = config.model.clone();
     let setups = config.setups.clone();
     let exa_api_key = config.exa_api_key.clone();
