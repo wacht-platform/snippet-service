@@ -90,12 +90,14 @@ impl CodingHarness {
                 )
             }
             "present_file" => {
-                let path = arguments
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let Some(path) = path else {
+                let text = |key: &str| {
+                    arguments
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                };
+                let Some(path) = text("path") else {
                     return (
                         tool_error("present_file requires a `path`."),
                         MetaControl::Continue,
@@ -106,31 +108,100 @@ impl CodingHarness {
                 } else {
                     self.context.workspace_root().join(path)
                 };
-                // Only real files get presented — a hallucinated or not-yet-written
-                // path fails loudly so the agent writes the file first.
-                if !resolved.is_file() {
+                if !resolved.exists() {
                     return (
                         tool_error(format!(
-                            "present_file: `{path}` does not exist — write the file before presenting it."
+                            "present_file: `{path}` does not exist — write it before presenting it."
                         )),
                         MetaControl::Continue,
                     );
                 }
-                let caption = arguments
-                    .get("caption")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string);
+                let caption = text("caption").map(str::to_string);
+                let title = text("title");
+                let artifact_id = text("artifact_id");
                 let shown = resolved.display().to_string();
+                if title.is_some() || artifact_id.is_some() || resolved.is_dir() {
+                    let Some(session) = self.session_id() else {
+                        return (
+                            tool_error("present_file: artifacts need a saved session."),
+                            MetaControl::Continue,
+                        );
+                    };
+                    let title = title.or_else(|| {
+                        resolved
+                            .is_dir()
+                            .then(|| resolved.file_name().and_then(|n| n.to_str()))
+                            .flatten()
+                    });
+                    return match crate::artifacts::present(
+                        &session,
+                        &resolved,
+                        title,
+                        artifact_id,
+                        caption.clone(),
+                    ) {
+                        Ok(presented) if presented.unchanged => (
+                            json!({"schema_version": 1, "status": "success", "data": {
+                                "artifact_id": presented.artifact.id,
+                                "version": presented.version,
+                                "note": "unchanged since the version the user already has, so nothing new was shown",
+                            }}),
+                            MetaControl::Continue,
+                        ),
+                        Ok(presented) => {
+                            state.events.push(HarnessEvent::ArtifactPresented {
+                                id: presented.artifact.id.clone(),
+                                version: presented.version,
+                                title: presented.artifact.title.clone(),
+                                artifact_kind: presented.artifact.kind.clone(),
+                                caption,
+                                path: shown,
+                            });
+                            (
+                                json!({"schema_version": 1, "status": "success", "data": {
+                                    "artifact_id": presented.artifact.id,
+                                    "version": presented.version,
+                                    "note": "shown to the user as an artifact; present again with this artifact_id to add a version",
+                                }}),
+                                MetaControl::Continue,
+                            )
+                        }
+                        Err(error) => (tool_error(format!("present_file: {error}")), MetaControl::Continue),
+                    };
+                }
+                let turn_start = state
+                    .events
+                    .iter()
+                    .rposition(|e| matches!(e, HarnessEvent::UserInput { .. }))
+                    .unwrap_or(0);
+                let turn = &state.events[turn_start..];
+                if turn.iter().any(|e| matches!(e, HarnessEvent::FilePresented { path, .. } if *path == shown)) {
+                    return (
+                        json!({"schema_version": 1, "status": "success", "data": {
+                            "presented": shown,
+                            "note": "already shown to the user this turn",
+                        }}),
+                        MetaControl::Continue,
+                    );
+                }
+                let shared = turn
+                    .iter()
+                    .filter(|e| matches!(e, HarnessEvent::FilePresented { .. }))
+                    .count()
+                    + 1;
                 state.events.push(HarnessEvent::FilePresented {
                     path: shown.clone(),
                     caption,
                 });
+                let note = if shared >= 10 {
+                    format!("shown to the user; that's {shared} files this turn. For a batch, write them into one folder and present the folder: it becomes one collection with a download-all")
+                } else {
+                    "shown to the user as a file they can open or download; continue your turn as usual".to_string()
+                };
                 (
                     json!({"schema_version": 1, "status": "success", "data": {
                         "presented": shown,
-                        "note": "shown to the user as an openable file card; continue your turn as usual",
+                        "note": note,
                     }}),
                     MetaControl::Continue,
                 )

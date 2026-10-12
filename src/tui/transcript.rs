@@ -395,6 +395,7 @@ fn turn_has_visible_action(events: &[HarnessEvent]) -> bool {
             | HarnessEvent::InvalidToolCall { .. }
             | HarnessEvent::PlanUpdated { .. }
             | HarnessEvent::FilePresented { .. }
+            | HarnessEvent::ArtifactPresented { .. }
             | HarnessEvent::UserQuestion { .. }
             | HarnessEvent::ApprovalRequest { .. }
             | HarnessEvent::LaneSpawned { .. }
@@ -478,6 +479,17 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
         HarnessEvent::FilePresented { path, caption } => {
             present_file_lines(path, caption.as_deref(), width)
         }
+        HarnessEvent::ArtifactPresented {
+            title, version, caption, ..
+        } => marker_block(
+            "◆",
+            accent(),
+            &match caption.as_deref() {
+                Some(caption) => format!("{title} · v{version}\n{caption}"),
+                None => format!("{title} · v{version}"),
+            },
+            width,
+        ),
         // Work routed on this session's behalf by someone else (usually the
         // user). A quiet aside: it is already dispatched, so it is a record of
         // what went out, not a decision to make.
