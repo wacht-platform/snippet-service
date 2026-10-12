@@ -610,7 +610,7 @@ fn session_root() -> PathBuf {
     crate::config::snippet_home().join("session-memory")
 }
 
-fn session_dir_name(session_id: &str) -> String {
+pub(crate) fn session_dir_name(session_id: &str) -> String {
     session_id
         .chars()
         .map(|c| match c {
