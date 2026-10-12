@@ -616,7 +616,7 @@ async fn commit(
 }
 
 /// Sniff an image MIME type from the leading magic bytes.
-fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         Some("image/png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
