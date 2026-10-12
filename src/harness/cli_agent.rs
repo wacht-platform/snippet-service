@@ -670,6 +670,7 @@ async fn run_cli_reflection(
             && let Some(files) = super::memory_reflection::parse_reflection_read(&reply)
         {
             reads += 1;
+            eprintln!("memory reflection {owner} opened: {}", super::memory_reflection::opened_names(&files));
             let next = kind.user_line(&super::memory_reflection::reflection_opened(repos, &files));
             if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
                 break Err(format!("send opened files: {e}"));
