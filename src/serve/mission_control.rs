@@ -342,6 +342,9 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
     if let Some(waiting) = wait_for_worker(d, task_id, &now)? {
         return Ok(waiting);
     }
+    if let Some(waiting) = wait_for_idle_switch(d, task_id).await? {
+        return Ok(waiting);
+    }
     let task = d
         .store
         .claim_task_for_dispatch(task_id, &now)
@@ -512,7 +515,17 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         },
         task.id,
     );
-    if let Some(profile) = task.profile.as_deref() {
+    let switch_to = match task.profile.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(profile) => {
+            let sessions = d.sessions.lock().await;
+            let same = sessions
+                .get(&session_id)
+                .is_some_and(|live| live.profile.as_deref().map(str::trim) == Some(profile.trim()));
+            (!same).then_some(profile)
+        }
+        None => None,
+    };
+    if let Some(profile) = switch_to {
         if let Err(error) = d.run_session_on_profile(&session_id, profile, false).await {
             release_failed_claim(d, &task, &error)?;
             return Err(error);
@@ -771,6 +784,31 @@ fn wait_for_worker(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>,
         .update_task_in(task_id, now, |task| task.notify_once("blocked", &reason))
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+async fn wait_for_idle_switch(d: &Daemon, task_id: &str) -> Result<Option<Task>, String> {
+    let Some(task) = d.store.get_task(task_id).map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let Some(profile) = task.profile.as_deref().filter(|p| !p.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let same = {
+        let sessions = d.sessions.lock().await;
+        match sessions.get(&task.session_id) {
+            Some(live) => live.profile.as_deref().map(str::trim) == Some(profile.trim()),
+            None => return Ok(None),
+        }
+    };
+    if same {
+        return Ok(None);
+    }
+    let busy = crate::session::state_path_for_id(&task.session_id)
+        .and_then(|path| crate::session::read_session_state(&path))
+        .is_some_and(|state| {
+            matches!(state.status, crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)
+        });
+    Ok(busy.then_some(task))
 }
 
 fn release_failed_claim(d: &Daemon, task: &Task, error: &str) -> Result<(), String> {
