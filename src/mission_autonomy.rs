@@ -285,7 +285,7 @@ fn next_wake_status(state: &AutonomyState) -> String {
                 .unwrap_or_default();
             format!(" Your next wake-up is set for {at} (the user's time): {}.", f.note)
         }
-        None => " You have no next wake-up set: set one with schedule_followup (next_wake) before you end this turn.".to_string(),
+        None => " You have no next wake-up set: set one with schedule_wake (next_wake) before you end this turn.".to_string(),
     }
 }
 
@@ -300,7 +300,7 @@ fn mode_status() -> String {
     let state = load();
     let settings = &state.settings;
     if !settings.on {
-        return "Autonomous mode is off. The user is driving: answer them in your replies, use ask_user for a question, and act on what they ask and on the reports that arrive.".to_string();
+        return "Automated wakes are off. The user is driving: answer them in your replies, use ask_user for a question, and act on what they ask and on the reports that arrive.".to_string();
     }
     let quiet = match (&settings.quiet_start, &settings.quiet_end) {
         (Some(start), Some(end)) => format!(
@@ -311,7 +311,7 @@ fn mode_status() -> String {
         _ => String::new(),
     };
     format!(
-        "Autonomous mode is on: rounds every {} minutes{quiet}.{} The user may be away and doesn't watch this chat: reach them with ping_user to keep working while they think, or ask_user when nothing worthwhile can move without their answer (it blocks you and your rounds until they reply). When they message you directly they are here, so answer in your reply as usual.",
+        "Automated wakes are on: you're woken every {} minutes{quiet}.{} The user may be away and doesn't watch this chat: reach them with ping_user to keep working while they think, or ask_user when nothing worthwhile can move without their answer (it blocks you and your wakes until they reply). When they message you directly they are here, so answer in your reply as usual.",
         settings.round_minutes,
         next_wake_status(&state)
     )
