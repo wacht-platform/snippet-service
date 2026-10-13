@@ -488,6 +488,10 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             display,
             ..
         } => {
+            let inline = artifact_inline(artifact_kind, path, *version, display.as_deref(), width);
+            if !inline.is_empty() {
+                return inline;
+            }
             let mut lines = marker_block(
                 "◆",
                 accent(),
@@ -497,7 +501,7 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
                 },
                 width,
             );
-            lines.extend(artifact_preview(artifact_kind, path, *version, display.as_deref(), width));
+            lines.extend(artifact_link(artifact_kind, path));
             lines
         }
         // Work routed on this session's behalf by someone else (usually the
@@ -1160,8 +1164,6 @@ pub(super) fn tool_call_preview(
 }
 
 
-const ARTIFACT_PREVIEW_LINES: usize = 20;
-
 fn artifact_text(path: &str, version: u32) -> Option<String> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>> =
         std::sync::OnceLock::new();
@@ -1185,7 +1187,7 @@ fn csv_as_markdown(text: &str) -> String {
     let rows: Vec<Vec<String>> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .take(13)
+        .take(201)
         .map(|l| l.split(sep).map(|c| c.trim().trim_matches('"').replace('|', "/")).collect())
         .collect();
     let Some(head) = rows.first() else { return String::new() };
@@ -1196,50 +1198,46 @@ fn csv_as_markdown(text: &str) -> String {
     out
 }
 
-fn artifact_preview(kind: &str, path: &str, version: u32, display: Option<&str>, width: usize) -> Vec<Line<'static>> {
-    let link = || {
-        let url = format!("file://{}", path.replace(' ', "%20"));
-        vec![Line::from(vec![
-            Span::raw(" ".repeat(AGENT)),
-            Span::styled("open ", Style::default().fg(muted())),
-            Span::styled(url, Style::default().fg(faint()).add_modifier(Modifier::UNDERLINED)),
-        ])]
-    };
+fn artifact_link(kind: &str, path: &str) -> Vec<Line<'static>> {
+    if !matches!(kind, "html" | "svg" | "image" | "pdf") {
+        return Vec::new();
+    }
+    let url = format!("file://{}", path.replace(' ', "%20"));
+    vec![Line::from(vec![
+        Span::raw(" ".repeat(AGENT)),
+        Span::styled("open ", Style::default().fg(muted())),
+        Span::styled(url, Style::default().fg(faint()).add_modifier(Modifier::UNDERLINED)),
+    ])]
+}
+
+fn artifact_inline(kind: &str, path: &str, version: u32, display: Option<&str>, width: usize) -> Vec<Line<'static>> {
     let inline = match display {
         Some("inline") => true,
         Some(_) => false,
-        None => matches!(kind, "markdown" | "csv" | "image"),
+        None => matches!(kind, "markdown" | "csv"),
     };
-    let text_kind = matches!(kind, "markdown" | "csv" | "code");
-    if !inline || !text_kind {
-        return if matches!(kind, "html" | "svg" | "image" | "pdf") { link() } else { Vec::new() };
+    if !inline || !matches!(kind, "markdown" | "csv" | "code") {
+        return Vec::new();
     }
-    let Some(text) = artifact_text(path, version) else { return link() };
+    let Some(text) = artifact_text(path, version) else { return Vec::new() };
     let source = match kind {
         "markdown" => text,
         "csv" => csv_as_markdown(&text),
         _ => {
             let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
-            let body: Vec<&str> = text.lines().take(ARTIFACT_PREVIEW_LINES * 2).collect();
-            format!("```{ext}\n{}\n```", body.join("\n"))
+            format!("```{ext}\n{}\n```", text.trim_end())
         }
     };
-    let mut rendered = render_prose(&source, width.saturating_sub(AGENT + 2));
+    let mut rendered = render_prose(&source, width.saturating_sub(AGENT));
     while rendered.last().is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())) {
         rendered.pop();
     }
-    let more = rendered.len() > ARTIFACT_PREVIEW_LINES;
-    let mut lines: Vec<Line<'static>> = rendered
+    rendered
         .into_iter()
-        .take(ARTIFACT_PREVIEW_LINES)
         .map(|l| {
-            let mut spans = vec![Span::raw(" ".repeat(AGENT)), Span::styled("│ ", Style::default().fg(faint()))];
+            let mut spans = vec![Span::raw(" ".repeat(AGENT))];
             spans.extend(l.spans);
             Line::from(spans)
         })
-        .collect();
-    if more {
-        lines.extend(link());
-    }
-    lines
+        .collect()
 }
