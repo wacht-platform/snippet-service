@@ -147,6 +147,10 @@ pub fn prepare_home(key: &str, mcp_url: &str, prompt: &str) -> Result<PathBuf, S
     write_if_changed(&gemini.join("antigravity-cli/settings.json"), &settings)?;
 
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = match exe.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => exe,
+    };
     write_if_changed(&plugin.join("plugin.json"), &json!({"name": "snippet"}))?;
     write_if_changed(
         &plugin.join("mcp_config.json"),

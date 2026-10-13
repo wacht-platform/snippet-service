@@ -740,7 +740,9 @@ impl Store {
             task.reporting_session = None;
             task.completed_at = None;
             task.result = None;
-            task.notifications.retain(|n| n.kind != "stalled");
+            task.notifications.retain(|n| {
+                !matches!(n.kind.as_str(), "stalled" | "offer_stuck" | "offer_unclaimed") && !n.target.starts_with("offer:")
+            });
         })?;
         if let Some(status) = refused {
             return Err(StoreError::NotRetryable {

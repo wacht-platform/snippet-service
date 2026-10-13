@@ -608,7 +608,12 @@ fn await_claim(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, Str
         return Ok(None);
     }
     let marker = crate::coordination::offer_marker(&agent);
-    if let Some(offered_at) = task.notifications.iter().find(|n| n.target == marker).map(|n| n.message.clone()) {
+    if let Some(offered_at) = task
+        .notifications
+        .iter()
+        .find(|n| n.target == marker && n.kind == "offered")
+        .map(|n| n.message.clone())
+    {
         if let Some(error) = inbox_failure_since(&agent, &offered_at) {
             let note = format!(
                 "The offer to {agent} is stuck: its inbox can't run ({error}). Offer the task to another agent (assign_task_agent, then retry_mission_task), or wait until it recovers."
@@ -620,8 +625,54 @@ fn await_claim(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, Str
                     .map(Some)
                     .map_err(|error| error.to_string());
             }
+            return Ok(Some(task));
         }
-        return Ok(Some(task));
+        if secs_between(&offered_at, now) < OFFER_RESEND_SECS || inbox_busy(&agent) {
+            return Ok(Some(task));
+        }
+        let resent = task
+            .notifications
+            .iter()
+            .filter(|n| n.target == marker && n.kind == "offer_resent")
+            .count();
+        if resent >= OFFER_RESENDS {
+            if task.notifications.iter().any(|n| n.kind == "offer_unclaimed") {
+                return Ok(Some(task));
+            }
+            let note = format!(
+                "{agent} hasn't claimed or declined this task after {} offers. Ask it directly (send_agent_message), offer it to another agent (assign_task_agent, then retry_mission_task), or tell the user.",
+                resent + 1
+            );
+            return d
+                .store
+                .update_task_in(task_id, now, |t| t.notify_once("offer_unclaimed", &note))
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+        d.store
+            .send_direct_message(
+                ("agent", mission_control::SESSION_ID),
+                ("agent", &agent),
+                &task_offer_body(&task),
+                &uuid::Uuid::new_v4().to_string(),
+                now,
+            )
+            .map_err(|error| error.to_string())?;
+        return d
+            .store
+            .update_task_in(task_id, now, |t| {
+                if let Some(m) = t.notifications.iter_mut().find(|n| n.target == marker && n.kind == "offered") {
+                    m.message = now.to_string();
+                }
+                t.notifications.push(crate::coordination::NotificationMarker {
+                    target: marker.clone(),
+                    kind: "offer_resent".into(),
+                    message: now.to_string(),
+                    delivered: true,
+                });
+            })
+            .map(Some)
+            .map_err(|error| error.to_string());
     }
     d.store
         .send_direct_message(
@@ -643,6 +694,24 @@ fn await_claim(d: &Daemon, task_id: &str, now: &str) -> Result<Option<Task>, Str
         })
         .map(Some)
         .map_err(|error| error.to_string())
+}
+
+const OFFER_RESEND_SECS: i64 = 600;
+const OFFER_RESENDS: usize = 2;
+
+fn secs_between(from: &str, to: &str) -> i64 {
+    match (chrono::DateTime::parse_from_rfc3339(from), chrono::DateTime::parse_from_rfc3339(to)) {
+        (Ok(a), Ok(b)) => (b - a).num_seconds(),
+        _ => 0,
+    }
+}
+
+fn inbox_busy(agent: &str) -> bool {
+    crate::session::state_path_for_id(&crate::session::inbox_session_id(agent))
+        .and_then(|path| crate::session::read_session_state(&path))
+        .is_some_and(|state| {
+            matches!(state.status, crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)
+        })
 }
 
 /// The model error an agent's inbox ended on after `since`, if its last turn failed.
