@@ -56,23 +56,56 @@ async fn list(State(d): State<Shared>, Query(q): Query<ListQuery>) -> Response {
     Json(json!({ "artifacts": artifacts })).into_response()
 }
 
-async fn serve(State(d): State<Shared>, AxPath((exp, sig, rest)): AxPath<(i64, String, String)>) -> Response {
+async fn serve(
+    State(d): State<Shared>,
+    AxPath((exp, sig, rest)): AxPath<(i64, String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let Some(path) = crate::artifacts::resolve_signed(&d.token, exp, &sig, &rest) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, crate::artifacts::content_type(&path)),
-                (header::CONTENT_SECURITY_POLICY, crate::artifacts::CSP),
-                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-                (header::REFERRER_POLICY, "no-referrer"),
-                (header::CACHE_CONTROL, "private, max-age=300"),
-            ],
-            bytes,
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let len = bytes.len() as u64;
+    let common = [
+        (header::CONTENT_TYPE, crate::artifacts::content_type(&path)),
+        (header::CONTENT_SECURITY_POLICY, crate::artifacts::CSP),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (header::CACHE_CONTROL, "private, max-age=300"),
+        (header::ACCEPT_RANGES, "bytes"),
+    ];
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().strip_prefix("bytes="))
+        .and_then(|spec| {
+            let (a, b) = spec.split(',').next()?.split_once('-')?;
+            let (a, b) = (a.trim(), b.trim());
+            if a.is_empty() {
+                let suffix: u64 = b.parse().ok()?;
+                (suffix > 0).then(|| (len.saturating_sub(suffix), len.saturating_sub(1)))
+            } else {
+                let start: u64 = a.parse().ok()?;
+                let end = if b.is_empty() { len.saturating_sub(1) } else { b.parse::<u64>().ok()?.min(len.saturating_sub(1)) };
+                Some((start, end))
+            }
+        });
+    match range {
+        Some((start, end)) if len > 0 && start <= end && start < len => (
+            StatusCode::PARTIAL_CONTENT,
+            common,
+            [(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))],
+            bytes[start as usize..=end as usize].to_vec(),
         )
             .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Some(_) => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+        )
+            .into_response(),
+        None => (common, bytes).into_response(),
     }
 }
 
