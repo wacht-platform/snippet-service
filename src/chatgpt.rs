@@ -95,6 +95,7 @@ pub struct ChatGptConfig {
     pub max_retries: u32,
     pub initial_retry_ms: u64,
     pub max_retry_ms: u64,
+    pub session_id: Option<String>,
 }
 
 pub struct ChatGptModel {
@@ -108,10 +109,14 @@ pub struct ChatGptModel {
 impl ChatGptModel {
     pub fn new(config: ChatGptConfig) -> Self {
         Self {
-            config,
             client: crate::llm::model_http_client(Some(CODEX_USER_AGENT)),
             tokens: chatgpt_auth::load_blocking(),
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: config
+                .session_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            config,
         }
     }
 
@@ -166,7 +171,10 @@ impl AgentModel for ChatGptModel {
         // Confirm we have a (fresh) token before building the request.
         self.ensure_fresh().await?;
 
-        let body = build_responses_request(&self.config, messages, tools, force_tool);
+        let mut body = build_responses_request(&self.config, messages, tools, force_tool);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("prompt_cache_key".to_string(), json!(self.session_id));
+        }
         let max_attempts = self.config.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
         let mut fatal = false;
@@ -691,6 +699,7 @@ mod tests {
 
     fn test_config() -> ChatGptConfig {
         ChatGptConfig {
+            session_id: None,
             model: "test-model".to_string(),
             reasoning_effort: None,
             supports_images: false,

@@ -606,7 +606,7 @@ fn image_block(path: &str) -> Option<(&'static str, String)> {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
-    let mime = crate::builtins::fs::sniff_image_mime(&bytes)?;
+    let (mime, bytes) = crate::builtins::fs::image_for_model(&bytes)?;
     Some((mime, base64::engine::general_purpose::STANDARD.encode(&bytes)))
 }
 

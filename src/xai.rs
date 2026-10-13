@@ -128,6 +128,9 @@ impl AgentModel for XaiModel {
             if stream {
                 request = request.header(reqwest::header::ACCEPT, "text/event-stream");
             }
+            if let Some(conv) = self.config.inner.session_id.as_deref().filter(|id| !id.trim().is_empty()) {
+                request = request.header("x-grok-conv-id", conv);
+            }
 
             match request.send().await {
                 Ok(response) => {
