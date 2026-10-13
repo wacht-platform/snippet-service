@@ -10,6 +10,7 @@ keywords = ["agent", "tui", "coding", "llm", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"

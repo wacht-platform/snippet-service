@@ -56,6 +56,42 @@ impl Tool for ViewImageTool {
     }
 }
 
+const MODEL_IMAGE_MAX_PIXELS: u64 = 800_000;
+const MODEL_IMAGE_MAX_EDGE: u32 = 1568;
+
+pub fn image_for_model(bytes: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+    let mime = sniff_image_mime(bytes)?;
+    let Ok(img) = image::load_from_memory(bytes) else {
+        return Some((mime, bytes.to_vec()));
+    };
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let pixels = w as u64 * h as u64;
+    let by_pixels = ((MODEL_IMAGE_MAX_PIXELS as f64) / pixels as f64).sqrt();
+    let by_edge = MODEL_IMAGE_MAX_EDGE as f64 / w.max(h) as f64;
+    let scale = by_pixels.min(by_edge);
+    if scale >= 1.0 && mime != "image/webp" {
+        return Some((mime, bytes.to_vec()));
+    }
+    let scale = scale.min(1.0);
+    let (nw, nh) = (((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1));
+    let small = img.resize_exact(nw, nh, image::imageops::FilterType::Triangle);
+    let mut out = std::io::Cursor::new(Vec::new());
+    let (format, out_mime) = if mime == "image/jpeg" {
+        (image::ImageFormat::Jpeg, "image/jpeg")
+    } else {
+        (image::ImageFormat::Png, "image/png")
+    };
+    let encoded = if format == image::ImageFormat::Jpeg {
+        image::DynamicImage::ImageRgb8(small.to_rgb8()).write_to(&mut out, format)
+    } else {
+        small.write_to(&mut out, format)
+    };
+    match encoded {
+        Ok(()) => Some((out_mime, out.into_inner())),
+        Err(_) => Some((mime, bytes.to_vec())),
+    }
+}
+
 pub struct ChangeFilesTool;
 
 /// Repair the shapes models commonly send instead of the schema: `changes`
