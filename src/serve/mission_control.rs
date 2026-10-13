@@ -1259,6 +1259,7 @@ fn autonomy_view() -> serde_json::Value {
         "last_round_summary": state.last_round_summary,
         "next_round_at": crate::mission_autonomy::next_round_at(&state),
         "followups": state.followups,
+        "wakes": state.followups,
         "held_pings": state.held_pings.len(),
         "pings_sent": state.pings_sent,
         "has_brief": !crate::mission_autonomy::read_brief().trim().is_empty(),

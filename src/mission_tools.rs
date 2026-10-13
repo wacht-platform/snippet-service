@@ -206,7 +206,7 @@ impl Tool for UpdateBrief {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "update_brief".into(),
-            description: "Read or rewrite your standing brief: the durable memory you keep across rounds and long conversations. Keep it current and compact (markdown): the user's goals and priorities, how they like to work, decisions they made, open threads, and what you are watching for. Omit content to read it; pass content to replace it whole.".into(),
+            description: "Read or rewrite your standing brief: the durable memory you keep across wakes and long conversations. Keep it current and compact (markdown): the user's goals and priorities, how they like to work, decisions they made, open threads, and what you are watching for. Omit content to read it; pass content to replace it whole.".into(),
             input_schema: schema(json!({"content": {"type": "string", "description": "The full new brief. Omit to read the current one."}}), &[]),
         }
     }
@@ -235,8 +235,8 @@ pub struct ScheduleFollowup;
 impl Tool for ScheduleFollowup {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
-            name: "schedule_followup".into(),
-            description: "Be woken at a time: a deploy window, a check you promised the user, a job that won't report on its own, the morning after quiet hours. You get a round with this note when it's due. Running tasks report by themselves, so their progress needs no wake-up. next_wake marks your one general next look, replacing the previous one.".into(),
+            name: "schedule_wake".into(),
+            description: "Be woken at a time: a deploy window, a check you promised the user, a job that won't report on its own, the morning after quiet hours. You're woken with this note when it's due. Running tasks report by themselves, so their progress needs no wake-up. next_wake marks your one general next look, replacing the previous one.".into(),
             input_schema: schema(json!({
                 "in_minutes": {"type": "integer", "description": "How many minutes from now (1 to 10080)."},
                 "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."},
@@ -247,7 +247,7 @@ impl Tool for ScheduleFollowup {
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ScheduleFollowupArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         if args.note.trim().is_empty() {
-            return Err(ToolError::msg("note must say what to do when the follow-up is due"));
+            return Err(ToolError::msg("note must say what to do when the wake-up is due"));
         }
         let minutes = args.in_minutes.clamp(1, 10080);
         let due_at = chrono::Utc::now().timestamp() + minutes * 60;
@@ -257,7 +257,7 @@ impl Tool for ScheduleFollowup {
             "scheduled": true,
             "id": followup.id,
             "in_minutes": minutes,
-            "note": if on { "You'll get a round with this note when it's due." } else { "Saved, but autonomous mode is off: it fires only once the user switches autonomy on." },
+            "note": if on { "You'll be woken with this note when it's due." } else { "Saved, but automated wakes are off: it fires only once the user turns them on." },
         })))
     }
 }
