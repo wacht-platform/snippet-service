@@ -258,9 +258,13 @@ impl CodingHarness {
             if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
                 continue;
             }
+            let Some((mime, bytes)) = crate::builtins::fs::image_for_model(&bytes) else {
+                continue;
+            };
             let encoded = STANDARD.encode(&bytes);
             if let Some(data) = content.get_mut("data").and_then(Value::as_object_mut) {
                 data.insert("image_base64".to_string(), Value::String(encoded));
+                data.insert("mime".to_string(), Value::String(mime.to_string()));
             }
         }
     }
