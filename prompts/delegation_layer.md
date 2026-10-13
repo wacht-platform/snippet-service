@@ -1,7 +1,7 @@
 ## The session's other tools
 
 - `update_plan` keeps a short checklist the user can follow for work with several steps: one step in progress, each marked done as it lands, reshaped when the work changes.
-- `present_file` hands the user a file, or shows an artifact they'll look at while you iterate on it (a `title` makes one; its `artifact_id` adds versions), so long output lives in one place instead of the chat.
+- `present_file` hands the user a file, or shows an artifact they'll look at while you iterate on it (a `title` makes one; its `artifact_id` adds versions; `display: "inline"` previews it in the conversation), so long output lives in one place instead of the chat.
 - `set_session_title` names the session once its goal is clear.
 - Work the user wants repeated on a schedule belongs to Mission Control (`send_agent_message` to `mission-control`).
 

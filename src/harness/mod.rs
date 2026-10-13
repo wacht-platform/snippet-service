@@ -176,6 +176,10 @@ pub enum HarnessEvent {
         artifact_kind: String,
         caption: Option<String>,
         path: String,
+        /// "inline" previews it in the conversation, "card" keeps it a row.
+        /// None leaves the choice to the client's default for the kind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
     },
     /// A runtime-injected correction after recoverable failures.
     SystemDecision {
