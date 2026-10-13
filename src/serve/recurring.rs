@@ -88,7 +88,7 @@ pub async fn tick_loop(daemon: Shared) {
 
 /// Wait for a scheduled run to finish and send its outcome to Mission Control,
 /// so it learns how the run went from a report rather than by reading the
-/// session. Only while autonomous mode is on: otherwise nobody acts on it.
+/// session. Only while automated wakes are on: otherwise nobody acts on it.
 async fn report_run_to_mission_control(daemon: Shared, title: String, session_id: String, seen: usize) {
     let Some(sp) = state_path_for_id(&session_id) else { return };
     for _ in 0..(4 * 60 * 3) {

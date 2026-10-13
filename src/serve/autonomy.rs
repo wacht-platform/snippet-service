@@ -256,11 +256,11 @@ fn round_envelope(
     now: i64,
 ) -> String {
     let since = state.last_round_at;
-    let mut out = String::from("[autonomous_round]\n");
+    let mut out = String::from("[automated_wake]\n");
     out.push_str(&format!(
-        "time: {}\nlast round: {}\n",
+        "time: {}\nlast wake: {}\n",
         mission_autonomy::user_now(&state.settings).format("%a %d %b %H:%M (UTC%:z, the user's time)"),
-        if since == 0 { "never (autonomous mode was just switched on)".to_string() } else { ago(now - since) }
+        if since == 0 { "never (automated wakes were just switched on)".to_string() } else { ago(now - since) }
     ));
     if mission_autonomy::in_quiet_hours(&state.settings) {
         out.push_str("quiet hours: yes — non-urgent pings are held until morning\n");
@@ -272,7 +272,7 @@ fn round_envelope(
         .take(20)
         .map(|t| format!("- {} · {} · {}", t.status, t.title, t.id))
         .collect();
-    out.push_str("\n## Changed since last round\n");
+    out.push_str("\n## Changed since last wake\n");
     out.push_str(if changed.is_empty() { "nothing" } else { "" });
     out.push_str(&changed.join("\n"));
 
@@ -305,7 +305,7 @@ fn round_envelope(
     out.push_str(&open.join("\n"));
 
     if !due.is_empty() {
-        out.push_str("\n\n## Follow-ups due now\n");
+        out.push_str("\n\n## Wake-ups due now\n");
         for f in due {
             out.push_str(&format!("- {}\n", f.note));
         }
@@ -316,7 +316,7 @@ fn round_envelope(
         .filter(|f| !due.iter().any(|d| d.id == f.id))
         .collect();
     if !upcoming.is_empty() {
-        out.push_str("\n\n## Follow-ups scheduled\n");
+        out.push_str("\n\n## Wake-ups scheduled\n");
         for f in upcoming.into_iter().take(10) {
             out.push_str(&format!("- in {} min: {}\n", ((f.due_at - now) / 60).max(0), f.note));
         }
@@ -350,7 +350,7 @@ fn round_envelope(
     } else {
         brief.trim()
     });
-    out.push_str("\n[/autonomous_round]\nWorkflow W4 · round: act, wait or ask, then stop. Running and waiting tasks report on their own: don't inspect them, read their logs or schedule a check for them. A round where you only waited needs no reply.");
+    out.push_str("\n[/automated_wake]\nWorkflow W4 · wake: act, wait or ask, then stop. Running and waiting tasks report on their own: don't inspect them, read their logs or schedule a check for them. A wake where you only waited needs no reply.");
     out
 }
 
@@ -362,10 +362,10 @@ fn round_summary(
     let open = tasks.iter().filter(|t| !t.status.is_terminal()).count();
     let mut parts = vec![format!("{open} open task{}", if open == 1 { "" } else { "s" })];
     if !due.is_empty() {
-        parts.push(format!("{} follow-up{} due", due.len(), if due.len() == 1 { "" } else { "s" }));
+        parts.push(format!("{} wake-up{} due", due.len(), if due.len() == 1 { "" } else { "s" }));
     }
     if state.last_round_at == 0 {
-        parts.insert(0, "autonomy switched on".to_string());
+        parts.insert(0, "automated wakes switched on".to_string());
     }
     parts.join(" · ")
 }
