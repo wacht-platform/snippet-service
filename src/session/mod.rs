@@ -557,6 +557,7 @@ fn start_session_with_role(
             // wants that layer, and it is the reason the environment layer is
             // dropped from its prompt.
             coordination: false,
+            images: model.supports_images(),
         };
         let runtime = AgentRuntime::resolve(
             session,
