@@ -148,6 +148,7 @@ impl CodingHarness {
                                 "artifact_id": presented.artifact.id,
                                 "version": presented.version,
                                 "note": "unchanged since the version the user already has, so nothing new was shown",
+                                "broken_references": presented.broken,
                             }}),
                             MetaControl::Continue,
                         ),
@@ -165,6 +166,11 @@ impl CodingHarness {
                                 json!({"schema_version": 1, "status": "success", "data": {
                                     "artifact_id": presented.artifact.id,
                                     "version": presented.version,
+                                    "bundled": presented.bundled,
+                                    "broken_references": presented.broken,
+                                    "check": if presented.broken.is_empty() { serde_json::Value::Null } else {
+                                        json!("Some files this page uses can't load from the artifact. Fix each broken reference and present it again with this artifact_id.")
+                                    },
                                     "note": match display.as_deref() {
                                         Some("inline") => "rendered inline in the conversation; present again with this artifact_id to add a version",
                                         _ => "shown to the user as an artifact; present again with this artifact_id to add a version",
