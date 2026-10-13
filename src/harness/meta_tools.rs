@@ -117,6 +117,9 @@ impl CodingHarness {
                     );
                 }
                 let caption = text("caption").map(str::to_string);
+                let display = text("display")
+                    .map(str::to_ascii_lowercase)
+                    .filter(|d| d == "inline" || d == "card");
                 let title = text("title");
                 let artifact_id = text("artifact_id");
                 let shown = resolved.display().to_string();
@@ -156,12 +159,16 @@ impl CodingHarness {
                                 artifact_kind: presented.artifact.kind.clone(),
                                 caption,
                                 path: shown,
+                                display: display.clone(),
                             });
                             (
                                 json!({"schema_version": 1, "status": "success", "data": {
                                     "artifact_id": presented.artifact.id,
                                     "version": presented.version,
-                                    "note": "shown to the user as an artifact; present again with this artifact_id to add a version",
+                                    "note": match display.as_deref() {
+                                        Some("inline") => "previewed inline in the conversation; present again with this artifact_id to add a version",
+                                        _ => "shown to the user as an artifact; present again with this artifact_id to add a version",
+                                    },
                                 }}),
                                 MetaControl::Continue,
                             )
