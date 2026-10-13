@@ -468,7 +468,7 @@ pub(crate) const PALETTE_ACTIONS: [(&str, &str); 25] = [
     ("new", "New session"),
     ("sessions", "Switch session…"),
     ("model", "Switch model…"),
-    ("mode", "Switch approval: Ask / YOLO"),
+    ("mode", "Switch approval: Ask / Yolo"),
     ("compact", "Compact history now"),
     ("steps", "Expand or fold tool steps"),
     ("term", "Open a terminal"),
