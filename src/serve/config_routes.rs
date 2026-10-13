@@ -412,6 +412,31 @@ pub(crate) async fn set_delegate(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct KeepTaskProfileReq {
+    on: bool,
+}
+
+pub(crate) async fn set_keep_task_profile(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<KeepTaskProfileReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        c.keep_task_profile = req.on;
+        save_config(&c, &d.config_path)
+    };
+    match result {
+        Ok(_) => Json(serde_json::json!({ "keep_task_profile": req.on })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub(crate) struct DeleteProfileQuery {
     token: Option<String>,
     name: String,

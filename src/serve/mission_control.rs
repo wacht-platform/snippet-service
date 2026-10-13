@@ -525,8 +525,14 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         }
         None => None,
     };
+    let keep = d.config.lock().map(|c| c.keep_task_profile).unwrap_or(true);
+    if let Some(profile) = task.profile.as_deref().filter(|p| keep && !p.trim().is_empty()) {
+        if let Some(sp) = crate::session::state_path_for_id(&session_id) {
+            crate::session::write_session_profile(&sp, profile);
+        }
+    }
     if let Some(profile) = switch_to {
-        if let Err(error) = d.run_session_on_profile(&session_id, profile, false).await {
+        if let Err(error) = d.run_session_on_profile(&session_id, profile, keep).await {
             release_failed_claim(d, &task, &error)?;
             return Err(error);
         }
