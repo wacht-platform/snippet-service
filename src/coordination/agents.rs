@@ -2,7 +2,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, types::Type};
 
-use super::{Store, StoreError, types::{Agent, AgentStatus}};
+use super::{Store, StoreError, types::{Agent, AgentKind, AgentStatus}};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentRemoval {
+    Removed,
+    NotFound,
+    MissionControl,
+    OnOpenTasks(Vec<String>),
+}
 
 fn now() -> String {
     SystemTime::now()
@@ -100,6 +108,54 @@ impl Store {
                 "UPDATE agents SET status = ?2, updated_at = ?3 WHERE id = ?1",
                 params![id, enum_text(status), timestamp],
             )? == 1)
+        })
+    }
+
+    /// Remove an agent for good. Mission Control cannot be removed, and an agent
+    /// still on an unfinished task is refused so that work is not orphaned.
+    /// Its finished task memberships, coordination notes and undelivered
+    /// messages go with it.
+    pub fn delete_agent(&self, id: &str) -> Result<AgentRemoval, StoreError> {
+        self.with_connection(|conn| {
+            let kind: Option<String> = conn
+                .query_row("SELECT kind FROM agents WHERE id = ?1", params![id], |row| {
+                    row.get(0)
+                })
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })?;
+            let Some(kind) = kind else {
+                return Ok(AgentRemoval::NotFound);
+            };
+            if kind == enum_text(&AgentKind::MissionControl) {
+                return Ok(AgentRemoval::MissionControl);
+            }
+            let open: Vec<String> = {
+                let mut stmt = conn.prepare(
+                    "SELECT t.title FROM task_agents ta JOIN tasks t ON t.id = ta.task_id
+                     WHERE ta.agent_id = ?1 AND ta.removed_at IS NULL
+                       AND t.status NOT IN ('done', 'failed', 'cancelled')
+                     ORDER BY t.updated_at DESC",
+                )?;
+                stmt.query_map(params![id], |row| row.get(0))?
+                    .collect::<Result<_, _>>()?
+            };
+            if !open.is_empty() {
+                return Ok(AgentRemoval::OnOpenTasks(open));
+            }
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM task_agents WHERE agent_id = ?1", params![id])?;
+            tx.execute("DELETE FROM agent_board WHERE agent_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM message_deliveries
+                 WHERE recipient_kind = 'agent' AND recipient_id = ?1 AND delivered_at IS NULL",
+                params![id],
+            )?;
+            tx.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(AgentRemoval::Removed)
         })
     }
 
