@@ -166,7 +166,7 @@ impl CodingHarness {
                                     "artifact_id": presented.artifact.id,
                                     "version": presented.version,
                                     "note": match display.as_deref() {
-                                        Some("inline") => "previewed inline in the conversation; present again with this artifact_id to add a version",
+                                        Some("inline") => "rendered inline in the conversation; present again with this artifact_id to add a version",
                                         _ => "shown to the user as an artifact; present again with this artifact_id to add a version",
                                     },
                                 }}),
