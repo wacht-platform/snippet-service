@@ -11,7 +11,6 @@ use super::*;
             sessions: Mutex::new(HashMap::new()),
             shells: crate::term::SessionTerms::new(global_shell_cwd()),
             git_write: Mutex::new(()),
-            browser: BrowserManager::default(),
             seen_nonces: std::sync::Mutex::new(HashMap::new()),
             queue_hidden: std::sync::Mutex::new(HashMap::new()),
             queue_revision: AtomicU64::new(0),

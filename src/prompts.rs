@@ -1,7 +1,7 @@
 //! System-prompt composition.
 //!
 //! A stable execution/conversation core is always present. Capability- and
-//! environment-specific guidance (git worktree, browser, skills, vault, memory)
+//! environment-specific guidance (git worktree, skills, vault, memory)
 //! is appended only when it applies, so an absent capability costs no tokens.
 
 pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer.md");
@@ -15,7 +15,6 @@ pub const MEMORY_GUIDANCE_LAYER: &str = include_str!("../prompts/memory_layer.md
 pub const MEMORY_WRITE_LAYER: &str = include_str!("../prompts/memory_write_layer.md");
 pub const SKILLS_LAYER: &str = include_str!("../prompts/skills_layer.md");
 pub const VAULT_LAYER: &str = include_str!("../prompts/vault_layer.md");
-pub const BROWSER_LAYER: &str = include_str!("../prompts/browser_command_layer.md");
 
 /// Capability/environment facts that decide which optional layers render.
 /// These are a session-start snapshot, so the assembled prompt stays stable
@@ -33,8 +32,6 @@ pub struct PromptContext {
     pub skills: bool,
     /// The vault holds at least one secret.
     pub vault: bool,
-    /// This session can reach connected browsers.
-    pub browser: bool,
     /// This is an agent's COORDINATION session: it answers direct messages and
     /// dispatches work, and holds no workspace tools. The layer is what tells it
     /// how to behave, which is not inferable from the tool list alone.
@@ -42,14 +39,13 @@ pub struct PromptContext {
 }
 
 impl PromptContext {
-    /// Detect the capability/environment snapshot for `workspace`. Browser
-    /// reachability and memory enablement are supplied by the caller (it owns
-    /// those facts); skills and vault are probed here.
+    /// Detect the capability/environment snapshot for `workspace`. Memory
+    /// enablement is supplied by the caller (it owns that fact); skills and
+    /// vault are probed here.
     pub fn detect(
         workspace: &std::path::Path,
         memory: bool,
         memory_writable: bool,
-        browser: bool,
     ) -> Self {
         Self {
             worktree: crate::session::workspace_is_worktree(workspace),
@@ -57,7 +53,6 @@ impl PromptContext {
             memory_writable: memory && memory_writable,
             skills: !crate::skills::discover().is_empty(),
             vault: !crate::vault::Vault::load().is_empty(),
-            browser,
             // Not inferable from the environment; the role's own constructor sets it.
             coordination: false,
         }
@@ -67,9 +62,6 @@ impl PromptContext {
         let mut layers = Vec::new();
         if self.worktree {
             layers.push(GIT_WORKTREE_LAYER.trim());
-        }
-        if self.browser {
-            layers.push(BROWSER_LAYER.trim());
         }
         if self.skills {
             layers.push(SKILLS_LAYER.trim());
@@ -125,7 +117,7 @@ pub fn conversation_system_prompt() -> String {
 /// per-workspace memory layers are excluded for the same reason — this session
 /// has no workspace to hold memory about.
 pub fn coordination_prompt(_context: &PromptContext) -> String {
-    // No browser or vault layers: both are about commands this session has no
+    // No vault layer: it is about commands this session has no
     // shell to run. COORDINATION_LAYER is last so its statements about what
     // this session can and cannot do are the final word.
     [CONVERSATION_AGENT_LAYER.trim(), COORDINATION_LAYER.trim()].join("\n\n")

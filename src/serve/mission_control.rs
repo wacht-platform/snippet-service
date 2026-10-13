@@ -16,7 +16,7 @@ use crate::coordination::{
 };
 use crate::mission_control::{self, ManagedSession};
 use crate::session::{
-    read_session_profile, start_mission_control_session, start_session_with_browser_summary,
+    read_session_profile, start_mission_control_session, start_session,
     write_session_sidecar, SessionRole, SessionSidecar,
 };
 use super::{
@@ -979,7 +979,7 @@ async fn create_session(
             apply_profile(&mut workspace, &req.profile);
             workspace
         };
-        let handle = start_session_with_browser_summary(
+        let handle = start_session(
             &cfg,
             path,
             None,
@@ -987,7 +987,6 @@ async fn create_session(
             Some(Arc::new(std::sync::Mutex::new(
                 crate::llm::StreamBuffer::default(),
             ))),
-            Some(d.browser.summary_provider()),
         );
         let mut live = d.sessions.lock().await;
         live.insert(id.clone(), live_from_handle(handle, req.profile.clone()));
@@ -1101,7 +1100,6 @@ pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<S
             Some(Arc::new(std::sync::Mutex::new(
                 crate::llm::StreamBuffer::default(),
             ))),
-            Some(d.browser.summary_provider()),
         );
         sessions.insert(id.clone(), live_from_handle(handle, profile));
         if !resume {
