@@ -71,6 +71,9 @@ struct CliSession {
     synced: usize,
     tool_guide: String,
     forking: bool,
+    mark: String,
+    tokens: u64,
+    compactions: u64,
 }
 
 impl CliSession {
@@ -84,19 +87,46 @@ impl CliSession {
             .map(|id| id.trim().to_string())
             .filter(|id| reuse && !id.is_empty());
         let synced = lines.next().and_then(|n| n.trim().parse().ok()).unwrap_or(0);
-        let forking = lines.next().is_some_and(|flag| flag.trim() == "fork");
+        let (mut forking, mut mark, mut tokens, mut compactions) = (false, String::new(), 0u64, 0u64);
+        for line in lines {
+            let line = line.trim();
+            if line == "fork" {
+                forking = true;
+            } else if let Some(v) = line.strip_prefix("m=") {
+                mark = v.to_string();
+            } else if let Some(v) = line.strip_prefix("t=") {
+                tokens = v.parse().unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("c=") {
+                compactions = v.parse().unwrap_or(0);
+            }
+        }
+        let fresh = |id: Option<String>| Self {
+            kind,
+            key: key.clone(),
+            id,
+            started: false,
+            synced: 0,
+            tool_guide: String::new(),
+            forking: false,
+            mark: String::new(),
+            tokens: 0,
+            compactions: 0,
+        };
         let session = match (kind, existing) {
-            (_, Some(id)) => Self { kind, key, id: Some(id), started: true, synced, tool_guide: String::new(), forking },
-            (CliKind::ClaudeCode, None) => Self {
+            (_, Some(id)) => Self {
                 kind,
-                key,
-                id: Some(uuid::Uuid::new_v4().to_string()),
-                started: false,
-                synced: 0,
+                key: key.clone(),
+                id: Some(id),
+                started: true,
+                synced,
                 tool_guide: String::new(),
-                forking: false,
+                forking,
+                mark,
+                tokens,
+                compactions,
             },
-            (CliKind::Antigravity, None) => Self { kind, key, id: None, started: false, synced: 0, tool_guide: String::new(), forking: false },
+            (CliKind::ClaudeCode, None) => fresh(Some(uuid::Uuid::new_v4().to_string())),
+            (CliKind::Antigravity, None) => fresh(None),
         };
         if !session.started {
             session.save();
@@ -115,7 +145,13 @@ impl CliSession {
         match self.id.as_deref() {
             Some(id) => {
                 let flag = if self.forking { "\nfork" } else { "" };
-                let _ = std::fs::write(file, format!("{id}\n{}{flag}", self.synced));
+                let _ = std::fs::write(
+                    file,
+                    format!(
+                        "{id}\n{}{flag}\nm={}\nt={}\nc={}",
+                        self.synced, self.mark, self.tokens, self.compactions
+                    ),
+                );
             }
             None => {
                 let _ = std::fs::remove_file(file);
@@ -131,59 +167,208 @@ impl CliSession {
         }
     }
 
-    fn mark_synced(&mut self, upto: usize) {
-        if self.synced != upto {
+    fn mark_synced(&mut self, messages: &[HarnessMessage], compactions: u64, tokens: u64) {
+        let upto = messages.len();
+        let mark = transcript_mark(messages, upto);
+        if self.synced != upto || self.mark != mark || self.compactions != compactions || self.tokens != tokens {
             self.synced = upto;
+            self.mark = mark;
+            self.compactions = compactions;
+            self.tokens = tokens;
             self.save();
+        }
+    }
+
+    fn restart(&mut self) {
+        self.id = match self.kind {
+            CliKind::ClaudeCode => Some(uuid::Uuid::new_v4().to_string()),
+            CliKind::Antigravity => None,
+        };
+        self.started = false;
+        self.forking = false;
+        self.synced = 0;
+        self.mark.clear();
+        self.tokens = 0;
+        self.save();
+    }
+}
+
+fn transcript_mark(messages: &[HarnessMessage], upto: usize) -> String {
+    use std::hash::{Hash, Hasher};
+    if upto == 0 || upto > messages.len() {
+        return String::new();
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    upto.hash(&mut h);
+    match &messages[upto - 1] {
+        HarnessMessage::User { content } => ("user", content.as_str()).hash(&mut h),
+        HarnessMessage::Assistant { content, tool_calls } => {
+            ("assistant", content.as_str()).hash(&mut h);
+            for call in tool_calls {
+                call.name.hash(&mut h);
+            }
+        }
+        HarnessMessage::ToolResult { tool_name, tool_call_id, .. } => {
+            ("tool", tool_name.as_str(), tool_call_id.as_str()).hash(&mut h)
+        }
+        HarnessMessage::Summary { kind, content } => ("summary", kind.as_str(), content.as_str()).hash(&mut h),
+        HarnessMessage::System { .. } => "system".hash(&mut h),
+    }
+    format!("{:016x}", h.finish())
+}
+
+const HANDOFF_BUDGET: usize = 40_000;
+
+fn clip_chars(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() > max {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
+fn call_target(arguments: &Value) -> Option<String> {
+    for key in ["file_path", "path", "command", "cmd", "query", "pattern", "url", "description", "title"] {
+        if let Some(v) = arguments.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty()) {
+            return Some(clip_chars(&v.replace('\n', " "), 100));
+        }
+    }
+    None
+}
+
+fn touched_paths(arguments: &Value, out: &mut Vec<String>) {
+    let mut push = |p: &str| {
+        let p = p.trim();
+        if !p.is_empty() && !out.iter().any(|x| x == p) {
+            out.push(p.to_string());
+        }
+    };
+    for key in ["file_path", "path", "new_path"] {
+        if let Some(p) = arguments.get(key).and_then(Value::as_str) {
+            push(p);
+        }
+    }
+    for key in ["paths", "files", "changes"] {
+        if let Some(list) = arguments.get(key).and_then(Value::as_array) {
+            for item in list {
+                match item {
+                    Value::String(p) => push(p),
+                    Value::Object(_) => {
+                        for k in ["path", "file_path", "new_path"] {
+                            if let Some(p) = item.get(k).and_then(Value::as_str) {
+                                push(p);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
 
-fn missed_context(messages: &[HarnessMessage]) -> Option<String> {
-    const BUDGET: usize = 30_000;
-    const PER_MESSAGE: usize = 2_000;
-    let clip = |text: &str| -> String {
-        let text = text.trim();
-        if text.chars().count() > PER_MESSAGE {
-            format!("{}…", text.chars().take(PER_MESSAGE).collect::<String>())
-        } else {
-            text.to_string()
-        }
-    };
-    let mut entries: Vec<String> = messages
+fn writes_files(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["edit", "write", "change", "patch", "create", "delete", "move", "rename", "replace"]
         .iter()
-        .filter_map(|m| match m {
-            HarnessMessage::User { content } if !content.trim().is_empty() => Some(format!("user: {}", clip(content))),
-            HarnessMessage::Assistant { content, tool_calls } => {
-                let tools: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
-                let mut line = format!("assistant: {}", clip(content));
-                if !tools.is_empty() {
-                    line.push_str(&format!(" (used {})", tools.join(", ")));
-                }
-                (!content.trim().is_empty() || !tools.is_empty()).then_some(line)
+        .any(|w| n.contains(w))
+}
+
+struct Handoff {
+    text: String,
+    dropped: usize,
+}
+
+fn handoff(messages: &[HarnessMessage], fresh: bool, memory: Option<&str>, other_compacted: bool) -> Option<Handoff> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut touched: Vec<String> = Vec::new();
+    let mut summary: Option<String> = None;
+    for m in messages {
+        match m {
+            HarnessMessage::User { content } if !content.trim().is_empty() => {
+                entries.push(format!("user: {}", clip_chars(content, 2_000)));
             }
-            HarnessMessage::Summary { content, .. } => Some(format!("summary of earlier work: {}", clip(content))),
-            _ => None,
-        })
-        .collect();
+            HarnessMessage::Assistant { content, tool_calls } => {
+                let mut line = format!("assistant: {}", clip_chars(content, 2_000));
+                for call in tool_calls {
+                    match call_target(&call.arguments) {
+                        Some(t) => line.push_str(&format!("\n  · {} {t}", call.name)),
+                        None => line.push_str(&format!("\n  · {}", call.name)),
+                    }
+                    if writes_files(&call.name) {
+                        touched_paths(&call.arguments, &mut touched);
+                    }
+                }
+                if !content.trim().is_empty() || !tool_calls.is_empty() {
+                    entries.push(line);
+                }
+            }
+            HarnessMessage::Summary { content, .. } if !content.trim().is_empty() => {
+                summary = Some(clip_chars(content, 8_000));
+            }
+            _ => {}
+        }
+    }
+    if entries.is_empty() && summary.is_none() {
+        return None;
+    }
     let mut used = 0;
     let mut keep = entries.len();
-    while keep > 0 && used + entries[keep - 1].len() <= BUDGET {
+    while keep > 0 && used + entries[keep - 1].len() <= HANDOFF_BUDGET {
         used += entries[keep - 1].len();
         keep -= 1;
     }
     let dropped = keep;
+    let dropped_requests: Vec<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            HarnessMessage::User { content } if !content.trim().is_empty() => Some(content.as_str()),
+            _ => None,
+        })
+        .take(entries[..keep].iter().filter(|e| e.starts_with("user: ")).count())
+        .map(|c| clip_chars(&c.replace('\n', " "), 200))
+        .collect();
     entries.drain(..keep);
-    if entries.is_empty() {
-        return None;
+    let mut out = String::from("<conversation_so_far>\n");
+    out.push_str(if fresh {
+        "This session's conversation so far, from before this runtime joined it. Treat it as your own history.\n"
+    } else {
+        "What happened in this session while another runtime was handling it, since your last turn. Treat it as your own history.\n"
+    });
+    if let Some(summary) = summary {
+        out.push_str(&format!("\nSummary of earlier work:\n{summary}\n"));
     }
-    let mut out = String::from("<conversation_so_far>\nThis session's earlier conversation, from before this runtime joined it. Treat it as your own history.\n");
-    if dropped > 0 {
-        out.push_str(&format!("({dropped} older messages omitted)\n"));
+    if !dropped_requests.is_empty() {
+        let skip = dropped_requests.len().saturating_sub(40);
+        let earlier = if skip > 0 { format!("({skip} earlier requests not listed)\n") } else { String::new() };
+        out.push_str(&format!(
+            "\nEarlier requests, oldest first ({dropped} older messages are not shown in full):\n{earlier}- {}\n",
+            dropped_requests[skip..].join("\n- ")
+        ));
     }
-    out.push_str(&entries.join("\n\n"));
-    out.push_str("\n</conversation_so_far>\n\n");
-    Some(out)
+    if !entries.is_empty() {
+        out.push_str("\n");
+        out.push_str(&entries.join("\n\n"));
+        out.push('\n');
+    }
+    if !touched.is_empty() {
+        let shown: Vec<&String> = touched.iter().take(40).collect();
+        out.push_str(&format!(
+            "\nFiles changed in that time{}:\n{}\n",
+            if touched.len() > shown.len() { format!(" (first {})", shown.len()) } else { String::new() },
+            shown.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+        ));
+    }
+    if let Some(path) = memory
+        && (fresh || dropped > 0 || other_compacted)
+    {
+        out.push_str(&format!(
+            "\nThis session's working state is saved in session memory at {path}: read MEMORY.md and the files its index links before relying on detail this summary leaves out.\n"
+        ));
+    }
+    out.push_str("</conversation_so_far>\n\n");
+    Some(Handoff { text: out, dropped })
 }
 
 #[derive(Default)]
@@ -889,6 +1074,9 @@ impl CodingHarness {
                     synced: 0,
                     tool_guide: session.tool_guide.clone(),
                     forking: false,
+                    mark: String::new(),
+                    tokens: 0,
+                    compactions: 0,
                 };
                 (self.antigravity_command(profile, &prompt, bridge_url, &fork)?, ForkCleanup::Antigravity(fork_id))
             }
@@ -1280,6 +1468,41 @@ impl CodingHarness {
                 self.persist(&mut state, &lanes).await?;
             }
             if !outbox.is_empty() {
+                if session.started && session.synced > 0 {
+                    let len = state.messages.len();
+                    let prior_end = len.saturating_sub(outbox.len());
+                    let rewritten = session.synced > len
+                        || (!session.mark.is_empty() && transcript_mark(&state.messages, session.synced) != session.mark);
+                    let away = !rewritten && prior_end > session.synced;
+                    let behind = away
+                        && handoff(&state.messages[session.synced..prior_end], false, None, false)
+                            .is_some_and(|h| h.dropped > 0);
+                    let threshold = self
+                        .config
+                        .context_window_tokens
+                        .saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64)
+                        / 100;
+                    let full = away && threshold > 0 && session.tokens >= threshold;
+                    if rewritten || behind || full {
+                        if let Some(mut p) = process.take() {
+                            let _ = p.child.start_kill();
+                        }
+                        generation += 1;
+                        session.restart();
+                        state.last_prompt_tokens = 0;
+                        state.events.push(HarnessEvent::SystemDecision {
+                            step: "runtime_reseeded".to_string(),
+                            reasoning: if rewritten {
+                                format!("This session's history was rewound or compacted elsewhere, so {} starts a fresh conversation from it.", kind.label())
+                            } else if behind {
+                                format!("{} missed more than a catch-up can carry, so it starts a fresh conversation from this session's history.", kind.label())
+                            } else {
+                                format!("{}'s own conversation was near its context limit, so it starts a fresh one from this session's history.", kind.label())
+                            },
+                        });
+                        self.persist(&mut state, &lanes).await?;
+                    }
+                }
                 if process.is_none() {
                     generation += 1;
                     match self
@@ -1314,11 +1537,18 @@ impl CodingHarness {
                         }
                     }
                     let prior_end = state.messages.len().saturating_sub(outbox.len());
+                    let fresh = session.synced == 0;
+                    let memory = self.session_memory_path();
                     if prior_end > session.synced.max(1)
-                        && let Some(context) = missed_context(&state.messages[session.synced.max(1)..prior_end])
+                        && let Some(context) = handoff(
+                            &state.messages[session.synced.max(1)..prior_end],
+                            fresh,
+                            memory.as_deref(),
+                            state.compactions > session.compactions,
+                        )
                         && let Some(first) = outbox.first_mut()
                     {
-                        *first = format!("{context}{first}");
+                        *first = format!("{}{first}", context.text);
                     }
                     let note = crate::coordination_tools::task_awareness(&self.context);
                     let mut reminder: Vec<String> = after_compaction.take().into_iter().collect();
@@ -1335,7 +1565,7 @@ impl CodingHarness {
                     {
                         *first = format!("<system-reminder>{}</system-reminder>\n\n{first}", reminder.join("\n\n"));
                     }
-                    session.mark_synced(state.messages.len());
+                    session.mark_synced(&state.messages, state.compactions, state.last_prompt_tokens);
                     for text in std::mem::take(&mut outbox) {
                         let text = match text.strip_prefix(COMMAND_MARK) {
                             Some(command) => command.to_string(),
@@ -1568,8 +1798,7 @@ impl CodingHarness {
                                         generation += 1;
                                         session.id = None;
                                         session.started = false;
-                                        session.synced = state.messages.len();
-                                        session.save();
+                                        session.mark_synced(&state.messages, state.compactions + 1, 0);
                                         let pointer = self.compaction_pointer().unwrap_or_default();
                                         after_compaction = Some(match summary {
                                             Some(summary) => format!("This conversation continues from an earlier one that was compacted. Summary of it:\n{summary}\n\n{pointer}"),
@@ -1641,7 +1870,7 @@ impl CodingHarness {
                                         }
                                     }
                                 }
-                                session.mark_synced(state.messages.len());
+                                session.mark_synced(&state.messages, state.compactions, state.last_prompt_tokens);
                                 if state.pending_question.is_some() {
                                     state.status = HarnessStatus::WaitingForInput;
                                 }
