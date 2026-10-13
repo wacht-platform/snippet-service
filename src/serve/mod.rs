@@ -279,7 +279,7 @@ impl Daemon {
         if state.workspace.is_empty() || !folder.is_dir() {
             return None;
         }
-        let profile = read_session_profile(&sp);
+        let profile = self.resume_profile(id, &sp);
         self.reload_config().await; // pick up profiles added from the TUI
         let cfg = {
             let c = self.config.lock().unwrap();
@@ -419,6 +419,19 @@ impl Daemon {
     ///   is not the dispatcher's to overwrite. So the profile is in-memory only:
     ///   it drives this run, and a later start falls back to whatever the
     ///   session was already set to.
+    pub(crate) fn resume_profile(&self, id: &str, sp: &std::path::Path) -> Option<String> {
+        self.store
+            .list_tasks(None, Some(&crate::coordination::TaskStatus::InProgress))
+            .ok()
+            .and_then(|tasks| {
+                tasks
+                    .into_iter()
+                    .filter(|t| t.session_id == id)
+                    .find_map(|t| t.profile.filter(|p| !p.trim().is_empty()))
+            })
+            .or_else(|| read_session_profile(sp))
+    }
+
     pub(crate) async fn run_session_on_profile(
         &self,
         session: &str,
@@ -595,7 +608,7 @@ impl Daemon {
             Some(s) => (s.state_path.clone(), s.profile.clone()),
             None => match state_path_for_id(id) {
                 Some(sp) => {
-                    let p = read_session_profile(&sp);
+                    let p = self.resume_profile(id, &sp);
                     (sp, p)
                 }
                 None => return,
@@ -1087,7 +1100,7 @@ async fn open_session(
     // reopening the chat), and honoring it silently reverted the model the user
     // set for this chat via /session/model. An explicit profile only seeds a
     // conversation that has no override yet (e.g. new_conversation).
-    let persisted = read_session_profile(&sp);
+    let persisted = d.resume_profile(&id, &sp);
     let profile = persisted.clone().or_else(|| req.profile.clone());
     let cfg = {
         let c = d.config.lock().unwrap();
