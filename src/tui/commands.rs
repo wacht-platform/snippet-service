@@ -876,7 +876,7 @@ impl App {
                 self.status = if manual {
                     "Approval: Ask".to_string()
                 } else {
-                    "Approval: YOLO".to_string()
+                    "Approval: Yolo".to_string()
                 };
             }
             "/compact" => {
