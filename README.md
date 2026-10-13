@@ -20,7 +20,7 @@
 
 - Durable coding sessions with checkpoints, rewind, and history compaction; compacted messages stay searchable with `snippet history`.
 - Persistent memory per repository — rules, learnings, and a generated table of contents of notes — shared by all of its worktrees.
-- A small tool set: a stateful shell, one all-or-nothing file-change tool, image viewing, web search, and browser control.
+- A small tool set: a stateful shell, one all-or-nothing file-change tool, image viewing, and web search; agents can operate a real computer through a computer-use driver they set up.
 - Multiple provider profiles with global and per-conversation model selection.
 - Anthropic, OpenAI, Gemini, OpenRouter, OpenAI-compatible endpoints, local models, and ChatGPT subscription login.
 - Delegated background lanes with live progress and recovery after reconnects.
