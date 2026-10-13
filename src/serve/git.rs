@@ -579,3 +579,29 @@ pub(super) async fn git_worktrees(
         None => Json(serde_json::json!({ "repo": null, "worktrees": [] })).into_response(),
     }
 }
+
+// POST /git/init — start a repository in the session's folder, then keep
+// `.snippet/` out of it like every session start does.
+pub(super) async fn git_init(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match resolve_session_dir(&req.session) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let _lock = d.git_write.lock().await;
+    match run_git(&dir, ["init"]).await {
+        Ok((c, so, se, t)) => {
+            if c == 0 {
+                crate::harness::ensure_snippet_gitignored(&dir);
+            }
+            git_result(c, so, se, t)
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
