@@ -15,6 +15,8 @@ pub const MEMORY_GUIDANCE_LAYER: &str = include_str!("../prompts/memory_layer.md
 pub const MEMORY_WRITE_LAYER: &str = include_str!("../prompts/memory_write_layer.md");
 pub const SKILLS_LAYER: &str = include_str!("../prompts/skills_layer.md");
 pub const VAULT_LAYER: &str = include_str!("../prompts/vault_layer.md");
+pub const VISION_LAYER: &str = include_str!("../prompts/vision_layer.md");
+pub const NO_VISION_LAYER: &str = include_str!("../prompts/no_vision_layer.md");
 
 /// Capability/environment facts that decide which optional layers render.
 /// These are a session-start snapshot, so the assembled prompt stays stable
@@ -36,6 +38,8 @@ pub struct PromptContext {
     /// dispatches work, and holds no workspace tools. The layer is what tells it
     /// how to behave, which is not inferable from the tool list alone.
     pub coordination: bool,
+    /// The session's model accepts image input.
+    pub images: bool,
 }
 
 impl PromptContext {
@@ -55,6 +59,7 @@ impl PromptContext {
             vault: !crate::vault::Vault::load().is_empty(),
             // Not inferable from the environment; the role's own constructor sets it.
             coordination: false,
+            images: false,
         }
     }
 
@@ -69,6 +74,7 @@ impl PromptContext {
         if self.vault {
             layers.push(VAULT_LAYER.trim());
         }
+        layers.push(if self.images { VISION_LAYER.trim() } else { NO_VISION_LAYER.trim() });
         if self.memory {
             layers.push(MEMORY_GUIDANCE_LAYER.trim());
         }
