@@ -96,10 +96,11 @@ fn present_file_tool() -> NativeToolDefinition {
             look at and you'll iterate on (a report, a dashboard, a prototype, a diagram): give it a \
             `title` and it opens in a viewer that renders HTML, markdown, images and CSV; present it \
             again with the `artifact_id` you got back to add a version instead of making a new one. \
-            `display` chooses how an artifact sits in the conversation: `inline` previews it right in \
-            the chat (a chart, a small table, a diagram, a quick mockup, variants side by side), `card` \
-            keeps it a row the user opens (a long report, a full app). Markdown, CSV and images preview \
-            inline by default; HTML is a card unless you ask for inline. \
+            `display` chooses how an artifact sits in the conversation: `inline` renders it in full as \
+            part of the chat, with no frame or title, at its natural height (a chart, a small table, a \
+            diagram, a quick mockup, variants side by side), `card` keeps it a row the user opens (a long \
+            report, a full app). Markdown, CSV and images are inline by default; HTML is a card unless \
+            you ask for inline. \
             Write HTML artifacts as self-contained pages (inline CSS and JS, libraries from cdnjs or \
             jsdelivr). For a batch of files, write them into one folder and present the folder: it \
             becomes a single collection. The path must exist. Presenting doesn't end your turn."
@@ -111,7 +112,7 @@ fn present_file_tool() -> NativeToolDefinition {
                 "caption": {"type": "string", "description": "Optional one-line caption shown with it."},
                 "title": {"type": "string", "description": "Makes it an artifact with this title."},
                 "artifact_id": {"type": "string", "description": "Adds a version to this existing artifact."},
-                "display": {"type": "string", "enum": ["inline", "card"], "description": "For artifacts: inline previews it in the conversation, card keeps it a row to open. Defaults by kind."}
+                "display": {"type": "string", "enum": ["inline", "card"], "description": "For artifacts: inline renders it in full as part of the conversation, card keeps it a row to open. Defaults by kind."}
             },
             "required": ["path"]
         }),
