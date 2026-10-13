@@ -49,6 +49,86 @@ pub struct Presented {
     pub artifact: Artifact,
     pub version: u32,
     pub unchanged: bool,
+    /// Local files the page references that were copied in beside it.
+    pub bundled: Vec<String>,
+    /// References that can't load from the artifact, with why.
+    pub broken: Vec<String>,
+}
+
+const BUNDLE_FILE_MAX: u64 = 80 * 1024 * 1024;
+const BUNDLE_TOTAL_MAX: u64 = 200 * 1024 * 1024;
+
+/// Local files an HTML or SVG page refers to by relative path, resolved
+/// against the page's folder: what must travel with the page for it to load
+/// from the artifact server. Returns (relative path, absolute path) pairs for
+/// files that exist and the reasons the rest can't be bundled.
+fn page_dependencies(page: &Path) -> (Vec<(String, PathBuf)>, Vec<String>) {
+    let ext = page.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    if !matches!(ext.as_deref(), Some("html" | "htm" | "svg")) {
+        return (Vec::new(), Vec::new());
+    }
+    let Ok(text) = fs::read_to_string(page) else { return (Vec::new(), Vec::new()) };
+    let Some(folder) = page.parent() else { return (Vec::new(), Vec::new()) };
+    let attr = regex::Regex::new(r#"(?i)\b(?:src|href|poster|data|xlink:href)\s*=\s*["']([^"']+)["']"#).unwrap();
+    let css = regex::Regex::new(r#"(?i)url\(\s*["']?([^"')]+)["']?\s*\)"#).unwrap();
+    let srcset = regex::Regex::new(r#"(?i)\bsrcset\s*=\s*["']([^"']+)["']"#).unwrap();
+    let mut refs: Vec<String> = Vec::new();
+    for c in attr.captures_iter(&text).chain(css.captures_iter(&text)) {
+        refs.push(c[1].trim().to_string());
+    }
+    for c in srcset.captures_iter(&text) {
+        for part in c[1].split(',') {
+            if let Some(url) = part.split_whitespace().next() {
+                refs.push(url.to_string());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut broken = Vec::new();
+    for raw in refs {
+        let lower = raw.to_ascii_lowercase();
+        if raw.is_empty()
+            || raw.starts_with('#')
+            || raw.starts_with("//")
+            || raw.contains("${")
+            || ["http:", "https:", "data:", "blob:", "mailto:", "tel:", "javascript:", "about:"]
+                .iter()
+                .any(|p| lower.starts_with(p))
+        {
+            continue;
+        }
+        let path = raw.split(['?', '#']).next().unwrap_or("").to_string();
+        let path = path.replace("%20", " ");
+        if path.is_empty() {
+            continue;
+        }
+        if lower.starts_with("file:") || path.starts_with('/') {
+            let note = format!("{raw}: an absolute path can't load from the artifact; reference it relative to the page");
+            if !broken.contains(&note) {
+                broken.push(note);
+            }
+            continue;
+        }
+        if path.split('/').any(|seg| seg == "..") {
+            let note = format!("{raw}: outside the page's folder; move it beside the page or present the folder");
+            if !broken.contains(&note) {
+                broken.push(note);
+            }
+            continue;
+        }
+        let abs = folder.join(&path);
+        if abs.is_file() {
+            if !found.iter().any(|(r, _): &(String, PathBuf)| r == &path) {
+                found.push((path, abs));
+            }
+        } else if !abs.exists() {
+            let note = format!("{raw}: not found next to the page");
+            if !broken.contains(&note) {
+                broken.push(note);
+            }
+        }
+    }
+    (found, broken)
 }
 
 pub fn root() -> PathBuf {
@@ -227,11 +307,33 @@ pub fn present(
     if caption.is_some() {
         artifact.caption = caption;
     }
-    let hash = hash_path(source)?;
+    let (deps, mut broken) = if source.is_dir() { (Vec::new(), Vec::new()) } else { page_dependencies(source) };
+    let hash = {
+        let base_hash = hash_path(source)?;
+        if deps.is_empty() {
+            base_hash
+        } else {
+            let mut hasher = Sha256::new();
+            hasher.update(base_hash.as_bytes());
+            for (rel, abs) in &deps {
+                hasher.update(rel.as_bytes());
+                if let Ok(meta) = fs::metadata(abs) {
+                    hasher.update(meta.len().to_le_bytes());
+                    if let Ok(modified) = meta.modified()
+                        && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
+                    {
+                        hasher.update(since.as_nanos().to_le_bytes());
+                    }
+                }
+            }
+            hasher.finalize().iter().take(12).map(|b| format!("{b:02x}")).collect()
+        }
+    };
     if let Some(last) = artifact.latest().filter(|v| v.hash == hash) {
         let version = last.n;
-        return Ok(Presented { artifact, version, unchanged: true });
+        return Ok(Presented { artifact, version, unchanged: true, bundled: Vec::new(), broken });
     }
+    let mut bundled = Vec::new();
     let n = artifact.latest().map(|v| v.n + 1).unwrap_or(1);
     let dir = base.join(&artifact.id);
     let dest = dir.join(format!("v{n}"));
@@ -250,6 +352,25 @@ pub fn present(
             .unwrap_or("file")
             .to_string();
         fs::copy(source, dest.join(&name)).map_err(|e| format!("copy: {e}"))?;
+        let mut total = 0u64;
+        for (rel, abs) in &deps {
+            let len = fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
+            if len > BUNDLE_FILE_MAX || total + len > BUNDLE_TOTAL_MAX {
+                broken.push(format!("{rel}: too large to bundle ({} MB); link it from the web or make it smaller", len / (1024 * 1024)));
+                continue;
+            }
+            let target = dest.join(rel);
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            match fs::copy(abs, &target) {
+                Ok(_) => {
+                    total += len;
+                    bundled.push(rel.clone());
+                }
+                Err(e) => broken.push(format!("{rel}: couldn't copy ({e})")),
+            }
+        }
         name
     };
     artifact.kind = kind_of(source).to_string();
@@ -265,7 +386,7 @@ pub fn present(
         let _ = fs::remove_dir_all(dir.join(format!("v{}", old.n)));
     }
     save(&dir, &artifact)?;
-    Ok(Presented { artifact, version: n, unchanged: false })
+    Ok(Presented { artifact, version: n, unchanged: false, bundled, broken })
 }
 
 fn escape(s: &str) -> String {
