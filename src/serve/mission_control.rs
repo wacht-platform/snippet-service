@@ -1201,6 +1201,29 @@ pub async fn dispatch_loop(daemon: Shared) {
     }
 }
 
+fn task_artifacts_block(session_id: &str, created_at: &str) -> String {
+    if session_id.trim().is_empty() {
+        return String::new();
+    }
+    let since = chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
+    let dir = crate::artifacts::session_dir_name(session_id);
+    let lines: Vec<String> = crate::artifacts::list(session_id)
+        .into_iter()
+        .filter_map(|a| {
+            let v = a.latest().filter(|v| v.created_at >= since)?;
+            let path = crate::artifacts::version_dir(&dir, &a.id, v.n)?.join(&v.entry);
+            path.exists().then(|| format!("- {} ({}, v{}): {}", a.title, a.kind, v.n, path.display()))
+        })
+        .collect();
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("artifacts:\n{}\n", lines.join("\n"))
+    }
+}
+
 async fn deliver_mission_control_reports(daemon: &Daemon) {
     if mission_control::awaiting_user() {
         return;
@@ -1220,8 +1243,13 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
                 )
             } else {
                 format!(
-                    "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n[/mission_task_report]\n{}",
-                    task.id, task.title, marker.kind, marker.message, WORKFLOW_REPORT
+                    "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n{}[/mission_task_report]\n{}",
+                    task.id,
+                    task.title,
+                    marker.kind,
+                    marker.message,
+                    task_artifacts_block(&task.session_id, &task.created_at),
+                    WORKFLOW_REPORT
                 )
             };
             daemon
