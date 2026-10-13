@@ -97,9 +97,10 @@ fn present_file_tool() -> NativeToolDefinition {
             `title` and it opens in a viewer that renders HTML, markdown, images and CSV; present it \
             again with the `artifact_id` you got back to add a version instead of making a new one. \
             `display` chooses how an artifact sits in the conversation: `inline` renders it in full as \
-            part of the chat, with no frame or title, at its natural height (a chart, a small table, a \
-            diagram, a quick mockup, variants side by side), `card` keeps it a row the user opens (a long \
-            report, a full app). Markdown, CSV and images are inline by default; HTML is a card unless \
+            part of the chat, with no frame or title, at its natural height, and suits anything that fits \
+            in a reasonable scroll of two or three screens or a few more; `card` keeps it a row the user \
+            opens, for what would be work to scroll past (a long report, a multi-view app). Pick whichever \
+            reads best in the conversation. Markdown, CSV and images are inline by default; HTML is a card unless \
             you ask for inline. \
             Write HTML artifacts as self-contained pages (inline CSS and JS, libraries from cdnjs or \
             jsdelivr). For a batch of files, write them into one folder and present the folder: it \
