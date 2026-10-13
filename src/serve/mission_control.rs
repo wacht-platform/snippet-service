@@ -1214,7 +1214,16 @@ fn task_artifacts_block(session_id: &str, created_at: &str) -> String {
         .filter_map(|a| {
             let v = a.latest().filter(|v| v.created_at >= since)?;
             let path = crate::artifacts::version_dir(&dir, &a.id, v.n)?.join(&v.entry);
-            path.exists().then(|| format!("- {} ({}, v{}): {}", a.title, a.kind, v.n, path.display()))
+            path.exists().then(|| {
+                format!(
+                    "- {} ({}, v{}): {} · link {}",
+                    a.title,
+                    a.kind,
+                    v.n,
+                    path.display(),
+                    crate::artifacts::markdown_link(session_id, &a.title, &a.id, v.n)
+                )
+            })
         })
         .collect();
     if lines.is_empty() {
