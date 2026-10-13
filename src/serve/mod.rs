@@ -797,6 +797,7 @@ pub async fn run_serve(
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
         .route("/config/delegate", post(set_delegate))
+        .route("/config/keep_task_profile", post(set_keep_task_profile))
         .route("/provider/models", post(provider_models))
         .route(
             "/vault",
@@ -1166,6 +1167,7 @@ struct ConfigView {
     delegate: Option<String>,
     theme: Option<String>,
     manual_approval: bool,
+    keep_task_profile: bool,
     hostname: String,
 }
 
@@ -1201,6 +1203,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
         delegate: c.delegate_setup.clone(),
         theme: c.theme.clone(),
         manual_approval: c.manual_approval,
+        keep_task_profile: c.keep_task_profile,
         hostname: d.hostname.clone(),
     })
     .into_response()
