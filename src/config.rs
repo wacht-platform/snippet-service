@@ -581,6 +581,7 @@ impl InferenceProfileConfig {
                         model,
                         reasoning_effort: self.reasoning_effort.clone(),
                         supports_images: true, // ChatGPT/Codex models are multimodal
+                        session_id: session_id.clone(),
                         max_retries: self.max_retries,
                         initial_retry_ms: self.initial_retry_ms,
                         max_retry_ms: self.max_retry_ms,
@@ -591,6 +592,7 @@ impl InferenceProfileConfig {
                 let mut config: OpenAiCompatibleConfig = self.clone().into();
                 config.base_url = "https://api.x.ai/v1".to_string();
                 config.oauth_xai = true;
+                config.session_id = session_id;
                 // Grok models are multimodal — default on when the profile left
                 // the flag unset/false by accident (older defaults were safe-off).
                 config.supports_images = true;
