@@ -17,7 +17,7 @@ use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
 use crate::prompts::{conversation_prompt, mission_control_system_prompt};
-use crate::tools::{BrowserSummaryProvider, ToolContext, ToolError, ToolRegistry};
+use crate::tools::{ToolContext, ToolError, ToolRegistry};
 
 pub struct SessionHandle {
     pub input_tx: mpsc::UnboundedSender<LoopInput>,
@@ -43,7 +43,6 @@ pub fn start_session(
         initial,
         resume,
         stream,
-        None,
         SessionConfig::standard(),
     )
 }
@@ -60,7 +59,6 @@ pub fn start_specialized_agent_session(
     initial: Option<String>,
     resume: bool,
     stream: Option<StreamHandle>,
-    browser_summary: Option<BrowserSummaryProvider>,
     agent_home: AgentHome,
 ) -> Result<SessionHandle, IdentityError> {
     let identity = agent_home.read_identity()?;
@@ -70,7 +68,6 @@ pub fn start_specialized_agent_session(
         initial,
         resume,
         stream,
-        browser_summary,
         SessionConfig::for_agent(AgentBinding {
             agent_id: agent_home.agent_id().to_string(),
             identity,
@@ -90,7 +87,6 @@ pub fn start_specialized_coordination_session(
     initial: Option<String>,
     resume: bool,
     stream: Option<StreamHandle>,
-    browser_summary: Option<BrowserSummaryProvider>,
     agent_home: AgentHome,
 ) -> Result<SessionHandle, IdentityError> {
     let identity = agent_home.read_identity()?;
@@ -100,7 +96,6 @@ pub fn start_specialized_coordination_session(
         initial,
         resume,
         stream,
-        browser_summary,
         SessionConfig::coordination(AgentBinding {
             agent_id: agent_home.agent_id().to_string(),
             identity,
@@ -114,7 +109,6 @@ pub fn start_mission_control_session(
     initial: Option<String>,
     resume: bool,
     stream: Option<StreamHandle>,
-    browser_summary: Option<BrowserSummaryProvider>,
 ) -> SessionHandle {
     start_session_with_role(
         config,
@@ -122,27 +116,7 @@ pub fn start_mission_control_session(
         initial,
         resume,
         stream,
-        browser_summary,
         SessionConfig::mission_control(),
-    )
-}
-
-pub fn start_session_with_browser_summary(
-    config: &SnippetConfig,
-    state_path: PathBuf,
-    initial: Option<String>,
-    resume: bool,
-    stream: Option<StreamHandle>,
-    browser_summary: Option<BrowserSummaryProvider>,
-) -> SessionHandle {
-    start_session_with_role(
-        config,
-        state_path,
-        initial,
-        resume,
-        stream,
-        browser_summary,
-        SessionConfig::standard(),
     )
 }
 
@@ -308,7 +282,6 @@ struct RuntimeInputs {
     workspace: PathBuf,
     durable_id: Option<String>,
     prompt_ctx: crate::prompts::PromptContext,
-    browser_summary: Option<BrowserSummaryProvider>,
     exa_api_key: Option<String>,
     base_model: InferenceProfileConfig,
     setups: Option<std::collections::BTreeMap<String, InferenceProfileConfig>>,
@@ -376,10 +349,7 @@ impl AgentRuntime {
     /// changes judgment and specialization, not the session's execution, safety
     /// or conversation rules — and not its executable permissions.
     fn snippet(i: RuntimeInputs, identity: Option<AgentIdentity<'_>>) -> Result<Self, ToolError> {
-        let context = match i.browser_summary {
-            Some(provider) => ToolContext::with_browser_summary(i.workspace, provider)?,
-            None => ToolContext::new(i.workspace)?,
-        }
+        let context = ToolContext::new(i.workspace)?
         .with_durable_session_id_opt(i.durable_id.clone())
         // Every session's coordination tools open the same database the daemon
         // owns, so board posts and tasks share one store.
@@ -472,10 +442,7 @@ impl AgentRuntime {
         identity: AgentIdentity<'_>,
     ) -> Result<Self, ToolError> {
         let (agent_id, body) = identity;
-        let context = match i.browser_summary {
-            Some(provider) => ToolContext::with_browser_summary(i.workspace, provider)?,
-            None => ToolContext::new(i.workspace)?,
-        }
+        let context = ToolContext::new(i.workspace)?
         .with_durable_session_id_opt(i.durable_id)
         .with_store_path(crate::store::default_db_path())
         // The board is per agent, so the identity is what makes every board read
@@ -555,7 +522,6 @@ fn start_session_with_role(
     initial: Option<String>,
     resume: bool,
     stream: Option<StreamHandle>,
-    browser_summary: Option<BrowserSummaryProvider>,
     session: SessionConfig,
 ) -> SessionHandle {
     let (input_tx, rx) = mpsc::unbounded_channel();
@@ -587,10 +553,6 @@ fn start_session_with_role(
             memory_writable: memory_enabled,
             skills: !crate::skills::discover().is_empty(),
             vault: !crate::vault::Vault::load().is_empty(),
-            browser: browser_summary
-                .as_ref()
-                .map(|provider| browser_summary_is_connected(&provider()))
-                .unwrap_or(false),
             // Set by the role, once it is known: only a coordination runtime
             // wants that layer, and it is the reason the environment layer is
             // dropped from its prompt.
@@ -602,8 +564,7 @@ fn start_session_with_role(
                 workspace,
                 durable_id,
                 prompt_ctx,
-                browser_summary,
-                exa_api_key: exa_api_key.clone(),
+                        exa_api_key: exa_api_key.clone(),
                 base_model: model_config,
                 setups,
             },
@@ -1661,13 +1622,3 @@ fn workspace_from_state_file(state_path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Parse the `connected = N` count out of a rendered browser summary. Drives both
-/// the conditional browser prompt layer (session start) and whether the live
-/// context shows the [browsers] section at all.
-pub(crate) fn browser_summary_is_connected(summary: &str) -> bool {
-    summary
-        .lines()
-        .find_map(|line| line.strip_prefix("connected = "))
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .is_some_and(|count| count > 0)
-}
