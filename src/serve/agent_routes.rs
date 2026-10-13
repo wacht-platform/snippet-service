@@ -360,6 +360,47 @@ pub(crate) async fn set_agent_status(
     }
 }
 
+/// DELETE /agents/{id} — remove an agent and its home. Mission Control stays,
+/// and an agent still on an unfinished task is refused with those tasks named.
+pub(crate) async fn delete_agent(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    use crate::coordination::AgentRemoval;
+    match d.store.delete_agent(&agent_id) {
+        Ok(AgentRemoval::Removed) => {
+            if let Ok(home) = crate::coordination::AgentHome::new(
+                crate::coordination::agents_root(&d.mission_control_root),
+                &agent_id,
+            ) {
+                let _ = std::fs::remove_dir_all(home.root());
+            }
+            Json(serde_json::json!({ "deleted": true })).into_response()
+        }
+        Ok(AgentRemoval::NotFound) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        Ok(AgentRemoval::MissionControl) => {
+            (StatusCode::BAD_REQUEST, "Mission Control can't be deleted").into_response()
+        }
+        Ok(AgentRemoval::OnOpenTasks(titles)) => {
+            let shown: Vec<String> = titles.iter().take(3).cloned().collect();
+            let more = titles.len().saturating_sub(shown.len());
+            let mut msg = format!("Still on {}: {}", if titles.len() == 1 { "a task" } else { "tasks" }, shown.join(", "));
+            if more > 0 {
+                msg.push_str(&format!(" and {more} more"));
+            }
+            msg.push_str(". Finish or reassign them first.");
+            (StatusCode::CONFLICT, msg).into_response()
+        }
+        Err(error) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("delete agent: {error}")).into_response()
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct NotificationReplayQuery {
     pub(crate) token: Option<String>,

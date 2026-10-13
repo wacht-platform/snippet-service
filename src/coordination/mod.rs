@@ -22,6 +22,7 @@ pub use board::{
 pub use direct::{
     DirectThreadSummary, LOCAL_HUMAN_ID, PendingDirectMessage, actor_ref, direct_thread_id,
 };
+pub use agents::AgentRemoval;
 pub use identity::{AgentHome, IdentityError};
 pub use tasks::{offer_marker, 
     HandoffMode, NotificationMarker, Task, TaskAgent, TaskFilter, TaskHandoff, TaskLink,
