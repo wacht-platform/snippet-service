@@ -147,6 +147,95 @@ fn scrub_partials(text: &str, value: &str, marker: &str) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct Vault {
     secrets: BTreeMap<String, String>,
+    /// Snippet's own credentials (the daemon token, provider keys, sign-in
+    /// tokens), read from its config files. Scrubbed from everything the model
+    /// sees like vault values, but never injected into commands: a script that
+    /// needs one reads it from its file at run time.
+    harness: Vec<(String, String)>,
+}
+
+fn harness_files() -> Vec<PathBuf> {
+    let home = crate::config::snippet_home();
+    ["serve.json", "serve.json.bak", "serve.token", "config.toml", "xai_auth.json", "chatgpt_auth.json"]
+        .iter()
+        .map(|f| home.join(f))
+        .collect()
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "token"
+        || k.ends_with("api_key")
+        || k.ends_with("_token")
+        || k.ends_with("secret")
+        || k.ends_with("password")
+}
+
+fn collect_json(value: &Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                match v {
+                    Value::String(s) if sensitive_key(k) => out.push((p, s.clone())),
+                    _ => collect_json(v, &p, out),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_json(item, path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_toml(value: &toml::Value, path: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        toml::Value::Table(map) => {
+            for (k, v) in map {
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                match v {
+                    toml::Value::String(s) if sensitive_key(k) => out.push((p, s.clone())),
+                    _ => collect_toml(v, &p, out),
+                }
+            }
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                collect_toml(item, path, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The credentials in Snippet's own config files, named for the redaction
+/// marker (`[secret:serve.json token]`). Values shorter than a real secret are
+/// skipped so ordinary text isn't shredded.
+fn harness_secrets(files: &[(PathBuf, Vec<u8>)]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (path, bytes) in files {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("config");
+        let text = String::from_utf8_lossy(bytes);
+        let mut found = Vec::new();
+        if name == "serve.token" {
+            found.push(("value".to_string(), text.trim().to_string()));
+        } else if name.ends_with(".toml") {
+            if let Ok(value) = text.parse::<toml::Value>() {
+                collect_toml(&value, "", &mut found);
+            }
+        } else if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            collect_json(&value, "", &mut found);
+        }
+        for (key, value) in found {
+            if value.len() >= PARTIAL_SEED && !out.iter().any(|(_, v): &(String, String)| *v == value) {
+                out.push((format!("{name} {key}"), value));
+            }
+        }
+    }
+    out
 }
 
 impl Vault {
@@ -159,15 +248,27 @@ impl Vault {
         // reading it is cheap; only the parse is skipped.
         static CACHE: std::sync::Mutex<Option<(Vec<u8>, Vault)>> = std::sync::Mutex::new(None);
         let bytes = std::fs::read(vault_path()).unwrap_or_default();
+        let files: Vec<(PathBuf, Vec<u8>)> = harness_files()
+            .into_iter()
+            .map(|p| {
+                let b = std::fs::read(&p).unwrap_or_default();
+                (p, b)
+            })
+            .collect();
+        let mut key = bytes.clone();
+        for (_, b) in &files {
+            key.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            key.extend_from_slice(b);
+        }
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((cached, vault)) = cache.as_ref() {
-            if *cached == bytes {
+            if *cached == key {
                 return vault.clone();
             }
         }
         let secrets = serde_json::from_slice(&bytes).unwrap_or_default();
-        let vault = Self { secrets };
-        *cache = Some((bytes, vault.clone()));
+        let vault = Self { secrets, harness: harness_secrets(&files) };
+        *cache = Some((key, vault.clone()));
         vault
     }
 
@@ -258,33 +359,38 @@ impl Vault {
     /// `head -c`, hexdump-adjacent tricks all emit fragments, and leaking a
     /// secret 8 chars at a time is still leaking it.
     pub fn scrub_str(&self, text: &str) -> String {
-        let mut out = text.to_string();
-        for (name, value) in &self.secrets {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        let named = self
+            .secrets
+            .iter()
+            .map(|(name, value)| (format!("[vault:{name}]"), value))
+            .chain(self.harness.iter().map(|(name, value)| (format!("[secret:{name}]"), value)));
+        for (marker, value) in named {
             if value.len() < MIN_SECRET_LEN {
                 continue;
             }
-            let marker = format!("[vault:{name}]");
-            // Redact the raw value AND its JSON-escaped on-disk form: `cat`-ing
-            // vault.json emits the escaped bytes (a value with " or \ differs from
-            // the raw string), so we must catch both representations.
-            let mut forms = vec![value.clone()];
+            // The raw value AND its JSON-escaped on-disk form: `cat`-ing a JSON
+            // file emits the escaped bytes, so both representations are caught.
+            entries.push((marker.clone(), value.clone()));
             if let Ok(json) = serde_json::to_string(value) {
-                // Strip the surrounding quotes serde adds → the escaped body.
                 let escaped = json.trim_matches('"').to_string();
-                if escaped != *value {
-                    forms.push(escaped);
+                if escaped != *value && escaped.len() >= MIN_SECRET_LEN {
+                    entries.push((marker, escaped));
                 }
             }
-            for form in forms {
-                if form.len() < MIN_SECRET_LEN {
-                    continue;
-                }
-                if out.contains(form.as_str()) {
-                    out = out.replace(form.as_str(), &marker);
-                }
-                if form.len() >= PARTIAL_SEED {
-                    out = scrub_partials(&out, &form, &marker);
-                }
+        }
+        // Whole values first, longest first, so one secret's fragments can't
+        // chew into another that shares a run with it (JWTs share headers).
+        entries.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        let mut out = text.to_string();
+        for (marker, form) in &entries {
+            if out.contains(form.as_str()) {
+                out = out.replace(form.as_str(), marker);
+            }
+        }
+        for (marker, form) in &entries {
+            if form.len() >= PARTIAL_SEED {
+                out = scrub_partials(&out, form, marker);
             }
         }
         out
@@ -292,7 +398,7 @@ impl Vault {
 
     /// Recursively scrub every string inside a JSON value (tool results).
     pub fn scrub_value(&self, value: &mut Value) {
-        if self.secrets.is_empty() {
+        if self.secrets.is_empty() && self.harness.is_empty() {
             return;
         }
         match value {
