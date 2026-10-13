@@ -28,14 +28,13 @@ use crate::mission_control as mc;
 use crate::session::{
     list_device_sessions,
     read_session_profile, read_session_sidecar, read_session_meta, read_session_state, read_session_state_tail, replay_notification_events,
-    session_id_for_state_path, start_session_with_browser_summary,
+    session_id_for_state_path, start_session,
     state_path_for_id, subscribe_device_events, write_session_profile,
     SessionRole,
 };
 
 pub mod agent_routes;
 pub(crate) use agent_routes::*;
-mod browser;
 pub mod config_routes;
 pub(crate) use config_routes::*;
 mod coordination;
@@ -65,7 +64,6 @@ pub(crate) use ws::*;
 pub use self::lifecycle::*;
 pub use self::tunnel::ensure_cloudflared_foreground;
 
-use self::browser::{BrowserManager, RegisterMessage};
 use self::fs::*;
 use self::git::*;
 use self::tunnel::{ensure_cloudflared, start_cloudflared_quick};
@@ -152,8 +150,6 @@ pub(crate) struct Daemon {
     /// Serializes git WRITE operations daemon-wide so a user's git action can't
     /// race the agent's edits (or another git write) on the same index.
     git_write: Mutex<()>,
-    /// Connected browser-extension sockets and their pending command waiters.
-    browser: BrowserManager,
     /// Recent idempotency nonces for inbound client inputs: `"session:nonce"` →
     /// first-seen time. Prevents duplicate user messages and decision retries when
     /// the mobile client resends after a reconnect.
@@ -341,7 +337,6 @@ impl Daemon {
                 initial,
                 true,
                 stream(),
-                Some(self.browser.summary_provider()),
             );
         }
         if let Some(agent_id) = sidecar.as_ref().and_then(|s| s.agent_id.as_deref()) {
@@ -364,7 +359,6 @@ impl Daemon {
                         initial.clone(),
                         true,
                         stream(),
-                        Some(self.browser.summary_provider()),
                         home,
                     ) {
                         Ok(handle) => return handle,
@@ -382,7 +376,6 @@ impl Daemon {
                     initial.clone(),
                     true,
                     stream(),
-                    Some(self.browser.summary_provider()),
                     home,
                 ) {
                     Ok(handle) => return handle,
@@ -396,13 +389,12 @@ impl Daemon {
                 Err(_) => {}
             }
         }
-        start_session_with_browser_summary(
+        start_session(
             cfg,
             sp,
             initial,
             true,
             stream(),
-            Some(self.browser.summary_provider()),
         )
     }
 
@@ -688,7 +680,6 @@ pub async fn run_serve(
         sessions: Mutex::new(HashMap::new()),
         shells: crate::term::SessionTerms::new(global_shell_cwd()),
         git_write: Mutex::new(()),
-        browser: BrowserManager::default(),
         seen_nonces: std::sync::Mutex::new(HashMap::new()),
         queue_hidden: std::sync::Mutex::new(HashMap::new()),
         queue_revision: AtomicU64::new(0),
@@ -789,9 +780,6 @@ pub async fn run_serve(
         .route("/attach", get(attach_ws))
         .route("/shells", get(shells_ws))
         .route("/events", get(events_ws))
-        .route("/browser/ws", get(browser_ws))
-        .route("/browsers", get(list_browsers))
-        .route("/browser/command", post(browser_command))
         .route("/config", get(get_config))
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
@@ -900,224 +888,6 @@ fn unauthorized() -> Response {
 #[derive(Deserialize, Clone)]
 pub(crate) struct Auth {
     pub(crate) token: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct BrowserCommandReq {
-    #[serde(alias = "deviceName")]
-    device_name: String,
-    method: String,
-    #[serde(default)]
-    args: serde_json::Value,
-}
-
-
-async fn list_browsers(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    Json(serde_json::json!({
-        "browsers": d.browser.list().await,
-    }))
-    .into_response()
-}
-
-/// POST /browser/command — authenticated relay used by the future CLI.
-async fn browser_command(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<BrowserCommandReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    if req.device_name.trim().is_empty() || req.method.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "device_name and method are required",
-        )
-            .into_response();
-    }
-    match d
-        .browser
-        .send_command_for_device_name(&req.device_name, &req.method, req.args)
-        .await
-    {
-        Ok(result) => Json(serde_json::json!({
-            "ok": true,
-            "device_name": req.device_name,
-            "method": req.method,
-            "result": result,
-        }))
-        .into_response(),
-        Err(error) => Json(serde_json::json!({
-            "ok": false,
-            "device_name": req.device_name,
-            "method": req.method,
-            "error": error,
-        }))
-        .into_response(),
-    }
-}
-
-/// WS /browser/ws?token= — extension-initiated command channel.
-async fn browser_ws(
-    ws: WebSocketUpgrade,
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    ws.on_upgrade(move |socket| handle_browser_ws(socket, d))
-}
-
-async fn handle_browser_ws(socket: WebSocket, daemon: Shared) {
-    let (mut sender, mut receiver) = socket.split();
-    let Some(Ok(Message::Text(first))) = receiver.next().await else {
-        return;
-    };
-    let Ok(register_value) = serde_json::from_str::<serde_json::Value>(first.as_str()) else {
-        let _ = sender
-            .send(Message::Text(
-                serde_json::json!({"type": "error", "error": "first message must be JSON"})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
-        return;
-    };
-    if register_value
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        != Some("register")
-    {
-        let _ = sender
-            .send(Message::Text(
-                serde_json::json!({"type": "error", "error": "first message must be register"})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
-        return;
-    }
-    let Ok(registration) = serde_json::from_value::<RegisterMessage>(register_value) else {
-        let _ = sender
-            .send(Message::Text(
-                serde_json::json!({"type": "error", "error": "invalid register message"})
-                    .to_string()
-                    .into(),
-            ))
-            .await;
-        return;
-    };
-    let (outbound, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-    let info = match daemon.browser.register(registration, outbound).await {
-        Ok(info) => info,
-        Err(error) => {
-            let _ = sender
-                .send(Message::Text(
-                    serde_json::json!({"type": "error", "error": error})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-            return;
-        }
-    };
-    let browser_id = info.browser_id.clone();
-    if sender
-        .send(Message::Text(
-            serde_json::json!({
-                "type": "registered",
-                "protocol": 1,
-                "browser": info.browser,
-                "deviceName": info.device_name,
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .is_err()
-    {
-        daemon.browser.unregister(&browser_id).await;
-        return;
-    }
-
-    let send_task = tokio::spawn(async move {
-        while let Some(message) = outbound_rx.recv().await {
-            if sender.send(message).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    while let Some(Ok(message)) = receiver.next().await {
-        match message {
-            Message::Text(text) => {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(text.as_str()) else {
-                    continue;
-                };
-                match value.get("type").and_then(serde_json::Value::as_str) {
-                    Some("heartbeat") => {
-                        daemon.browser.touch(&browser_id).await;
-                        let _ = daemon
-                            .browser
-                            .send_message(
-                                &browser_id,
-                                Message::Text(
-                                    serde_json::json!({
-                                        "type": "heartbeat_ack",
-                                        "at": value.get("at").cloned().unwrap_or(serde_json::Value::Null),
-                                    })
-                                    .to_string()
-                                    .into(),
-                                ),
-                            )
-                            .await;
-                    }
-                    Some("pong") => {
-                        daemon.browser.touch(&browser_id).await;
-                    }
-                    Some("result") => {
-                        let Some(id) = value.get("id").and_then(serde_json::Value::as_str) else {
-                            continue;
-                        };
-                        let ok = value
-                            .get("ok")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
-                        daemon
-                            .browser
-                            .complete(
-                                id,
-                                ok,
-                                value.get("result").cloned(),
-                                value
-                                    .get("error")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string),
-                            )
-                            .await;
-                        daemon.browser.touch(&browser_id).await;
-                    }
-                    Some("tab_event") => daemon.browser.touch(&browser_id).await,
-                    _ => {}
-                }
-            }
-            Message::Ping(payload) => {
-                daemon.browser.touch(&browser_id).await;
-                let _ = daemon
-                    .browser
-                    .send_message(&browser_id, Message::Pong(payload))
-                    .await;
-            }
-            Message::Close(_) => break,
-            _ => {}
-        }
-    }
-    send_task.abort();
-    daemon.browser.unregister(&browser_id).await;
 }
 
 #[derive(Deserialize)]
@@ -1328,7 +1098,7 @@ async fn open_session(
 
     let mut sessions = d.sessions.lock().await;
     if !sessions.contains_key(&id) {
-        let handle = start_session_with_browser_summary(
+        let handle = start_session(
             &cfg,
             sp.clone(),
             None,
@@ -1336,7 +1106,6 @@ async fn open_session(
             Some(std::sync::Arc::new(std::sync::Mutex::new(
                 crate::llm::StreamBuffer::default(),
             ))),
-            Some(d.browser.summary_provider()),
         );
         if persisted.is_none()
             && let Some(name) = req.profile.clone()

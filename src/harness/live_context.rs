@@ -15,7 +15,6 @@ pub(super) fn build_reminder(
     vars: &mut LoopVars,
     workspace: &std::path::Path,
     cwd: &std::path::Path,
-    browser_summary: Option<String>,
     tasks: String,
 ) -> Option<String> {
     if vars.reminded_compactions != state.compactions {
@@ -23,7 +22,7 @@ pub(super) fn build_reminder(
         vars.reminded_compactions = state.compactions;
     }
     let mut lines: Vec<String> = Vec::new();
-    for (key, current, cleared) in sections(state, workspace, cwd, browser_summary, tasks) {
+    for (key, current, cleared) in sections(state, workspace, cwd, tasks) {
         let previous = vars.reminded.get(key).cloned().unwrap_or_default();
         if current == previous {
             continue;
@@ -68,7 +67,6 @@ fn sections(
     state: &HarnessState,
     workspace: &std::path::Path,
     cwd: &std::path::Path,
-    browser_summary: Option<String>,
     tasks: String,
 ) -> Vec<(&'static str, String, Option<&'static str>)> {
     let mut out = Vec::new();
@@ -93,11 +91,6 @@ fn sections(
         out.push(("autonomy", crate::mission_autonomy::mode_line(), None));
         out.push(("clock", crate::mission_autonomy::clock_line(), None));
     }
-
-    let browser = browser_summary
-        .filter(|summary| crate::session::browser_summary_is_connected(summary))
-        .unwrap_or_default();
-    out.push(("browser", browser, Some("No browser is connected any more.")));
 
     let vault_names = crate::vault::Vault::load().names();
     out.push((

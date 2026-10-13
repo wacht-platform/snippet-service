@@ -25,7 +25,6 @@
 - Anthropic, OpenAI, Gemini, OpenRouter, OpenAI-compatible endpoints, local models, and ChatGPT subscription login.
 - Delegated background lanes with live progress and recovery after reconnects.
 - Detached background processes for servers and watchers.
-- Optional Chrome/Firefox browser extension control through the `snippet browser` CLI.
 - Remote control through the companion Android, macOS, and Windows app.
 
 ## Install

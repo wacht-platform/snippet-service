@@ -63,11 +63,6 @@ enum Command {
         #[arg(long, hide = true)]
         supervised: bool,
     },
-    /// Manage connected browser extensions through the authenticated serve daemon.
-    Browser {
-        #[command(subcommand)]
-        action: BrowserAction,
-    },
     /// Manage the secret vault (~/.snippet/vault.json). Secrets are usable by the
     /// agent as $NAME in shell commands; values are injected into the child
     /// process and redacted from everything the model sees.
@@ -168,134 +163,6 @@ enum HistoryAction {
         /// Session to read (defaults to $SNIPPET_SESSION_ID).
         #[arg(long)]
         session: Option<String>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum BrowserAction {
-    /// Print the complete authenticated WebSocket URI for a new browser extension.
-    Uri {
-        /// Print a JSON object instead of only the URI.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List all connected browser extensions.
-    List {
-        /// Print the response as formatted JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Print the browser-control manual for agents and humans.
-    Manual {
-        /// Print machine-readable JSON instead of Markdown.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Relay an arbitrary extension method through the daemon.
-    Call {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        method: String,
-        /// JSON object passed as the extension method arguments.
-        #[arg(long, default_value = "{}")]
-        args: String,
-    },
-    /// Take a compact DOM/page snapshot.
-    Snapshot {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        tab: i64,
-        #[arg(long, default_value_t = 120)]
-        max_elements: usize,
-        #[arg(long, default_value_t = 8000)]
-        max_text: usize,
-    },
-    /// Click a snapshot element reference.
-    Click {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        tab: i64,
-        #[arg(long = "ref")]
-        element_ref: String,
-        /// Use Chrome's real pointer path instead of DOM click.
-        #[arg(long)]
-        cdp: bool,
-    },
-    /// Type into a snapshot element reference.
-    Type {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        tab: i64,
-        #[arg(long = "ref")]
-        element_ref: String,
-        text: String,
-        #[arg(long)]
-        append: bool,
-    },
-    /// Drag from one snapshot element reference to another.
-    Drag {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        tab: i64,
-        #[arg(long)]
-        from: String,
-        #[arg(long)]
-        to: String,
-        /// Use Chrome's real pointer path instead of HTML5 drag events.
-        #[arg(long)]
-        cdp: bool,
-    },
-    /// Drag from one snapshot element reference to another using HTML5 drag events.
-    DragHtml5 {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        tab: i64,
-        #[arg(long)]
-        from: String,
-        #[arg(long)]
-        to: String,
-    },
-    /// Drag between viewport CSS-pixel coordinates without snapshot references.
-    DragCoordinates {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        tab: i64,
-        #[arg(long)]
-        x1: f64,
-        #[arg(long)]
-        y1: f64,
-        #[arg(long)]
-        x2: f64,
-        #[arg(long)]
-        y2: f64,
-        /// Number of bounded intermediate pointer positions (2-100).
-        #[arg(long, default_value_t = 8)]
-        steps: u32,
-    },
-    /// Upload one local file into a file input element reference.
-    Upload {
-        /// Connected device name shown by `snippet browser list`.
-        #[arg(long, alias = "browser")]
-        device_name: String,
-        #[arg(long)]
-        tab: i64,
-        #[arg(long = "ref")]
-        element_ref: String,
-        file: PathBuf,
     },
 }
 
@@ -449,7 +316,7 @@ async fn daemon_http(
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let mut url = browser_route_url(state.base_url(), route)?;
+    let mut url = serve_route_url(state.base_url(), route)?;
     {
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("token", &state.token);
@@ -495,7 +362,7 @@ async fn daemon_http(
 /// daemon owns delivery, wake-up, and the retry ledger, so a message this CLI
 /// accepts is still delivered after a restart.
 async fn agent_cli(action: AgentAction) -> Result<(), Box<dyn std::error::Error>> {
-    let state = browser_connection().map_err(|error| {
+    let state = serve_connection().map_err(|error| {
         format!(
             "{error}\n\nis the daemon running? start it with `snippet serve`, then check `snippet serve --status`"
         )
@@ -745,18 +612,18 @@ fn serve_state_path() -> PathBuf {
         .join(".snippet/serve.json")
 }
 
-fn browser_connection() -> Result<ServeState, Box<dyn std::error::Error>> {
+fn serve_connection() -> Result<ServeState, Box<dyn std::error::Error>> {
     let path = serve_state_path();
     let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let state: ServeState =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))?;
     if state.url.trim().is_empty() || state.token.trim().is_empty() {
-        return Err(format!("{} has no usable browser connection", path.display()).into());
+        return Err(format!("{} has no usable daemon connection", path.display()).into());
     }
     Ok(state)
 }
 
-fn browser_route_url(
+fn serve_route_url(
     base_url: &str,
     route: &str,
 ) -> Result<reqwest::Url, Box<dyn std::error::Error>> {
@@ -773,408 +640,6 @@ fn browser_route_url(
     Ok(url)
 }
 
-fn browser_ws_uri(state: &ServeState) -> Result<String, Box<dyn std::error::Error>> {
-    let mut url = browser_route_url(&state.url, "browser/ws")?;
-    let scheme = match url.scheme() {
-        "https" => "wss",
-        "http" => "ws",
-        other => return Err(format!("unsupported serve URL scheme `{other}`").into()),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| "could not set WebSocket URL scheme")?;
-    url.query_pairs_mut().append_pair("token", &state.token);
-    Ok(url.to_string())
-}
-
-async fn browser_http(
-    base_url: &str,
-    method: &str,
-    args: serde_json::Value,
-    token: &str,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    let response = match method {
-        "GET" => {
-            client
-                .get(browser_route_url(base_url, "browsers")?)
-                .query(&[("token", token)])
-                .send()
-                .await?
-        }
-        "POST" => {
-            client
-                .post(browser_route_url(base_url, "browser/command")?)
-                .query(&[("token", token)])
-                .json(&args)
-                .send()
-                .await?
-        }
-        _ => return Err(format!("unsupported browser HTTP method `{method}`").into()),
-    };
-    let status = response.status();
-    let body = response.text().await?;
-    let value = serde_json::from_str::<serde_json::Value>(&body)
-        .unwrap_or_else(|_| serde_json::json!({"error": body}));
-    if !status.is_success() {
-        return Err(format!("browser daemon returned {status}: {value}").into());
-    }
-    Ok(value)
-}
-
-fn browser_command_error(value: &serde_json::Value) -> Option<String> {
-    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-        Some(
-            value
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("browser command failed")
-                .to_string(),
-        )
-    } else {
-        None
-    }
-}
-
-fn print_browser_json(
-    value: &serde_json::Value,
-    pretty: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let rendered = if pretty {
-        serde_json::to_string_pretty(value)?
-    } else {
-        serde_json::to_string(value)?
-    };
-    const MAX_INLINE_BYTES: usize = 32 * 1024;
-    if rendered.len() > MAX_INLINE_BYTES {
-        let path = std::env::temp_dir().join(format!(
-            "snippet-browser-response-{}.json",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::write(&path, rendered.as_bytes())?;
-        println!(
-            "{}",
-            serde_json::json!({
-                "path": path,
-                "truncated": true,
-                "bytes": rendered.len(),
-                "message": "Response saved to a temporary file because it exceeded the inline output limit"
-            })
-        );
-    } else {
-        println!("{rendered}");
-    }
-    Ok(())
-}
-
-fn save_screenshot_tmp(value: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
-    use base64::Engine as _;
-    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-        let error = value
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("browser screenshot command failed");
-        return Err(error.to_string().into());
-    }
-    let data_url = value
-        .pointer("/result/dataUrl")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("screenshot response did not contain result.dataUrl")?;
-    let (header, encoded) = data_url
-        .split_once(",")
-        .ok_or("invalid screenshot data URL")?;
-    if !header.starts_with("data:image/") || !header.ends_with(";base64") {
-        return Err("unsupported screenshot data URL".into());
-    }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-    let path = std::env::temp_dir().join(format!(
-        "snippet-screenshot-{}.png",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::write(&path, bytes)?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
-fn mime_type(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "txt" => "text/plain",
-        "html" | "htm" => "text/html",
-        "json" => "application/json",
-        "csv" => "text/csv",
-        "pdf" => "application/pdf",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
-    }
-}
-
-fn browser_manual(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let manual = serde_json::json!({
-        "workflow": [
-            "Once per connection: list --json for device_name, then tabs.query for TAB_ID; reuse both until invalidated.",
-            "Keep output small: pipe list/snapshot/manual JSON through jq and return only fields needed for the next action.",
-            "Choose by question: page.eval for a known value/state; filtered page.snapshot for semantic DOM discovery and refs; page.screenshot only when pixels matter or DOM is insufficient (canvas/WebGL, charts/maps, overlays/clipping, responsive layout, colors/spacing, drag geometry, or final visual confirmation).",
-            "Snapshot answers WHAT exists and gives refs; screenshot answers HOW it looks but has no refs and costs image tokens. Screenshot once at the relevant state, inspect it, then return to eval/snapshot for actions; screenshots in a loop, or as OCR for ordinary DOM text, cost far more than they tell you.",
-            "Need text rather than refs/pixels: use page.eval with targeted element.innerText. For broad extraction, get counts/headings or structured section snippets first, then narrow; do not dump body.innerText into model context unless explicitly required. Full text should be chunked or processed outside context. Virtualized lists require scroll+collect+dedupe; use frameId for iframes.",
-            "Multiple CLI calls are allowed and often required. Use a short adaptive loop: inspect -> act -> verify -> recalculate -> continue, reading each result before choosing the next call. Uncertain UI actions go one at a time; a single pipeline suits only deterministic reads, or a harmless action plus a tiny check.",
-            "One action, then one small state check. Re-snapshot only after navigation/DOM change or a stale-ref error.",
-            "Use page.type for the whole string (it replaces unless append:true). Following type with page.key of the same characters doubles them (5 then key 5 → 55). page.key is named keys/shortcuts or one extra printable. Tiny icon buttons often have data-testid; filter snapshot for testid, and keep 16–24px controls in view. Use refs for DOM, coordinates/mouse for canvas or elements without refs.",
-            "Reliable, graceful scrolling may take multiple calls: measure -> calculated wheel -> verify -> recalculate, repeated until target visible, end reached, or no progress. Known destination -> page.scroll{ref}; normal document -> page.scroll{x,y}; nested/virtual/wheel-driven pane -> locate its visible rect and scroll metrics with a SMALL page.eval, then page.mouse.wheel at a viewport point inside that rect; hover there first if needed. Calculate step from the pane and remaining distance: sign(target-current)*min(abs(remaining), max(120, floor(clientSize*0.7))); reduce to ~0.25 pane near a target. Wait and verify scrollTop plus visible content between inputs. Use deltaX for horizontal panes.",
-            "Wheel coordinates are viewport CSS pixels, not document coordinates: require 0<=x<innerWidth and 0<=y<innerHeight, and keep the point inside the intended visible scroller. Use one moderate delta (~0.5-0.9 viewport) at a time. If unchanged, check end-of-scroll, wrong axis, overlay, iframe, or wrong scroll owner instead of repeating.",
-            "Stick to the methods listed here rather than inventing new ones or calling Runtime.evaluate directly. Query one contract with: snippet browser manual --json | jq '.methods[\"METHOD\"]'.",
-            "Network/console: start, reproduce once, get a small limit, stop."
-        ],
-        "methods": {
-            "tabs.query": "{active:true} is optional; returns tab objects. Use result[].id.",
-            "tabs.get": "Requires {tabId:number}.",
-            "tabs.update": "Requires {tabId:number,url:string}.",
-            "tabs.create": "Creates a tab; usually provide {url:string}.",
-            "tabs.remove": "Requires {tabId:number} or {tabIds:[number]}.",
-            "page.snapshot": "Use when you need semantic DOM discovery or actionable refs: text, roles, labels, states, and rects. It answers WHAT exists, not visual appearance. Requires {tabId:number}; returns refs such as e42. Output can be large: pipe through jq and keep only matching ref/text/label/rect fields.",
-            "page.click": "Requires {tabId:number,ref:string}; optional mode dom or cdp.",
-            "page.type": "Requires {tabId:number,ref:string,text:string}; optional append. Writes the whole string (replaces unless append:true), including contenteditable/Draft.js via insertText. Adding page.key with the same characters doubles them.",
-            "page.key": "Requires {tabId:number,ref:string,key:string}; optional code. Named keys handle Enter/Escape/Tab/arrows/shortcuts; one printable character inserts into editable controls and reports inserted. Prefer page.type for bulk text; typing and then keying the same text doubles it. Enter also requestSubmit()s the enclosing form. Ref must be fresh.",
-            "page.drag": "Requires {tabId:number,from:string,to:string}; drags between snapshot refs; optional mode cdp.",
-            "page.dragHtml5": "Requires {tabId:number,from:string,to:string}; uses HTML5 drag events between snapshot refs.",
-            "page.dragCoordinates": "Requires {tabId:number,x1:number,y1:number,x2:number,y2:number}; viewport CSS pixels, optional steps 2-100.",
-            "page.scroll": "Reliable first choices: finite {x,y} scrolls the normal viewport; {ref} uses scrollIntoView to reveal a known DOM target. Requires {tabId:number}. If scrolled:false or window.scrollY stays fixed, find the actual nested scroll owner with a small page.eval (scrollHeight>clientHeight plus scrollTop and rect), then use page.mouse.wheel inside its visible rect. Verify movement/content.",
-            "page.geometry": "Requires {tabId:number,ref:string}; returns the element center and rect.",
-            "page.clickCoordinate": "Requires {tabId:number,x:number,y:number}; uses Chrome CDP pointer input when available.",
-            "page.mouse.click": "Requires {tabId:number,x:number,y:number}; Chrome uses Input.dispatchMouseEvent.",
-            "page.mouse.move": "Requires {tabId:number,x:number,y:number}; optional steps and fromX/fromY.",
-            "page.mouse.down": "Requires {tabId:number,x:number,y:number}; optional button.",
-            "page.mouse.up": "Requires {tabId:number,x:number,y:number}; optional button.",
-            "page.mouse.wheel": "Requires {tabId:number} and non-zero deltaX or deltaY; x/y are VIEWPORT CSS pixels, not document coordinates. Validate 0<=x<innerWidth and 0<=y<innerHeight and place the point inside the intended visible scroller rect. Best for nested, virtualized, hover-sensitive, or wheel-driven UI; move the mouse into the pane first if needed. Calculate a graceful step from remaining distance and pane size: direction=sign(target-current), magnitude=min(abs(remaining), max(120, floor(clientSize*0.7))); use ~0.25 pane near the target and stop at a known end. Send one event, allow smooth/lazy rendering to settle, then verify scrollTop AND newly visible content. A transport-level scrolled:true only means the wheel event was sent. Stop when target is visible or no progress; if unchanged, inspect max scroll, axis, overlay, iframe/frameId, or another scroll owner instead of repeating.",
-            "page.listFrames": "Requires {tabId:number}; returns frame ids. Pass frameId to page.snapshot and content-script actions.",
-            "page.upload": "Requires {tabId:number,ref:string,files:[{name,type,data}]}; data is base64.",
-            "page.getCookies": "Requires {tabId:number}; returns cookies for the tab URL.",
-            "page.setCookie": "Requires {tabId:number,name:string,value:string}; provide url or use the tab URL.",
-            "page.removeCookies": "Requires {tabId:number,name:string}; optionally provide domain and path.",
-            "page.handleDialog": "Chrome only; requires {tabId:number,accept:boolean}; enable dialog events first.",
-            "page.enableDialogs": "Chrome only; requires {tabId:number}; keeps dialog event capture active until disconnect.",
-            "page.startConsole": "Chrome only; requires {tabId:number}; starts bounded console event capture.",
-            "page.getConsole": "Chrome only; optional {limit:number,consume:boolean}; returns buffered console events. consume defaults true.",
-            "page.stopConsole": "Chrome only; stops capture and releases its debugger use.",
-            "page.eval": "Requires {tabId:number,expression:string}; do not call Runtime.evaluate. Best for known state and text extraction: targeted el.innerText approximates rendered text; textContent includes hidden/unrendered text. For broad pages, first return character/line counts, headings, or structured h1/h2/h3/p/li/table snippets and narrow by keyword. Only extract full body when explicitly needed; chunk or process large text outside model context. Virtualized/lazy lists expose only mounted rows, so scroll+collect+dedupe; iframes need listFrames/frameId; open shadow roots need recursive traversal; canvas text needs screenshot or app-state inspection. Return a small scalar/object by default.",
-            "page.screenshot": "Use only when pixels matter or DOM is insufficient: canvas/WebGL, charts/maps, overlays/clipping, responsive layout, colors/spacing, drag geometry, or final visual confirmation. It answers HOW the page looks but provides no refs and costs image tokens. Set the relevant tab/scroll/dialog state first; capture once, inspect it, then act via a fresh snapshot ref or verified coordinates. Ordinary DOM text reads better from a snapshot, and one capture per state is plenty. Requires {tabId:number}; Firefox requires the tab to be active.",
-            "netwatch.start": "Requires {tabId:number}; starts bounded metadata-only network capture for that tab.",
-            "netwatch.pause": "Pauses capture while retaining the watcher and buffered events.",
-            "netwatch.resume": "Resumes capture for the active watcher.",
-            "netwatch.getEvents": "Returns buffered request/response/error metadata; optional {limit:number,consume:boolean}. consume defaults true; false peeks without removing events.",
-            "netwatch.stop": "Stops capture and releases the Chrome debugger attachment."
-        },
-        "errors": {
-            "missing_tabId": "Stop. Run tabs.query and use the returned numeric id; a guessed id points at nothing.",
-            "method_not_allowed": "Stop. Use only a method listed by browser list capabilities or this manual; do not retry a renamed/invented method.",
-            "stale_ref": "Run page.snapshot again and use a fresh ref.",
-            "inactive_firefox_tab": "Activate the target tab, then retry page.eval or page.screenshot once.",
-            "network": "netwatch captures bounded metadata only (URL, method, type, status, errors); it does not capture request or response bodies."
-        }
-    });
-    if json {
-        println!("{}", serde_json::to_string_pretty(&manual)?);
-    } else {
-        println!(
-            "BROWSER MANUAL\n\n{}",
-            serde_json::to_string_pretty(&manual)?
-        );
-    }
-    Ok(())
-}
-
-async fn browser_cli(action: BrowserAction) -> Result<(), Box<dyn std::error::Error>> {
-    if let BrowserAction::Manual { json } = action {
-        return browser_manual(json);
-    }
-    let state = browser_connection()?;
-    match action {
-        BrowserAction::Manual { .. } => unreachable!("manual handled before daemon connection"),
-        BrowserAction::Uri { json } => {
-            let uri = browser_ws_uri(&state)?;
-            if json {
-                print_browser_json(
-                    &serde_json::json!({"uri": uri, "url": state.url, "token": state.token}),
-                    true,
-                )
-            } else {
-                println!("{uri}");
-                Ok(())
-            }
-        }
-        BrowserAction::List { json } => {
-            let value = browser_http(
-                &state.url,
-                "GET",
-                serde_json::Value::Null,
-                &state.token,
-            )
-            .await?;
-            print_browser_json(&value, json)
-        }
-        BrowserAction::Call {
-            device_name,
-            method,
-            args,
-        } => {
-            let args: serde_json::Value = serde_json::from_str(&args)
-                .map_err(|e| format!("invalid --args JSON: {e}"))?;
-            let value = browser_http(
-                &state.url,
-                "POST",
-                serde_json::json!({"device_name": device_name, "method": method, "args": args}),
-                &state.token,
-            )
-            .await?;
-            if let Some(error) = browser_command_error(&value) {
-                return Err(error.into());
-            }
-            if method == "page.screenshot" {
-                let path = save_screenshot_tmp(&value)?;
-                print_browser_json(&serde_json::json!({"path": path}), true)
-            } else {
-                print_browser_json(&value, true)
-            }
-        }
-        BrowserAction::Snapshot {
-            device_name,
-            tab,
-            max_elements,
-            max_text,
-        } => browser_command_cli(
-            &state.url,
-            &state.token,
-            device_name,
-            "page.snapshot",
-            serde_json::json!({"tabId": tab, "maxElements": max_elements, "maxText": max_text}),
-        )
-        .await,
-        BrowserAction::Click {
-            device_name,
-            tab,
-            element_ref,
-            cdp,
-        } => browser_command_cli(
-            &state.url,
-            &state.token,
-            device_name,
-            "page.click",
-            serde_json::json!({"tabId": tab, "ref": element_ref, "mode": if cdp { "cdp" } else { "dom" }}),
-        )
-        .await,
-        BrowserAction::Type {
-            device_name,
-            tab,
-            element_ref,
-            text,
-            append,
-        } => browser_command_cli(
-            &state.url,
-            &state.token,
-            device_name,
-            "page.type",
-            serde_json::json!({"tabId": tab, "ref": element_ref, "text": text, "append": append}),
-        )
-        .await,
-        BrowserAction::Drag {
-            device_name,
-            tab,
-            from,
-            to,
-            cdp,
-        } => browser_command_cli(
-            &state.url,
-            &state.token,
-            device_name,
-            "page.drag",
-            serde_json::json!({"tabId": tab, "from": from, "to": to, "mode": if cdp { "cdp" } else { "html5" }}),
-        )
-        .await,
-        BrowserAction::DragHtml5 {
-            device_name,
-            tab,
-            from,
-            to,
-        } => browser_command_cli(
-            &state.url,
-            &state.token,
-            device_name,
-            "page.dragHtml5",
-            serde_json::json!({"tabId": tab, "from": from, "to": to}),
-        )
-        .await,
-        BrowserAction::DragCoordinates {
-            device_name,
-            tab,
-            x1,
-            y1,
-            x2,
-            y2,
-            steps,
-        } => browser_command_cli(
-            &state.url,
-            &state.token,
-            device_name,
-            "page.dragCoordinates",
-            serde_json::json!({"tabId": tab, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "steps": steps}),
-        )
-        .await,
-        BrowserAction::Upload {
-            device_name,
-            tab,
-            element_ref,
-            file,
-        } => {
-            let data = std::fs::read(&file)
-                .map_err(|e| format!("read upload {}: {e}", file.display()))?;
-            use base64::Engine as _;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-            let name = file
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| format!("upload path has no valid file name: {}", file.display()))?;
-            browser_command_cli(
-                &state.url,
-                &state.token,
-                device_name,
-                "page.upload",
-                serde_json::json!({"tabId": tab, "ref": element_ref, "files": [{"name": name, "type": mime_type(&file), "data": encoded}]}),
-            )
-            .await
-        }
-    }
-}
-
-async fn browser_command_cli(
-    base_url: &str,
-    token: &str,
-    device_name: String,
-    method: &str,
-    args: serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let value = browser_http(
-        base_url,
-        "POST",
-        serde_json::json!({"device_name": device_name, "method": method, "args": args}),
-        token,
-    )
-    .await?;
-    if let Some(error) = browser_command_error(&value) {
-        return Err(error.into());
-    }
-    print_browser_json(&value, true)
-}
-
-// Not `#[tokio::main]`: `serve` daemonizes (fork) before any runtime threads exist,
-// so the runtime is built explicitly *after* the fork.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let config_path = config_path(&cli);
@@ -1187,7 +652,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Vault { action }) => return vault_cli(action),
         Some(Command::History { action }) => return history_cli(action),
         Some(Command::Agent { action }) => return runtime()?.block_on(agent_cli(action)),
-        Some(Command::Browser { action }) => return runtime()?.block_on(browser_cli(action)),
         Some(Command::AgyHook) => return Ok(snippet::antigravity::run_hook()?),
         Some(Command::Serve {
             port,

@@ -63,14 +63,10 @@ fn content_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-pub type BrowserSummaryProvider = Arc<dyn Fn() -> String + Send + Sync>;
-
-
 #[derive(Clone)]
 pub struct ToolContext {
     workspace_root: PathBuf,
     owner: String,
-    browser_summary: Option<BrowserSummaryProvider>,
     /// Whole-file content hashes this context last saw per path — recorded on read
     /// and after its own writes. A write is rejected when the file on disk no
     /// longer matches the recorded hash, catching any change since (including
@@ -113,27 +109,12 @@ impl ToolContext {
         Ok(context)
     }
 
-    pub fn with_browser_summary(
-        workspace_root: impl Into<PathBuf>,
-        browser_summary: BrowserSummaryProvider,
-    ) -> Result<Self, ToolError> {
-        Self::with_owner_and_browser_summary(workspace_root, "main", Some(browser_summary))
-    }
-
     /// Build a context with an `owner` label (e.g. "main" or a lane id). Each
     /// context tracks its own seen-hashes; staleness is detected against the file
     /// on disk, so lanes need not share any state.
     pub fn with_owner(
         workspace_root: impl Into<PathBuf>,
         owner: impl Into<String>,
-    ) -> Result<Self, ToolError> {
-        Self::with_owner_and_browser_summary(workspace_root, owner, None)
-    }
-
-    fn with_owner_and_browser_summary(
-        workspace_root: impl Into<PathBuf>,
-        owner: impl Into<String>,
-        browser_summary: Option<BrowserSummaryProvider>,
     ) -> Result<Self, ToolError> {
         let root = workspace_root.into();
         let root = if root.exists() {
@@ -145,7 +126,6 @@ impl ToolContext {
             current_dir: Arc::new(Mutex::new(root.clone())),
             workspace_root: root,
             owner: owner.into(),
-            browser_summary,
             seen: Arc::new(Mutex::new(HashMap::new())),
             mission_control: false,
             durable_session_id: None,
@@ -244,11 +224,6 @@ impl ToolContext {
 
     pub fn lane_origin(&self) -> Option<(&str, &str)> {
         self.lane_origin.as_ref().map(|(session, lane)| (session.as_str(), lane.as_str()))
-    }
-
-
-    pub fn browser_summary(&self) -> Option<String> {
-        self.browser_summary.as_ref().map(|provider| provider())
     }
 
     /// Reject a write to `path` when the file on disk differs from what this
