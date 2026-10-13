@@ -173,6 +173,17 @@ pub fn list(session: &str) -> Vec<Artifact> {
     out
 }
 
+pub fn markdown_link(session: &str, title: &str, id: &str, version: u32) -> String {
+    let label: String = title
+        .chars()
+        .map(|c| match c {
+            '[' | ']' => ' ',
+            c => c,
+        })
+        .collect();
+    format!("[{}](artifact:{session}/{id}@{version})", label.trim())
+}
+
 pub fn get(session: &str, id: &str) -> Option<Artifact> {
     safe_component(id).then(|| load(&session_dir(session).join(id))).flatten()
 }

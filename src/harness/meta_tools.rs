@@ -147,6 +147,7 @@ impl CodingHarness {
                             json!({"schema_version": 1, "status": "success", "data": {
                                 "artifact_id": presented.artifact.id,
                                 "version": presented.version,
+                                "link": crate::artifacts::markdown_link(&session, &presented.artifact.title, &presented.artifact.id, presented.version),
                                 "note": "unchanged since the version the user already has, so nothing new was shown",
                                 "broken_references": presented.broken,
                             }}),
@@ -166,6 +167,7 @@ impl CodingHarness {
                                 json!({"schema_version": 1, "status": "success", "data": {
                                     "artifact_id": presented.artifact.id,
                                     "version": presented.version,
+                                    "link": crate::artifacts::markdown_link(&session, &presented.artifact.title, &presented.artifact.id, presented.version),
                                     "bundled": presented.bundled,
                                     "broken_references": presented.broken,
                                     "check": if presented.broken.is_empty() { serde_json::Value::Null } else {
