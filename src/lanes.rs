@@ -969,7 +969,10 @@ async fn run_lane(
     let harness = CodingHarness::new(
         HarnessConfig {
             system_prompt: lane_prompt(
-                &PromptContext::detect(&workspace_for_grounding, true, false),
+                &PromptContext {
+                    images: model.supports_images(),
+                    ..PromptContext::detect(&workspace_for_grounding, true, false)
+                },
                 identity.as_ref().map(|(id, body)| (id.as_str(), body.as_str())),
             ),
             state_path: Some(state_path),
