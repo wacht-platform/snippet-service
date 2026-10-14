@@ -452,6 +452,7 @@ impl CodingHarness {
                             && self.config.memory_enabled
                             && self.config.memory_reflect
                             && self.context.owner() == "main"
+                            && self.context.agent_id().is_none()
                         {
                             match self.reflect_on_request(model, &state).await {
                                 Ok(true) => {

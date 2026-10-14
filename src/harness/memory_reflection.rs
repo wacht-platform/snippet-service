@@ -329,7 +329,7 @@ pub(super) fn reflection_scope(state: &HarnessState) -> Option<String> {
     let events = &state.events[start..];
     let tools = events.iter().filter(|e| matches!(e, HarnessEvent::ToolResult { .. })).count();
     let asks = events.iter().filter(|e| matches!(e, HarnessEvent::UserInput { .. })).count();
-    if tools < 3 && asks < 3 {
+    if tools < 100 || asks < 4 {
         return None;
     }
     Some(
