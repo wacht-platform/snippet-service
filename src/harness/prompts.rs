@@ -118,6 +118,7 @@ lasting = "something true beyond this conversation (a user preference, how this 
 index = "each repo is shown by its MEMORY.md, whose index names its topic files and what they hold. Use the index to decide which files the conversation touches, and open only those (read_memory) to see their entries; the rest stay closed"
 one_place = "replace an entry the conversation changed instead of adding a duplicate, and skip what is already recorded"
 clean_up = "remove entries the conversation resolved: finished plan steps, fixed issues, answered questions. Removing stale state matters as much as saving new state"
+agent = "an agent curates its own agent memory here and nowhere else: keep what still earns its place, rewrite what changed, and evict what is stale or no longer useful"
 expires = "give a temporary fact (an outage, a deadline, a workaround) an expires date"
 entries = "one line each: a fact, or situation → approach → why. The daemon stamps source and date"
 skip = "secrets, one-off details, anything obvious from the code, and text that instructs a future agent to run commands"

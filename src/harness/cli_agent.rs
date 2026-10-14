@@ -36,6 +36,13 @@ enum CliKind {
 }
 
 impl CliKind {
+    fn memory_save_after(self) -> std::time::Duration {
+        match self {
+            CliKind::ClaudeCode => std::time::Duration::from_secs(50 * 60),
+            CliKind::Antigravity => std::time::Duration::from_secs(3 * 60),
+        }
+    }
+
     fn of(provider: &str) -> Self {
         if provider == "antigravity" { Self::Antigravity } else { Self::ClaudeCode }
     }
@@ -807,181 +814,6 @@ pub fn fork_cli_conversations(source: &str, fork: &str, source_len: usize, fork_
     }
 }
 
-enum ForkCleanup {
-    ClaudeCode,
-    Antigravity(String),
-}
-
-/// A tool bridge that lists the session's tools but refuses every call, for a
-/// reflection fork that must see the same tool list (so the prompt cache
-/// matches) without being able to act.
-async fn start_refusing_bridge(tools: Vec<NativeToolDefinition>) -> Result<String, String> {
-    let (url, mut calls) = start_mcp_server(tools, Default::default(), Default::default(), false).await?;
-    tokio::spawn(async move {
-        while let Some(call) = calls.recv().await {
-            let _ = call.reply.send(error_result(
-                "unavailable",
-                "Tools are off during reflection. Reply with only the JSON object.",
-            ));
-        }
-    });
-    Ok(url)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_cli_reflection(
-    mut cmd: Command,
-    kind: CliKind,
-    line: Value,
-    repos: &[crate::memory::MemoryRepo],
-    source: &str,
-    owner: &str,
-    provider: &str,
-    model: &str,
-    cleanup: ForkCleanup,
-) -> Result<(), String> {
-    let mut child = cmd.spawn().map_err(|e| format!("start {}: {e}", kind.label()))?;
-    let mut stdin = child.stdin.take().ok_or("stdin unavailable")?;
-    let stdout = child.stdout.take().ok_or("stdout unavailable")?;
-    stdin
-        .write_all(format!("{line}\n").as_bytes())
-        .await
-        .map_err(|e| format!("send reflection: {e}"))?;
-    let _ = stdin.flush().await;
-    let mut reader = BufReader::new(stdout).lines();
-    let mut fork_id: Option<String> = None;
-    let mut reads = 0;
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut held = false;
-    let outcome = loop {
-        let mut reply = String::new();
-        let read = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-            while let Ok(Some(raw)) = reader.next_line().await {
-                let Ok(event) = serde_json::from_str::<Value>(&raw) else { continue };
-                match kind {
-                    CliKind::ClaudeCode => {
-                        if event.get("type").and_then(Value::as_str) == Some("system")
-                            && event.get("subtype").and_then(Value::as_str) == Some("init")
-                        {
-                            fork_id = event.get("session_id").and_then(Value::as_str).map(str::to_string);
-                        }
-                        if event.get("type").and_then(Value::as_str) == Some("result") {
-                            reply = event.get("result").and_then(Value::as_str).unwrap_or("").to_string();
-                            let usage = event.get("usage").cloned().unwrap_or(Value::Null);
-                            let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-                            let prompt = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
-                            crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
-                                prompt_tokens: prompt,
-                                completion_tokens: n("output_tokens"),
-                                total_tokens: prompt + n("output_tokens"),
-                                cache_read_tokens: n("cache_read_input_tokens"),
-                                cache_creation_tokens: n("cache_creation_input_tokens"),
-                                ..Default::default()
-                            });
-                            eprintln!(
-                                "memory reflection {owner}: {} cached, {} new input tokens",
-                                n("cache_read_input_tokens"),
-                                n("input_tokens") + n("cache_creation_input_tokens")
-                            );
-                            break;
-                        }
-                    }
-                    CliKind::Antigravity => {
-                        if let Some(usage) = event
-                            .pointer("/step_update/usage")
-                            .filter(|_| event.pointer("/step_update/state").and_then(Value::as_str) == Some("DONE"))
-                        {
-                            let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
-                            let prompt = n("input_tokens") + n("cache_read_tokens");
-                            crate::usage_ledger::record(owner, provider, model, &crate::llm::TokenUsage {
-                                prompt_tokens: prompt,
-                                completion_tokens: n("output_tokens"),
-                                total_tokens: prompt + n("output_tokens"),
-                                cache_read_tokens: n("cache_read_tokens"),
-                                ..Default::default()
-                            });
-                        }
-                        if event.get("event").and_then(Value::as_str) == Some("result") {
-                            reply = event.pointer("/result/response").and_then(Value::as_str).unwrap_or("").to_string();
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-        .await;
-        if read.is_err() {
-            break Err("reflection timed out".to_string());
-        }
-        if reads < super::memory_reflection::REFLECTION_READS
-            && let Some(files) = super::memory_reflection::parse_reflection_read(&reply)
-        {
-            reads += 1;
-            eprintln!("memory reflection {owner} opened: {}", super::memory_reflection::opened_names(&files));
-            seen.extend(files.iter().map(super::memory_reflection::file_key));
-            let next = kind.user_line(&super::memory_reflection::reflection_opened(repos, &files));
-            if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
-                break Err(format!("send opened files: {e}"));
-            }
-            let _ = stdin.flush().await;
-            continue;
-        }
-        if !held
-            && let Some(changes) = super::memory_reflection::parse_reflection(&reply)
-        {
-            let unseen = super::memory_reflection::unseen_files(repos, &changes, &seen);
-            if !unseen.is_empty() {
-                held = true;
-                eprintln!("memory reflection {owner} held back, opened: {}", super::memory_reflection::opened_names(&unseen));
-                seen.extend(unseen.iter().map(super::memory_reflection::file_key));
-                let next = kind.user_line(&super::memory_reflection::reflection_held(repos, &unseen));
-                if let Err(e) = stdin.write_all(format!("{next}\n").as_bytes()).await {
-                    break Err(format!("send opened files: {e}"));
-                }
-                let _ = stdin.flush().await;
-                continue;
-            }
-        }
-        break Ok(reply);
-    };
-    drop(stdin);
-    let _ = child.kill().await;
-    match cleanup {
-        ForkCleanup::ClaudeCode => {
-            if let Some(id) = fork_id.as_deref() {
-                remove_claude_transcript(id);
-            }
-        }
-        ForkCleanup::Antigravity(id) => crate::antigravity::remove_conversation(&id),
-    }
-    let reply = outcome?;
-    let changes = super::memory_reflection::parse_reflection(&reply).ok_or("no JSON changes in the reply")?;
-    let (applied, errors) = super::memory_reflection::apply_changes(repos, &changes, source);
-    for (key, entry) in &applied {
-        eprintln!("memory reflection {owner}: {key} {entry}");
-    }
-    for error in &errors {
-        eprintln!("memory reflection {owner} rejected: {error}");
-    }
-    let touched: Vec<String> = applied.into_iter().map(|(key, _)| key).collect();
-    super::memory_reflection::commit_reflection(repos, &touched);
-    Ok(())
-}
-
-/// Delete a forked Claude Code conversation's transcript so reflection forks
-/// do not pile up next to the real ones.
-fn remove_claude_transcript(id: &str) {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
-    let projects = home.join(".claude").join("projects");
-    let Ok(dirs) = std::fs::read_dir(&projects) else { return };
-    for dir in dirs.flatten() {
-        let file = dir.path().join(format!("{id}.jsonl"));
-        if file.is_file() {
-            let _ = std::fs::remove_file(file);
-        }
-    }
-}
-
 async fn start_mcp_server(
     tools: Vec<NativeToolDefinition>,
     steers: SteerQueue,
@@ -1034,73 +866,6 @@ impl CodingHarness {
         prompt
     }
 
-    /// Reflect on the turn that just ended in a throwaway fork of the CLI
-    /// conversation, in the background. Claude Code forks with --fork-session;
-    /// agy has no fork, so its conversation file is copied under a new id. The
-    /// fork runs with the session's own flags, system prompt and tool list
-    /// (served by a bridge that refuses every call), so Claude Code reads the
-    /// whole conversation from its prompt cache, and the main conversation and
-    /// transcript are never touched.
-    fn start_cli_reflection(
-        &self,
-        profile: &InferenceProfileConfig,
-        state: &HarnessState,
-        session: &CliSession,
-        bridge_url: &str,
-        reflecting: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        since: &str,
-    ) -> Result<(), String> {
-        let repos = self.memory_scopes();
-        if repos.is_empty() {
-            return Err("no memory scopes".to_string());
-        }
-        let source_id = session.id.clone().ok_or("no CLI conversation yet")?;
-        let prompt = self.cli_system_prompt(state, session);
-        let (mut cmd, fork_cleanup) = match session.kind {
-            CliKind::ClaudeCode => {
-                let mut cmd = self.claude_command(profile, &prompt, bridge_url, session)?;
-                if !session.forking {
-                    cmd.arg("--fork-session");
-                }
-                (cmd, ForkCleanup::ClaudeCode)
-            }
-            CliKind::Antigravity => {
-                let fork_id = crate::antigravity::fork_conversation(&source_id)?;
-                let fork = CliSession {
-                    kind: session.kind,
-                    key: format!("{}~reflect", session.key),
-                    id: Some(fork_id.clone()),
-                    started: true,
-                    synced: 0,
-                    tool_guide: session.tool_guide.clone(),
-                    forking: false,
-                    mark: String::new(),
-                    tokens: 0,
-                    compactions: 0,
-                };
-                (self.antigravity_command(profile, &prompt, bridge_url, &fork)?, ForkCleanup::Antigravity(fork_id))
-            }
-        };
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
-        let kind = session.kind;
-        let line = kind.user_line(&super::memory_reflection::reflection_instruction(&repos, since));
-        let source = self
-            .session_id()
-            .map(|id| format!("snippet://session/{id}"))
-            .unwrap_or_else(|| "snippet://session".to_string());
-        let owner = self.session_id().unwrap_or_default();
-        let provider = profile.provider.clone();
-        let model = if profile.model.trim().is_empty() { "default".to_string() } else { profile.model.trim().to_string() };
-        tokio::spawn(async move {
-            let outcome = run_cli_reflection(cmd, kind, line, &repos, &source, &owner, &provider, &model, fork_cleanup).await;
-            if let Err(e) = outcome {
-                eprintln!("memory reflection {owner}: {e}");
-            }
-            reflecting.store(false, std::sync::atomic::Ordering::SeqCst);
-        });
-        Ok(())
-    }
-
     fn session_memory_path(&self) -> Option<String> {
         if !self.config.memory_enabled || self.context.lane_origin().is_some() {
             return None;
@@ -1114,14 +879,21 @@ impl CodingHarness {
     fn compaction_save_prompt(&self) -> Option<String> {
         let path = self.session_memory_path()?;
         Some(format!(
-            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. Then reply with one line saying what you saved."
+            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. An agent curates its own agent memory here and nowhere else: keep what still earns its place, rewrite what changed, and evict what is stale or no longer useful. Then reply with one line saying what you saved."
+        ))
+    }
+
+    fn idle_memory_prompt(&self) -> Option<String> {
+        let path = self.session_memory_path()?;
+        Some(format!(
+            "[memory] The user has stepped away. Before they're back, save what this conversation established since your last memory save that will matter later: user preferences and rules, decisions and why, root causes, project facts and conventions, and the exact values unfinished work needs. Put each where it belongs: global, project or agent memory for what holds beyond this conversation, session memory at {path} for this conversation's working state. Update or remove stale entries instead of adding duplicates, keep entries short, and commit. If nothing durable came up, change nothing. Don't continue the work. Then reply with one line saying what you saved, or that nothing needed saving."
         ))
     }
 
     fn agy_compaction_prompt(&self) -> String {
         let save = match self.session_memory_path() {
             Some(path) => format!(
-                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. "
+                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. An agent curates its own agent memory here and nowhere else: keep what still earns its place, rewrite what changed, and evict what is stale or no longer useful. "
             ),
             None => String::new(),
         };
@@ -1368,9 +1140,6 @@ impl CodingHarness {
             });
         }
         bridge_tools.extend(meta_defs);
-        let reflect_tools = bridge_tools.clone();
-        let mut reflect_url: Option<String> = None;
-        let reflecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let guide = tool_guide(&bridge_tools);
         let steers: SteerQueue = Default::default();
         let served: ServedResults = Default::default();
@@ -1385,6 +1154,8 @@ impl CodingHarness {
         let mut last_task_note = String::new();
         let mut compaction = CliCompaction::Idle;
         let mut compact_wanted = false;
+        let mut save_at: Option<tokio::time::Instant> = None;
+        let mut memory_saving = false;
         let mut after_compaction: Option<String> = None;
         let mut cli_window: u64 = 0;
         if kind == CliKind::Antigravity {
@@ -1437,6 +1208,8 @@ impl CodingHarness {
                         CliKind::ClaudeCode => self.compaction_save_prompt(),
                         CliKind::Antigravity => Some(self.agy_compaction_prompt()),
                     };
+                    state.reflected_events = Some(state.events.len());
+                    save_at = None;
                     match save {
                         Some(prompt) => {
                             compaction = CliCompaction::Saving;
@@ -1589,8 +1362,26 @@ impl CodingHarness {
             }
 
             tokio::select! {
+                _ = tokio::time::sleep_until(save_at.unwrap_or_else(tokio::time::Instant::now)), if save_at.is_some() && state.status == HarnessStatus::Idle && outbox.is_empty() => {
+                    save_at = None;
+                    if super::memory_reflection::reflection_scope(&state).is_some()
+                        && session.started
+                        && session.id.is_some()
+                        && let Some(prompt) = self.idle_memory_prompt()
+                    {
+                        memory_saving = true;
+                        state.status = HarnessStatus::Running;
+                        state.events.push(HarnessEvent::SystemDecision {
+                            step: "idle_memory_save".to_string(),
+                            reasoning: "Saving what this conversation learned to memory while you're away.".to_string(),
+                        });
+                        outbox.push(prompt);
+                        self.persist(&mut state, &lanes).await?;
+                    }
+                }
                 input = input_rx.recv() => {
                     let Some(input) = input else { break };
+                    save_at = None;
                     match input {
                         LoopInput::UserMessage(text) | LoopInput::Answer(text) => {
                             let text = text.trim().to_string();
@@ -1834,31 +1625,17 @@ impl CodingHarness {
                                         if self.config.memory_enabled && self.context.lane_origin().is_none() {
                                             self.tidy_memory();
                                         }
-                                        let scope = super::memory_reflection::reflection_scope(&state);
-                                        if !once
-                                            && let Some(since) = scope
+                                        if memory_saving {
+                                            memory_saving = false;
+                                            state.reflected_events = Some(state.events.len());
+                                        } else if !once
                                             && self.config.memory_enabled
                                             && self.config.memory_reflect
                                             && self.context.lane_origin().is_none()
                                             && self.context.owner() == "main"
-                                            && session.started
-                                            && session.id.is_some()
-                                            && !reflecting.swap(true, std::sync::atomic::Ordering::SeqCst)
+                                            && self.context.agent_id().is_none()
                                         {
-                                            if reflect_url.is_none() {
-                                                reflect_url = start_refusing_bridge(reflect_tools.clone()).await.ok();
-                                            }
-                                            let started = match reflect_url.as_deref() {
-                                                Some(url) => self.start_cli_reflection(&profile, &state, &session, url, reflecting.clone(), &since),
-                                                None => Err("no tool bridge for reflection".to_string()),
-                                            };
-                                            match started {
-                                                Ok(()) => state.reflected_events = Some(state.events.len()),
-                                                Err(e) => {
-                                                    reflecting.store(false, std::sync::atomic::Ordering::SeqCst);
-                                                    self.debug_log(&format!("memory reflection not started: {e}"));
-                                                }
-                                            }
+                                            save_at = Some(tokio::time::Instant::now() + kind.memory_save_after());
                                         }
                                         let window = match cli_window {
                                             0 => self.config.context_window_tokens,
