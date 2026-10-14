@@ -181,6 +181,7 @@ impl Tool for BashTool {
                     "id": id,
                     "pid": pid,
                     "log": out_path.display().to_string(),
+                    "moved_after_secs": timeout.as_secs(),
                     "note": format!(
                         "still running after {}s, so it was moved to the background instead of being stopped. It keeps running and appears in your [background_processes] list, which reports its exit status when it finishes. Read new output with manage_process log (id {id}) or tail the log; stop it with manage_process kill if it's stuck. Don't rerun it.",
                         timeout.as_secs()
