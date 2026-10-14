@@ -100,7 +100,6 @@ impl Tool for BashTool {
                 let _ = std::fs::write(status_path, code);
             });
             let mut res = json!({
-                "command": args.command,
                 "background": true,
                 "id": id,
                 "pid": pid,
@@ -176,7 +175,6 @@ impl Tool for BashTool {
                     .map(|(t, _)| t)
                     .unwrap_or_default();
                 let mut res = json!({
-                    "command": args.command,
                     "background": true,
                     "id": id,
                     "pid": pid,
@@ -255,7 +253,6 @@ impl Tool for BashTool {
         let is_truncated = stdout_truncated || stderr_truncated;
 
         let mut value = json!({
-            "command": args.command,
             "exit_code": output.status.code(),
             "stdout": stdout_display,
         });
