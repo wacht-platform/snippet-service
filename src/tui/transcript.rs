@@ -532,6 +532,8 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
                 compaction_divider(width)
             } else if step == "tool_payloads_pruned" {
                 tool_prune_divider(width)
+            } else if step == "idle_memory_save" {
+                marker_block("◆", muted(), "saved memory while you were away", width)
             } else {
                 marker_block("⚙", warn(), &format!("{step} — {reasoning}"), width)
             }

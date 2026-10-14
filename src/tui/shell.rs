@@ -87,16 +87,14 @@ pub(crate) struct Palette {
 }
 
 const SIDEBAR_W: u16 = 34;
-const SIDEBAR_MIN_WINDOW: u16 = 110;
-const PANE_MIN_WINDOW: u16 = 150;
 
 impl ShellState {
     pub(crate) fn sidebar_visible(&self, width: u16) -> bool {
-        width >= 80 && self.sidebar.unwrap_or(width >= SIDEBAR_MIN_WINDOW)
+        width >= 80 && self.sidebar.unwrap_or(false)
     }
 
     pub(crate) fn pane_visible(&self, width: u16) -> bool {
-        width >= 100 && self.pane.unwrap_or(width >= PANE_MIN_WINDOW)
+        width >= 100 && self.pane.unwrap_or(false)
     }
 }
 
@@ -646,8 +644,8 @@ impl App {
                 self.shell.sidebar = Some(true);
                 self.shell.focus = Focus::Sidebar;
             }
-            "sidebar" => self.shell.sidebar = Some(!self.shell.sidebar.unwrap_or(true)),
-            "pane" => self.shell.pane = Some(!self.shell.pane.unwrap_or(true)),
+            "sidebar" => self.shell.sidebar = Some(!self.shell.sidebar.unwrap_or(false)),
+            "pane" => self.shell.pane = Some(!self.shell.pane.unwrap_or(false)),
             "tools" => self.open_pane(PaneTab::Tools),
             "steps" => self.tools_expanded = !self.tools_expanded,
             "plan" => self.open_pane(PaneTab::Plan),
