@@ -16,6 +16,8 @@ pub(crate) struct ProfileReq {
     #[serde(default)]
     pub(crate) context_window: Option<u64>,
     #[serde(default)]
+    pub(crate) compact_at_pct: Option<u8>,
+    #[serde(default)]
     pub(crate) stream: Option<bool>,
     #[serde(default)]
     pub(crate) x_search: Option<bool>,
@@ -87,6 +89,9 @@ pub(crate) async fn put_profile(
         }
         if let Some(ctx) = req.context_window.filter(|&n| n > 0) {
             mc.context_window = ctx;
+        }
+        if let Some(pct) = req.compact_at_pct.filter(|p| (10..=100).contains(p)) {
+            mc.compact_at_pct = pct;
         }
         if let Some(stream) = req.stream {
             mc.stream = stream;
