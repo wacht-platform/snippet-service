@@ -49,7 +49,7 @@ impl Tool for ViewImageTool {
             )));
         };
         Ok(ToolResult::success(json!({
-            "path": args.path,
+            "path": path.display().to_string(),
             "mime": mime,
             "size_bytes": bytes.len(),
         })))
