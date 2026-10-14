@@ -42,7 +42,7 @@ impl Tool for BashTool {
                 json!({
                     "command": {"type": "string", "description": "The exact shell command line string to execute."},
                     "label": {"type": "string", "description": "A concise description of what this command does (typically under 10 words, e.g. 'Run test suite', 'Check git status', 'Install dependencies', 'Build backend'). Required."},
-                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 1800, "description": "Seconds to wait (default 120). A command still running then is moved to the background, not stopped."},
                     "max_lines": {"type": "integer", "minimum": 1, "description": "Limit stdout/stderr output to this many lines. If omitted, uses max_bytes."},
                     "max_bytes": {"type": "integer", "minimum": 1, "default": 20000, "description": "Hard limit on output size in bytes."},
                     "background": {"type": "boolean", "default": false, "description": "Run detached and return immediately; for servers/watchers that should keep running. Output goes to a log file; the process shows up in the background-process list."}
@@ -123,7 +123,20 @@ impl Tool for BashTool {
             pwd_file.display(),
             args.command
         );
-        let child = Command::new("sh")
+        let id = crate::bg::new_id();
+        let out_path = crate::bg::log_path(ctx.workspace_root(), &id);
+        let err_path = crate::bg::err_path(ctx.workspace_root(), &id);
+        std::fs::create_dir_all(crate::bg::bg_dir(ctx.workspace_root()))
+            .map_err(|e| ToolError::msg(format!("output dir: {e}")))?;
+        let mut capture = Capture {
+            paths: vec![out_path.clone(), err_path.clone(), pwd_file.clone()],
+            keep: false,
+        };
+        let out_file = std::fs::File::create(&out_path)
+            .map_err(|e| ToolError::msg(format!("output file: {e}")))?;
+        let err_file = std::fs::File::create(&err_path)
+            .map_err(|e| ToolError::msg(format!("output file: {e}")))?;
+        let mut child = Command::new("sh")
             .arg("-lc")
             .arg(&script)
             .current_dir(&start_dir)
@@ -137,24 +150,61 @@ impl Tool for BashTool {
             .envs(agent_env(ctx))
             .envs(vault_env)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file))
             .spawn()?;
         let timeout = std::time::Duration::from_secs(args.timeout_seconds.unwrap_or(120).min(1800));
-        let output = tokio::time::timeout(timeout, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                let _ = std::fs::remove_file(&pwd_file);
-                ToolError::msg(format!(
-                    "command timed out after {}s and was stopped. Start servers, browsers, displays and anything else that keeps running with background: true; for a long finite job, raise timeout_seconds.",
-                    timeout.as_secs()
-                ))
-            })??;
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(status) => status?,
+            Err(_) => {
+                capture.keep = true;
+                let pid = child.id().unwrap_or(0);
+                crate::bg::record(ctx.workspace_root(), &id, &args.command, label, pid).ok();
+                let status_path = crate::bg::status_path(ctx.workspace_root(), &id);
+                tokio::spawn(async move {
+                    let code = match child.wait().await {
+                        Ok(s) => s
+                            .code()
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".to_string()),
+                        Err(_) => "?".to_string(),
+                    };
+                    let _ = std::fs::write(status_path, code);
+                    let _ = std::fs::remove_file(&pwd_file);
+                });
+                let so_far = crate::bg::tail_log(ctx.workspace_root(), &id, 20)
+                    .map(|(t, _)| t)
+                    .unwrap_or_default();
+                let mut res = json!({
+                    "command": args.command,
+                    "background": true,
+                    "id": id,
+                    "pid": pid,
+                    "log": out_path.display().to_string(),
+                    "note": format!(
+                        "still running after {}s, so it was moved to the background instead of being stopped. It keeps running and appears in your [background_processes] list, which reports its exit status when it finishes. Read new output with manage_process log (id {id}) or tail the log; stop it with manage_process kill if it's stuck. Don't rerun it.",
+                        timeout.as_secs()
+                    ),
+                });
+                if !so_far.trim().is_empty() {
+                    res["output_so_far"] = json!(so_far);
+                }
+                if let Some(lbl) = label {
+                    res["label"] = json!(lbl);
+                }
+                return Ok(ToolResult::success(res));
+            }
+        };
+        let output = std::process::Output {
+            status,
+            stdout: std::fs::read(&out_path).unwrap_or_default(),
+            stderr: std::fs::read(&err_path).unwrap_or_default(),
+        };
         let end_dir = std::fs::read_to_string(&pwd_file)
             .ok()
             .map(|s| std::path::PathBuf::from(s.trim()))
             .filter(|p| p.is_dir());
-        let _ = std::fs::remove_file(&pwd_file);
+        drop(capture);
         if let Some(dir) = end_dir.as_ref() {
             ctx.set_current_dir(dir.clone());
         }
@@ -232,6 +282,21 @@ impl Tool for BashTool {
     }
 }
 
+struct Capture {
+    paths: Vec<std::path::PathBuf>,
+    keep: bool,
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if !self.keep {
+            for p in &self.paths {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+}
+
 /// Environment every agent shell gets: the session id `snippet history` is
 /// scoped to, and the folder of the running snippet binary so its subcommands
 /// resolve to the same version as the daemon.
@@ -289,3 +354,4 @@ fn format_output_preview(
 
     (result, true)
 }
+
