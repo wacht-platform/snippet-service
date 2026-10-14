@@ -79,9 +79,7 @@ use super::*;
         let rows = snapshot(90, 24);
         let frame = rows.join("\n");
         for expected in [
-            "(  o.o  )",          // the mascot's eyes
-            "SNIPPET",            // the nameplate inside the mascot's box
-            "MATRIX PET",
+            "████████████",       // Mochi's body
             "███████",            // the block-letter title
             "workspace",          // the footer names the working folder
             "gpt-4o",             // ...and the model
@@ -479,3 +477,4 @@ fn ask_user_choice_question_takes_a_typed_answer() {
         assert_eq!(app.active_conversation, "fresh");
     }
 }
+

@@ -24,26 +24,7 @@ pub(super) fn empty_state_lines(_cwd: &str, _model: &str, width: usize) -> Vec<L
 
     lines.push(Line::from(""));
 
-    let green = Style::default().fg(Color::Rgb(74, 222, 128));
-    let cyan = Style::default().fg(Color::Rgb(125, 207, 245));
-    let purple = Style::default().fg(Color::Rgb(189, 147, 249));
-
-    // Crisp Vector Catgirl Pet Mascot Artwork
-    lines.push(center(
-        "          /\\___/\\       /\\___/\\          ",
-        purple,
-    ));
-    lines.push(center("         (  o.o  )     (  o.o  )  ~♥     ", green));
-    lines.push(center("          >  ^  <       >  ^  <          ", cyan));
-    lines.push(center("      . - ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ - .      ", green));
-    lines.push(center("    /   .-----------------------.   \\    ", green));
-    lines.push(center(
-        "   /   /    (◕ ◡ ◕)   SNIPPET    \\   \\   ",
-        cyan.add_modifier(Modifier::BOLD),
-    ));
-    lines.push(center("  |   |     \\  ♥  /   MATRIX PET  |   |  ", purple));
-    lines.push(center("   \\   \\     `---'               /   /   ", green));
-    lines.push(center("     ~ - . _ . _ . _ . _ . _ . - ~       ", green));
+    lines.extend(super::mascot::mochi_lines(width));
     lines.push(Line::from(""));
 
     // Block Pixel Title SNIPPET
