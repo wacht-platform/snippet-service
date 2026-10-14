@@ -1149,6 +1149,7 @@ struct ProfileView {
     has_key: bool,
     active: bool,
     context_window: u64,
+    compact_at_pct: u8,
     reasoning_effort: Option<String>,
     stream: bool,
     /// Returned so profile editors can round-trip it — without it, an app edit
@@ -1190,6 +1191,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
                 has_key: !m.api_key.trim().is_empty(),
                 active: active.as_deref() == Some(name.as_str()),
                 context_window: m.context_window,
+                compact_at_pct: m.compact_at_pct,
                 reasoning_effort: m.reasoning_effort.clone(),
                 stream: m.stream,
                 supports_images: m.supports_images,
