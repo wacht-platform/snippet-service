@@ -285,6 +285,7 @@ struct RuntimeInputs {
     exa_api_key: Option<String>,
     base_model: InferenceProfileConfig,
     setups: Option<std::collections::BTreeMap<String, InferenceProfileConfig>>,
+    delegate: Option<InferenceProfileConfig>,
 }
 
 /// A researched, versioned identity overlaid on the snippet runtime.
@@ -396,6 +397,7 @@ impl AgentRuntime {
 
         let base_model = i.base_model;
         let setups = i.setups;
+        let delegate = i.delegate.unwrap_or_else(|| base_model.clone());
         let lane_session_id = i.durable_id;
         Ok(Self {
             factory: Some(Arc::new(move |profile: Option<&str>| {
@@ -413,7 +415,7 @@ impl AgentRuntime {
                         ));
                     }
                 }
-                Ok(base_model.build_model_for_session(lane_session_id.clone()))
+                Ok(delegate.build_model_for_session(lane_session_id.clone()))
             })),
             context,
             tools,
@@ -532,6 +534,10 @@ fn start_session_with_role(
     crate::harness::ensure_snippet_gitignored(&workspace);
     let model_config = config.model.clone();
     let setups = config.setups.clone();
+    let delegate = config
+        .delegate_setup
+        .as_deref()
+        .and_then(|name| config.setups.as_ref()?.get(name).cloned());
     let exa_api_key = config.exa_api_key.clone();
     let manual_approval = config.manual_approval;
     let context_window_tokens = model_config.context_window;
@@ -568,6 +574,7 @@ fn start_session_with_role(
                         exa_api_key: exa_api_key.clone(),
                 base_model: model_config,
                 setups,
+                delegate,
             },
         )
         .map_err(|e| e.to_string())?;
