@@ -17,6 +17,10 @@ pub fn log_path(workspace: &Path, id: &str) -> PathBuf {
     bg_dir(workspace).join(format!("{id}.log"))
 }
 
+pub fn err_path(workspace: &Path, id: &str) -> PathBuf {
+    bg_dir(workspace).join(format!("{id}.err"))
+}
+
 /// Exit-status file: written when the process exits (the code, or "signal"/"?").
 pub fn status_path(workspace: &Path, id: &str) -> PathBuf {
     bg_dir(workspace).join(format!("{id}.status"))
@@ -279,7 +283,16 @@ pub fn kill_by_id(workspace: &Path, id: &str) -> std::io::Result<bool> {
 /// Read trailing lines from a background process's log file.
 /// Returns (content, truncated_flag).
 pub fn tail_log(workspace: &Path, id: &str, max_lines: usize) -> std::io::Result<(String, bool)> {
-    let path = log_path(workspace, id);
+    let (out, truncated) = tail_file(&log_path(workspace, id), max_lines)?;
+    match tail_file(&err_path(workspace, id), max_lines) {
+        Ok((err, err_truncated)) if !err.trim().is_empty() => {
+            Ok((format!("{out}\n--- stderr ---\n{err}"), truncated || err_truncated))
+        }
+        _ => Ok((out, truncated)),
+    }
+}
+
+fn tail_file(path: &Path, max_lines: usize) -> std::io::Result<(String, bool)> {
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -287,7 +300,7 @@ pub fn tail_log(workspace: &Path, id: &str, max_lines: usize) -> std::io::Result
         ));
     }
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(&path)?;
+    let mut file = std::fs::File::open(path)?;
     let meta = file.metadata()?;
     let len = meta.len();
     let max_read = 256 * 1024;
