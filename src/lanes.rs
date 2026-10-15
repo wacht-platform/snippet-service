@@ -244,6 +244,7 @@ impl Tool for MessageParent {
 }
 
 /// Who a lane works for, gathered from the parent session when the lane starts.
+#[derive(Clone)]
 struct LaneLink {
     origin_session: Option<String>,
     agent_id: Option<String>,
@@ -915,6 +916,81 @@ async fn run_lane(
     approval: Option<LaneApprovalRoute>,
     link: LaneLink,
 ) -> Result<(String, String), String> {
+    let route = match profile {
+        Some(_) => Vec::new(),
+        None => crate::config::SnippetConfig::load(&crate::config::default_config_path())
+            .await
+            .map(|c| crate::routing::candidates(&c, crate::routing::Route::Lanes))
+            .unwrap_or_default(),
+    };
+    if route.is_empty() {
+        return run_lane_once(
+            factory, workspace_root, state_path, brief, owner, exa_api_key, resume, read_only, agent, profile,
+            progress_tx, approval, link,
+        )
+        .await;
+    }
+    let (mut brief, mut resume, mut last) = (brief, resume, None);
+    for name in route {
+        if crate::routing::limited_until(&name).is_some() {
+            continue;
+        }
+        let result = run_lane_once(
+            factory.clone(),
+            workspace_root.clone(),
+            state_path.clone(),
+            brief.clone(),
+            owner.clone(),
+            exa_api_key.clone(),
+            resume,
+            read_only,
+            agent.clone(),
+            Some(name.clone()),
+            progress_tx.clone(),
+            approval.clone(),
+            link.clone(),
+        )
+        .await;
+        match result {
+            Err(message) if crate::routing::is_limit_error(&message) => {
+                crate::routing::mark_limited(&name, crate::routing::reset_from(None));
+                brief = format!(
+                    "{brief}\n\n[routing] An earlier attempt at this on {name} stopped partway when that model hit its usage limit. Check the workspace for changes it already made before continuing."
+                );
+                resume = false;
+                last = Some(message);
+            }
+            other => return other,
+        }
+    }
+    match last {
+        Some(message) => Err(message),
+        None => {
+            run_lane_once(
+                factory, workspace_root, state_path, brief, owner, exa_api_key, resume, read_only, agent, None,
+                progress_tx, approval, link,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_lane_once(
+    factory: ModelFactory,
+    workspace_root: PathBuf,
+    state_path: PathBuf,
+    brief: String,
+    owner: String,
+    exa_api_key: Option<String>,
+    resume: bool,
+    read_only: bool,
+    agent: Option<String>,
+    profile: Option<String>,
+    progress_tx: mpsc::UnboundedSender<LaneProgress>,
+    approval: Option<LaneApprovalRoute>,
+    link: LaneLink,
+) -> Result<(String, String), String> {
     let mut model = factory(profile.as_deref())?;
     let mut log = LaneLog::open(&owner).ok();
     if let Some(log) = log.as_mut() {
@@ -1000,6 +1076,12 @@ async fn run_lane(
         Some(cli) => harness.run_cli_lane(cli, brief).await,
         None => harness.run(&mut *model, brief).await,
     };
+    if let Some(message) = crate::routing::limit_in(&run) {
+        if let Some(log) = log.as_mut() {
+            let _ = log.write_end(&owner, "failed", None, Some(&message), None);
+        }
+        return Err(message);
+    }
     let outcome = match run {
         Ok(outcome) => outcome,
         Err(error) => {

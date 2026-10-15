@@ -499,6 +499,24 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
             &format!("{by} dispatched: {title}\ntask {task_id} → {session_id}"),
             width,
         ),
+        HarnessEvent::ProfileSwitched { from, to, .. } => marker_block(
+            "⇄",
+            muted(),
+            &format!("{from} hit its usage limit. Continuing on {to}."),
+            width,
+        ),
+        HarnessEvent::LimitReached { profile, resets_at, .. } => marker_block(
+            "!",
+            muted(),
+            &format!("{profile} hit its usage limit (resets {}). Pick another model with /model, or wait.", crate::routing::reset_label(*resets_at)),
+            width,
+        ),
+        HarnessEvent::LimitWait { profile, resets_at } => marker_block(
+            "…",
+            muted(),
+            &format!("Waiting for {profile} to reset at {}.", crate::routing::reset_label(*resets_at)),
+            width,
+        ),
         HarnessEvent::SystemDecision { step, reasoning } => {
             if step == "history_compaction_pass" {
                 // Keep the live banner only during the turn; the durable

@@ -36,6 +36,7 @@ pub mod prompts;
 pub mod reasoning;
 pub mod recurring;
 pub mod replay;
+pub mod routing;
 pub mod sanitize;
 pub mod serve;
 pub mod session;

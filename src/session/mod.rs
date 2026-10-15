@@ -1012,6 +1012,17 @@ pub use fork::*;
 /// Mission Control once.
 pub fn park_failed_session_work(id: &str, prev_status: &str, state: &HarnessState) {
     let status = status_str(state.status);
+    if prev_status == "running" && matches!(status.as_str(), "idle" | "failed") {
+        if let Some(crate::harness::HarnessEvent::ModelError { message }) = state.events.last() {
+            if crate::routing::is_limit_error(message) {
+                crate::routing::report(crate::routing::LimitHit {
+                    session_id: id.to_string(),
+                    message: message.clone(),
+                    resets_at: crate::routing::reset_from(state.rate_limit.as_ref()),
+                });
+            }
+        }
+    }
     let lanes_running = state
         .lanes
         .iter()

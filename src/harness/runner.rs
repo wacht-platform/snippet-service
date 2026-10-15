@@ -494,8 +494,7 @@ impl CodingHarness {
                                 continue;
                             }
                         }
-                        // Fatal errors never recover — fail at once, no backoff.
-                        if !retryable {
+                        if !retryable || crate::routing::is_limit_error(&message) {
                             state.status = HarnessStatus::Failed;
                             self.persist(&mut state, &lanes).await?;
                             break;

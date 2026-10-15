@@ -1188,7 +1188,9 @@ pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<S
     let id = mission_control::SESSION_ID.to_string();
     // The conversation lives in the store; its path is only a key.
     let resume = d.store.has_conversation(&id).unwrap_or(false);
-    let profile = requested_profile.or_else(|| read_session_profile(&state_path));
+    let profile = requested_profile
+        .or_else(|| read_session_profile(&state_path))
+        .or_else(|| d.routed_profile(&id));
     write_session_sidecar(
         &state_path,
         &SessionSidecar {

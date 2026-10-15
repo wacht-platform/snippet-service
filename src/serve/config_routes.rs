@@ -417,6 +417,50 @@ pub(crate) async fn set_delegate(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct RoutingReq {
+    route: String,
+    profiles: Vec<String>,
+}
+
+pub(crate) async fn set_routing(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<RoutingReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(route) = crate::routing::Route::parse(&req.route) else {
+        return (StatusCode::BAD_REQUEST, "unknown route").into_response();
+    };
+    d.reload_config().await;
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        let mut profiles: Vec<String> = Vec::new();
+        for name in req.profiles.into_iter().map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+            if !c.setups.as_ref().is_some_and(|m| m.contains_key(&name)) {
+                return (StatusCode::NOT_FOUND, format!("no such profile `{name}`")).into_response();
+            }
+            if !profiles.contains(&name) {
+                profiles.push(name);
+            }
+        }
+        if route == crate::routing::Route::Lanes {
+            c.delegate_setup = profiles.first().cloned();
+        }
+        c.routing.set(route, profiles.clone());
+        save_config(&c, &d.config_path).map(|_| profiles)
+    };
+    match result {
+        Ok(profiles) => {
+            notify_models(None);
+            Json(serde_json::json!({ "route": route.key(), "profiles": profiles })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub(crate) struct KeepTaskProfileReq {
     on: bool,
 }
