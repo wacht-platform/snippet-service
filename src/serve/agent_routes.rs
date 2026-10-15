@@ -42,6 +42,7 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                         .into_response();
                 }
             };
+            let colors = d.store.agent_colors().unwrap_or_default();
             let mut grouped: HashMap<String, serde_json::Map<String, serde_json::Value>> =
                 HashMap::new();
             for (agent_id, status, count) in counts {
@@ -57,6 +58,9 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                             serde_json::Value::Object(grouped.remove(&agent.id).unwrap_or_default()),
                         );
                         object.insert("task_counts_since".into(), since.clone().into());
+                        if let Some(color) = colors.get(&agent.id) {
+                            object.insert("color".into(), color.clone().into());
+                        }
                     }
                     value
                 })
@@ -356,6 +360,37 @@ pub(crate) async fn set_agent_status(
         },
         Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent status: {error}"))
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentColorReq {
+    pub(crate) color: Option<String>,
+}
+
+/// POST /agents/{id}/color — the agent's mascot colour as `#RRGGBB`, or null to
+/// go back to the default.
+pub(crate) async fn set_agent_color(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(req): Json<AgentColorReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let color = req.color.map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty());
+    if let Some(c) = &color {
+        let hex = c.strip_prefix('#').unwrap_or("");
+        if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return (StatusCode::BAD_REQUEST, "color must be #RRGGBB").into_response();
+        }
+    }
+    match d.store.set_agent_color(&agent_id, color.as_deref()) {
+        Ok(true) => Json(serde_json::json!({ "id": agent_id, "color": color })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent color: {error}"))
             .into_response(),
     }
 }

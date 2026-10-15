@@ -761,6 +761,7 @@ pub async fn run_serve(
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{agent_id}/board", get(agent_board))
         .route("/agents/{agent_id}/status", post(set_agent_status))
+        .route("/agents/{agent_id}/color", post(set_agent_color))
         .route("/agents/{agent_id}", axum::routing::delete(delete_agent))
         .merge(coordination::router())
         .route(
