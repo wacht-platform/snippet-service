@@ -582,6 +582,15 @@ impl Daemon {
     /// Send a loop input to a session. Audio attachment markers are expanded here,
     /// before the input reaches the harness, so every model/provider receives the
     /// same transcript plus the original attachment reference.
+    pub(crate) async fn broadcast_mode(&self, mode: crate::harness::ApprovalMode) {
+        let sessions = self.sessions.lock().await;
+        for s in sessions.values() {
+            if !s.join.is_finished() {
+                let _ = s.input_tx.send(LoopInput::SetMode(mode));
+            }
+        }
+    }
+
     pub(crate) async fn deliver(&self, id: &str, input: LoopInput) {
         match &input {
             LoopInput::Unqueue(queue_id) | LoopInput::SteerQueued(queue_id) => {
@@ -816,6 +825,7 @@ pub async fn run_serve(
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
         .route("/config/keep_task_profile", post(set_keep_task_profile))
+        .route("/config/manual_approval", post(set_manual_approval))
         .route("/config/routing", post(set_routing))
         .route("/provider/models", post(provider_models))
         .route(
