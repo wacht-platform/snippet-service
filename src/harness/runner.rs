@@ -89,7 +89,7 @@ impl CodingHarness {
                     });
                     // Fatal errors (auth/permission/not-found/bad-request) never
                     // succeed on retry — give up at once instead of recovering.
-                    let action = if retryable {
+                    let action = if retryable && !crate::routing::is_limit_error(&message) {
                         self.recover(&mut state, &mut consecutive_errors).await
                     } else {
                         RecoveryAction::GiveUp
@@ -494,7 +494,12 @@ impl CodingHarness {
                                 continue;
                             }
                         }
-                        if !retryable || crate::routing::is_limit_error(&message) {
+                        if crate::routing::is_limit_error(&message) {
+                            state.status = HarnessStatus::Idle;
+                            self.persist(&mut state, &lanes).await?;
+                            continue;
+                        }
+                        if !retryable {
                             state.status = HarnessStatus::Failed;
                             self.persist(&mut state, &lanes).await?;
                             break;
