@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="snippet-mascot/png/snip-mascot-256.png" alt="snippet mascot" width="120" height="120" />
+<img src="snippet-mascot/png/snip-mascot-256.png" alt="Mochi, the snippet mascot" width="120" height="120" />
 
 # snippet
 
