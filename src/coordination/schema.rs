@@ -13,7 +13,12 @@ use rusqlite::Connection;
 
 pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.execute_batch(
-        r#"CREATE TABLE IF NOT EXISTS agents (
+        r#"CREATE TABLE IF NOT EXISTS agent_colors (
+             agent_id TEXT PRIMARY KEY NOT NULL,
+             color TEXT NOT NULL
+         );
+
+         CREATE TABLE IF NOT EXISTS agents (
              id TEXT PRIMARY KEY NOT NULL,
              display_name TEXT NOT NULL,
              handle TEXT NOT NULL UNIQUE,
