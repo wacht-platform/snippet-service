@@ -380,43 +380,6 @@ pub(crate) async fn provider_models(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct DelegateReq {
-    /// Profile for delegated lanes. Empty/null clears it (delegation → active model).
-    #[serde(default)]
-    name: Option<String>,
-}
-
-// POST /config/delegate — set (or clear) the profile that delegated lanes run on.
-pub(crate) async fn set_delegate(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<DelegateReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    d.reload_config().await; // don't clobber TUI-side profile edits
-    let name = req.name.filter(|n| !n.trim().is_empty());
-    let result = {
-        let mut c = d.config.lock().unwrap();
-        if let Some(n) = name.as_deref() {
-            if !c.setups.as_ref().is_some_and(|m| m.contains_key(n)) {
-                return (StatusCode::NOT_FOUND, "no such profile").into_response();
-            }
-        }
-        c.delegate_setup = name.clone();
-        save_config(&c, &d.config_path)
-    };
-    match result {
-        Ok(_) => {
-            notify_models(None);
-            Json(serde_json::json!({ "delegate": name })).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
 pub(crate) struct RoutingReq {
     route: String,
     profiles: Vec<String>,

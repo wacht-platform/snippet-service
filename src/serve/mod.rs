@@ -815,7 +815,6 @@ pub async fn run_serve(
         .route("/config", get(get_config))
         .route("/config/profile", put(put_profile).delete(delete_profile))
         .route("/config/active", post(set_active))
-        .route("/config/delegate", post(set_delegate))
         .route("/config/keep_task_profile", post(set_keep_task_profile))
         .route("/config/routing", post(set_routing))
         .route("/provider/models", post(provider_models))
@@ -1185,8 +1184,6 @@ struct ProfileView {
 struct ConfigView {
     profiles: Vec<ProfileView>,
     active: Option<String>,
-    /// Profile that delegated lanes run on; null → they use the active model.
-    delegate: Option<String>,
     theme: Option<String>,
     manual_approval: bool,
     keep_task_profile: bool,
@@ -1225,7 +1222,6 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
     Json(ConfigView {
         profiles,
         active,
-        delegate: c.delegate_setup.clone(),
         theme: c.theme.clone(),
         manual_approval: c.manual_approval,
         keep_task_profile: c.keep_task_profile,
