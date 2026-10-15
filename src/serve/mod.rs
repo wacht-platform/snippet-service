@@ -52,6 +52,7 @@ pub(crate) use maintenance::*;
 mod mission_control;
 pub use mission_control::{mission_error, validated_owned_paths};
 mod recurring;
+mod routing_routes;
 pub mod session_routes;
 pub(crate) use session_routes::*;
 use crate::term::SessionTerms;
@@ -430,6 +431,19 @@ impl Daemon {
                     .find_map(|t| t.profile.filter(|p| !p.trim().is_empty()))
             })
             .or_else(|| read_session_profile(sp))
+            .or_else(|| self.routed_profile(id))
+    }
+
+    pub(crate) fn routed_profile(&self, id: &str) -> Option<String> {
+        let route = if id == crate::mission_control::SESSION_ID {
+            crate::routing::Route::Mission
+        } else if crate::session::is_inbox_session_id(id) {
+            crate::routing::Route::Inbox
+        } else {
+            return None;
+        };
+        let c = self.config.lock().unwrap();
+        crate::routing::candidates(&c, route).into_iter().next()
     }
 
     pub(crate) async fn run_session_on_profile(
@@ -750,6 +764,10 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { memory_routes::consolidation_loop(d).await });
     }
+    if let Some(rx) = crate::routing::subscribe() {
+        let d = daemon.clone();
+        tokio::spawn(async move { routing_routes::routing_loop(d, rx).await });
+    }
     // The upload endpoint carries the file base64-encoded inside a JSON body, which
     // inflates it by ~4/3. Size the request-body limit so a ~1 GB file still fits
     // once encoded (≈1.33 GB) plus headroom for the JSON envelope. Every other route
@@ -799,6 +817,7 @@ pub async fn run_serve(
         .route("/config/active", post(set_active))
         .route("/config/delegate", post(set_delegate))
         .route("/config/keep_task_profile", post(set_keep_task_profile))
+        .route("/config/routing", post(set_routing))
         .route("/provider/models", post(provider_models))
         .route(
             "/vault",
@@ -813,6 +832,7 @@ pub async fn run_serve(
         .route("/reasoning", get(reasoning_spec))
         .route("/chatgpt/logout", post(chatgpt_logout))
         .route("/session/model", post(set_session_model))
+        .route("/session/limit", post(routing_routes::resolve_limit))
         .route("/session/rewind", post(rewind_session))
         .route("/session/fork", post(fork_session))
         .route("/session/exec", post(exec_in_session))
@@ -1170,6 +1190,8 @@ struct ConfigView {
     theme: Option<String>,
     manual_approval: bool,
     keep_task_profile: bool,
+    routing: std::collections::BTreeMap<&'static str, Vec<String>>,
+    limited: std::collections::HashMap<String, i64>,
     hostname: String,
 }
 
@@ -1207,6 +1229,11 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
         theme: c.theme.clone(),
         manual_approval: c.manual_approval,
         keep_task_profile: c.keep_task_profile,
+        routing: crate::routing::Route::ALL
+            .into_iter()
+            .map(|r| (r.key(), crate::routing::configured(&c, r)))
+            .collect(),
+        limited: crate::routing::limited_now(),
         hostname: d.hostname.clone(),
     })
     .into_response()

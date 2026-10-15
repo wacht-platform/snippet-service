@@ -163,6 +163,20 @@ pub enum HarnessEvent {
         /// Who dispatched it — `human` for a user filing work directly.
         by: String,
     },
+    ProfileSwitched {
+        from: String,
+        to: String,
+        resets_at: i64,
+    },
+    LimitReached {
+        profile: String,
+        resets_at: i64,
+        options: Vec<String>,
+    },
+    LimitWait {
+        profile: String,
+        resets_at: i64,
+    },
     /// The agent presented a file to the user (an openable card in the UIs).
     FilePresented {
         path: String,
