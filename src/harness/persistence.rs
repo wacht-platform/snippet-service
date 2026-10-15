@@ -65,8 +65,13 @@ impl CodingHarness {
         let seeded_system = self.seeded_system_prompt();
 
         if self.config.resume
-            && let Some(state) = self.load_from_store().await?
+            && let Some(mut state) = self.load_from_store().await?
         {
+            state.approval_mode = if self.config.manual_approval {
+                ApprovalMode::Manual
+            } else {
+                ApprovalMode::Auto
+            };
             return self
                 .resume_loaded_state(state, seeded_system, initial_request)
                 .await;

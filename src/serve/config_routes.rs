@@ -449,6 +449,38 @@ pub(crate) async fn set_keep_task_profile(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct ManualApprovalReq {
+    on: bool,
+}
+
+// POST /config/manual_approval — the global approval mode, applied to every live session.
+pub(crate) async fn set_manual_approval(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ManualApprovalReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        c.manual_approval = req.on;
+        save_config(&c, &d.config_path)
+    };
+    if let Err(e) = result {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    let mode = if req.on {
+        crate::harness::ApprovalMode::Manual
+    } else {
+        crate::harness::ApprovalMode::Auto
+    };
+    d.broadcast_mode(mode).await;
+    Json(serde_json::json!({ "manual_approval": req.on })).into_response()
+}
+
+#[derive(Deserialize)]
 pub(crate) struct DeleteProfileQuery {
     token: Option<String>,
     name: String,
