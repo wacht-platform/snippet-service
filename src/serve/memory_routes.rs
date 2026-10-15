@@ -364,29 +364,52 @@ async fn consolidation(d: &Shared, repo: &MemoryRepo) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&state_dir);
     let state_path = state_dir.join(format!("{}.json", repo.key.replace([':', '/'], "_")));
     let _ = std::fs::remove_file(&state_path);
-    let mut model = {
+    let attempts = {
         let config = d.config.lock().unwrap();
-        config.for_workspace(repo.root.clone()).model.build_model()
+        let routed: Vec<(String, crate::config::InferenceProfileConfig)> =
+            crate::routing::candidates(&config, crate::routing::Route::Memory)
+                .into_iter()
+                .filter_map(|name| config.setups.as_ref()?.get(&name).cloned().map(|c| (name, c)))
+                .collect();
+        if routed.is_empty() {
+            vec![(String::new(), config.for_workspace(repo.root.clone()).model)]
+        } else {
+            routed
+        }
     };
-    let context = crate::ToolContext::with_owner(repo.root.clone(), "consolidating").map_err(|e| e.to_string())?;
-    let harness = CodingHarness::new(
-        HarnessConfig {
-            system_prompt: CONSOLIDATE_SYSTEM.to_string(),
-            state_path: Some(state_path),
-            resume: false,
-            memory_enabled: false,
-            memory_reflect: false,
-            ..HarnessConfig::default()
-        },
-        crate::builtins::coding_tools(None),
-        context,
-    );
-    match model.cli_agent_profile() {
-        Some(cli) => harness.run_cli_lane(cli, brief).await,
-        None => harness.run(&mut *model, brief).await,
+    let mut last_error = String::new();
+    for (name, profile) in attempts {
+        let _ = std::fs::remove_file(&state_path);
+        let mut model = profile.build_model();
+        let context = crate::ToolContext::with_owner(repo.root.clone(), "consolidating").map_err(|e| e.to_string())?;
+        let harness = CodingHarness::new(
+            HarnessConfig {
+                system_prompt: CONSOLIDATE_SYSTEM.to_string(),
+                state_path: Some(state_path.clone()),
+                resume: false,
+                memory_enabled: false,
+                memory_reflect: false,
+                ..HarnessConfig::default()
+            },
+            crate::builtins::coding_tools(None),
+            context,
+        );
+        let result = match model.cli_agent_profile() {
+            Some(cli) => harness.run_cli_lane(cli, brief.clone()).await,
+            None => harness.run(&mut *model, brief.clone()).await,
+        };
+        match crate::routing::limit_in(&result) {
+            Some(message) if !name.is_empty() => {
+                crate::routing::mark_limited(&name, crate::routing::reset_from(None));
+                last_error = message;
+            }
+            _ => {
+                result.map_err(|e| e.to_string())?;
+                return finish(repo);
+            }
+        }
     }
-    .map_err(|e| e.to_string())?;
-    finish(repo)
+    Err(last_error)
 }
 
 /// Commit anything the consolidation left uncommitted, and mark the consolidation even when it

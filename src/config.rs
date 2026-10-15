@@ -174,6 +174,8 @@ pub struct SnippetConfig {
     pub memory_reflect: bool,
     #[serde(default = "default_keep_task_profile")]
     pub keep_task_profile: bool,
+    #[serde(default, skip_serializing_if = "crate::routing::RoutingConfig::is_empty")]
+    pub routing: crate::routing::RoutingConfig,
     /// Saved provider profiles, keyed by name. Multiple can be configured; one is
     /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
     /// stays valid (tables must follow top-level scalars).
@@ -258,6 +260,7 @@ impl Default for SnippetConfig {
             memory_enabled: default_memory_enabled(),
             memory_reflect: default_memory_reflect(),
             keep_task_profile: default_keep_task_profile(),
+            routing: Default::default(),
         }
     }
 }
