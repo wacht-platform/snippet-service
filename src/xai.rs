@@ -20,6 +20,50 @@ use crate::openai::{
 use crate::tools::ToolError;
 
 const RESPONSES_PATH: &str = "/responses";
+const SERVER_ITEMS_CAP: usize = 256;
+
+static SERVER_ITEMS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::VecDeque<(String, Vec<Value>)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn server_items_key<'a>(mut call_ids: impl Iterator<Item = &'a str>, text: &str) -> Option<String> {
+    if let Some(id) = call_ids.find(|id| !id.is_empty()) {
+        return Some(format!("call:{id}"));
+    }
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("text:{text}"))
+}
+
+fn remember_server_items(items: &[Value], calls: &[GeneratedToolCall], text: &str) {
+    let Some(key) = server_items_key(calls.iter().filter_map(|c| c.id.as_deref()), text) else {
+        return;
+    };
+    let items: Vec<Value> = items
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.remove("status");
+                }
+            }
+            item
+        })
+        .collect();
+    let Ok(mut store) = SERVER_ITEMS.lock() else {
+        return;
+    };
+    store.retain(|(k, _)| k != &key);
+    store.push_back((key, items));
+    while store.len() > SERVER_ITEMS_CAP {
+        store.pop_front();
+    }
+}
+
+fn recall_server_items(key: &str) -> Option<Vec<Value>> {
+    let store = SERVER_ITEMS.lock().ok()?;
+    store.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
 
 #[derive(Debug, Clone)]
 pub struct XaiConfig {
@@ -271,6 +315,19 @@ fn build_responses_request(
                 content,
                 tool_calls,
             } => {
+                let recalled = server_items_key(tool_calls.iter().map(|c| c.id.as_str()), content)
+                    .and_then(|key| recall_server_items(&key));
+                if let Some(items) = recalled {
+                    for item in items {
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                                seen_calls.insert(id.to_string());
+                            }
+                        }
+                        input.push(item);
+                    }
+                    continue;
+                }
                 if !content.is_empty() {
                     input.push(message_item("assistant", content));
                 }
@@ -394,6 +451,9 @@ fn build_responses_request(
             json!("auto")
         };
         obj.insert("tools".to_string(), json!(tools_json));
+        if config.x_search {
+            obj.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
+        }
         obj.insert("tool_choice".to_string(), tool_choice);
     }
     if !instructions.is_empty() {
@@ -447,8 +507,10 @@ fn is_declared_server_tool_name(name: &str) -> bool {
 
 fn is_x_search_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("x_search_call")
-        || ((item.get("type").and_then(Value::as_str) == Some("function_call")
-            || item.get("type").and_then(Value::as_str) == Some("function"))
+        || (matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call" | "function" | "custom_tool_call")
+        )
             && item
                 .get("name")
                 .or_else(|| item.pointer("/function/name"))
@@ -461,7 +523,7 @@ fn is_x_search_item(item: &Value) -> bool {
 fn is_server_tool_item(item: &Value) -> bool {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
         kind if is_server_tool_type(kind) => true,
-        "function_call" | "function" => item
+        "function_call" | "function" | "custom_tool_call" => item
             .get("name")
             .or_else(|| item.pointer("/function/name"))
             .and_then(Value::as_str)
@@ -684,6 +746,11 @@ fn parse_responses_value(
         }
     }
     append_citations(&mut text, value);
+    if used_server_tools {
+        if let Some(items) = output {
+            remember_server_items(items, &calls, &text);
+        }
+    }
     if let Some(sink) = sink {
         if !text.is_empty() {
             StreamBuffer::append(sink, &text);
@@ -738,6 +805,7 @@ async fn parse_responses_sse(
     let mut incomplete = false;
     let mut citations: Option<Value> = None;
     let mut used_server_tools = false;
+    let mut final_items: Vec<Value> = Vec::new();
 
     crate::sse::for_each_event(response, |data| {
         if data == "[DONE]" {
@@ -911,6 +979,7 @@ async fn parse_responses_sse(
                     .pointer("/response/output")
                     .and_then(Value::as_array)
                 {
+                    final_items = items.clone();
                     for item in items {
                         if is_server_tool_item(item) {
                             used_server_tools = true;
@@ -1022,6 +1091,10 @@ async fn parse_responses_sse(
             obj.insert("citations".into(), c.clone());
         }
         append_citations(&mut text, &wrapper);
+    }
+
+    if used_server_tools && !final_items.is_empty() {
+        remember_server_items(&final_items, &calls, &text);
     }
 
     if let Some(err) = failure {
