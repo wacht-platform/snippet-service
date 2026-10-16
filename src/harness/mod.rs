@@ -374,6 +374,40 @@ only the user can resolve, say exactly what you need."
     )
 }
 
+fn goal_headline(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(|l| l.trim().trim_matches('*').trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut out: String = line.chars().take(160).collect();
+    if line.chars().count() > 160 {
+        out.push('…');
+    }
+    out
+}
+
+fn goal_reference(messages: &[HarnessMessage], text: &str) -> String {
+    let started = messages.iter().any(|m| {
+        matches!(m, HarnessMessage::User { content }
+            if content.starts_with("[goal] The user has given you a goal") && content.contains(text))
+    });
+    if started {
+        goal_headline(text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn goal_stalled_directive(text: &str) -> String {
+    format!(
+        "[goal] Your last turn ended without calling any tool or `complete_goal`, so nothing \
+happened. Saying you'll do something doesn't do it. In this reply, make the actual call for the \
+next step of: {text}. If it's finished, call `complete_goal`; if only the user can unblock \
+it, say exactly what you need."
+    )
+}
+
 fn goal_continue_directive(text: &str, dir: &str) -> String {
     format!(
         "[goal] Carry on with your goal: {text}\n\
