@@ -29,6 +29,7 @@ pub fn router() -> Router<Shared> {
         .route("/github/pr/review", post(review))
         .route("/github/pr/comment", post(comment))
         .route("/github/pr/merge", post(merge))
+        .route("/github/pr/create", post(create))
         .route("/github/pr/reply", post(reply))
         .route("/github/pr/thread", post(resolve_thread))
         .route("/github/commit/diff", get(commit_diff))
@@ -336,6 +337,53 @@ async fn comment(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json
     };
     match gh(&dir, &["pr", "comment", &req.number.to_string(), "--body-file", "-"], Some(&req.body)).await {
         Ok(text) => Json(json!({ "posted": true, "url": text.trim() })).into_response(),
+        Err(e) => fail(StatusCode::BAD_GATEWAY, e),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateReq {
+    session: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    draft: bool,
+}
+
+async fn create(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<CreateReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match session_dir(&req.session) {
+        Ok(dir) => dir,
+        Err(r) => return r,
+    };
+    let push = tokio::process::Command::new("git")
+        .args(["push", "-u", "origin", "HEAD"])
+        .current_dir(&dir)
+        .output()
+        .await;
+    match push {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => return fail(StatusCode::BAD_GATEWAY, String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+    let title = req.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let mut args: Vec<&str> = vec!["pr", "create"];
+    match title {
+        Some(t) => {
+            args.extend(["--title", t, "--body-file", "-"]);
+        }
+        None => args.push("--fill"),
+    }
+    if req.draft {
+        args.push("--draft");
+    }
+    let body = req.body.clone().unwrap_or_default();
+    match gh(&dir, &args, title.map(|_| body.as_str())).await {
+        Ok(text) => Json(json!({ "created": true, "url": text.trim().lines().last().unwrap_or("") })).into_response(),
         Err(e) => fail(StatusCode::BAD_GATEWAY, e),
     }
 }

@@ -862,6 +862,8 @@ pub async fn run_serve(
         .route("/bg/kill", post(bg_kill))
         .route("/bg/log", post(bg_log))
         .route("/git/stash", post(git_stash))
+        .route("/git/discard", post(git_discard))
+        .route("/session/checkpoint-stats", post(checkpoint_stats))
         .route("/git/init", post(git_init))
         .with_state(daemon);
     let addr: SocketAddr = format!("{host}:{port}")

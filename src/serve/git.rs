@@ -548,6 +548,36 @@ pub(super) async fn git_stash(
 }
 
 #[derive(Deserialize)]
+pub(super) struct GitSessionReq {
+    session: String,
+}
+
+// POST /git/discard {session} — drop every uncommitted change, tracked and untracked.
+pub(super) async fn git_discard(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<GitSessionReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match resolve_session_dir(&req.session) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let _lock = d.git_write.lock().await;
+    match run_git(&dir, ["reset", "--hard", "HEAD"]).await {
+        Ok((0, ..)) => {}
+        Ok((c, so, se, t)) => return git_result(c, so, se, t),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+    match run_git(&dir, ["clean", "-fd"]).await {
+        Ok((c, so, se, t)) => git_result(c, so, se, t),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub(super) struct WorktreesQuery {
     token: Option<String>,
     folder: String,

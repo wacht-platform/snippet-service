@@ -15,7 +15,7 @@ use std::time::Duration;
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 
@@ -44,6 +44,39 @@ pub fn router() -> Router<Shared> {
         .route("/memory/scopes", get(list_scopes))
         .route("/memory/file", get(read_file))
         .route("/memory/history", get(history))
+        .route("/memory/entry", post(edit_entry))
+}
+
+#[derive(Deserialize)]
+struct EntryReq {
+    key: String,
+    #[serde(default)]
+    file: Option<String>,
+    matching: String,
+    #[serde(default)]
+    entry: Option<String>,
+}
+
+async fn edit_entry(State(d): State<Shared>, Query(a): Query<Auth>, Json(req): Json<EntryReq>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(repo) = MemoryRepo::from_key(&req.key) else {
+        return (StatusCode::NOT_FOUND, "no such memory").into_response();
+    };
+    let file = req.file.as_deref().unwrap_or("MEMORY.md");
+    let result = match req.entry.as_deref() {
+        Some(entry) => repo.replace_entry(file, &req.matching, entry),
+        None => repo.remove_entry(file, &req.matching),
+    };
+    match result {
+        Ok(msg) => {
+            let verb = if req.entry.is_some() { "Edit" } else { "Forget" };
+            let _ = repo.commit_all(&format!("{verb} from the app"));
+            Json(serde_json::json!({ "ok": true, "message": msg })).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
