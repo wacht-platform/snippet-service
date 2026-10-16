@@ -4,8 +4,9 @@
 //! durable record. The serve tick loop is the only reader. It claims due jobs and
 //! delivers `LoopInput::SetGoal` so the target session drives that piece of work
 //! to `complete_goal`. Optional `plan_path` is read from disk at fire time. If
-//! the target is mid-turn, has a running lane, or already has an active/paused
-//! goal, the fire is queued (one deep). Queued jobs are retried as soon as that
+//! the target is mid-turn, has a running lane, or already has an active goal or
+//! a paused one of its own, the fire is queued (one deep). A paused goal left by
+//! an earlier scheduled run does not block: the next fire replaces it. Queued jobs are retried as soon as that
 //! goal completes (fast poll while anything is queued) — missed intervals are not
 //! backfilled.
 
