@@ -649,6 +649,9 @@ impl CodingHarness {
         if text.is_empty() {
             return;
         }
+        if text.starts_with("**Scheduled run") {
+            self.start_fresh_context(state);
+        }
         state.goal = Some(Goal {
             text: text.clone(),
             dir: String::new(),
@@ -664,6 +667,24 @@ impl CodingHarness {
             reasoning: text,
         });
         state.status = HarnessStatus::Running;
+    }
+
+    fn start_fresh_context(&self, state: &mut HarnessState) {
+        let keep = state
+            .messages
+            .iter()
+            .take_while(|m| matches!(m, HarnessMessage::System { .. }))
+            .count();
+        if state.messages.len() <= keep {
+            return;
+        }
+        let older: Vec<HarnessMessage> = state.messages.drain(keep..).collect();
+        if let (Ok(store), Some(session_id)) =
+            (self.context.store(), self.context.durable_session_id())
+        {
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = crate::history_archive::archive_messages(&store, session_id, &older, &now);
+        }
     }
 
     /// Resume a paused rate-limited goal without replacing its text.
