@@ -333,7 +333,7 @@ impl MemoryRepo {
         let mut newest = None;
         for line in log.lines() {
             let (time, subject) = line.split_once('\x1f').unwrap_or((line, ""));
-            if subject.starts_with(CONSOLIDATE_PREFIX) || subject == "Create memory repo" {
+            if subject.starts_with(CONSOLIDATE_PREFIX) || subject == "Create memory repo" || subject == "Remove expired entries" {
                 continue;
             }
             count += 1;

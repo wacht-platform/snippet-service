@@ -2,10 +2,10 @@
 //! each repo without anyone asking.
 //!
 //! **When a repo is consolidated.** The loop wakes every few minutes. A global, project
-//! or agent repo is due once it has `BURST` commits since its last consolidation, or
-//! any commit at all and no consolidation for `DAILY`. Session memory counts toward
-//! the project and agent it belongs to, since consolidation is where durable facts
-//! leave a session. Consolidations only start while no session is running, one at a
+//! or agent repo is due at most once per `DAILY`, and only when a session memory that
+//! feeds it changed since its last consolidation (or its `MEMORY.md` is over budget).
+//! Session memory feeds the project and agent it belongs to, since consolidation is
+//! where durable facts leave a session. Consolidations only start while no session is running, one at a
 //! time, so they never compete with the user's own work.
 
 use std::path::PathBuf;
@@ -25,7 +25,6 @@ use crate::session::{read_session_meta, state_path_for_id, status_str};
 use super::{unauthorized, Auth, Shared};
 
 const TICK: Duration = Duration::from_secs(300);
-const BURST: usize = 6;
 const DAILY: i64 = 20 * 3600;
 const SETTLE: i64 = 30 * 60;
 
@@ -307,15 +306,16 @@ fn due_repo() -> Option<MemoryRepo> {
             continue;
         }
         let last = repo.last_consolidated();
-        let (own, newest) = repo.activity_since_consolidation();
         let fed = sessions_feeding(&repo, &sessions, last);
-        let activity = own + fed.len();
-        if activity == 0 {
+        let over_budget = repo.entry_point().chars().count() > ENTRY_BUDGET_CHARS;
+        if fed.is_empty() && !over_budget {
             continue;
         }
+        let newest = fed.iter().filter_map(|s| s.activity_since_consolidation().1).max();
+        let activity = fed.len();
         let settled = newest.is_none_or(|t| now - t > SETTLE);
         let stale = last.is_none_or(|t| now - t > DAILY);
-        let due = activity >= BURST || (stale && settled);
+        let due = stale && settled;
         if due && best.as_ref().is_none_or(|(n, _)| activity > *n) {
             best = Some((activity, repo));
         }
