@@ -1,6 +1,6 @@
 //! xAI (Grok) Responses adapter. SuperGrok/X Premium OAuth talks to
-//! `https://api.x.ai/v1/responses` so built-in server tools such as `x_search`
-//! can run on xAI. Snippet client tools stay mixed in as function tools; the
+//! `https://api.x.ai/v1/responses`. X search is exposed as a `search_x` function that
+//! the adapter runs as a small `x_search`-only xAI request. Snippet client tools stay mixed in as function tools; the
 //! harness loop is unchanged.
 
 use async_trait::async_trait;
@@ -21,6 +21,9 @@ use crate::tools::ToolError;
 
 const RESPONSES_PATH: &str = "/responses";
 const SERVER_ITEMS_CAP: usize = 256;
+const SEARCH_X_TOOL: &str = "search_x";
+const SEARCH_X_ROUNDS: usize = 4;
+const SEARCH_X_RESULT_CHARS: usize = 16_000;
 
 static SERVER_ITEMS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::VecDeque<(String, Vec<Value>)>>,
@@ -34,22 +37,10 @@ fn server_items_key<'a>(mut call_ids: impl Iterator<Item = &'a str>, text: &str)
     (!text.is_empty()).then(|| format!("text:{text}"))
 }
 
-fn remember_server_items(items: &[Value], calls: &[GeneratedToolCall], text: &str) {
+fn remember_server_items(items: Vec<Value>, calls: &[GeneratedToolCall], text: &str) {
     let Some(key) = server_items_key(calls.iter().filter_map(|c| c.id.as_deref()), text) else {
         return;
     };
-    let items: Vec<Value> = items
-        .iter()
-        .map(|item| {
-            let mut item = item.clone();
-            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                if let Some(obj) = item.as_object_mut() {
-                    obj.remove("status");
-                }
-            }
-            item
-        })
-        .collect();
     let Ok(mut store) = SERVER_ITEMS.lock() else {
         return;
     };
@@ -141,7 +132,107 @@ impl AgentModel for XaiModel {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
-        let body = build_responses_request(&self.config, messages, tools, force_tool);
+        let mut body = build_responses_request(&self.config, messages, tools, force_tool);
+        if !self.config.x_search {
+            return self.send(&body, sink).await;
+        }
+        let mut prefix: Vec<Value> = Vec::new();
+        let mut round = 0;
+        loop {
+            round += 1;
+            let mut output = self.send(&body, sink.clone()).await?;
+            let (searches, rest): (Vec<GeneratedToolCall>, Vec<GeneratedToolCall>) = output
+                .calls
+                .drain(..)
+                .partition(|c| c.tool_name == SEARCH_X_TOOL);
+            output.calls = rest;
+            if searches.is_empty() {
+                if !prefix.is_empty() {
+                    let text = output.content_text.clone().unwrap_or_default();
+                    remember_server_items(prefix, &output.calls, &text);
+                }
+                return Ok(output);
+            }
+            let mut items: Vec<Value> = Vec::new();
+            if let Some(text) = output.content_text.as_deref().filter(|t| !t.trim().is_empty()) {
+                items.push(message_item("assistant", text));
+            }
+            for (i, call) in searches.iter().enumerate() {
+                let call_id = call
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("search_x_{round}_{i}"));
+                let query = call
+                    .arguments
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let result = self.search_x(&query).await;
+                items.push(json!({
+                    "type": "function_call",
+                    "name": SEARCH_X_TOOL,
+                    "arguments": serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into()),
+                    "call_id": call_id,
+                }));
+                items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": result,
+                }));
+            }
+            prefix.extend(items.iter().cloned());
+            if !output.calls.is_empty() || round >= SEARCH_X_ROUNDS {
+                output.content_text = None;
+                remember_server_items(prefix, &output.calls, "");
+                if output.calls.is_empty() {
+                    output.content_text = Some(
+                        "X search ran but I hit the search round limit for this turn.".to_string(),
+                    );
+                }
+                return Ok(output);
+            }
+            if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+                input.extend(items);
+            }
+        }
+    }
+}
+
+impl XaiModel {
+    async fn search_x(&mut self, query: &str) -> String {
+        if query.trim().is_empty() {
+            return "search_x needs a query.".to_string();
+        }
+        let mut body = json!({
+            "model": self.config.inner.model,
+            "input": [message_item("user", &format!(
+                "Search X for: {query}\n\nUse X search (try more than one query if the first is thin). For every matching post give: @handle, UTC timestamp, the exact https://x.com/<handle>/status/<id> URL from the search results, likes/reposts/replies/views when known, and the post text. Only list posts the search actually returned; never guess IDs. If nothing matches, say so."
+            ))],
+            "tools": [{"type": "x_search"}],
+            "store": false,
+        });
+        if let Some(effort) = normalize_effort(self.config.inner.reasoning_effort.as_deref()) {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+        match self.send(&body, None).await {
+            Ok(out) => {
+                let text = out.content_text.unwrap_or_default();
+                if text.trim().is_empty() {
+                    "X search returned nothing.".to_string()
+                } else {
+                    text.chars().take(SEARCH_X_RESULT_CHARS).collect()
+                }
+            }
+            Err(e) => format!("X search failed: {e}"),
+        }
+    }
+
+    async fn send(
+        &mut self,
+        body: &Value,
+        sink: Option<StreamHandle>,
+    ) -> Result<ModelOutput, ToolError> {
         let url = self.responses_url();
         let max_attempts = self.config.inner.max_retries.saturating_add(1).max(1);
         let mut last_error = String::new();
@@ -299,7 +390,7 @@ fn build_responses_request(
                 instructions = content.clone();
                 if config.x_search {
                     instructions.push_str(
-                        "\n\nYou have xAI's built-in X search (x_keyword_search, x_semantic_search, x_user_search, x_thread_fetch). It isn't in your function list because xAI runs it for you, but it is available on every turn: use it whenever you need posts, threads, accounts or live counts from X, and try it before concluding anything about X. If a search comes back empty, say so; never assume it's unavailable because an earlier turn said so. Use `web_search` for the open web, and browser tools only for logged-in sites.",
+                        "\n\nYou have `search_x` for X (Twitter): it searches posts, accounts and threads live and returns each post's author, time, status URL and text. Call it whenever you need anything from X, including recent posts in a time window; never assume X search is unavailable. Use `web_search` for the open web, and browser tools only for logged-in sites.",
                     );
                 }
             }
@@ -318,15 +409,7 @@ fn build_responses_request(
                 let recalled = server_items_key(tool_calls.iter().map(|c| c.id.as_str()), content)
                     .and_then(|key| recall_server_items(&key));
                 if let Some(items) = recalled {
-                    for item in items {
-                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                            if let Some(id) = item.get("call_id").and_then(Value::as_str) {
-                                seen_calls.insert(id.to_string());
-                            }
-                        }
-                        input.push(item);
-                    }
-                    continue;
+                    input.extend(items);
                 }
                 if !content.is_empty() {
                     input.push(message_item("assistant", content));
@@ -423,7 +506,17 @@ fn build_responses_request(
 
     let mut tools_json: Vec<Value> = Vec::new();
     if config.x_search {
-        tools_json.push(json!({ "type": "x_search" }));
+        tools_json.push(json!({
+            "type": "function",
+            "name": SEARCH_X_TOOL,
+            "description": "Search X (Twitter) live. Describe what to find in plain words, including any time window (e.g. \"posts from the last hour about Claude Code or coding agents\"), accounts, or a status URL to fetch a thread. Returns matching posts with author, UTC time, status URL, engagement and text.",
+            "strict": false,
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "What to find on X."}},
+                "required": ["query"],
+            },
+        }));
     }
     for t in tools {
         tools_json.push(json!({
@@ -451,9 +544,6 @@ fn build_responses_request(
             json!("auto")
         };
         obj.insert("tools".to_string(), json!(tools_json));
-        if config.x_search {
-            obj.insert("include".to_string(), json!(["reasoning.encrypted_content"]));
-        }
         obj.insert("tool_choice".to_string(), tool_choice);
     }
     if !instructions.is_empty() {
@@ -746,11 +836,6 @@ fn parse_responses_value(
         }
     }
     append_citations(&mut text, value);
-    if used_server_tools {
-        if let Some(items) = output {
-            remember_server_items(items, &calls, &text);
-        }
-    }
     if let Some(sink) = sink {
         if !text.is_empty() {
             StreamBuffer::append(sink, &text);
@@ -805,7 +890,6 @@ async fn parse_responses_sse(
     let mut incomplete = false;
     let mut citations: Option<Value> = None;
     let mut used_server_tools = false;
-    let mut final_items: Vec<Value> = Vec::new();
 
     crate::sse::for_each_event(response, |data| {
         if data == "[DONE]" {
@@ -979,7 +1063,6 @@ async fn parse_responses_sse(
                     .pointer("/response/output")
                     .and_then(Value::as_array)
                 {
-                    final_items = items.clone();
                     for item in items {
                         if is_server_tool_item(item) {
                             used_server_tools = true;
@@ -1093,10 +1176,6 @@ async fn parse_responses_sse(
         append_citations(&mut text, &wrapper);
     }
 
-    if used_server_tools && !final_items.is_empty() {
-        remember_server_items(&final_items, &calls, &text);
-    }
-
     if let Some(err) = failure {
         if text.is_empty() && calls.is_empty() {
             return Err(ToolError::model_request(format!("xAI: {err}"), false));
@@ -1159,7 +1238,7 @@ mod tests {
         );
         assert_eq!(body["store"], json!(false));
         let tools = body["tools"].as_array().expect("tools");
-        assert_eq!(tools[0]["type"], "x_search");
+        assert_eq!(tools[0]["name"], "search_x");
         assert_eq!(tools[1]["type"], "function");
         assert_eq!(tools[1]["name"], "bash");
     }
@@ -1175,7 +1254,7 @@ mod tests {
             false,
         );
         let tools = body["tools"].as_array().expect("tools");
-        assert!(tools.iter().all(|t| t["type"] != "x_search"));
+        assert!(tools.iter().all(|t| t["type"] != "x_search" && t["name"] != "search_x"));
         assert_eq!(tools[0]["name"], "bash");
     }
 
