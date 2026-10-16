@@ -862,6 +862,9 @@ fn idle_goal_turns(messages: &[HarnessMessage]) -> usize {
                     break;
                 }
                 idle += 1;
+                if content.starts_with("[goal] The user has given you a goal") {
+                    break;
+                }
             }
             _ => {}
         }
