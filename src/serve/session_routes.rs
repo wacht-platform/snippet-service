@@ -515,3 +515,37 @@ pub(crate) struct AttachQuery {
     pub(crate) compact: Option<String>,
 }
 
+
+#[derive(Deserialize)]
+pub(crate) struct CheckpointStatsReq {
+    session: String,
+    ids: Vec<String>,
+}
+
+pub(crate) async fn checkpoint_stats(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<CheckpointStatsReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let dir = match resolve_session_dir(&req.session) {
+        Ok(dir) => dir,
+        Err(r) => return r,
+    };
+    let ids = req.ids;
+    let stats = tokio::task::spawn_blocking(move || {
+        let mut out = serde_json::Map::new();
+        for (i, id) in ids.iter().enumerate() {
+            let next = ids.get(i + 1).map(String::as_str);
+            if let Some((files, add, del)) = crate::checkpoint::shortstat(&dir, id, next) {
+                out.insert(id.clone(), serde_json::json!({"files": files, "add": add, "del": del}));
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default();
+    Json(serde_json::Value::Object(stats)).into_response()
+}
