@@ -76,6 +76,8 @@ pub struct AutonomyState {
     pub pings_sent: u32,
     #[serde(default)]
     pub answers: Vec<QueuedAnswer>,
+    #[serde(default)]
+    pub run_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
