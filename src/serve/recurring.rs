@@ -33,10 +33,11 @@ fn session_busy_for_recurring(id: &str) -> bool {
             .lanes
             .iter()
             .any(|l| matches!(l.status, crate::lanes::LaneStatus::Running))
-        || matches!(
-            state.goal.as_ref().map(|g| g.status),
-            Some(GoalStatus::Active | GoalStatus::Paused)
-        )
+        || state.goal.as_ref().is_some_and(|g| match g.status {
+            GoalStatus::Active => true,
+            GoalStatus::Paused => !g.text.starts_with("**Scheduled run"),
+            _ => false,
+        })
 }
 
 pub async fn tick_loop(daemon: Shared) {
