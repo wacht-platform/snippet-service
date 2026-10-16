@@ -1355,6 +1355,7 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
     let Ok(tasks) = daemon.store.list_tasks(None, None) else {
         return;
     };
+    let mut delivered_any = false;
     for task in tasks {
         for marker in &task.notifications {
             if marker.delivered || marker.target != "mission_control" {
@@ -1379,6 +1380,7 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
             daemon
                 .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))
                 .await;
+            delivered_any = true;
             let _ = daemon
                 .store
                 .update_task_in(&task.id, &chrono::Utc::now().to_rfc3339(), |t| {
@@ -1388,6 +1390,11 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
                         n.delivered = true;
                     }
                 });
+        }
+    }
+    if delivered_any {
+        if let Ok(tasks) = daemon.store.list_tasks(None, None) {
+            super::autonomy::mark_board_seen(&tasks);
         }
     }
 }
