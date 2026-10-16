@@ -678,8 +678,9 @@ impl CodingHarness {
         goal.resume_at = 0;
         let text = goal.text.clone();
         let dir = goal.dir.clone();
+        let reference = goal_reference(&state.messages, &text);
         state.messages.push(HarnessMessage::User {
-            content: goal_continue_directive(&text, &dir),
+            content: goal_continue_directive(&reference, &dir),
         });
         state.events.push(HarnessEvent::SystemDecision {
             step: "goal_resumed".to_string(),
@@ -731,10 +732,13 @@ impl CodingHarness {
             }
             None => return,
         };
-        let directive = if n % GOAL_SELF_CHECK_EVERY == 0 {
-            goal_selfcheck_directive(&text, &dir, n)
+        let reference = goal_reference(&state.messages, &text);
+        let directive = if idle_goal_turns(&state.messages) > 0 {
+            goal_stalled_directive(&reference)
+        } else if n % GOAL_SELF_CHECK_EVERY == 0 {
+            goal_selfcheck_directive(&reference, &dir, n)
         } else {
-            goal_continue_directive(&text, &dir)
+            goal_continue_directive(&reference, &dir)
         };
         state
             .messages
