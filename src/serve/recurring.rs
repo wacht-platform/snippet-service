@@ -108,6 +108,17 @@ async fn report_run_to_mission_control(daemon: Shared, title: String, session_id
             return;
         }
         let label = if title.trim().is_empty() { "untitled job" } else { title.trim() };
+        if status == "completed" {
+            let line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+            let line: String = line.chars().take(240).collect();
+            let note = format!("- {label} · {line}");
+            let _ = crate::mission_autonomy::update(|s| {
+                s.run_notes.push(note);
+                let excess = s.run_notes.len().saturating_sub(20);
+                s.run_notes.drain(..excess);
+            });
+            return;
+        }
         let text = format!(
             "[recurring_run_report]\njob: {label}\nsession_id: {session_id}\nstatus: {status}\nsummary: {}\n[/recurring_run_report]\nWorkflow W6 · recurring run report: pass on what's worth the user's attention, note it in your brief if it changes anything, then stop. Don't read the session's files or logs; this report is the outcome.",
             summary.trim()
