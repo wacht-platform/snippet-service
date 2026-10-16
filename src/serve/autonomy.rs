@@ -50,6 +50,7 @@ pub async fn autonomy_loop(daemon: Shared) {
             s.last_round_at = now;
             s.last_digest = digest;
             s.last_round_summary = Some(summary);
+            s.run_notes.clear();
         });
         deliver_to_mission_control(&daemon, envelope).await;
     }
@@ -77,6 +78,11 @@ fn board_digest(tasks: &[crate::coordination::Task]) -> String {
     rows.sort();
     rows.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+pub fn mark_board_seen(tasks: &[crate::coordination::Task]) {
+    let digest = board_digest(tasks);
+    let _ = mission_autonomy::update(|s| s.last_digest = digest);
 }
 
 fn secs_since(rfc3339: &str, now: i64) -> i64 {
@@ -275,6 +281,11 @@ fn round_envelope(
     out.push_str("\n## Changed since last wake\n");
     out.push_str(if changed.is_empty() { "nothing" } else { "" });
     out.push_str(&changed.join("\n"));
+
+    if !state.run_notes.is_empty() {
+        out.push_str("\n\n## Scheduled runs that completed since last wake\nTheir output is in their own sessions; mention one only if it needs the user.\n");
+        out.push_str(&state.run_notes.join("\n"));
+    }
 
     let open: Vec<String> = tasks
         .iter()
