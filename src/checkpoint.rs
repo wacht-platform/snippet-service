@@ -50,6 +50,24 @@ fn git(workspace: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Files changed, lines added and removed between checkpoint `from` and `to`, or
+/// the current working tree when `to` is None.
+pub fn shortstat(workspace: &Path, from: &str, to: Option<&str>) -> Option<(u64, u64, u64)> {
+    let mut args = vec!["diff", "--shortstat", from];
+    if let Some(to) = to {
+        args.push(to);
+    }
+    let out = git(workspace, &args).ok()?;
+    let num = |word: &str| {
+        out.split(',')
+            .find(|p| p.contains(word))
+            .and_then(|p| p.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    Some((num("changed"), num("insertion"), num("deletion")))
+}
+
 /// Restrict a path to the owning user (0700). Best-effort, unix-only.
 fn set_private(path: &Path) {
     #[cfg(unix)]
