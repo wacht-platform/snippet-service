@@ -72,6 +72,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/resume", "Resume a saved session"),
     ("/mission", "Open Mission Control"),
+    ("/go", "Open a session linked in the last reply"),
     ("/rewind", "Restore the workspace to a checkpoint"),
     ("/fork", "Branch a new session from a checkpoint or event"),
     ("/model", "Connect or change the AI model"),

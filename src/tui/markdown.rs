@@ -336,6 +336,20 @@ pub(super) fn parse_inline_md(text: &str, base: Style) -> Vec<(String, Style)> {
 
     while i < chars.len() {
         let c = chars[i];
+        if c == '['
+            && let Some(close) = find(i + 1, ']')
+            && chars.get(close + 1) == Some(&'(')
+            && let Some(end) = find(close + 2, ')')
+            && chars[close + 2..end].iter().collect::<String>().starts_with("session:")
+        {
+            flush(&mut runs, &mut buf, base);
+            runs.push((
+                chars[i + 1..close].iter().collect(),
+                base.fg(accent()).add_modifier(Modifier::UNDERLINED),
+            ));
+            i = end + 1;
+            continue;
+        }
         if c == '`'
             && let Some(end) = find(i + 1, '`')
         {
