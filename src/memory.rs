@@ -526,16 +526,13 @@ impl MemoryRepo {
 }
 
 /// The repos a session reads, most general first. Each is created on demand.
-pub fn scopes_for(workspace: Option<&Path>, agent: Option<&str>, session: Option<&str>) -> Vec<MemoryRepo> {
+pub fn scopes_for(workspace: Option<&Path>, agent: Option<&str>) -> Vec<MemoryRepo> {
     let mut repos = vec![MemoryRepo::global()];
     if let Some(workspace) = workspace {
         repos.push(MemoryRepo::project(workspace));
     }
     if let Some(repo) = agent.and_then(MemoryRepo::agent) {
         repos.push(repo);
-    }
-    if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
-        repos.push(MemoryRepo::session(session));
     }
     repos.retain(|repo| repo.ensure().is_ok());
     repos
