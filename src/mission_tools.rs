@@ -1554,7 +1554,7 @@ impl Tool for CleanUpSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "clean_up_sessions".into(),
-            description: "Keep the session list tidy. `list` (the default) returns sessions that have gone stale: not running, idle for `idle_days` (default 14) and with no open task, each with its title, workspace and how long it's been idle. `delete` removes the sessions you name, the same way deleting one in the app does: the conversation and its session memory go for good, while project and global memory keep what was learned. Deletion is the user's call, so show them the exact list and delete what they confirm; sessions that are running or have open work are refused.".into(),
+            description: "Keep the session list tidy. `list` (the default) returns sessions that have gone stale: not running, idle for `idle_days` (default 14) and with no open task, each with its title, workspace and how long it's been idle. `delete` removes the sessions you name, the same way deleting one in the app does: the conversation goes for good, while project and global memory keep what was learned. Deletion is the user's call, so show them the exact list and delete what they confirm; sessions that are running or have open work are refused.".into(),
             input_schema: schema(
                 json!({
                     "action": {"type": "string", "enum": ["list", "delete"]},

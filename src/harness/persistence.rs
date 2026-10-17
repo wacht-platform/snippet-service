@@ -192,16 +192,11 @@ impl CodingHarness {
             .agent_id()
             .map(str::to_string)
             .or_else(|| (self.context.owner() == "mission_control").then(|| "mission-control".to_string()));
-        let session = match self.context.lane_origin() {
-            Some((parent, _)) => Some(parent.to_string()),
-            None => self.session_id(),
-        };
         let workspace = self.context.workspace_root();
         let project = !workspace.starts_with(crate::config::snippet_home());
         crate::memory::scopes_for(
             project.then_some(workspace),
             agent.as_deref(),
-            session.as_deref(),
         )
     }
 
