@@ -591,6 +591,15 @@ impl Daemon {
         }
     }
 
+    async fn with_transcripts(&self, text: String) -> String {
+        match transcribe::prepare_message(self, text.clone()).await {
+            Ok(text) => text,
+            Err(error) => format!(
+                "{text}\n\n[Audio transcription unavailable: {error}. The original audio attachment remains available.]"
+            ),
+        }
+    }
+
     pub(crate) async fn deliver(&self, id: &str, input: LoopInput) {
         match &input {
             LoopInput::Unqueue(queue_id) | LoopInput::SteerQueued(queue_id) => {
@@ -600,12 +609,11 @@ impl Daemon {
         }
         let input = match input {
             LoopInput::UserMessage(text) => {
-                match transcribe::prepare_message(self, text.clone()).await {
-                    Ok(text) => LoopInput::UserMessage(text),
-                    Err(error) => LoopInput::UserMessage(format!(
-                        "{text}\n\n[Audio transcription unavailable: {error}. The original audio attachment remains available.]"
-                    )),
-                }
+                LoopInput::UserMessage(self.with_transcripts(text).await)
+            }
+            LoopInput::Queue(mut item) => {
+                item.text = self.with_transcripts(item.text).await;
+                LoopInput::Queue(item)
             }
             other => other,
         };
