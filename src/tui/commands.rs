@@ -364,6 +364,49 @@ impl App {
     /// newest first. Read from the daemon's catalog when there is one, else
     /// straight from the store.
     pub(crate) fn list_conversations(&self) -> Vec<Conversation> {
+        self.conversations(true)
+    }
+
+    fn linked_session_ids(&self) -> Vec<String> {
+        let Some(state) = self.state.as_ref() else {
+            return Vec::new();
+        };
+        let text = state.events.iter().rev().find_map(|e| match e {
+            HarnessEvent::AssistantText { text } if text.contains("](session:") => Some(text.as_str()),
+            _ => None,
+        });
+        let mut ids: Vec<String> = Vec::new();
+        for part in text.unwrap_or_default().split("](session:").skip(1) {
+            let id = part.split(')').next().unwrap_or("").trim().to_string();
+            if !id.is_empty() && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    fn open_linked_session(&mut self) {
+        let ids = self.linked_session_ids();
+        let all = self.conversations(false);
+        let linked: Vec<Conversation> = ids
+            .iter()
+            .filter_map(|id| all.iter().find(|c| &c.id == id).cloned())
+            .collect();
+        match linked.len() {
+            0 => self.status = "No session is linked in the last reply.".to_string(),
+            1 => self.open_conversation(&linked[0]),
+            _ => {
+                self.conv_cache = Some(linked);
+                self.screen = Screen::ResumeSelection;
+                self.resume_selected_index = 0;
+                self.resume_pending_delete = false;
+                self.resume_rename = None;
+                self.status = "↑↓ select · Enter open · Esc cancel".to_string();
+            }
+        }
+    }
+
+    fn conversations(&self, home_only: bool) -> Vec<Conversation> {
         let home = self.home_folder();
         let rows: Vec<crate::serve::sidecar::SessionRow> = match self.daemon_sessions.as_ref() {
             Some(rows) => rows.clone(),
@@ -384,7 +427,7 @@ impl App {
         let home_str = home.display().to_string();
         let mut list: Vec<_> = rows
             .into_iter()
-            .filter(|s| s.folder == home_str || s.origin_folder.as_deref() == Some(home_str.as_str()))
+            .filter(|s| !home_only || s.folder == home_str || s.origin_folder.as_deref() == Some(home_str.as_str()))
             // A workspace's root `default` state exists before anyone uses it;
             // only a titled one is a session worth resuming.
             .filter(|s| {
@@ -951,6 +994,7 @@ impl App {
             "/mission" => {
                 self.open_mission_control();
             }
+            "/go" => self.open_linked_session(),
             "/theme" => {
                 self.status = "AMOLED is the only theme.".to_string();
             }
