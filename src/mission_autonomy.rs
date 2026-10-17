@@ -287,7 +287,7 @@ fn next_wake_status(state: &AutonomyState) -> String {
                 .unwrap_or_default();
             format!(" Your next wake-up is set for {at} (the user's time): {}.", f.note)
         }
-        None => " You have no next wake-up set: set one with schedule_wake (next_wake) before you end this turn.".to_string(),
+        None => " No wake-up of your own is set; reports, questions and board changes still wake you.".to_string(),
     }
 }
 
