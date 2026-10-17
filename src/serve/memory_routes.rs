@@ -99,7 +99,7 @@ async fn list_scopes(State(d): State<Shared>, Query(a): Query<Auth>) -> Response
     let running = RUNNING.lock().unwrap().clone();
     let scopes: Vec<_> = MemoryRepo::all()
         .into_iter()
-        .filter(MemoryRepo::exists)
+        .filter(|repo| repo.kind != ScopeKind::Session && repo.exists())
         .map(|repo| {
             let entry = repo.entry_point();
             let entries = entry.lines().filter(|l| l.trim_start().starts_with("- ")).count();
@@ -308,11 +308,12 @@ fn due_repo() -> Option<MemoryRepo> {
         let last = repo.last_consolidated();
         let fed = sessions_feeding(&repo, &sessions, last);
         let over_budget = repo.entry_point().chars().count() > ENTRY_BUDGET_CHARS;
-        if fed.is_empty() && !over_budget {
+        let (own, own_newest) = repo.activity_since_consolidation();
+        if fed.is_empty() && own == 0 && !over_budget {
             continue;
         }
-        let newest = fed.iter().filter_map(|s| s.activity_since_consolidation().1).max();
-        let activity = fed.len();
+        let newest = fed.iter().filter_map(|s| s.activity_since_consolidation().1).max().max(own_newest);
+        let activity = fed.len() + own;
         let settled = newest.is_none_or(|t| now - t > SETTLE);
         let stale = last.is_none_or(|t| now - t > DAILY);
         let due = stale && settled;

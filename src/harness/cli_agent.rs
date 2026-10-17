@@ -287,7 +287,9 @@ struct Handoff {
     dropped: usize,
 }
 
-fn handoff(messages: &[HarnessMessage], fresh: bool, memory: Option<&str>, other_compacted: bool) -> Option<Handoff> {
+const DURABLE_SAVE: &str = "First save to global, project or agent memory what holds beyond this conversation: user preferences and rules, decisions and why, root causes, project facts and conventions. This conversation's own working state belongs in the summary, not in memory. Replace stale entries instead of adding duplicates, remove what is no longer true, and commit. An agent curates its own agent memory here and nowhere else: keep what still earns its place, rewrite what changed, and evict what is stale. ";
+
+fn handoff(messages: &[HarnessMessage], fresh: bool) -> Option<Handoff> {
     let mut entries: Vec<String> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
     let mut summary: Option<String> = None;
@@ -365,13 +367,6 @@ fn handoff(messages: &[HarnessMessage], fresh: bool, memory: Option<&str>, other
             "\nFiles changed in that time{}:\n{}\n",
             if touched.len() > shown.len() { format!(" (first {})", shown.len()) } else { String::new() },
             shown.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
-        ));
-    }
-    if let Some(path) = memory
-        && (fresh || dropped > 0 || other_compacted)
-    {
-        out.push_str(&format!(
-            "\nThis session's working state is saved in session memory at {path}: read MEMORY.md and the files its index links before relying on detail this summary leaves out.\n"
         ));
     }
     out.push_str("</conversation_so_far>\n\n");
@@ -866,57 +861,27 @@ impl CodingHarness {
         prompt
     }
 
-    fn session_memory_path(&self) -> Option<String> {
-        if !self.config.memory_enabled || self.context.lane_origin().is_some() {
-            return None;
-        }
-        self.memory_scopes()
-            .into_iter()
-            .find(|repo| repo.kind == crate::memory::ScopeKind::Session)
-            .map(|repo| repo.root.display().to_string())
+    fn memory_on(&self) -> bool {
+        self.config.memory_enabled && self.context.lane_origin().is_none()
     }
 
     fn compaction_save_prompt(&self) -> Option<String> {
-        let path = self.session_memory_path()?;
-        Some(format!(
-            "[compaction] This conversation is about to be compacted. First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. An agent curates its own agent memory here and nowhere else: keep what still earns its place, rewrite what changed, and evict what is stale or no longer useful. Then reply with one line saying what you saved."
-        ))
+        self.memory_on().then(|| format!("[compaction] This conversation is about to be compacted. {}Then reply with one line saying what you saved.", DURABLE_SAVE))
     }
 
     fn idle_memory_prompt(&self) -> Option<String> {
-        let path = self.session_memory_path()?;
-        Some(format!(
-            "[memory] The user has stepped away. Before they're back, save what this conversation established since your last memory save that will matter later: user preferences and rules, decisions and why, root causes, project facts and conventions, and the exact values unfinished work needs. Put each where it belongs: global, project or agent memory for what holds beyond this conversation, session memory at {path} for this conversation's working state. Update or remove stale entries instead of adding duplicates, keep entries short, and commit. If nothing durable came up, change nothing. Don't continue the work. Then reply with one line saying what you saved, or that nothing needed saving."
-        ))
+        self.memory_on().then(|| "[memory] The user has stepped away. Before they're back, save what this conversation established since your last memory save that holds beyond it: user preferences and rules, decisions and why, root causes, project facts and conventions, in global, project or agent memory. Update or remove stale entries instead of adding duplicates, keep entries short, and commit. If nothing durable came up, change nothing. Don't continue the work. Then reply with one line saying what you saved, or that nothing needed saving.".to_string())
     }
 
     fn agy_compaction_prompt(&self) -> String {
-        let save = match self.session_memory_path() {
-            Some(path) => format!(
-                "First save its working state to session memory at {path}: decisions and why, constraints and user rules, findings and root causes, the exact values (paths, ids, error strings) the work still needs, and the plan with what is done and what is left. Its MEMORY.md indexes the topic files; open only the ones this conversation changes. Use topic files such as decisions.md, findings.md and plan.md, replace stale entries instead of adding duplicates, remove entries that are finished or no longer true, and commit. Anything true beyond this conversation goes to the global, project or agent memory instead. An agent curates its own agent memory here and nowhere else: keep what still earns its place, rewrite what changed, and evict what is stale or no longer useful. "
-            ),
-            None => String::new(),
-        };
+        let save = if self.memory_on() { DURABLE_SAVE } else { "" };
         format!(
-            "[compaction] This conversation is about to be compacted: it will continue in a fresh conversation that starts from your summary. {save}Then reply with only the summary, about 2k tokens: the user's requests in order (one line each), the goal and what counts as done, progress (done, in progress, left), the next steps and the exact values they need, pointing to memory files instead of restating what they hold."
+            "[compaction] This conversation is about to be compacted: it will continue in a fresh conversation that starts from your summary. {save}Then reply with only the summary, about 2k tokens: the user's requests in order (one line each), the goal and what counts as done, progress (done, in progress, left), decisions and constraints, the next steps and the exact values (paths, ids, error strings) they need."
         )
     }
 
     fn compact_command(&self) -> String {
-        let pointer = match self.session_memory_path() {
-            Some(path) => format!(" The detail is saved in session memory at {path}; point to its files instead of restating them."),
-            None => String::new(),
-        };
-        format!(
-            "/compact Keep the summary lean, about 2k tokens: the user's requests in order (one line each), the goal and what counts as done, progress (done, in progress, left), the next steps and the exact values they need.{pointer}"
-        )
-    }
-
-    fn compaction_pointer(&self) -> Option<String> {
-        let path = self.session_memory_path()?;
-        Some(format!(
-            "This conversation was compacted. Its working state is in session memory at {path}: read MEMORY.md and the files its index links before relying on detail the summary leaves out."
-        ))
+        "/compact Keep the summary lean, about 2k tokens: the user's requests in order (one line each), the goal and what counts as done, progress (done, in progress, left), decisions and constraints, the next steps and the exact values (paths, ids, error strings) they need.".to_string()
     }
 
     fn effort_arg(profile: &InferenceProfileConfig) -> Option<&str> {
@@ -1248,7 +1213,7 @@ impl CodingHarness {
                         || (!session.mark.is_empty() && transcript_mark(&state.messages, session.synced) != session.mark);
                     let away = !rewritten && prior_end > session.synced;
                     let behind = away
-                        && handoff(&state.messages[session.synced..prior_end], false, None, false)
+                        && handoff(&state.messages[session.synced..prior_end], false)
                             .is_some_and(|h| h.dropped > 0);
                     let threshold = self
                         .config
@@ -1311,13 +1276,10 @@ impl CodingHarness {
                     }
                     let prior_end = state.messages.len().saturating_sub(outbox.len());
                     let fresh = session.synced == 0;
-                    let memory = self.session_memory_path();
                     if prior_end > session.synced.max(1)
                         && let Some(context) = handoff(
                             &state.messages[session.synced.max(1)..prior_end],
                             fresh,
-                            memory.as_deref(),
-                            state.compactions > session.compactions,
                         )
                         && let Some(first) = outbox.first_mut()
                     {
@@ -1557,7 +1519,6 @@ impl CodingHarness {
                                     ),
                                 });
                                 last_task_note.clear();
-                                after_compaction = self.compaction_pointer();
                                 self.persist(&mut state, &lanes).await?;
                             }
                             let final_before = state.final_text.clone();
@@ -1590,10 +1551,9 @@ impl CodingHarness {
                                         session.id = None;
                                         session.started = false;
                                         session.mark_synced(&state.messages, state.compactions + 1, 0);
-                                        let pointer = self.compaction_pointer().unwrap_or_default();
                                         after_compaction = Some(match summary {
-                                            Some(summary) => format!("This conversation continues from an earlier one that was compacted. Summary of it:\n{summary}\n\n{pointer}"),
-                                            None => format!("This conversation continues from an earlier one that was compacted. {pointer}"),
+                                            Some(summary) => format!("This conversation continues from an earlier one that was compacted. Summary of it:\n{summary}"),
+                                            None => "This conversation continues from an earlier one that was compacted.".to_string(),
                                         });
                                         last_task_note.clear();
                                         state.compactions += 1;
