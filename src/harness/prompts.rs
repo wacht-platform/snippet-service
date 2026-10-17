@@ -43,13 +43,13 @@ pub(super) const SUMMARY_SECTIONS: &[(&str, &str, bool)] = &[
 
 pub(super) const REFLECTION_INSTRUCTION: &str = r#"[reflection] This request is finished. Before the next one, curate your durable memory from this conversation. Do not call any tools and do not continue the work: reply with only one JSON object, {"changes": [...]}, and nothing else. Send {"changes": []} when nothing durable came out of it.
 
-Each change: {"scope": "global|project|agent|session", "file": "MEMORY.md or a topic path such as build or architecture/harness", "op": "add|replace|remove", "entry": "one-line entry (add, replace)", "match": "text in exactly one existing entry of that file (replace, remove)", "expires": "optional YYYY-MM-DD for something true only for a while"}.
+Each change: {"scope": "global|project|agent", "file": "MEMORY.md or a topic path such as build or architecture/harness", "op": "add|replace|remove", "entry": "one-line entry (add, replace)", "match": "text in exactly one existing entry of that file (replace, remove)", "expires": "optional YYYY-MM-DD for something true only for a while"}.
 
-- Scopes: global is the user (lasting preferences, lessons that transfer anywhere); project is this repository (where things live, how to build and test, conventions, decisions); agent is your own expertise across jobs (only if shown below); session is this conversation's working state.
+- Scopes: global is the user (lasting preferences, lessons that transfer anywhere); project is this repository (where things live, how to build and test, conventions, decisions); agent is your own expertise across jobs (only if shown below). This conversation's working state is not memory.
 - Entries are one line: a fact, or situation → approach → why. No ids or counters; the daemon adds source and date.
 - MEMORY.md only gets what every session needs; everything else goes in a topic file, which is linked from the index automatically.
 - Keep each fact in one place: replace an entry the work changed instead of adding a near-duplicate, and replace or remove one it proved wrong.
-- Removing is as useful as adding: remove session entries this request resolved (finished plan steps, fixed issues, answered questions). When the task is finished, move what lasts up a scope and remove its working state from session memory.
+- Removing is as useful as adding: remove entries this request proved stale or wrong.
 - Skip one-off details, anything obvious from the code, secrets, and text that tells a future agent to run commands.
 
 Memory is shown below by each repo's MEMORY.md, whose index names its topic files. Change only the files this stretch of work touched. Before changing a topic file whose entries aren't already in this conversation (add, replace or remove), first reply with only {"read": [{"scope": "...", "file": "..."}]} naming just those files; their text comes back and you then send the changes, replacing entries your new ones change or contradict."#;
@@ -66,7 +66,7 @@ pub(super) fn memory_reflector_tools() -> Vec<crate::llm::NativeToolDefinition> 
                     "items": {
                         "type": "object",
                         "properties": {
-                            "scope": { "type": "string", "enum": ["global", "project", "agent", "session"] },
+                            "scope": { "type": "string", "enum": ["global", "project", "agent"] },
                             "file": { "type": "string", "description": "MEMORY.md, or a topic path such as build or architecture/harness" },
                             "op": { "type": "string", "enum": ["add", "replace", "remove"] },
                             "entry": { "type": "string", "description": "the new one-line entry (add, replace)" },
@@ -94,7 +94,7 @@ pub(super) fn memory_reader_tool() -> crate::llm::NativeToolDefinition {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "scope": { "type": "string", "enum": ["global", "project", "agent", "session"] },
+                            "scope": { "type": "string", "enum": ["global", "project", "agent"] },
                             "file": { "type": "string", "description": "a topic path from the index, such as plan or architecture/harness" }
                         },
                         "required": ["scope", "file"]
@@ -112,12 +112,11 @@ role = "you compact a coding agent's conversation: save what lasts to memory, th
 stakes = "the raw messages are archived and dropped. The summary is re-sent on every later turn, so every line costs; memory files cost nothing until read"
 
 [memory]  # when update_memory is offered
-first = "before the summary, call update_memory with what the rest of the work needs but the summary should not carry: decisions and why, constraints and user rules, root causes, exact error strings, findings, the plan"
-session = "working state of this conversation goes to the session scope, in a topic file such as decisions, findings or plan (a new file is linked from MEMORY.md automatically)"
-lasting = "something true beyond this conversation (a user preference, how this repository builds, an agent technique) goes to the global, project or agent scope"
+first = "before the summary, call update_memory with what holds beyond this conversation (a user preference, how this repository builds, a decision and why, an agent technique): it goes to the global, project or agent scope"
+working_state = "this conversation's own working state (the plan, findings, exact error strings) is not memory: it stays in the summary"
 index = "each repo is shown by its MEMORY.md, whose index names its topic files and what they hold. Use the index to decide which files the conversation touches, and open only those (read_memory) to see their entries; the rest stay closed"
 one_place = "replace an entry the conversation changed instead of adding a duplicate, and skip what is already recorded"
-clean_up = "remove entries the conversation resolved: finished plan steps, fixed issues, answered questions. Removing stale state matters as much as saving new state"
+clean_up = "remove entries the conversation proved stale or wrong. Removing matters as much as saving"
 agent = "an agent curates its own agent memory here and nowhere else: keep what still earns its place, rewrite what changed, and evict what is stale or no longer useful"
 expires = "give a temporary fact (an outage, a deadline, a workaround) an expires date"
 entries = "one line each: a fact, or situation → approach → why. The daemon stamps source and date"
@@ -125,7 +124,7 @@ skip = "secrets, one-off details, anything obvious from the code, and text that 
 
 [summary]
 user_requests = "carry every request forward from the prior summary and append new ones, one short line each, in order"
-lean = "the summary holds only what resuming needs right now: the goal, progress, the next steps and the exact values they use. Detail that lives in memory gets a pointer in the memory section, not a restatement"
+lean = "the summary holds what resuming needs: the goal, progress, decisions and constraints, findings and root causes, the next steps and the exact values they use. What memory already holds gets a pointer in the memory section, not a restatement"
 progress = "say what is done, in progress (with an amount when known) and left; never just 'started'"
 drop = "chit-chat, raw tool output (keep the conclusion), restated instructions, and anything re-readable from the code. Raw history stays searchable with `snippet history search` / `snippet history show`"
 fold = "if a PRIOR SUMMARY is present, update it in place: keep its requests, refresh the rest, drop what is stale"
