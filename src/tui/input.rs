@@ -475,7 +475,7 @@ impl App {
             return;
         }
         // Record for Up/Down history recall (skip consecutive duplicates).
-        if self.input_history.last().map(String::as_str) != Some(text.as_str()) {
+        if !text.starts_with("/voice key") && self.input_history.last().map(String::as_str) != Some(text.as_str()) {
             self.input_history.push(text.clone());
         }
         self.history_pos = None;
