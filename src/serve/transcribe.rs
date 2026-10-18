@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 const MAX_ATTACHMENTS: usize = 5;
-const MAX_AUDIO_DURATION_SECONDS: f64 = 3.0 * 60.0;
 
 fn is_audio_path(path: &Path) -> bool {
     matches!(
@@ -94,27 +93,44 @@ pub(super) async fn prepare_message(d: &Daemon, text: String) -> Result<String, 
     Ok(out)
 }
 
+pub(super) fn transcript_request(voice: &crate::config::VoiceConfig, upload_url: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({"audio_url": upload_url});
+    if !voice.speech_model.is_empty() {
+        body["speech_models"] = serde_json::json!([voice.speech_model]);
+    }
+    if !voice.language.is_empty() {
+        body["language_code"] = serde_json::json!(voice.language);
+    }
+    if !voice.keyterms.is_empty() {
+        body["keyterms_prompt"] = serde_json::json!(voice.keyterms);
+    }
+    body
+}
+
 async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String> {
+    d.reload_config().await;
+    let (voice, key) = {
+        let c = d.config.lock().unwrap();
+        (c.voice.clone(), c.assemblyai_api_key.clone())
+    };
+    if !voice.enabled {
+        return Err("voice notes are turned off in Settings → Voice".to_string());
+    }
+    let key = key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "no AssemblyAI API key is set (Settings → Voice)".to_string())?;
     let duration = audio_duration_seconds(path).await?;
-    if duration >= MAX_AUDIO_DURATION_SECONDS {
+    let limit = voice.max_seconds.max(crate::config::VOICE_MIN_SECONDS);
+    if duration >= limit as f64 + 1.0 {
         return Err(format!(
-            "audio attachment `{}` must be 3 minutes or shorter",
-            path.display()
+            "audio attachment `{}` is longer than the {} limit set in Settings → Voice",
+            path.display(),
+            if limit % 60 == 0 { format!("{}-minute", limit / 60) } else { format!("{limit}-second") }
         ));
     }
     let audio = tokio::fs::read(path)
         .await
         .map_err(|e| format!("could not read audio attachment: {e}"))?;
-
-    d.reload_config().await;
-    let key = d
-        .config
-        .lock()
-        .unwrap()
-        .assemblyai_api_key
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "assemblyai_api_key is not configured in config.toml".to_string())?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(300))
@@ -146,7 +162,7 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
     let submit_response = client
         .post("https://api.assemblyai.com/v2/transcript")
         .header("authorization", &key)
-        .json(&serde_json::json!({"audio_url": upload_url}))
+        .json(&transcript_request(&voice, &upload_url))
         .send()
         .await
         .map_err(|e| format!("AssemblyAI transcript request failed: {e}"))?;

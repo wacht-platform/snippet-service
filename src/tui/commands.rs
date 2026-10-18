@@ -999,9 +999,10 @@ impl App {
                 self.status = "AMOLED is the only theme.".to_string();
             }
             "/recur" => self.handle_recur_command(text),
+            "/voice" => self.handle_voice_command(text),
             other => {
                 self.status = format!(
-                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, /term, or /recur."
+                    "Unknown command: {other}. Type /new, /resume, /rewind, /fork, /model, /term, /recur, or /voice."
                 );
             }
         }
@@ -1016,6 +1017,105 @@ impl App {
             return crate::mission_control::SESSION_ID.to_string();
         }
         crate::serve::sidecar::state_path_to_session_id(&self.active_state_path)
+    }
+
+    pub(crate) fn handle_voice_command(&mut self, text: &str) {
+        let rest = text.strip_prefix("/voice").unwrap_or("").trim();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let verb = parts.next().unwrap_or("").to_ascii_lowercase();
+        let arg = parts.next().unwrap_or("").trim();
+        let mut config = match std::fs::read_to_string(&self.options.config_path)
+            .map_err(|e| e.to_string())
+            .and_then(|raw| toml::from_str::<crate::config::SnippetConfig>(&raw).map_err(|e| e.to_string()))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("voice: could not read config: {e}");
+                return;
+            }
+        };
+        let usage = "/voice · on|off · model universal-3-5-pro|universal-2|auto · language <code>|auto · terms <a, b, …>|clear · max <90s|3m> · key <api key>|clear";
+        let mut voice = config.voice.clone();
+        let mut key_change: Option<Option<String>> = None;
+        match verb.as_str() {
+            "" | "show" => {}
+            "on" => voice.enabled = true,
+            "off" => voice.enabled = false,
+            "model" => voice.speech_model = if arg.eq_ignore_ascii_case("auto") { String::new() } else { arg.to_string() },
+            "language" | "lang" => voice.language = if arg.eq_ignore_ascii_case("auto") { String::new() } else { arg.to_string() },
+            "terms" | "keyterms" => {
+                voice.keyterms = if arg.eq_ignore_ascii_case("clear") || arg.is_empty() {
+                    Vec::new()
+                } else {
+                    arg.split(',').map(|t| t.trim().to_string()).collect()
+                }
+            }
+            "max" => {
+                let raw = arg.to_ascii_lowercase();
+                let parsed = if let Some(m) = raw.strip_suffix('m') {
+                    m.trim().parse::<u32>().ok().map(|m| m * 60)
+                } else {
+                    raw.trim_end_matches('s').trim().parse::<u32>().ok()
+                };
+                match parsed {
+                    Some(secs) => voice.max_seconds = secs,
+                    None => {
+                        self.status = format!("voice: `{arg}` isn't a length (try 90s or 3m)");
+                        return;
+                    }
+                }
+            }
+            "key" => {
+                if arg.is_empty() {
+                    self.status = "voice: /voice key <AssemblyAI API key>  ·  /voice key clear".into();
+                    return;
+                }
+                key_change = Some((!arg.eq_ignore_ascii_case("clear")).then(|| arg.to_string()));
+            }
+            _ => {
+                self.status = format!("voice: {usage}");
+                return;
+            }
+        }
+        let changed = !matches!(verb.as_str(), "" | "show");
+        if changed {
+            match voice.normalized() {
+                Ok(v) => config.voice = v,
+                Err(e) => {
+                    self.status = format!("voice: {e}");
+                    return;
+                }
+            }
+            if let Some(key) = key_change {
+                config.assemblyai_api_key = key;
+            }
+            self.options.config.voice = config.voice.clone();
+            self.options.config.assemblyai_api_key = config.assemblyai_api_key.clone();
+            let saved = toml::to_string_pretty(&config)
+                .map_err(|e| e.to_string())
+                .and_then(|out| {
+                    toml::from_str::<crate::config::SnippetConfig>(&out).map_err(|e| e.to_string())?;
+                    std::fs::write(&self.options.config_path, out).map_err(|e| e.to_string())
+                });
+            if let Err(e) = saved {
+                self.status = format!("voice: could not save config: {e}");
+                return;
+            }
+            crate::config::set_private(&self.options.config_path);
+        }
+        let v = &config.voice;
+        let key_set = config.assemblyai_api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
+        let max = if v.max_seconds % 60 == 0 { format!("{}m", v.max_seconds / 60) } else { format!("{}s", v.max_seconds) };
+        self.status = format!(
+            "{}Voice notes: {}\n  model     {}\n  language  {}\n  key terms {}\n  max       {}\n  API key   {}\n{usage}",
+            if changed { "Saved. " } else { "" },
+            if v.enabled { "on" } else { "off" },
+            if v.speech_model.is_empty() { "auto" } else { v.speech_model.as_str() },
+            if v.language.is_empty() { "auto-detect" } else { v.language.as_str() },
+            if v.keyterms.is_empty() { "none".to_string() } else { v.keyterms.join(", ") },
+            max,
+            if key_set { "set" } else { "not set" },
+        );
     }
 
     pub(crate) fn handle_recur_command(&mut self, text: &str) {
