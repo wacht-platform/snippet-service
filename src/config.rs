@@ -176,6 +176,8 @@ pub struct SnippetConfig {
     pub keep_task_profile: bool,
     #[serde(default, skip_serializing_if = "crate::routing::RoutingConfig::is_empty")]
     pub routing: crate::routing::RoutingConfig,
+    #[serde(default, skip_serializing_if = "VoiceConfig::is_default")]
+    pub voice: VoiceConfig,
     /// Saved provider profiles, keyed by name. Multiple can be configured; one is
     /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
     /// stays valid (tables must follow top-level scalars).
@@ -261,8 +263,85 @@ impl Default for SnippetConfig {
             memory_reflect: default_memory_reflect(),
             keep_task_profile: default_keep_task_profile(),
             routing: Default::default(),
+            voice: VoiceConfig::default(),
         }
     }
+}
+
+pub const VOICE_SPEECH_MODELS: &[&str] = &["universal-3-5-pro", "universal-2"];
+pub const VOICE_MIN_SECONDS: u32 = 30;
+pub const VOICE_MAX_SECONDS: u32 = 600;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    #[serde(default = "default_voice_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub speech_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub language: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyterms: Vec<String>,
+    #[serde(default = "default_voice_max_seconds")]
+    pub max_seconds: u32,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_voice_enabled(),
+            speech_model: String::new(),
+            language: String::new(),
+            keyterms: Vec::new(),
+            max_seconds: default_voice_max_seconds(),
+        }
+    }
+}
+
+impl VoiceConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.speech_model = self.speech_model.trim().to_string();
+        if !self.speech_model.is_empty() && !VOICE_SPEECH_MODELS.contains(&self.speech_model.as_str()) {
+            return Err(format!(
+                "unknown speech model `{}` (use {} or leave it empty for automatic)",
+                self.speech_model,
+                VOICE_SPEECH_MODELS.join(", ")
+            ));
+        }
+        self.language = self.language.trim().to_ascii_lowercase();
+        if !self.language.is_empty()
+            && !self.language.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+        {
+            return Err(format!("invalid language code `{}` (e.g. en, hi, es; empty = auto-detect)", self.language));
+        }
+        let mut terms: Vec<String> = Vec::new();
+        for term in self.keyterms.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+            if term.split_whitespace().count() > 6 {
+                return Err(format!("key term `{term}` is longer than 6 words"));
+            }
+            if !terms.iter().any(|t| t.eq_ignore_ascii_case(term)) {
+                terms.push(term.to_string());
+            }
+        }
+        if terms.len() > 200 {
+            return Err("at most 200 key terms".into());
+        }
+        self.keyterms = terms;
+        self.max_seconds = self.max_seconds.clamp(VOICE_MIN_SECONDS, VOICE_MAX_SECONDS);
+        Ok(self)
+    }
+}
+
+fn default_voice_enabled() -> bool {
+    true
+}
+
+fn default_voice_max_seconds() -> u32 {
+    180
 }
 
 impl SnippetConfig {

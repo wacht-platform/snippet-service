@@ -93,6 +93,10 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
         "/recur",
         "Schedule a goal or message: /recur list · add every 5m <prompt> · add at 14:00 <msg> (one-off) · add <session> every 5m … · add … @plan.md · pause|on|rm <id>",
     ),
+    (
+        "/voice",
+        "Voice notes: /voice shows settings · on|off · model … · language <code>|auto · terms a, b · max 3m · key <AssemblyAI key>|clear",
+    ),
 ];
 
 
