@@ -548,3 +548,79 @@ fn notify_models(session: Option<&str>) {
         None => serde_json::json!({ "kind": "models" }),
     });
 }
+
+#[derive(Serialize)]
+pub(crate) struct VoiceView {
+    enabled: bool,
+    speech_model: String,
+    language: String,
+    keyterms: Vec<String>,
+    max_seconds: u32,
+    key_set: bool,
+    speech_models: &'static [&'static str],
+    min_seconds: u32,
+    max_seconds_limit: u32,
+}
+
+impl VoiceView {
+    pub(crate) fn of(c: &crate::config::SnippetConfig) -> Self {
+        Self {
+            enabled: c.voice.enabled,
+            speech_model: c.voice.speech_model.clone(),
+            language: c.voice.language.clone(),
+            keyterms: c.voice.keyterms.clone(),
+            max_seconds: c.voice.max_seconds,
+            key_set: c.assemblyai_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+            speech_models: crate::config::VOICE_SPEECH_MODELS,
+            min_seconds: crate::config::VOICE_MIN_SECONDS,
+            max_seconds_limit: crate::config::VOICE_MAX_SECONDS,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct VoiceReq {
+    enabled: Option<bool>,
+    speech_model: Option<String>,
+    language: Option<String>,
+    keyterms: Option<Vec<String>>,
+    max_seconds: Option<u32>,
+    api_key: Option<String>,
+}
+
+pub(crate) async fn set_voice(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<VoiceReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        let mut voice = c.voice.clone();
+        if let Some(v) = req.enabled { voice.enabled = v; }
+        if let Some(v) = req.speech_model { voice.speech_model = v; }
+        if let Some(v) = req.language { voice.language = v; }
+        if let Some(v) = req.keyterms { voice.keyterms = v; }
+        if let Some(v) = req.max_seconds { voice.max_seconds = v; }
+        match voice.normalized() {
+            Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+            Ok(voice) => {
+                c.voice = voice;
+                if let Some(key) = req.api_key {
+                    let key = key.trim().to_string();
+                    c.assemblyai_api_key = (!key.is_empty()).then_some(key);
+                }
+                save_config(&c, &d.config_path)
+                    .map(|_| VoiceView::of(&c))
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+            }
+        }
+    };
+    match result {
+        Ok(view) => Json(view).into_response(),
+        Err((code, e)) => (code, e).into_response(),
+    }
+}
