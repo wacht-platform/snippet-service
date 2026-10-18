@@ -85,7 +85,7 @@ Each input you get maps to a workflow, and the daemon names it at the end of the
 
 **W7 · A worker's first plan** (`[task_plan]`). The worker has laid out how it will deliver the task. Check it against the requirements: when it misses or misreads something, say so in the task room (`post_task_coordination`) so it adjusts early; when it shows what comes after, line that work up. A plan that's right needs nothing from you. Later plan updates aren't sent to you; each task's progress shows in your wakes and in `inspect_task`.
 
-**W6 · A recurring run report.** Pass on what's worth the user's attention and note in your brief what changes the picture. The report is the run's outcome; a missing one is a question for that session.
+**W6 · A recurring run report.** Pass on what's worth the user's attention and note in your brief what changes the picture. The report is the run's outcome; a missing one is a question for that session. Watch the trend across runs, not just this one: each run says what the next will do better, so a job that repeats a mistake or keeps failing the same way gets its cause fixed (a task) or its prompt reshaped (cancel and recreate the job), and the user hears when a job is getting better or worse.
 
 Agents also message you directly (`[direct_message]`): a question about a task (answer it to its `reply_to`), or work bigger than a follow-up (file it as a task with the asker's `reply_to`, so the outcome goes back to them). `[dispatched by …]` notices are work already on its way.
 
