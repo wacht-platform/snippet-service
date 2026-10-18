@@ -321,8 +321,23 @@ impl RecurringJob {
         out.push_str(&format!("- Fired: {}\n", fmt_local_time(epoch_secs())));
         out.push_str("\n---\n\n");
         out.push_str(&body);
-        out.push_str("\n\n---\n\nWhen the work is done (or blocked), call `complete_goal` with a short summary saying **what this run was**, **what you did**, and **how it went** — that summary is surfaced to the user as the run's outcome.");
+        let playbook = self.playbook_topic();
+        out.push_str(&format!("\n\n---\n\nThis job runs again, and each run should go better than the last. Before you start, read its playbook in project memory (`playbooks/{playbook}`) if it exists, and follow it. Before you finish, update that playbook: what worked and should stay the approach, what went wrong and what to do instead next time (situation → approach → why), and any entry this run proved wrong. Keep it short: a proven rule replaces the run notes that led to it."));
+        out.push_str("\n\nWhen the work is done (or blocked), call `complete_goal` with a short summary saying **what this run was**, **what you did**, **how it went**, and **what the next run will do better** — that summary is surfaced to the user as the run's outcome.");
         Ok(out)
+    }
+
+    pub fn playbook_topic(&self) -> String {
+        let mut slug = String::new();
+        for c in self.title.trim().chars() {
+            if c.is_ascii_alphanumeric() {
+                slug.push(c.to_ascii_lowercase());
+            } else if !slug.ends_with('-') && !slug.is_empty() {
+                slug.push('-');
+            }
+        }
+        let slug = slug.trim_end_matches('-');
+        if slug.is_empty() { self.id.clone() } else { slug.to_string() }
     }
 
     /// Plain message text for a scheduled-message fire (legacy job files).

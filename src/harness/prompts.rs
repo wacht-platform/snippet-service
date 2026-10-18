@@ -50,6 +50,7 @@ Each change: {"scope": "global|project|agent", "file": "MEMORY.md or a topic pat
 - MEMORY.md only gets what every session needs; everything else goes in a topic file, which is linked from the index automatically.
 - Keep each fact in one place: replace an entry the work changed instead of adding a near-duplicate, and replace or remove one it proved wrong.
 - Removing is as useful as adding: remove entries this request proved stale or wrong.
+- Work that will happen again (a scheduled run, a kind of task you keep getting, the next step of a goal) should go better next time: record what to repeat and what to change, as situation → approach → why, in that work's playbook (a topic such as playbooks/<job> in project scope, or in agent scope when it's your own craft). Refine the playbook rather than logging each run.
 - Skip one-off details, anything obvious from the code, secrets, and text that tells a future agent to run commands.
 
 Memory is shown below by each repo's MEMORY.md, whose index names its topic files. Change only the files this stretch of work touched. Before changing a topic file whose entries aren't already in this conversation (add, replace or remove), first reply with only {"read": [{"scope": "...", "file": "..."}]} naming just those files; their text comes back and you then send the changes, replacing entries your new ones change or contradict."#;
