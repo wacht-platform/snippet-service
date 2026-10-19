@@ -281,12 +281,9 @@ impl App {
         if let Some(name) = options.config.theme.as_deref() {
             set_theme_by_name(name);
         }
-        let status = if options.config.resume_on_start {
-            "Resuming the saved run...".to_string()
-        } else {
+        let status =
             "Type a task and press Enter. Type /new for a new session, or /resume to resume the last session."
-                .to_string()
-        };
+                .to_string();
         let cwd_display = home_path(&options.config.workspace);
         let active_state_path = options.config.state_path.clone();
         let mut app = Self {
@@ -396,14 +393,6 @@ impl App {
         if let Some(id) = app.options.resume.clone() {
             // Explicit --resume <id> wins: reopen exactly that conversation.
             app.switch_conversation(&id);
-        } else if let Some(last_active) = app
-            .options
-            .config
-            .resume_on_start
-            .then(|| app.find_last_active_conversation())
-            .flatten()
-        {
-            app.switch_conversation(&last_active);
         } else {
             // Nothing to resume: a new session, and in a git repository the
             // new-session screen asks where it works.
