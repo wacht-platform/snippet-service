@@ -340,10 +340,6 @@ impl RecurringJob {
         if slug.is_empty() { self.id.clone() } else { slug.to_string() }
     }
 
-    /// Plain message text for a scheduled-message fire (legacy job files).
-    pub fn render_message(&self, workspace: Option<&Path>) -> Result<String, String> {
-        self.render_body(workspace)
-    }
 }
 
 /// Local "YYYY-MM-DD HH:MM" for a unix timestamp (fire header).
@@ -406,13 +402,6 @@ pub fn list_jobs(root: &Path) -> Result<Vec<RecurringJob>, String> {
     let mut jobs = store_for(root)?.list_recurring_jobs().map_err(|e| e.to_string())?;
     jobs.sort_by(|a, b| a.next_run_at.cmp(&b.next_run_at).then(a.id.cmp(&b.id)));
     Ok(jobs)
-}
-
-pub fn get_job(root: &Path, id: &str) -> Result<RecurringJob, String> {
-    store_for(root)?
-        .get_recurring_job(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no recurring job `{id}`"))
 }
 
 fn normalize_plan_path(raw: Option<&str>) -> Option<String> {
@@ -761,7 +750,7 @@ mod tests {
         assert_eq!(listed[0].id, job.id);
 
         set_enabled(root.path(), &job.id, false).unwrap();
-        assert!(!get_job(root.path(), &job.id).unwrap().enabled);
+        assert!(!list_jobs(root.path()).unwrap()[0].enabled);
 
         delete_job(root.path(), &job.id).unwrap();
         assert!(list_jobs(root.path()).unwrap().is_empty());

@@ -8,7 +8,6 @@
 //! handler, so a message accepted just before a restart is still delivered after
 //! it, and a reconnecting client cannot cause a second delivery.
 
-use std::path::PathBuf;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -627,12 +626,6 @@ pub(super) async fn direct_mark_read(
         )
             .into_response(),
     }
-}
-
-/// Path of the Mission Control session's state, for the MC inbox case.
-#[allow(dead_code)]
-fn mission_control_state_path() -> PathBuf {
-    crate::mission_control::session_state_path()
 }
 
 #[cfg(test)]

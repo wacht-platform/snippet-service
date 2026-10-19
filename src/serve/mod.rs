@@ -820,7 +820,6 @@ pub async fn run_serve(
         .route("/sessions/counts", get(session_counts))
         .route("/usage", get(usage_summary))
         .route("/notifications", get(notification_replay))
-        .route("/notifications/replay", get(notification_replay))
         .merge(recurring::router())
         .merge(memory_routes::router())
         .merge(artifact_routes::router())

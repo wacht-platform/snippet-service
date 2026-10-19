@@ -130,12 +130,6 @@ fn ensure_init(workspace: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Snapshot the whole work-tree to a hidden commit and return its id. Best-effort:
-/// returns `None` (never errors the turn) if git is missing or the snapshot fails.
-pub fn snapshot(workspace: &Path, label: &str) -> Option<String> {
-    snapshot_diagnostic(workspace, label).ok()
-}
-
 /// Snapshot with a diagnostic error so callers can record why checkpoint creation
 /// was skipped. Keep `snapshot` as the quiet compatibility wrapper for restores.
 pub fn snapshot_diagnostic(workspace: &Path, label: &str) -> Result<String, String> {

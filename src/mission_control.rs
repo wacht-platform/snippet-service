@@ -182,15 +182,6 @@ pub fn list_sessions(root: &Path, active_only: bool) -> Result<Vec<ManagedSessio
     Ok(sessions)
 }
 
-/// Find sessions whose label contains `query` (case-insensitive).
-pub fn find_sessions(root: &Path, query: &str) -> Result<Vec<ManagedSession>, String> {
-    let q = query.to_lowercase();
-    Ok(list_sessions(root, false)?
-        .into_iter()
-        .filter(|s| s.label.to_lowercase().contains(&q))
-        .collect())
-}
-
 /// Archive a session (set status to `Archived`).
 pub fn archive_session(root: &Path, id: &str) -> Result<ManagedSession, String> {
     update_session(root, id, |s| s.status = SessionStatus::Archived)
@@ -296,17 +287,6 @@ mod tests {
 
         // Still addressable by id — filtering the list must not orphan it.
         assert!(get_session(root.path(), "inbox-snippet").is_ok());
-    }
-
-    #[test]
-    fn find_sessions_case_insensitive() {
-        let root = tmp();
-        create_session(root.path(), "s1", "Hello World", Path::new("/")).unwrap();
-        create_session(root.path(), "s2", "Other", Path::new("/")).unwrap();
-
-        let found = find_sessions(root.path(), "hello").unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, "s1");
     }
 
     #[test]

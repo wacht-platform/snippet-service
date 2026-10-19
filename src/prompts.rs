@@ -109,11 +109,6 @@ pub fn coding_system_prompt() -> String {
     coding_prompt(&PromptContext::default())
 }
 
-/// Base conversation prompt with no optional capabilities.
-pub fn conversation_system_prompt() -> String {
-    conversation_prompt(&PromptContext::default())
-}
-
 /// The prompt for an agent's COORDINATION session.
 ///
 /// Deliberately does NOT include [`CODING_AGENT_LAYER`]: that layer states the

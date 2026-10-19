@@ -8,24 +8,6 @@ pub fn lock_path() -> PathBuf {
     snippet_dir().join("serve.lock")
 }
 
-/// Acquire a shared flock on the lock file. Returns the file handle (lock is held
-/// for the lifetime of the process). Used by the running serve daemon.
-pub fn acquire_shared_lock() -> Option<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
-    let dir = snippet_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(lock_path())
-        .ok()?;
-    unsafe {
-        let ret = libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB);
-        if ret == 0 { Some(file) } else { None }
-    }
-}
-
 /// Write the current binary's hash into the lock file. A process that has just
 /// launched is already running the selected binary, so any older hash is stale.
 pub fn stamp_binary_hash() {
@@ -78,57 +60,8 @@ pub(super) fn snippet_dir() -> PathBuf {
 pub(super) fn pid_path() -> PathBuf {
     snippet_dir().join("serve.pid")
 }
-fn log_path() -> PathBuf {
-    snippet_dir().join("serve.log")
-}
 pub(super) fn state_json_path() -> PathBuf {
     snippet_dir().join("serve.json")
-}
-
-/// Binary modification stamp — used to detect updates and auto-restart.
-fn binary_stamp_path() -> PathBuf {
-    snippet_dir().join("serve.binary.stamp")
-}
-
-/// Check if the binary has been updated since the last serve start.
-/// Returns true if the binary is newer than the stored stamp (or no stamp exists).
-pub fn binary_updated() -> bool {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let mtime = match std::fs::metadata(&exe).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    // No stamp → first run, don't restart.
-    let Ok(stamp) = std::fs::read_to_string(binary_stamp_path()) else {
-        return false;
-    };
-    let stamp: std::time::SystemTime = match stamp.trim().parse::<u64>().ok() {
-        Some(secs) => std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
-        None => return false,
-    };
-    mtime > stamp
-}
-
-/// Record the current binary's mtime so next startup can detect updates.
-pub fn stamp_binary() {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let Ok(mtime) = std::fs::metadata(&exe).and_then(|m| m.modified()) else {
-        return;
-    };
-    let Ok(secs) = mtime
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-    else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(snippet_dir());
-    let _ = std::fs::write(binary_stamp_path(), secs.to_string());
 }
 
 /// Persist the live connection (url + token) so the launching parent and
@@ -145,89 +78,6 @@ pub(super) fn write_serve_state(public_url: &str, token: &str, api_host: &str, a
     if std::fs::write(&path, payload.to_string()).is_ok() {
         crate::config::set_private(&path);
     }
-}
-
-/// Fully detach the current process into the background (double-fork + setsid via
-/// the `daemonize` crate, output to the log). Run by the spawned worker before it
-/// builds the runtime and serves.
-pub fn daemonize_self() -> Result<(), String> {
-    std::fs::create_dir_all(snippet_dir()).map_err(|e| e.to_string())?;
-    let log = std::fs::File::create(log_path()).map_err(|e| format!("open log: {e}"))?;
-    // The log can carry sensitive runtime output — owner-only like the token file.
-    crate::config::set_private(&log_path());
-    let log2 = log.try_clone().map_err(|e| e.to_string())?;
-    daemonize::Daemonize::new()
-        .pid_file(pid_path())
-        .working_directory(home_dir())
-        .stdout(daemonize::Stdio::from(log))
-        .stderr(daemonize::Stdio::from(log2))
-        .start()
-        .map_err(|e| format!("daemonize: {e}"))
-}
-
-/// Foreground launcher (what `snippet serve` runs): spawn the detached worker, wait
-/// for it to publish the connection, print the QR here, then exit. This is why the
-/// QR shows on the terminal even though the server runs in the background.
-pub fn launch_and_show(
-    host: &str,
-    port: u16,
-    token: &str,
-    no_tunnel: bool,
-    public_url: Option<String>,
-    config_path: &std::path::Path,
-) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-
-    if let Some(pid) = running_pid() {
-        return Err(format!(
-            "snippet serve is already running (pid {pid}). `snippet serve --stop` first."
-        ));
-    }
-    std::fs::create_dir_all(snippet_dir()).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(state_json_path());
-
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    // Hand the token to the worker via the 0600 token file, NEVER argv — the
-    // command line of the long-lived daemon is world-readable (`ps`,
-    // /proc/<pid>/cmdline) on multi-user machines. `resolve_token` in the worker
-    // reads the file back.
-    persist_token(token);
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--config")
-        .arg(config_path)
-        .arg("serve")
-        .arg("--host")
-        .arg(host)
-        .arg("--port")
-        .arg(port.to_string());
-    if no_tunnel {
-        cmd.arg("--no-tunnel");
-    }
-    if let Some(u) = &public_url {
-        cmd.arg("--public-url").arg(u);
-    }
-    // The worker re-enters `serve` with this marker set and runs the server; we (the
-    // launcher) stay alive to print the QR. The worker redirects output to the log.
-    cmd.env("__SNIPPET_SERVE_WORKER", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0);
-    cmd.spawn().map_err(|e| format!("spawn worker: {e}"))?;
-
-    println!("\n  snippet serve — bringing up the tunnel…");
-    for _ in 0..120 {
-        if let Some((url, tok)) = read_serve_state() {
-            print_connection(&url, &tok);
-            println!("  Running in the background.  stop: snippet serve --stop\n");
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    Err(format!(
-        "the server didn't come up within 60s — check the log: {}",
-        log_path().display()
-    ))
 }
 
 /// Resolves on SIGTERM/SIGINT; pends forever if the handlers can't be installed

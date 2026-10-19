@@ -327,7 +327,6 @@ impl AgentRuntime {
             "read_coordination_board",
             "record_coordination_note",
             "read_agent_inbox",
-            "archive_mission_session",
         ] {
             tools.remove(name);
         }
@@ -1438,21 +1437,6 @@ fn notification_page(rows: Vec<serde_json::Value>, settings: &crate::mission_con
         if eligible { events.push(row); }
     }
     serde_json::json!({"events": events, "next_cursor": cursor, "has_more": has_more})
-}
-
-/// Last-active unix seconds for a state file: the store's stamp if the session
-/// has been migrated, else the sidecar, else the file mtime (legacy sessions that
-/// have never been rewritten).
-///
-/// Store first, because a migrated session has neither sidecar nor state file —
-/// and the session list sorts on this, so returning 0 for every migrated session
-/// would collapse the ordering.
-/// Last-active unix seconds for a session. Reads the store row; the list sorts on
-/// this, so a file fallback would mis-order every migrated session.
-pub fn session_last_active(state_path: &Path) -> i64 {
-    store_session_row(state_path)
-        .and_then(|row| row.last_active)
-        .unwrap_or(0)
 }
 
 /// Record that the user sent a message in this session. List sort uses this
