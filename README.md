@@ -76,15 +76,22 @@ Useful commands and keys include:
 Run the daemon on the machine that owns the project:
 
 ```sh
-snippet serve                 # start the daemon and tunnel
-snippet serve --status        # show the current connection details
-snippet serve --stop          # stop the daemon and tunnel
-snippet serve --no-tunnel     # localhost-only mode
+snippet serve                       # start the daemon and the tunnel you have set up
+snippet serve --tunnel tailscale    # pick one: auto, tailscale, funnel, cloudflare, none
+snippet serve --status              # show the current connection details
+snippet serve --stop                # stop the daemon and tunnel
 ```
+
+Snippet does not install a tunnel for you. Set one up yourself:
+
+- **Tailscale** (recommended): install it on this machine and your phone, run `tailscale up`. `--tunnel tailscale` uses `tailscale serve` on port 8443, private to your tailnet, with an address that never changes. `--tunnel funnel` makes it public with Tailscale Funnel.
+- **Cloudflare**: install `cloudflared`. `--tunnel cloudflare` opens a quick tunnel with a public `trycloudflare.com` link that changes on every restart.
+
+With the default `auto`, serve uses Tailscale when it is connected, then cloudflared when it is installed. With neither, the daemon runs on this machine only and prints how to set one up.
 
 `serve` prints a QR code and a connection string containing a URL and token. Add that connection in the [companion app](https://github.com/wacht-platform/snippet-mobile). The daemon exposes authenticated HTTP endpoints and WebSockets for sessions, live state, streams, terminals, device events, and paginated transcript history over the existing session attachment socket.
 
-Useful flags include `--port` (default `8787`), `--host`, `--token`, `--no-tunnel`, and `--public-url`.
+Useful flags include `--port` (default `8787`), `--host`, `--token`, `--tunnel`, `--no-tunnel`, and `--public-url` (bring your own tunnel or named Cloudflare tunnel).
 
 To install or remove a login service:
 

@@ -63,11 +63,10 @@ pub mod ws;
 pub(crate) use ws::*;
 
 pub use self::lifecycle::*;
-pub use self::tunnel::ensure_cloudflared_foreground;
+pub use self::tunnel::setup_help;
 
 use self::fs::*;
 use self::git::*;
-use self::tunnel::{ensure_cloudflared, start_cloudflared_quick};
 
 pub(crate) struct LiveSession {
     input_tx: UnboundedSender<LoopInput>,
@@ -676,26 +675,38 @@ impl Daemon {
 
 /// How the daemon is reached from outside the box.
 pub enum Tunnel {
-    /// Auto-launch a cloudflared quick tunnel (random public HTTPS URL, no account).
-    /// The only tunnel serve manages itself.
-    Cloudflared,
-    /// Bring-your-own: just advertise this public URL (you run your own tunnel —
-    /// e.g. a named cloudflared run as its own service — pointed at the local port).
+    /// Use whatever is already set up: Tailscale, then cloudflared, else local only.
+    Auto,
+    /// A cloudflared quick tunnel (random public HTTPS URL, no account).
+    Cloudflare,
+    /// `tailscale serve` (tailnet only) or `tailscale funnel` (public).
+    Tailscale { funnel: bool },
+    /// Bring-your-own: just advertise this public URL.
     Url(String),
     /// Local only (no public URL).
     None,
 }
 
-/// Map the serve CLI's tunnel flags to a `Tunnel`. Shared by the daemonizing worker
-/// and the supervised (service-manager) path. serve only ever runs the default quick
-/// tunnel; a stable URL means binding locally and running your own tunnel.
-pub fn resolve_tunnel(no_tunnel: bool, public_url: Option<String>) -> Tunnel {
+pub const TUNNEL_KINDS: &str = "auto, tailscale, funnel, cloudflare, none";
+
+pub fn resolve_tunnel(
+    kind: Option<&str>,
+    no_tunnel: bool,
+    public_url: Option<String>,
+) -> Result<Tunnel, String> {
     if no_tunnel {
-        Tunnel::None
-    } else if let Some(u) = public_url {
-        Tunnel::Url(u)
-    } else {
-        Tunnel::Cloudflared
+        return Ok(Tunnel::None);
+    }
+    if let Some(u) = public_url {
+        return Ok(Tunnel::Url(u));
+    }
+    match kind.map(|k| k.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("auto") => Ok(Tunnel::Auto),
+        Some("cloudflare" | "cloudflared" | "cf") => Ok(Tunnel::Cloudflare),
+        Some("tailscale" | "ts") => Ok(Tunnel::Tailscale { funnel: false }),
+        Some("funnel" | "tailscale-funnel") => Ok(Tunnel::Tailscale { funnel: true }),
+        Some("none" | "local") => Ok(Tunnel::None),
+        Some(other) => Err(format!("unknown tunnel `{other}` (use one of: {TUNNEL_KINDS})")),
     }
 }
 
@@ -884,25 +895,10 @@ pub async fn run_serve(
 
     let mut server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    // Serve is remote-only: a tunnel is required (on-device, use the TUI). A tunnel
-    // failure is fatal — never silently fall back to an unreachable localhost URL.
-    // `--no-tunnel` (Tunnel::None) is an explicit local mode for testing only.
-    let mut tunnel_child: Option<tokio::process::Child> = None;
-    let resolved: Result<String, String> = async {
-        match tunnel {
-            Tunnel::Url(u) => Ok(u),
-            Tunnel::None => Ok(format!("http://127.0.0.1:{port}")),
-            Tunnel::Cloudflared => {
-                let bin = ensure_cloudflared().await?;
-                let (url, child) = start_cloudflared_quick(&bin, port).await?;
-                tunnel_child = Some(child);
-                Ok(url)
-            }
-        }
-    }
-    .await;
-    let public_url = match resolved {
-        Ok(u) => u,
+    // A tunnel the user asked for by name is fatal when it fails. Auto mode with
+    // nothing set up stays local and prints how to set one up.
+    let (public_url, running) = match tunnel::open(tunnel, port).await {
+        Ok(up) => up,
         Err(e) => {
             server.abort();
             return Err(format!("could not establish the tunnel: {e}"));
@@ -928,9 +924,7 @@ pub async fn run_serve(
         _ = shutdown_signal() => Ok(()),
     };
     server.abort();
-    if let Some(mut child) = tunnel_child {
-        let _ = child.start_kill();
-    }
+    running.stop().await;
     let _ = std::fs::remove_file(state_json_path());
     let _ = std::fs::remove_file(pid_path());
     result
