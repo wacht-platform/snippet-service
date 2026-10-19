@@ -32,7 +32,7 @@
 ### Prebuilt Linux or macOS binary
 
 ```sh
-curl -fsSL https://wacht.dev/snippet.sh | sh
+curl -fsSL https://snippet.wacht.dev/install.sh | sh
 ```
 
 Or download a package from the [service releases](https://github.com/wacht-platform/snippet-service/releases).
