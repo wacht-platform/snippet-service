@@ -25,14 +25,6 @@ pub fn is_meta_tool(name: &str) -> bool {
     META_TOOL_NAMES.contains(&name)
 }
 
-/// Tool definitions advertised to the conversation agent on top of the coding
-/// tools. Ordinarily there is no terminate/complete tool — the agent finishes a
-/// turn by replying with no tool calls. `complete_goal` is the one exception, and
-/// it's only offered while an autonomous `/goal` is active (so it can end it).
-pub fn conversation_meta_definitions(goal_active: bool) -> Vec<NativeToolDefinition> {
-    conversation_meta_definitions_for(goal_active, true)
-}
-
 pub fn conversation_meta_definitions_for(
     goal_active: bool,
     allow_lane_control: bool,
