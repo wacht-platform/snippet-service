@@ -68,11 +68,6 @@ pub struct HarnessConfig {
     pub context_window_tokens: u64,
     /// Full history rewrite (agentic table) when prompt usage hits this % of window.
     pub compact_at_pct: u8,
-    /// Cheap tool-body prune starts at this % of the window (no model call).
-    pub tool_prune_at_pct: u8,
-    /// When prune fires, stub tools only in the oldest prefix whose estimated
-    /// size is this % of the context window (default first 40%).
-    pub tool_prune_prefix_pct: u8,
     /// Start fresh runs in manual approval mode (bash + file edits wait for y/n).
     pub manual_approval: bool,
     /// Inject the `[memory]` block (each scope's path and MEMORY.md) into the
@@ -104,8 +99,6 @@ impl Default for HarnessConfig {
             exa_api_key: None,
             context_window_tokens: 128_000,
             compact_at_pct: 90,
-            tool_prune_at_pct: 75,
-            tool_prune_prefix_pct: 40,
             manual_approval: false,
             memory_enabled: true,
             memory_reflect: true,
@@ -540,8 +533,6 @@ pub struct HarnessState {
     /// The model's context window in tokens, for the usage gauge (0 = unknown).
     #[serde(default)]
     pub context_window: u64,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub tool_payloads_pruned: bool,
     /// Messages typed while a run is in progress — held until the turn ends
     /// (idle / interrupted), then submitted as the next turn. Shared across
     /// TUI and app clients so every attach sees the same queue. Always serialized
@@ -627,7 +618,6 @@ impl HarnessState {
         self.compacting = false;
         self.compacting_started_at = None;
         self.turn_started_at = None;
-        self.tool_payloads_pruned = false;
         self.queued_inputs.clear();
         self.status = HarnessStatus::Idle;
         Ok(cp.label)

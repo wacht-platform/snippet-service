@@ -6,85 +6,7 @@ impl CodingHarness {
         model: &mut dyn AgentModel,
         state: &mut HarnessState,
     ) -> Result<(), ToolError> {
-        // Tier 0: strip old tool bodies (no model call) once usage is high.
-        // Only then fall through to the expensive agentic table rewrite.
-        if self.prune_old_tool_payloads(state) {
-            let _ = self.persist_state(state).await;
-        }
         self.compact_history_agentic(model, state, false).await
-    }
-
-    pub(super) fn prune_old_tool_payloads(&self, state: &mut HarnessState) -> bool {
-        const MIN_SAVINGS_TOKENS: u64 = 256;
-
-        let window = self.config.context_window_tokens.max(1);
-        let start_at =
-            window.saturating_mul(self.config.tool_prune_at_pct.clamp(1, 100) as u64) / 100;
-        let prefix_budget =
-            window.saturating_mul(self.config.tool_prune_prefix_pct.clamp(1, 100) as u64) / 100;
-        if state.tool_payloads_pruned
-            || start_at == 0
-            || prefix_budget == 0
-            || state.last_prompt_tokens < start_at
-            || state.messages.is_empty()
-        {
-            return false;
-        }
-
-        let mut cumulative = 0u64;
-        let mut cut = 0usize;
-        for (i, msg) in state.messages.iter().enumerate() {
-            let tokens = estimate_message_tokens(msg);
-            if cumulative.saturating_add(tokens) > prefix_budget {
-                break;
-            }
-            cumulative = cumulative.saturating_add(tokens);
-            cut = i + 1;
-        }
-        if cut == 0 {
-            return false;
-        }
-
-        let before = estimate_prompt_tokens(&state.messages);
-        let mut messages = state.messages.clone();
-        let mut pruned_n = 0u32;
-        for message in &mut messages[..cut] {
-            match message {
-                HarnessMessage::Assistant { tool_calls, .. } => {
-                    for call in tool_calls {
-                        if !tool_args_are_stub(&call.arguments) {
-                            call.arguments = json!({"_":"pruned"});
-                            pruned_n += 1;
-                        }
-                    }
-                }
-                HarnessMessage::ToolResult {
-                    tool_name, content, ..
-                } if !tool_result_is_stub(content) => {
-                    *content = pruned_tool_result_stub(tool_name);
-                    pruned_n += 1;
-                }
-                _ => {}
-            }
-        }
-
-        let after = estimate_prompt_tokens(&messages);
-        let saved = before.saturating_sub(after);
-        if pruned_n == 0 || saved < MIN_SAVINGS_TOKENS {
-            return false;
-        }
-
-        state.messages = messages;
-        state.tool_payloads_pruned = true;
-        // Pruning REPLACES tool bodies in place, so the transcript is the same
-        // LENGTH with different content. A length check cannot see that, which is
-        // exactly why the flag exists.
-        state.history_rewritten = true;
-        state.events.push(HarnessEvent::SystemDecision {
-            step: "tool_payloads_pruned".to_string(),
-            reasoning: "Pruned older tool data.".to_string(),
-        });
-        true
     }
 
     pub(super) async fn compact_history(
@@ -472,7 +394,6 @@ impl CodingHarness {
         // (prompt/completion/total) reflect everything sent and are unaffected by
         // compaction. The gauge repopulates from the next response's usage.
         state.last_prompt_tokens = 0;
-        state.tool_payloads_pruned = false;
         state.compacting = false;
         Ok(())
     }
@@ -638,7 +559,6 @@ impl CodingHarness {
         // Restore the session's reasoning effort for the next real model call.
         model.swap_reasoning_effort(prev_effort);
         state.last_prompt_tokens = 0;
-        state.tool_payloads_pruned = false;
         state.compacting = false;
         Ok(())
     }
