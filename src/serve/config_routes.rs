@@ -624,3 +624,40 @@ pub(crate) async fn set_voice(
         Err((code, e)) => (code, e).into_response(),
     }
 }
+
+#[derive(Serialize)]
+pub(crate) struct WebSearchView {
+    key_set: bool,
+}
+
+impl WebSearchView {
+    pub(crate) fn of(c: &crate::config::SnippetConfig) -> Self {
+        Self { key_set: c.exa_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()) }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WebSearchReq {
+    api_key: String,
+}
+
+pub(crate) async fn set_web_search(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<WebSearchReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        let key = req.api_key.trim().to_string();
+        c.exa_api_key = (!key.is_empty()).then_some(key);
+        save_config(&c, &d.config_path).map(|_| WebSearchView::of(&c))
+    };
+    match result {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
