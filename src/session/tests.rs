@@ -85,7 +85,6 @@ mod fork_tests {
         assert!(f.lanes.is_empty());
         assert!(f.title.as_deref().unwrap_or("").starts_with("fork ·"));
         assert_eq!(f.total_tokens, 0);
-        assert!(!f.tool_payloads_pruned);
     }
 
     #[test]

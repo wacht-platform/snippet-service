@@ -131,7 +131,6 @@ impl CodingHarness {
             checkpoints: Vec::new(),
             rate_limit: None,
             context_window: self.config.context_window_tokens,
-            tool_payloads_pruned: false,
             queued_inputs: Vec::new(),
             plan: Vec::new(),
             history_rewritten: false,
