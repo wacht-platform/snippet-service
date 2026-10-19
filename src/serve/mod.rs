@@ -846,6 +846,7 @@ pub async fn run_serve(
         .route("/config/keep_task_profile", post(set_keep_task_profile))
         .route("/config/manual_approval", post(set_manual_approval))
         .route("/config/voice", post(config_routes::set_voice))
+        .route("/config/web_search", post(config_routes::set_web_search))
         .route("/config/routing", post(set_routing))
         .route("/provider/models", post(provider_models))
         .route(
@@ -1206,6 +1207,7 @@ struct ConfigView {
     limited: std::collections::HashMap<String, i64>,
     hostname: String,
     voice: config_routes::VoiceView,
+    web_search: config_routes::WebSearchView,
 }
 
 // GET /config — profiles with keys redacted (has_key only), active profile, theme.
@@ -1248,6 +1250,7 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
         limited: crate::routing::limited_now(),
         hostname: d.hostname.clone(),
         voice: config_routes::VoiceView::of(&c),
+        web_search: config_routes::WebSearchView::of(&c),
     })
     .into_response()
 }
