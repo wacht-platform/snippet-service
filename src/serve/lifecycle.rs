@@ -307,6 +307,12 @@ pub fn status() -> Result<(), String> {
         (Some(pid), Some((url, token))) => {
             println!("snippet serve running (pid {pid})");
             print_connection(&url, &token);
+            if let Some(port) = url
+                .strip_prefix("http://127.0.0.1:")
+                .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+            {
+                println!("{}\n", super::setup_help(port));
+            }
             Ok(())
         }
         (Some(pid), None) => {
@@ -387,6 +393,8 @@ pub struct ServeSettings {
     pub public_url: Option<String>,
     #[serde(default)]
     pub no_tunnel: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<String>,
 }
 
 /// XDG-style config dir, shared by the CLI and the auto-start service so both
@@ -457,8 +465,10 @@ pub fn install_service(
     token: Option<&str>,
     no_tunnel: bool,
     public_url: Option<&str>,
+    tunnel: Option<&str>,
     config_path: &std::path::Path,
 ) -> Result<(), String> {
+    super::resolve_tunnel(tunnel, false, None)?;
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     // Persist the settings the supervised daemon will read on boot.
     ServeSettings {
@@ -466,6 +476,7 @@ pub fn install_service(
         port: Some(port),
         public_url: public_url.map(str::to_string),
         no_tunnel,
+        tunnel: tunnel.map(str::to_string).or(ServeSettings::load().tunnel),
     }
     .save()?;
     if let Some(t) = token {
@@ -816,6 +827,7 @@ fn install_service_quiet(config_path: &std::path::Path) -> Result<(), String> {
         port: Some(port),
         public_url: settings.public_url.clone(),
         no_tunnel: settings.no_tunnel,
+        tunnel: settings.tunnel.clone(),
     }
     .save()?;
     let args = service_args(config_path);
