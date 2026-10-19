@@ -618,6 +618,34 @@ impl Tool for ListProfiles {
     }
 }
 
+fn session_folder_outside_mission_control(raw: &str, title: &str) -> Result<(PathBuf, bool), String> {
+    let expanded = match raw.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(rest),
+        None => PathBuf::from(raw),
+    };
+    let canon = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mc = canon(&mission_control::workspace_path());
+    let target = canon(&expanded);
+    if !target.starts_with(&mc) {
+        return Ok((expanded, false));
+    }
+    let name: String = title
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("-");
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let name = if name.is_empty() { format!("session-{stamp}") } else { format!("{name}-{stamp}") };
+    let dir = crate::config::snippet_home().join("tmp").join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    Ok((dir, true))
+}
+
 #[derive(Deserialize)]
 struct CreateSessionArgs {
     folder: String,
@@ -659,10 +687,11 @@ impl Tool for CreateMissionSession {
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "create_mission_session".into(),
             })?;
-        let folder = std::path::PathBuf::from(args.folder.trim());
         if args.folder.trim().is_empty() {
             return Err(ToolError::msg("folder must be a non-empty path"));
         }
+        let (folder, moved) = session_folder_outside_mission_control(args.folder.trim(), &args.title)
+            .map_err(ToolError::msg)?;
         let profile = args.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
         if let Some(name) = profile.as_deref() {
             check_profile(name).await?;
@@ -674,9 +703,17 @@ impl Tool for CreateMissionSession {
             crate::session::write_session_profile(&path, name);
             session.profile = Some(name.to_string());
         }
+        let note = if moved {
+            format!(
+                "Created idle in {} — sessions never run in Mission Control's own folder. Give it work with create_mission_task(session_id, handoff_mode=fresh); the work itself happens in that session.",
+                folder.display()
+            )
+        } else {
+            "Created idle. Give it work with create_mission_task(session_id, handoff_mode=fresh); the work itself happens in that session.".to_string()
+        };
         Ok(ToolResult::success(json!({
             "session": session,
-            "note": "Created idle. Give it work with create_mission_task(session_id, handoff_mode=fresh); the work itself happens in that session.",
+            "note": note,
         })))
     }
 }
