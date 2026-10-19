@@ -44,40 +44,6 @@ pub(super) fn take_queued(state: &mut HarnessState, id: &str) -> Option<String> 
     Some(state.queued_inputs.remove(i).text)
 }
 
-/// Tiny marker left in place of pruned tool-call arguments.
-pub(super) fn tool_args_are_stub(args: &Value) -> bool {
-    match args {
-        Value::Object(map) => {
-            map.len() <= 1
-                && map
-                    .get("_")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| s == "pruned")
-        }
-        _ => false,
-    }
-}
-
-/// True when a tool result was already replaced by our prune stub.
-pub(super) fn tool_result_is_stub(content: &Value) -> bool {
-    content
-        .get("pruned")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || content
-            .get("status")
-            .and_then(Value::as_str)
-            .is_some_and(|s| s == "pruned")
-}
-
-/// Minimal tool-result body kept after prune — just enough for pairing + audit.
-pub(super) fn pruned_tool_result_stub(tool_name: &str) -> Value {
-    json!({
-        "pruned": true,
-        "tool": tool_name,
-    })
-}
-
 /// Insert synthetic error results for assistant tool calls that never received
 /// one. Every unanswered `tool_call_id` gets a stub result appended right after
 /// the contiguous result run that follows its assistant message, preserving the
