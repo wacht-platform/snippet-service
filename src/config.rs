@@ -126,8 +126,6 @@ pub struct SnippetConfig {
     pub workspace: PathBuf,
     #[serde(skip)]
     pub state_path: PathBuf,
-    #[serde(default)]
-    pub resume_on_start: bool,
     /// Start runs in manual approval mode — bash and file edits wait for y/n.
     #[serde(default)]
     pub manual_approval: bool,
@@ -250,7 +248,6 @@ impl Default for SnippetConfig {
         Self {
             workspace: default_workspace(),
             state_path: default_state_path(),
-            resume_on_start: false,
             manual_approval: false,
             active_setup: None,
             delegate_setup: None,
