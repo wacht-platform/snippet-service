@@ -38,6 +38,12 @@ enum Command {
         /// own cloudflared/named tunnel as a service, pointed at the local port).
         #[arg(long)]
         public_url: Option<String>,
+        /// How to reach the daemon remotely: auto (default: Tailscale if connected,
+        /// else cloudflared if installed, else local only), tailscale (tailnet only),
+        /// funnel (Tailscale Funnel, public), cloudflare (quick tunnel), or none.
+        /// Snippet never installs these; set one up yourself.
+        #[arg(long)]
+        tunnel: Option<String>,
         /// Bind address. Use 0.0.0.0 to expose on the box's public IP for a fixed,
         /// tunnel-less URL (pair with --public-url http://<ip>:<port>). Default localhost.
         #[arg(long, default_value = "127.0.0.1")]
@@ -658,6 +664,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             token,
             no_tunnel,
             public_url,
+            tunnel,
             host,
             stop,
             status,
@@ -686,6 +693,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     token.as_deref(),
                     no_tunnel,
                     public_url.as_deref(),
+                    tunnel.as_deref(),
                     &config_path,
                 )
                 .map_err(Into::into);
@@ -699,12 +707,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let port = s.port.unwrap_or(port);
             let no_tunnel = no_tunnel || s.no_tunnel;
             let public_url = public_url.or(s.public_url);
-            let tunnel = serve::resolve_tunnel(no_tunnel, public_url.clone());
+            let tunnel = serve::resolve_tunnel(
+                tunnel.or(s.tunnel).as_deref(),
+                no_tunnel,
+                public_url.clone(),
+            )?;
             serve::write_own_pidfile();
-            let needs_cf = !no_tunnel && public_url.is_none();
-            if needs_cf {
-                serve::ensure_cloudflared_foreground()?;
-            }
             let supervised = true; // treat all foreground as supervised
             runtime()?.block_on(async {
                 let config = SnippetConfig::load(&config_path).await?;
