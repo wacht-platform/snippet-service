@@ -186,7 +186,6 @@ pub fn build_forked_state(source: &HarnessState, point: ForkPoint) -> HarnessSta
     forked.prompt_tokens = 0;
     forked.completion_tokens = 0;
     forked.cache_read_tokens = 0;
-    forked.tool_payloads_pruned = false;
     forked.queued_inputs.clear();
     // Keep last_prompt_tokens / context_window as hints; model will refresh.
     forked.created_at = now.clone();
