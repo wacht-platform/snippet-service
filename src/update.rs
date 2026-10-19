@@ -53,13 +53,30 @@ pub fn is_newer(latest: &str) -> bool {
     }
 }
 
-fn parse(v: &str) -> Option<(u64, u64, u64)> {
-    let core = v.split(['-', '+']).next().unwrap_or(v);
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Ident {
+    Num(u64),
+    Text(String),
+}
+
+fn parse(v: &str) -> Option<((u64, u64, u64), bool, Vec<Ident>)> {
+    let v = v.split('+').next().unwrap_or(v);
+    let (core, pre) = match v.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (v, None),
+    };
     let mut it = core.split('.');
     let major = it.next()?.parse().ok()?;
     let minor = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let patch = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    Some((major, minor, patch))
+    let idents = pre
+        .map(|p| {
+            p.split('.')
+                .map(|s| s.parse().map(Ident::Num).unwrap_or_else(|_| Ident::Text(s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(((major, minor, patch), pre.is_none(), idents))
 }
 
 /// Download `version`'s binary for this platform and atomically replace the
