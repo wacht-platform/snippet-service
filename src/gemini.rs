@@ -158,20 +158,17 @@ impl AgentModel for GeminiModel {
         if supports_thoughts(&self.config.model) {
             let mut thinking = serde_json::Map::new();
             thinking.insert("includeThoughts".to_string(), json!(true));
-            let model = self.config.model.to_ascii_lowercase();
-            let is_g3 = model.contains("gemini-3") || model.contains("gemini3");
+            let levels = thinking_kind(&self.config.model) == Thinking::Level;
             if let Some(effort) = self.config.reasoning_effort.as_deref() {
                 match effort.to_ascii_lowercase().as_str() {
-                    "off" if !is_g3 => {
+                    "off" if !levels => {
                         thinking.insert("thinkingBudget".to_string(), json!(0));
                     }
-                    e @ ("low" | "medium" | "high" | "xhigh" | "max") if is_g3 => {
-                        // Gemini 3 exposes discrete levels; `high` is the ceiling, so
-                        // `xhigh`/`max` map onto it too.
-                        let level = if matches!(e, "high" | "xhigh" | "max") {
-                            "high"
-                        } else {
-                            "low"
+                    e @ ("low" | "medium" | "high" | "xhigh" | "max") if levels => {
+                        let level = match e {
+                            "low" => "low",
+                            "medium" => "medium",
+                            _ => "high",
                         };
                         thinking.insert("thinkingLevel".to_string(), json!(level));
                     }
@@ -624,7 +621,7 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
                     });
                     if let Some(signature) = own_signature {
                         part["thoughtSignature"] = json!(signature);
-                    } else if !is_gemini_2_5(model) {
+                    } else if thinking_kind(model) != Thinking::Budget {
                         part["thoughtSignature"] = json!(SKIP_THOUGHT_SIGNATURE);
                     }
                     parts.push(part);
@@ -912,16 +909,38 @@ fn safety_settings() -> Value {
     ])
 }
 
-fn is_gemini_2_5(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("2.5") || model.contains("2-5")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Thinking {
+    Budget,
+    Level,
+    None,
 }
 
-/// Models that emit thinking — the 2.5 series and the 3.x family. Used to gate
-/// `thinkingConfig.includeThoughts` so we don't send it to non-thinking models.
-fn supports_thoughts(model: &str) -> bool {
+pub(crate) fn thinking_kind(model: &str) -> Thinking {
     let model = model.to_ascii_lowercase();
-    is_gemini_2_5(model.as_str()) || model.contains("gemini-3") || model.contains("gemini3")
+    if model.contains("gemma") || model.contains("embedding") || model.contains("imagen") {
+        return Thinking::None;
+    }
+    let version = model.split("gemini-").nth(1).and_then(|rest| {
+        let digits: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .collect();
+        let mut parts = digits.split(['.', '-']).filter(|p| !p.is_empty());
+        let major: u32 = parts.next()?.parse().ok()?;
+        let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        Some((major, minor))
+    });
+    match version {
+        Some((major, _)) if major >= 3 => Thinking::Level,
+        Some((2, minor)) if minor >= 5 => Thinking::Budget,
+        Some(_) => Thinking::None,
+        None => Thinking::Level,
+    }
+}
+
+fn supports_thoughts(model: &str) -> bool {
+    thinking_kind(model) != Thinking::None
 }
 
 fn is_retryable_status(status: StatusCode) -> bool {
