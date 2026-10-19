@@ -60,6 +60,10 @@ pub(super) fn snippet_dir() -> PathBuf {
 pub(super) fn pid_path() -> PathBuf {
     snippet_dir().join("serve.pid")
 }
+fn log_path() -> PathBuf {
+    snippet_dir().join("serve.log")
+}
+
 pub(super) fn state_json_path() -> PathBuf {
     snippet_dir().join("serve.json")
 }
