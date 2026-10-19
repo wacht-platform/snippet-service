@@ -2047,7 +2047,15 @@ impl CodingHarness {
                 state.iterations += result.get("num_turns").and_then(Value::as_u64).unwrap_or(1) as usize;
                 let error = result.get("error").and_then(Value::as_str).unwrap_or("");
                 let cancelled = error.contains("context canceled");
-                if result.get("status").and_then(Value::as_str) == Some("ERROR") && !cancelled {
+                let response = result.get("response").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                let replied = !response.is_empty()
+                    || state
+                        .events
+                        .iter()
+                        .rev()
+                        .take_while(|e| !matches!(e, HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. }))
+                        .any(|e| matches!(e, HarnessEvent::AssistantText { .. }));
+                if result.get("status").and_then(Value::as_str) == Some("ERROR") && !cancelled && !replied {
                     let message = if error.is_empty() { "Antigravity reported an error" } else { error }.to_string();
                     state.events.push(HarnessEvent::ModelError { message });
                 } else if let Some(text) = result.get("response").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
