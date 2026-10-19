@@ -1541,29 +1541,6 @@ impl Tool for CancelMissionTask {
     }
 }
 
-#[derive(Deserialize)]
-struct ArchiveArgs {
-    session_id: String,
-}
-pub struct ArchiveMissionSession;
-#[async_trait]
-impl Tool for ArchiveMissionSession {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "archive_mission_session".into(), description: "Archive a managed session without deleting its history. Use after work is complete or at the user's request.".into(), input_schema: schema(json!({"session_id":{"type":"string"}}), &["session_id"]) }
-    }
-    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: ArchiveArgs =
-            serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
-                tool: "archive_mission_session".into(),
-            })?;
-        let session = mission_control::archive_session(&root(ctx)?, &args.session_id)
-            .map_err(ToolError::msg)?;
-        Ok(ToolResult::success(
-            json!({"archived": true, "session_id": session.id}),
-        ))
-    }
-}
-
 /// Sessions that have gone quiet: not running, idle for a while, and with no
 /// open task routed to them. Mission Control's own session, agents' inboxes
 /// and lanes are never candidates.

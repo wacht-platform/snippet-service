@@ -41,16 +41,6 @@ pub struct Agent {
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ThreadScope {
-    Workspace,
-    Goal,
-    Session,
-    Direct,
-    System,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CoordinationEvent {
     pub event_id: String,

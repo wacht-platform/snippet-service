@@ -535,17 +535,6 @@ impl SnippetConfig {
         }
     }
 
-    /// The inference profile for delegated lanes. Uses the `delegate_setup` profile
-    /// when it names a known one; otherwise falls back to the active profile, so
-    /// delegation keeps working unchanged when no separate profile is chosen.
-    pub fn delegate_profile(&self) -> InferenceProfileConfig {
-        if let Some(name) = self.delegate_setup.as_deref() {
-            if let Some(cfg) = self.setups.as_ref().and_then(|m| m.get(name)) {
-                return cfg.clone();
-            }
-        }
-        self.model.clone()
-    }
 }
 
 impl InferenceProfileConfig {
