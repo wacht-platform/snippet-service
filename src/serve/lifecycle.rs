@@ -60,6 +60,7 @@ pub(super) fn snippet_dir() -> PathBuf {
 pub(super) fn pid_path() -> PathBuf {
     snippet_dir().join("serve.pid")
 }
+#[cfg(target_os = "macos")]
 fn log_path() -> PathBuf {
     snippet_dir().join("serve.log")
 }
