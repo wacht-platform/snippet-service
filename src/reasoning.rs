@@ -90,27 +90,25 @@ pub fn spec(provider: &str, model: &str) -> ReasoningSpec {
                 )
             }
         }
-        "gemini" => {
-            if m.contains("gemini-3") || m.contains("gemini3") {
-                ReasoningSpec::effort(
-                    "Thinking",
-                    &["low", "high"],
-                    false,
-                    true,
-                    "Gemini 3 thinks at a low or high level and can't be switched off. Default is dynamic.",
-                )
-            } else if m.contains("2.5") || m.contains("2-5") {
-                ReasoningSpec::effort(
-                    "Thinking",
-                    &["low", "medium", "high", "max"],
-                    m.contains("flash"),
-                    true,
-                    "Gemini 2.5 thinking budget, from 2k tokens (Low) to 32k (Max). Default is dynamic.",
-                )
-            } else {
+        "gemini" => match crate::gemini::thinking_kind(&m) {
+            crate::gemini::Thinking::Level => ReasoningSpec::effort(
+                "Thinking",
+                &["low", "medium", "high"],
+                false,
+                true,
+                "Gemini 3 and later think at a level and can't be switched off. Default is dynamic. If a model doesn't take a level, snippet steps down until it's accepted.",
+            ),
+            crate::gemini::Thinking::Budget => ReasoningSpec::effort(
+                "Thinking",
+                &["low", "medium", "high", "max"],
+                m.contains("flash"),
+                true,
+                "Gemini 2.5 thinking budget, from 2k tokens (Low) to 32k (Max). Default is dynamic.",
+            ),
+            crate::gemini::Thinking::None => {
                 ReasoningSpec::fixed(Control::None, "Thinking", false, "This model doesn't think.")
             }
-        }
+        },
         "chatgpt" => {
             let version = gpt_version(&m).unwrap_or(0.0);
             let options: &[&'static str] = if version >= 5.6 {
