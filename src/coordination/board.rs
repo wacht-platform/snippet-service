@@ -7,7 +7,6 @@
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use super::types::CoordinationEvent;
 use super::{Store, StoreError};
 
 /// What a board row is about.
@@ -215,28 +214,6 @@ impl Store {
             let rows = stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))?;
             rows.collect()
         })
-    }
-}
-
-/// Build a report summary from a completed work session's own event log.
-///
-/// Kept here so both the coordinator's board and any future consumer describe a
-/// finished dispatch the same way.
-pub fn completion_summary(
-    session_id: &str,
-    events: &[CoordinationEvent],
-) -> String {
-    let last_body = events
-        .iter()
-        .rev()
-        .find_map(|event| event.payload.get("body").and_then(|v| v.as_str()))
-        .map(|body| body.split_whitespace().collect::<Vec<_>>().join(" "))
-        .unwrap_or_default();
-    if last_body.is_empty() {
-        format!("session {session_id} finished")
-    } else {
-        let clipped: String = last_body.chars().take(280).collect();
-        format!("session {session_id} finished: {clipped}")
     }
 }
 
@@ -448,33 +425,5 @@ mod tests {
             db.board_workspaces("a").unwrap(),
             ["/code/new", "/code/old"]
         );
-    }
-
-    #[test]
-    fn completion_summary_collapses_and_clips() {
-        let events = vec![CoordinationEvent {
-            event_id: "e1".into(),
-            thread_id: "t".into(),
-            partition_key: "p".into(),
-            sequence: 1,
-            event_type: "message.posted".into(),
-            actor_kind: "agent".into(),
-            actor_id: "w".into(),
-            payload_version: 1,
-            payload: serde_json::json!({"body": "line one\nline two"}),
-            causation_id: None,
-            correlation_id: None,
-            idempotency_key: "k".into(),
-            created_at: "t".into(),
-        }];
-        let summary = completion_summary("s1", &events);
-        assert!(summary.contains("line one line two"), "newlines collapse");
-        assert!(summary.starts_with("session s1 finished"));
-    }
-
-    #[test]
-    fn completion_summary_handles_an_empty_log() {
-        let summary = completion_summary("s1", &[]);
-        assert_eq!(summary, "session s1 finished");
     }
 }

@@ -521,15 +521,6 @@ pub fn fork_conversation(source: &str) -> Result<String, String> {
     Ok(fork)
 }
 
-pub fn remove_conversation(id: &str) {
-    if let Some(root) = conversations_dir() {
-        for suffix in ["db", "db-wal", "db-shm"] {
-            let _ = std::fs::remove_file(root.join("conversations").join(format!("{id}.{suffix}")));
-        }
-        let _ = std::fs::remove_dir_all(root.join("brain").join(id));
-    }
-}
-
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }

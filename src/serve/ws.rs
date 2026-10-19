@@ -49,8 +49,6 @@ async fn handle_shells_ws(socket: WebSocket, terms: Arc<crate::term::SessionTerm
 
     let push = tokio::spawn(async move {
         loop {
-            // Drain the PTY so idle shells still fire BEL / OSC.
-            let _ = push_terms.take_snapshots();
             for (id, chunk, cols, rows, alive) in push_terms.poll_client(&term_client) {
                 if chunk.is_empty() && alive {
                     continue;
@@ -291,7 +289,6 @@ async fn handle_ws(
                 // sized vt100 (tmux/ghostty-style: emulator owns the grid;
                 // clients get live bytes or a cell snapshot, never CSI history)
                 // is what glued `ls` onto the fish prompt.
-                let _ = terms.take_snapshots();
                 let frames = match term_client.as_ref() {
                     Some(c) => terms.poll_client(c),
                     None => terms.poll_all(),

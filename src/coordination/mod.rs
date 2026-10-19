@@ -17,7 +17,7 @@ pub mod types;
 
 pub use crate::store::{Store, StoreError};
 pub use board::{
-    BoardEntry, BoardEntryKind, BoardQuery, NewBoardEntry, completion_summary,
+    BoardEntry, BoardEntryKind, BoardQuery, NewBoardEntry,
 };
 pub use direct::{
     DirectThreadSummary, LOCAL_HUMAN_ID, PendingDirectMessage, actor_ref, direct_thread_id,
