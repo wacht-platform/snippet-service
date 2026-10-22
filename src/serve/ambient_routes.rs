@@ -3,6 +3,77 @@ use super::*;
 use axum::body::Bytes;
 
 const MAX_SEGMENT_BYTES: usize = 25 * 1024 * 1024;
+const LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+
+static LEASE: std::sync::Mutex<Option<(String, String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+fn lease_holder() -> Option<(String, String)> {
+    let mut lease = LEASE.lock().unwrap();
+    if lease.as_ref().is_some_and(|(_, _, at)| at.elapsed() > LEASE_TTL) {
+        *lease = None;
+    }
+    lease.as_ref().map(|(device, label, _)| (device.clone(), label.clone()))
+}
+
+/// Returns false when another live device holds the lease; otherwise takes or renews it.
+fn lease_touch(device: &str, label: Option<&str>, claim: bool) -> bool {
+    let mut lease = LEASE.lock().unwrap();
+    let live = lease.as_ref().is_some_and(|(_, _, at)| at.elapsed() <= LEASE_TTL);
+    let other = live && lease.as_ref().is_some_and(|(held, _, _)| held != device);
+    if other && !claim {
+        return false;
+    }
+    let kept = lease
+        .as_ref()
+        .filter(|(held, _, _)| held == device)
+        .map(|(_, l, _)| l.clone());
+    let label = label
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .or(kept)
+        .unwrap_or_else(|| device.to_string());
+    *lease = Some((device.to_string(), label, std::time::Instant::now()));
+    true
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LeaseReq {
+    device: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    claim: bool,
+    #[serde(default)]
+    release: bool,
+}
+
+pub(crate) async fn lease(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<LeaseReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if req.device.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "device is required").into_response();
+    }
+    if req.release {
+        let mut lease = LEASE.lock().unwrap();
+        if lease.as_ref().is_some_and(|(held, _, _)| held == &req.device) {
+            *lease = None;
+        }
+        return Json(serde_json::json!({"held": false, "holder": serde_json::Value::Null})).into_response();
+    }
+    let held = lease_touch(&req.device, Some(&req.label), req.claim);
+    let holder = lease_holder();
+    Json(serde_json::json!({
+        "held": held,
+        "holder": holder.as_ref().map(|(_, l)| l),
+    }))
+    .into_response()
+}
 
 #[derive(Deserialize)]
 pub(crate) struct SettingsReq {
@@ -42,6 +113,8 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "mode": ambient.mode,
         "key_set": key_set,
         "devices": devices,
+        "listening_id": lease_holder().map(|(d, _)| d),
+        "listening_device": lease_holder().map(|(_, l)| l),
     })
 }
 
@@ -67,6 +140,9 @@ pub(crate) async fn set_settings(
         let mut ambient = c.ambient.clone();
         if let Some(v) = req.enabled {
             ambient.enabled = v;
+            if !v {
+                *LEASE.lock().unwrap() = None;
+            }
         }
         if let Some(v) = req.mode {
             ambient.mode = v;
@@ -156,6 +232,9 @@ pub(crate) async fn ingest(
     d.reload_config().await;
     if !d.config.lock().unwrap().ambient.enabled {
         return (StatusCode::FORBIDDEN, "ambient listening is turned off on the server").into_response();
+    }
+    if !q.device.is_empty() && !lease_touch(&q.device, None, false) {
+        return (StatusCode::CONFLICT, "another device is listening").into_response();
     }
     if !valid_id(&q.id) {
         return (StatusCode::BAD_REQUEST, "id must be 1-64 letters, digits or dashes").into_response();

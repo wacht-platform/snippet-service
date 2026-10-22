@@ -862,6 +862,7 @@ pub async fn run_serve(
                 .get(ambient_routes::list),
         )
         .route("/ambient/stats", get(ambient_routes::stats))
+        .route("/ambient/lease", post(ambient_routes::lease))
         .route(
             "/ambient/settings",
             get(ambient_routes::get_settings).post(ambient_routes::set_settings),
