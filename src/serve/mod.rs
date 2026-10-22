@@ -35,6 +35,7 @@ use crate::session::{
 
 pub mod agent_routes;
 mod account_routes;
+mod ambient_routes;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
 pub(crate) use config_routes::*;
@@ -747,6 +748,7 @@ pub async fn run_serve(
 
     // Register the built-in agents before anything can address them.
     mission_control::register_builtin_agents(&daemon);
+    ambient_routes::resume(daemon.clone());
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
@@ -853,6 +855,13 @@ pub async fn run_serve(
             "/vault",
             get(vault_list).put(vault_set).delete(vault_delete),
         )
+        .route(
+            "/ambient/events",
+            post(ambient_routes::ingest)
+                .layer(ambient_routes::body_limit())
+                .get(ambient_routes::list),
+        )
+        .route("/ambient/stats", get(ambient_routes::stats))
         .route("/accounts", get(account_routes::list_accounts))
         .route("/accounts/add", post(account_routes::add_account))
         .route("/accounts/remove", post(account_routes::remove_account))

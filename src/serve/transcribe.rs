@@ -128,6 +128,14 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
             if limit % 60 == 0 { format!("{}-minute", limit / 60) } else { format!("{limit}-second") }
         ));
     }
+    assemblyai_transcribe(&voice, &key, path).await
+}
+
+async fn assemblyai_transcribe(
+    voice: &crate::config::VoiceConfig,
+    key: &str,
+    path: &Path,
+) -> Result<String, String> {
     let audio = tokio::fs::read(path)
         .await
         .map_err(|e| format!("could not read audio attachment: {e}"))?;
@@ -139,7 +147,7 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
 
     let upload_response = client
         .post("https://api.assemblyai.com/v2/upload")
-        .header("authorization", &key)
+        .header("authorization", key)
         .header("content-type", "application/octet-stream")
         .body(audio)
         .send()
@@ -161,8 +169,8 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
 
     let submit_response = client
         .post("https://api.assemblyai.com/v2/transcript")
-        .header("authorization", &key)
-        .json(&transcript_request(&voice, &upload_url))
+        .header("authorization", key)
+        .json(&transcript_request(voice, &upload_url))
         .send()
         .await
         .map_err(|e| format!("AssemblyAI transcript request failed: {e}"))?;
@@ -187,7 +195,7 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
         tokio::time::sleep(Duration::from_secs(1)).await;
         let response = client
             .get(&poll_url)
-            .header("authorization", &key)
+            .header("authorization", key)
             .send()
             .await
             .map_err(|e| format!("AssemblyAI polling failed: {e}"))?;
@@ -220,4 +228,16 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
         }
     }
     Err("AssemblyAI transcription timed out".to_string())
+}
+
+pub(super) async fn transcribe_ambient(d: &Daemon, path: &Path) -> Result<String, String> {
+    d.reload_config().await;
+    let (voice, key) = {
+        let c = d.config.lock().unwrap();
+        (c.voice.clone(), c.assemblyai_api_key.clone())
+    };
+    let key = key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "no AssemblyAI API key is set (Settings → Voice)".to_string())?;
+    assemblyai_transcribe(&voice, &key, path).await
 }

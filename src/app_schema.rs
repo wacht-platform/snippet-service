@@ -85,6 +85,20 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              id INTEGER PRIMARY KEY CHECK (id = 1),
              created_at INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS ambient_events (
+             id TEXT PRIMARY KEY NOT NULL,
+             device TEXT NOT NULL DEFAULT '',
+             started_at TEXT NOT NULL,
+             duration_ms INTEGER NOT NULL DEFAULT 0,
+             status TEXT NOT NULL,
+             text TEXT NOT NULL DEFAULT '',
+             error TEXT,
+             created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS ambient_events_started
+             ON ambient_events(started_at);
+         CREATE VIRTUAL TABLE IF NOT EXISTS ambient_events_fts
+             USING fts5(text, content='ambient_events', content_rowid='rowid');
 "#,
     )?;
     let legacy: bool = connection.query_row(
