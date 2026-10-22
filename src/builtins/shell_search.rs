@@ -336,9 +336,12 @@ fn format_output_preview(
 
     let head = &lines[..head_count];
     let tail = &lines[total_lines.saturating_sub(tail_count)..];
+    let half_bytes = (max_bytes / 2).max(1);
+    let head_text = clip_head(&head.join("\n"), half_bytes);
+    let tail_text = clip_tail(&tail.join("\n"), half_bytes);
 
     let mut result = String::new();
-    result.push_str(&head.join("\n"));
+    result.push_str(&head_text);
     if omitted > 0 {
         result.push_str(&format!(
             "\n\n… <truncated {omitted} lines; full output ({total_lines} lines, {total_bytes} bytes) saved to {log_ref}> …\n\n"
@@ -348,8 +351,30 @@ fn format_output_preview(
             "\n\n… <truncated to size limit; full output saved to {log_ref}> …\n\n"
         ));
     }
-    result.push_str(&tail.join("\n"));
+    result.push_str(&tail_text);
 
     (result, true)
+}
+
+fn clip_head(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+fn clip_tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &text[start..])
 }
 

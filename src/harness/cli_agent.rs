@@ -759,7 +759,7 @@ async fn mcp_dispatch(state: &McpState, request: Value) -> Option<Value> {
                 }
             }
             let failed = value.get("status").and_then(Value::as_str) == Some("error");
-            let mut content = vec![json!({"type": "text", "text": value.to_string()})];
+            let mut content = vec![json!({"type": "text", "text": crate::llm::render_tool_result(&value)})];
             if let Some(path) = image_path {
                 match image_block(&path).filter(|_| state.images) {
                     Some((mime, data)) => content.push(json!({"type": "image", "data": data, "mimeType": mime})),
