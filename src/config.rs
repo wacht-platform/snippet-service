@@ -176,6 +176,8 @@ pub struct SnippetConfig {
     pub routing: crate::routing::RoutingConfig,
     #[serde(default, skip_serializing_if = "VoiceConfig::is_default")]
     pub voice: VoiceConfig,
+    #[serde(default, skip_serializing_if = "AmbientConfig::is_default")]
+    pub ambient: AmbientConfig,
     /// Saved provider profiles, keyed by name. Multiple can be configured; one is
     /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
     /// stays valid (tables must follow top-level scalars).
@@ -261,8 +263,46 @@ impl Default for SnippetConfig {
             keep_task_profile: default_keep_task_profile(),
             routing: Default::default(),
             voice: VoiceConfig::default(),
+            ambient: AmbientConfig::default(),
         }
     }
+}
+
+pub const AMBIENT_MODES: &[&str] = &["passive", "active"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbientConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ambient_mode")]
+    pub mode: String,
+}
+
+impl Default for AmbientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_ambient_mode(),
+        }
+    }
+}
+
+impl AmbientConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn normalized(mut self) -> Result<Self, String> {
+        self.mode = self.mode.trim().to_ascii_lowercase();
+        if !AMBIENT_MODES.contains(&self.mode.as_str()) {
+            return Err(format!("mode must be one of: {}", AMBIENT_MODES.join(", ")));
+        }
+        Ok(self)
+    }
+}
+
+fn default_ambient_mode() -> String {
+    "passive".to_string()
 }
 
 pub const VOICE_SPEECH_MODELS: &[&str] = &["universal-3-5-pro", "universal-2"];

@@ -5,6 +5,88 @@ use axum::body::Bytes;
 const MAX_SEGMENT_BYTES: usize = 25 * 1024 * 1024;
 
 #[derive(Deserialize)]
+pub(crate) struct SettingsReq {
+    enabled: Option<bool>,
+    mode: Option<String>,
+}
+
+fn settings_view(d: &Daemon) -> serde_json::Value {
+    let (ambient, key_set) = {
+        let c = d.config.lock().unwrap();
+        (
+            c.ambient.clone(),
+            c.assemblyai_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+        )
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp();
+    let devices: Vec<serde_json::Value> = d
+        .store
+        .with_connection(|c| {
+            let mut stmt = c.prepare(
+                "SELECT device, MAX(created_at) FROM ambient_events
+                 WHERE created_at >= ?1 GROUP BY device ORDER BY MAX(created_at) DESC",
+            )?;
+            let rows = stmt
+                .query_map([since], |r| {
+                    Ok(serde_json::json!({
+                        "device": r.get::<_, String>(0)?,
+                        "last_seen": r.get::<_, i64>(1)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "enabled": ambient.enabled,
+        "mode": ambient.mode,
+        "key_set": key_set,
+        "devices": devices,
+    })
+}
+
+pub(crate) async fn get_settings(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    Json(settings_view(&d)).into_response()
+}
+
+pub(crate) async fn set_settings(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<SettingsReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let result = {
+        let mut c = d.config.lock().unwrap();
+        let mut ambient = c.ambient.clone();
+        if let Some(v) = req.enabled {
+            ambient.enabled = v;
+        }
+        if let Some(v) = req.mode {
+            ambient.mode = v;
+        }
+        match ambient.normalized() {
+            Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+            Ok(ambient) => {
+                c.ambient = ambient;
+                crate::config::save_config(&c, &d.config_path)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+            }
+        }
+    };
+    match result {
+        Ok(()) => Json(settings_view(&d)).into_response(),
+        Err((code, e)) => (code, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 pub(crate) struct IngestQuery {
     token: Option<String>,
     id: String,
@@ -70,6 +152,10 @@ pub(crate) async fn ingest(
 ) -> Response {
     if !d.authed(&q.token) {
         return unauthorized();
+    }
+    d.reload_config().await;
+    if !d.config.lock().unwrap().ambient.enabled {
+        return (StatusCode::FORBIDDEN, "ambient listening is turned off on the server").into_response();
     }
     if !valid_id(&q.id) {
         return (StatusCode::BAD_REQUEST, "id must be 1-64 letters, digits or dashes").into_response();
