@@ -84,7 +84,16 @@ pub fn logout_blocking() -> Result<(), String> {
 }
 
 pub fn is_signed_in() -> bool {
-    load_blocking().is_some()
+    !crate::accounts::ids("xai").is_empty()
+}
+
+pub fn load_account(id: &str) -> Option<XaiTokens> {
+    serde_json::from_str(&crate::accounts::read_credential("xai", id)?).ok()
+}
+
+pub fn save_account(id: &str, tokens: &XaiTokens) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(tokens).map_err(|e| e.to_string())?;
+    crate::accounts::write_credential("xai", id, &json)
 }
 
 #[derive(Debug, Clone)]
@@ -238,15 +247,15 @@ pub async fn refresh(prior: &XaiTokens) -> Result<XaiTokens, String> {
     tokens_from_response(&body, Some(&prior.refresh_token))
 }
 
-/// A valid access token for a request: loads the stored token, refreshes it when
-/// stale (persisting the new one), and returns the bearer value. Errors when not
-/// signed in or the refresh fails (the caller surfaces "sign in again").
-pub async fn access_token() -> Result<String, String> {
-    let tokens = load_blocking().ok_or("not signed in to xAI — run `snippet xai login`")?;
+/// A valid access token for a request on the account currently in rotation,
+/// refreshing it when stale. Returns the account id with the bearer value.
+pub async fn access_token() -> Result<(String, String), String> {
+    let id = crate::accounts::active("xai").ok_or("not signed in to xAI — run `snippet xai login`")?;
+    let tokens = load_account(&id).ok_or("not signed in to xAI — run `snippet xai login`")?;
     if !tokens.is_stale() {
-        return Ok(tokens.access_token);
+        return Ok((id, tokens.access_token));
     }
     let fresh = refresh(&tokens).await?;
-    save_blocking(&fresh)?;
-    Ok(fresh.access_token)
+    save_account(&id, &fresh)?;
+    Ok((id, fresh.access_token))
 }
