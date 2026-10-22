@@ -3,6 +3,7 @@
 #[link(name = "util")]
 unsafe extern "C" {}
 
+pub mod accounts;
 pub mod agent_tools;
 pub mod anthropic;
 pub mod artifacts;

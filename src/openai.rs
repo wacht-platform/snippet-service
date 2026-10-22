@@ -118,7 +118,7 @@ impl AgentModel for OpenAiCompatibleModel {
         // and use it as the bearer key. Runs only when signed in via `xai login`.
         if self.config.oauth_xai {
             match crate::xai_auth::access_token().await {
-                Ok(token) => self.config.api_key = token,
+                Ok((_, token)) => self.config.api_key = token,
                 Err(e) => return Err(ToolError::model_request(e, false)),
             }
         }

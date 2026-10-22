@@ -91,7 +91,7 @@ async fn fetch_provider_models(cfg: &InferenceProfileConfig) -> Result<Vec<Catal
         "xai" | "grok" => {
             let mut c = cfg.clone();
             c.base_url = "https://api.x.ai/v1".to_string();
-            if let Ok(token) = crate::xai_auth::access_token().await {
+            if let Ok(token) = crate::xai_auth::access_token().await.map(|(_, t)| t) {
                 c.api_key = token;
             }
             fetch_openai_compatible(&c).await

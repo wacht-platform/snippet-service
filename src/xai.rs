@@ -66,6 +66,7 @@ pub struct XaiConfig {
 pub struct XaiModel {
     config: XaiConfig,
     client: reqwest::Client,
+    account: Option<String>,
 }
 
 impl XaiModel {
@@ -76,7 +77,7 @@ impl XaiModel {
             .clone()
             .unwrap_or_else(|| "snippet/xai".to_string());
         let client = crate::llm::model_http_client(Some(&user_agent));
-        Self { config, client }
+        Self { config, client, account: None }
     }
 
     fn responses_url(&self) -> String {
@@ -90,9 +91,11 @@ impl XaiModel {
 
     async fn bearer_token(&mut self) -> Result<String, ToolError> {
         if self.config.inner.oauth_xai {
-            crate::xai_auth::access_token()
+            let (account, token) = crate::xai_auth::access_token()
                 .await
-                .map_err(|e| ToolError::model_request(e, false))
+                .map_err(|e| ToolError::model_request(e, false))?;
+            self.account = Some(account);
+            Ok(token)
         } else {
             let key = self.config.inner.api_key.trim();
             if key.is_empty() {
@@ -302,10 +305,11 @@ impl XaiModel {
                         && !refreshed
                     {
                         refreshed = true;
-                        if let Some(prior) = crate::xai_auth::load_blocking() {
+                        let account = self.account.clone().unwrap_or_else(|| crate::accounts::MAIN.to_string());
+                        if let Some(prior) = crate::xai_auth::load_account(&account) {
                             match crate::xai_auth::refresh(&prior).await {
                                 Ok(fresh) => {
-                                    let _ = crate::xai_auth::save_blocking(&fresh);
+                                    let _ = crate::xai_auth::save_account(&account, &fresh);
                                     attempt = attempt.saturating_sub(1);
                                     continue;
                                 }
@@ -321,6 +325,19 @@ impl XaiModel {
                     let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
                     let text = response.text().await.unwrap_or_default();
                     last_error = crate::llm::humanize_http_error(status, &text);
+                    if self.config.inner.oauth_xai
+                        && crate::accounts::is_limit_response(status, &text, None, retry_after)
+                        && let Some(from) = self.account.clone()
+                    {
+                        let until = crate::accounts::reset_for("xai", &from, crate::accounts::reset_hint(&text));
+                        if crate::accounts::rotate("xai", &from, until).is_some() {
+                            refreshed = false;
+                            attempt = attempt.saturating_sub(1);
+                            continue;
+                        }
+                        fatal = true;
+                        break;
+                    }
                     if !is_retryable_status(status) {
                         fatal = true;
                         break;
