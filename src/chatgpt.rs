@@ -102,6 +102,7 @@ pub struct ChatGptModel {
     config: ChatGptConfig,
     client: reqwest::Client,
     tokens: Option<ChatGptTokens>,
+    account: Option<String>,
     /// Stable per-process id used for the session/cache-key headers.
     session_id: String,
 }
@@ -110,13 +111,31 @@ impl ChatGptModel {
     pub fn new(config: ChatGptConfig) -> Self {
         Self {
             client: crate::llm::model_http_client(Some(CODEX_USER_AGENT)),
-            tokens: chatgpt_auth::load_blocking(),
+            tokens: None,
+            account: None,
             session_id: config
                 .session_id
                 .clone()
                 .filter(|id| !id.trim().is_empty())
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             config,
+        }
+        .with_account(crate::accounts::active("chatgpt"))
+    }
+
+    fn with_account(mut self, account: Option<String>) -> Self {
+        self.use_account(account);
+        self
+    }
+
+    fn use_account(&mut self, account: Option<String>) {
+        self.tokens = account.as_deref().and_then(chatgpt_auth::load_account);
+        self.account = account;
+    }
+
+    fn save_tokens(&self) {
+        if let (Some(id), Some(tokens)) = (self.account.as_deref(), self.tokens.as_ref()) {
+            let _ = chatgpt_auth::save_account(id, tokens);
         }
     }
 
@@ -130,7 +149,10 @@ impl ChatGptModel {
         if stale {
             if let Some(prior) = self.tokens.clone() {
                 match chatgpt_auth::refresh(&prior).await {
-                    Ok(fresh) => self.tokens = Some(fresh),
+                    Ok(fresh) => {
+                        self.tokens = Some(fresh);
+                        self.save_tokens();
+                    }
                     // A failed refresh isn't necessarily fatal — the existing token
                     // may still have a few seconds; let the request try and 401 if not.
                     Err(_) => {}
@@ -168,7 +190,10 @@ impl AgentModel for ChatGptModel {
         force_tool: bool,
         sink: Option<StreamHandle>,
     ) -> Result<ModelOutput, ToolError> {
-        // Confirm we have a (fresh) token before building the request.
+        let current = crate::accounts::active("chatgpt");
+        if current.is_some() && current != self.account {
+            self.use_account(current);
+        }
         self.ensure_fresh().await?;
 
         let mut body = build_responses_request(&self.config, messages, tools, force_tool);
@@ -216,6 +241,9 @@ impl AgentModel for ChatGptModel {
                         let rate_limit = parse_codex_rate_limits(response.headers());
                         if let Some(snap) = &rate_limit {
                             persist_global_usage(snap);
+                            if let Some(id) = self.account.as_deref() {
+                                crate::accounts::record_usage("chatgpt", id, snap);
+                            }
                         }
                         match parse_responses_sse(response, sink.as_ref()).await {
                             Ok(mut output) => {
@@ -252,6 +280,7 @@ impl AgentModel for ChatGptModel {
                             match chatgpt_auth::refresh(&prior).await {
                                 Ok(fresh) => {
                                     self.tokens = Some(fresh);
+                                    self.save_tokens();
                                     // Genuinely free retry: on the last attempt a
                                     // plain `continue` exhausted the loop and the
                                     // fresh token was never used.
@@ -270,8 +299,26 @@ impl AgentModel for ChatGptModel {
                         }
                     }
                     let retry_after = retry_after_delay(response.headers().get(RETRY_AFTER));
+                    let limit_snapshot = parse_codex_rate_limits(response.headers());
                     let text = response.text().await.unwrap_or_default();
                     last_error = crate::llm::humanize_http_error(status, &text);
+                    if crate::accounts::is_limit_response(status, &text, limit_snapshot.as_ref(), retry_after)
+                        && let Some(from) = self.account.clone()
+                    {
+                        if let Some(snap) = &limit_snapshot {
+                            crate::accounts::record_usage("chatgpt", &from, snap);
+                        }
+                        let until = crate::accounts::reset_for("chatgpt", &from, crate::accounts::reset_hint(&text));
+                        if let Some(next) = crate::accounts::rotate("chatgpt", &from, until) {
+                            self.use_account(Some(next));
+                            self.ensure_fresh().await?;
+                            refreshed = false;
+                            attempt -= 1;
+                            continue;
+                        }
+                        fatal = true;
+                        break;
+                    }
                     if !is_retryable_status(status) {
                         fatal = true;
                         break;

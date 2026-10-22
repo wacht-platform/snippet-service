@@ -895,7 +895,7 @@ pub(crate) async fn fetch_models_from_provider(
             Ok(models)
         }
         "xai" => {
-            let token = crate::xai_auth::access_token()
+            let (_, token) = crate::xai_auth::access_token()
                 .await
                 .map_err(|e| format!("sign in to xAI first: {e}"))?;
             let res = client
