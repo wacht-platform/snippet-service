@@ -34,6 +34,7 @@ use crate::session::{
 };
 
 pub mod agent_routes;
+mod account_routes;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
 pub(crate) use config_routes::*;
@@ -852,6 +853,10 @@ pub async fn run_serve(
             "/vault",
             get(vault_list).put(vault_set).delete(vault_delete),
         )
+        .route("/accounts", get(account_routes::list_accounts))
+        .route("/accounts/add", post(account_routes::add_account))
+        .route("/accounts/remove", post(account_routes::remove_account))
+        .route("/accounts/update", post(account_routes::update_account))
         .route("/xai/login", post(xai_login))
         .route("/xai/status", get(xai_status))
         .route("/xai/logout", post(xai_logout))
@@ -1003,8 +1008,13 @@ async fn usage_summary(State(d): State<Shared>, Query(q): Query<UsageQuery>) -> 
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let chatgpt_rate = crate::chatgpt::read_global_usage().filter(|rate| rate.is_reported());
-    let claude_rate = crate::harness::claude_rate_limits().filter(|rate| rate.is_reported());
+    let pooled = |provider: &str| {
+        crate::accounts::active(provider)
+            .and_then(|id| crate::accounts::usage(provider, &id))
+            .filter(|rate| rate.is_reported())
+    };
+    let chatgpt_rate = pooled("chatgpt").or_else(|| crate::chatgpt::read_global_usage().filter(|rate| rate.is_reported()));
+    let claude_rate = pooled("claude-code").or_else(|| crate::harness::claude_rate_limits().filter(|rate| rate.is_reported()));
     crate::antigravity::refresh_quota_if_stale(300);
     let agy_quota = crate::antigravity::cached_quota().map(|(_, groups)| groups).unwrap_or_default();
     let mut order: Vec<String> = Vec::new();
@@ -1030,6 +1040,7 @@ async fn usage_summary(State(d): State<Shared>, Query(q): Query<UsageQuery>) -> 
                 "cache_creation_tokens": 0,
                 "rate_limits_supported": crate::config::provider_reports_rate_limits(&row.provider),
                 "rate_limits": rate_limits,
+                "accounts": if crate::accounts::is_pooled(&row.provider) { serde_json::to_value(crate::accounts::list(&row.provider)).unwrap_or_default() } else { serde_json::json!([]) },
                 "models": [],
             })
         });

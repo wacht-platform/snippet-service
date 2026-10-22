@@ -116,7 +116,16 @@ pub fn logout_blocking() -> Result<(), String> {
 
 /// Whether a sign-in already exists.
 pub fn is_signed_in() -> bool {
-    load_blocking().is_some()
+    !crate::accounts::ids("chatgpt").is_empty()
+}
+
+pub fn load_account(id: &str) -> Option<ChatGptTokens> {
+    serde_json::from_str(&crate::accounts::read_credential("chatgpt", id)?).ok()
+}
+
+pub fn save_account(id: &str, tokens: &ChatGptTokens) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(tokens).map_err(|e| e.to_string())?;
+    crate::accounts::write_credential("chatgpt", id, &json)
 }
 
 fn pkce() -> (String, String) {
@@ -331,9 +340,7 @@ pub async fn refresh(prior: &ChatGptTokens) -> Result<ChatGptTokens, String> {
         .json()
         .await
         .map_err(|e| format!("parse refresh JSON: {e}"))?;
-    let refreshed = tokens_from_response(parsed, Some(prior))?;
-    save_blocking(&refreshed)?;
-    Ok(refreshed)
+    tokens_from_response(parsed, Some(prior))
 }
 
 /// Wait for the OAuth redirect on the local callback server, returning the code.
@@ -618,15 +625,13 @@ pub async fn begin_device_code_login() -> Result<DeviceCodeInfo, String> {
 pub async fn complete_device_code_login(info: DeviceCodeInfo) -> Result<ChatGptTokens, String> {
     let code = poll_device_code(&info.device_auth_id, &info.user_code, info.interval).await?;
     let client = codex_client();
-    let tokens = exchange_code(
+    exchange_code(
         &client,
         &code.authorization_code,
         &code.code_verifier,
         DEVICE_AUTH_CALLBACK_URI,
     )
-    .await?;
-    save_blocking(&tokens)?;
-    Ok(tokens)
+    .await
 }
 
 async fn login_browser() -> Result<ChatGptTokens, String> {
@@ -655,7 +660,9 @@ async fn login_browser() -> Result<ChatGptTokens, String> {
 
 async fn login_device_code() -> Result<ChatGptTokens, String> {
     let info = begin_device_code_login().await?;
-    complete_device_code_login(info).await
+    let tokens = complete_device_code_login(info).await?;
+    save_blocking(&tokens)?;
+    Ok(tokens)
 }
 
 pub async fn login(method: ChatGptLoginMethod) -> Result<ChatGptTokens, String> {

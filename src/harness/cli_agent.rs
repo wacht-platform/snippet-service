@@ -497,6 +497,16 @@ struct McpState {
 struct CliProcess {
     child: Child,
     stdin: ChildStdin,
+    account: Option<String>,
+}
+
+fn claude_account_token(id: &str) -> Option<String> {
+    if id == crate::accounts::MAIN {
+        return None;
+    }
+    let raw = crate::accounts::read_credential("claude-code", id)?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value.get("token").and_then(Value::as_str).map(str::to_string)
 }
 
 enum CliLine {
@@ -897,6 +907,7 @@ impl CodingHarness {
         prompt: &str,
         mcp_url: &str,
         session: &CliSession,
+        account: Option<&str>,
     ) -> Result<Command, String> {
         let bin = claude_binary().ok_or_else(|| {
             "Claude Code isn't installed or isn't on PATH (set SNIPPET_CLAUDE_BIN to its path)".to_string()
@@ -915,6 +926,9 @@ impl CodingHarness {
             .args(["--setting-sources", ""])
             .env("MCP_TOOL_TIMEOUT", "3600000")
             .env("MCP_TIMEOUT", "30000");
+        if let Some(token) = account.and_then(claude_account_token) {
+            cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+        }
         if !profile.model.trim().is_empty() {
             cmd.args(["--model", profile.model.trim()]);
         }
@@ -974,8 +988,12 @@ impl CodingHarness {
     ) -> Result<CliProcess, String> {
         let kind = session.kind;
         let prompt = self.cli_system_prompt(state, session);
+        let account = match kind {
+            CliKind::ClaudeCode => crate::accounts::active("claude-code"),
+            CliKind::Antigravity => None,
+        };
         let mut cmd = match kind {
-            CliKind::ClaudeCode => self.claude_command(profile, &prompt, mcp_url, session)?,
+            CliKind::ClaudeCode => self.claude_command(profile, &prompt, mcp_url, session, account.as_deref())?,
             CliKind::Antigravity => self.antigravity_command(profile, &prompt, mcp_url, session)?,
         };
         cmd.stdin(Stdio::piped())
@@ -1008,7 +1026,7 @@ impl CodingHarness {
             }
             let _ = tx.send(CliLine::Exited(generation, tail.trim().to_string()));
         });
-        Ok(CliProcess { child, stdin })
+        Ok(CliProcess { child, stdin, account })
     }
 
     pub async fn run_cli_agent(
@@ -1111,6 +1129,7 @@ impl CodingHarness {
         let (mcp_url, mut mcp_rx) = start_mcp_server(bridge_tools, steers.clone(), served.clone(), true).await.map_err(ToolError::msg)?;
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<CliLine>();
         let mut process: Option<CliProcess> = None;
+        let mut account_limit: Option<i64> = None;
         let mut generation = 0u64;
         let kind = CliKind::of(&profile.provider);
         let session_key = self.session_id().unwrap_or_else(|| "main".to_string());
@@ -1240,6 +1259,13 @@ impl CodingHarness {
                         });
                         self.persist(&mut state, &lanes).await?;
                     }
+                }
+                if kind == CliKind::ClaudeCode
+                    && let Some(p) = process.as_mut()
+                    && p.account != crate::accounts::active("claude-code")
+                {
+                    let _ = p.child.start_kill();
+                    process = None;
                 }
                 if process.is_none() {
                     generation += 1;
@@ -1529,7 +1555,59 @@ impl CodingHarness {
                                 ),
                                 CliKind::Antigravity => self.apply_agy_event(&mut state, &event, sink.as_ref(), &mut parse),
                             };
+                            if kind == CliKind::ClaudeCode
+                                && event.get("type").and_then(Value::as_str) == Some("rate_limit_event")
+                            {
+                                let info = event.get("rate_limit_info");
+                                let account = process.as_ref().and_then(|p| p.account.clone());
+                                if let (Some(account), Some(snapshot)) = (account.as_deref(), state.rate_limit.as_ref()) {
+                                    crate::accounts::record_usage("claude-code", account, snapshot);
+                                }
+                                if info.and_then(|i| i.get("status")).and_then(Value::as_str) == Some("rejected") {
+                                    account_limit = Some(info.and_then(|i| i.get("resetsAt")).and_then(Value::as_i64).unwrap_or(0));
+                                }
+                            }
+                            if finished
+                                && kind == CliKind::ClaudeCode
+                                && event.get("is_error").and_then(Value::as_bool) == Some(true)
+                                && event.get("api_error_status").and_then(Value::as_u64) == Some(429)
+                                && account_limit.is_none()
+                            {
+                                account_limit = Some(0);
+                            }
+                            if finished
+                                && kind == CliKind::ClaudeCode
+                                && event.get("is_error").and_then(Value::as_bool) == Some(true)
+                                && let Some(hint) = account_limit.take()
+                                && let Some(from) = process.as_ref().and_then(|p| p.account.clone())
+                            {
+                                let until = crate::accounts::reset_for("claude-code", &from, Some(hint));
+                                if let Some(next) = crate::accounts::rotate("claude-code", &from, until) {
+                                    if matches!(state.events.last(), Some(HarnessEvent::ModelError { .. })) {
+                                        state.events.pop();
+                                    }
+                                    state.final_text = final_before.clone();
+                                    state.events.push(HarnessEvent::SystemDecision {
+                                        step: "account_switched".to_string(),
+                                        reasoning: format!(
+                                            "Claude account {} reached its usage limit (resets {}), so this continues on {}.",
+                                            crate::accounts::label("claude-code", &from),
+                                            crate::routing::reset_label(until),
+                                            crate::accounts::label("claude-code", &next),
+                                        ),
+                                    });
+                                    if let Some(mut p) = process.take() {
+                                        let _ = p.child.start_kill();
+                                    }
+                                    generation += 1;
+                                    state.status = HarnessStatus::Running;
+                                    outbox.push("The last turn stopped at a usage limit before it finished. Pick up where it stopped and finish it.".to_string());
+                                    self.persist(&mut state, &lanes).await?;
+                                    continue;
+                                }
+                            }
                             if finished {
+                                account_limit = None;
                                 if let Some(usage) = event.get("modelUsage").and_then(Value::as_object) {
                                     cli_window = usage
                                         .values()
