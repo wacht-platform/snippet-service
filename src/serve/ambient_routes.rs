@@ -538,9 +538,13 @@ fn warm_models(stt: String, voice: String) {
 }
 
 pub(crate) fn warm_voice(d: Shared) {
-    tokio::spawn(async {
+    let reaper = d.clone();
+    tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if reaper.config.lock().unwrap().ambient.enabled {
+                continue;
+            }
             let _ = tokio::task::spawn_blocking(|| {
                 let idle = std::time::Duration::from_secs(600);
                 crate::stt::unload_idle(idle);
