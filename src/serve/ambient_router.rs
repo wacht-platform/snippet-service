@@ -134,7 +134,7 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
         if deadline.is_some_and(|t| Instant::now() >= t) && !turn.is_empty() {
             let parts = std::mem::take(&mut turn);
             deadline = None;
-            flush(&d, &device, parts, false, &mut last).await;
+            flush(&d, &device, parts, crate::ambient::conversation().is_some(), &mut last).await;
         }
     }
 }
@@ -198,15 +198,14 @@ async fn accept(
     });
     if !mergeable && !turn.is_empty() {
         let parts = std::mem::take(turn);
-        flush(d, device, parts, false, last).await;
+        flush(d, device, parts, crate::ambient::conversation().is_some(), last).await;
     }
-    let question = part.text.trim_end().ends_with('?');
     turn.push(part);
     if wake {
         let parts = std::mem::take(turn);
         *deadline = None;
         flush(d, device, parts, true, last).await;
-    } else if question && crate::ambient::conversation().is_some() {
+    } else if crate::ambient::conversation().is_some() {
         *deadline = Some(Instant::now() + FAST_HOLD);
     } else {
         *deadline = Some(Instant::now() + HOLD);
@@ -273,7 +272,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let mut task = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await });
     let mut delivered = false;
     let mut early: Option<Verdict> = None;
-    if fast && routable {
+    if fast && routable && !from_others {
         early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
         if !early.as_ref().is_some_and(|v| !v.kept()) {
             let v = wake_verdict(early.as_ref());
@@ -297,6 +296,10 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             deliver(d, device, &parts, &verdict, wake, None, ttl, false).await;
             delivered = true;
         }
+    }
+    if !delivered && verdict.kept() && !from_others && verdict.intent == "note" {
+        let (rendered, _) = render(&parts, &text);
+        super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &rendered, false).await;
     }
     mark_verdict(d, &ids, &verdict, delivered);
     *last = Some(Flushed {
