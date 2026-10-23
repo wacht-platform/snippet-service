@@ -192,29 +192,22 @@ pub async fn speak(text: &str) -> Result<Value, String> {
         .unwrap_or_default();
     let conversation = open_conversation("mission-control", ambient.conversation_timeout_secs);
     let id = record_turn(&conversation.id, "assistant", text, &device)?;
-    let mut audio = false;
-    if ambient.voice != "system" {
-        match crate::tts::synthesize(&ambient.voice, text).await {
-            Ok(bytes) => {
-                let dir = crate::tts::audio_dir();
-                if tokio::fs::create_dir_all(&dir).await.is_ok()
-                    && tokio::fs::write(dir.join(format!("{id}.wav")), bytes).await.is_ok()
-                {
-                    audio = true;
-                }
-            }
-            Err(e) => eprintln!("[ambient] server voice failed: {e}"),
-        }
+    if ambient.voice.is_empty() {
+        return Err("no reply voice is downloaded; ask the user to add one in Settings, Voice".into());
     }
+    let bytes = crate::tts::synthesize(&ambient.voice, text).await?;
+    let dir = crate::tts::audio_dir();
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::write(dir.join(format!("{id}.wav")), bytes).await.map_err(|e| e.to_string())?;
     crate::session::emit_device_event(json!({
         "kind": "ambient_speech",
         "id": id,
         "conversation_id": conversation.id,
         "device": device,
         "text": text,
-        "audio": audio,
+        "audio": true,
     }));
-    Ok(json!({"spoken": true, "turn": id, "voice": if audio { ambient.voice.as_str() } else { "phone" }}))
+    Ok(json!({"spoken": true, "turn": id, "voice": ambient.voice}))
 }
 
 pub fn prompt_line() -> String {

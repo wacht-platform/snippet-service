@@ -48,6 +48,7 @@ pub(crate) struct SettingsReq {
     watcher: Option<String>,
     watcher_chat_context: Option<bool>,
     voice: Option<String>,
+    stt_model: Option<String>,
     typesafe_api_key: Option<String>,
     conversation_timeout_secs: Option<u32>,
     wake_phrases: Option<Vec<String>>,
@@ -91,7 +92,8 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "watcher": ambient.watcher,
         "watcher_chat_context": ambient.watcher_chat_context,
         "voice": ambient.voice,
-        "voices": crate::tts::VOICES.iter().map(|(id, name)| serde_json::json!({"id": id, "name": name})).collect::<Vec<_>>(),
+        "stt_model": ambient.stt_model,
+        "models_ready": crate::models::is_ready(&ambient.stt_model) && crate::models::is_ready(&ambient.voice),
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
@@ -146,6 +148,9 @@ pub(crate) async fn set_settings(
         if let Some(v) = req.voice {
             ambient.voice = v;
         }
+        if let Some(v) = req.stt_model {
+            ambient.stt_model = v;
+        }
         if let Some(v) = req.conversation_timeout_secs {
             ambient.conversation_timeout_secs = v;
         }
@@ -154,6 +159,16 @@ pub(crate) async fn set_settings(
         }
         match ambient.normalized() {
             Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+            Ok(ambient)
+                if ambient.enabled
+                    && !(crate::models::is_ready(&ambient.stt_model)
+                        && crate::models::is_ready(&ambient.voice)) =>
+            {
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    "Download a speech model and a reply voice in Settings, Voice, before turning ambient listening on".into(),
+                ))
+            }
             Ok(ambient) => {
                 c.ambient = ambient;
                 if let Some(key) = req.typesafe_api_key {
@@ -168,13 +183,8 @@ pub(crate) async fn set_settings(
     match result {
         Ok(()) => {
             let ambient = d.config.lock().unwrap().ambient.clone();
-            if ambient.enabled && ambient.voice != "system" {
-                let voice = ambient.voice.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::tts::prepare(&voice).await {
-                        eprintln!("[ambient] could not prepare voice {voice}: {e}");
-                    }
-                });
+            if ambient.enabled {
+                warm_models(ambient.stt_model.clone(), ambient.voice.clone());
             }
             Json(settings_view(&d)).into_response()
         }
@@ -523,17 +533,72 @@ pub(crate) async fn turn_audio(
     }
 }
 
+fn warm_models(stt: String, voice: String) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = crate::stt::warm(&stt) {
+            eprintln!("[ambient] could not load speech model {stt}: {e}");
+        }
+        if let Err(e) = crate::tts::warm(&voice) {
+            eprintln!("[ambient] could not load voice {voice}: {e}");
+        }
+    });
+}
+
 pub(crate) fn warm_voice(d: Shared) {
     tokio::spawn(async move {
         crate::tts::clean_old_replies().await;
-        let (enabled, voice) = {
+        let (enabled, stt, voice) = {
             let c = d.config.lock().unwrap();
-            (c.ambient.enabled, c.ambient.voice.clone())
+            (c.ambient.enabled, c.ambient.stt_model.clone(), c.ambient.voice.clone())
         };
-        if enabled && voice != "system" {
-            if let Err(e) = crate::tts::prepare(&voice).await {
-                eprintln!("[ambient] could not prepare voice {voice}: {e}");
-            }
+        if enabled && crate::models::is_ready(&stt) && crate::models::is_ready(&voice) {
+            warm_models(stt, voice);
         }
     });
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ModelReq {
+    id: String,
+}
+
+pub(crate) async fn models(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    Json(serde_json::json!({ "models": crate::models::list() })).into_response()
+}
+
+pub(crate) async fn model_download(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ModelReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::models::start_download(&req.id) {
+        Ok(()) => Json(serde_json::json!({ "models": crate::models::list() })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+pub(crate) async fn model_delete(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ModelReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    {
+        let c = d.config.lock().unwrap();
+        if c.ambient.enabled && (c.ambient.stt_model == req.id || c.ambient.voice == req.id) {
+            return (StatusCode::CONFLICT, "turn ambient listening off before removing the model it uses").into_response();
+        }
+    }
+    if let Err(e) = crate::models::delete(&req.id).await {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    Json(serde_json::json!({ "models": crate::models::list() })).into_response()
 }

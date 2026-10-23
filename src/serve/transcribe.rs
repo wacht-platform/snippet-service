@@ -232,12 +232,9 @@ async fn assemblyai_transcribe(
 
 pub(super) async fn transcribe_ambient(d: &Daemon, path: &Path) -> Result<String, String> {
     d.reload_config().await;
-    let (voice, key) = {
-        let c = d.config.lock().unwrap();
-        (c.voice.clone(), c.assemblyai_api_key.clone())
-    };
-    let key = key
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "no AssemblyAI API key is set (Settings → Voice)".to_string())?;
-    assemblyai_transcribe(&voice, &key, path).await
+    let model = d.config.lock().unwrap().ambient.stt_model.clone();
+    if model.is_empty() {
+        return Err("no speech model is selected (Settings, Voice)".into());
+    }
+    crate::stt::transcribe(&model, path).await
 }

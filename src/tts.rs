@@ -1,14 +1,6 @@
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use piper_rs::Piper;
-
-pub const VOICES: &[(&str, &str)] = &[
-    ("en_US-lessac-medium", "Lessac (US)"),
-    ("en_US-amy-medium", "Amy (US)"),
-    ("en_GB-alan-medium", "Alan (UK)"),
-    ("en_GB-jenny_dioco-medium", "Jenny (UK)"),
-];
 
 struct Loaded {
     voice: String,
@@ -21,67 +13,27 @@ fn engine() -> &'static Mutex<Option<Loaded>> {
     ENGINE.get_or_init(|| Mutex::new(None))
 }
 
-pub fn is_known(voice: &str) -> bool {
-    voice == "system" || VOICES.iter().any(|(id, _)| *id == voice)
-}
-
-fn voice_dir(voice: &str) -> PathBuf {
-    crate::config::snippet_home().join("tts").join(voice)
-}
-
-pub fn audio_dir() -> PathBuf {
+pub fn audio_dir() -> std::path::PathBuf {
     crate::config::snippet_home().join("tts").join("replies")
 }
 
-async fn ensure_voice(voice: &str) -> Result<(PathBuf, PathBuf), String> {
-    let dir = voice_dir(voice);
-    let model = dir.join(format!("{voice}.onnx"));
-    let config = dir.join(format!("{voice}.onnx.json"));
-    if model.exists() && config.exists() {
-        return Ok((model, config));
+pub fn unload(voice: &str) {
+    let mut guard = engine().lock().unwrap();
+    if guard.as_ref().is_some_and(|l| l.voice == voice) {
+        *guard = None;
     }
-    let mut parts = voice.split('-');
-    let region = parts.next().unwrap_or_default();
-    let name = parts.next().unwrap_or_default();
-    let quality = parts.next().unwrap_or_default();
-    let lang = region.split('_').next().unwrap_or_default();
-    if lang.is_empty() || name.is_empty() || quality.is_empty() {
-        return Err(format!("unknown voice {voice}"));
-    }
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
-    let base = format!("https://huggingface.co/rhasspy/piper-voices/resolve/main/{lang}/{region}/{name}/{quality}/{voice}");
-    for (url, target) in [(format!("{base}.onnx.json"), &config), (format!("{base}.onnx"), &model)] {
-        let response = reqwest::Client::new()
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(600))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !response.status().is_success() {
-            return Err(format!("voice download failed: {}", response.status()));
-        }
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        let part = target.with_extension("part");
-        tokio::fs::write(&part, &bytes).await.map_err(|e| e.to_string())?;
-        tokio::fs::rename(&part, target).await.map_err(|e| e.to_string())?;
-    }
-    Ok((model, config))
 }
 
-pub async fn prepare(voice: &str) -> Result<(), String> {
-    let (model, config) = ensure_voice(voice).await?;
-    let voice = voice.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut guard = engine().lock().unwrap();
-        if guard.as_ref().is_some_and(|l| l.voice == voice) {
-            return Ok(());
-        }
-        let piper = Piper::new(&model, &config).map_err(|e| e.to_string())?;
-        *guard = Some(Loaded { voice, piper });
-        Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+pub fn warm(voice: &str) -> Result<(), String> {
+    let mut guard = engine().lock().unwrap();
+    if guard.as_ref().is_some_and(|l| l.voice == voice) {
+        return Ok(());
+    }
+    let dir = crate::models::dir(voice);
+    let piper = Piper::new(&dir.join(format!("{voice}.onnx")), &dir.join(format!("{voice}.onnx.json")))
+        .map_err(|e| e.to_string())?;
+    *guard = Some(Loaded { voice: voice.to_string(), piper });
+    Ok(())
 }
 
 fn wav(samples: &[f32], rate: u32) -> Vec<u8> {
@@ -107,9 +59,13 @@ fn wav(samples: &[f32], rate: u32) -> Vec<u8> {
 }
 
 pub async fn synthesize(voice: &str, text: &str) -> Result<Vec<u8>, String> {
-    prepare(voice).await?;
+    if !crate::models::is_ready(voice) {
+        return Err("the reply voice is not downloaded".into());
+    }
+    let voice = voice.to_string();
     let text = text.to_string();
     tokio::task::spawn_blocking(move || {
+        warm(&voice)?;
         let mut guard = engine().lock().unwrap();
         let loaded = guard.as_mut().ok_or("voice is not loaded")?;
         let (samples, rate) = loaded

@@ -90,8 +90,6 @@ struct ReadFileArgs {
     offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
-    #[serde(default)]
-    include_hidden: bool,
 }
 
 pub struct ReadFile;
