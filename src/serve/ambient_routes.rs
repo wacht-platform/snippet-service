@@ -202,6 +202,8 @@ pub(crate) struct IngestQuery {
     #[serde(default)]
     during_playback: bool,
     #[serde(default)]
+    media: bool,
+    #[serde(default)]
     backlog: bool,
 }
 
@@ -300,8 +302,8 @@ pub(crate) async fn ingest(
     let inserted = d.store.with_connection(|c| {
         c.execute(
             "INSERT OR IGNORE INTO ambient_events
-                 (id, device, started_at, duration_ms, status, created_at, seq, continued, during_playback, routed)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9)",
+                 (id, device, started_at, duration_ms, status, created_at, seq, continued, during_playback, routed, media)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 q.id,
                 q.device,
@@ -311,7 +313,8 @@ pub(crate) async fn ingest(
                 q.seq,
                 q.continued as i64,
                 q.during_playback as i64,
-                !q.backlog as i64
+                !q.backlog as i64,
+                q.media as i64
             ],
         )
     });
@@ -334,6 +337,7 @@ fn spawn_transcription(d: Shared, id: String) {
         let permit = gate.acquire_owned().await.ok();
         let result = super::transcribe::transcribe_ambient(&d, &path).await;
         drop(permit);
+        let speaker_is_you = result.as_ref().is_ok_and(|s| s.summary == "you");
         let (status, text, error, speakers, summary) = match result {
             Ok(s) if s.text.is_empty() => ("empty", String::new(), None, None, None),
             Ok(s) => ("done", s.text, None, Some(s.speakers), Some(s.summary)),
@@ -373,6 +377,18 @@ fn spawn_transcription(d: Shared, id: String) {
         if during_playback != 0 && echo_of_reply(&text, &device) {
             let _ = d.store.with_connection(|c| {
                 c.execute("UPDATE ambient_events SET status = 'echo', kept = 0 WHERE id = ?1", [&id])?;
+                Ok(())
+            });
+            super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));
+            return;
+        }
+        let media: i64 = d
+            .store
+            .with_connection(|c| c.query_row("SELECT media FROM ambient_events WHERE id = ?1", [&id], |r| r.get(0)))
+            .unwrap_or(0);
+        if media != 0 && !speaker_is_you {
+            let _ = d.store.with_connection(|c| {
+                c.execute("UPDATE ambient_events SET status = 'media', kept = 0 WHERE id = ?1", [&id])?;
                 Ok(())
             });
             super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));

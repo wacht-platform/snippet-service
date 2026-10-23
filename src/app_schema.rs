@@ -147,6 +147,7 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
         ("seq", "ALTER TABLE ambient_events ADD COLUMN seq INTEGER"),
         ("continued", "ALTER TABLE ambient_events ADD COLUMN continued INTEGER NOT NULL DEFAULT 0"),
         ("during_playback", "ALTER TABLE ambient_events ADD COLUMN during_playback INTEGER NOT NULL DEFAULT 0"),
+        ("media", "ALTER TABLE ambient_events ADD COLUMN media INTEGER NOT NULL DEFAULT 0"),
         ("routed", "ALTER TABLE ambient_events ADD COLUMN routed INTEGER NOT NULL DEFAULT 1"),
         ("delivered", "ALTER TABLE ambient_events ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0"),
         ("turn_key", "ALTER TABLE ambient_events ADD COLUMN turn_key TEXT"),
