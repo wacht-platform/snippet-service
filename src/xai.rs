@@ -968,6 +968,7 @@ async fn parse_responses_sse(
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string();
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Start { call_id: if item_id.is_empty() { in_flight_calls.len().to_string() } else { item_id.clone() }, name: name.clone() });
                         if !item_id.is_empty() {
                             in_flight_calls.insert(
                                 item_id,
@@ -991,6 +992,7 @@ async fn parse_responses_sse(
                     if let Some(inflight) = in_flight_calls.get_mut(item_id) {
                         inflight.arguments_buf.push_str(delta);
                     }
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: item_id.to_string(), chunk: delta.to_string() });
                 }
             }
             "response.function_call_arguments.done" => {
@@ -1001,8 +1003,11 @@ async fn parse_responses_sse(
                     .unwrap_or("");
                 if let Some(args) = chunk.get("arguments").and_then(Value::as_str) {
                     if let Some(inflight) = in_flight_calls.get_mut(item_id) {
+                        let had_delta = !inflight.arguments_buf.is_empty();
                         inflight.arguments_buf = args.to_string();
+                        if !had_delta { StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: item_id.to_string(), chunk: args.to_string() }); }
                     }
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id: item_id.to_string() });
                 }
             }
             "response.output_item.done" => {
@@ -1017,6 +1022,11 @@ async fn parse_responses_sse(
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     if let Some(inflight) = in_flight_calls.remove(item_id) {
+                        let done_args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                        if inflight.arguments_buf.is_empty() && !done_args.is_empty() {
+                            StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: if item_id.is_empty() { "0".to_string() } else { item_id.to_string() }, chunk: done_args.to_string() });
+                        }
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id: if item_id.is_empty() { "0".to_string() } else { item_id.to_string() } });
                         let has_args = item_clone
                             .get("arguments")
                             .and_then(Value::as_str)

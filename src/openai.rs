@@ -659,10 +659,14 @@ async fn parse_openai_sse(
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                 {
+                    if entry.name.is_empty() {
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Start { call_id: if entry.id.is_empty() { index.to_string() } else { entry.id.clone() }, name: name.to_string() });
+                    }
                     entry.name.push_str(name);
                 }
                 if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
                     entry.args.push_str(args);
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: if entry.id.is_empty() { index.to_string() } else { entry.id.clone() }, chunk: args.to_string() });
                 }
             }
         }
@@ -672,6 +676,9 @@ async fn parse_openai_sse(
     // is transient — mark it retryable so the request loop re-runs it.
     .map_err(|error| ToolError::model_request(format!("model stream error: {error}"), true))?;
 
+    for (index, call) in &calls {
+        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id: if call.id.is_empty() { index.to_string() } else { call.id.clone() } });
+    }
     if let Some(err) = stream_error {
         return Err(ToolError::model_request(
             format!("model mid-stream error: {err}"),

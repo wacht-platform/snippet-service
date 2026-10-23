@@ -1376,7 +1376,7 @@ impl CodingHarness {
                             if text.is_empty() {
                                 continue;
                             }
-                            if state.pending_question.is_some() && is_daemon_envelope(&text) {
+                            if state.pending_question.is_some() && is_held_envelope(&text) {
                                 held_envelopes.push(text);
                                 continue;
                             }

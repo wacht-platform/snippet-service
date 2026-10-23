@@ -90,10 +90,10 @@ The camera captures a frame when the scene changes, plus one every few minutes a
 ## Decisions so far
 
 1. **Mission Control owns the policy.** It sets the interruption budget, cooldowns, channel ladder and which moments matter, and decides what to do with each one. It learns from accepted, dismissed and ignored nudges.
-2. **The ambient worker only produces moments.** Capture, transcription, storage and the cheap watcher run outside Mission Control's context. Mission Control sees distilled moments, urgent ones wake it, and it can search the full log.
-3. **Shadow mode first.** The watcher logs what it would have said and you rate it. Nudges go live from the quietest channel up once precision is good.
+2. **The ambient worker only produces moments.** Capture, transcription, storage and the cheap voice classifier run outside Mission Control's context. Mission Control sees distilled moments, urgent ones wake it, and it can search the full log.
+3. **Shadow mode first.** The voice classifier logs what it would have said and you rate it. Nudges go live from the quietest channel up once precision is good.
 4. **One capture core in Dart.** The app already ships on Android, macOS, Windows and Linux, so recording, voice detection, the retry queue and upload are written once. Each platform only adds its own shell.
-5. **Jev as the watcher is a candidate, not a decision.** Latency, price and the privacy of sending transcripts are unchecked.
+5. **The voice classifier (TypeSafe) is a candidate, not a decision.** Latency, price and the privacy of sending transcripts are unchecked.
 
 ## Platforms
 
@@ -114,7 +114,7 @@ The camera captures a frame when the scene changes, plus one every few minutes a
 | 4 | Desktop shells: Mac, Linux, Windows (tray, login item, mute) | snippet-mobile | not started |
 | 5 | Android foreground service, battery exemption prompt, mute | snippet-mobile | not started |
 | 6 | One-day soak test per platform: gaps, battery, upload failures | all | not started |
-| 7 | Watcher in shadow mode, moments table, review screen | both | not started |
+| 7 | Voice classifier in shadow mode, moments table, review screen | both | not started |
 | 8 | Mission Control integration: moments as wakes, policy in its memory, feedback loop | snippet-service | not started |
 | 9 | Live nudges up the channel ladder | both | not started |
 

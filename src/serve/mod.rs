@@ -37,6 +37,7 @@ pub mod agent_routes;
 mod account_routes;
 mod ambient_routes;
 mod ambient_context;
+mod ambient_router;
 mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
@@ -340,7 +341,7 @@ impl Daemon {
                 sp,
                 initial,
                 true,
-                stream(),
+                Some(crate::speech::mission_control_stream()),
             );
         }
         if let Some(agent_id) = sidecar.as_ref().and_then(|s| s.agent_id.as_deref()) {
@@ -880,6 +881,9 @@ pub async fn run_serve(
         .route("/ambient/turns", get(ambient_routes::turns))
         .route("/ambient/turns/played", post(ambient_routes::played))
         .route("/ambient/turns/{id}/audio", get(ambient_routes::turn_audio))
+        .route("/ambient/turns/{id}/chunks/{seq}", get(ambient_routes::turn_chunk))
+        .route("/ambient/barge", post(ambient_routes::barge))
+        .route("/ambient/activity", post(ambient_routes::activity))
         .route("/ambient/conversation/end", post(ambient_routes::end_conversation))
         .route(
             "/ambient/settings",

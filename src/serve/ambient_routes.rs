@@ -60,6 +60,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
             c.typesafe_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
         )
     };
+    crate::ambient::note_enabled(ambient.enabled);
     crate::ambient::note_pinned(ambient.enabled && ambient.mode == "active");
     let since = (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp();
     let devices: Vec<serde_json::Value> = d
@@ -85,7 +86,10 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "mode": ambient.mode,
         "devices": devices,
         "effective_mode": crate::ambient::effective_mode_name(ambient.enabled && ambient.mode == "active"),
-        "watcher": ambient.watcher,
+        "state": crate::ambient::state_name(),
+        "sub": crate::ambient::sub_state(),
+        "expecting": crate::ambient::expectation().map(|e| serde_json::json!({"kind": e.kind, "about": e.about})),
+        "watcher": if ambient.watcher == "jev" { "classifier" } else { ambient.watcher.as_str() },
         "watcher_chat_context": ambient.watcher_chat_context,
         "models_ready": crate::models::is_ready(crate::models::STT_MODEL) && crate::models::is_ready(crate::models::TTS_VOICE) && crate::models::is_ready(crate::models::SPEAKER_MODEL),
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
@@ -191,6 +195,14 @@ pub(crate) struct IngestQuery {
     started_at: String,
     #[serde(default)]
     duration_ms: i64,
+    #[serde(default)]
+    seq: Option<i64>,
+    #[serde(default)]
+    continued: bool,
+    #[serde(default)]
+    during_playback: bool,
+    #[serde(default)]
+    backlog: bool,
 }
 
 #[derive(Deserialize)]
@@ -260,7 +272,7 @@ pub(crate) async fn ingest(
     if q.device.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "device is required").into_response();
     }
-    if !lease_touch(&q.device, None, false) {
+    if !q.backlog && !lease_touch(&q.device, None, false) {
         return (StatusCode::CONFLICT, "another device is listening").into_response();
     }
     if !valid_id(&q.id) {
@@ -287,9 +299,20 @@ pub(crate) async fn ingest(
     let now = chrono::Utc::now().timestamp();
     let inserted = d.store.with_connection(|c| {
         c.execute(
-            "INSERT OR IGNORE INTO ambient_events (id, device, started_at, duration_ms, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
-            rusqlite::params![q.id, q.device, started, q.duration_ms, now],
+            "INSERT OR IGNORE INTO ambient_events
+                 (id, device, started_at, duration_ms, status, created_at, seq, continued, during_playback, routed)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                q.id,
+                q.device,
+                started,
+                q.duration_ms,
+                now,
+                q.seq,
+                q.continued as i64,
+                q.during_playback as i64,
+                !q.backlog as i64
+            ],
         )
     });
     if let Err(e) = inserted {
@@ -328,35 +351,122 @@ fn spawn_transcription(d: Shared, id: String) {
         if status != "failed" {
             let _ = tokio::fs::remove_file(&path).await;
         }
+        let row: Option<(String, Option<i64>, String, i64, i64, i64, i64)> = d
+            .store
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT device, seq, started_at, duration_ms, continued, during_playback, routed
+                     FROM ambient_events WHERE id = ?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                )
+            })
+            .ok();
+        let Some((device, seq, started_at, duration_ms, continued, during_playback, routed)) = row else {
+            return;
+        };
+        let seq = seq.unwrap_or(-1);
         if status != "done" {
+            super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));
             return;
         }
-        let (verdict, delivered) = super::ambient_watch::process(&d, &id, &text).await;
-        let kept = verdict.kept();
-        let _ = d.store.with_connection(|c| {
-            c.execute(
-                "UPDATE ambient_events SET verdict = ?2, addressed = ?3, judge = ?4, kept = ?5, intent = ?6
-                 WHERE id = ?1",
-                rusqlite::params![
-                    id,
-                    verdict.kind,
-                    verdict.addressed,
-                    verdict.judge,
-                    kept as i64,
-                    verdict.intent
-                ],
-            )?;
-            if kept {
+        if during_playback != 0 && echo_of_reply(&text, &device) {
+            let _ = d.store.with_connection(|c| {
+                c.execute("UPDATE ambient_events SET status = 'echo', kept = 0 WHERE id = ?1", [&id])?;
+                Ok(())
+            });
+            super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));
+            return;
+        }
+        if routed == 0 {
+            let _ = d.store.with_connection(|c| {
+                c.execute("UPDATE ambient_events SET kept = 1 WHERE id = ?1", [&id])?;
                 c.execute(
-                    "INSERT INTO ambient_events_fts(rowid, text)
-                     SELECT rowid, text FROM ambient_events WHERE id = ?1",
+                    "INSERT INTO ambient_events_fts(rowid, text) SELECT rowid, text FROM ambient_events WHERE id = ?1",
                     [&id],
                 )?;
-            }
-            Ok(())
-        });
-        super::ambient_watch::act(&d, &id, &text, &verdict, delivered).await;
+                Ok(())
+            });
+            return;
+        }
+        let started = chrono::DateTime::parse_from_rfc3339(&started_at)
+            .map(|t| t.timestamp_millis() as f64 / 1000.0)
+            .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+        let lines = speakers
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+            .unwrap_or_default();
+        super::ambient_router::submit(
+            &d,
+            &device,
+            super::ambient_router::Msg::Done(super::ambient_router::Part {
+                id: id.clone(),
+                seq,
+                text: text.clone(),
+                started,
+                ended: started + duration_ms as f64 / 1000.0,
+                started_at,
+                summary: summary.unwrap_or("unknown").to_string(),
+                speakers: lines,
+                continued: continued != 0,
+            }),
+        );
     });
+}
+
+fn echo_of_reply(text: &str, device: &str) -> bool {
+    let heard: std::collections::HashSet<String> = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    if heard.len() < 3 {
+        return false;
+    }
+    let since = chrono::Utc::now().timestamp() - 180;
+    let replies: Vec<String> = crate::ambient::store()
+        .ok()
+        .and_then(|s| {
+            s.with_connection(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT text FROM ambient_turns WHERE role = 'assistant' AND device = ?1 AND created_at >= ?2
+                     ORDER BY id DESC LIMIT 3",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![device, since], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .ok()
+        })
+        .unwrap_or_default();
+    let spoken: std::collections::HashSet<String> = replies
+        .iter()
+        .flat_map(|t| t.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect::<Vec<_>>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let shared = heard.iter().filter(|w| spoken.contains(*w)).count();
+    shared as f64 / heard.len() as f64 >= 0.6
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ActivityReq {
+    device: String,
+}
+
+pub(crate) async fn activity(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<ActivityReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if lease_holder().is_some_and(|(h, _)| h == req.device) {
+        super::ambient_router::submit(&d, &req.device, super::ambient_router::Msg::Activity);
+    }
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 pub(crate) fn resume(d: Shared) {
@@ -478,7 +588,7 @@ pub(crate) async fn turns(State(d): State<Shared>, Query(q): Query<TurnsQuery>) 
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    match crate::ambient::turns_after(q.after, &q.device) {
+    match crate::speech::turns_after(q.after, &q.device) {
         Ok(turns) => Json(serde_json::json!({ "turns": turns })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -487,6 +597,10 @@ pub(crate) async fn turns(State(d): State<Shared>, Query(q): Query<TurnsQuery>) 
 #[derive(Deserialize)]
 pub(crate) struct PlayedReq {
     id: i64,
+    #[serde(default)]
+    seq: Option<i64>,
+    #[serde(default)]
+    complete: Option<bool>,
 }
 
 pub(crate) async fn played(
@@ -497,8 +611,48 @@ pub(crate) async fn played(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    crate::ambient::mark_played(req.id);
+    let ttl = d.config.lock().unwrap().ambient.conversation_timeout_secs;
+    crate::speech::played(req.id, req.seq, req.complete.unwrap_or(req.seq.is_none()), ttl);
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BargeReq {
+    turn: i64,
+    #[serde(default = "no_chunk")]
+    seq: i64,
+    #[serde(default)]
+    played_ms: i64,
+}
+
+fn no_chunk() -> i64 {
+    -1
+}
+
+pub(crate) async fn barge(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<BargeReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    crate::speech::barge(req.turn, req.seq, req.played_ms);
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+pub(crate) async fn turn_chunk(
+    State(d): State<Shared>,
+    axum::extract::Path((id, seq)): axum::extract::Path<(i64, i64)>,
+    Query(a): Query<Auth>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match tokio::fs::read(crate::speech::chunk_path(id, seq)).await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "audio/L16;rate=24000;channels=1")], bytes).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "chunk not ready").into_response(),
+    }
 }
 
 pub(crate) async fn end_conversation(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {

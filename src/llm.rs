@@ -139,6 +139,16 @@ pub fn degrade_effort(current: &str) -> Option<&'static str> {
 /// the UI renders the in-progress text and clears it once the turn commits to
 /// durable state. Only the interactive conversation sets a sink — lanes and
 /// one-shot runs stream nothing and keep the buffered path.
+#[derive(Debug, Clone)]
+pub enum ToolArgEvent {
+    Start { call_id: String, name: String },
+    Delta { call_id: String, chunk: String },
+    End { call_id: String },
+    Reset,
+}
+
+pub type ToolArgTap = tokio::sync::mpsc::UnboundedSender<ToolArgEvent>;
+
 #[derive(Default)]
 pub struct StreamBuffer {
     /// The visible answer the model is streaming.
@@ -149,11 +159,26 @@ pub struct StreamBuffer {
     /// Reasoning/thinking tokens, when the provider returns them — shown dimmed,
     /// separate from the answer. Best-effort: empty for models that don't emit it.
     pub thinking: String,
+    pub tool_tap: Option<ToolArgTap>,
 }
 
 pub type StreamHandle = Arc<Mutex<StreamBuffer>>;
 
 impl StreamBuffer {
+    pub fn set_tool_tap(&mut self, tap: ToolArgTap) {
+        self.tool_tap = Some(tap);
+    }
+
+    pub fn tool_event<'a>(handle: impl Into<Option<&'a StreamHandle>>, ev: ToolArgEvent) {
+        if let Some(handle) = handle.into() {
+            if let Ok(buf) = handle.lock() {
+                if let Some(tap) = &buf.tool_tap {
+                    let _ = tap.send(ev);
+                }
+            }
+        }
+    }
+
     pub fn append(handle: &StreamHandle, delta: &str) {
         if let Ok(mut buf) = handle.lock() {
             buf.text.push_str(delta);
@@ -172,6 +197,9 @@ impl StreamBuffer {
             buf.text.clear();
             buf.text_visible = false;
             buf.thinking.clear();
+            if let Some(tap) = &buf.tool_tap {
+                let _ = tap.send(ToolArgEvent::Reset);
+            }
         }
     }
 

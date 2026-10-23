@@ -116,6 +116,13 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              ON ambient_turns(device, id);
          CREATE INDEX IF NOT EXISTS ambient_turns_created
              ON ambient_turns(created_at);
+         CREATE TABLE IF NOT EXISTS ambient_chunks (
+             turn_id INTEGER NOT NULL,
+             seq INTEGER NOT NULL,
+             ms INTEGER NOT NULL,
+             text TEXT NOT NULL,
+             PRIMARY KEY (turn_id, seq)
+         );
          CREATE TABLE IF NOT EXISTS speakers (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              label TEXT NOT NULL DEFAULT '',
@@ -137,10 +144,32 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
         ("judge", "ALTER TABLE ambient_events ADD COLUMN judge TEXT"),
         ("intent", "ALTER TABLE ambient_events ADD COLUMN intent TEXT"),
         ("kept", "ALTER TABLE ambient_events ADD COLUMN kept INTEGER NOT NULL DEFAULT 1"),
+        ("seq", "ALTER TABLE ambient_events ADD COLUMN seq INTEGER"),
+        ("continued", "ALTER TABLE ambient_events ADD COLUMN continued INTEGER NOT NULL DEFAULT 0"),
+        ("during_playback", "ALTER TABLE ambient_events ADD COLUMN during_playback INTEGER NOT NULL DEFAULT 0"),
+        ("routed", "ALTER TABLE ambient_events ADD COLUMN routed INTEGER NOT NULL DEFAULT 1"),
+        ("delivered", "ALTER TABLE ambient_events ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0"),
+        ("turn_key", "ALTER TABLE ambient_events ADD COLUMN turn_key TEXT"),
         ("speakers", "ALTER TABLE ambient_events ADD COLUMN speakers TEXT"),
         ("speaker_summary", "ALTER TABLE ambient_events ADD COLUMN speaker_summary TEXT"),
     ] {
         if !have.iter().any(|c| c == name) {
+            connection.execute(ddl, [])?;
+        }
+    }
+    let have_turns: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(ambient_turns)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (name, ddl) in [
+        ("status", "ALTER TABLE ambient_turns ADD COLUMN status TEXT NOT NULL DEFAULT 'played'"),
+        ("heard_text", "ALTER TABLE ambient_turns ADD COLUMN heard_text TEXT"),
+        ("chunk_count", "ALTER TABLE ambient_turns ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"),
+        ("ended", "ALTER TABLE ambient_turns ADD COLUMN ended INTEGER NOT NULL DEFAULT 0"),
+        ("played_through", "ALTER TABLE ambient_turns ADD COLUMN played_through INTEGER NOT NULL DEFAULT -1"),
+    ] {
+        if !have_turns.iter().any(|c| c == name) {
             connection.execute(ddl, [])?;
         }
     }

@@ -661,11 +661,15 @@ async fn parse_responses_sse(
                 {
                     let item = item.expect("checked");
                     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let call_id = item.get("id").or_else(|| item.get("call_id")).and_then(Value::as_str).unwrap_or("0").to_string();
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Start { call_id: call_id.clone(), name: name.to_string() });
                     if !name.is_empty() {
                         let args_str = item
                             .get("arguments")
                             .and_then(Value::as_str)
                             .unwrap_or("{}");
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: call_id.clone(), chunk: args_str.to_string() });
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id });
                         let arguments = serde_json::from_str::<Value>(args_str)
                             .unwrap_or_else(|_| Value::String(args_str.to_string()));
                         let id = item

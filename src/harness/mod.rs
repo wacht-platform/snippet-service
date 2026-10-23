@@ -917,6 +917,23 @@ pub(crate) use transcript::notice_text;
 #[cfg(test)]
 mod tests;
 
+pub(crate) fn is_held_envelope(text: &str) -> bool {
+    if is_daemon_envelope(text) {
+        return true;
+    }
+    let first = text.lines().next().unwrap_or("");
+    if !first.starts_with("<ambient_turn") {
+        return false;
+    }
+    let matched = first
+        .split("matched=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    matched < 0.7
+}
+
 pub(crate) fn is_daemon_envelope(text: &str) -> bool {
     let first = text.lines().next().unwrap_or("").trim();
     first.len() > 2

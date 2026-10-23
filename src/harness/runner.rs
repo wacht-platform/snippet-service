@@ -225,7 +225,7 @@ impl CodingHarness {
                             let hold = !was_running
                                 && state.status == HarnessStatus::WaitingForInput
                                 && state.pending_question.is_some()
-                                && is_daemon_envelope(&text);
+                                && is_held_envelope(&text);
                             had_user_msg |= !hold;
                             if was_running {
                                 // Mid-run steer: the step continues; fold it in.
@@ -578,7 +578,7 @@ impl CodingHarness {
                             }
                             if state.status == HarnessStatus::WaitingForInput
                                 && state.pending_question.is_some()
-                                && is_daemon_envelope(&text)
+                                && is_held_envelope(&text)
                             {
                                 state.queued_inputs.push(QueuedInput {
                                     id: uuid::Uuid::new_v4().simple().to_string(),

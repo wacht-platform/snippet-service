@@ -102,11 +102,36 @@ fn clause_tokens(segment: &str, punct: Option<char>) -> Result<Vec<i64>, String>
     Ok(phonemes.chars().filter_map(|c| map.get(&c).copied()).collect())
 }
 
+const ABBREVIATIONS: &[&str] = &["mr", "mrs", "ms", "dr", "st", "vs", "etc", "e.g", "i.e", "prof", "no", "approx"];
+
+fn splits_here(segment: &str, c: char, next: Option<char>) -> bool {
+    if c == '\n' {
+        return true;
+    }
+    let boundary = next.is_none_or(|n| n.is_whitespace() || matches!(n, '"' | '\'' | ')' | ']'));
+    if !boundary {
+        return false;
+    }
+    if c == '.' {
+        let word = segment
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("")
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '.')
+            .to_lowercase();
+        if ABBREVIATIONS.contains(&word.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
 fn groups(text: &str) -> Result<Vec<Vec<i64>>, String> {
     let mut clauses: Vec<Vec<i64>> = Vec::new();
     let mut segment = String::new();
-    for c in text.chars() {
-        if matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '\n') {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, c) in chars.iter().copied().enumerate() {
+        if matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '\n') && splits_here(&segment, c, chars.get(i + 1).copied()) {
             let punct = if c == '\n' { Some('.') } else { Some(c) };
             let tokens = clause_tokens(&segment, punct)?;
             if tokens.len() > 1 {
@@ -207,17 +232,130 @@ pub async fn synthesize(voice: &str, text: &str) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())?
 }
 
+pub fn chunk_text(text: &str) -> Vec<String> {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = flat.chars().collect();
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (i, c) in chars.iter().copied().enumerate() {
+        current.push(c);
+        if matches!(c, '.' | '!' | '?') && splits_here(&current[..current.len() - c.len_utf8()], c, chars.get(i + 1).copied()) {
+            sentences.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.trim().is_empty() {
+        sentences.push(current);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (i, sentence) in sentences.into_iter().enumerate() {
+        let sentence = sentence.trim().to_string();
+        if sentence.is_empty() {
+            continue;
+        }
+        if i == 0 && sentence.split_whitespace().count() >= 8 {
+            let mut cut = None;
+            let mut words = 0;
+            let mut last = ' ';
+            for (idx, ch) in sentence.char_indices() {
+                if ch == ' ' && !matches!(last, ',' | ';' | ':' | '\u{2014}') {
+                    words += 1;
+                }
+                if matches!(ch, ',' | ';' | ':' | '\u{2014}') && words >= 2 && sentence[idx + ch.len_utf8()..].starts_with(' ') {
+                    cut = Some(idx + ch.len_utf8());
+                    break;
+                }
+                last = ch;
+            }
+            if let Some(at) = cut {
+                let rest = sentence[at..].trim().to_string();
+                out.push(sentence[..at].trim().to_string());
+                if !rest.is_empty() {
+                    out.push(rest);
+                }
+                continue;
+            }
+        }
+        out.push(sentence);
+    }
+    let mut merged: Vec<String> = Vec::new();
+    for piece in out {
+        match merged.last_mut() {
+            Some(prev) if prev.split_whitespace().count() < 3 => {
+                prev.push(' ');
+                prev.push_str(&piece);
+            }
+            _ => merged.push(piece),
+        }
+    }
+    let mut final_chunks: Vec<String> = Vec::new();
+    for piece in merged {
+        let mut rest = piece.as_str();
+        while rest.len() > 160 {
+            let cut = rest[..160].rfind(' ').unwrap_or(160);
+            final_chunks.push(rest[..cut].trim().to_string());
+            rest = rest[cut..].trim_start();
+        }
+        if !rest.is_empty() {
+            final_chunks.push(rest.to_string());
+        }
+    }
+    final_chunks
+}
+
+pub async fn synthesize_pcm(voice: &str, text: &str) -> Result<(Vec<u8>, u32), String> {
+    if !crate::models::is_ready(voice) {
+        return Err("the reply voice is not downloaded".into());
+    }
+    let voice = voice.to_string();
+    let text = text.to_string();
+    tokio::task::spawn_blocking(move || {
+        warm(&voice)?;
+        let pieces = groups(&text)?;
+        if pieces.is_empty() {
+            return Err("nothing to say".to_string());
+        }
+        let mut guard = engine().lock().unwrap();
+        let loaded = guard.as_mut().ok_or("voice is not loaded")?;
+        loaded.used = Instant::now();
+        let mut samples: Vec<f32> = Vec::new();
+        for ids in &pieces {
+            if !samples.is_empty() {
+                samples.extend(std::iter::repeat_n(0.0f32, GAP_SAMPLES));
+            }
+            samples.extend(run(loaded, ids)?);
+        }
+        let ms = (samples.len() as u64 * 1000 / RATE as u64) as u32;
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+            .collect();
+        Ok((bytes, ms))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 pub async fn clean_old_replies() {
-    let dir = audio_dir();
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return;
-    };
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(modified) = entry.metadata().await.and_then(|m| m.modified()) {
-            if modified < cutoff {
+    let mut stack = vec![audio_dir()];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if meta.modified().is_ok_and(|m| m < cutoff) {
                 let _ = tokio::fs::remove_file(entry.path()).await;
             }
+        }
+        if dir != audio_dir() {
+            let _ = tokio::fs::remove_dir(&dir).await;
         }
     }
 }

@@ -74,7 +74,8 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
     registry.insert(Speak);
-    registry.insert(AmbientPassive);
+    registry.insert(AmbientMode);
+    registry.insert(AmbientExpect);
     registry.insert(AmbientSearch);
     registry.insert(UpdateBrief);
     registry.insert(ScheduleFollowup);
@@ -276,6 +277,27 @@ struct PingUserArgs {
 #[derive(Deserialize)]
 struct SpeakArgs {
     text: String,
+    #[serde(default)]
+    expecting: Option<String>,
+    #[serde(default)]
+    about: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AmbientModeArgs {
+    mode: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AmbientExpectArgs {
+    kind: String,
+    about: String,
+    #[serde(default)]
+    minutes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -298,7 +320,7 @@ impl Tool for AmbientSearch {
             input_schema: schema(json!({
                 "query": {"type": "string", "description": "Words to look for; leave empty for the latest lines."},
                 "limit": {"type": "integer", "description": "How many lines, up to 50. Default 15."},
-                "include_hidden": {"type": "boolean", "description": "Also return lines the watcher filtered out as TV, background or noise, each with judged_as. Use it when a request looks cut off or out of context: the watcher can misjudge."}
+                "include_hidden": {"type": "boolean", "description": "Also return lines the voice classifier filtered out as TV, background or noise, each with judged_as. Use it when a request looks cut off or out of context: the voice classifier can misjudge."}
             }), &[]),
         }
     }
@@ -309,19 +331,45 @@ impl Tool for AmbientSearch {
     }
 }
 
-pub struct AmbientPassive;
+pub struct AmbientMode;
 #[async_trait]
-impl Tool for AmbientPassive {
+impl Tool for AmbientMode {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
-            name: "ambient_passive".into(),
-            description: "Put ambient listening back to passive: the microphone keeps taking notes, nothing is spoken, and the conversation with you continues in the chat. Call it when the user has stopped talking to you aloud for a while and is typing instead, or when they ask you to stop listening or speaking. The watcher can switch it back to active when they next speak to you directly.".into(),
-            input_schema: schema(json!({}), &[]),
+            name: "ambient_mode".into(),
+            description: "Switch ambient listening between passive and active. Passive: the microphone takes notes and passes along what is addressed to you as chat messages; you cannot speak and the user is notified of each reply. Active: a spoken back and forth with the user, and `speak` works. Call it with active when a conversation would help (the user asks something conversational, their hands are busy, a quick exchange of questions); call it with passive when speaking is no longer needed, for example the user is typing, or asks you to stop listening or speaking. It never changes unless you call it; the voice classifier only advises.".into(),
+            input_schema: schema(json!({
+                "mode": {"type": "string", "enum": ["passive", "active"], "description": "The mode to switch to."},
+                "reason": {"type": "string", "description": "One short phrase the user may see, for example 'quick back and forth' or 'you are typing'."}
+            }), &["mode"]),
         }
     }
-    async fn execute(&self, _ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
-        crate::ambient::set_passive().await.map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({"mode": "passive"})))
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AmbientModeArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let out = crate::ambient::set_mode(&args.mode, args.reason.as_deref().unwrap_or("")).await.map_err(ToolError::msg)?;
+        Ok(ToolResult::success(out))
+    }
+}
+
+pub struct AmbientExpect;
+#[async_trait]
+impl Tool for AmbientExpect {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ambient_expect".into(),
+            description: "Tell the voice classifier what kind of spoken message you expect next, so a short reply such as 'yes' or 'the second one' is recognised as meant for you. Use it after asking the user something in the chat that they may answer aloud, or before waiting on a dictation. It lapses after the given minutes or at the next thing the user says. `speak` can set the same hint with its `expecting` argument.".into(),
+            input_schema: schema(json!({
+                "kind": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation"], "description": "What you expect."},
+                "about": {"type": "string", "description": "What it is about, in a short phrase, for example 'whether to delete the old branch'."},
+                "minutes": {"type": "integer", "description": "How long to expect it, 1 to 30. Default 10."}
+            }), &["kind", "about"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AmbientExpectArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        crate::ambient::set_expectation(&args.kind, &args.about, args.minutes.unwrap_or(10));
+        crate::ambient::emit_state("expectation set");
+        Ok(ToolResult::success(json!({"expecting": args.kind, "about": args.about})))
     }
 }
 
@@ -331,15 +379,18 @@ impl Tool for Speak {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "speak".into(),
-            description: "Say something aloud to the user through the phone or computer that is listening. Use it to answer every <ambient_turn> message while a spoken conversation is open: one to three short plain sentences, no markdown, no lists, nothing the user would need to read. It fails when nobody is listening or ambient is passive with no conversation open; then use ping_user.".into(),
+            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: one to three short plain sentences, no markdown, no lists, nothing the user would need to read. It fails when nobody is listening or ambient is passive; in passive reply in the chat, or call ambient_mode with active first.".into(),
             input_schema: schema(json!({
-                "text": {"type": "string", "description": "What to say, in plain spoken sentences."}
+                "text": {"type": "string", "description": "What to say, in plain spoken sentences."},
+                "expecting": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation", "none"], "description": "Set this when you are asking something: it tells the voice classifier a short reply is meant for you."},
+                "about": {"type": "string", "description": "What the expected reply is about, in a short phrase."},
+                "mode": {"type": "string", "enum": ["append", "replace"], "description": "append (default) queues after what is still being said; replace stops anything unplayed first."}
             }), &["text"]),
         }
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: SpeakArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let out = crate::ambient::speak(&args.text).await.map_err(ToolError::msg)?;
+        let out = crate::speech::speak(&args.text, args.expecting.as_deref(), args.about.as_deref(), args.mode.as_deref() == Some("replace")).await.map_err(ToolError::msg)?;
         Ok(ToolResult::success(out))
     }
 }

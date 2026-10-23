@@ -154,7 +154,7 @@ pub struct SnippetConfig {
     /// before any table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exa_api_key: Option<String>,
-    /// TypeSafe (Jev) key for the ambient watcher; local config only.
+    /// TypeSafe key for the ambient voice classifier; local config only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typesafe_api_key: Option<String>,
     /// TUI color theme. Ignored — AMOLED is the only palette.
@@ -268,7 +268,7 @@ impl Default for SnippetConfig {
 }
 
 pub const AMBIENT_MODES: &[&str] = &["passive", "active"];
-pub const AMBIENT_WATCHERS: &[&str] = &["jev", "off"];
+pub const AMBIENT_WATCHERS: &[&str] = &["classifier", "off"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AmbientConfig {
@@ -310,8 +310,11 @@ impl AmbientConfig {
             return Err(format!("mode must be one of: {}", AMBIENT_MODES.join(", ")));
         }
         self.watcher = self.watcher.trim().to_ascii_lowercase();
+        if self.watcher == "jev" {
+            self.watcher = "classifier".into();
+        }
         if !AMBIENT_WATCHERS.contains(&self.watcher.as_str()) {
-            return Err(format!("watcher must be one of: {}", AMBIENT_WATCHERS.join(", ")));
+            return Err(format!("voice classifier setting must be one of: {}", AMBIENT_WATCHERS.join(", ")));
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
         self.wake_phrases = self
@@ -334,7 +337,7 @@ fn default_wake_phrases() -> Vec<String> {
 }
 
 fn default_ambient_watcher() -> String {
-    "jev".into()
+    "classifier".into()
 }
 
 fn default_ambient_mode() -> String {
