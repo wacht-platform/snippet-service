@@ -141,8 +141,28 @@ pub fn state_json(reason: &str) -> Value {
     })
 }
 
+type ModeHook = Box<dyn Fn(&str, &str) + Send + Sync>;
+static MODE_HOOK: std::sync::OnceLock<ModeHook> = std::sync::OnceLock::new();
+static LAST_MODE: Mutex<String> = Mutex::new(String::new());
+
+pub fn set_mode_hook(hook: ModeHook) {
+    let _ = MODE_HOOK.set(hook);
+}
+
 pub fn emit_state(reason: &str) {
     crate::session::emit_device_event(state_json(reason));
+    let mode = effective_mode_name(is_pinned());
+    let changed = {
+        let mut last = LAST_MODE.lock().unwrap();
+        let changed = !last.is_empty() && *last != mode;
+        *last = mode.to_string();
+        changed
+    };
+    if changed && !reason.starts_with("mission_control:") {
+        if let Some(hook) = MODE_HOOK.get() {
+            hook(mode, reason);
+        }
+    }
 }
 
 pub fn effective_mode_name(pinned_active: bool) -> &'static str {

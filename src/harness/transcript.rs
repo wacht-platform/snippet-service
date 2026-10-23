@@ -14,6 +14,13 @@ pub(crate) fn notice_text(event: &HarnessEvent) -> Option<String> {
             agent_id,
             body,
             outbound,
+        } if agent_id == "voice classifier" && !*outbound && body.starts_with("Ambient mode is now") => Some(format!(
+            "[ambient mode] {body}\nContext only: no reply needed. Adjust how you answer to match the mode."
+        )),
+        HarnessEvent::AgentMessage {
+            agent_id,
+            body,
+            outbound,
         } if agent_id == "voice classifier" && !*outbound => Some(format!(
             "[heard, voice classifier] {body}\nContext only: the user did not address you. Do not reply or speak; use it to stay informed, and act only if it clearly matters to current work."
         )),

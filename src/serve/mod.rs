@@ -753,6 +753,17 @@ pub async fn run_serve(
     mission_control::register_builtin_agents(&daemon);
     ambient_routes::resume(daemon.clone());
     ambient_routes::warm_voice(daemon.clone());
+    {
+        let d = daemon.clone();
+        let handle = tokio::runtime::Handle::current();
+        crate::ambient::set_mode_hook(Box::new(move |mode, reason| {
+            let d = d.clone();
+            let body = format!("Ambient mode is now {mode} ({reason}).");
+            handle.spawn(async move {
+                agent_routes::record_agent_message(&d, crate::mission_control::SESSION_ID, "voice classifier", &body, false).await;
+            });
+        }));
+    }
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
