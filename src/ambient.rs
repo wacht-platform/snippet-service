@@ -192,10 +192,7 @@ pub async fn speak(text: &str) -> Result<Value, String> {
         .unwrap_or_default();
     let conversation = open_conversation("mission-control", ambient.conversation_timeout_secs);
     let id = record_turn(&conversation.id, "assistant", text, &device)?;
-    if ambient.voice.is_empty() {
-        return Err("no reply voice is downloaded; ask the user to add one in Settings, Voice".into());
-    }
-    let bytes = crate::tts::synthesize(&ambient.voice, text).await?;
+    let bytes = crate::tts::synthesize(crate::models::TTS_VOICE, text).await?;
     let dir = crate::tts::audio_dir();
     tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
     tokio::fs::write(dir.join(format!("{id}.wav")), bytes).await.map_err(|e| e.to_string())?;
@@ -207,7 +204,7 @@ pub async fn speak(text: &str) -> Result<Value, String> {
         "text": text,
         "audio": true,
     }));
-    Ok(json!({"spoken": true, "turn": id, "voice": ambient.voice}))
+    Ok(json!({"spoken": true, "turn": id, "voice": crate::models::TTS_VOICE}))
 }
 
 pub fn prompt_line() -> String {

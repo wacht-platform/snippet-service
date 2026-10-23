@@ -16,10 +16,13 @@ pub struct Entry {
 
 enum Source {
     Archive(&'static str),
-    Piper(&'static str),
+    Kokoro,
 }
 
 pub const STT_MODEL: &str = "parakeet-v3-int8";
+pub const TTS_VOICE: &str = "kokoro-bella";
+const KOKORO_MODEL_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx";
+const KOKORO_VOICES_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin";
 
 pub const CATALOG: &[Entry] = &[
     Entry {
@@ -30,10 +33,14 @@ pub const CATALOG: &[Entry] = &[
         size_mb: 640,
         source: Source::Archive("https://blob.handy.computer/parakeet-v3-int8.tar.gz"),
     },
-    Entry { id: "en_US-lessac-medium", kind: "tts", name: "Lessac (US)", detail: "English, US", size_mb: 63, source: Source::Piper("en_US-lessac-medium") },
-    Entry { id: "en_US-amy-medium", kind: "tts", name: "Amy (US)", detail: "English, US", size_mb: 63, source: Source::Piper("en_US-amy-medium") },
-    Entry { id: "en_GB-alan-medium", kind: "tts", name: "Alan (UK)", detail: "English, UK", size_mb: 63, source: Source::Piper("en_GB-alan-medium") },
-    Entry { id: "en_GB-jenny_dioco-medium", kind: "tts", name: "Jenny (UK)", detail: "English, UK", size_mb: 63, source: Source::Piper("en_GB-jenny_dioco-medium") },
+    Entry {
+        id: TTS_VOICE,
+        kind: "tts",
+        name: "Reply voice (Bella)",
+        detail: "Natural English voice. Runs on this machine.",
+        size_mb: 353,
+        source: Source::Kokoro,
+    },
 ];
 
 #[derive(Clone, Default)]
@@ -150,19 +157,16 @@ async fn download(entry: &'static Entry) -> Result<(), String> {
     let _ = tokio::fs::remove_dir_all(&target).await;
     tokio::fs::create_dir_all(&target).await.map_err(|e| e.to_string())?;
     match &entry.source {
-        Source::Piper(voice) => {
-            let mut parts = voice.split('-');
-            let region = parts.next().unwrap_or_default();
-            let name = parts.next().unwrap_or_default();
-            let quality = parts.next().unwrap_or_default();
-            let lang = region.split('_').next().unwrap_or_default();
-            let base = format!(
-                "https://huggingface.co/rhasspy/piper-voices/resolve/main/{lang}/{region}/{name}/{quality}/{voice}"
-            );
-            let config = target.join(format!("{voice}.onnx.json"));
-            let model = target.join(format!("{voice}.onnx"));
-            let first = fetch(&format!("{base}.onnx.json"), &config, entry.id, 0).await?;
-            fetch(&format!("{base}.onnx"), &model, entry.id, first).await?;
+        Source::Kokoro => {
+            let first = fetch(KOKORO_MODEL_URL, &target.join("kokoro.onnx"), entry.id, 0).await?;
+            let voices = target.join("voices.bin");
+            fetch(KOKORO_VOICES_URL, &voices, entry.id, first).await?;
+            let style = target.join("style.bin");
+            let source = voices.clone();
+            tokio::task::spawn_blocking(move || extract_voice(&source, "af_bella", &style))
+                .await
+                .map_err(|e| e.to_string())??;
+            let _ = tokio::fs::remove_file(&voices).await;
         }
         Source::Archive(url) => {
             let archive = target.join("download.tar.gz");
@@ -176,6 +180,22 @@ async fn download(entry: &'static Entry) -> Result<(), String> {
         }
     }
     tokio::fs::write(target.join(".ready"), b"ok").await.map_err(|e| e.to_string())
+}
+
+fn extract_voice(bundle: &std::path::Path, name: &str, out: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    let file = std::fs::File::open(bundle).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    zip.by_name(&format!("{name}.npy"))
+        .map_err(|e| e.to_string())?
+        .read_to_end(&mut raw)
+        .map_err(|e| e.to_string())?;
+    if raw.len() < 10 {
+        return Err("voice file is damaged".into());
+    }
+    let header = u16::from_le_bytes([raw[8], raw[9]]) as usize + 10;
+    std::fs::write(out, &raw[header..]).map_err(|e| e.to_string())
 }
 
 fn extract(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {

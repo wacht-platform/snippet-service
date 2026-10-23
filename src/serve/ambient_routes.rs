@@ -47,7 +47,6 @@ pub(crate) struct SettingsReq {
     mode: Option<String>,
     watcher: Option<String>,
     watcher_chat_context: Option<bool>,
-    voice: Option<String>,
     typesafe_api_key: Option<String>,
     conversation_timeout_secs: Option<u32>,
     wake_phrases: Option<Vec<String>>,
@@ -88,8 +87,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "effective_mode": crate::ambient::effective_mode_name(ambient.enabled && ambient.mode == "active"),
         "watcher": ambient.watcher,
         "watcher_chat_context": ambient.watcher_chat_context,
-        "voice": ambient.voice,
-        "models_ready": crate::models::is_ready(crate::models::STT_MODEL) && crate::models::is_ready(&ambient.voice),
+        "models_ready": crate::models::is_ready(crate::models::STT_MODEL) && crate::models::is_ready(crate::models::TTS_VOICE),
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
@@ -141,9 +139,6 @@ pub(crate) async fn set_settings(
         if let Some(v) = req.watcher_chat_context {
             ambient.watcher_chat_context = v;
         }
-        if let Some(v) = req.voice {
-            ambient.voice = v;
-        }
         if let Some(v) = req.conversation_timeout_secs {
             ambient.conversation_timeout_secs = v;
         }
@@ -155,7 +150,7 @@ pub(crate) async fn set_settings(
             Ok(ambient)
                 if ambient.enabled
                     && !(crate::models::is_ready(crate::models::STT_MODEL)
-                        && crate::models::is_ready(&ambient.voice)) =>
+                        && crate::models::is_ready(crate::models::TTS_VOICE)) =>
             {
                 Err((
                     StatusCode::BAD_REQUEST,
@@ -177,7 +172,7 @@ pub(crate) async fn set_settings(
         Ok(()) => {
             let ambient = d.config.lock().unwrap().ambient.clone();
             if ambient.enabled {
-                warm_models(crate::models::STT_MODEL.to_string(), ambient.voice.clone());
+                warm_models(crate::models::STT_MODEL.to_string(), crate::models::TTS_VOICE.to_string());
             }
             Json(settings_view(&d)).into_response()
         }
@@ -556,10 +551,8 @@ pub(crate) fn warm_voice(d: Shared) {
     tokio::spawn(async move {
         crate::tts::clean_old_replies().await;
         let stt = crate::models::STT_MODEL.to_string();
-        let (enabled, voice) = {
-            let c = d.config.lock().unwrap();
-            (c.ambient.enabled, c.ambient.voice.clone())
-        };
+        let voice = crate::models::TTS_VOICE.to_string();
+        let enabled = d.config.lock().unwrap().ambient.enabled;
         if enabled && crate::models::is_ready(&stt) && crate::models::is_ready(&voice) {
             warm_models(stt, voice);
         }
@@ -602,7 +595,7 @@ pub(crate) async fn model_delete(
     }
     {
         let c = d.config.lock().unwrap();
-        if c.ambient.enabled && (crate::models::STT_MODEL == req.id || c.ambient.voice == req.id) {
+        if c.ambient.enabled && (crate::models::STT_MODEL == req.id || crate::models::TTS_VOICE == req.id) {
             return (StatusCode::CONFLICT, "turn ambient listening off before removing the model it uses").into_response();
         }
     }
