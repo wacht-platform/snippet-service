@@ -4,11 +4,11 @@ use std::sync::{Mutex, OnceLock};
 use transcribe_rs::SpeechModel;
 use transcribe_rs::TranscribeOptions;
 use transcribe_rs::onnx::Quantization;
-use transcribe_rs::onnx::moonshine::{MoonshineModel, MoonshineVariant};
 use transcribe_rs::onnx::parakeet::ParakeetModel;
 
 struct Loaded {
     id: String,
+    used: std::time::Instant,
     model: Box<dyn SpeechModel + Send>,
 }
 
@@ -28,9 +28,6 @@ pub fn unload(id: &str) {
 fn load(id: &str) -> Result<Box<dyn SpeechModel + Send>, String> {
     let dir = crate::models::dir(id);
     match id {
-        "moonshine-base" => MoonshineModel::load(&dir, MoonshineVariant::Base, &Quantization::default())
-            .map(|m| Box::new(m) as Box<dyn SpeechModel + Send>)
-            .map_err(|e| e.to_string()),
         "parakeet-v3-int8" => ParakeetModel::load(&dir, &Quantization::Int8)
             .map(|m| Box::new(m) as Box<dyn SpeechModel + Send>)
             .map_err(|e| e.to_string()),
@@ -43,7 +40,7 @@ pub fn warm(id: &str) -> Result<(), String> {
     if guard.as_ref().is_some_and(|l| l.id == id) {
         return Ok(());
     }
-    *guard = Some(Loaded { id: id.to_string(), model: load(id)? });
+    *guard = Some(Loaded { id: id.to_string(), used: std::time::Instant::now(), model: load(id)? });
     Ok(())
 }
 
@@ -57,12 +54,27 @@ pub async fn transcribe(id: &str, path: &Path) -> Result<String, String> {
         warm(&id)?;
         let mut guard = engine().lock().unwrap();
         let loaded = guard.as_mut().ok_or("speech model is not loaded")?;
+        loaded.used = std::time::Instant::now();
         let result = loaded
             .model
-            .transcribe_file(&path, &TranscribeOptions::default())
+            .transcribe_file(
+                &path,
+                &TranscribeOptions {
+                    leading_silence_ms: Some(500),
+                    trailing_silence_ms: Some(1000),
+                    ..Default::default()
+                },
+            )
             .map_err(|e| e.to_string())?;
         Ok(result.text.trim().to_string())
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+pub fn unload_idle(after: std::time::Duration) {
+    let mut guard = engine().lock().unwrap();
+    if guard.as_ref().is_some_and(|l| l.used.elapsed() > after) {
+        *guard = None;
+    }
 }

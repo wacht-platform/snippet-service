@@ -154,10 +154,6 @@ pub struct SnippetConfig {
     /// before any table).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exa_api_key: Option<String>,
-    /// AssemblyAI API key for mobile voice transcription. Keep this in the local
-    /// config.toml; it is never returned by the remote config endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assemblyai_api_key: Option<String>,
     /// TypeSafe (Jev) key for the ambient watcher; local config only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typesafe_api_key: Option<String>,
@@ -259,7 +255,6 @@ impl Default for SnippetConfig {
             setups: None,
             model: InferenceProfileConfig::default(),
             exa_api_key: None,
-            assemblyai_api_key: None,
             typesafe_api_key: None,
             theme: None,
             memory_enabled: default_memory_enabled(),
@@ -287,8 +282,6 @@ pub struct AmbientConfig {
     pub watcher_chat_context: bool,
     #[serde(default)]
     pub voice: String,
-    #[serde(default)]
-    pub stt_model: String,
     #[serde(default = "default_conversation_timeout")]
     pub conversation_timeout_secs: u32,
     #[serde(default = "default_wake_phrases")]
@@ -303,7 +296,6 @@ impl Default for AmbientConfig {
             watcher: default_ambient_watcher(),
             watcher_chat_context: false,
             voice: String::new(),
-            stt_model: String::new(),
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
         }
@@ -329,12 +321,6 @@ impl AmbientConfig {
             && !crate::models::find(&self.voice).is_some_and(|e| e.kind == "tts")
         {
             return Err("unknown reply voice".into());
-        }
-        self.stt_model = self.stt_model.trim().to_string();
-        if !self.stt_model.is_empty()
-            && !crate::models::find(&self.stt_model).is_some_and(|e| e.kind == "stt")
-        {
-            return Err("unknown speech model".into());
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
         self.wake_phrases = self
@@ -364,7 +350,6 @@ fn default_ambient_mode() -> String {
     "passive".to_string()
 }
 
-pub const VOICE_SPEECH_MODELS: &[&str] = &["universal-3-5-pro", "universal-2"];
 pub const VOICE_MIN_SECONDS: u32 = 30;
 pub const VOICE_MAX_SECONDS: u32 = 600;
 
@@ -372,12 +357,6 @@ pub const VOICE_MAX_SECONDS: u32 = 600;
 pub struct VoiceConfig {
     #[serde(default = "default_voice_enabled")]
     pub enabled: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub speech_model: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub language: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub keyterms: Vec<String>,
     #[serde(default = "default_voice_max_seconds")]
     pub max_seconds: u32,
 }
@@ -386,9 +365,6 @@ impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             enabled: default_voice_enabled(),
-            speech_model: String::new(),
-            language: String::new(),
-            keyterms: Vec::new(),
             max_seconds: default_voice_max_seconds(),
         }
     }
@@ -400,33 +376,6 @@ impl VoiceConfig {
     }
 
     pub fn normalized(mut self) -> Result<Self, String> {
-        self.speech_model = self.speech_model.trim().to_string();
-        if !self.speech_model.is_empty() && !VOICE_SPEECH_MODELS.contains(&self.speech_model.as_str()) {
-            return Err(format!(
-                "unknown speech model `{}` (use {} or leave it empty for automatic)",
-                self.speech_model,
-                VOICE_SPEECH_MODELS.join(", ")
-            ));
-        }
-        self.language = self.language.trim().to_ascii_lowercase();
-        if !self.language.is_empty()
-            && !self.language.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
-        {
-            return Err(format!("invalid language code `{}` (e.g. en, hi, es; empty = auto-detect)", self.language));
-        }
-        let mut terms: Vec<String> = Vec::new();
-        for term in self.keyterms.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-            if term.split_whitespace().count() > 6 {
-                return Err(format!("key term `{term}` is longer than 6 words"));
-            }
-            if !terms.iter().any(|t| t.eq_ignore_ascii_case(term)) {
-                terms.push(term.to_string());
-            }
-        }
-        if terms.len() > 200 {
-            return Err("at most 200 key terms".into());
-        }
-        self.keyterms = terms;
         self.max_seconds = self.max_seconds.clamp(VOICE_MIN_SECONDS, VOICE_MAX_SECONDS);
         Ok(self)
     }

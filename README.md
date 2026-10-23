@@ -123,7 +123,7 @@ supports_images = false
 
 Supported provider values include `anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, and `openai-compatible`. Profile settings also cover temperature, image support, context size, compaction thresholds, prompt caching, and user-agent options.
 
-Optional top-level integrations include `exa_api_key` for web search and `assemblyai_api_key` for remote voice transcription. Keys remain on the daemon and are not returned by the configuration API.
+Optional top-level integrations include `exa_api_key` for web search. Keys remain on the daemon and are not returned by the configuration API.
 
 ## Memory and history
 

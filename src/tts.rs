@@ -4,6 +4,7 @@ use piper_rs::Piper;
 
 struct Loaded {
     voice: String,
+    used: std::time::Instant,
     piper: Piper,
 }
 
@@ -32,7 +33,7 @@ pub fn warm(voice: &str) -> Result<(), String> {
     let dir = crate::models::dir(voice);
     let piper = Piper::new(&dir.join(format!("{voice}.onnx")), &dir.join(format!("{voice}.onnx.json")))
         .map_err(|e| e.to_string())?;
-    *guard = Some(Loaded { voice: voice.to_string(), piper });
+    *guard = Some(Loaded { voice: voice.to_string(), used: std::time::Instant::now(), piper });
     Ok(())
 }
 
@@ -68,6 +69,7 @@ pub async fn synthesize(voice: &str, text: &str) -> Result<Vec<u8>, String> {
         warm(&voice)?;
         let mut guard = engine().lock().unwrap();
         let loaded = guard.as_mut().ok_or("voice is not loaded")?;
+        loaded.used = std::time::Instant::now();
         let (samples, rate) = loaded
             .piper
             .create(&text, false, None, None, None, None)
@@ -90,5 +92,12 @@ pub async fn clean_old_replies() {
                 let _ = tokio::fs::remove_file(entry.path()).await;
             }
         }
+    }
+}
+
+pub fn unload_idle(after: std::time::Duration) {
+    let mut guard = engine().lock().unwrap();
+    if guard.as_ref().is_some_and(|l| l.used.elapsed() > after) {
+        *guard = None;
     }
 }

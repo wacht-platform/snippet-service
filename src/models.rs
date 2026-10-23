@@ -19,20 +19,14 @@ enum Source {
     Piper(&'static str),
 }
 
+pub const STT_MODEL: &str = "parakeet-v3-int8";
+
 pub const CATALOG: &[Entry] = &[
-    Entry {
-        id: "moonshine-base",
-        kind: "stt",
-        name: "Moonshine base",
-        detail: "English. Small and fast.",
-        size_mb: 74,
-        source: Source::Archive("https://blob.handy.computer/moonshine-base.tar.gz"),
-    },
     Entry {
         id: "parakeet-v3-int8",
         kind: "stt",
-        name: "Parakeet v3",
-        detail: "Most accurate. English and 24 other European languages.",
+        name: "Speech recognition (Parakeet v3)",
+        detail: "Speech recognition. Runs on this machine.",
         size_mb: 640,
         source: Source::Archive("https://blob.handy.computer/parakeet-v3-int8.tar.gz"),
     },
