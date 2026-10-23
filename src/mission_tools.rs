@@ -73,6 +73,8 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(CleanUpSessions);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
+    registry.insert(Speak);
+    registry.insert(AmbientSearch);
     registry.insert(UpdateBrief);
     registry.insert(ScheduleFollowup);
     registry.insert(PingUser);
@@ -268,6 +270,58 @@ struct PingUserArgs {
     message: String,
     #[serde(default)]
     kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SpeakArgs {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct AmbientSearchArgs {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+pub struct AmbientSearch;
+#[async_trait]
+impl Tool for AmbientSearch {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ambient_search".into(),
+            description: "Search what the user's always-on microphone has heard (transcripts of real conversation only; TV and noise are already filtered out). Empty query returns the most recent lines. Use it to answer questions like what they said earlier or to recall a commitment; never ask for the whole stream.".into(),
+            input_schema: schema(json!({
+                "query": {"type": "string", "description": "Words to look for; leave empty for the latest lines."},
+                "limit": {"type": "integer", "description": "How many lines, up to 50. Default 15."}
+            }), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AmbientSearchArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let rows = crate::ambient::search(&args.query, args.limit.unwrap_or(15)).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"lines": rows})))
+    }
+}
+
+pub struct Speak;
+#[async_trait]
+impl Tool for Speak {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "speak".into(),
+            description: "Say something aloud to the user through the phone or computer that is listening. Use it to answer every <ambient_turn> message while a spoken conversation is open: one to three short plain sentences, no markdown, no lists, nothing the user would need to read. It fails when nobody is listening or ambient is passive with no conversation open; then use ping_user.".into(),
+            input_schema: schema(json!({
+                "text": {"type": "string", "description": "What to say, in plain spoken sentences."}
+            }), &["text"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: SpeakArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let out = crate::ambient::speak(&args.text).await.map_err(ToolError::msg)?;
+        Ok(ToolResult::success(out))
+    }
 }
 
 pub struct PingUser;

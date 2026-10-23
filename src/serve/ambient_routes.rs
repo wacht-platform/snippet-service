@@ -3,39 +3,7 @@ use super::*;
 use axum::body::Bytes;
 
 const MAX_SEGMENT_BYTES: usize = 25 * 1024 * 1024;
-const LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(45);
-
-static LEASE: std::sync::Mutex<Option<(String, String, std::time::Instant)>> =
-    std::sync::Mutex::new(None);
-
-fn lease_holder() -> Option<(String, String)> {
-    let mut lease = LEASE.lock().unwrap();
-    if lease.as_ref().is_some_and(|(_, _, at)| at.elapsed() > LEASE_TTL) {
-        *lease = None;
-    }
-    lease.as_ref().map(|(device, label, _)| (device.clone(), label.clone()))
-}
-
-/// Returns false when another live device holds the lease; otherwise takes or renews it.
-fn lease_touch(device: &str, label: Option<&str>, claim: bool) -> bool {
-    let mut lease = LEASE.lock().unwrap();
-    let live = lease.as_ref().is_some_and(|(_, _, at)| at.elapsed() <= LEASE_TTL);
-    let other = live && lease.as_ref().is_some_and(|(held, _, _)| held != device);
-    if other && !claim {
-        return false;
-    }
-    let kept = lease
-        .as_ref()
-        .filter(|(held, _, _)| held == device)
-        .map(|(_, l, _)| l.clone());
-    let label = label
-        .filter(|l| !l.is_empty())
-        .map(str::to_string)
-        .or(kept)
-        .unwrap_or_else(|| device.to_string());
-    *lease = Some((device.to_string(), label, std::time::Instant::now()));
-    true
-}
+use crate::ambient::{lease_clear, lease_holder, lease_release, lease_touch};
 
 #[derive(Deserialize)]
 pub(crate) struct LeaseReq {
@@ -60,10 +28,7 @@ pub(crate) async fn lease(
         return (StatusCode::BAD_REQUEST, "device is required").into_response();
     }
     if req.release {
-        let mut lease = LEASE.lock().unwrap();
-        if lease.as_ref().is_some_and(|(held, _, _)| held == &req.device) {
-            *lease = None;
-        }
+        lease_release(&req.device);
         return Json(serde_json::json!({"held": false, "holder": serde_json::Value::Null})).into_response();
     }
     let held = lease_touch(&req.device, Some(&req.label), req.claim);
@@ -82,11 +47,12 @@ pub(crate) struct SettingsReq {
 }
 
 fn settings_view(d: &Daemon) -> serde_json::Value {
-    let (ambient, key_set) = {
+    let (ambient, key_set, watcher_key_set) = {
         let c = d.config.lock().unwrap();
         (
             c.ambient.clone(),
             c.assemblyai_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+            c.typesafe_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
         )
     };
     let since = (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp();
@@ -113,6 +79,13 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "mode": ambient.mode,
         "key_set": key_set,
         "devices": devices,
+        "watcher": ambient.watcher,
+        "watcher_key_set": watcher_key_set,
+        "conversation": crate::ambient::conversation().map(|c| serde_json::json!({
+            "id": c.id,
+            "opened_by": c.opened_by,
+            "seconds_left": c.seconds_left(),
+        })),
         "listening_id": lease_holder().map(|(d, _)| d),
         "listening_device": lease_holder().map(|(_, l)| l),
     })
@@ -141,7 +114,7 @@ pub(crate) async fn set_settings(
         if let Some(v) = req.enabled {
             ambient.enabled = v;
             if !v {
-                *LEASE.lock().unwrap() = None;
+                lease_clear();
             }
         }
         if let Some(v) = req.mode {
@@ -181,6 +154,7 @@ pub(crate) struct ListQuery {
     to: Option<String>,
     q: Option<String>,
     limit: Option<usize>,
+    all: Option<bool>,
 }
 
 fn audio_dir() -> PathBuf {
@@ -204,10 +178,13 @@ fn event_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
         "status": row.get::<_, String>(4)?,
         "text": row.get::<_, String>(5)?,
         "error": row.get::<_, Option<String>>(6)?,
+        "verdict": row.get::<_, Option<String>>(7)?,
+        "addressed": row.get::<_, Option<f64>>(8)?,
+        "kept": row.get::<_, i64>(9)? != 0,
     }))
 }
 
-const COLUMNS: &str = "e.id, e.device, e.started_at, e.duration_ms, e.status, e.text, e.error";
+const COLUMNS: &str = "e.id, e.device, e.started_at, e.duration_ms, e.status, e.text, e.error, e.verdict, e.addressed, e.kept";
 
 fn fetch(d: &Daemon, id: &str) -> Option<serde_json::Value> {
     d.store
@@ -283,12 +260,28 @@ fn spawn_transcription(d: Shared, id: String) {
             Ok(text) => ("done", text, None),
             Err(e) => ("failed", String::new(), Some(e)),
         };
+        let verdict = if status == "done" {
+            Some(super::ambient_watch::classify(&d, &id, &text).await)
+        } else {
+            None
+        };
+        let kept = verdict.as_ref().is_none_or(|v| v.kept());
         let _ = d.store.with_connection(|c| {
             c.execute(
-                "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4 WHERE id = ?1",
-                rusqlite::params![id, status, text, error],
+                "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4,
+                     verdict = ?5, addressed = ?6, judge = ?7, kept = ?8 WHERE id = ?1",
+                rusqlite::params![
+                    id,
+                    status,
+                    text,
+                    error,
+                    verdict.as_ref().map(|v| v.kind.clone()),
+                    verdict.as_ref().map(|v| v.addressed),
+                    verdict.as_ref().map(|v| v.judge),
+                    kept as i64
+                ],
             )?;
-            if status == "done" {
+            if status == "done" && kept {
                 c.execute(
                     "INSERT INTO ambient_events_fts(rowid, text)
                      SELECT rowid, text FROM ambient_events WHERE id = ?1",
@@ -297,6 +290,9 @@ fn spawn_transcription(d: Shared, id: String) {
             }
             Ok(())
         });
+        if let Some(verdict) = &verdict {
+            super::ambient_watch::act(&d, &id, &text, verdict).await;
+        }
         if status != "failed" {
             let _ = tokio::fs::remove_file(&path).await;
         }
@@ -347,6 +343,9 @@ pub(crate) async fn list(State(d): State<Shared>, Query(q): Query<ListQuery>) ->
         sql.push_str(" WHERE (?1 = '' OR e.started_at >= ?1) AND (?2 = '' OR e.started_at <= ?2)");
         if search.is_some() {
             sql.push_str(" AND ambient_events_fts MATCH ?4");
+        }
+        if !q.all.unwrap_or(false) {
+            sql.push_str(" AND e.kept = 1");
         }
         sql.push_str(" ORDER BY e.started_at DESC LIMIT ?3");
         let mut stmt = c.prepare(&sql)?;
@@ -404,4 +403,48 @@ pub(crate) async fn stats(State(d): State<Shared>, Query(a): Query<Auth>) -> Res
 
 pub(crate) fn body_limit() -> DefaultBodyLimit {
     DefaultBodyLimit::max(MAX_SEGMENT_BYTES)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct TurnsQuery {
+    token: Option<String>,
+    #[serde(default)]
+    after: i64,
+    #[serde(default)]
+    device: String,
+}
+
+pub(crate) async fn turns(State(d): State<Shared>, Query(q): Query<TurnsQuery>) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match crate::ambient::turns_after(q.after, &q.device) {
+        Ok(turns) => Json(serde_json::json!({ "turns": turns })).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PlayedReq {
+    id: i64,
+}
+
+pub(crate) async fn played(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<PlayedReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    crate::ambient::mark_played(req.id);
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+pub(crate) async fn end_conversation(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    crate::ambient::end_conversation();
+    Json(settings_view(&d)).into_response()
 }

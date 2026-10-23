@@ -56,7 +56,7 @@ pub async fn autonomy_loop(daemon: Shared) {
     }
 }
 
-async fn deliver_to_mission_control(daemon: &Shared, text: String) {
+pub(super) async fn deliver_to_mission_control(daemon: &Shared, text: String) {
     if let Err(error) = super::mission_control::open_mission_control(daemon, None).await {
         eprintln!("[autonomy] could not open Mission Control: {error}");
         return;

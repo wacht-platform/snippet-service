@@ -36,6 +36,7 @@ use crate::session::{
 pub mod agent_routes;
 mod account_routes;
 mod ambient_routes;
+mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
 pub(crate) use config_routes::*;
@@ -863,6 +864,9 @@ pub async fn run_serve(
         )
         .route("/ambient/stats", get(ambient_routes::stats))
         .route("/ambient/lease", post(ambient_routes::lease))
+        .route("/ambient/turns", get(ambient_routes::turns))
+        .route("/ambient/turns/played", post(ambient_routes::played))
+        .route("/ambient/conversation/end", post(ambient_routes::end_conversation))
         .route(
             "/ambient/settings",
             get(ambient_routes::get_settings).post(ambient_routes::set_settings),

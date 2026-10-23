@@ -99,8 +99,32 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              ON ambient_events(started_at);
          CREATE VIRTUAL TABLE IF NOT EXISTS ambient_events_fts
              USING fts5(text, content='ambient_events', content_rowid='rowid');
+         CREATE TABLE IF NOT EXISTS ambient_turns (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             conversation_id TEXT NOT NULL,
+             role TEXT NOT NULL,
+             text TEXT NOT NULL,
+             device TEXT NOT NULL DEFAULT '',
+             created_at INTEGER NOT NULL,
+             played_at INTEGER
+         );
 "#,
     )?;
+    let have: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(ambient_events)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (name, ddl) in [
+        ("verdict", "ALTER TABLE ambient_events ADD COLUMN verdict TEXT"),
+        ("addressed", "ALTER TABLE ambient_events ADD COLUMN addressed REAL"),
+        ("judge", "ALTER TABLE ambient_events ADD COLUMN judge TEXT"),
+        ("kept", "ALTER TABLE ambient_events ADD COLUMN kept INTEGER NOT NULL DEFAULT 1"),
+    ] {
+        if !have.iter().any(|c| c == name) {
+            connection.execute(ddl, [])?;
+        }
+    }
     let legacy: bool = connection.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mission_duty')",
         [],

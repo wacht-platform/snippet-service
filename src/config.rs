@@ -158,6 +158,9 @@ pub struct SnippetConfig {
     /// config.toml; it is never returned by the remote config endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assemblyai_api_key: Option<String>,
+    /// TypeSafe (Jev) key for the ambient watcher; local config only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typesafe_api_key: Option<String>,
     /// TUI color theme. Ignored — AMOLED is the only palette.
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +260,7 @@ impl Default for SnippetConfig {
             model: InferenceProfileConfig::default(),
             exa_api_key: None,
             assemblyai_api_key: None,
+            typesafe_api_key: None,
             theme: None,
             memory_enabled: default_memory_enabled(),
             memory_reflect: default_memory_reflect(),
@@ -269,6 +273,7 @@ impl Default for SnippetConfig {
 }
 
 pub const AMBIENT_MODES: &[&str] = &["passive", "active"];
+pub const AMBIENT_WATCHERS: &[&str] = &["jev", "off"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AmbientConfig {
@@ -276,6 +281,8 @@ pub struct AmbientConfig {
     pub enabled: bool,
     #[serde(default = "default_ambient_mode")]
     pub mode: String,
+    #[serde(default = "default_ambient_watcher")]
+    pub watcher: String,
 }
 
 impl Default for AmbientConfig {
@@ -283,6 +290,7 @@ impl Default for AmbientConfig {
         Self {
             enabled: false,
             mode: default_ambient_mode(),
+            watcher: default_ambient_watcher(),
         }
     }
 }
@@ -297,8 +305,16 @@ impl AmbientConfig {
         if !AMBIENT_MODES.contains(&self.mode.as_str()) {
             return Err(format!("mode must be one of: {}", AMBIENT_MODES.join(", ")));
         }
+        self.watcher = self.watcher.trim().to_ascii_lowercase();
+        if !AMBIENT_WATCHERS.contains(&self.watcher.as_str()) {
+            return Err(format!("watcher must be one of: {}", AMBIENT_WATCHERS.join(", ")));
+        }
         Ok(self)
     }
+}
+
+fn default_ambient_watcher() -> String {
+    "jev".into()
 }
 
 fn default_ambient_mode() -> String {
