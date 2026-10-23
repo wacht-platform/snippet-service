@@ -283,6 +283,10 @@ pub struct AmbientConfig {
     pub mode: String,
     #[serde(default = "default_ambient_watcher")]
     pub watcher: String,
+    #[serde(default = "default_conversation_timeout")]
+    pub conversation_timeout_secs: u32,
+    #[serde(default = "default_wake_phrases")]
+    pub wake_phrases: Vec<String>,
 }
 
 impl Default for AmbientConfig {
@@ -291,6 +295,8 @@ impl Default for AmbientConfig {
             enabled: false,
             mode: default_ambient_mode(),
             watcher: default_ambient_watcher(),
+            conversation_timeout_secs: default_conversation_timeout(),
+            wake_phrases: default_wake_phrases(),
         }
     }
 }
@@ -309,8 +315,24 @@ impl AmbientConfig {
         if !AMBIENT_WATCHERS.contains(&self.watcher.as_str()) {
             return Err(format!("watcher must be one of: {}", AMBIENT_WATCHERS.join(", ")));
         }
+        self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
+        self.wake_phrases = self
+            .wake_phrases
+            .iter()
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .take(8)
+            .collect();
         Ok(self)
     }
+}
+
+fn default_conversation_timeout() -> u32 {
+    90
+}
+
+fn default_wake_phrases() -> Vec<String> {
+    vec!["snippet".into(), "mission control".into()]
 }
 
 fn default_ambient_watcher() -> String {

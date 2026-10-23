@@ -14,20 +14,20 @@ impl Verdict {
     }
 }
 
-fn wake_word(text: &str) -> bool {
+fn wake_word(text: &str, phrases: &[String]) -> bool {
     let head: String = text
         .to_lowercase()
         .split_whitespace()
         .take(6)
         .collect::<Vec<_>>()
         .join(" ");
-    head.contains("snippet") || head.contains("mission control")
+    phrases.iter().any(|p| head.contains(p.as_str()))
 }
 
-fn rule(text: &str) -> Verdict {
+fn rule(text: &str, phrases: &[String]) -> Verdict {
     Verdict {
         kind: "unjudged".into(),
-        addressed: if wake_word(text) { 1.0 } else { 0.0 },
+        addressed: if wake_word(text, phrases) { 1.0 } else { 0.0 },
         judge: "rule",
     }
 }
@@ -82,16 +82,17 @@ async fn jev(key: &str, text: &str, prior: &[String], active: bool, open: bool) 
 }
 
 pub(crate) async fn classify(d: &Shared, id: &str, text: &str) -> Verdict {
-    let (key, watcher, mode) = {
+    let (key, watcher, mode, phrases) = {
         let c = d.config.lock().unwrap();
         (
             c.typesafe_api_key.clone().filter(|k| !k.trim().is_empty()),
             c.ambient.watcher.clone(),
             c.ambient.mode.clone(),
+            c.ambient.wake_phrases.clone(),
         )
     };
     let Some(key) = key.filter(|_| watcher == "jev") else {
-        return rule(text);
+        return rule(text, &phrases);
     };
     let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp();
     let prior: Vec<String> = d
@@ -111,14 +112,14 @@ pub(crate) async fn classify(d: &Shared, id: &str, text: &str) -> Verdict {
     let open = crate::ambient::conversation().is_some();
     match jev(&key, text, &prior, mode == "active", open).await {
         Ok(mut verdict) => {
-            if wake_word(text) && verdict.kind == "conversation" {
+            if wake_word(text, &phrases) && verdict.kind == "conversation" {
                 verdict.addressed = verdict.addressed.max(0.9);
             }
             verdict
         }
         Err(e) => {
             eprintln!("[ambient] watcher failed: {e}");
-            rule(text)
+            rule(text, &phrases)
         }
     }
 }
@@ -139,11 +140,15 @@ pub(crate) async fn act(d: &Shared, id: &str, text: &str, verdict: &Verdict) {
     if !device.is_empty() && device != holder {
         return;
     }
-    let pinned_active = {
+    let (pinned_active, phrases, ttl) = {
         let c = d.config.lock().unwrap();
-        c.ambient.mode == "active"
+        (
+            c.ambient.mode == "active",
+            c.ambient.wake_phrases.clone(),
+            c.ambient.conversation_timeout_secs,
+        )
     };
-    let wake = wake_word(text);
+    let wake = wake_word(text, &phrases);
     let conversation = crate::ambient::conversation();
     let live = pinned_active || conversation.is_some();
     let opens = verdict.kind != "unjudged" && verdict.addressed >= 0.85 || wake;
@@ -151,7 +156,7 @@ pub(crate) async fn act(d: &Shared, id: &str, text: &str, verdict: &Verdict) {
     if !(continues || opens) {
         return;
     }
-    let conversation = crate::ambient::open_conversation(&holder);
+    let conversation = crate::ambient::open_conversation(&holder, ttl);
     let _ = crate::ambient::record_turn(&conversation.id, "user", text, &holder);
     let at = chrono::Utc::now().to_rfc3339();
     let envelope = format!("<ambient_turn device=\"{holder}\" at=\"{at}\">{text}</ambient_turn>");

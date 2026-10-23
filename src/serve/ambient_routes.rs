@@ -44,6 +44,10 @@ pub(crate) async fn lease(
 pub(crate) struct SettingsReq {
     enabled: Option<bool>,
     mode: Option<String>,
+    watcher: Option<String>,
+    typesafe_api_key: Option<String>,
+    conversation_timeout_secs: Option<u32>,
+    wake_phrases: Option<Vec<String>>,
 }
 
 fn settings_view(d: &Daemon) -> serde_json::Value {
@@ -80,6 +84,8 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "key_set": key_set,
         "devices": devices,
         "watcher": ambient.watcher,
+        "conversation_timeout_secs": ambient.conversation_timeout_secs,
+        "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
         "conversation": crate::ambient::conversation().map(|c| serde_json::json!({
             "id": c.id,
@@ -120,10 +126,23 @@ pub(crate) async fn set_settings(
         if let Some(v) = req.mode {
             ambient.mode = v;
         }
+        if let Some(v) = req.watcher {
+            ambient.watcher = v;
+        }
+        if let Some(v) = req.conversation_timeout_secs {
+            ambient.conversation_timeout_secs = v;
+        }
+        if let Some(v) = req.wake_phrases {
+            ambient.wake_phrases = v;
+        }
         match ambient.normalized() {
             Err(e) => Err((StatusCode::BAD_REQUEST, e)),
             Ok(ambient) => {
                 c.ambient = ambient;
+                if let Some(key) = req.typesafe_api_key {
+                    let key = key.trim().to_string();
+                    c.typesafe_api_key = (!key.is_empty()).then_some(key);
+                }
                 crate::config::save_config(&c, &d.config_path)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
             }

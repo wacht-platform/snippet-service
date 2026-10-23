@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 use crate::store::Store;
 
 const LEASE_TTL: Duration = Duration::from_secs(45);
-const CONVERSATION_TTL: Duration = Duration::from_secs(90);
 
 static LEASE: Mutex<Option<(String, String, Instant)>> = Mutex::new(None);
 static CONVERSATION: Mutex<Option<Conversation>> = Mutex::new(None);
@@ -74,18 +73,19 @@ pub fn conversation() -> Option<Conversation> {
     conversation.clone()
 }
 
-pub fn open_conversation(by: &str) -> Conversation {
+pub fn open_conversation(by: &str, ttl_secs: u32) -> Conversation {
+    let ttl = Duration::from_secs(u64::from(ttl_secs));
     let mut conversation = CONVERSATION.lock().unwrap();
     let live = conversation.as_ref().is_some_and(|c| c.expires > Instant::now());
     if !live {
         *conversation = Some(Conversation {
             id: format!("c{}", chrono::Utc::now().timestamp_millis()),
             opened_by: by.to_string(),
-            expires: Instant::now() + CONVERSATION_TTL,
+            expires: Instant::now() + ttl,
         });
     }
     let c = conversation.as_mut().unwrap();
-    c.expires = Instant::now() + CONVERSATION_TTL;
+    c.expires = Instant::now() + ttl;
     c.clone()
 }
 
@@ -166,7 +166,11 @@ pub async fn speak(text: &str) -> Result<Value, String> {
     if !effective_active().await {
         return Err("ambient is in passive mode and no conversation is open; use ping_user instead".into());
     }
-    let conversation = open_conversation("mission-control");
+    let ttl = crate::config::SnippetConfig::load(crate::config::default_config_path())
+        .await
+        .map(|c| c.ambient.conversation_timeout_secs)
+        .unwrap_or(90);
+    let conversation = open_conversation("mission-control", ttl);
     let id = record_turn(&conversation.id, "assistant", text, &device)?;
     crate::session::emit_device_event(json!({
         "kind": "ambient_speech",
