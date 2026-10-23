@@ -17,10 +17,12 @@ pub struct Entry {
 enum Source {
     Archive(&'static str),
     Kokoro,
+    Files(&'static [(&'static str, &'static str)]),
 }
 
 pub const STT_MODEL: &str = "parakeet-v3-int8";
 pub const TTS_VOICE: &str = "kokoro-bella";
+pub const SPEAKER_MODEL: &str = "speaker-recognition";
 const KOKORO_MODEL_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx";
 const KOKORO_VOICES_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin";
 
@@ -40,6 +42,17 @@ pub const CATALOG: &[Entry] = &[
         detail: "Natural English voice. Runs on this machine.",
         size_mb: 353,
         source: Source::Kokoro,
+    },
+    Entry {
+        id: SPEAKER_MODEL,
+        kind: "speaker",
+        name: "Speaker recognition",
+        detail: "Tells voices apart. Runs on this machine.",
+        size_mb: 33,
+        source: Source::Files(&[
+            ("https://huggingface.co/onnx-community/pyannote-segmentation-3.0/resolve/main/onnx/model.onnx", "segmentation.onnx"),
+            ("https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx", "embedding.onnx"),
+        ]),
     },
 ];
 
@@ -157,6 +170,12 @@ async fn download(entry: &'static Entry) -> Result<(), String> {
     let _ = tokio::fs::remove_dir_all(&target).await;
     tokio::fs::create_dir_all(&target).await.map_err(|e| e.to_string())?;
     match &entry.source {
+        Source::Files(files) => {
+            let mut base = 0u64;
+            for (url, name) in files.iter() {
+                base += fetch(url, &target.join(name), entry.id, base).await?;
+            }
+        }
         Source::Kokoro => {
             let first = fetch(KOKORO_MODEL_URL, &target.join("kokoro.onnx"), entry.id, 0).await?;
             let voices = target.join("voices.bin");
@@ -230,6 +249,9 @@ pub async fn delete(id: &str) -> Result<(), String> {
     find(id).ok_or("unknown model")?;
     crate::stt::unload(id);
     crate::tts::unload(id);
+    if id == SPEAKER_MODEL {
+        crate::diarize::unload();
+    }
     let _ = tokio::fs::remove_dir_all(dir(id)).await;
     set(id, |p| *p = Progress::default());
     Ok(())

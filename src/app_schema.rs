@@ -116,6 +116,14 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              ON ambient_turns(device, id);
          CREATE INDEX IF NOT EXISTS ambient_turns_created
              ON ambient_turns(created_at);
+         CREATE TABLE IF NOT EXISTS speakers (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             label TEXT NOT NULL DEFAULT '',
+             is_user INTEGER NOT NULL DEFAULT 0,
+             centroid BLOB NOT NULL,
+             lines INTEGER NOT NULL DEFAULT 0,
+             last_seen INTEGER NOT NULL DEFAULT 0
+         );
 "#,
     )?;
     let have: Vec<String> = {
@@ -129,6 +137,8 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
         ("judge", "ALTER TABLE ambient_events ADD COLUMN judge TEXT"),
         ("intent", "ALTER TABLE ambient_events ADD COLUMN intent TEXT"),
         ("kept", "ALTER TABLE ambient_events ADD COLUMN kept INTEGER NOT NULL DEFAULT 1"),
+        ("speakers", "ALTER TABLE ambient_events ADD COLUMN speakers TEXT"),
+        ("speaker_summary", "ALTER TABLE ambient_events ADD COLUMN speaker_summary TEXT"),
     ] {
         if !have.iter().any(|c| c == name) {
             connection.execute(ddl, [])?;

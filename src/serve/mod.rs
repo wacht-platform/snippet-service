@@ -866,6 +866,14 @@ pub async fn run_serve(
         )
         .route("/ambient/stats", get(ambient_routes::stats))
         .route("/ambient/lease", post(ambient_routes::lease))
+        .route("/ambient/speakers", get(ambient_routes::speakers_list))
+        .route(
+            "/ambient/speakers/enroll",
+            post(ambient_routes::speakers_enroll).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+        )
+        .route("/ambient/speakers/unenroll", post(ambient_routes::speakers_unenroll))
+        .route("/ambient/speakers/clear", post(ambient_routes::speakers_clear))
+        .route("/ambient/speakers/label", post(ambient_routes::speakers_label))
         .route("/models", get(ambient_routes::models))
         .route("/models/download", post(ambient_routes::model_download))
         .route("/models/delete", post(ambient_routes::model_delete))

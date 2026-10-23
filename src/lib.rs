@@ -30,6 +30,7 @@ pub mod lanes;
 pub mod llm;
 pub mod memory;
 pub mod meta;
+pub mod diarize;
 pub mod models;
 pub mod mission_control;
 pub mod mission_autonomy;

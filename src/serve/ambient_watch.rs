@@ -45,6 +45,45 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn speaker_state(d: &Shared, id: &str) -> (String, Vec<Value>) {
+    let row: (Option<String>, Option<String>) = d
+        .store
+        .with_connection(|c| {
+            c.query_row("SELECT speakers, speaker_summary FROM ambient_events WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+        })
+        .unwrap_or_default();
+    let lines = row
+        .0
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .unwrap_or_default();
+    (row.1.unwrap_or_else(|| "unknown".into()), lines)
+}
+
+fn from_others(d: &Shared, id: &str) -> bool {
+    speaker_state(d, id).0 == "other" && crate::diarize::enrolled(&d.store)
+}
+
+fn render(d: &Shared, id: &str, text: &str) -> (String, String) {
+    let (_, lines) = speaker_state(d, id);
+    let plain = lines.len() <= 1
+        && lines.iter().all(|l| l["is_user"] == true || l["speaker"].as_i64() == Some(-1));
+    if lines.is_empty() || plain {
+        return (text.to_string(), String::new());
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut body = Vec::new();
+    for l in &lines {
+        let label = l["label"].as_str().unwrap_or("Unknown").to_string();
+        body.push(format!("{}: {}", label, l["text"].as_str().unwrap_or("")));
+        if !names.contains(&label) {
+            names.push(label);
+        }
+    }
+    (body.join("\n"), names.join(", "))
+}
+
 fn rule(text: &str, phrases: &[String]) -> Verdict {
     Verdict {
         kind: "unjudged".into(),
@@ -222,8 +261,11 @@ pub(crate) async fn classify(d: &Shared, id: &str, text: &str) -> Verdict {
         mission = super::ambient_context::mission_control(d);
         with_pending = mission["waiting_for_user"] == true;
     }
+    let (speaker_summary, speaker_lines) = speaker_state(d, id);
     let state = json!({
         "utterance": text,
+        "speaker": speaker_summary,
+        "speaker_lines": if speaker_lines.len() > 1 { Value::Array(speaker_lines) } else { Value::Null },
         "utterance_audio": {"length": length, "words": words},
         "spoken_exchange": exchange,
         "assistant": {
@@ -349,13 +391,15 @@ async fn deliver(d: &Shared, route: &Route, text: &str) {
     crate::ambient::note_user_turn();
     crate::ambient::note_pinned(route.pinned_active);
     let conversation = crate::ambient::open_conversation(&route.holder, route.ttl);
-    let _ = crate::ambient::record_turn(&conversation.id, "user", text, &route.holder);
+    let (rendered, names) = render(d, &route.id, text);
+    let _ = crate::ambient::record_turn(&conversation.id, "user", &rendered, &route.holder);
     let device = escape(&route.holder);
     let at = escape(&route.started_at);
-    let body = escape(text);
+    let body = escape(&rendered);
     let recent = recent_speech(d, route);
+    let speakers = if names.is_empty() { String::new() } else { format!(" speakers=\"{}\"", escape(&names)) };
     let envelope = format!(
-        "<ambient_turn device=\"{device}\" at=\"{at}\">{recent}{body}</ambient_turn>"
+        "<ambient_turn device=\"{device}\" at=\"{at}\"{speakers}>{recent}{body}</ambient_turn>"
     );
     super::autonomy::deliver_to_mission_control(d, envelope).await;
 }
@@ -364,7 +408,7 @@ pub(crate) async fn process(d: &Shared, id: &str, text: &str) -> (Verdict, bool)
     let (d2, id2, text2) = (d.clone(), id.to_string(), text.to_string());
     let mut task = tokio::spawn(async move { classify(&d2, &id2, &text2).await });
     let route = route(d, id);
-    let wake = route.as_ref().is_some_and(|r| wake_word(text, &r.phrases));
+    let wake = !from_others(d, id) && route.as_ref().is_some_and(|r| wake_word(text, &r.phrases));
     let mut early = None;
     let mut delivered = false;
     if wake {
@@ -394,7 +438,7 @@ pub(crate) async fn process(d: &Shared, id: &str, text: &str) -> (Verdict, bool)
 }
 
 pub(crate) async fn act(d: &Shared, id: &str, text: &str, verdict: &Verdict, delivered: bool) {
-    if delivered || !verdict.kept() {
+    if delivered || !verdict.kept() || from_others(d, id) {
         return;
     }
     let Some(route) = route(d, id) else {

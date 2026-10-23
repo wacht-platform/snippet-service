@@ -129,6 +129,100 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
     result
 }
 
-pub(super) async fn transcribe_ambient(_d: &Daemon, path: &Path) -> Result<String, String> {
-    crate::stt::transcribe(crate::models::STT_MODEL, path).await
+pub(super) struct Spoken {
+    pub text: String,
+    pub speakers: String,
+    pub summary: &'static str,
+}
+
+pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken, String> {
+    let owned = path.to_path_buf();
+    let samples = tokio::task::spawn_blocking(move || crate::diarize::read_audio_16k(&owned))
+        .await
+        .map_err(|e| e.to_string())??;
+    let ready = crate::models::is_ready(crate::models::SPEAKER_MODEL);
+    let words = crate::stt::transcribe_words(crate::models::STT_MODEL, samples.clone());
+    let analysis = {
+        let d = d.clone();
+        tokio::task::spawn_blocking(move || {
+            if ready { crate::diarize::analyze(&d.store, &samples) } else { Ok(Vec::new()) }
+        })
+    };
+    let (words, analysis) = tokio::join!(words, analysis);
+    let (text, words) = words?;
+    let turns = match analysis.map_err(|e| e.to_string())? {
+        Ok(turns) => turns,
+        Err(e) => {
+            eprintln!("[ambient] speaker analysis failed: {e}");
+            Vec::new()
+        }
+    };
+    if text.is_empty() {
+        return Ok(Spoken { text, speakers: String::new(), summary: "unknown" });
+    }
+    let infos = crate::diarize::speakers(&d.store);
+    let enrolled = infos.iter().any(|s| s.is_user);
+    let owner = |w: &crate::stt::Word| -> i64 {
+        let mid = (w.start + w.end) / 2.0;
+        turns
+            .iter()
+            .min_by(|a, b| {
+                let da = if mid < a.start { a.start - mid } else if mid > a.end { mid - a.end } else { 0.0 };
+                let db = if mid < b.start { b.start - mid } else if mid > b.end { mid - b.end } else { 0.0 };
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|t| t.speaker)
+            .unwrap_or(-1)
+    };
+    let mut lines: Vec<(i64, String, f32, f32)> = Vec::new();
+    for w in &words {
+        let who = owner(w);
+        match lines.last_mut() {
+            Some(last) if last.0 == who => {
+                last.1.push(' ');
+                last.1.push_str(&w.text);
+                last.3 = w.end;
+            }
+            _ => lines.push((who, w.text.clone(), w.start, w.end)),
+        }
+    }
+    if lines.is_empty() {
+        lines.push((-1, text.clone(), 0.0, 0.0));
+    } else if lines.len() == 1 {
+        lines[0].1 = text.clone();
+    }
+    let named = |id: i64| infos.iter().find(|s| s.id == id);
+    let has_user = lines.iter().any(|l| named(l.0).is_some_and(|s| s.is_user));
+    let has_other = lines.iter().any(|l| l.0 != -1 && !named(l.0).is_some_and(|s| s.is_user));
+    let distinct: std::collections::HashSet<i64> = lines.iter().map(|l| l.0).filter(|id| *id != -1).collect();
+    let summary = if enrolled {
+        match (has_user, has_other) {
+            (true, false) => "you",
+            (false, true) => "other",
+            (true, true) => "mixed",
+            _ => "unknown",
+        }
+    } else if distinct.len() > 1 {
+        "mixed"
+    } else {
+        "unknown"
+    };
+    let speakers = serde_json::Value::Array(
+        lines
+            .iter()
+            .map(|(id, t, a, b)| {
+                let info = named(*id);
+                serde_json::json!({
+                    "speaker": id,
+                    "label": info.map(crate::diarize::display_name).unwrap_or_else(|| "Unknown".to_string()),
+                    "is_user": info.is_some_and(|s| s.is_user),
+                    "text": t,
+                    "start": a,
+                    "end": b,
+                })
+            })
+            .collect(),
+    )
+    .to_string();
+    Ok(Spoken { text, speakers, summary })
 }

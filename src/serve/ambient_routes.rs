@@ -87,7 +87,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "effective_mode": crate::ambient::effective_mode_name(ambient.enabled && ambient.mode == "active"),
         "watcher": ambient.watcher,
         "watcher_chat_context": ambient.watcher_chat_context,
-        "models_ready": crate::models::is_ready(crate::models::STT_MODEL) && crate::models::is_ready(crate::models::TTS_VOICE),
+        "models_ready": crate::models::is_ready(crate::models::STT_MODEL) && crate::models::is_ready(crate::models::TTS_VOICE) && crate::models::is_ready(crate::models::SPEAKER_MODEL),
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
@@ -150,11 +150,12 @@ pub(crate) async fn set_settings(
             Ok(ambient)
                 if ambient.enabled
                     && !(crate::models::is_ready(crate::models::STT_MODEL)
-                        && crate::models::is_ready(crate::models::TTS_VOICE)) =>
+                        && crate::models::is_ready(crate::models::TTS_VOICE)
+                        && crate::models::is_ready(crate::models::SPEAKER_MODEL)) =>
             {
                 Err((
                     StatusCode::BAD_REQUEST,
-                    "Download a speech model and a reply voice in Settings, Voice, before turning ambient listening on".into(),
+                    "Download a speech model, a reply voice and a speaker model in Settings, Voice, before turning ambient listening on".into(),
                 ))
             }
             Ok(ambient) => {
@@ -310,16 +311,17 @@ fn spawn_transcription(d: Shared, id: String) {
         let permit = gate.acquire_owned().await.ok();
         let result = super::transcribe::transcribe_ambient(&d, &path).await;
         drop(permit);
-        let (status, text, error) = match result {
-            Ok(text) if text.is_empty() => ("empty", String::new(), None),
-            Ok(text) => ("done", text, None),
-            Err(e) => ("failed", String::new(), Some(e)),
+        let (status, text, error, speakers, summary) = match result {
+            Ok(s) if s.text.is_empty() => ("empty", String::new(), None, None, None),
+            Ok(s) => ("done", s.text, None, Some(s.speakers), Some(s.summary)),
+            Err(e) => ("failed", String::new(), Some(e), None, None),
         };
         let _ = d.store.with_connection(|c| {
             c.execute(
                 "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4,
-                     kept = CASE WHEN ?2 = 'done' THEN 0 ELSE 1 END WHERE id = ?1",
-                rusqlite::params![id, status, text, error],
+                     kept = CASE WHEN ?2 = 'done' THEN 0 ELSE 1 END,
+                     speakers = ?5, speaker_summary = ?6 WHERE id = ?1",
+                rusqlite::params![id, status, text, error, speakers, summary],
             )?;
             Ok(())
         });
@@ -529,6 +531,9 @@ fn warm_models(stt: String, voice: String) {
         if let Err(e) = crate::tts::warm(&voice) {
             eprintln!("[ambient] could not load voice {voice}: {e}");
         }
+        if let Err(e) = crate::diarize::warm() {
+            eprintln!("[ambient] could not load speaker model: {e}");
+        }
     });
 }
 
@@ -544,6 +549,7 @@ pub(crate) fn warm_voice(d: Shared) {
                 let idle = std::time::Duration::from_secs(600);
                 crate::stt::unload_idle(idle);
                 crate::tts::unload_idle(idle);
+                crate::diarize::unload_idle(idle);
             })
             .await;
         }
@@ -553,7 +559,7 @@ pub(crate) fn warm_voice(d: Shared) {
         let stt = crate::models::STT_MODEL.to_string();
         let voice = crate::models::TTS_VOICE.to_string();
         let enabled = d.config.lock().unwrap().ambient.enabled;
-        if enabled && crate::models::is_ready(&stt) && crate::models::is_ready(&voice) {
+        if enabled && crate::models::is_ready(&stt) && crate::models::is_ready(&voice) && crate::models::is_ready(crate::models::SPEAKER_MODEL) {
             warm_models(stt, voice);
         }
     });
@@ -595,7 +601,7 @@ pub(crate) async fn model_delete(
     }
     {
         let c = d.config.lock().unwrap();
-        if c.ambient.enabled && (crate::models::STT_MODEL == req.id || crate::models::TTS_VOICE == req.id) {
+        if c.ambient.enabled && (crate::models::STT_MODEL == req.id || crate::models::TTS_VOICE == req.id || crate::models::SPEAKER_MODEL == req.id) {
             return (StatusCode::CONFLICT, "turn ambient listening off before removing the model it uses").into_response();
         }
     }
@@ -603,4 +609,95 @@ pub(crate) async fn model_delete(
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
     Json(serde_json::json!({ "models": crate::models::list() })).into_response()
+}
+
+pub(crate) async fn speakers_list(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let list: Vec<serde_json::Value> = crate::diarize::speakers(&d.store)
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "label": crate::diarize::display_name(s),
+                "is_user": s.is_user,
+                "lines": s.lines,
+                "last_seen": s.last_seen,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "models_ready": crate::models::is_ready(crate::models::SPEAKER_MODEL),
+        "enrolled": crate::diarize::enrolled(&d.store),
+        "speakers": list,
+    }))
+    .into_response()
+}
+
+pub(crate) async fn speakers_enroll(State(d): State<Shared>, Query(a): Query<Auth>, body: Bytes) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    if !crate::models::is_ready(crate::models::SPEAKER_MODEL) {
+        return (StatusCode::BAD_REQUEST, "Download the speaker model first").into_response();
+    }
+    let path = std::env::temp_dir().join(format!("snippet-enrol-{}", uuid::Uuid::new_v4()));
+    if let Err(e) = tokio::fs::write(&path, &body).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let worker = d.clone();
+    let file = path.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let samples = crate::diarize::read_audio_16k(&file)?;
+        crate::diarize::enroll(&worker.store, &samples)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    let _ = tokio::fs::remove_file(&path).await;
+    match result {
+        Ok(seconds) => Json(serde_json::json!({"enrolled": true, "seconds": seconds})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+pub(crate) async fn speakers_unenroll(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::diarize::unenroll(&d.store) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+pub(crate) async fn speakers_clear(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::diarize::clear(&d.store) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SpeakerLabelReq {
+    id: i64,
+    label: String,
+}
+
+pub(crate) async fn speakers_label(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<SpeakerLabelReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::diarize::rename(&d.store, req.id, &req.label) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
