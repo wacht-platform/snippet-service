@@ -285,6 +285,8 @@ pub struct AmbientConfig {
     pub watcher: String,
     #[serde(default)]
     pub watcher_chat_context: bool,
+    #[serde(default = "default_voice")]
+    pub voice: String,
     #[serde(default = "default_conversation_timeout")]
     pub conversation_timeout_secs: u32,
     #[serde(default = "default_wake_phrases")]
@@ -298,6 +300,7 @@ impl Default for AmbientConfig {
             mode: default_ambient_mode(),
             watcher: default_ambient_watcher(),
             watcher_chat_context: false,
+            voice: default_voice(),
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
         }
@@ -318,6 +321,10 @@ impl AmbientConfig {
         if !AMBIENT_WATCHERS.contains(&self.watcher.as_str()) {
             return Err(format!("watcher must be one of: {}", AMBIENT_WATCHERS.join(", ")));
         }
+        self.voice = self.voice.trim().to_string();
+        if !crate::tts::is_known(&self.voice) {
+            return Err(format!("voice must be one of: system, {}", crate::tts::VOICES.iter().map(|(id, _)| *id).collect::<Vec<_>>().join(", ")));
+        }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
         self.wake_phrases = self
             .wake_phrases
@@ -328,6 +335,10 @@ impl AmbientConfig {
             .collect();
         Ok(self)
     }
+}
+
+fn default_voice() -> String {
+    "en_US-lessac-medium".into()
 }
 
 fn default_conversation_timeout() -> u32 {

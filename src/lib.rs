@@ -48,6 +48,7 @@ pub mod sse;
 pub mod store;
 pub mod term;
 pub mod tools;
+pub mod tts;
 pub mod tui;
 pub mod update;
 pub mod usage_ledger;

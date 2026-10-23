@@ -138,8 +138,10 @@ pub fn turns_after(after: i64, device: &str) -> Result<Vec<Value>, String> {
             let cutoff = chrono::Utc::now().timestamp() - 120;
             let rows = stmt
                 .query_map(rusqlite::params![after, device, cutoff], |r| {
+                    let id = r.get::<_, i64>(0)?;
                     Ok(json!({
-                        "id": r.get::<_, i64>(0)?,
+                        "audio": crate::tts::audio_dir().join(format!("{id}.wav")).exists(),
+                        "id": id,
                         "conversation_id": r.get::<_, String>(1)?,
                         "text": r.get::<_, String>(2)?,
                         "created_at": r.get::<_, i64>(3)?,
@@ -184,20 +186,35 @@ pub async fn speak(text: &str) -> Result<Value, String> {
     if !effective_active().await {
         return Err("ambient is in passive mode and no conversation is open; use ping_user instead".into());
     }
-    let ttl = crate::config::SnippetConfig::load(crate::config::default_config_path())
+    let ambient = crate::config::SnippetConfig::load(crate::config::default_config_path())
         .await
-        .map(|c| c.ambient.conversation_timeout_secs)
-        .unwrap_or(90);
-    let conversation = open_conversation("mission-control", ttl);
+        .map(|c| c.ambient)
+        .unwrap_or_default();
+    let conversation = open_conversation("mission-control", ambient.conversation_timeout_secs);
     let id = record_turn(&conversation.id, "assistant", text, &device)?;
+    let mut audio = false;
+    if ambient.voice != "system" {
+        match crate::tts::synthesize(&ambient.voice, text).await {
+            Ok(bytes) => {
+                let dir = crate::tts::audio_dir();
+                if tokio::fs::create_dir_all(&dir).await.is_ok()
+                    && tokio::fs::write(dir.join(format!("{id}.wav")), bytes).await.is_ok()
+                {
+                    audio = true;
+                }
+            }
+            Err(e) => eprintln!("[ambient] server voice failed: {e}"),
+        }
+    }
     crate::session::emit_device_event(json!({
         "kind": "ambient_speech",
         "id": id,
         "conversation_id": conversation.id,
         "device": device,
         "text": text,
+        "audio": audio,
     }));
-    Ok(json!({"spoken": true, "turn": id}))
+    Ok(json!({"spoken": true, "turn": id, "voice": if audio { ambient.voice.as_str() } else { "phone" }}))
 }
 
 pub fn prompt_line() -> String {

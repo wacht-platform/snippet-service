@@ -47,6 +47,7 @@ pub(crate) struct SettingsReq {
     mode: Option<String>,
     watcher: Option<String>,
     watcher_chat_context: Option<bool>,
+    voice: Option<String>,
     typesafe_api_key: Option<String>,
     conversation_timeout_secs: Option<u32>,
     wake_phrases: Option<Vec<String>>,
@@ -89,6 +90,8 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "effective_mode": crate::ambient::effective_mode_name(ambient.enabled && ambient.mode == "active"),
         "watcher": ambient.watcher,
         "watcher_chat_context": ambient.watcher_chat_context,
+        "voice": ambient.voice,
+        "voices": crate::tts::VOICES.iter().map(|(id, name)| serde_json::json!({"id": id, "name": name})).collect::<Vec<_>>(),
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
@@ -140,6 +143,9 @@ pub(crate) async fn set_settings(
         if let Some(v) = req.watcher_chat_context {
             ambient.watcher_chat_context = v;
         }
+        if let Some(v) = req.voice {
+            ambient.voice = v;
+        }
         if let Some(v) = req.conversation_timeout_secs {
             ambient.conversation_timeout_secs = v;
         }
@@ -160,7 +166,18 @@ pub(crate) async fn set_settings(
         }
     };
     match result {
-        Ok(()) => Json(settings_view(&d)).into_response(),
+        Ok(()) => {
+            let ambient = d.config.lock().unwrap().ambient.clone();
+            if ambient.enabled && ambient.voice != "system" {
+                let voice = ambient.voice.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::tts::prepare(&voice).await {
+                        eprintln!("[ambient] could not prepare voice {voice}: {e}");
+                    }
+                });
+            }
+            Json(settings_view(&d)).into_response()
+        }
         Err((code, e)) => (code, e).into_response(),
     }
 }
@@ -490,4 +507,33 @@ pub(crate) async fn end_conversation(State(d): State<Shared>, Query(a): Query<Au
     }
     crate::ambient::end_conversation();
     Json(settings_view(&d)).into_response()
+}
+
+pub(crate) async fn turn_audio(
+    State(d): State<Shared>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Query(a): Query<Auth>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match tokio::fs::read(crate::tts::audio_dir().join(format!("{id}.wav"))).await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "audio/wav")], bytes).into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no audio for this turn").into_response(),
+    }
+}
+
+pub(crate) fn warm_voice(d: Shared) {
+    tokio::spawn(async move {
+        crate::tts::clean_old_replies().await;
+        let (enabled, voice) = {
+            let c = d.config.lock().unwrap();
+            (c.ambient.enabled, c.ambient.voice.clone())
+        };
+        if enabled && voice != "system" {
+            if let Err(e) = crate::tts::prepare(&voice).await {
+                eprintln!("[ambient] could not prepare voice {voice}: {e}");
+            }
+        }
+    });
 }

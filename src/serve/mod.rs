@@ -751,6 +751,7 @@ pub async fn run_serve(
     // Register the built-in agents before anything can address them.
     mission_control::register_builtin_agents(&daemon);
     ambient_routes::resume(daemon.clone());
+    ambient_routes::warm_voice(daemon.clone());
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
@@ -867,6 +868,7 @@ pub async fn run_serve(
         .route("/ambient/lease", post(ambient_routes::lease))
         .route("/ambient/turns", get(ambient_routes::turns))
         .route("/ambient/turns/played", post(ambient_routes::played))
+        .route("/ambient/turns/{id}/audio", get(ambient_routes::turn_audio))
         .route("/ambient/conversation/end", post(ambient_routes::end_conversation))
         .route(
             "/ambient/settings",
