@@ -200,10 +200,11 @@ fn event_json(row: &rusqlite::Row) -> rusqlite::Result<serde_json::Value> {
         "verdict": row.get::<_, Option<String>>(7)?,
         "addressed": row.get::<_, Option<f64>>(8)?,
         "kept": row.get::<_, i64>(9)? != 0,
+        "intent": row.get::<_, Option<String>>(10)?,
     }))
 }
 
-const COLUMNS: &str = "e.id, e.device, e.started_at, e.duration_ms, e.status, e.text, e.error, e.verdict, e.addressed, e.kept";
+const COLUMNS: &str = "e.id, e.device, e.started_at, e.duration_ms, e.status, e.text, e.error, e.verdict, e.addressed, e.kept, e.intent";
 
 fn fetch(d: &Daemon, id: &str) -> Option<serde_json::Value> {
     d.store
@@ -279,28 +280,35 @@ fn spawn_transcription(d: Shared, id: String) {
             Ok(text) => ("done", text, None),
             Err(e) => ("failed", String::new(), Some(e)),
         };
-        let verdict = if status == "done" {
-            Some(super::ambient_watch::classify(&d, &id, &text).await)
-        } else {
-            None
-        };
-        let kept = verdict.as_ref().is_none_or(|v| v.kept());
         let _ = d.store.with_connection(|c| {
             c.execute(
-                "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4,
-                     verdict = ?5, addressed = ?6, judge = ?7, kept = ?8 WHERE id = ?1",
+                "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4 WHERE id = ?1",
+                rusqlite::params![id, status, text, error],
+            )?;
+            Ok(())
+        });
+        if status != "failed" {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        if status != "done" {
+            return;
+        }
+        let (verdict, delivered) = super::ambient_watch::process(&d, &id, &text).await;
+        let kept = verdict.kept();
+        let _ = d.store.with_connection(|c| {
+            c.execute(
+                "UPDATE ambient_events SET verdict = ?2, addressed = ?3, judge = ?4, kept = ?5, intent = ?6
+                 WHERE id = ?1",
                 rusqlite::params![
                     id,
-                    status,
-                    text,
-                    error,
-                    verdict.as_ref().map(|v| v.kind.clone()),
-                    verdict.as_ref().map(|v| v.addressed),
-                    verdict.as_ref().map(|v| v.judge),
-                    kept as i64
+                    verdict.kind,
+                    verdict.addressed,
+                    verdict.judge,
+                    kept as i64,
+                    verdict.intent
                 ],
             )?;
-            if status == "done" && kept {
+            if kept {
                 c.execute(
                     "INSERT INTO ambient_events_fts(rowid, text)
                      SELECT rowid, text FROM ambient_events WHERE id = ?1",
@@ -309,12 +317,7 @@ fn spawn_transcription(d: Shared, id: String) {
             }
             Ok(())
         });
-        if let Some(verdict) = &verdict {
-            super::ambient_watch::act(&d, &id, &text, verdict).await;
-        }
-        if status != "failed" {
-            let _ = tokio::fs::remove_file(&path).await;
-        }
+        super::ambient_watch::act(&d, &id, &text, &verdict, delivered).await;
     });
 }
 

@@ -119,6 +119,7 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
         ("verdict", "ALTER TABLE ambient_events ADD COLUMN verdict TEXT"),
         ("addressed", "ALTER TABLE ambient_events ADD COLUMN addressed REAL"),
         ("judge", "ALTER TABLE ambient_events ADD COLUMN judge TEXT"),
+        ("intent", "ALTER TABLE ambient_events ADD COLUMN intent TEXT"),
         ("kept", "ALTER TABLE ambient_events ADD COLUMN kept INTEGER NOT NULL DEFAULT 1"),
     ] {
         if !have.iter().any(|c| c == name) {
