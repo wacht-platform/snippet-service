@@ -116,10 +116,12 @@ pub fn turns_after(after: i64, device: &str) -> Result<Vec<Value>, String> {
             let mut stmt = c.prepare(
                 "SELECT id, conversation_id, text, created_at FROM ambient_turns
                  WHERE id > ?1 AND role = 'assistant' AND device = ?2 AND played_at IS NULL
+                   AND created_at >= ?3
                  ORDER BY id LIMIT 50",
             )?;
+            let cutoff = chrono::Utc::now().timestamp() - 120;
             let rows = stmt
-                .query_map(rusqlite::params![after, device], |r| {
+                .query_map(rusqlite::params![after, device, cutoff], |r| {
                     Ok(json!({
                         "id": r.get::<_, i64>(0)?,
                         "conversation_id": r.get::<_, String>(1)?,

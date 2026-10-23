@@ -20,13 +20,27 @@ impl Verdict {
 }
 
 fn wake_word(text: &str, phrases: &[String]) -> bool {
-    let head: String = text
+    let words: Vec<String> = text
         .to_lowercase()
-        .split_whitespace()
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ");
-    phrases.iter().any(|p| head.contains(p.as_str()))
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(7)
+        .map(str::to_string)
+        .collect();
+    phrases.iter().any(|p| {
+        let parts: Vec<&str> = p.split_whitespace().collect();
+        !parts.is_empty()
+            && words
+                .windows(parts.len())
+                .any(|w| w.iter().zip(&parts).all(|(a, b)| a == b))
+    })
+}
+
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn rule(text: &str, phrases: &[String]) -> Verdict {
@@ -36,6 +50,16 @@ fn rule(text: &str, phrases: &[String]) -> Verdict {
         addressed: if wake_word(text, phrases) { 1.0 } else { 0.0 },
         judge: "rule",
     }
+}
+
+fn jev_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(4))
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 async fn jev(key: &str, text: &str, history: &[Value], active: bool, open: bool) -> Result<Verdict, String> {
@@ -74,11 +98,7 @@ async fn jev(key: &str, text: &str, history: &[Value], active: bool, open: bool)
             }
         }
     });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let response = client
+    let response = jev_client()
         .post("https://api.typesafe.ai/v1/systemone")
         .bearer_auth(key)
         .json(&body)
@@ -160,6 +180,9 @@ pub(crate) async fn classify(d: &Shared, id: &str, text: &str) -> Verdict {
 }
 
 struct Route {
+    id: String,
+    device: String,
+    started_at: String,
     holder: String,
     phrases: Vec<String>,
     ttl: u32,
@@ -168,17 +191,27 @@ struct Route {
 
 fn route(d: &Shared, id: &str) -> Option<Route> {
     let (holder, _) = crate::ambient::lease_holder()?;
-    let device: String = d
+    let (device, started_at): (String, String) = d
         .store
         .with_connection(|c| {
-            c.query_row("SELECT device FROM ambient_events WHERE id = ?1", [id], |r| r.get(0))
+            c.query_row("SELECT device, started_at FROM ambient_events WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
         })
         .unwrap_or_default();
-    if !device.is_empty() && device != holder {
+    if device != holder {
         return None;
+    }
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+        if (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds() > 45 {
+            return None;
+        }
     }
     let c = d.config.lock().unwrap();
     Some(Route {
+        id: id.to_string(),
+        device,
+        started_at,
         holder,
         phrases: c.ambient.wake_phrases.clone(),
         ttl: c.ambient.conversation_timeout_secs,
@@ -187,27 +220,62 @@ fn route(d: &Shared, id: &str) -> Option<Route> {
 }
 
 async fn deliver(d: &Shared, route: &Route, text: &str) {
+    for _ in 0..30 {
+        let earlier: i64 = d
+            .store
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM ambient_events
+                     WHERE device = ?1 AND status = 'pending' AND started_at < ?2 AND id != ?3",
+                    rusqlite::params![route.device, route.started_at, route.id],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap_or(0);
+        if earlier == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let conversation = crate::ambient::open_conversation(&route.holder, route.ttl);
     let _ = crate::ambient::record_turn(&conversation.id, "user", text, &route.holder);
-    let at = chrono::Utc::now().to_rfc3339();
-    let holder = &route.holder;
-    let envelope = format!("<ambient_turn device=\"{holder}\" at=\"{at}\">{text}</ambient_turn>");
+    let device = escape(&route.holder);
+    let at = escape(&route.started_at);
+    let body = escape(text);
+    let envelope = format!("<ambient_turn device=\"{device}\" at=\"{at}\">{body}</ambient_turn>");
     super::autonomy::deliver_to_mission_control(d, envelope).await;
 }
 
-async fn fast_wake(d: &Shared, id: &str, text: &str) -> bool {
-    let Some(route) = route(d, id) else {
-        return false;
-    };
-    if !wake_word(text, &route.phrases) {
-        return false;
-    }
-    deliver(d, &route, text).await;
-    true
-}
-
 pub(crate) async fn process(d: &Shared, id: &str, text: &str) -> (Verdict, bool) {
-    let (delivered, verdict) = tokio::join!(fast_wake(d, id, text), classify(d, id, text));
+    let (d2, id2, text2) = (d.clone(), id.to_string(), text.to_string());
+    let mut task = tokio::spawn(async move { classify(&d2, &id2, &text2).await });
+    let route = route(d, id);
+    let wake = route.as_ref().is_some_and(|r| wake_word(text, &r.phrases));
+    let mut early = None;
+    let mut delivered = false;
+    if wake {
+        early = tokio::time::timeout(Duration::from_millis(700), &mut task)
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        let vetoed = early.as_ref().is_some_and(|v| !v.kept());
+        if !vetoed {
+            if let Some(route) = &route {
+                deliver(d, route, text).await;
+                delivered = true;
+            }
+        }
+    }
+    let verdict = match early {
+        Some(v) => v,
+        None => match task.await {
+            Ok(v) => v,
+            Err(_) => {
+                let phrases = d.config.lock().unwrap().ambient.wake_phrases.clone();
+                rule(text, &phrases)
+            }
+        },
+    };
     (verdict, delivered)
 }
 

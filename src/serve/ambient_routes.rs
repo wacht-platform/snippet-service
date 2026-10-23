@@ -2,7 +2,8 @@ use super::*;
 
 use axum::body::Bytes;
 
-const MAX_SEGMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TRANSCRIPTIONS: usize = 4;
 use crate::ambient::{lease_clear, lease_holder, lease_release, lease_touch};
 
 #[derive(Deserialize)]
@@ -124,6 +125,9 @@ pub(crate) async fn set_settings(
             }
         }
         if let Some(v) = req.mode {
+            if v == "passive" && ambient.mode != "passive" {
+                crate::ambient::end_conversation();
+            }
             ambient.mode = v;
         }
         if let Some(v) = req.watcher {
@@ -230,7 +234,10 @@ pub(crate) async fn ingest(
     if !d.config.lock().unwrap().ambient.enabled {
         return (StatusCode::FORBIDDEN, "ambient listening is turned off on the server").into_response();
     }
-    if !q.device.is_empty() && !lease_touch(&q.device, None, false) {
+    if q.device.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "device is required").into_response();
+    }
+    if !lease_touch(&q.device, None, false) {
         return (StatusCode::CONFLICT, "another device is listening").into_response();
     }
     if !valid_id(&q.id) {
@@ -274,7 +281,13 @@ pub(crate) async fn ingest(
 fn spawn_transcription(d: Shared, id: String) {
     tokio::spawn(async move {
         let path = audio_path(&id);
+        static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        let gate = GATE
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TRANSCRIPTIONS)))
+            .clone();
+        let permit = gate.acquire_owned().await.ok();
         let result = super::transcribe::transcribe_ambient(&d, &path).await;
+        drop(permit);
         let (status, text, error) = match result {
             Ok(text) if text.is_empty() => ("empty", String::new(), None),
             Ok(text) => ("done", text, None),
@@ -282,7 +295,8 @@ fn spawn_transcription(d: Shared, id: String) {
         };
         let _ = d.store.with_connection(|c| {
             c.execute(
-                "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4 WHERE id = ?1",
+                "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4,
+                     kept = CASE WHEN ?2 = 'done' THEN 0 ELSE 1 END WHERE id = ?1",
                 rusqlite::params![id, status, text, error],
             )?;
             Ok(())

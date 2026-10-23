@@ -191,8 +191,8 @@ async fn assemblyai_transcribe(
         .ok_or_else(|| "AssemblyAI response did not contain transcript id".to_string())?;
     let poll_url = format!("https://api.assemblyai.com/v2/transcript/{id}");
 
-    for _ in 0..300 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    for step in 0..312 {
+        tokio::time::sleep(Duration::from_millis(if step < 12 { 250 } else { 1000 })).await;
         let response = client
             .get(&poll_url)
             .header("authorization", key)

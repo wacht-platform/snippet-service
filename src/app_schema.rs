@@ -97,6 +97,10 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
          );
          CREATE INDEX IF NOT EXISTS ambient_events_started
              ON ambient_events(started_at);
+         CREATE INDEX IF NOT EXISTS ambient_events_created
+             ON ambient_events(created_at);
+         CREATE INDEX IF NOT EXISTS ambient_events_status
+             ON ambient_events(status);
          CREATE VIRTUAL TABLE IF NOT EXISTS ambient_events_fts
              USING fts5(text, content='ambient_events', content_rowid='rowid');
          CREATE TABLE IF NOT EXISTS ambient_turns (
@@ -108,6 +112,10 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              created_at INTEGER NOT NULL,
              played_at INTEGER
          );
+         CREATE INDEX IF NOT EXISTS ambient_turns_device
+             ON ambient_turns(device, id);
+         CREATE INDEX IF NOT EXISTS ambient_turns_created
+             ON ambient_turns(created_at);
 "#,
     )?;
     let have: Vec<String> = {
