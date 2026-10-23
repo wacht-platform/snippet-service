@@ -220,13 +220,9 @@ pub fn prompt_line() -> String {
     }
 }
 
-pub fn search(query: &str, limit: usize) -> Result<Vec<Value>, String> {
+pub fn search(query: &str, limit: usize, include_hidden: bool) -> Result<Vec<Value>, String> {
     let limit = limit.clamp(1, 50) as i64;
-    let terms = query
-        .split_whitespace()
-        .map(|w| format!("\"{}\"", w.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let words: Vec<String> = query.split_whitespace().map(|w| w.replace('"', "")).collect();
     store()?
         .with_connection(|c| {
             let map = |r: &rusqlite::Row| {
@@ -234,17 +230,35 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Value>, String> {
                     "at": r.get::<_, String>(0)?,
                     "device": r.get::<_, String>(1)?,
                     "text": r.get::<_, String>(2)?,
+                    "judged_as": r.get::<_, Option<String>>(3)?,
                 }))
             };
-            if terms.is_empty() {
+            if include_hidden {
+                let mut sql = String::from(
+                    "SELECT started_at, device, text, verdict FROM ambient_events
+                     WHERE status = 'done' AND text != ''",
+                );
+                let mut params: Vec<String> = Vec::new();
+                for w in &words {
+                    params.push(format!("%{}%", w.replace('%', "").replace('_', "")));
+                    sql.push_str(&format!(" AND text LIKE ?{} COLLATE NOCASE", params.len()));
+                }
+                sql.push_str(&format!(" ORDER BY started_at DESC LIMIT {limit}"));
+                let mut stmt = c.prepare(&sql)?;
+                return stmt
+                    .query_map(rusqlite::params_from_iter(params.iter()), map)?
+                    .collect::<Result<Vec<_>, _>>();
+            }
+            if words.is_empty() {
                 let mut stmt = c.prepare(
-                    "SELECT started_at, device, text FROM ambient_events
+                    "SELECT started_at, device, text, verdict FROM ambient_events
                      WHERE status = 'done' AND kept = 1 ORDER BY started_at DESC LIMIT ?1",
                 )?;
                 return stmt.query_map([limit], map)?.collect::<Result<Vec<_>, _>>();
             }
+            let terms = words.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(" ");
             let mut stmt = c.prepare(
-                "SELECT e.started_at, e.device, e.text FROM ambient_events e
+                "SELECT e.started_at, e.device, e.text, e.verdict FROM ambient_events e
                  JOIN ambient_events_fts f ON f.rowid = e.rowid
                  WHERE ambient_events_fts MATCH ?1 AND e.kept = 1
                  ORDER BY e.started_at DESC LIMIT ?2",

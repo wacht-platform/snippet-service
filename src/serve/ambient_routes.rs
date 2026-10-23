@@ -46,6 +46,7 @@ pub(crate) struct SettingsReq {
     enabled: Option<bool>,
     mode: Option<String>,
     watcher: Option<String>,
+    watcher_chat_context: Option<bool>,
     typesafe_api_key: Option<String>,
     conversation_timeout_secs: Option<u32>,
     wake_phrases: Option<Vec<String>>,
@@ -87,6 +88,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "devices": devices,
         "effective_mode": crate::ambient::effective_mode_name(ambient.enabled && ambient.mode == "active"),
         "watcher": ambient.watcher,
+        "watcher_chat_context": ambient.watcher_chat_context,
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
@@ -134,6 +136,9 @@ pub(crate) async fn set_settings(
         }
         if let Some(v) = req.watcher {
             ambient.watcher = v;
+        }
+        if let Some(v) = req.watcher_chat_context {
+            ambient.watcher_chat_context = v;
         }
         if let Some(v) = req.conversation_timeout_secs {
             ambient.conversation_timeout_secs = v;

@@ -283,6 +283,8 @@ pub struct AmbientConfig {
     pub mode: String,
     #[serde(default = "default_ambient_watcher")]
     pub watcher: String,
+    #[serde(default)]
+    pub watcher_chat_context: bool,
     #[serde(default = "default_conversation_timeout")]
     pub conversation_timeout_secs: u32,
     #[serde(default = "default_wake_phrases")]
@@ -295,6 +297,7 @@ impl Default for AmbientConfig {
             enabled: false,
             mode: default_ambient_mode(),
             watcher: default_ambient_watcher(),
+            watcher_chat_context: false,
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
         }

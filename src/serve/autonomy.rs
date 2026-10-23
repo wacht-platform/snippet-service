@@ -106,7 +106,7 @@ fn session_status(id: &str) -> Option<crate::harness::HarnessState> {
     crate::session::state_path_for_id(id).and_then(|p| crate::session::read_session_state(&p))
 }
 
-fn question_text(question: &Value) -> String {
+pub(super) fn question_text(question: &Value) -> String {
     let mut lines = Vec::new();
     if let Some(context) = question.get("context").and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
         lines.push(context.trim().to_string());

@@ -36,6 +36,7 @@ use crate::session::{
 pub mod agent_routes;
 mod account_routes;
 mod ambient_routes;
+mod ambient_context;
 mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;

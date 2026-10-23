@@ -90,6 +90,8 @@ struct ReadFileArgs {
     offset: Option<usize>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    include_hidden: bool,
 }
 
 pub struct ReadFile;
@@ -284,6 +286,8 @@ struct AmbientSearchArgs {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    include_hidden: bool,
 }
 
 pub struct AmbientSearch;
@@ -295,13 +299,14 @@ impl Tool for AmbientSearch {
             description: "Search what the user's always-on microphone has heard (transcripts of real conversation only; TV and noise are already filtered out). Empty query returns the most recent lines. Use it to answer questions like what they said earlier or to recall a commitment; never ask for the whole stream.".into(),
             input_schema: schema(json!({
                 "query": {"type": "string", "description": "Words to look for; leave empty for the latest lines."},
-                "limit": {"type": "integer", "description": "How many lines, up to 50. Default 15."}
+                "limit": {"type": "integer", "description": "How many lines, up to 50. Default 15."},
+                "include_hidden": {"type": "boolean", "description": "Also return lines the watcher filtered out as TV, background or noise, each with judged_as. Use it when a request looks cut off or out of context: the watcher can misjudge."}
             }), &[]),
         }
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: AmbientSearchArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let rows = crate::ambient::search(&args.query, args.limit.unwrap_or(15)).map_err(ToolError::msg)?;
+        let rows = crate::ambient::search(&args.query, args.limit.unwrap_or(15), args.include_hidden).map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({"lines": rows})))
     }
 }
