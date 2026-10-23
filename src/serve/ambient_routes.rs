@@ -60,6 +60,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
             c.typesafe_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
         )
     };
+    crate::ambient::note_pinned(ambient.enabled && ambient.mode == "active");
     let since = (chrono::Utc::now() - chrono::Duration::minutes(10)).timestamp();
     let devices: Vec<serde_json::Value> = d
         .store
@@ -84,6 +85,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "mode": ambient.mode,
         "key_set": key_set,
         "devices": devices,
+        "effective_mode": crate::ambient::effective_mode_name(ambient.enabled && ambient.mode == "active"),
         "watcher": ambient.watcher,
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "wake_phrases": ambient.wake_phrases,

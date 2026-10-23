@@ -237,6 +237,8 @@ async fn deliver(d: &Shared, route: &Route, text: &str) {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    crate::ambient::note_user_turn();
+    crate::ambient::note_pinned(route.pinned_active);
     let conversation = crate::ambient::open_conversation(&route.holder, route.ttl);
     let _ = crate::ambient::record_turn(&conversation.id, "user", text, &route.holder);
     let device = escape(&route.holder);

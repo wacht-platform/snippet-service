@@ -74,6 +74,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
     registry.insert(Speak);
+    registry.insert(AmbientPassive);
     registry.insert(AmbientSearch);
     registry.insert(UpdateBrief);
     registry.insert(ScheduleFollowup);
@@ -302,6 +303,22 @@ impl Tool for AmbientSearch {
         let args: AmbientSearchArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         let rows = crate::ambient::search(&args.query, args.limit.unwrap_or(15)).map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({"lines": rows})))
+    }
+}
+
+pub struct AmbientPassive;
+#[async_trait]
+impl Tool for AmbientPassive {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ambient_passive".into(),
+            description: "Put ambient listening back to passive: the microphone keeps taking notes, nothing is spoken, and the conversation with you continues in the chat. Call it when the user has stopped talking to you aloud for a while and is typing instead, or when they ask you to stop listening or speaking. The watcher can switch it back to active when they next speak to you directly.".into(),
+            input_schema: schema(json!({}), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
+        crate::ambient::set_passive().await.map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"mode": "passive"})))
     }
 }
 

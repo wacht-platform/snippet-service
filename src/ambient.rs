@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -6,6 +7,9 @@ use serde_json::{Value, json};
 use crate::store::Store;
 
 const LEASE_TTL: Duration = Duration::from_secs(45);
+
+static LAST_USER_TURN: AtomicI64 = AtomicI64::new(0);
+static PINNED_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 static LEASE: Mutex<Option<(String, String, Instant)>> = Mutex::new(None);
 static CONVERSATION: Mutex<Option<Conversation>> = Mutex::new(None);
@@ -21,6 +25,18 @@ impl Conversation {
     pub fn seconds_left(&self) -> u64 {
         self.expires.saturating_duration_since(Instant::now()).as_secs()
     }
+}
+
+pub fn note_user_turn() {
+    LAST_USER_TURN.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+}
+
+pub fn note_pinned(active: bool) {
+    PINNED_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+pub fn effective_mode_name(pinned_active: bool) -> &'static str {
+    if pinned_active || conversation().is_some() { "active" } else { "passive" }
 }
 
 pub fn lease_holder() -> Option<(String, String)> {
@@ -185,11 +201,21 @@ pub async fn speak(text: &str) -> Result<Value, String> {
 }
 
 pub fn prompt_line() -> String {
-    match (lease_holder(), conversation()) {
+    let holder = lease_holder();
+    match (&holder, conversation()) {
         (Some((_, label)), Some(c)) => format!(
             " A live spoken conversation is open with the user on {label} (about {}s left). Their words arrive as <ambient_turn> messages; answer every one by calling speak with one to three plain sentences (it is read aloud, so no markdown or lists). Anything you only write in your reply is not heard.",
             c.seconds_left()
         ),
+        (Some(_), None) if PINNED_ACTIVE.load(Ordering::Relaxed) => {
+            let last = LAST_USER_TURN.load(Ordering::Relaxed);
+            let idle = (chrono::Utc::now().timestamp() - last) / 60;
+            if last == 0 || idle >= 5 {
+                " Ambient listening is pinned to active but the user has not spoken to you for a while; if they are just typing, call ambient_passive so it stops listening for you.".to_string()
+            } else {
+                String::new()
+            }
+        }
         _ => String::new(),
     }
 }
@@ -227,4 +253,16 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<Value>, String> {
                 .collect::<Result<Vec<_>, _>>()
         })
         .map_err(|e| e.to_string())
+}
+
+pub async fn set_passive() -> Result<(), String> {
+    let path = crate::config::default_config_path();
+    let mut config = crate::config::SnippetConfig::load(&path)
+        .await
+        .map_err(|e| e.to_string())?;
+    config.ambient.mode = "passive".into();
+    crate::config::save_config(&config, &path)?;
+    note_pinned(false);
+    end_conversation();
+    Ok(())
 }
