@@ -9,6 +9,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const SEND_MIN: usize = 3200;
+const MIN_SEND: usize = 1760;
+const MAX_SEND: usize = 24_000;
 const FINISH_WAIT: Duration = Duration::from_millis(1800);
 const EMPTY_WAIT: Duration = Duration::from_millis(1100);
 const IDLE_CLOSE: Duration = Duration::from_secs(300);
@@ -93,11 +95,22 @@ pub(super) struct Ticket {
 impl Inner {
     fn flush(&mut self) {
         if !self.buf.is_empty() {
-            let bytes = std::mem::take(&mut self.buf);
-            self.sent += bytes.len() as u64;
-            self.session.flushed.fetch_add(bytes.len() as u64, Ordering::SeqCst);
-            let _ = self.session.cmd.send(Cmd::Audio(bytes));
+            let mut bytes = std::mem::take(&mut self.buf);
+            while bytes.len() > MAX_SEND {
+                let rest = bytes.split_off(MAX_SEND);
+                self.send(std::mem::replace(&mut bytes, rest));
+            }
+            if bytes.len() < MIN_SEND {
+                bytes.resize(MIN_SEND, 0);
+            }
+            self.send(bytes);
         }
+    }
+
+    fn send(&mut self, bytes: Vec<u8>) {
+        self.sent += bytes.len() as u64;
+        self.session.flushed.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+        let _ = self.session.cmd.send(Cmd::Audio(bytes));
     }
 
     fn owns(&self, index: Option<u64>, turn: &Turn, end: f32) -> bool {
@@ -280,6 +293,7 @@ async fn run(session: &Arc<Session>, key: String, terms: Vec<String>, mut cmd: m
                 Some(Err(e)) => return Err(format!("AssemblyAI stream error: {e}")),
             },
             _ = tick.tick() => {
+                let _ = tx.send(Message::Ping(Default::default())).await;
                 if last_audio.elapsed() >= IDLE_CLOSE {
                     let _ = tx.send(Message::Text("{\"type\":\"Terminate\"}".into())).await;
                     return Ok(());
