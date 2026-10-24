@@ -374,7 +374,8 @@ fn spawn_transcription(d: Shared, id: String) {
             super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));
             return;
         }
-        if during_playback != 0 && echo_of_reply(&text, &device) {
+        let spoke_then = during_playback != 0 || assistant_was_speaking(&device, &started_at, duration_ms);
+        if spoke_then && echo_of_reply(&text, &device) {
             let _ = d.store.with_connection(|c| {
                 c.execute("UPDATE ambient_events SET status = 'echo', kept = 0 WHERE id = ?1", [&id])?;
                 Ok(())
@@ -437,7 +438,7 @@ fn echo_of_reply(text: &str, device: &str) -> bool {
         .filter(|w| !w.is_empty())
         .map(str::to_string)
         .collect();
-    if heard.len() < 5 {
+    if heard.len() < 2 {
         return false;
     }
     let since = chrono::Utc::now().timestamp() - 180;
@@ -891,4 +892,29 @@ pub(crate) async fn speakers_label(
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+fn assistant_was_speaking(device: &str, started_at: &str, duration_ms: i64) -> bool {
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(started_at) else {
+        return false;
+    };
+    let start = t.timestamp();
+    let end = start + duration_ms / 1000;
+    crate::ambient::store()
+        .ok()
+        .and_then(|st| {
+            st.with_connection(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT t.created_at, COALESCE((SELECT SUM(ms) FROM ambient_chunks WHERE turn_id = t.id), 0)
+                     FROM ambient_turns t WHERE t.role = 'assistant' AND t.device = ?1 AND t.created_at >= ?2
+                     ORDER BY t.id DESC LIMIT 4",
+                )?;
+                let rows = stmt
+                    .query_map(rusqlite::params![device, start - 90], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .ok()
+        })
+        .is_some_and(|rows| rows.iter().any(|(at, ms)| *at <= end && at + ms / 1000 + 4 >= start))
 }
