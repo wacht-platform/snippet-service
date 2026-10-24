@@ -340,7 +340,7 @@ pub fn played(turn: i64, seq: Option<i64>, complete: bool, ttl_secs: u32) {
             if complete {
                 c.execute(
                     "UPDATE ambient_turns SET status = 'played', played_at = ?2,
-                         heard_text = text WHERE id = ?1 AND status IN ('queued', 'synthesised')",
+                         heard_text = text WHERE id = ?1 AND status IN ('queued', 'synthesised', 'missed')",
                     rusqlite::params![turn, now],
                 )?;
             }
@@ -358,11 +358,16 @@ pub fn barge(turn: i64, seq: i64, played_ms: i64) {
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
     for job in &queued {
         set_status(job.turn, "cancelled");
+        emit(json!({"kind": "ambient_speech_cancel", "turn": job.turn, "after_seq": -1, "reason": "interrupted", "device": job.device}));
     }
     let current = CURRENT.lock().unwrap().clone();
-    if let Some((cur, flag, _)) = current {
-        if cur == turn {
+    if let Some((cur, flag, device)) = current {
+        if cur >= turn {
             flag.store(true, Ordering::SeqCst);
+            if cur != turn {
+                set_status(cur, "cancelled");
+                emit(json!({"kind": "ambient_speech_cancel", "turn": cur, "after_seq": -1, "reason": "interrupted", "device": device}));
+            }
         }
     }
     if let Ok(store) = crate::ambient::store() {
@@ -386,7 +391,8 @@ pub fn turns_after(after: i64, device: &str) -> Result<Vec<Value>, String> {
         .with_connection(|c| {
             c.execute(
                 "UPDATE ambient_turns SET status = 'missed' WHERE role = 'assistant' AND device = ?1
-                   AND status IN ('queued', 'synthesised') AND created_at < ?2",
+                   AND status IN ('queued', 'synthesised')
+                   AND created_at + COALESCE((SELECT SUM(ms) FROM ambient_chunks WHERE turn_id = ambient_turns.id), 0) / 1000 < ?2",
                 rusqlite::params![device, cutoff],
             )?;
             let mut stmt = c.prepare(

@@ -563,14 +563,22 @@ pub fn enrolled(store: &Store) -> bool {
         .unwrap_or(false)
 }
 
-pub fn claim(store: &Store, id: i64) -> Result<(), String> {
+pub fn claim(store: &Store, id: i64, explicit: bool) -> Result<(), String> {
     let _guard = ASSIGN.lock().unwrap();
     store
         .with_connection(|c| {
-            if c.query_row("SELECT COUNT(*) FROM speakers WHERE is_user = 1", [], |r| r.get::<_, i64>(0))? > 0 {
+            let user: i64 = c.query_row("SELECT COUNT(*) FROM speakers WHERE is_user = 1", [], |r| r.get(0))?;
+            if user > 0 && !explicit {
                 return Ok(());
+            }
+            let exists: i64 = c.query_row("SELECT COUNT(*) FROM speakers WHERE id = ?1", [id], |r| r.get(0))?;
+            if exists == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            if explicit {
+                c.execute("UPDATE speakers SET is_user = 0 WHERE is_user = 1 AND id != ?1", [id])?;
             }
             c.execute("UPDATE speakers SET is_user = 1, label = '' WHERE id = ?1", [id]).map(|_| ())
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| { let m = e.to_string(); if m.contains("no rows") { "no such speaker".to_string() } else { m } })
 }

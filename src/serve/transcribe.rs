@@ -167,7 +167,7 @@ pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken
         }
         kept
     };
-    let text = if is_filler(&text) && !crate::ambient::expectation().is_some() { String::new() } else { text };
+    let text = if is_filler(&text) && crate::ambient::expectation().is_none() && crate::ambient::conversation().is_none() { String::new() } else { text };
     let turns = match analysis.map_err(|e| e.to_string())? {
         Ok(turns) => turns,
         Err(e) => {
@@ -277,7 +277,7 @@ fn is_filler(text: &str) -> bool {
 fn fix_wake_spelling(text: &str) -> String {
     let lower = text.to_lowercase();
     for variant in ["snip it", "snip but", "snip bit", "snippit", "snipit", "snip pet"] {
-        if lower.starts_with(variant) {
+        if lower.starts_with(variant) && !lower[variant.len()..].starts_with(|c: char| c.is_alphanumeric()) {
             return format!("Snippet{}", &text[variant.len()..]);
         }
     }

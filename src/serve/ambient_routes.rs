@@ -318,11 +318,14 @@ pub(crate) async fn ingest(
             ],
         )
     });
+    let fresh = matches!(inserted, Ok(1));
     if let Err(e) = inserted {
         let _ = tokio::fs::remove_file(&path).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not record event: {e}")).into_response();
     }
-    spawn_transcription(d.clone(), q.id.clone());
+    if fresh {
+        spawn_transcription(d.clone(), q.id.clone());
+    }
     Json(fetch(&d, &q.id).unwrap_or_else(|| serde_json::json!({"id": q.id, "status": "pending"})))
         .into_response()
 }
@@ -375,7 +378,7 @@ fn spawn_transcription(d: Shared, id: String) {
             return;
         }
         let spoke_then = during_playback != 0 || assistant_was_speaking(&device, &started_at, duration_ms);
-        if spoke_then && echo_of_reply(&text, &device) {
+        if spoke_then && echo_of_reply(&text, &device, if during_playback != 0 { 0.6 } else { 0.8 }) {
             let _ = d.store.with_connection(|c| {
                 c.execute("UPDATE ambient_events SET status = 'echo', kept = 0 WHERE id = ?1", [&id])?;
                 Ok(())
@@ -431,14 +434,27 @@ fn spawn_transcription(d: Shared, id: String) {
     });
 }
 
-fn echo_of_reply(text: &str, device: &str) -> bool {
-    let heard: std::collections::HashSet<String> = text
-        .to_lowercase()
+const ECHO_STOP: &[&str] = &[
+    "a", "an", "the", "i", "you", "me", "my", "it", "is", "are", "was", "to", "of", "and", "or", "so", "in", "on", "that", "this",
+    "do", "did", "does", "be", "can", "just", "yes", "no", "ok", "okay", "right", "well", "uh", "um", "oh", "we", "he", "she",
+    "they", "what", "how", "if", "for", "with", "at", "as", "but", "not", "have", "has", "had", "will", "would", "could", "your",
+    "its", "there", "here", "now", "then",
+];
+
+fn spoken_words(text: &str) -> Vec<String> {
+    text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_string)
-        .collect();
-    if heard.len() < 2 {
+        .collect()
+}
+
+fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
+    let heard = spoken_words(text);
+    let mut content: Vec<&String> = heard.iter().filter(|w| !ECHO_STOP.contains(&w.as_str())).collect();
+    content.sort();
+    content.dedup();
+    if content.len() < 2 {
         return false;
     }
     let since = chrono::Utc::now().timestamp() - 180;
@@ -458,13 +474,12 @@ fn echo_of_reply(text: &str, device: &str) -> bool {
             .ok()
         })
         .unwrap_or_default();
-    let spoken: std::collections::HashSet<String> = replies
-        .iter()
-        .flat_map(|t| t.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect::<Vec<_>>())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let shared = heard.iter().filter(|w| spoken.contains(*w)).count();
-    shared as f64 / heard.len() as f64 >= 0.8
+    let n = if heard.len() >= 5 { 3 } else { 2 };
+    replies.iter().any(|reply| {
+        let said = spoken_words(reply);
+        let shared = content.iter().filter(|w| said.contains(**w)).count();
+        shared as f64 / content.len() as f64 >= ratio && heard.windows(n).any(|h| said.windows(n).any(|r| r == h))
+    })
 }
 
 #[derive(Deserialize)]
@@ -472,6 +487,8 @@ pub(crate) struct ActivityReq {
     device: String,
     #[serde(default)]
     seq: Option<i64>,
+    #[serde(default)]
+    skip: bool,
 }
 
 pub(crate) async fn activity(
@@ -483,7 +500,10 @@ pub(crate) async fn activity(
         return unauthorized();
     }
     if lease_holder().is_some_and(|(h, _)| h == req.device) {
-        super::ambient_router::submit(&d, &req.device, super::ambient_router::Msg::Activity(req.seq));
+        match (req.skip, req.seq) {
+            (true, Some(seq)) if seq > 0 => super::ambient_router::submit(&d, &req.device, super::ambient_router::Msg::Skip(seq)),
+            _ => super::ambient_router::submit(&d, &req.device, super::ambient_router::Msg::Activity(req.seq)),
+        }
     }
     Json(serde_json::json!({"ok": true})).into_response()
 }
@@ -497,6 +517,8 @@ pub(crate) fn resume(d: Shared) {
             Ok(ids)
         })
         .unwrap_or_default();
+    let stale = chrono::Utc::now().timestamp() - 60;
+    let _ = d.store.with_connection(|c| c.execute("UPDATE ambient_events SET routed = 0 WHERE status = 'pending' AND created_at < ?1", [stale]));
     for id in pending {
         if audio_path(&id).exists() {
             spawn_transcription(d.clone(), id);
@@ -874,8 +896,9 @@ pub(crate) async fn speakers_claim(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    match crate::diarize::claim(&d.store, req.id) {
+    match crate::diarize::claim(&d.store, req.id, true) {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) if e == "no such speaker" => (StatusCode::NOT_FOUND, e).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

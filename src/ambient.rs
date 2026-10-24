@@ -231,7 +231,7 @@ pub fn conversation() -> Option<Conversation> {
 pub fn open_conversation(by: &str, ttl_secs: u32) -> Conversation {
     let ttl = Duration::from_secs(u64::from(ttl_secs));
     let mut conversation = CONVERSATION.lock().unwrap();
-    let live = conversation.as_ref().is_some_and(|c| c.expires > Instant::now());
+    let live = conversation.as_ref().is_some_and(|c| c.expires > Instant::now() || c.hold_until.is_some_and(|h| h > Instant::now()));
     if !live {
         *conversation = Some(Conversation {
             id: format!("c{}", chrono::Utc::now().timestamp_millis()),

@@ -53,18 +53,25 @@ struct Flushed {
 static ROUTERS: Mutex<Option<HashMap<String, mpsc::UnboundedSender<Msg>>>> = Mutex::new(None);
 
 pub(crate) fn submit(d: &Shared, device: &str, msg: Msg) {
-    let tx = {
-        let mut guard = ROUTERS.lock().unwrap();
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.entry(device.to_string())
-            .or_insert_with(|| {
+    let mut guard = ROUTERS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(tx) = map.get(device) {
+        match tx.send(msg) {
+            Ok(()) => return,
+            Err(mpsc::error::SendError(m)) => {
+                map.remove(device);
                 let (tx, rx) = mpsc::unbounded_channel();
                 tokio::spawn(actor(d.clone(), device.to_string(), rx));
-                tx
-            })
-            .clone()
-    };
+                let _ = tx.send(m);
+                map.insert(device.to_string(), tx);
+                return;
+            }
+        }
+    }
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(actor(d.clone(), device.to_string(), rx));
     let _ = tx.send(msg);
+    map.insert(device.to_string(), tx);
 }
 
 enum Wake {
@@ -128,8 +135,14 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
                 break;
             }
             drained_max = drained_max.max(first);
-            if let Some(Some(part)) = buffered.remove(&first) {
-                accept(&d, &device, part, &mut turn, &mut deadline, &mut last).await;
+            match buffered.remove(&first) {
+                Some(Some(part)) => accept(&d, &device, part, &mut turn, &mut deadline, &mut last).await,
+                Some(None) => {
+                    if announced.is_empty() && !turn.is_empty() && deadline.is_some_and(|t| t > Instant::now() + HOLD) {
+                        deadline = Some(Instant::now() + HOLD);
+                    }
+                }
+                None => {}
             }
         }
         stalled = if buffered.is_empty() { None } else { stalled.or(Some(Instant::now())) };
@@ -178,13 +191,13 @@ async fn accept(
     if turn.is_empty() && !gated {
         if let Some(l) = last.as_mut() {
             let gap = part.started - l.ended;
-            if l.delivered && l.at.elapsed() < LATE_WINDOW && gap <= CONTINUED_GAP && part.summary != "other" && (part.summary == "you" || !enrolled(d)) {
+            let routable = crate::ambient::lease_holder().is_some_and(|(h, _)| h == device);
+            if l.delivered && routable && crate::ambient::conversation().is_some() && l.at.elapsed() < LATE_WINDOW && gap <= CONTINUED_GAP && part.summary != "other" && (part.summary == "you" || !enrolled(d)) {
                 let parent = l.ids.clone();
                 let ended = part.ended;
                 let ids = vec![part.id.clone()];
                 deliver(d, device, &[part], &Verdict::inherited(), false, Some(&parent), ttl, false).await;
                 l.ended = ended;
-                l.at = Instant::now();
                 mark_verdict(d, &ids, &Verdict::inherited(), true);
                 return;
             }
@@ -456,15 +469,17 @@ async fn deliver(
 }
 
 fn claim_wake_speaker(d: &Shared, parts: &[Part]) {
+    let phrases = d.config.lock().unwrap().ambient.wake_phrases.clone();
     let ids: std::collections::HashSet<i64> = parts
         .iter()
         .flat_map(|p| p.speakers.iter())
+        .filter(|l| ambient_watch::wake_word(l["text"].as_str().unwrap_or(""), &phrases))
         .filter_map(|l| l["speaker"].as_i64())
         .filter(|id| *id != -1)
         .collect();
     if ids.len() == 1 {
         if let Some(id) = ids.into_iter().next() {
-            let _ = crate::diarize::claim(&d.store, id);
+            let _ = crate::diarize::claim(&d.store, id, false);
         }
     }
 }

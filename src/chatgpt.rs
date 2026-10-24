@@ -612,14 +612,16 @@ fn message_item(role: &str, text: &str) -> Value {
 }
 
 /// Parse the Codex Responses SSE stream into a `ModelOutput`. Assistant text
-/// deltas stream to `sink`; tool calls arrive whole in `response.output_item.done`
-/// items; usage comes from `response.completed`.
+/// deltas stream to `sink`; tool-call arguments stream through
+/// `response.function_call_arguments.delta` (the whole call also arrives in
+/// `response.output_item.done`); usage comes from `response.completed`.
 async fn parse_responses_sse(
     response: reqwest::Response,
     sink: Option<&StreamHandle>,
 ) -> Result<ModelOutput, ToolError> {
     let mut text = String::new();
     let mut calls: Vec<GeneratedToolCall> = Vec::new();
+    let mut streamed: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut usage: Option<TokenUsage> = None;
     let mut failure: Option<String> = None;
     let mut incomplete = false;
@@ -655,6 +657,31 @@ async fn parse_responses_sse(
                     StreamBuffer::append_thinking(sink, delta);
                 }
             }
+            "response.output_item.added" => {
+                if let Some(item) = chunk.get("item").filter(|i| i.get("type").and_then(Value::as_str) == Some("function_call")) {
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let id = item.get("id").or_else(|| item.get("call_id")).and_then(Value::as_str).unwrap_or("0").to_string();
+                    if !name.is_empty() {
+                        streamed.insert(id.clone(), false);
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Start { call_id: id, name: name.to_string() });
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let id = chunk.get("item_id").or_else(|| chunk.get("call_id")).and_then(Value::as_str).unwrap_or("");
+                if let Some(delta) = chunk.get("delta").and_then(Value::as_str).filter(|_| streamed.contains_key(id)) {
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: id.to_string(), chunk: delta.to_string() });
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let id = chunk.get("item_id").or_else(|| chunk.get("call_id")).and_then(Value::as_str).unwrap_or("");
+                if let Some(ended) = streamed.get_mut(id) {
+                    if !*ended {
+                        *ended = true;
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id: id.to_string() });
+                    }
+                }
+            }
             "response.output_item.done" => {
                 let item = chunk.get("item");
                 if item.and_then(|i| i.get("type")).and_then(Value::as_str) == Some("function_call")
@@ -662,14 +689,21 @@ async fn parse_responses_sse(
                     let item = item.expect("checked");
                     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
                     let call_id = item.get("id").or_else(|| item.get("call_id")).and_then(Value::as_str).unwrap_or("0").to_string();
-                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Start { call_id: call_id.clone(), name: name.to_string() });
+                    let already = streamed.get(&call_id).copied();
+                    if already.is_none() {
+                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Start { call_id: call_id.clone(), name: name.to_string() });
+                    }
                     if !name.is_empty() {
                         let args_str = item
                             .get("arguments")
                             .and_then(Value::as_str)
                             .unwrap_or("{}");
-                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: call_id.clone(), chunk: args_str.to_string() });
-                        StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id });
+                        if already.is_none() {
+                            StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: call_id.clone(), chunk: args_str.to_string() });
+                        }
+                        if already != Some(true) {
+                            StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id });
+                        }
                         let arguments = serde_json::from_str::<Value>(args_str)
                             .unwrap_or_else(|_| Value::String(args_str.to_string()));
                         let id = item

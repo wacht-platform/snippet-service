@@ -48,7 +48,9 @@ pub(super) fn wake_word(text: &str, phrases: &[String]) -> bool {
         .take(7)
         .map(str::to_string)
         .collect();
-    if words.iter().take(2).any(|w| w == "snip" || w == "snipit") && phrases.iter().any(|p| p == "snippet") {
+    let near = words.iter().take(3).any(|w| w == "snipit" || w == "snippit")
+        || words.windows(2).take(2).any(|w| w[0] == "snip" && matches!(w[1].as_str(), "it" | "but" | "bit" | "pet"));
+    if near && phrases.iter().any(|p| p == "snippet") {
         return true;
     }
     phrases.iter().any(|p| {

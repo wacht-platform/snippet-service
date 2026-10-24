@@ -760,7 +760,7 @@ pub async fn run_serve(
             let d = d.clone();
             let body = format!("Ambient mode is now {mode} ({reason}).");
             handle.spawn(async move {
-                agent_routes::record_agent_message(&d, crate::mission_control::SESSION_ID, "voice classifier", &body, false).await;
+                agent_routes::record_agent_message(&d, crate::mission_control::SESSION_ID, "ambient mode", &body, false).await;
             });
         }));
     }
