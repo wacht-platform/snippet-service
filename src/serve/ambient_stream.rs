@@ -29,9 +29,34 @@ pub(crate) async fn stream(ws: WebSocketUpgrade, State(d): State<Shared>, Query(
         .on_upgrade(move |socket| run(socket, d, device, token))
 }
 
+const QUIET_FLOOR: f32 = 200.0;
+const QUIET_BYTES: usize = 9_600;
+
 struct Open {
     meta: serde_json::Value,
     pcm: Vec<u8>,
+    peak: f32,
+    quiet: usize,
+    spec: Option<(usize, tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>)>,
+}
+
+fn rms(bytes: &[u8]) -> f32 {
+    let n = bytes.len() / 2;
+    if n == 0 {
+        return 0.0;
+    }
+    let sum: f64 = bytes
+        .chunks_exact(2)
+        .map(|b| {
+            let v = i16::from_le_bytes([b[0], b[1]]) as f64;
+            v * v
+        })
+        .sum();
+    (sum / n as f64).sqrt() as f32
+}
+
+fn quiet(level: f32, peak: f32) -> bool {
+    level < QUIET_FLOOR.max(peak * 0.08)
 }
 
 fn wav(pcm: &[u8]) -> Vec<u8> {
@@ -72,7 +97,33 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                 let h = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
                 if let Some(seg) = open.get_mut(&h) {
                     if seg.pcm.len() + b.len() - 4 <= MAX_SEGMENT_PCM {
-                        seg.pcm.extend_from_slice(&b[4..]);
+                        let body = &b[4..];
+                        seg.pcm.extend_from_slice(body);
+                        if body.len() <= 2048 {
+                            let level = rms(body);
+                            seg.peak = seg.peak.max(level);
+                            if quiet(level, seg.peak) {
+                                seg.quiet += body.len();
+                            } else {
+                                seg.quiet = 0;
+                                if let Some((_, h)) = seg.spec.take() {
+                                    h.abort();
+                                }
+                            }
+                            if seg.quiet >= QUIET_BYTES && seg.spec.is_none() && seg.pcm.len() >= 16_000 {
+                                let samples: Vec<f32> =
+                                    seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+                                let len = seg.pcm.len();
+                                let d = d.clone();
+                                let handle = tokio::spawn(async move {
+                                    let permit = super::ambient_routes::gate().acquire_owned().await.ok();
+                                    let r = super::transcribe::transcribe_samples(&d, samples).await;
+                                    drop(permit);
+                                    r
+                                });
+                                seg.spec = Some((len, handle));
+                            }
+                        }
                     }
                 }
             }
@@ -88,7 +139,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
                             super::ambient_routes::announce(&d, &device, seq, false);
                         }
-                        open.insert(h, Open { meta: v, pcm: Vec::new() });
+                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, spec: None });
                     }
                     Some("skip") => {
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
@@ -113,6 +164,18 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         }
                         if let Some(n) = v.get("bytes").and_then(|x| x.as_u64()) {
                             seg.pcm.truncate((n as usize) & !1);
+                        }
+                        if let Some((len, handle)) = seg.spec.take() {
+                            let tail_ok = len <= seg.pcm.len()
+                                && seg.pcm[len..]
+                                    .chunks(1024)
+                                    .all(|c| quiet(rms(c), seg.peak));
+                            match (tail_ok, v.get("id").and_then(|x| x.as_str())) {
+                                (true, Some(id)) => {
+                                    super::ambient_routes::precomputed().lock().unwrap().insert(id.to_string(), handle);
+                                }
+                                _ => handle.abort(),
+                            }
                         }
                         let d = d.clone();
                         let out = out_tx.clone();

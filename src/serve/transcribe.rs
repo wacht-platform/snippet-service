@@ -140,6 +140,10 @@ pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken
     let samples = tokio::task::spawn_blocking(move || crate::diarize::read_audio_16k(&owned))
         .await
         .map_err(|e| e.to_string())??;
+    transcribe_samples(d, samples).await
+}
+
+pub(super) async fn transcribe_samples(d: &Shared, samples: Vec<f32>) -> Result<Spoken, String> {
     let ready = crate::models::is_ready(crate::models::SPEAKER_MODEL);
     let words = crate::stt::transcribe_words(crate::models::STT_MODEL, samples.clone());
     let analysis = {

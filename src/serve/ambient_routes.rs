@@ -330,16 +330,34 @@ pub(crate) async fn ingest(
         .into_response()
 }
 
+type Early = tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>;
+
+pub(super) fn precomputed() -> &'static std::sync::Mutex<std::collections::HashMap<String, Early>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Early>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+pub(super) fn gate() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TRANSCRIPTIONS))).clone()
+}
+
 fn spawn_transcription(d: Shared, id: String) {
     tokio::spawn(async move {
         let path = audio_path(&id);
-        static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-        let gate = GATE
-            .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TRANSCRIPTIONS)))
-            .clone();
-        let permit = gate.acquire_owned().await.ok();
-        let result = super::transcribe::transcribe_ambient(&d, &path).await;
-        drop(permit);
+        let early = precomputed().lock().unwrap().remove(&id);
+        let result = match early {
+            Some(handle) => match handle.await {
+                Ok(r) => r,
+                Err(e) => Err(e.to_string()),
+            },
+            None => {
+                let permit = gate().acquire_owned().await.ok();
+                let r = super::transcribe::transcribe_ambient(&d, &path).await;
+                drop(permit);
+                r
+            }
+        };
         let speaker_is_you = result.as_ref().is_ok_and(|s| s.summary == "you");
         let (status, text, error, speakers, summary) = match result {
             Ok(s) if s.text.is_empty() => ("empty", String::new(), None, None, None),
