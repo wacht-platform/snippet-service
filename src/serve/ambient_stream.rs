@@ -41,6 +41,7 @@ struct Open {
     voiced: usize,
     checks: u8,
     asm: Option<super::assembly::Ticket>,
+    flux: Option<super::flux_stt::Ticket>,
     forced: bool,
     spec: Option<(usize, tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>)>,
 }
@@ -111,6 +112,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         seg.pcm.extend_from_slice(body);
                         if let Some(a) = seg.asm.as_mut() {
                             a.push(body);
+                        }
+                        if let Some(f) = seg.flux.as_mut() {
+                            f.push(body);
                         }
                         if body.len() <= 2048 {
                             let level = rms(body);
@@ -185,24 +189,29 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             super::ambient_routes::announce(&d, &device, seq, false);
                         }
                         d.reload_config().await;
-                        let asm = if v.get("live").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        let (asm, flux) = if v.get("live").and_then(|x| x.as_bool()).unwrap_or(false) {
                             let c = d.config.lock().unwrap();
                             let key = c.assemblyai_api_key.clone().filter(|k| !k.trim().is_empty());
-                            if c.ambient.stt == "assemblyai" && key.is_some() {
-                                let mut terms: Vec<String> = c.ambient.wake_phrases.clone();
-                                for extra in ["Snippet", "Mission Control"] {
-                                    if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
-                                        terms.push(extra.to_string());
-                                    }
+                            let mut terms: Vec<String> = c.ambient.wake_phrases.clone();
+                            for extra in ["Snippet", "Mission Control"] {
+                                if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
+                                    terms.push(extra.to_string());
                                 }
+                            }
+                            let flux = match c.deepgram_api_key.clone().filter(|k| !k.trim().is_empty()) {
+                                Some(k) if c.ambient.stt_shadow == "flux" && !device.is_empty() => super::flux_stt::begin(&device, k, terms.clone()),
+                                _ => None,
+                            };
+                            let asm = if c.ambient.stt == "assemblyai" && key.is_some() {
                                 key.map(|k| super::assembly::begin(&device, k, terms))
                             } else {
                                 None
-                            }
+                            };
+                            (asm, flux)
                         } else {
-                            None
+                            (None, None)
                         };
-                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, asm, forced: false, spec: None });
+                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, asm, flux, forced: false, spec: None });
                     }
                     Some("skip") => {
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
@@ -228,12 +237,27 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(n) = v.get("bytes").and_then(|x| x.as_u64()) {
                             seg.pcm.truncate((n as usize) & !1);
                         }
+                        let ended = std::time::Instant::now();
+                        let (shadow_tx, shadow_rx) = match seg.flux.is_some() && seg.asm.is_some() {
+                            true => {
+                                let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+                                (Some(tx), Some(rx))
+                            }
+                            false => (None, None),
+                        };
+                        if let Some(f) = seg.flux.take() {
+                            let id = v.get("id").and_then(|x| x.as_str()).or_else(|| seg.meta.get("id").and_then(|x| x.as_str())).unwrap_or("?");
+                            f.end(id.to_string(), ended, shadow_rx);
+                        }
                         if let Some(handle) = seg.asm.take() {
                             if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
                                 let samples: Vec<f32> = seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
                                 let (dd, ident) = (d.clone(), id.to_string());
                                 let task = tokio::spawn(async move {
                                     let outcome = handle.finish().await;
+                                    if let Some(tx) = shadow_tx {
+                                        let _ = tx.send(outcome.as_ref().ok().map(|t| t.text.clone()));
+                                    }
                                     let permit = super::ambient_routes::gate().acquire_owned().await.ok();
                                     let result = match outcome {
                                         Ok(t) if !t.text.trim().is_empty() => {

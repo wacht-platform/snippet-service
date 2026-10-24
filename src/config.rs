@@ -298,6 +298,8 @@ pub struct AmbientConfig {
     pub tts: String,
     #[serde(default = "default_tts_voice")]
     pub tts_voice: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stt_shadow: String,
 }
 
 fn default_tts_voice() -> String {
@@ -320,6 +322,7 @@ impl Default for AmbientConfig {
             stt: default_ambient_stt(),
             tts: default_ambient_stt(),
             tts_voice: default_tts_voice(),
+            stt_shadow: String::new(),
         }
     }
 }
@@ -342,6 +345,7 @@ impl AmbientConfig {
             return Err(format!("voice classifier setting must be one of: {}", AMBIENT_WATCHERS.join(", ")));
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
+        self.stt_shadow = self.stt_shadow.trim().to_ascii_lowercase();
         self.wake_phrases = self
             .wake_phrases
             .iter()
