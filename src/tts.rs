@@ -232,8 +232,7 @@ pub async fn synthesize(voice: &str, text: &str) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())?
 }
 
-const FIRST_CHUNK_WORDS: usize = 8;
-const SECOND_CHUNK_WORDS: usize = 14;
+const RAMP_WORDS: [usize; 3] = [5, 8, 14];
 const BREAK_BEFORE: &[&str] = &["to", "that", "and", "but", "so", "for", "with", "in", "on", "at", "of", "which", "because", "when", "if", "then"];
 
 fn shorten(first: &str, limit: usize) -> Option<(String, String)> {
@@ -242,14 +241,21 @@ fn shorten(first: &str, limit: usize) -> Option<(String, String)> {
         return None;
     }
     let clause = words.iter().take(limit + 1).position(|w| w.ends_with([',', ';', ':', '\u{2014}'])).filter(|i| i + 1 >= 3);
+    let word = |j: usize| words[j].to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string();
     let at = match clause {
         Some(i) => i + 1,
-        None => (4..limit)
-            .rev()
-            .find(|j| BREAK_BEFORE.contains(&words[*j].to_lowercase().trim_matches(|c: char| !c.is_alphanumeric())))
-            .unwrap_or(limit - 1),
+        None => (3..=(limit + 2).min(words.len() - 1))
+            .filter(|j| BREAK_BEFORE.contains(&word(*j).as_str()))
+            .min_by_key(|j| j.abs_diff(limit))
+            .unwrap_or_else(|| {
+                let mut at = limit;
+                while at + 1 < words.len() && ["the", "a", "an", "of", "to", "and", "my", "your", "our", "its", "this", "that"].contains(&word(at - 1).as_str()) {
+                    at += 1;
+                }
+                at
+            }),
     };
-    if at >= words.len() {
+    if at + 3 > words.len() {
         return None;
     }
     Some((words[..at].join(" "), words[at..].join(" ")))
@@ -311,7 +317,7 @@ pub fn chunk_text(text: &str) -> Vec<String> {
             _ => merged.push(piece),
         }
     }
-    for (i, limit) in [FIRST_CHUNK_WORDS, SECOND_CHUNK_WORDS].into_iter().enumerate() {
+    for (i, limit) in RAMP_WORDS.into_iter().enumerate() {
         if let Some(piece) = merged.get(i).cloned() {
             if let Some((head, tail)) = shorten(&piece, limit) {
                 merged[i] = head;
