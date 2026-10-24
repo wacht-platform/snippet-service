@@ -38,6 +38,7 @@ mod account_routes;
 mod ambient_routes;
 mod ambient_context;
 mod ambient_router;
+mod ambient_stream;
 mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
@@ -876,6 +877,7 @@ pub async fn run_serve(
                 .layer(ambient_routes::body_limit())
                 .get(ambient_routes::list),
         )
+        .route("/ambient/stream", get(ambient_stream::stream))
         .route("/ambient/stats", get(ambient_routes::stats))
         .route("/ambient/lease", post(ambient_routes::lease))
         .route("/ambient/speakers", get(ambient_routes::speakers_list))
