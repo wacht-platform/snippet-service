@@ -2,7 +2,6 @@ use super::*;
 
 use axum::body::Bytes;
 
-const MAX_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TRANSCRIPTIONS: usize = 4;
 use crate::ambient::{lease_clear, lease_holder, lease_release, lease_touch};
 
@@ -641,9 +640,6 @@ pub(crate) async fn stats(State(d): State<Shared>, Query(a): Query<Auth>) -> Res
     }
 }
 
-pub(crate) fn body_limit() -> DefaultBodyLimit {
-    DefaultBodyLimit::max(MAX_SEGMENT_BYTES)
-}
 
 #[derive(Deserialize)]
 pub(crate) struct TurnsQuery {

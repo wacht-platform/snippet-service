@@ -871,12 +871,7 @@ pub async fn run_serve(
             "/vault",
             get(vault_list).put(vault_set).delete(vault_delete),
         )
-        .route(
-            "/ambient/events",
-            post(ambient_routes::ingest)
-                .layer(ambient_routes::body_limit())
-                .get(ambient_routes::list),
-        )
+        .route("/ambient/events", get(ambient_routes::list))
         .route("/ambient/stream", get(ambient_stream::stream))
         .route("/ambient/stats", get(ambient_routes::stats))
         .route("/ambient/lease", post(ambient_routes::lease))

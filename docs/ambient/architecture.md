@@ -14,7 +14,7 @@ The goal is an assistant that is always listening (and later always looking). It
 ```
  DEVICE                     DAEMON (snippet serve)                      AGENTS
  ------                     ----------------------                      ------
- mic ─▶ VAD ─▶ utterance ──▶ POST /ambient/events ─▶ STT ─▶ ambient log ─┬▶ wake command ─▶ Mission Control
+ mic ─▶ VAD ─▶ utterance ──▶ WS /ambient/stream ─▶ STT ─▶ ambient log ─┬▶ wake command ─▶ Mission Control
           └─▶ wake word ─▶ (priority flag)                    (sqlite+FTS)├▶ triage (cheap) ─▶ notes / tasks / memory
  camera ─▶ change detect ─▶ frame ─▶ same endpoint ─▶ caption ─┘          └▶ search tool for any agent
                                                                           │
@@ -26,7 +26,7 @@ The goal is an assistant that is always listening (and later always looking). It
 | Capture | Mic always on, camera sometimes | Android foreground service | ESP32-S3 Sense over BLE, phone relays |
 | Edge gate | Drop silence, mark wake | On-device VAD (Silero, ~2 MB) | Same model on a desk node; energy VAD on ESP32 |
 | Transport | Get clips to the daemon, survive being offline | Opus clips over HTTPS, local queue | Same |
-| Ingest | Store, dedupe, order | `POST /ambient/events` | Same |
+| Ingest | Store, dedupe, order | `WS /ambient/stream` | Same |
 | Understanding | Audio to text, frames to captions | See decision D | Speaker labels |
 | Memory | Durable, searchable record | `ambient_events` table + FTS | Embeddings |
 | Agents | Act, digest, recall | Wake commands to MC, hourly triage | Proactive nudges |
@@ -108,7 +108,7 @@ The camera captures a frame when the scene changes, plus one every few minutes a
 
 | # | Step | Where | Status |
 |---|---|---|---|
-| 1 | Ingest endpoint `POST /ambient/events` and `ambient_events` store with search | snippet-service | not started |
+| 1 | Ingest endpoint `WS /ambient/stream` and `ambient_events` store with search | snippet-service | not started |
 | 2 | Transcription behind the ingest, using the existing AssemblyAI path, pluggable later | snippet-service | not started |
 | 3 | Capture core: record, voice detection, local queue, upload with retry | snippet-mobile | not started |
 | 4 | Desktop shells: Mac, Linux, Windows (tray, login item, mute) | snippet-mobile | not started |
