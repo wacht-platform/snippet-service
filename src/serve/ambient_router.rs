@@ -25,6 +25,19 @@ const LIVE_REPLY_THRESHOLD: f64 = 0.55;
 const MATCH_THRESHOLD: f64 = 0.7;
 const MEMORABLE_THRESHOLD: f64 = 0.65;
 
+type Pending = (Vec<String>, String, tokio::task::JoinHandle<Verdict>);
+
+fn classify_turn(d: &Shared, turn: &[Part], pending: &mut Option<Pending>) {
+    if let Some((_, _, h)) = pending.take() {
+        h.abort();
+    }
+    let ids: Vec<String> = turn.iter().map(|p| p.id.clone()).collect();
+    let text = turn.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
+    let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
+    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await });
+    *pending = Some((ids, text, h));
+}
+
 #[derive(Clone)]
 pub(crate) struct Part {
     pub id: String,
@@ -89,6 +102,7 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
     let mut turn: Vec<Part> = Vec::new();
     let mut deadline: Option<Instant> = None;
     let mut last: Option<Flushed> = None;
+    let mut pending: Option<Pending> = None;
     loop {
         let next = [deadline, stalled.map(|s| s + STALL)].into_iter().flatten().min();
         let wake = match next {
@@ -110,7 +124,7 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
             }
             Wake::Msg(Msg::Done(part)) => {
                 if part.seq <= 0 {
-                    accept(&d, &device, part, &mut turn, &mut deadline, &mut last).await;
+                    accept(&d, &device, part, &mut turn, &mut deadline, &mut last, &mut pending).await;
                 } else {
                     announced.remove(&part.seq);
                     buffered.insert(part.seq, Some(part));
@@ -137,7 +151,7 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
             }
             drained_max = drained_max.max(first);
             match buffered.remove(&first) {
-                Some(Some(part)) => accept(&d, &device, part, &mut turn, &mut deadline, &mut last).await,
+                Some(Some(part)) => accept(&d, &device, part, &mut turn, &mut deadline, &mut last, &mut pending).await,
                 Some(None) => {
                     if announced.is_empty() && !turn.is_empty() && deadline.is_some_and(|t| t > Instant::now() + HOLD) {
                         deadline = Some(Instant::now() + HOLD);
@@ -150,8 +164,11 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
         if deadline.is_some_and(|t| Instant::now() >= t) && !turn.is_empty() {
             let parts = std::mem::take(&mut turn);
             deadline = None;
-            flush(&d, &device, parts, crate::ambient::conversation().is_some(), &mut last).await;
+            flush(&d, &device, parts, crate::ambient::conversation().is_some(), &mut last, pending.take()).await;
         }
+    }
+    if let Some((_, _, h)) = pending.take() {
+        h.abort();
     }
 }
 
@@ -182,6 +199,7 @@ async fn accept(
     turn: &mut Vec<Part>,
     deadline: &mut Option<Instant>,
     last: &mut Option<Flushed>,
+    pending: &mut Option<Pending>,
 ) {
     let (phrases, ttl) = {
         let c = d.config.lock().unwrap();
@@ -214,17 +232,17 @@ async fn accept(
     });
     if !mergeable && !turn.is_empty() {
         let parts = std::mem::take(turn);
-        flush(d, device, parts, crate::ambient::conversation().is_some(), last).await;
+        flush(d, device, parts, crate::ambient::conversation().is_some(), last, pending.take()).await;
     }
     turn.push(part);
     if wake {
         let parts = std::mem::take(turn);
         *deadline = None;
-        flush(d, device, parts, true, last).await;
-    } else if crate::ambient::conversation().is_some() {
-        *deadline = Some(Instant::now() + FAST_HOLD);
+        flush(d, device, parts, true, last, pending.take()).await;
     } else {
-        *deadline = Some(Instant::now() + HOLD);
+        classify_turn(d, turn, pending);
+        let hold = if crate::ambient::conversation().is_some() { FAST_HOLD } else { HOLD };
+        *deadline = Some(Instant::now() + hold);
     }
 }
 
@@ -270,7 +288,7 @@ fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool, fr
     (wake || asked || matched, false)
 }
 
-async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mut Option<Flushed>) {
+async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mut Option<Flushed>, pending: Option<Pending>) {
     if parts.is_empty() {
         return;
     }
@@ -295,8 +313,16 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let live = crate::ambient::conversation().is_some();
     let pinned = crate::ambient::is_pinned();
 
-    let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-    let mut task = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await });
+    let mut task = match pending {
+        Some((pids, _, h)) if pids == ids => h,
+        other => {
+            if let Some((_, _, h)) = other {
+                h.abort();
+            }
+            let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
+            tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await })
+        }
+    };
     let mut delivered = false;
     let mut early: Option<Verdict> = None;
     if fast && routable && !from_others {

@@ -13,13 +13,20 @@ use crate::tools::ToolError;
 /// (not a total timeout) never cuts off a long-but-active generation, since each
 /// received chunk resets it.
 pub fn model_http_client(user_agent: Option<&str>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .read_timeout(std::time::Duration::from_secs(180));
-    if let Some(ua) = user_agent {
-        builder = builder.user_agent(ua);
-    }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    static CLIENTS: std::sync::OnceLock<Mutex<std::collections::HashMap<Option<String>, reqwest::Client>>> = std::sync::OnceLock::new();
+    let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
+    clients
+        .entry(user_agent.map(str::to_string))
+        .or_insert_with(|| {
+            let mut builder = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .read_timeout(std::time::Duration::from_secs(180));
+            if let Some(ua) = user_agent {
+                builder = builder.user_agent(ua);
+            }
+            builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
 }
 
 /// Turn a failed model HTTP response into a short, human-readable explanation

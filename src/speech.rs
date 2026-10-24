@@ -96,6 +96,17 @@ pub fn chunk_path(turn: i64, seq: i64) -> std::path::PathBuf {
     crate::tts::audio_dir().join(turn.to_string()).join(format!("{seq}.pcm"))
 }
 
+static CHUNK_READY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+pub fn chunk_ready() -> &'static tokio::sync::Notify {
+    CHUNK_READY.get_or_init(tokio::sync::Notify::new)
+}
+
+pub fn chunk_wanted(turn: i64) -> bool {
+    let running = CURRENT.lock().unwrap().as_ref().is_some_and(|(t, _, _)| *t == turn);
+    running || QUEUE.lock().unwrap().iter().any(|j| j.turn == turn)
+}
+
 pub fn pending() -> bool {
     CURRENT.lock().unwrap().is_some() || !QUEUE.lock().unwrap().is_empty()
 }
@@ -277,6 +288,7 @@ async fn run_job(job: Job) {
                         Ok(())
                     });
                 }
+                chunk_ready().notify_waiters();
                 made += 1;
                 if made == 1 {
                     crate::ambient::mark_last("first_chunk");
@@ -312,6 +324,7 @@ async fn run_job(job: Job) {
     }
     emit(json!({"kind": "ambient_speech_end", "turn": job.turn, "count": made, "device": job.device}));
     *CURRENT.lock().unwrap() = None;
+    chunk_ready().notify_waiters();
     crate::ambient::emit_state("speech synthesised");
 }
 
@@ -402,6 +415,7 @@ pub fn interrupt(device: &str) -> bool {
 pub fn cancel_all(reason: &str) {
     eprintln!("[ambient-speech] cancel_all reason={reason}");
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
+    chunk_ready().notify_waiters();
     for job in &queued {
         set_status(job.turn, "cancelled");
         emit(json!({"kind": "ambient_speech_cancel", "turn": job.turn, "after_seq": -1, "reason": reason, "device": job.device}));
@@ -457,6 +471,7 @@ pub fn barge(turn: i64, seq: i64, played_ms: i64) {
     eprintln!("[ambient-speech] barge turn={turn} seq={seq} played_ms={played_ms}");
     let text = heard(turn, seq, played_ms);
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
+    chunk_ready().notify_waiters();
     for job in &queued {
         set_status(job.turn, "cancelled");
         emit(json!({"kind": "ambient_speech_cancel", "turn": job.turn, "after_seq": -1, "reason": "interrupted", "device": job.device}));

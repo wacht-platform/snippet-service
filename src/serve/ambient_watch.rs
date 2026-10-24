@@ -105,6 +105,8 @@ fn classifier_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(4))
+            .pool_idle_timeout(None)
+            .tcp_keepalive(Duration::from_secs(30))
             .build()
             .unwrap_or_default()
     })

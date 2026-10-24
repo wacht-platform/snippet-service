@@ -734,10 +734,21 @@ pub(crate) async fn turn_chunk(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    match tokio::fs::read(crate::speech::chunk_path(id, seq)).await {
-        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "audio/L16;rate=24000;channels=1")], bytes).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "chunk not ready").into_response(),
+    let path = crate::speech::chunk_path(id, seq);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let ready = crate::speech::chunk_ready().notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            return ([(axum::http::header::CONTENT_TYPE, "audio/L16;rate=24000;channels=1")], bytes).into_response();
+        }
+        if !crate::speech::chunk_wanted(id) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let _ = tokio::time::timeout_at(deadline, ready).await;
     }
+    (StatusCode::NOT_FOUND, "chunk not ready").into_response()
 }
 
 pub(crate) async fn end_conversation(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
