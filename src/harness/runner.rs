@@ -448,7 +448,17 @@ impl CodingHarness {
                         if self.config.memory_enabled && self.context.lane_origin().is_none() {
                             self.tidy_memory();
                         }
+                        let voice_turn = state
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|m| match m {
+                                HarnessMessage::User { content } => Some(content.contains("<ambient_turn")),
+                                _ => None,
+                            })
+                            .unwrap_or(false);
                         if matches!(kind, TurnEndKind::Complete)
+                            && !voice_turn
                             && self.config.memory_enabled
                             && self.config.memory_reflect
                             && self.context.owner() == "main"

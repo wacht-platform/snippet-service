@@ -257,6 +257,35 @@ pub fn end_conversation() {
     }
 }
 
+pub fn mark(id: &str, stage: &str) {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    let mut map = T.get_or_init(Default::default).lock().unwrap();
+    let now = std::time::Instant::now();
+    if stage == "end" {
+        if map.len() > 64 {
+            map.clear();
+        }
+        map.insert(id.to_string(), now);
+    }
+    if stage == "deliver" {
+        *last().lock().unwrap() = id.to_string();
+    }
+    let ms = map.get(id).map(|t| now.duration_since(*t).as_millis()).unwrap_or(0);
+    eprintln!("[ambient-t] {} {stage} +{ms}ms", &id[..id.len().min(8)]);
+}
+
+fn last() -> &'static std::sync::Mutex<String> {
+    static L: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+    L.get_or_init(Default::default)
+}
+
+pub fn mark_last(stage: &str) {
+    let id = last().lock().unwrap().clone();
+    if !id.is_empty() {
+        mark(&id, stage);
+    }
+}
+
 pub(crate) fn store() -> Result<Store, String> {
     Store::open_cached(crate::store::default_db_path()).map_err(|e| e.to_string())
 }

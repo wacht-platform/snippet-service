@@ -209,6 +209,7 @@ fn start_worker() {
 
 async fn run_job(job: Job) {
     *CURRENT.lock().unwrap() = Some((job.turn, job.cancel.clone(), job.device.clone()));
+    crate::ambient::mark_last("speech_start");
     crate::ambient::emit_state("speaking");
     emit(json!({
         "kind": "ambient_speech_start",
@@ -239,6 +240,9 @@ async fn run_job(job: Job) {
                     });
                 }
                 made += 1;
+                if made == 1 {
+                    crate::ambient::mark_last("first_chunk");
+                }
                 emit(json!({
                     "kind": "ambient_speech_chunk",
                     "turn": job.turn,
@@ -620,6 +624,7 @@ pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<cr
         match event {
             ToolArgEvent::Start { call_id, name } => {
                 if name == "speak" || name.ends_with("__speak") {
+                    crate::ambient::mark_last("speak_call");
                     call = Some(call_id);
                     raw.clear();
                     sent = 0;

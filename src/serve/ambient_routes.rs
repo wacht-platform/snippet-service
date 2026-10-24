@@ -330,17 +330,7 @@ pub(crate) async fn ingest(
 }
 
 pub(super) fn mark(id: &str, stage: &str) {
-    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
-    let mut map = T.get_or_init(Default::default).lock().unwrap();
-    let now = std::time::Instant::now();
-    if stage == "end" {
-        if map.len() > 64 {
-            map.clear();
-        }
-        map.insert(id.to_string(), now);
-    }
-    let ms = map.get(id).map(|t| now.duration_since(*t).as_millis()).unwrap_or(0);
-    eprintln!("[ambient-t] {} {stage} +{ms}ms", &id[..id.len().min(8)]);
+    crate::ambient::mark(id, stage);
 }
 
 type Early = tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>;
