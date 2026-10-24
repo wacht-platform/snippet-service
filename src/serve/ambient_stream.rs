@@ -39,6 +39,8 @@ struct Open {
     quiet: usize,
     voiced: usize,
     checks: u8,
+    asm: Option<super::assembly::Handle>,
+    forced: bool,
     spec: Option<(usize, tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>)>,
 }
 
@@ -101,6 +103,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                     if seg.pcm.len() + b.len() - 4 <= MAX_SEGMENT_PCM {
                         let body = &b[4..];
                         seg.pcm.extend_from_slice(body);
+                        if let Some(a) = seg.asm.as_mut() {
+                            a.push(body);
+                        }
                         if body.len() <= 2048 {
                             let level = rms(body);
                             seg.peak = seg.peak.max(level);
@@ -109,6 +114,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             } else {
                                 seg.quiet = 0;
                                 seg.voiced += body.len();
+                                seg.forced = false;
                                 let due = (seg.checks == 0 && seg.voiced >= 12_800) || (seg.checks == 1 && seg.voiced >= 38_400);
                                 if due && !device.is_empty() && crate::speech::is_audible(&device) {
                                     seg.checks += 1;
@@ -132,7 +138,13 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                     h.abort();
                                 }
                             }
-                            if seg.quiet >= QUIET_BYTES && seg.spec.is_none() && seg.pcm.len() >= 16_000 {
+                            if seg.quiet >= QUIET_BYTES && seg.asm.is_some() && !seg.forced && seg.pcm.len() >= 16_000 {
+                                seg.forced = true;
+                                if let Some(a) = seg.asm.as_mut() {
+                                    a.force();
+                                }
+                            }
+                            if seg.quiet >= QUIET_BYTES && seg.asm.is_none() && seg.spec.is_none() && seg.pcm.len() >= 16_000 {
                                 let samples: Vec<f32> =
                                     seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
                                 let len = seg.pcm.len();
@@ -161,7 +173,25 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
                             super::ambient_routes::announce(&d, &device, seq, false);
                         }
-                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, spec: None });
+                        d.reload_config().await;
+                        let asm = if v.get("live").and_then(|x| x.as_bool()).unwrap_or(false) {
+                            let c = d.config.lock().unwrap();
+                            let key = c.assemblyai_api_key.clone().filter(|k| !k.trim().is_empty());
+                            if c.ambient.stt == "assemblyai" && key.is_some() {
+                                let mut terms: Vec<String> = c.ambient.wake_phrases.clone();
+                                for extra in ["Snippet", "Mission Control"] {
+                                    if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
+                                        terms.push(extra.to_string());
+                                    }
+                                }
+                                key.map(|k| super::assembly::start(k, terms))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, asm, forced: false, spec: None });
                     }
                     Some("skip") => {
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
@@ -186,6 +216,30 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         }
                         if let Some(n) = v.get("bytes").and_then(|x| x.as_u64()) {
                             seg.pcm.truncate((n as usize) & !1);
+                        }
+                        if let Some(handle) = seg.asm.take() {
+                            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                                let samples: Vec<f32> = seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+                                let (dd, ident) = (d.clone(), id.to_string());
+                                let task = tokio::spawn(async move {
+                                    let outcome = handle.finish().await;
+                                    let permit = super::ambient_routes::gate().acquire_owned().await.ok();
+                                    let result = match outcome {
+                                        Ok(t) if !t.text.trim().is_empty() => {
+                                            crate::ambient::mark(&ident, "assembly");
+                                            super::transcribe::transcribe_samples_with(&dd, samples, Some((t.text, t.words))).await
+                                        }
+                                        Ok(_) => super::transcribe::transcribe_samples_with(&dd, samples, Some((String::new(), Vec::new()))).await,
+                                        Err(e) => {
+                                            eprintln!("[ambient] AssemblyAI failed, using local speech recognition: {e}");
+                                            super::transcribe::transcribe_samples(&dd, samples).await
+                                        }
+                                    };
+                                    drop(permit);
+                                    result
+                                });
+                                super::ambient_routes::precomputed().lock().unwrap().insert(id.to_string(), task);
+                            }
                         }
                         if let Some((len, handle)) = seg.spec.take() {
                             let tail_ok = len <= seg.pcm.len()

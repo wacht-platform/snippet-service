@@ -144,8 +144,24 @@ pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken
 }
 
 pub(super) async fn transcribe_samples(d: &Shared, samples: Vec<f32>) -> Result<Spoken, String> {
+    transcribe_samples_with(d, samples, None).await
+}
+
+pub(super) async fn transcribe_samples_with(
+    d: &Shared,
+    samples: Vec<f32>,
+    external: Option<(String, Vec<crate::stt::Word>)>,
+) -> Result<Spoken, String> {
     let ready = crate::models::is_ready(crate::models::SPEAKER_MODEL);
-    let words = crate::stt::transcribe_words(crate::models::STT_MODEL, samples.clone());
+    let words = {
+        let samples = samples.clone();
+        async move {
+            match external {
+                Some(found) => Ok(found),
+                None => crate::stt::transcribe_words(crate::models::STT_MODEL, samples).await,
+            }
+        }
+    };
     let analysis = {
         let d = d.clone();
         tokio::task::spawn_blocking(move || {
@@ -209,7 +225,17 @@ pub(super) async fn transcribe_samples(d: &Shared, samples: Vec<f32>) -> Result<
         }
     }
     if lines.is_empty() {
-        lines.push((-1, text.clone(), 0.0, 0.0));
+        let mut totals: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+        for t in &turns {
+            *totals.entry(t.speaker).or_default() += t.end - t.start;
+        }
+        let lead = totals
+            .into_iter()
+            .filter(|(id, _)| *id != -1)
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(id, _)| id)
+            .unwrap_or(-1);
+        lines.push((lead, text.clone(), 0.0, 0.0));
     } else if lines.len() == 1 {
         lines[0].1 = text.clone();
     }

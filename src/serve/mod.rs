@@ -39,6 +39,7 @@ mod ambient_routes;
 mod ambient_context;
 mod ambient_router;
 mod ambient_stream;
+mod assembly;
 mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
