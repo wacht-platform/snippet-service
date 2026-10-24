@@ -85,7 +85,15 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             let _ = out_tx.send(serde_json::json!({"t":"err","h":h,"code":429}).to_string());
                             continue;
                         }
+                        if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
+                            super::ambient_routes::announce(&d, &device, seq, false);
+                        }
                         open.insert(h, Open { meta: v, pcm: Vec::new() });
+                    }
+                    Some("skip") => {
+                        if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
+                            super::ambient_routes::announce(&d, &device, seq, true);
+                        }
                     }
                     Some("abort") => {
                         open.remove(&h);
@@ -98,8 +106,13 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(ms) = v.get("duration_ms") {
                             seg.meta["duration_ms"] = ms.clone();
                         }
-                        if let Some(m) = v.get("media") {
-                            seg.meta["media"] = m.clone();
+                        for key in ["media", "during_playback"] {
+                            if let Some(m) = v.get(key) {
+                                seg.meta[key] = m.clone();
+                            }
+                        }
+                        if let Some(n) = v.get("bytes").and_then(|x| x.as_u64()) {
+                            seg.pcm.truncate((n as usize) & !1);
                         }
                         let d = d.clone();
                         let out = out_tx.clone();

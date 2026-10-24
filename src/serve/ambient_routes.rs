@@ -508,6 +508,17 @@ pub(crate) async fn activity(
     Json(serde_json::json!({"ok": true})).into_response()
 }
 
+pub(super) fn announce(d: &Shared, device: &str, seq: i64, skip: bool) {
+    if !lease_holder().is_some_and(|(h, _)| h == device) {
+        return;
+    }
+    if skip && seq > 0 {
+        super::ambient_router::submit(d, device, super::ambient_router::Msg::Skip(seq));
+    } else {
+        super::ambient_router::submit(d, device, super::ambient_router::Msg::Activity(Some(seq)));
+    }
+}
+
 pub(crate) fn resume(d: Shared) {
     let pending: Vec<String> = d
         .store
