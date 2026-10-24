@@ -150,7 +150,7 @@ pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken
     };
     let (words, analysis) = tokio::join!(words, analysis);
     let (text, words) = words?;
-    let text = collapse_repeats(&text);
+    let text = fix_wake_spelling(&collapse_repeats(&text));
     let words: Vec<crate::stt::Word> = {
         let mut kept: Vec<crate::stt::Word> = Vec::new();
         let mut run = 0;
@@ -272,4 +272,14 @@ fn is_filler(text: &str) -> bool {
         .map(str::to_string)
         .collect();
     !words.is_empty() && words.len() <= 3 && words.iter().all(|w| FILLER.contains(&w.as_str()))
+}
+
+fn fix_wake_spelling(text: &str) -> String {
+    let lower = text.to_lowercase();
+    for variant in ["snip it", "snip but", "snip bit", "snippit", "snipit", "snip pet"] {
+        if lower.starts_with(variant) {
+            return format!("Snippet{}", &text[variant.len()..]);
+        }
+    }
+    text.to_string()
 }
