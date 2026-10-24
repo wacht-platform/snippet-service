@@ -8,6 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
 use super::{unauthorized, Shared};
+use crate::tts_stream::PhoneFrame;
 
 const MAX_SEGMENT_PCM: usize = 16_000 * 2 * 120;
 const MAX_OPEN: usize = 4;
@@ -83,14 +84,19 @@ fn wav(pcm: &[u8]) -> Vec<u8> {
 
 async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>) {
     let (mut tx, mut rx) = socket.split();
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<PhoneFrame>();
     let writer = tokio::spawn(async move {
-        while let Some(text) = out_rx.recv().await {
-            if tx.send(Message::Text(text.into())).await.is_err() {
+        while let Some(frame) = out_rx.recv().await {
+            let msg = match frame {
+                PhoneFrame::Text(text) => Message::Text(text.into()),
+                PhoneFrame::Binary(bytes) => Message::Binary(bytes.into()),
+            };
+            if tx.send(msg).await.is_err() {
                 break;
             }
         }
     });
+    let mut phone: Option<u64> = None;
     let mut open: HashMap<u32, Open> = HashMap::new();
     while let Some(Ok(msg)) = rx.next().await {
         match msg {
@@ -168,7 +174,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                 match v.get("t").and_then(|x| x.as_str()) {
                     Some("start") => {
                         if open.len() >= MAX_OPEN {
-                            let _ = out_tx.send(serde_json::json!({"t":"err","h":h,"code":429}).to_string());
+                            let _ = out_tx.send(PhoneFrame::Text(serde_json::json!({"t":"err","h":h,"code":429}).to_string()));
                             continue;
                         }
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
@@ -204,7 +210,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                     }
                     Some("end") => {
                         let Some(mut seg) = open.remove(&h) else {
-                            let _ = out_tx.send(serde_json::json!({"t":"err","h":h,"code":404}).to_string());
+                            let _ = out_tx.send(PhoneFrame::Text(serde_json::json!({"t":"err","h":h,"code":404}).to_string()));
                             continue;
                         };
                         if let Some(ms) = v.get("duration_ms") {
@@ -264,14 +270,30 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         tokio::spawn(async move {
                             let (code, status) = finish(d, device, token, seg).await;
                             let id = v.get("id").cloned().unwrap_or_default();
-                            let _ = out.send(serde_json::json!({"t":"done","h":h,"id":id,"code":code,"status":status}).to_string());
+                            let _ = out.send(PhoneFrame::Text(serde_json::json!({"t":"done","h":h,"id":id,"code":code,"status":status}).to_string()));
                         });
                     }
                     Some("stat") => {
                         eprintln!("[ambient-stat] {device} {v}");
                     }
+                    Some("caps") => {
+                        if !device.is_empty() && v.get("tts_stream").and_then(|x| x.as_i64()).unwrap_or(0) > 0 {
+                            if let Some(old) = phone.take() {
+                                crate::tts_stream::unregister_phone(&device, old);
+                            }
+                            phone = Some(crate::tts_stream::register_phone(&device, out_tx.clone()));
+                        }
+                    }
+                    Some("tts_pos") => {
+                        let turn = v.get("turn").and_then(|x| x.as_i64()).unwrap_or(0);
+                        let ms = v.get("ms").and_then(|x| x.as_i64()).unwrap_or(0);
+                        let done = v.get("done").and_then(|x| x.as_bool()).unwrap_or(false);
+                        if !device.is_empty() {
+                            crate::tts_stream::report_pos(&device, turn, ms, done);
+                        }
+                    }
                     Some("ping") => {
-                        let _ = out_tx.send(serde_json::json!({"t":"pong"}).to_string());
+                        let _ = out_tx.send(PhoneFrame::Text(serde_json::json!({"t":"pong"}).to_string()));
                     }
                     _ => {}
                 }
@@ -279,6 +301,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
             Message::Close(_) => break,
             _ => {}
         }
+    }
+    if let Some(id) = phone {
+        crate::tts_stream::unregister_phone(&device, id);
     }
     drop(out_tx);
     let _ = writer.await;

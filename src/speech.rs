@@ -76,6 +76,14 @@ struct Provisional {
 }
 
 static STREAMING: Mutex<Option<Provisional>> = Mutex::new(None);
+
+struct FluxProvisional {
+    turn: Arc<crate::tts_stream::StreamTurn>,
+    token: u64,
+}
+
+static FLUX_STREAMING: Mutex<Option<FluxProvisional>> = Mutex::new(None);
+static STREAM_INTERRUPTED: Mutex<Option<String>> = Mutex::new(None);
 static DIRECT: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
 
 fn normalise(t: &str) -> String {
@@ -108,7 +116,7 @@ pub fn chunk_wanted(turn: i64) -> bool {
 }
 
 pub fn pending() -> bool {
-    CURRENT.lock().unwrap().is_some() || !QUEUE.lock().unwrap().is_empty()
+    CURRENT.lock().unwrap().is_some() || !QUEUE.lock().unwrap().is_empty() || crate::tts_stream::busy()
 }
 
 pub fn cut_view(text: &str) -> Option<String> {
@@ -137,7 +145,18 @@ pub fn cut_view(text: &str) -> Option<String> {
 }
 
 pub fn take_interruption() -> Option<String> {
-    INTERRUPTED.lock().unwrap().take()
+    let chunk = INTERRUPTED.lock().unwrap().take();
+    let stream = STREAM_INTERRUPTED.lock().unwrap().take();
+    match (chunk, stream) {
+        (_, Some(s)) if !s.trim().is_empty() => Some(s),
+        (Some(c), _) => Some(c),
+        (None, s) => s,
+    }
+}
+
+pub(crate) fn note_stream_interruption(text: String) {
+    *STREAM_INTERRUPTED.lock().unwrap() = Some(text);
+    crate::ambient::emit_state("interrupted");
 }
 
 fn emit(value: Value) {
@@ -203,6 +222,35 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
     if let Some(kind) = expecting.filter(|k| !k.is_empty() && *k != "none") {
         crate::ambient::set_expectation(kind, about.unwrap_or(""), 10);
     }
+    let mut say = text.to_string();
+    let flux = {
+        let mut guard = FLUX_STREAMING.lock().unwrap();
+        let p = guard.take();
+        if p.is_none() && STREAMING.lock().unwrap().is_none() {
+            *DIRECT.lock().unwrap() = Some((std::time::Instant::now(), normalise(text)));
+        }
+        p
+    };
+    if let Some(p) = flux {
+        let sent = p.turn.text();
+        if normalise(text).starts_with(&normalise(&sent)) {
+            let rest = match text.strip_prefix(sent.trim_start()) {
+                Some(r) => r.to_string(),
+                None => {
+                    let skip = sent.split_whitespace().count();
+                    format!(" {}", text.split_whitespace().skip(skip).collect::<Vec<_>>().join(" "))
+                }
+            };
+            if p.turn.is_stopped() || rest.trim().is_empty() || p.turn.push(&rest) {
+                p.turn.flush();
+                finalise_text(p.turn.turn, text);
+                return Ok(json!({"spoken": true, "turn": p.turn.turn, "queued": true, "streamed": true}));
+            }
+            say = rest.trim().to_string();
+        }
+        p.turn.flush();
+    }
+    let text = say.as_str();
     let provisional = STREAMING.lock().unwrap().take();
     if let Some(p) = provisional {
         let spoken = p.live.text.lock().unwrap().clone();
@@ -226,6 +274,20 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
     }
     if replace {
         cancel_all("replaced");
+    }
+    if let Some(session) = crate::tts_stream::ready(&device).await {
+        match crate::tts_stream::start_turn(&session, &device, &conversation.id) {
+            Ok(t) => {
+                finalise_text(t.turn, text);
+                if t.push(text) {
+                    t.flush();
+                    return Ok(json!({"spoken": true, "turn": t.turn, "queued": true, "streamed": true}));
+                }
+                t.flush();
+                eprintln!("[ambient-flux] turn {} could not be sent, using chunk speech", t.turn);
+            }
+            Err(e) => eprintln!("[ambient-flux] could not start a streamed turn: {e}"),
+        }
     }
     let (live, turn, _) = create_job(&device, &conversation.id)?;
     finalise_text(turn, text);
@@ -376,7 +438,7 @@ fn audible_turns(device: &str) -> Vec<i64> {
 }
 
 pub fn is_audible(device: &str) -> bool {
-    !audible_turns(device).is_empty() || CURRENT.lock().unwrap().is_some()
+    !audible_turns(device).is_empty() || CURRENT.lock().unwrap().is_some() || crate::tts_stream::audible(device)
 }
 
 fn open_turns(device: &str) -> Vec<i64> {
@@ -399,7 +461,7 @@ fn open_turns(device: &str) -> Vec<i64> {
 pub fn interrupt(device: &str) -> bool {
     let turns = audible_turns(device);
     let open = open_turns(device);
-    if turns.is_empty() && open.is_empty() && CURRENT.lock().unwrap().is_none() {
+    if turns.is_empty() && open.is_empty() && CURRENT.lock().unwrap().is_none() && !crate::tts_stream::busy_for(device) {
         return false;
     }
     eprintln!("[ambient-speech] interrupt device={device} turns={turns:?} open={open:?}");
@@ -444,6 +506,7 @@ pub fn interrupt(device: &str) -> bool {
 
 pub fn cancel_all(reason: &str) {
     eprintln!("[ambient-speech] cancel_all reason={reason}");
+    crate::tts_stream::stop(None, reason, None);
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
     chunk_ready().notify_waiters();
     for job in &queued {
@@ -499,6 +562,7 @@ pub fn played(turn: i64, seq: Option<i64>, complete: bool, ttl_secs: u32) {
 
 pub fn barge(turn: i64, seq: i64, played_ms: i64) {
     eprintln!("[ambient-speech] barge turn={turn} seq={seq} played_ms={played_ms}");
+    let streamed = crate::tts_stream::stop(None, "interrupted", Some((turn, played_ms))).contains(&turn);
     let text = heard(turn, seq, played_ms);
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
     chunk_ready().notify_waiters();
@@ -515,6 +579,9 @@ pub fn barge(turn: i64, seq: i64, played_ms: i64) {
                 emit(json!({"kind": "ambient_speech_cancel", "turn": cur, "after_seq": -1, "reason": "interrupted", "device": device}));
             }
         }
+    }
+    if streamed {
+        return;
     }
     if let Ok(store) = crate::ambient::store() {
         let _ = store.with_connection(|c| {
@@ -762,6 +829,71 @@ fn drop_provisional(token: u64) {
     }
 }
 
+enum Route {
+    Pending,
+    Flux(Arc<crate::tts_stream::StreamTurn>, u64),
+    Chunks,
+    Off,
+}
+
+fn fresh_route() -> Route {
+    if crate::tts_stream::enabled() { Route::Pending } else { Route::Chunks }
+}
+
+fn direct_claims(text: &str, done: bool) -> Option<Route> {
+    let guard = DIRECT.lock().unwrap();
+    let (_, said) = guard.as_ref().filter(|(at, _)| at.elapsed().as_secs() < 20)?;
+    let n = normalise(text);
+    if !said.starts_with(&n) {
+        return None;
+    }
+    Some(if done || n.len() >= 24 || *said == n { Route::Off } else { Route::Pending })
+}
+
+async fn open_flux(text: &str, done: bool) -> Route {
+    if let Some(r) = direct_claims(text, done) {
+        return r;
+    }
+    let Ok((device, conversation)) = prepare().await else {
+        return Route::Off;
+    };
+    let Some(session) = crate::tts_stream::ready(&device).await else {
+        return Route::Chunks;
+    };
+    let mut guard = FLUX_STREAMING.lock().unwrap();
+    if let Some(r) = direct_claims(text, done) {
+        return r;
+    }
+    match crate::tts_stream::start_turn(&session, &device, &conversation.id) {
+        Ok(turn) => {
+            let token = TOKEN.fetch_add(1, Ordering::SeqCst);
+            *guard = Some(FluxProvisional { turn: turn.clone(), token });
+            Route::Flux(turn, token)
+        }
+        Err(e) => {
+            eprintln!("[ambient-flux] could not start a streamed turn: {e}");
+            Route::Chunks
+        }
+    }
+}
+
+fn drop_flux_provisional(token: u64) {
+    let mut guard = FLUX_STREAMING.lock().unwrap();
+    if guard.as_ref().is_some_and(|p| p.token == token) {
+        if let Some(p) = guard.take() {
+            p.turn.flush();
+        }
+    }
+}
+
+fn push_suffix(turn: &Arc<crate::tts_stream::StreamTurn>, text: &str, pushed: &mut usize) {
+    let total = text.chars().count();
+    if total > *pushed {
+        turn.push(&text.chars().skip(*pushed).collect::<String>());
+        *pushed = total;
+    }
+}
+
 pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::llm::ToolArgEvent>) {
     use crate::llm::ToolArgEvent;
     let mut call: Option<String> = None;
@@ -769,20 +901,29 @@ pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<cr
     let mut sent = 0usize;
     let mut live: Option<(Arc<Live>, i64, u64)> = None;
     let mut disabled = false;
+    let mut route = Route::Off;
+    let mut pushed = 0usize;
     while let Some(event) = rx.recv().await {
         match event {
             ToolArgEvent::Start { call_id, name } => {
+                if let Route::Flux(turn, token) = &route {
+                    drop_flux_provisional(*token);
+                    turn.flush();
+                }
                 if name == "speak" || name.ends_with("__speak") {
                     crate::ambient::mark_last("speak_call");
                     call = Some(call_id);
                     raw.clear();
                     sent = 0;
+                    pushed = 0;
+                    route = fresh_route();
                     if let Some((_, _, token)) = live.take() {
                         drop_provisional(token);
                     }
                     disabled = false;
                 } else {
                     call = None;
+                    route = Route::Off;
                 }
             }
             ToolArgEvent::Delta { call_id, chunk } => {
@@ -790,41 +931,80 @@ pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<cr
                     continue;
                 }
                 raw.push_str(&chunk);
-                if let Some((text, _)) = extract_text(&raw) {
-                    let chunks = crate::tts::chunk_text(&text);
-                    let ready = chunks.len().saturating_sub(1);
-                    while sent < ready {
-                        feed(&mut live, &mut disabled, chunks[sent].clone()).await;
-                        sent += 1;
+                let Some((text, done)) = extract_text(&raw) else { continue };
+                if matches!(route, Route::Pending) && !text.trim().is_empty() {
+                    route = open_flux(&text, done).await;
+                }
+                match &route {
+                    Route::Flux(turn, _) => push_suffix(turn, &text, &mut pushed),
+                    Route::Chunks => {
+                        let chunks = crate::tts::chunk_text(&text);
+                        let ready = chunks.len().saturating_sub(1);
+                        while sent < ready {
+                            feed(&mut live, &mut disabled, chunks[sent].clone()).await;
+                            sent += 1;
+                        }
                     }
+                    Route::Pending | Route::Off => {}
                 }
             }
             ToolArgEvent::End { call_id } => {
                 if call.as_deref() != Some(call_id.as_str()) {
                     continue;
                 }
-                if let Some((text, _)) = extract_text(&raw).filter(|(t, _)| !(live.is_none() && spoken_directly(t))) {
-                    let chunks = crate::tts::chunk_text(&text);
-                    while sent < chunks.len() {
-                        feed(&mut live, &mut disabled, chunks[sent].clone()).await;
-                        sent += 1;
+                let text = extract_text(&raw).map(|(t, _)| t);
+                if matches!(route, Route::Pending) {
+                    route = match text.as_deref().filter(|t| !t.trim().is_empty() && !spoken_directly(t)) {
+                        Some(t) => open_flux(t, true).await,
+                        None => Route::Off,
+                    };
+                }
+                match &route {
+                    Route::Flux(turn, token) => {
+                        if let Some(t) = &text {
+                            push_suffix(turn, t, &mut pushed);
+                            finalise_text(turn.turn, t.trim());
+                        }
+                        turn.flush();
+                        let token = *token;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            drop_flux_provisional(token);
+                        });
                     }
+                    Route::Chunks => {
+                        if let Some(text) = text.filter(|t| !(live.is_none() && spoken_directly(t))) {
+                            let chunks = crate::tts::chunk_text(&text);
+                            while sent < chunks.len() {
+                                feed(&mut live, &mut disabled, chunks[sent].clone()).await;
+                                sent += 1;
+                            }
+                        }
+                        if let Some((_, _, token)) = live.take() {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                drop_provisional(token);
+                            });
+                        }
+                    }
+                    Route::Pending | Route::Off => {}
                 }
-                if let Some((_, _, token)) = live.take() {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        drop_provisional(token);
-                    });
-                }
+                route = Route::Off;
                 call = None;
             }
             ToolArgEvent::Reset => {
+                if let Route::Flux(turn, token) = &route {
+                    drop_flux_provisional(*token);
+                    turn.flush();
+                }
                 if let Some((_, _, token)) = live.take() {
                     drop_provisional(token);
                 }
+                route = Route::Off;
                 call = None;
                 raw.clear();
                 sent = 0;
+                pushed = 0;
             }
         }
     }

@@ -358,8 +358,16 @@ static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub fn apply_config(c: &crate::config::SnippetConfig) {
     let key = c.deepgram_api_key.clone().filter(|k| !k.trim().is_empty());
-    let remote = if c.ambient.tts == "deepgram" { key.map(|k| (k, c.ambient.tts_voice.clone())) } else { None };
+    let remote = match c.ambient.tts.as_str() {
+        "deepgram" => key.map(|k| (k, c.ambient.tts_voice.clone())),
+        "flux" => {
+            let voice = if c.ambient.tts_voice.starts_with("aura") { c.ambient.tts_voice.clone() } else { "aura-2-thalia-en".to_string() };
+            key.map(|k| (k, voice))
+        }
+        _ => None,
+    };
     *REMOTE.lock().unwrap() = remote;
+    crate::tts_stream::apply_config(c);
 }
 
 fn http() -> &'static reqwest::Client {

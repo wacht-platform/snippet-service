@@ -473,6 +473,7 @@ async fn deliver(
     opened: bool,
 ) {
     let _ = ttl;
+    crate::tts_stream::prewarm(device);
     let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
     if let Some(last) = ids.last() {
         super::ambient_routes::mark(last, "deliver");
@@ -511,6 +512,7 @@ async fn deliver(
     if let Some(parent) = continuation_of {
         attrs.push_str(&format!(" continuation_of=\"{}\"", ambient_watch::escape(&parent.join(","))));
     }
+    crate::tts_stream::settle(Duration::from_millis(800)).await;
     if let Some(heard) = crate::speech::take_interruption() {
         attrs.push_str(&format!(" interrupted_reply=\"{}\"", ambient_watch::escape(&heard)));
     }
