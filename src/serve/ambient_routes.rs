@@ -329,6 +329,20 @@ pub(crate) async fn ingest(
         .into_response()
 }
 
+pub(super) fn mark(id: &str, stage: &str) {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = std::sync::OnceLock::new();
+    let mut map = T.get_or_init(Default::default).lock().unwrap();
+    let now = std::time::Instant::now();
+    if stage == "end" {
+        if map.len() > 64 {
+            map.clear();
+        }
+        map.insert(id.to_string(), now);
+    }
+    let ms = map.get(id).map(|t| now.duration_since(*t).as_millis()).unwrap_or(0);
+    eprintln!("[ambient-t] {} {stage} +{ms}ms", &id[..id.len().min(8)]);
+}
+
 type Early = tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>;
 
 pub(super) fn precomputed() -> &'static std::sync::Mutex<std::collections::HashMap<String, Early>> {
@@ -357,6 +371,7 @@ fn spawn_transcription(d: Shared, id: String) {
                 r
             }
         };
+        mark(&id, "transcribed");
         let speaker_is_you = result.as_ref().is_ok_and(|s| s.summary == "you");
         let (status, text, error, speakers, summary) = match result {
             Ok(s) if s.text.is_empty() => ("empty", String::new(), None, None, None),

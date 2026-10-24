@@ -269,6 +269,9 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         return;
     }
     let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
+    if let Some(last) = ids.last() {
+        super::ambient_routes::mark(last, "flush");
+    }
     let text = parts.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
     let summary = merge_summary(&parts);
     let (phrases, ttl) = {
@@ -319,6 +322,9 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         Some(v) => v,
         None => task.await.unwrap_or_else(|_| Verdict::inherited()),
     };
+    if let Some(last) = ids.last() {
+        super::ambient_routes::mark(last, "classified");
+    }
     if !delivered && routable {
         let (go, open) = decide(live, pinned, &verdict, wake, expecting, from_others, summary == "you");
         if go {
@@ -420,6 +426,9 @@ async fn deliver(
 ) {
     let _ = ttl;
     let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
+    if let Some(last) = ids.last() {
+        super::ambient_routes::mark(last, "deliver");
+    }
     let text = parts.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
     let (rendered, names) = render(parts, &text);
     let mode = if opened || crate::ambient::conversation().is_some() { "active" } else { "passive" };

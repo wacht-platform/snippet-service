@@ -177,6 +177,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                 _ => handle.abort(),
                             }
                         }
+                        if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                            super::ambient_routes::mark(id, "end");
+                        }
                         let d = d.clone();
                         let out = out_tx.clone();
                         let device = device.clone();
