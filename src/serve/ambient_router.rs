@@ -21,6 +21,7 @@ const MAX_PARTS: usize = 5;
 const MAX_SPAN: f64 = 30.0;
 const PASSIVE_THRESHOLD: f64 = 0.7;
 const PINNED_THRESHOLD: f64 = 0.5;
+const LIVE_REPLY_THRESHOLD: f64 = 0.55;
 const MATCH_THRESHOLD: f64 = 0.7;
 const MEMORABLE_THRESHOLD: f64 = 0.65;
 
@@ -247,20 +248,25 @@ fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
     }
 }
 
-fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool, from_others: bool, you: bool) -> (bool, bool) {
+fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool, from_others: bool, you: bool, unsure_voice: bool) -> (bool, bool) {
     if !v.kept() || from_others {
         return (false, false);
     }
     let matched = expecting && v.matches >= MATCH_THRESHOLD;
     if live {
-        return (you || wake || matched || v.for_assistant() || v.addressed >= 0.4 || v.continues >= 0.6, false);
+        if wake || matched || v.continues >= 0.6 {
+            return (true, false);
+        }
+        let bar = if unsure_voice && !you { 0.7 } else { LIVE_REPLY_THRESHOLD };
+        return (v.addressed >= bar && (v.for_assistant() || v.addressed >= 0.6), false);
     }
     if pinned {
         let asked = v.for_assistant() && v.addressed >= PINNED_THRESHOLD;
         let go = wake || asked || matched;
         return (go, go);
     }
-    let asked = v.for_assistant() && v.addressed >= if v.kind == "conversation" { 0.55 } else { PASSIVE_THRESHOLD };
+    let bar = if unsure_voice && !you { 0.8 } else if v.kind == "conversation" { 0.55 } else { PASSIVE_THRESHOLD };
+    let asked = v.for_assistant() && v.addressed >= bar;
     (wake || asked || matched, false)
 }
 
@@ -295,7 +301,11 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let mut early: Option<Verdict> = None;
     if fast && routable && !from_others {
         early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
-        if !early.as_ref().is_some_and(|v| !v.kept()) {
+        let go = match &early {
+            Some(v) => decide(live, pinned, v, wake, expecting, from_others, summary == "you", enrolled(d) && summary != "you").0,
+            None => wake,
+        };
+        if go {
             let v = wake_verdict(early.as_ref());
             deliver(d, device, &parts, &v, wake, None, ttl, !live).await;
             delivered = true;
@@ -326,7 +336,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         super::ambient_routes::mark(last, "classified");
     }
     if !delivered && routable {
-        let (go, open) = decide(live, pinned, &verdict, wake, expecting, from_others, summary == "you");
+        let (go, open) = decide(live, pinned, &verdict, wake, expecting, from_others, summary == "you", enrolled(d) && summary != "you");
         if go {
             if open {
                 crate::ambient::open_conversation(device, ttl);
