@@ -379,13 +379,43 @@ pub fn is_audible(device: &str) -> bool {
     !audible_turns(device).is_empty() || CURRENT.lock().unwrap().is_some()
 }
 
+fn open_turns(device: &str) -> Vec<i64> {
+    let Ok(store) = crate::ambient::store() else {
+        return Vec::new();
+    };
+    store
+        .with_connection(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM ambient_turns WHERE device = ?1 AND role = 'assistant' AND created_at >= ?2
+                   AND status NOT IN ('played', 'missed', 'interrupted', 'cancelled', 'failed') ORDER BY id",
+            )?;
+            let since = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)) as i64 - 300;
+            let rows = stmt.query_map(rusqlite::params![device, since], |r| r.get::<_, i64>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default()
+}
+
 pub fn interrupt(device: &str) -> bool {
     let turns = audible_turns(device);
-    if turns.is_empty() && CURRENT.lock().unwrap().is_none() {
+    let open = open_turns(device);
+    if turns.is_empty() && open.is_empty() && CURRENT.lock().unwrap().is_none() {
         return false;
     }
-    eprintln!("[ambient-speech] interrupt device={device} turns={turns:?}");
+    eprintln!("[ambient-speech] interrupt device={device} turns={turns:?} open={open:?}");
     cancel_all("interrupted");
+    if let Ok(store) = crate::ambient::store() {
+        for turn in &open {
+            let _ = store.with_connection(|c| {
+                c.execute(
+                    "UPDATE ambient_turns SET status = 'interrupted' WHERE id = ?1 AND status NOT IN ('played', 'missed', 'interrupted', 'cancelled')",
+                    [turn],
+                )?;
+                Ok(())
+            });
+        }
+    }
+    emit(json!({"kind": "ambient_speech_interrupt", "device": device, "turns": open}));
     let mut heard_text = String::new();
     for turn in &turns {
         let through: i64 = crate::ambient::store()
