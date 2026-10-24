@@ -232,7 +232,7 @@ pub async fn synthesize(voice: &str, text: &str) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())?
 }
 
-const RAMP_WORDS: [usize; 3] = [5, 8, 14];
+const RAMP_WORDS: [usize; 2] = [8, 14];
 const BREAK_BEFORE: &[&str] = &["to", "that", "and", "but", "so", "for", "with", "in", "on", "at", "of", "which", "because", "when", "if", "then"];
 
 fn shorten(first: &str, limit: usize) -> Option<(String, String)> {
@@ -340,6 +340,17 @@ pub fn chunk_text(text: &str) -> Vec<String> {
     final_chunks
 }
 
+fn trim_quiet(mut v: Vec<f32>) -> Vec<f32> {
+    const FLOOR: f32 = 0.004;
+    const KEEP: usize = 360;
+    let first = v.iter().position(|s| s.abs() > FLOOR).unwrap_or(0);
+    let last = v.iter().rposition(|s| s.abs() > FLOOR).unwrap_or(v.len().saturating_sub(1));
+    let end = (last + KEEP).min(v.len());
+    v.truncate(end);
+    v.drain(..first.saturating_sub(KEEP));
+    v
+}
+
 pub async fn synthesize_pcm(voice: &str, text: &str) -> Result<(Vec<u8>, u32), String> {
     if !crate::models::is_ready(voice) {
         return Err("the reply voice is not downloaded".into());
@@ -360,7 +371,7 @@ pub async fn synthesize_pcm(voice: &str, text: &str) -> Result<(Vec<u8>, u32), S
             if !samples.is_empty() {
                 samples.extend(std::iter::repeat_n(0.0f32, GAP_SAMPLES));
             }
-            samples.extend(run(loaded, ids)?);
+            samples.extend(trim_quiet(run(loaded, ids)?));
         }
         let ms = (samples.len() as u64 * 1000 / RATE as u64) as u32;
         let bytes: Vec<u8> = samples
