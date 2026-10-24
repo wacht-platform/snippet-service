@@ -232,6 +232,29 @@ pub async fn synthesize(voice: &str, text: &str) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())?
 }
 
+const FIRST_CHUNK_WORDS: usize = 8;
+const SECOND_CHUNK_WORDS: usize = 14;
+const BREAK_BEFORE: &[&str] = &["to", "that", "and", "but", "so", "for", "with", "in", "on", "at", "of", "which", "because", "when", "if", "then"];
+
+fn shorten(first: &str, limit: usize) -> Option<(String, String)> {
+    let words: Vec<&str> = first.split_whitespace().collect();
+    if words.len() <= limit {
+        return None;
+    }
+    let clause = words.iter().take(limit + 1).position(|w| w.ends_with([',', ';', ':', '\u{2014}'])).filter(|i| i + 1 >= 3);
+    let at = match clause {
+        Some(i) => i + 1,
+        None => (4..limit)
+            .rev()
+            .find(|j| BREAK_BEFORE.contains(&words[*j].to_lowercase().trim_matches(|c: char| !c.is_alphanumeric())))
+            .unwrap_or(limit - 1),
+    };
+    if at >= words.len() {
+        return None;
+    }
+    Some((words[..at].join(" "), words[at..].join(" ")))
+}
+
 pub fn chunk_text(text: &str) -> Vec<String> {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let chars: Vec<char> = flat.chars().collect();
@@ -279,12 +302,21 @@ pub fn chunk_text(text: &str) -> Vec<String> {
     }
     let mut merged: Vec<String> = Vec::new();
     for piece in out {
+        let keep_first = merged.len() == 1;
         match merged.last_mut() {
-            Some(prev) if prev.split_whitespace().count() < 3 => {
+            Some(prev) if !keep_first && prev.split_whitespace().count() < 3 => {
                 prev.push(' ');
                 prev.push_str(&piece);
             }
             _ => merged.push(piece),
+        }
+    }
+    for (i, limit) in [FIRST_CHUNK_WORDS, SECOND_CHUNK_WORDS].into_iter().enumerate() {
+        if let Some(piece) = merged.get(i).cloned() {
+            if let Some((head, tail)) = shorten(&piece, limit) {
+                merged[i] = head;
+                merged.insert(i + 1, tail);
+            }
         }
     }
     let mut final_chunks: Vec<String> = Vec::new();
