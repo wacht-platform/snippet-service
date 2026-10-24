@@ -39,7 +39,7 @@ struct Open {
     quiet: usize,
     voiced: usize,
     checks: u8,
-    asm: Option<super::assembly::Handle>,
+    asm: Option<super::assembly::Ticket>,
     forced: bool,
     spec: Option<(usize, tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>)>,
 }
@@ -184,7 +184,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                         terms.push(extra.to_string());
                                     }
                                 }
-                                key.map(|k| super::assembly::start(k, terms))
+                                key.map(|k| super::assembly::begin(&device, k, terms))
                             } else {
                                 None
                             }

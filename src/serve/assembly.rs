@@ -1,14 +1,18 @@
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const SEND_MIN: usize = 3200;
 const FINISH_WAIT: Duration = Duration::from_millis(1800);
 const EMPTY_WAIT: Duration = Duration::from_millis(1100);
+const IDLE_CLOSE: Duration = Duration::from_secs(300);
+const KEEP_FINALS: usize = 64;
 
 pub(super) struct Transcript {
     pub text: String,
@@ -18,72 +22,171 @@ pub(super) struct Transcript {
 enum Cmd {
     Audio(Vec<u8>),
     Force,
-    Finish,
-    Abort,
 }
 
-pub(super) struct Handle {
+#[derive(Clone)]
+struct Turn {
+    text: String,
+    words: Vec<crate::stt::Word>,
+}
+
+#[derive(Default)]
+struct State {
+    finals: VecDeque<(u64, Turn)>,
+    next: u64,
+    partial: Option<Turn>,
+    closed: Option<String>,
+}
+
+pub(super) struct Session {
     cmd: mpsc::UnboundedSender<Cmd>,
-    result: Option<oneshot::Receiver<Result<Transcript, String>>>,
+    state: Mutex<State>,
+    notify: Notify,
+    flushed: AtomicU64,
+}
+
+fn hub() -> &'static Mutex<HashMap<String, Arc<Session>>> {
+    static HUB: OnceLock<Mutex<HashMap<String, Arc<Session>>>> = OnceLock::new();
+    HUB.get_or_init(Default::default)
+}
+
+pub(super) fn begin(device: &str, key: String, terms: Vec<String>) -> Ticket {
+    let session = {
+        let mut map = hub().lock().unwrap();
+        match map.get(device).filter(|s| s.state.lock().unwrap().closed.is_none()) {
+            Some(existing) => existing.clone(),
+            None => {
+                let (cmd, rx) = mpsc::unbounded_channel();
+                let session = Arc::new(Session { cmd, state: Mutex::new(State::default()), notify: Notify::new(), flushed: AtomicU64::new(0) });
+                map.insert(device.to_string(), session.clone());
+                let (task, name) = (session.clone(), device.to_string());
+                tokio::spawn(async move {
+                    let reason = run(&task, key, terms, rx).await.err().unwrap_or_else(|| "closed".into());
+                    task.state.lock().unwrap().closed = Some(reason);
+                    task.notify.notify_waiters();
+                    let mut map = hub().lock().unwrap();
+                    if map.get(&name).is_some_and(|s| Arc::ptr_eq(s, &task)) {
+                        map.remove(&name);
+                    }
+                });
+                session
+            }
+        }
+    };
+    let start = session.state.lock().unwrap().next;
+    let offset = session.flushed.load(Ordering::SeqCst) as f32 / 32_000.0;
+    Ticket { inner: Some(Inner { session, start, offset, buf: Vec::new() }) }
+}
+
+struct Inner {
+    session: Arc<Session>,
+    start: u64,
+    offset: f32,
     buf: Vec<u8>,
 }
 
-impl Handle {
+pub(super) struct Ticket {
+    inner: Option<Inner>,
+}
+
+impl Inner {
     fn flush(&mut self) {
         if !self.buf.is_empty() {
-            let _ = self.cmd.send(Cmd::Audio(std::mem::take(&mut self.buf)));
+            let bytes = std::mem::take(&mut self.buf);
+            self.session.flushed.fetch_add(bytes.len() as u64, Ordering::SeqCst);
+            let _ = self.session.cmd.send(Cmd::Audio(bytes));
         }
     }
 
+    async fn finish(mut self) -> Result<Transcript, String> {
+        self.flush();
+        let _ = self.session.cmd.send(Cmd::Force);
+        let deadline = tokio::time::Instant::now() + FINISH_WAIT;
+        let empty_deadline = tokio::time::Instant::now() + EMPTY_WAIT;
+        loop {
+            let notified = self.session.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let (have, open, closed, any_partial) = {
+                let s = self.session.state.lock().unwrap();
+                (s.finals.iter().any(|(i, _)| *i >= self.start), s.partial.is_some(), s.closed.clone(), s.partial.is_some())
+            };
+            if have && !open {
+                break;
+            }
+            if let Some(reason) = closed {
+                if !have && !any_partial {
+                    return Err(reason);
+                }
+                break;
+            }
+            let limit = if have || any_partial { deadline } else { empty_deadline };
+            if tokio::time::timeout_at(limit, notified).await.is_err() {
+                break;
+            }
+        }
+        let s = self.session.state.lock().unwrap();
+        let mut text = String::new();
+        let mut words: Vec<crate::stt::Word> = Vec::new();
+        let mut parts: Vec<&Turn> = s.finals.iter().filter(|(i, _)| *i >= self.start).map(|(_, t)| t).collect();
+        if let Some(p) = s.partial.as_ref() {
+            parts.push(p);
+        }
+        for turn in parts {
+            if turn.text.is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&turn.text);
+            words.extend(turn.words.iter().map(|w| crate::stt::Word {
+                text: w.text.clone(),
+                start: (w.start - self.offset).max(0.0),
+                end: (w.end - self.offset).max(0.0),
+            }));
+        }
+        Ok(Transcript { text, words })
+    }
+}
+
+impl Ticket {
     pub fn push(&mut self, pcm: &[u8]) {
-        self.buf.extend_from_slice(pcm);
-        if self.buf.len() >= SEND_MIN {
-            self.flush();
+        if let Some(inner) = self.inner.as_mut() {
+            inner.buf.extend_from_slice(pcm);
+            if inner.buf.len() >= SEND_MIN {
+                inner.flush();
+            }
         }
     }
 
     pub fn force(&mut self) {
-        self.flush();
-        let _ = self.cmd.send(Cmd::Force);
+        if let Some(inner) = self.inner.as_mut() {
+            inner.flush();
+            let _ = inner.session.cmd.send(Cmd::Force);
+        }
     }
 
     pub async fn finish(mut self) -> Result<Transcript, String> {
-        self.flush();
-        let _ = self.cmd.send(Cmd::Finish);
-        let rx = self.result.take().ok_or("already finished")?;
-        match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Err("session ended".into()),
-            Err(_) => Err("timed out".into()),
+        match self.inner.take() {
+            Some(inner) => inner.finish().await,
+            None => Err("already finished".into()),
         }
     }
 }
 
-impl Drop for Handle {
+impl Drop for Ticket {
     fn drop(&mut self) {
-        if self.result.is_some() {
-            let _ = self.cmd.send(Cmd::Abort);
+        if let Some(inner) = self.inner.take() {
+            tokio::spawn(async move {
+                let _ = inner.finish().await;
+            });
         }
     }
 }
 
-pub(super) fn start(key: String, terms: Vec<String>) -> Handle {
-    let (cmd, rx) = mpsc::unbounded_channel();
-    let (done_tx, done_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let _ = done_tx.send(run(key, terms, rx).await);
-    });
-    Handle { cmd, result: Some(done_rx), buf: Vec::new() }
-}
-
-struct Turn {
-    text: String,
-    words: Vec<crate::stt::Word>,
-    ended: bool,
-}
-
-fn parse_turn(v: &serde_json::Value) -> Option<(i64, Turn)> {
-    let order = v.get("turn_order").and_then(|x| x.as_i64())?;
+fn parse_turn(v: &serde_json::Value) -> Option<(bool, Turn)> {
+    v.get("turn_order").and_then(|x| x.as_i64())?;
     let text = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
     let ended = v.get("end_of_turn").and_then(|x| x.as_bool()).unwrap_or(false);
     let words = v
@@ -101,10 +204,10 @@ fn parse_turn(v: &serde_json::Value) -> Option<(i64, Turn)> {
                 .collect()
         })
         .unwrap_or_default();
-    Some((order, Turn { text, words, ended }))
+    Some((ended, Turn { text, words }))
 }
 
-async fn run(key: String, terms: Vec<String>, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<Transcript, String> {
+async fn run(session: &Arc<Session>, key: String, terms: Vec<String>, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
     let keyterms = serde_json::to_string(&terms).map_err(|e| e.to_string())?;
     let url = format!(
         "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&mode=balanced&language_codes={}&keyterms_prompt={}",
@@ -118,72 +221,59 @@ async fn run(key: String, terms: Vec<String>, mut cmd: mpsc::UnboundedReceiver<C
         .map_err(|_| "AssemblyAI connect timed out".to_string())?
         .map_err(|e| format!("AssemblyAI connect failed: {e}"))?;
     let (mut tx, mut rx) = ws.split();
-    let mut turns: BTreeMap<i64, Turn> = BTreeMap::new();
-    let mut deadline: Option<tokio::time::Instant> = None;
-    let mut open = true;
+    let mut last_audio = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
     loop {
         tokio::select! {
-            c = cmd.recv(), if open => match c {
+            c = cmd.recv() => match c {
                 Some(Cmd::Audio(b)) => {
-                    if tx.send(Message::Binary(b.into())).await.is_err() {
-                        return Err("AssemblyAI connection dropped".into());
-                    }
+                    last_audio = Instant::now();
+                    tx.send(Message::Binary(b.into())).await.map_err(|_| "AssemblyAI connection dropped".to_string())?;
                 }
                 Some(Cmd::Force) => {
                     let _ = tx.send(Message::Text("{\"type\":\"ForceEndpoint\"}".into())).await;
                 }
-                Some(Cmd::Abort) => {
-                    let _ = tx.send(Message::Text("{\"type\":\"Terminate\"}".into())).await;
-                    return Err("aborted".into());
-                }
-                Some(Cmd::Finish) | None => {
-                    open = false;
-                    let _ = tx.send(Message::Text("{\"type\":\"ForceEndpoint\"}".into())).await;
-                    let wait = if turns.is_empty() { EMPTY_WAIT } else { FINISH_WAIT };
-                    deadline = Some(tokio::time::Instant::now() + wait);
-                }
+                None => break,
             },
             m = rx.next() => match m {
                 Some(Ok(Message::Text(t))) => {
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
                     match v.get("type").and_then(|x| x.as_str()) {
                         Some("Turn") => {
-                            if let Some((order, turn)) = parse_turn(&v) {
-                                let keep = turns.get(&order).is_some_and(|old| old.ended && !turn.ended);
-                                if !keep {
-                                    turns.insert(order, turn);
+                            if let Some((ended, turn)) = parse_turn(&v) {
+                                let mut s = session.state.lock().unwrap();
+                                if ended {
+                                    let idx = s.next;
+                                    s.next += 1;
+                                    s.finals.push_back((idx, turn));
+                                    while s.finals.len() > KEEP_FINALS {
+                                        s.finals.pop_front();
+                                    }
+                                    s.partial = None;
+                                } else {
+                                    s.partial = Some(turn);
                                 }
-                                if !open && !turns.is_empty() && turns.values().all(|t| t.ended) {
-                                    break;
-                                }
+                                drop(s);
+                                session.notify.notify_waiters();
                             }
                         }
-                        Some("Termination") => break,
-                        Some(other) if other.eq_ignore_ascii_case("error") => {
-                            return Err(format!("AssemblyAI error: {t}"));
-                        }
+                        Some("Termination") => return Err("AssemblyAI ended the session".into()),
+                        Some(other) if other.eq_ignore_ascii_case("error") => return Err(format!("AssemblyAI error: {t}")),
                         _ => {}
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Close(_))) | None => return Err("AssemblyAI closed the connection".into()),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(format!("AssemblyAI stream error: {e}")),
             },
-            _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => break,
+            _ = tick.tick() => {
+                if last_audio.elapsed() >= IDLE_CLOSE {
+                    let _ = tx.send(Message::Text("{\"type\":\"Terminate\"}".into())).await;
+                    return Ok(());
+                }
+            }
         }
     }
     let _ = tx.send(Message::Text("{\"type\":\"Terminate\"}".into())).await;
-    let mut text = String::new();
-    let mut words: Vec<crate::stt::Word> = Vec::new();
-    for turn in turns.values() {
-        if turn.text.is_empty() {
-            continue;
-        }
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(&turn.text);
-        words.extend(turn.words.iter().cloned());
-    }
-    Ok(Transcript { text, words })
+    Ok(())
 }
