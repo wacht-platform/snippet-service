@@ -305,6 +305,7 @@ fn heard(turn: i64, through: i64, played_ms: i64) -> String {
 }
 
 pub fn cancel_all(reason: &str) {
+    eprintln!("[ambient-speech] cancel_all reason={reason}");
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
     for job in &queued {
         set_status(job.turn, "cancelled");
@@ -358,6 +359,7 @@ pub fn played(turn: i64, seq: Option<i64>, complete: bool, ttl_secs: u32) {
 }
 
 pub fn barge(turn: i64, seq: i64, played_ms: i64) {
+    eprintln!("[ambient-speech] barge turn={turn} seq={seq} played_ms={played_ms}");
     let text = heard(turn, seq, played_ms);
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
     for job in &queued {

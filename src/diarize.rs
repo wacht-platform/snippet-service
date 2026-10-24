@@ -24,7 +24,7 @@ const MATCH: f32 = 0.40;
 const NEW_BELOW: f32 = 0.30;
 const USER_MATCH: f32 = 0.30;
 const USER_GUARD: f32 = 0.22;
-const USER_FOLD: f32 = 0.50;
+const USER_FOLD: f32 = 0.40;
 const USER_ADAPT: f32 = 0.55;
 const ENROL_MIN: f32 = 12.0;
 const ENROL_MAX: usize = RATE * 90;
@@ -327,7 +327,7 @@ fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
     }
     cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     for (sim, i, s) in &cands {
-        if done[*i] || *sim < if sps[*s].is_user { USER_MATCH } else { MATCH } || used.contains(&(items[*i].window, sps[*s].id)) {
+        if done[*i] || *sim < if sps[*s].is_user { USER_MATCH } else { MATCH } || (!sps[*s].is_user && used.contains(&(items[*i].window, sps[*s].id))) {
             continue;
         }
         done[*i] = true;
@@ -358,7 +358,7 @@ fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
         let best = sps
             .iter()
             .enumerate()
-            .filter(|(_, sp)| !used.contains(&(items[i].window, sp.id)) && sp.centroid.len() == e.len())
+            .filter(|(_, sp)| (sp.is_user || !used.contains(&(items[i].window, sp.id))) && sp.centroid.len() == e.len())
             .map(|(s, sp)| (dot(e, &sp.centroid), s))
             .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         match best {
@@ -370,7 +370,7 @@ fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
             }
             _ if items[i].secs >= MIN_NEW
                 && sps.iter().any(|sp| {
-                    sp.is_user && !used.contains(&(items[i].window, sp.id)) && sp.centroid.len() == e.len() && dot(e, &sp.centroid) >= USER_GUARD
+                    sp.is_user && sp.centroid.len() == e.len() && dot(e, &sp.centroid) >= USER_GUARD
                 }) =>
             {
                 if let Some(sp) = sps.iter_mut().find(|sp| sp.is_user) {
@@ -459,6 +459,17 @@ pub fn analyze(store: &Store, samples: &[f32]) -> Result<Vec<Turn>, String> {
         });
         if let Some(n) = near {
             t.speaker = n.speaker;
+        }
+    }
+    if let Some(user) = speakers(store).into_iter().find(|s| s.is_user).map(|s| s.id) {
+        let snapshot = turns.clone();
+        for t in turns.iter_mut().filter(|t| t.speaker != user && t.end - t.start < 1.0) {
+            let touching = snapshot.iter().any(|x| {
+                x.speaker == user && (if t.start > x.end { t.start - x.end } else if x.start > t.end { x.start - t.end } else { 0.0 }) < 0.4
+            });
+            if touching {
+                t.speaker = user;
+            }
         }
     }
     let mut merged: Vec<Turn> = Vec::new();
