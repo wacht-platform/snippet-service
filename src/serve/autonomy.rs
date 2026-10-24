@@ -64,10 +64,12 @@ pub(super) async fn deliver_to_mission_control(daemon: &Shared, text: String) {
     daemon.deliver(SESSION_ID, LoopInput::UserMessage(text)).await;
 }
 
-pub(super) async fn interrupt_mission_control(daemon: &Shared) {
-    if mission_control_busy() {
-        daemon.deliver(SESSION_ID, LoopInput::Interrupt).await;
+pub(super) async fn interrupt_mission_control(daemon: &Shared) -> bool {
+    if !mission_control_busy() {
+        return false;
     }
+    daemon.deliver(SESSION_ID, LoopInput::Interrupt).await;
+    true
 }
 
 fn mission_control_busy() -> bool {
