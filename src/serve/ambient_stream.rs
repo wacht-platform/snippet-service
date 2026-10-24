@@ -37,6 +37,8 @@ struct Open {
     pcm: Vec<u8>,
     peak: f32,
     quiet: usize,
+    voiced: usize,
+    checks: u8,
     spec: Option<(usize, tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>)>,
 }
 
@@ -106,6 +108,26 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                 seg.quiet += body.len();
                             } else {
                                 seg.quiet = 0;
+                                seg.voiced += body.len();
+                                let due = (seg.checks == 0 && seg.voiced >= 12_800) || (seg.checks == 1 && seg.voiced >= 38_400);
+                                if due && !device.is_empty() && crate::speech::is_audible(&device) {
+                                    seg.checks += 1;
+                                    let first = seg.checks == 1;
+                                    let samples: Vec<f32> = seg.pcm.chunks_exact(2).take(16_000 * 3).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+                                    let (d, dev) = (d.clone(), device.clone());
+                                    tokio::spawn(async move {
+                                        let sim = tokio::task::spawn_blocking(move || crate::diarize::user_similarity(&d.store, &samples)).await;
+                                        let go = match sim {
+                                            Ok(Ok(Some(s))) => s >= if first { 0.28 } else { 0.22 },
+                                            Ok(Ok(None)) => true,
+                                            _ => false,
+                                        };
+                                        eprintln!("[ambient-speech] interrupt check {dev} go={go}");
+                                        if go {
+                                            crate::speech::interrupt(&dev);
+                                        }
+                                    });
+                                }
                                 if let Some((_, h)) = seg.spec.take() {
                                     h.abort();
                                 }
@@ -139,7 +161,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
                             super::ambient_routes::announce(&d, &device, seq, false);
                         }
-                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, spec: None });
+                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, spec: None });
                     }
                     Some("skip") => {
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {

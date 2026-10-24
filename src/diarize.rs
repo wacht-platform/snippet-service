@@ -412,6 +412,22 @@ fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
     Ok(result)
 }
 
+pub fn user_similarity(store: &Store, samples: &[f32]) -> Result<Option<f32>, String> {
+    let Some(user) = load_speakers(store)?.into_iter().find(|s| s.is_user) else {
+        return Ok(None);
+    };
+    if samples.len() < MIN_EMBED {
+        return Ok(Some(0.0));
+    }
+    warm()?;
+    let mut guard = engine().lock().unwrap();
+    let eng = guard.as_mut().ok_or("speaker model is not loaded")?;
+    eng.used = Instant::now();
+    let audio = &samples[..samples.len().min(MAX_EMBED)];
+    let e = embed(eng, audio)?;
+    Ok(Some(if e.len() == user.centroid.len() { dot(&e, &user.centroid) } else { 0.0 }))
+}
+
 pub fn analyze(store: &Store, samples: &[f32]) -> Result<Vec<Turn>, String> {
     if samples.len() < MIN_EMBED {
         return Ok(Vec::new());

@@ -304,6 +304,63 @@ fn heard(turn: i64, through: i64, played_ms: i64) -> String {
         .unwrap_or_default()
 }
 
+fn audible_turns(device: &str) -> Vec<i64> {
+    let now = chrono::Utc::now().timestamp();
+    crate::ambient::store()
+        .ok()
+        .and_then(|s| {
+            s.with_connection(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT t.id FROM ambient_turns t
+                     WHERE t.role = 'assistant' AND t.device = ?1 AND t.status IN ('queued', 'synthesised')
+                       AND t.created_at + COALESCE((SELECT SUM(ms) FROM ambient_chunks WHERE turn_id = t.id), 0) / 1000 + 3 >= ?2
+                     ORDER BY t.id",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![device, now], |r| r.get::<_, i64>(0))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .ok()
+        })
+        .unwrap_or_default()
+}
+
+pub fn is_audible(device: &str) -> bool {
+    !audible_turns(device).is_empty() || CURRENT.lock().unwrap().is_some()
+}
+
+pub fn interrupt(device: &str) -> bool {
+    let turns = audible_turns(device);
+    if turns.is_empty() && CURRENT.lock().unwrap().is_none() {
+        return false;
+    }
+    eprintln!("[ambient-speech] interrupt device={device} turns={turns:?}");
+    cancel_all("interrupted");
+    let mut heard_text = String::new();
+    for turn in &turns {
+        let through: i64 = crate::ambient::store()
+            .ok()
+            .and_then(|s| s.with_connection(|c| c.query_row("SELECT played_through FROM ambient_turns WHERE id = ?1", [turn], |r| r.get(0))).ok())
+            .unwrap_or(-1);
+        let text = heard(*turn, through, 0);
+        if let Ok(store) = crate::ambient::store() {
+            let _ = store.with_connection(|c| {
+                c.execute(
+                    "UPDATE ambient_turns SET status = 'interrupted', heard_text = ?2 WHERE id = ?1 AND status NOT IN ('played', 'missed')",
+                    rusqlite::params![turn, text],
+                )?;
+                Ok(())
+            });
+        }
+        emit(json!({"kind": "ambient_speech_cancel", "turn": turn, "after_seq": through, "reason": "interrupted", "device": device}));
+        if !text.is_empty() {
+            heard_text = text;
+        }
+    }
+    *INTERRUPTED.lock().unwrap() = Some(heard_text);
+    crate::ambient::emit_state("interrupted");
+    true
+}
+
 pub fn cancel_all(reason: &str) {
     eprintln!("[ambient-speech] cancel_all reason={reason}");
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
