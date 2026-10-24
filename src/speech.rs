@@ -22,6 +22,9 @@ impl Live {
     }
 
     fn push(&self, chunk: String) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let mut text = self.text.lock().unwrap();
         if !text.is_empty() {
             text.push(' ');
@@ -73,6 +76,15 @@ struct Provisional {
 }
 
 static STREAMING: Mutex<Option<Provisional>> = Mutex::new(None);
+static DIRECT: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
+
+fn normalise(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn spoken_directly(text: &str) -> bool {
+    DIRECT.lock().unwrap().as_ref().is_some_and(|(at, t)| at.elapsed().as_secs() < 20 && *t == normalise(text))
+}
 static TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 static QUEUE: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
@@ -196,6 +208,7 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
         }
         p.live.close();
     }
+    *DIRECT.lock().unwrap() = Some((std::time::Instant::now(), normalise(text)));
     let chunks = crate::tts::chunk_text(text);
     if chunks.is_empty() {
         return Err("nothing to say".into());
@@ -712,7 +725,9 @@ pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<cr
                     call = Some(call_id);
                     raw.clear();
                     sent = 0;
-                    live = None;
+                    if let Some((_, _, token)) = live.take() {
+                        drop_provisional(token);
+                    }
                     disabled = false;
                 } else {
                     call = None;
@@ -736,7 +751,7 @@ pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<cr
                 if call.as_deref() != Some(call_id.as_str()) {
                     continue;
                 }
-                if let Some((text, _)) = extract_text(&raw) {
+                if let Some((text, _)) = extract_text(&raw).filter(|(t, _)| !(live.is_none() && spoken_directly(t))) {
                     let chunks = crate::tts::chunk_text(&text);
                     while sent < chunks.len() {
                         feed(&mut live, &mut disabled, chunks[sent].clone()).await;
