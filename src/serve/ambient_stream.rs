@@ -122,7 +122,8 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                 seg.voiced += body.len();
                                 seg.forced = false;
                                 let due = (seg.checks == 0 && seg.voiced >= 12_800) || (seg.checks == 1 && seg.voiced >= 38_400);
-                                if due && !device.is_empty() && crate::speech::is_audible(&device) {
+                                let live_busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+                                if due && !device.is_empty() && (crate::speech::is_audible(&device) || live_busy) {
                                     seg.checks += 1;
                                     let first = seg.checks == 1;
                                     let samples: Vec<f32> = seg.pcm.chunks_exact(2).take(16_000 * 3).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
@@ -136,8 +137,11 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                             _ => false,
                                         };
                                         eprintln!("[ambient-speech] interrupt check {dev} go={go}");
-                                        if go && crate::speech::interrupt(&dev) {
-                                            super::autonomy::interrupt_mission_control(&dd).await;
+                                        if go {
+                                            let spoke = crate::speech::interrupt(&dev);
+                                            if spoke || live_busy {
+                                                super::autonomy::interrupt_mission_control(&dd).await;
+                                            }
                                         }
                                     });
                                 }

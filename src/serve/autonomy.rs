@@ -72,7 +72,7 @@ pub(super) async fn interrupt_mission_control(daemon: &Shared) -> bool {
     true
 }
 
-fn mission_control_busy() -> bool {
+pub(super) fn mission_control_busy() -> bool {
     crate::session::read_session_state(&crate::mission_control::session_state_path())
         .is_some_and(|s| matches!(s.status, HarnessStatus::Running | HarnessStatus::WaitingForInput))
 }
