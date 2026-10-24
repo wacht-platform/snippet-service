@@ -22,6 +22,7 @@ const MIN_NEW: usize = RATE * 3 / 2;
 const MAX_EMBED: usize = RATE * 15;
 const MATCH: f32 = 0.40;
 const NEW_BELOW: f32 = 0.30;
+const SPEAKER_MERGE: f32 = 0.55;
 const USER_MATCH: f32 = 0.30;
 const USER_GUARD: f32 = 0.22;
 const USER_FOLD: f32 = 0.40;
@@ -397,6 +398,35 @@ fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
             }
             _ => {}
         }
+    }
+    loop {
+        let mut pair = None;
+        'scan: for i in 0..sps.len() {
+            for j in (i + 1)..sps.len() {
+                if !sps[i].is_user && !sps[j].is_user && sps[i].centroid.len() == sps[j].centroid.len() && dot(&sps[i].centroid, &sps[j].centroid) >= SPEAKER_MERGE {
+                    pair = Some(if sps[i].lines >= sps[j].lines { (i, j) } else { (j, i) });
+                    break 'scan;
+                }
+            }
+        }
+        let Some((keep, drop)) = pair else { break };
+        let gone = sps.remove(drop);
+        let keep = if drop < keep { keep - 1 } else { keep };
+        let (kw, gw) = (sps[keep].lines.min(60) as f32, gone.lines.min(60) as f32);
+        let mut c: Vec<f32> = sps[keep].centroid.iter().zip(&gone.centroid).map(|(a, b)| a * kw + b * gw).collect();
+        normalise(&mut c);
+        sps[keep].centroid = c;
+        sps[keep].lines += gone.lines;
+        let kid = sps[keep].id;
+        for r in result.iter_mut().filter(|r| **r == gone.id) {
+            *r = kid;
+        }
+        touched.remove(&gone.id);
+        touched.insert(kid);
+        let _ = store.with_connection(|c| {
+            c.execute("DELETE FROM speakers WHERE id = ?1", [gone.id])?;
+            Ok(())
+        });
     }
     let at = now();
     for sp in sps.iter().filter(|s| touched.contains(&s.id)) {
