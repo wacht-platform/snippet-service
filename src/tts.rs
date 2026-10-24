@@ -409,12 +409,21 @@ pub fn prewarm() {
 pub async fn speak_pcm(text: &str) -> Result<(Vec<u8>, u32), String> {
     let remote = REMOTE.lock().unwrap().clone();
     if let Some((key, voice)) = remote {
+        let started = Instant::now();
         match deepgram(&key, &voice, text).await {
-            Ok(done) => return Ok(done),
+            Ok(done) => {
+                eprintln!("[ambient-tts] deepgram {}ms for {}ms of audio", started.elapsed().as_millis(), done.1);
+                return Ok(done);
+            }
             Err(e) => eprintln!("[ambient] deepgram speech failed, using the local voice: {e}"),
         }
     }
-    synthesize_pcm(crate::models::TTS_VOICE, text).await
+    let started = Instant::now();
+    let done = synthesize_pcm(crate::models::TTS_VOICE, text).await;
+    if let Ok((_, ms)) = &done {
+        eprintln!("[ambient-tts] local {}ms for {ms}ms of audio", started.elapsed().as_millis());
+    }
+    done
 }
 
 pub async fn synthesize_pcm(voice: &str, text: &str) -> Result<(Vec<u8>, u32), String> {

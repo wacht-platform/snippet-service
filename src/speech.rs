@@ -725,7 +725,14 @@ async fn feed(live: &mut Option<(Arc<Live>, i64, u64)>, disabled: &mut bool, chu
     if live.is_none() {
         match prepare().await {
             Ok((device, conversation)) => match create_job(&device, &conversation.id) {
-                Ok((l, turn, _)) => {
+                Ok((l, turn, cancel)) => {
+                    if DIRECT.lock().unwrap().as_ref().is_some_and(|(at, t)| at.elapsed().as_secs() < 20 && t.starts_with(&normalise(&chunk))) {
+                        cancel.store(true, Ordering::SeqCst);
+                        l.close();
+                        set_status(turn, "cancelled");
+                        *disabled = true;
+                        return;
+                    }
                     let token = TOKEN.fetch_add(1, Ordering::SeqCst);
                     *STREAMING.lock().unwrap() = Some(Provisional { live: l.clone(), turn, token });
                     *live = Some((l, turn, token));
