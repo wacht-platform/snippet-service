@@ -190,6 +190,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             let _ = out.send(serde_json::json!({"t":"done","h":h,"id":id,"code":code,"status":status}).to_string());
                         });
                     }
+                    Some("stat") => {
+                        eprintln!("[ambient-stat] {device} {v}");
+                    }
                     Some("ping") => {
                         let _ = out_tx.send(serde_json::json!({"t":"pong"}).to_string());
                     }

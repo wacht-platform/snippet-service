@@ -333,6 +333,20 @@ pub(super) fn mark(id: &str, stage: &str) {
     crate::ambient::mark(id, stage);
 }
 
+async fn prune_audio(keep: usize) {
+    let Ok(mut dir) = tokio::fs::read_dir(audio_dir()).await else { return };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        if let Ok(modified) = entry.metadata().await.and_then(|m| m.modified()) {
+            files.push((modified, entry.path()));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
 type Early = tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>;
 
 pub(super) fn precomputed() -> &'static std::sync::Mutex<std::collections::HashMap<String, Early>> {
@@ -378,7 +392,7 @@ fn spawn_transcription(d: Shared, id: String) {
             Ok(())
         });
         if status != "failed" {
-            let _ = tokio::fs::remove_file(&path).await;
+            prune_audio(40).await;
         }
         let row: Option<(String, Option<i64>, String, i64, i64, i64, i64)> = d
             .store

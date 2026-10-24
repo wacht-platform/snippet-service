@@ -22,6 +22,10 @@ const MIN_NEW: usize = RATE * 3 / 2;
 const MAX_EMBED: usize = RATE * 15;
 const MATCH: f32 = 0.40;
 const NEW_BELOW: f32 = 0.30;
+const USER_MATCH: f32 = 0.30;
+const USER_GUARD: f32 = 0.22;
+const USER_FOLD: f32 = 0.50;
+const USER_ADAPT: f32 = 0.55;
 const ENROL_MIN: f32 = 12.0;
 const ENROL_MAX: usize = RATE * 90;
 const ENROL_CHUNK: usize = RATE * 8;
@@ -296,6 +300,17 @@ struct Item {
 fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
     let _guard = ASSIGN.lock().unwrap();
     let mut sps = load_speakers(store)?;
+    if let Some(user) = sps.iter().find(|s| s.is_user).map(|s| s.centroid.clone()) {
+        let dupes: Vec<i64> = sps
+            .iter()
+            .filter(|s| !s.is_user && s.centroid.len() == user.len() && dot(&s.centroid, &user) >= USER_FOLD)
+            .map(|s| s.id)
+            .collect();
+        for id in &dupes {
+            let _ = store.with_connection(|c| c.execute("DELETE FROM speakers WHERE id = ?1", [id]));
+        }
+        sps.retain(|s| !dupes.contains(&s.id));
+    }
     let mut result = vec![-1i64; items.len()];
     let mut done = vec![false; items.len()];
     let mut used: HashSet<(usize, i64)> = HashSet::new();
@@ -312,14 +327,21 @@ fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
     }
     cands.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     for (sim, i, s) in &cands {
-        if done[*i] || *sim < MATCH || used.contains(&(items[*i].window, sps[*s].id)) {
+        if done[*i] || *sim < if sps[*s].is_user { USER_MATCH } else { MATCH } || used.contains(&(items[*i].window, sps[*s].id)) {
             continue;
         }
         done[*i] = true;
         used.insert((items[*i].window, sps[*s].id));
         result[*i] = sps[*s].id;
         touched.insert(sps[*s].id);
-        if !sps[*s].is_user {
+        if sps[*s].is_user {
+            if *sim >= USER_ADAPT {
+                let e = items[*i].emb.as_ref().unwrap();
+                let mut c: Vec<f32> = sps[*s].centroid.iter().zip(e).map(|(a, b)| a * 0.97 + b * 0.03).collect();
+                normalise(&mut c);
+                sps[*s].centroid = c;
+            }
+        } else {
             let e = items[*i].emb.as_ref().unwrap();
             let w = sps[*s].lines.min(30) as f32;
             let mut c: Vec<f32> = sps[*s].centroid.iter().zip(e).map(|(a, b)| a * w + b).collect();
@@ -345,6 +367,18 @@ fn assign(store: &Store, items: &[Item]) -> Result<Vec<i64>, String> {
                 result[i] = sps[s].id;
                 touched.insert(sps[s].id);
                 sps[s].lines += 1;
+            }
+            _ if items[i].secs >= MIN_NEW
+                && sps.iter().any(|sp| {
+                    sp.is_user && !used.contains(&(items[i].window, sp.id)) && sp.centroid.len() == e.len() && dot(e, &sp.centroid) >= USER_GUARD
+                }) =>
+            {
+                if let Some(sp) = sps.iter_mut().find(|sp| sp.is_user) {
+                    used.insert((items[i].window, sp.id));
+                    result[i] = sp.id;
+                    touched.insert(sp.id);
+                    sp.lines += 1;
+                }
             }
             _ if items[i].secs >= MIN_NEW => {
                 let at = now();
