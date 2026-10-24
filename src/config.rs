@@ -278,7 +278,7 @@ impl Default for SnippetConfig {
 pub const AMBIENT_MODES: &[&str] = &["passive", "active"];
 pub const AMBIENT_WATCHERS: &[&str] = &["classifier", "off"];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AmbientConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -300,6 +300,29 @@ pub struct AmbientConfig {
     pub tts_voice: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stt_shadow: String,
+    #[serde(default = "default_flux_eot_threshold")]
+    pub flux_eot_threshold: f32,
+    #[serde(default = "default_flux_eager_eot_threshold")]
+    pub flux_eager_eot_threshold: f32,
+    #[serde(default = "default_flux_keyterms")]
+    pub flux_keyterms: Vec<String>,
+}
+
+impl Eq for AmbientConfig {}
+
+fn default_flux_eot_threshold() -> f32 {
+    0.7
+}
+
+fn default_flux_eager_eot_threshold() -> f32 {
+    0.5
+}
+
+fn default_flux_keyterms() -> Vec<String> {
+    ["Snippet", "Mission Control", "Technoxi", "Deepgram", "AssemblyAI", "Kokoro", "Tailscale", "ambient", "diarization"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 fn default_tts_voice() -> String {
@@ -323,6 +346,9 @@ impl Default for AmbientConfig {
             tts: default_ambient_stt(),
             tts_voice: default_tts_voice(),
             stt_shadow: String::new(),
+            flux_eot_threshold: default_flux_eot_threshold(),
+            flux_eager_eot_threshold: default_flux_eager_eot_threshold(),
+            flux_keyterms: default_flux_keyterms(),
         }
     }
 }
@@ -346,6 +372,12 @@ impl AmbientConfig {
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
         self.stt_shadow = self.stt_shadow.trim().to_ascii_lowercase();
+        if !self.flux_eot_threshold.is_finite() {
+            self.flux_eot_threshold = default_flux_eot_threshold();
+        }
+        if !self.flux_eager_eot_threshold.is_finite() {
+            self.flux_eager_eot_threshold = default_flux_eager_eot_threshold();
+        }
         self.wake_phrases = self
             .wake_phrases
             .iter()

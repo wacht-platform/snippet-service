@@ -8,16 +8,42 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const CHUNK: usize = 2560;
-const SETTLE: Duration = Duration::from_millis(700);
-const FORCE_AFTER: Duration = Duration::from_millis(1500);
+const SETTLE: Duration = Duration::from_millis(160);
+const FORCE_AFTER: Duration = Duration::from_millis(300);
 const GIVE_UP: Duration = Duration::from_millis(3000);
+const LIVE_WAIT: Duration = Duration::from_millis(1500);
 const ASSEMBLY_WAIT: Duration = Duration::from_secs(15);
 const IDLE_CLOSE: Duration = Duration::from_secs(300);
 const BACKOFF_BASE: Duration = Duration::from_secs(15);
 const BACKOFF_MAX: Duration = Duration::from_secs(600);
+const MAX_KEYTERMS: usize = 100;
+
+#[derive(Clone, PartialEq)]
+pub(super) struct Params {
+    key: String,
+    eot: f32,
+    eager: Option<f32>,
+    keyterms: Vec<String>,
+}
+
+pub(super) fn params(c: &crate::config::SnippetConfig) -> Option<Params> {
+    let key = c.deepgram_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty())?.to_string();
+    let eot = c.ambient.flux_eot_threshold.clamp(0.5, 1.0);
+    let eager = Some(c.ambient.flux_eager_eot_threshold).filter(|e| *e >= 0.3).map(|e| e.min(0.9).min(eot));
+    let mut keyterms: Vec<String> = Vec::new();
+    for t in c.ambient.wake_phrases.iter().chain(c.ambient.flux_keyterms.iter()) {
+        let t = t.trim();
+        if !t.is_empty() && !keyterms.iter().any(|k| k.eq_ignore_ascii_case(t)) {
+            keyterms.push(t.to_string());
+        }
+    }
+    keyterms.truncate(MAX_KEYTERMS);
+    Some(Params { key, eot, eager, keyterms })
+}
 
 struct Outcome {
     text: String,
+    words: Vec<crate::stt::Word>,
     eager: Option<i64>,
     eot: Option<i64>,
     trigger: String,
@@ -28,11 +54,14 @@ enum Cmd {
     Audio(Vec<u8>),
     End { at: Instant, reply: oneshot::Sender<Outcome> },
     Abort,
+    Configure(String),
+    Close,
 }
 
 struct Session {
     cmd: mpsc::UnboundedSender<Cmd>,
     closed: Mutex<bool>,
+    params: Mutex<Params>,
 }
 
 #[derive(Default)]
@@ -60,7 +89,7 @@ fn failed(device: &str, reason: &str) {
     h.until = Some(Instant::now() + wait);
     if !h.logged {
         h.logged = true;
-        eprintln!("[ambient-flux-stt] {device} shadow disabled for {}s: {reason}", wait.as_secs());
+        eprintln!("[ambient-flux-stt] {device} Flux unavailable for {}s: {reason}", wait.as_secs());
     }
 }
 
@@ -68,21 +97,45 @@ fn healthy(device: &str) {
     health().lock().unwrap().remove(device);
 }
 
-pub(super) fn begin(device: &str, key: String, terms: Vec<String>) -> Option<Ticket> {
+fn configure_message(p: &Params) -> String {
+    let mut thresholds = serde_json::json!({ "eot_threshold": p.eot });
+    if let Some(e) = p.eager {
+        thresholds["eager_eot_threshold"] = serde_json::json!(e);
+    }
+    serde_json::json!({ "type": "Configure", "thresholds": thresholds, "keyterms": p.keyterms }).to_string()
+}
+
+pub(super) fn begin(device: &str, p: Params) -> Option<Ticket> {
     if health().lock().unwrap().get(device).and_then(|h| h.until).is_some_and(|u| Instant::now() < u) {
         return None;
     }
     let session = {
         let mut map = hub().lock().unwrap();
-        match map.get(device).filter(|s| !*s.closed.lock().unwrap()) {
-            Some(existing) => existing.clone(),
+        let reuse = match map.get(device).filter(|s| !*s.closed.lock().unwrap()) {
+            Some(existing) => {
+                let mut current = existing.params.lock().unwrap();
+                if current.key != p.key || current.eager.is_some() != p.eager.is_some() {
+                    let _ = existing.cmd.send(Cmd::Close);
+                    None
+                } else {
+                    if *current != p {
+                        let _ = existing.cmd.send(Cmd::Configure(configure_message(&p)));
+                        *current = p.clone();
+                    }
+                    Some(existing.clone())
+                }
+            }
+            None => None,
+        };
+        match reuse {
+            Some(s) => s,
             None => {
                 let (cmd, rx) = mpsc::unbounded_channel();
-                let session = Arc::new(Session { cmd, closed: Mutex::new(false) });
+                let session = Arc::new(Session { cmd, closed: Mutex::new(false), params: Mutex::new(p.clone()) });
                 map.insert(device.to_string(), session.clone());
                 let (task, name) = (session.clone(), device.to_string());
                 tokio::spawn(async move {
-                    let result = run(&name, key, terms, rx).await;
+                    let result = run(&name, p, rx).await;
                     *task.closed.lock().unwrap() = true;
                     if let Err(e) = result {
                         failed(&name, &e);
@@ -105,6 +158,15 @@ pub(super) struct Ticket {
     buf: Vec<u8>,
 }
 
+fn short(id: &str) -> String {
+    id[..id.len().min(8)].to_string()
+}
+
+fn log_outcome(id: &str, o: &Outcome, tag: &str) {
+    let ms = |v: Option<i64>| v.map(|m| format!("{m:+}")).unwrap_or_else(|| "-".into());
+    eprintln!("[ambient-flux-stt] {} eager_eot {} eot {} ({}{tag}) text={:?}", short(id), ms(o.eager), ms(o.eot), o.trigger, o.text);
+}
+
 impl Ticket {
     pub fn push(&mut self, pcm: &[u8]) {
         let Some(session) = self.session.as_ref() else { return };
@@ -115,39 +177,50 @@ impl Ticket {
         }
     }
 
-    pub fn end(mut self, id: String, at: Instant, assembly: Option<oneshot::Receiver<Option<String>>>) {
-        let Some(session) = self.session.take() else { return };
+    fn close(&mut self, at: Instant) -> Option<oneshot::Receiver<Outcome>> {
+        let session = self.session.take()?;
         if !self.buf.is_empty() {
             let _ = session.cmd.send(Cmd::Audio(std::mem::take(&mut self.buf)));
         }
         let (reply, rx) = oneshot::channel();
-        if session.cmd.send(Cmd::End { at, reply }).is_err() {
-            return;
-        }
-        let short = id[..id.len().min(8)].to_string();
+        session.cmd.send(Cmd::End { at, reply }).ok()?;
+        Some(rx)
+    }
+
+    pub fn end(mut self, id: String, at: Instant, assembly: Option<oneshot::Receiver<Option<String>>>) {
+        let Some(rx) = self.close(at) else { return };
         tokio::spawn(async move {
             let Ok(flux) = rx.await else { return };
-            let ms = |v: Option<i64>| v.map(|m| format!("{m:+}")).unwrap_or_else(|| "-".into());
-            eprintln!(
-                "[ambient-flux-stt] {short} eager_eot {} eot {} ({}) text={:?}",
-                ms(flux.eager),
-                ms(flux.eot),
-                flux.trigger,
-                flux.text
-            );
+            log_outcome(&id, &flux, "");
             let reference = match assembly {
                 Some(rx) => tokio::time::timeout(ASSEMBLY_WAIT, rx).await.ok().and_then(|r| r.ok()).flatten(),
                 None => None,
             };
+            let s = short(&id);
             match reference {
                 Some(asm) => {
                     let (dist, len) = word_distance(&asm, &flux.text);
                     let wer = dist as f32 / len.max(1) as f32;
-                    eprintln!("[ambient-flux-stt] {short} vs assembly: wer={wer:.2} ({dist}/{len}) assembly={asm:?} flux={:?}", flux.text);
+                    eprintln!("[ambient-flux-stt] {s} vs assembly: wer={wer:.2} ({dist}/{len}) assembly={asm:?} flux={:?}", flux.text);
                 }
-                None => eprintln!("[ambient-flux-stt] {short} vs assembly: no assembly transcript flux={:?}", flux.text),
+                None => eprintln!("[ambient-flux-stt] {s} vs assembly: no assembly transcript flux={:?}", flux.text),
             }
         });
+    }
+
+    pub async fn finish(mut self, id: &str, at: Instant) -> Result<(String, Vec<crate::stt::Word>), String> {
+        let rx = self.close(at).ok_or_else(|| "Flux session closed".to_string())?;
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(at + LIVE_WAIT), rx).await {
+            Ok(Ok(o)) => {
+                log_outcome(id, &o, ", live");
+                if o.text.trim().is_empty() {
+                    return Err("Flux heard no words".into());
+                }
+                Ok((o.text, o.words))
+            }
+            Ok(Err(_)) => Err("Flux session dropped".into()),
+            Err(_) => Err(format!("Flux gave no transcript within {}ms", LIVE_WAIT.as_millis())),
+        }
     }
 }
 
@@ -180,20 +253,50 @@ fn word_distance(reference: &str, hypothesis: &str) -> (usize, usize) {
     (prev[h.len()], r.len())
 }
 
+fn turn_words(v: &serde_json::Value, offset: f32) -> Vec<crate::stt::Word> {
+    let list: Vec<&serde_json::Value> = v.get("words").and_then(|x| x.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
+    let from = v.get("audio_window_start").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+    let to = v.get("audio_window_end").and_then(|x| x.as_f64()).unwrap_or(from as f64) as f32;
+    let step = (to - from) / list.len().max(1) as f32;
+    list.iter()
+        .enumerate()
+        .filter_map(|(i, w)| {
+            let text = w.get("word").and_then(|x| x.as_str())?.trim().to_string();
+            let start = w.get("start").and_then(|x| x.as_f64()).map(|s| s as f32).unwrap_or(from + step * i as f32);
+            let end = w.get("end").and_then(|x| x.as_f64()).map(|s| s as f32).unwrap_or(start + step);
+            Some(crate::stt::Word { text, start: (start - offset).max(0.0), end: (end - offset).max(0.0) })
+        })
+        .filter(|w| !w.text.is_empty())
+        .collect()
+}
+
 struct Seg {
+    offset: f32,
     turns: Vec<String>,
+    words: Vec<crate::stt::Word>,
     partial: String,
+    partial_words: Vec<crate::stt::Word>,
     eager: Option<Instant>,
     eot: Option<Instant>,
     trigger: String,
     ended: Option<(Instant, oneshot::Sender<Outcome>)>,
-    eot_after_end: bool,
     forced: bool,
 }
 
 impl Seg {
-    fn new() -> Self {
-        Seg { turns: Vec::new(), partial: String::new(), eager: None, eot: None, trigger: "none".into(), ended: None, eot_after_end: false, forced: false }
+    fn new(offset: f32) -> Self {
+        Seg {
+            offset,
+            turns: Vec::new(),
+            words: Vec::new(),
+            partial: String::new(),
+            partial_words: Vec::new(),
+            eager: None,
+            eot: None,
+            trigger: "none".into(),
+            ended: None,
+            forced: false,
+        }
     }
 
     fn finish(mut self, trigger: Option<&str>) -> bool {
@@ -204,12 +307,14 @@ impl Seg {
                 text.push(' ');
             }
             text.push_str(self.partial.trim());
+            self.words.append(&mut self.partial_words);
         }
         let rel = |t: Option<Instant>| {
             t.map(|t| if t >= at { t.duration_since(at).as_millis() as i64 } else { -(at.duration_since(t).as_millis() as i64) })
         };
         let _ = reply.send(Outcome {
             text,
+            words: self.words,
             eager: rel(self.eager),
             eot: rel(self.eot),
             trigger: trigger.map(str::to_string).unwrap_or(self.trigger),
@@ -218,16 +323,22 @@ impl Seg {
     }
 }
 
-async fn run(device: &str, key: String, terms: Vec<String>, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
-    let mut url = "wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=linear16&sample_rate=16000&eot_threshold=0.7&eager_eot_threshold=0.5".to_string();
-    for t in &terms {
+async fn run(device: &str, p: Params, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
+    let mut url = format!(
+        "wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=linear16&sample_rate=16000&eot_threshold={}",
+        p.eot
+    );
+    if let Some(e) = p.eager {
+        url.push_str(&format!("&eager_eot_threshold={e}"));
+    }
+    for t in &p.keyterms {
         url.push_str("&keyterm=");
         url.push_str(&urlencoding::encode(t));
     }
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     request
         .headers_mut()
-        .insert("Authorization", format!("Token {}", key.trim()).parse().map_err(|_| "invalid Deepgram key".to_string())?);
+        .insert("Authorization", format!("Token {}", p.key).parse().map_err(|_| "invalid Deepgram key".to_string())?);
     let began = Instant::now();
     let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async(request))
         .await
@@ -237,6 +348,7 @@ async fn run(device: &str, key: String, terms: Vec<String>, mut cmd: mpsc::Unbou
     let (mut tx, mut rx) = ws.split();
     let mut seg: Option<Seg> = None;
     let mut in_turn = false;
+    let mut sent: u64 = 0;
     let mut last_audio = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     let silence = vec![0u8; CHUNK];
@@ -247,10 +359,11 @@ async fn run(device: &str, key: String, terms: Vec<String>, mut cmd: mpsc::Unbou
                     if let Some(prev) = seg.take() {
                         prev.finish(Some("cut"));
                     }
-                    seg = Some(Seg::new());
+                    seg = Some(Seg::new(sent as f32 / 32_000.0));
                 }
                 Some(Cmd::Audio(b)) => {
                     last_audio = Instant::now();
+                    sent += b.len() as u64;
                     tx.send(Message::Binary(b.into())).await.map_err(|e| format!("Flux STT send failed: {e}"))?;
                 }
                 Some(Cmd::End { at, reply }) => {
@@ -263,7 +376,10 @@ async fn run(device: &str, key: String, terms: Vec<String>, mut cmd: mpsc::Unbou
                         seg = None;
                     }
                 }
-                None => break,
+                Some(Cmd::Configure(m)) => {
+                    tx.send(Message::Text(m.into())).await.map_err(|e| format!("Flux STT send failed: {e}"))?;
+                }
+                Some(Cmd::Close) | None => break,
             },
             m = rx.next() => match m {
                 Some(Ok(Message::Text(t))) => {
@@ -278,30 +394,37 @@ async fn run(device: &str, key: String, terms: Vec<String>, mut cmd: mpsc::Unbou
                                 "EndOfTurn" => in_turn = false,
                                 _ => {}
                             }
-                            if let Some(s) = seg.as_mut() {
-                                match event {
-                                    "Update" | "StartOfTurn" => s.partial = text,
-                                    "EagerEndOfTurn" => {
-                                        s.eager = Some(now);
-                                        s.partial = text;
+                            let Some(s) = seg.as_mut() else { continue };
+                            match event {
+                                "Update" | "StartOfTurn" | "EagerEndOfTurn" | "TurnResumed" => {
+                                    match event {
+                                        "EagerEndOfTurn" => s.eager = Some(now),
+                                        "TurnResumed" => s.eager = None,
+                                        _ => {}
                                     }
-                                    "TurnResumed" => {
-                                        s.eager = None;
-                                        s.partial = text;
-                                    }
-                                    "EndOfTurn" => {
-                                        if !text.is_empty() {
-                                            s.turns.push(text);
-                                        }
-                                        s.partial.clear();
-                                        s.eot = Some(now);
-                                        s.trigger = v.get("trigger").and_then(|x| x.as_str()).unwrap_or("model").to_string();
-                                        s.eot_after_end = s.ended.is_some();
-                                    }
-                                    _ => {}
+                                    s.partial_words = turn_words(&v, s.offset);
+                                    s.partial = text;
                                 }
+                                "EndOfTurn" => {
+                                    if !text.is_empty() {
+                                        s.turns.push(text);
+                                        s.words.extend(turn_words(&v, s.offset));
+                                    }
+                                    s.partial.clear();
+                                    s.partial_words.clear();
+                                    s.eot = Some(now);
+                                    s.trigger = v.get("trigger").and_then(|x| x.as_str()).unwrap_or("model").to_string();
+                                    if s.ended.is_some() {
+                                        if seg.take().is_some_and(|s| s.finish(None)) {
+                                            healthy(device);
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
+                        Some("ConfigureSuccess") => eprintln!("[ambient-flux-stt] {device} reconfigured"),
+                        Some("ConfigureFailure") => eprintln!("[ambient-flux-stt] {device} configure rejected: {t}"),
                         Some("Error") => return Err(format!("Flux STT error: {t}")),
                         _ => {}
                     }
@@ -315,13 +438,11 @@ async fn run(device: &str, key: String, terms: Vec<String>, mut cmd: mpsc::Unbou
             _ = tick.tick() => {
                 let Some(since) = seg.as_ref().and_then(|s| s.ended.as_ref()).map(|(at, _)| at.elapsed()) else {
                     if seg.is_none() && last_audio.elapsed() >= IDLE_CLOSE {
-                        let _ = tx.send(Message::Text("{\"type\":\"CloseStream\"}".into())).await;
-                        return Ok(());
+                        break;
                     }
                     continue;
                 };
-                let s = seg.as_mut().unwrap();
-                if !in_turn && (s.eot_after_end || since >= SETTLE) || since >= GIVE_UP {
+                if (!in_turn && since >= SETTLE) || since >= GIVE_UP {
                     if seg.take().is_some_and(|s| s.finish(if since >= GIVE_UP { Some("gave-up") } else { None })) {
                         healthy(device);
                     }
@@ -329,7 +450,9 @@ async fn run(device: &str, key: String, terms: Vec<String>, mut cmd: mpsc::Unbou
                 }
                 // The phone uploads only speech, so Flux needs trailing silence to see the turn end.
                 last_audio = Instant::now();
+                sent += silence.len() as u64;
                 tx.send(Message::Binary(silence.clone().into())).await.map_err(|e| format!("Flux STT send failed: {e}"))?;
+                let s = seg.as_mut().unwrap();
                 if in_turn && since >= FORCE_AFTER && !s.forced {
                     s.forced = true;
                     tx.send(Message::Text("{\"type\":\"ForceEndTurn\"}".into())).await.map_err(|e| format!("Flux STT send failed: {e}"))?;

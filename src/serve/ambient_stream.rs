@@ -40,10 +40,44 @@ struct Open {
     quiet: usize,
     voiced: usize,
     checks: u8,
-    asm: Option<super::assembly::Ticket>,
+    asm: Option<Live>,
     flux: Option<super::flux_stt::Ticket>,
     forced: bool,
     spec: Option<(usize, tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>)>,
+}
+
+enum Live {
+    Assembly(super::assembly::Ticket),
+    Flux(super::flux_stt::Ticket),
+}
+
+impl Live {
+    fn push(&mut self, pcm: &[u8]) {
+        match self {
+            Live::Assembly(t) => t.push(pcm),
+            Live::Flux(t) => t.push(pcm),
+        }
+    }
+
+    fn force(&mut self) {
+        if let Live::Assembly(t) = self {
+            t.force();
+        }
+    }
+
+    fn source(&self) -> &'static str {
+        match self {
+            Live::Assembly(_) => "assembly",
+            Live::Flux(_) => "flux",
+        }
+    }
+
+    async fn finish(self, id: &str, at: std::time::Instant) -> Result<(String, Vec<crate::stt::Word>), String> {
+        match self {
+            Live::Assembly(t) => t.finish().await.map(|t| (t.text, t.words)),
+            Live::Flux(t) => t.finish(id, at).await,
+        }
+    }
 }
 
 fn rms(bytes: &[u8]) -> f32 {
@@ -198,14 +232,15 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                     terms.push(extra.to_string());
                                 }
                             }
-                            let flux = match c.deepgram_api_key.clone().filter(|k| !k.trim().is_empty()) {
-                                Some(k) if c.ambient.stt_shadow == "flux" && !device.is_empty() => super::flux_stt::begin(&device, k, terms.clone()),
+                            let flux_params = if device.is_empty() { None } else { super::flux_stt::params(&c) };
+                            let asm = match c.ambient.stt.as_str() {
+                                "assemblyai" => key.map(|k| Live::Assembly(super::assembly::begin(&device, k, terms))),
+                                "flux" => flux_params.clone().and_then(|p| super::flux_stt::begin(&device, p)).map(Live::Flux),
                                 _ => None,
                             };
-                            let asm = if c.ambient.stt == "assemblyai" && key.is_some() {
-                                key.map(|k| super::assembly::begin(&device, k, terms))
-                            } else {
-                                None
+                            let flux = match flux_params {
+                                Some(p) if c.ambient.stt_shadow == "flux" && c.ambient.stt != "flux" => super::flux_stt::begin(&device, p),
+                                _ => None,
                             };
                             (asm, flux)
                         } else {
@@ -238,7 +273,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             seg.pcm.truncate((n as usize) & !1);
                         }
                         let ended = std::time::Instant::now();
-                        let (shadow_tx, shadow_rx) = match seg.flux.is_some() && seg.asm.is_some() {
+                        let (shadow_tx, shadow_rx) = match seg.flux.is_some() && matches!(seg.asm, Some(Live::Assembly(_))) {
                             true => {
                                 let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
                                 (Some(tx), Some(rx))
@@ -254,19 +289,20 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                 let samples: Vec<f32> = seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
                                 let (dd, ident) = (d.clone(), id.to_string());
                                 let task = tokio::spawn(async move {
-                                    let outcome = handle.finish().await;
+                                    let source = handle.source();
+                                    let outcome = handle.finish(&ident, ended).await;
                                     if let Some(tx) = shadow_tx {
-                                        let _ = tx.send(outcome.as_ref().ok().map(|t| t.text.clone()));
+                                        let _ = tx.send(outcome.as_ref().ok().map(|t| t.0.clone()));
                                     }
                                     let permit = super::ambient_routes::gate().acquire_owned().await.ok();
                                     let result = match outcome {
-                                        Ok(t) if !t.text.trim().is_empty() => {
-                                            crate::ambient::mark(&ident, "assembly");
-                                            super::transcribe::transcribe_samples_with(&dd, samples, Some((t.text, t.words))).await
+                                        Ok((text, words)) if !text.trim().is_empty() => {
+                                            crate::ambient::mark(&ident, source);
+                                            super::transcribe::transcribe_samples_with(&dd, samples, Some((text, words))).await
                                         }
                                         Ok(_) => super::transcribe::transcribe_samples_with(&dd, samples, Some((String::new(), Vec::new()))).await,
                                         Err(e) => {
-                                            eprintln!("[ambient] AssemblyAI failed, using local speech recognition: {e}");
+                                            eprintln!("[ambient] {source} speech recognition failed, using local speech recognition: {e}");
                                             super::transcribe::transcribe_samples(&dd, samples).await
                                         }
                                     };

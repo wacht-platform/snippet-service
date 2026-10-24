@@ -75,13 +75,14 @@ pub(super) fn begin(device: &str, key: String, terms: Vec<String>) -> Ticket {
     };
     let start = session.state.lock().unwrap().next;
     let offset = session.flushed.load(Ordering::SeqCst) as f32 / 32_000.0;
-    Ticket { inner: Some(Inner { session, start, offset, buf: Vec::new() }) }
+    Ticket { inner: Some(Inner { session, start, offset, sent: 0, buf: Vec::new() }) }
 }
 
 struct Inner {
     session: Arc<Session>,
     start: u64,
     offset: f32,
+    sent: u64,
     buf: Vec<u8>,
 }
 
@@ -93,13 +94,25 @@ impl Inner {
     fn flush(&mut self) {
         if !self.buf.is_empty() {
             let bytes = std::mem::take(&mut self.buf);
+            self.sent += bytes.len() as u64;
             self.session.flushed.fetch_add(bytes.len() as u64, Ordering::SeqCst);
             let _ = self.session.cmd.send(Cmd::Audio(bytes));
         }
     }
 
+    fn owns(&self, index: Option<u64>, turn: &Turn, end: f32) -> bool {
+        match (turn.words.first(), turn.words.last()) {
+            (Some(first), Some(last)) => {
+                let mid = (first.start + last.end) / 2.0;
+                mid >= self.offset && mid < end
+            }
+            _ => index.is_some_and(|i| i >= self.start),
+        }
+    }
+
     async fn finish(mut self) -> Result<Transcript, String> {
         self.flush();
+        let end = self.offset + self.sent as f32 / 32_000.0;
         let _ = self.session.cmd.send(Cmd::Force);
         let deadline = tokio::time::Instant::now() + FINISH_WAIT;
         let empty_deadline = tokio::time::Instant::now() + EMPTY_WAIT;
@@ -109,7 +122,7 @@ impl Inner {
             notified.as_mut().enable();
             let (have, open, closed, any_partial) = {
                 let s = self.session.state.lock().unwrap();
-                (s.finals.iter().any(|(i, _)| *i >= self.start), s.partial.is_some(), s.closed.clone(), s.partial.is_some())
+                (s.finals.iter().any(|(i, t)| self.owns(Some(*i), t, end)), s.partial.as_ref().is_some_and(|p| self.owns(None, p, end)), s.closed.clone(), s.partial.as_ref().is_some_and(|p| self.owns(None, p, end)))
             };
             if have && !open {
                 break;
@@ -128,8 +141,8 @@ impl Inner {
         let s = self.session.state.lock().unwrap();
         let mut text = String::new();
         let mut words: Vec<crate::stt::Word> = Vec::new();
-        let mut parts: Vec<&Turn> = s.finals.iter().filter(|(i, _)| *i >= self.start).map(|(_, t)| t).collect();
-        if let Some(p) = s.partial.as_ref() {
+        let mut parts: Vec<&Turn> = s.finals.iter().filter(|(i, t)| self.owns(Some(*i), t, end)).map(|(_, t)| t).collect();
+        if let Some(p) = s.partial.as_ref().filter(|p| self.owns(None, p, end)) {
             parts.push(p);
         }
         for turn in parts {
