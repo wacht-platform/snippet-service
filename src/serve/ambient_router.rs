@@ -10,10 +10,10 @@ use tokio::sync::mpsc;
 use super::ambient_watch::{self, Verdict};
 
 const HOLD: Duration = Duration::from_millis(1600);
-const FAST_HOLD: Duration = Duration::from_millis(500);
+const FAST_HOLD: Duration = Duration::from_millis(300);
 const ACTIVITY_HOLD: Duration = Duration::from_secs(30);
-const STALL: Duration = Duration::from_secs(4);
-const WAKE_VETO: Duration = Duration::from_millis(700);
+const STALL: Duration = Duration::from_millis(2000);
+const WAKE_VETO: Duration = Duration::from_millis(400);
 const LATE_WINDOW: Duration = Duration::from_secs(20);
 const MERGE_GAP: f64 = 1.5;
 const CONTINUED_GAP: f64 = 4.0;
@@ -22,6 +22,7 @@ const MAX_SPAN: f64 = 30.0;
 const PASSIVE_THRESHOLD: f64 = 0.7;
 const PINNED_THRESHOLD: f64 = 0.5;
 const MATCH_THRESHOLD: f64 = 0.7;
+const MEMORABLE_THRESHOLD: f64 = 0.65;
 
 #[derive(Clone)]
 pub(crate) struct Part {
@@ -39,7 +40,7 @@ pub(crate) struct Part {
 pub(crate) enum Msg {
     Done(Part),
     Skip(i64),
-    Activity,
+    Activity(Option<i64>),
 }
 
 struct Flushed {
@@ -73,7 +74,8 @@ enum Wake {
 }
 
 async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) {
-    let mut expected: Option<i64> = None;
+    let mut announced: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut drained_max: i64 = 0;
     let mut buffered: BTreeMap<i64, Option<Part>> = BTreeMap::new();
     let mut stalled: Option<Instant> = None;
     let mut turn: Vec<Part> = Vec::new();
@@ -90,7 +92,10 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
         };
         match wake {
             Wake::Closed => break,
-            Wake::Msg(Msg::Activity) => {
+            Wake::Msg(Msg::Activity(seq)) => {
+                if let Some(seq) = seq.filter(|s| *s > drained_max) {
+                    announced.insert(seq);
+                }
                 if !turn.is_empty() {
                     deadline = Some(Instant::now() + ACTIVITY_HOLD);
                 }
@@ -99,17 +104,13 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
                 if part.seq <= 0 {
                     accept(&d, &device, part, &mut turn, &mut deadline, &mut last).await;
                 } else {
-                    if expected.is_none() || part.seq > expected.unwrap_or(0) + 1000 {
-                        expected = Some(part.seq);
-                    }
+                    announced.remove(&part.seq);
                     buffered.insert(part.seq, Some(part));
                 }
             }
             Wake::Msg(Msg::Skip(seq)) => {
                 if seq > 0 {
-                    if expected.is_none() {
-                        expected = Some(seq);
-                    }
+                    announced.remove(&seq);
                     buffered.insert(seq, None);
                 }
             }
@@ -117,16 +118,17 @@ async fn actor(d: Shared, device: String, mut rx: mpsc::UnboundedReceiver<Msg>) 
         }
         if stalled.is_some_and(|s| s.elapsed() >= STALL) {
             if let Some((first, _)) = buffered.iter().next() {
-                expected = Some(*first);
+                let first = *first;
+                announced.retain(|s| *s >= first);
             }
             stalled = None;
         }
-        while let Some(want) = expected {
-            let Some(item) = buffered.remove(&want) else {
+        while let Some((&first, _)) = buffered.iter().next() {
+            if announced.range(..first).next().is_some() {
                 break;
-            };
-            expected = Some(want + 1);
-            if let Some(part) = item {
+            }
+            drained_max = drained_max.max(first);
+            if let Some(Some(part)) = buffered.remove(&first) {
                 accept(&d, &device, part, &mut turn, &mut deadline, &mut last).await;
             }
         }
@@ -176,7 +178,7 @@ async fn accept(
     if turn.is_empty() && !gated {
         if let Some(l) = last.as_mut() {
             let gap = part.started - l.ended;
-            if l.delivered && l.at.elapsed() < LATE_WINDOW && gap <= CONTINUED_GAP && part.summary != "other" {
+            if l.delivered && l.at.elapsed() < LATE_WINDOW && gap <= CONTINUED_GAP && part.summary != "other" && (part.summary == "you" || !enrolled(d)) {
                 let parent = l.ids.clone();
                 let ended = part.ended;
                 let ids = vec![part.id.clone()];
@@ -232,20 +234,20 @@ fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
     }
 }
 
-fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool, from_others: bool) -> (bool, bool) {
+fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool, from_others: bool, you: bool) -> (bool, bool) {
     if !v.kept() || from_others {
         return (false, false);
     }
-    if live {
-        return (true, false);
-    }
     let matched = expecting && v.matches >= MATCH_THRESHOLD;
+    if live {
+        return (you || wake || matched || v.for_assistant() || v.addressed >= 0.4 || v.continues >= 0.6, false);
+    }
     if pinned {
         let asked = v.for_assistant() && v.addressed >= PINNED_THRESHOLD;
         let go = wake || asked || matched;
         return (go, go);
     }
-    let asked = v.for_assistant() && v.addressed >= PASSIVE_THRESHOLD;
+    let asked = v.for_assistant() && v.addressed >= if v.kind == "conversation" { 0.55 } else { PASSIVE_THRESHOLD };
     (wake || asked || matched, false)
 }
 
@@ -264,6 +266,9 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let routable = holder.as_deref() == Some(device);
     let from_others = enrolled(d) && summary == "other";
     let wake = !from_others && ambient_watch::wake_word(&text, &phrases);
+    if wake && !enrolled(d) {
+        claim_wake_speaker(d, &parts);
+    }
     let expecting = crate::ambient::expectation().is_some();
     let live = crate::ambient::conversation().is_some();
     let pinned = crate::ambient::is_pinned();
@@ -276,19 +281,33 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
         if !early.as_ref().is_some_and(|v| !v.kept()) {
             let v = wake_verdict(early.as_ref());
-            deliver(d, device, &parts, &v, true, None, ttl, !live).await;
+            deliver(d, device, &parts, &v, wake, None, ttl, !live).await;
             delivered = true;
             if !live && !pinned {
                 crate::ambient::open_conversation(device, ttl);
             }
         }
     }
+    if delivered && early.is_none() {
+        let (d3, ids3) = (d.clone(), ids.clone());
+        tokio::spawn(async move {
+            let v = task.await.unwrap_or_else(|_| Verdict::inherited());
+            mark_verdict(&d3, &ids3, &v, true);
+        });
+        *last = Some(Flushed {
+            ids,
+            ended: parts.last().map(|p| p.ended).unwrap_or(0.0),
+            at: Instant::now(),
+            delivered,
+        });
+        return;
+    }
     let verdict = match early {
         Some(v) => v,
         None => task.await.unwrap_or_else(|_| Verdict::inherited()),
     };
     if !delivered && routable {
-        let (go, open) = decide(live, pinned, &verdict, wake, expecting, from_others);
+        let (go, open) = decide(live, pinned, &verdict, wake, expecting, from_others, summary == "you");
         if go {
             if open {
                 crate::ambient::open_conversation(device, ttl);
@@ -297,7 +316,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             delivered = true;
         }
     }
-    if !delivered && verdict.kept() && !from_others && verdict.intent == "note" {
+    if !delivered && verdict.kept() && !from_others && verdict.memorable >= MEMORABLE_THRESHOLD {
         let (rendered, _) = render(&parts, &text);
         super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &rendered, false).await;
     }
@@ -321,6 +340,7 @@ fn wake_verdict(early: Option<&Verdict>) -> Verdict {
             matches: v.matches,
             continues: v.continues,
             suggest: v.suggest,
+            memorable: v.memorable,
             judge: v.judge,
         },
         None => Verdict { addressed: 0.9, ..Verdict::inherited() },
@@ -432,5 +452,19 @@ async fn deliver(
             c.execute("UPDATE ambient_events SET delivered = 1 WHERE id = ?1", [id])?;
             Ok(())
         });
+    }
+}
+
+fn claim_wake_speaker(d: &Shared, parts: &[Part]) {
+    let ids: std::collections::HashSet<i64> = parts
+        .iter()
+        .flat_map(|p| p.speakers.iter())
+        .filter_map(|l| l["speaker"].as_i64())
+        .filter(|id| *id != -1)
+        .collect();
+    if ids.len() == 1 {
+        if let Some(id) = ids.into_iter().next() {
+            let _ = crate::diarize::claim(&d.store, id);
+        }
     }
 }

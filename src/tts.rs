@@ -252,7 +252,7 @@ pub fn chunk_text(text: &str) -> Vec<String> {
         if sentence.is_empty() {
             continue;
         }
-        if i == 0 && sentence.split_whitespace().count() >= 8 {
+        if i == 0 && sentence.split_whitespace().count() >= 5 {
             let mut cut = None;
             let mut words = 0;
             let mut last = ' ';

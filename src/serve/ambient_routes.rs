@@ -437,7 +437,7 @@ fn echo_of_reply(text: &str, device: &str) -> bool {
         .filter(|w| !w.is_empty())
         .map(str::to_string)
         .collect();
-    if heard.len() < 3 {
+    if heard.len() < 5 {
         return false;
     }
     let since = chrono::Utc::now().timestamp() - 180;
@@ -463,12 +463,14 @@ fn echo_of_reply(text: &str, device: &str) -> bool {
         .filter(|w| !w.is_empty())
         .collect();
     let shared = heard.iter().filter(|w| spoken.contains(*w)).count();
-    shared as f64 / heard.len() as f64 >= 0.6
+    shared as f64 / heard.len() as f64 >= 0.8
 }
 
 #[derive(Deserialize)]
 pub(crate) struct ActivityReq {
     device: String,
+    #[serde(default)]
+    seq: Option<i64>,
 }
 
 pub(crate) async fn activity(
@@ -480,7 +482,7 @@ pub(crate) async fn activity(
         return unauthorized();
     }
     if lease_holder().is_some_and(|(h, _)| h == req.device) {
-        super::ambient_router::submit(&d, &req.device, super::ambient_router::Msg::Activity);
+        super::ambient_router::submit(&d, &req.device, super::ambient_router::Msg::Activity(req.seq));
     }
     Json(serde_json::json!({"ok": true})).into_response()
 }
@@ -856,6 +858,25 @@ pub(crate) async fn speakers_clear(State(d): State<Shared>, Query(a): Query<Auth
 pub(crate) struct SpeakerLabelReq {
     id: i64,
     label: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SpeakerClaimReq {
+    id: i64,
+}
+
+pub(crate) async fn speakers_claim(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<SpeakerClaimReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match crate::diarize::claim(&d.store, req.id) {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 pub(crate) async fn speakers_label(

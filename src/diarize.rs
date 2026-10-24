@@ -562,3 +562,15 @@ pub fn enrolled(store: &Store) -> bool {
         .map(|n| n > 0)
         .unwrap_or(false)
 }
+
+pub fn claim(store: &Store, id: i64) -> Result<(), String> {
+    let _guard = ASSIGN.lock().unwrap();
+    store
+        .with_connection(|c| {
+            if c.query_row("SELECT COUNT(*) FROM speakers WHERE is_user = 1", [], |r| r.get::<_, i64>(0))? > 0 {
+                return Ok(());
+            }
+            c.execute("UPDATE speakers SET is_user = 1, label = '' WHERE id = ?1", [id]).map(|_| ())
+        })
+        .map_err(|e| e.to_string())
+}

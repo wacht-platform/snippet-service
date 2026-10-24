@@ -886,6 +886,7 @@ pub async fn run_serve(
         .route("/ambient/speakers/unenroll", post(ambient_routes::speakers_unenroll))
         .route("/ambient/speakers/clear", post(ambient_routes::speakers_clear))
         .route("/ambient/speakers/label", post(ambient_routes::speakers_label))
+        .route("/ambient/speakers/claim", post(ambient_routes::speakers_claim))
         .route("/models", get(ambient_routes::models))
         .route("/models/download", post(ambient_routes::model_download))
         .route("/models/delete", post(ambient_routes::model_delete))

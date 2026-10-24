@@ -150,6 +150,24 @@ pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken
     };
     let (words, analysis) = tokio::join!(words, analysis);
     let (text, words) = words?;
+    let text = collapse_repeats(&text);
+    let words: Vec<crate::stt::Word> = {
+        let mut kept: Vec<crate::stt::Word> = Vec::new();
+        let mut run = 0;
+        for w in words {
+            if kept.last().is_some_and(|l| l.text.eq_ignore_ascii_case(&w.text)) {
+                run += 1;
+                if run >= 3 {
+                    continue;
+                }
+            } else {
+                run = 0;
+            }
+            kept.push(w);
+        }
+        kept
+    };
+    let text = if is_filler(&text) && !crate::ambient::expectation().is_some() { String::new() } else { text };
     let turns = match analysis.map_err(|e| e.to_string())? {
         Ok(turns) => turns,
         Err(e) => {
@@ -225,4 +243,33 @@ pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken
     )
     .to_string();
     Ok(Spoken { text, speakers, summary })
+}
+
+fn collapse_repeats(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut run = 0;
+    for w in text.split_whitespace() {
+        let key = |x: &str| x.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if out.last().is_some_and(|l| key(l) == key(w) && !key(w).is_empty()) {
+            run += 1;
+            if run >= 3 {
+                continue;
+            }
+        } else {
+            run = 0;
+        }
+        out.push(w);
+    }
+    out.join(" ")
+}
+
+fn is_filler(text: &str) -> bool {
+    const FILLER: [&str; 12] = ["uh", "um", "okay", "ok", "wow", "hmm", "well", "oh", "ah", "mm", "yeah", "huh"];
+    let words: Vec<String> = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    !words.is_empty() && words.len() <= 3 && words.iter().all(|w| FILLER.contains(&w.as_str()))
 }
