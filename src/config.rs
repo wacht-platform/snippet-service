@@ -160,6 +160,9 @@ pub struct SnippetConfig {
     /// AssemblyAI key for streaming speech recognition (ambient `stt = "assemblyai"`); local config only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assemblyai_api_key: Option<String>,
+    /// Deepgram key for hosted reply speech (ambient `tts = "deepgram"`); local config only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepgram_api_key: Option<String>,
     /// TUI color theme. Ignored — AMOLED is the only palette.
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +263,7 @@ impl Default for SnippetConfig {
             exa_api_key: None,
             typesafe_api_key: None,
             assemblyai_api_key: None,
+            deepgram_api_key: None,
             theme: None,
             memory_enabled: default_memory_enabled(),
             memory_reflect: default_memory_reflect(),
@@ -290,6 +294,14 @@ pub struct AmbientConfig {
     pub wake_phrases: Vec<String>,
     #[serde(default = "default_ambient_stt")]
     pub stt: String,
+    #[serde(default = "default_ambient_stt")]
+    pub tts: String,
+    #[serde(default = "default_tts_voice")]
+    pub tts_voice: String,
+}
+
+fn default_tts_voice() -> String {
+    "aura-2-thalia-en".into()
 }
 
 fn default_ambient_stt() -> String {
@@ -306,6 +318,8 @@ impl Default for AmbientConfig {
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
             stt: default_ambient_stt(),
+            tts: default_ambient_stt(),
+            tts_voice: default_tts_voice(),
         }
     }
 }

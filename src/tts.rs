@@ -232,7 +232,8 @@ pub async fn synthesize(voice: &str, text: &str) -> Result<Vec<u8>, String> {
     .map_err(|e| e.to_string())?
 }
 
-const RAMP_WORDS: [usize; 2] = [8, 14];
+const RAMP_LOCAL: [usize; 2] = [8, 14];
+const RAMP_HOSTED: [usize; 2] = [6, 12];
 const BREAK_BEFORE: &[&str] = &["to", "that", "and", "but", "so", "for", "with", "in", "on", "at", "of", "which", "because", "when", "if", "then"];
 
 fn shorten(first: &str, limit: usize) -> Option<(String, String)> {
@@ -317,7 +318,8 @@ pub fn chunk_text(text: &str) -> Vec<String> {
             _ => merged.push(piece),
         }
     }
-    for (i, limit) in RAMP_WORDS.into_iter().enumerate() {
+    let ramp = if REMOTE.lock().unwrap().is_some() { RAMP_HOSTED } else { RAMP_LOCAL };
+    for (i, limit) in ramp.into_iter().enumerate() {
         if let Some(piece) = merged.get(i).cloned() {
             if let Some((head, tail)) = shorten(&piece, limit) {
                 merged[i] = head;
@@ -349,6 +351,70 @@ fn trim_quiet(mut v: Vec<f32>) -> Vec<f32> {
     v.truncate(end);
     v.drain(..first.saturating_sub(KEEP));
     v
+}
+
+static REMOTE: Mutex<Option<(String, String)>> = Mutex::new(None);
+static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
+
+pub fn apply_config(c: &crate::config::SnippetConfig) {
+    let key = c.deepgram_api_key.clone().filter(|k| !k.trim().is_empty());
+    let remote = if c.ambient.tts == "deepgram" { key.map(|k| (k, c.ambient.tts_voice.clone())) } else { None };
+    *REMOTE.lock().unwrap() = remote;
+}
+
+fn http() -> &'static reqwest::Client {
+    HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_idle_timeout(None)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+async fn deepgram(key: &str, voice: &str, text: &str) -> Result<(Vec<u8>, u32), String> {
+    let resp = http()
+        .post("https://api.deepgram.com/v1/speak")
+        .query(&[("model", voice), ("encoding", "linear16"), ("sample_rate", "24000"), ("container", "none")])
+        .header("Authorization", format!("Token {key}"))
+        .json(&serde_json::json!({ "text": text }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body = resp.bytes().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", String::from_utf8_lossy(&body).chars().take(200).collect::<String>()));
+    }
+    let samples: Vec<f32> = body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+    if samples.is_empty() {
+        return Err("empty audio".into());
+    }
+    let samples = trim_quiet(samples);
+    let ms = (samples.len() as u64 * 1000 / RATE as u64) as u32;
+    let bytes: Vec<u8> = samples.iter().flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()).collect();
+    Ok((bytes, ms))
+}
+
+pub fn prewarm() {
+    if REMOTE.lock().unwrap().is_none() {
+        return;
+    }
+    tokio::spawn(async {
+        let _ = http().get("https://api.deepgram.com/").timeout(std::time::Duration::from_secs(4)).send().await;
+    });
+}
+
+pub async fn speak_pcm(text: &str) -> Result<(Vec<u8>, u32), String> {
+    let remote = REMOTE.lock().unwrap().clone();
+    if let Some((key, voice)) = remote {
+        match deepgram(&key, &voice, text).await {
+            Ok(done) => return Ok(done),
+            Err(e) => eprintln!("[ambient] deepgram speech failed, using the local voice: {e}"),
+        }
+    }
+    synthesize_pcm(crate::models::TTS_VOICE, text).await
 }
 
 pub async fn synthesize_pcm(voice: &str, text: &str) -> Result<(Vec<u8>, u32), String> {

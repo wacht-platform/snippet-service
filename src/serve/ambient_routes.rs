@@ -808,6 +808,7 @@ pub(crate) fn warm_voice(d: Shared) {
         crate::tts::clean_old_replies().await;
         let stt = crate::models::STT_MODEL.to_string();
         let voice = crate::models::TTS_VOICE.to_string();
+        crate::tts::apply_config(&d.config.lock().unwrap());
         let enabled = d.config.lock().unwrap().ambient.enabled;
         if enabled && crate::models::is_ready(&stt) && crate::models::is_ready(&voice) && crate::models::is_ready(crate::models::SPEAKER_MODEL) {
             warm_models(stt, voice);

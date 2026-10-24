@@ -273,7 +273,7 @@ async fn run_job(job: Job) {
     let mut failed = false;
     while let Some(text) = job.live.next(&job.cancel).await {
         let seq = made;
-        match crate::tts::synthesize_pcm(crate::models::TTS_VOICE, &text).await {
+        match crate::tts::speak_pcm(&text).await {
             Ok((bytes, ms)) => {
                 if tokio::fs::write(dir.join(format!("{seq}.pcm")), bytes).await.is_err() {
                     failed = true;

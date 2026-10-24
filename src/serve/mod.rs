@@ -256,6 +256,7 @@ impl Daemon {
     /// transiently fails (never wipes profiles on a bad read).
     async fn reload_config(&self) {
         if let Ok(fresh) = SnippetConfig::load(&self.config_path).await {
+            crate::tts::apply_config(&fresh);
             *self.config.lock().unwrap() = fresh;
         }
     }

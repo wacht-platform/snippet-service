@@ -519,6 +519,7 @@ async fn deliver(
     if mode == "active" && continuation_of.is_none() && super::autonomy::interrupt_mission_control(d).await {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    crate::tts::prewarm();
     super::autonomy::deliver_to_mission_control(d, envelope).await;
     for id in &ids {
         let _ = d.store.with_connection(|c| {
