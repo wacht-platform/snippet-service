@@ -19,9 +19,9 @@ const MERGE_GAP: f64 = 1.5;
 const CONTINUED_GAP: f64 = 4.0;
 const MAX_PARTS: usize = 5;
 const MAX_SPAN: f64 = 30.0;
-const PASSIVE_THRESHOLD: f64 = 0.7;
-const PINNED_THRESHOLD: f64 = 0.5;
-const LIVE_REPLY_THRESHOLD: f64 = 0.55;
+const PASSIVE_THRESHOLD: f64 = 0.55;
+const PINNED_THRESHOLD: f64 = 0.4;
+const LIVE_REPLY_THRESHOLD: f64 = 0.35;
 const MATCH_THRESHOLD: f64 = 0.7;
 const MEMORABLE_THRESHOLD: f64 = 0.65;
 
@@ -272,18 +272,18 @@ fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool, fr
     }
     let matched = expecting && v.matches >= MATCH_THRESHOLD;
     if live {
-        if wake || matched || v.continues >= 0.6 {
+        if wake || matched || v.continues >= 0.4 {
             return (true, false);
         }
-        let bar = if unsure_voice && !you { 0.7 } else { LIVE_REPLY_THRESHOLD };
-        return (v.addressed >= bar && (v.for_assistant() || v.addressed >= 0.6), false);
+        let bar = if unsure_voice && !you { 0.5 } else { LIVE_REPLY_THRESHOLD };
+        return (v.addressed >= bar && (v.for_assistant() || you || v.addressed >= 0.45), false);
     }
     if pinned {
         let asked = v.for_assistant() && v.addressed >= PINNED_THRESHOLD;
         let go = wake || asked || matched;
         return (go, go);
     }
-    let bar = if unsure_voice && !you { 0.8 } else if v.kind == "conversation" { 0.55 } else { PASSIVE_THRESHOLD };
+    let bar = if unsure_voice && !you { 0.65 } else if v.kind == "conversation" { 0.45 } else { PASSIVE_THRESHOLD };
     let asked = v.for_assistant() && v.addressed >= bar;
     (wake || asked || matched, false)
 }
