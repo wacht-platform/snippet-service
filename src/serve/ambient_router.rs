@@ -395,24 +395,36 @@ fn render(parts: &[Part], fallback: &str) -> (String, String) {
     (body.join("\n"), names.join(", "))
 }
 
+fn attached() -> &'static Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
 fn context(d: &Shared, device: &str, ids: &[String]) -> String {
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
     let since = chrono::Utc::now().timestamp() - 60;
-    let lines: Vec<String> = d
+    let rows: Vec<(String, String)> = d
         .store
         .with_connection(|c| {
             let mut stmt = c.prepare(
-                "SELECT text FROM ambient_events
+                "SELECT id, text FROM ambient_events
                  WHERE device = ?1 AND status = 'done' AND kept = 1 AND delivered = 0 AND routed = 1
                    AND created_at >= ?2 AND text != '' AND id NOT IN (SELECT value FROM json_each(?3))
-                 ORDER BY started_at DESC LIMIT 3",
+                 ORDER BY started_at DESC LIMIT 6",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![device, since, excluded], |r| r.get::<_, String>(0))?
+                .query_map(rusqlite::params![device, since, excluded], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .unwrap_or_default();
+    let lines: Vec<String> = {
+        let mut seen = attached().lock().unwrap();
+        if seen.len() > 500 {
+            seen.clear();
+        }
+        rows.into_iter().filter(|(id, _)| seen.insert(id.clone())).map(|(_, t)| t).take(3).collect()
+    };
     if lines.is_empty() {
         return String::new();
     }

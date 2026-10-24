@@ -64,6 +64,12 @@ pub(super) async fn deliver_to_mission_control(daemon: &Shared, text: String) {
     daemon.deliver(SESSION_ID, LoopInput::UserMessage(text)).await;
 }
 
+pub(super) async fn interrupt_mission_control(daemon: &Shared) {
+    if mission_control_busy() {
+        daemon.deliver(SESSION_ID, LoopInput::Interrupt).await;
+    }
+}
+
 fn mission_control_busy() -> bool {
     crate::session::read_session_state(&crate::mission_control::session_state_path())
         .is_some_and(|s| matches!(s.status, HarnessStatus::Running | HarnessStatus::WaitingForInput))

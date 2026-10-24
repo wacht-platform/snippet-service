@@ -121,6 +121,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                     let first = seg.checks == 1;
                                     let samples: Vec<f32> = seg.pcm.chunks_exact(2).take(16_000 * 3).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
                                     let (d, dev) = (d.clone(), device.clone());
+                                    let dd = d.clone();
                                     tokio::spawn(async move {
                                         let sim = tokio::task::spawn_blocking(move || crate::diarize::user_similarity(&d.store, &samples)).await;
                                         let go = match sim {
@@ -129,8 +130,8 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                             _ => false,
                                         };
                                         eprintln!("[ambient-speech] interrupt check {dev} go={go}");
-                                        if go {
-                                            crate::speech::interrupt(&dev);
+                                        if go && crate::speech::interrupt(&dev) {
+                                            super::autonomy::interrupt_mission_control(&dd).await;
                                         }
                                     });
                                 }

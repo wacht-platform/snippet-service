@@ -416,6 +416,7 @@ impl CodingHarness {
                     }
                     repair_unanswered_tool_events(&mut state.events, evt_mark);
                     repair_unanswered_tool_calls(&mut state.messages);
+                    trim_spoken_calls(&mut state, evt_mark);
                     // Apply any pending inputs (such as queued messages sent immediately via SteerQueued,
                     // UserMessages, newly queued inputs, and notices) so they survive into the transcript.
                     self.apply_interrupted_pending(&mut state, &mut pending_inputs);
@@ -797,3 +798,34 @@ pub(super) fn backoff_delay(attempt: usize, base_ms: u64, max_ms: u64) -> Durati
     Duration::from_millis(delay)
 }
 
+
+
+fn is_speak_tool(name: &str) -> bool {
+    name == "speak" || name.ends_with("__speak")
+}
+
+fn trim_spoken_calls(state: &mut HarnessState, evt_mark: usize) {
+    for message in state.messages.iter_mut().rev() {
+        match message {
+            HarnessMessage::User { .. } => break,
+            HarnessMessage::Assistant { tool_calls, .. } => {
+                for call in tool_calls.iter_mut().filter(|c| is_speak_tool(&c.name)) {
+                    if let Some(cut) = call.arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
+                        call.arguments["text"] = serde_json::Value::String(cut);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let from = evt_mark.min(state.events.len());
+    for event in state.events[from..].iter_mut() {
+        if let HarnessEvent::ToolCall { tool_name, arguments } = event {
+            if is_speak_tool(tool_name) {
+                if let Some(cut) = arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
+                    arguments["text"] = serde_json::Value::String(cut);
+                }
+            }
+        }
+    }
+}

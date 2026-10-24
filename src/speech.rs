@@ -88,6 +88,31 @@ pub fn pending() -> bool {
     CURRENT.lock().unwrap().is_some() || !QUEUE.lock().unwrap().is_empty()
 }
 
+pub fn cut_view(text: &str) -> Option<String> {
+    let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (status, heard): (String, Option<String>) = crate::ambient::store()
+        .ok()
+        .and_then(|s| {
+            s.with_connection(|c| {
+                c.query_row(
+                    "SELECT status, heard_text FROM ambient_turns WHERE role = 'assistant' AND TRIM(text) = ?1 ORDER BY id DESC LIMIT 1",
+                    [&wanted],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+            })
+            .ok()
+        })?;
+    if status != "interrupted" && status != "cancelled" {
+        return None;
+    }
+    let heard = heard.unwrap_or_default();
+    Some(if heard.trim().is_empty() {
+        "[the user interrupted before any of this was spoken]".to_string()
+    } else {
+        format!("{} [cut off by the user; the rest was never spoken]", heard.trim())
+    })
+}
+
 pub fn take_interruption() -> Option<String> {
     INTERRUPTED.lock().unwrap().take()
 }
