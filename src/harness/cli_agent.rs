@@ -1726,7 +1726,7 @@ impl CodingHarness {
                         }
                         CliLine::Exited(g, stderr) if g == generation => {
                             process = None;
-                            if matches!(state.status, HarnessStatus::Running | HarnessStatus::WaitingForInput) {
+                            if state.status == HarnessStatus::Running {
                                 let message = if stderr.is_empty() {
                                     format!("{} exited before finishing the turn", kind.label())
                                 } else {
