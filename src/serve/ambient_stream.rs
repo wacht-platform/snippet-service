@@ -151,7 +151,12 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                     });
                                 }
                             }
-                            let _ = QUIET_BYTES;
+                            if seg.quiet >= QUIET_BYTES && seg.asm.is_some() && !seg.forced && seg.voiced >= 9_600 {
+                                seg.forced = true;
+                                if let Some(a) = seg.asm.as_mut() {
+                                    a.force();
+                                }
+                            }
                         }
                     }
                 }
@@ -250,6 +255,19 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         eprintln!("[ambient-stat] {device} {v}");
                     }
                     Some("caps") => {
+                        if !device.is_empty() {
+                            let (key, terms) = {
+                                let c = d.config.lock().unwrap();
+                                let mut terms = c.ambient.wake_phrases.clone();
+                                for extra in ["Snippet", "Mission Control"] {
+                                    if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
+                                        terms.push(extra.to_string());
+                                    }
+                                }
+                                (c.assemblyai_api_key.clone().unwrap_or_default(), terms)
+                            };
+                            super::assembly::prewarm(&device, key, terms);
+                        }
                         if !device.is_empty() && v.get("tts_stream").and_then(|x| x.as_i64()).unwrap_or(0) > 0 {
                             if let Some(old) = phone.take() {
                                 crate::tts_stream::unregister_phone(&device, old);

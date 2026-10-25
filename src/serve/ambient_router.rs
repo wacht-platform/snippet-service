@@ -211,7 +211,8 @@ async fn accept(
         flush(d, device, parts, crate::ambient::conversation().is_some(), last, pending.take()).await;
     }
     turn.push(part);
-    if wake {
+    let fast_interrupt = crate::speech::has_interruption();
+    if wake || fast_interrupt {
         let parts = std::mem::take(turn);
         *deadline = None;
         flush(d, device, parts, true, last, pending.take()).await;
@@ -295,7 +296,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
         let go = match &early {
             Some(v) => decide(live, pinned, v, wake, expecting).0,
-            None => wake,
+            None => wake || (live && crate::speech::has_interruption()),
         };
         if go {
             let v = wake_verdict(early.as_ref());
@@ -453,14 +454,14 @@ async fn deliver(
     if let Some(parent) = continuation_of {
         attrs.push_str(&format!(" continuation_of=\"{}\"", ambient_watch::escape(&parent.join(","))));
     }
-    crate::tts_stream::settle(Duration::from_millis(800)).await;
+    crate::tts_stream::settle(Duration::from_millis(120)).await;
     if let Some(heard) = crate::speech::take_interruption() {
         attrs.push_str(&format!(" interrupted_reply=\"{}\"", ambient_watch::escape(&heard)));
     }
     let ctx = context(d, device, &ids);
     let envelope = format!("<ambient_turn{attrs}>{ctx}{}</ambient_turn>", ambient_watch::escape(&rendered));
     if mode == "active" && super::autonomy::interrupt_mission_control(d).await {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     crate::tts::prewarm();
     super::autonomy::deliver_to_mission_control(d, envelope).await;

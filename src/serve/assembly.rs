@@ -11,8 +11,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 const SEND_MIN: usize = 3200;
 const MIN_SEND: usize = 1760;
 const MAX_SEND: usize = 24_000;
-const FINISH_WAIT: Duration = Duration::from_millis(1800);
-const EMPTY_WAIT: Duration = Duration::from_millis(1100);
+const FINISH_WAIT: Duration = Duration::from_millis(2600);
+const EMPTY_WAIT: Duration = Duration::from_millis(2000);
+const FORCE_RETRY: Duration = Duration::from_millis(350);
 const IDLE_CLOSE: Duration = Duration::from_secs(300);
 const KEEP_FINALS: usize = 64;
 
@@ -51,29 +52,42 @@ fn hub() -> &'static Mutex<HashMap<String, Arc<Session>>> {
     HUB.get_or_init(Default::default)
 }
 
-pub(super) fn begin(device: &str, key: String, terms: Vec<String>) -> Ticket {
-    let session = {
-        let mut map = hub().lock().unwrap();
-        match map.get(device).filter(|s| s.state.lock().unwrap().closed.is_none()) {
-            Some(existing) => existing.clone(),
-            None => {
-                let (cmd, rx) = mpsc::unbounded_channel();
-                let session = Arc::new(Session { cmd, state: Mutex::new(State::default()), notify: Notify::new(), flushed: AtomicU64::new(0) });
-                map.insert(device.to_string(), session.clone());
-                let (task, name) = (session.clone(), device.to_string());
-                tokio::spawn(async move {
-                    let reason = run(&task, key, terms, rx).await.err().unwrap_or_else(|| "closed".into());
-                    task.state.lock().unwrap().closed = Some(reason);
-                    task.notify.notify_waiters();
-                    let mut map = hub().lock().unwrap();
-                    if map.get(&name).is_some_and(|s| Arc::ptr_eq(s, &task)) {
-                        map.remove(&name);
-                    }
-                });
-                session
-            }
+fn ensure_session(device: &str, key: String, terms: Vec<String>) -> Arc<Session> {
+    let mut map = hub().lock().unwrap();
+    match map.get(device).filter(|s| s.state.lock().unwrap().closed.is_none()) {
+        Some(existing) => existing.clone(),
+        None => {
+            let (cmd, rx) = mpsc::unbounded_channel();
+            let session = Arc::new(Session {
+                cmd,
+                state: Mutex::new(State::default()),
+                notify: Notify::new(),
+                flushed: AtomicU64::new(0),
+            });
+            map.insert(device.to_string(), session.clone());
+            let (task, name) = (session.clone(), device.to_string());
+            tokio::spawn(async move {
+                let reason = run(&task, key, terms, rx).await.err().unwrap_or_else(|| "closed".into());
+                task.state.lock().unwrap().closed = Some(reason);
+                task.notify.notify_waiters();
+                let mut map = hub().lock().unwrap();
+                if map.get(&name).is_some_and(|s| Arc::ptr_eq(s, &task)) {
+                    map.remove(&name);
+                }
+            });
+            session
         }
-    };
+    }
+}
+
+pub(super) fn prewarm(device: &str, key: String, terms: Vec<String>) {
+    if !device.is_empty() && !key.trim().is_empty() {
+        let _ = ensure_session(device, key, terms);
+    }
+}
+
+pub(super) fn begin(device: &str, key: String, terms: Vec<String>) -> Ticket {
+    let session = ensure_session(device, key, terms);
     let start = session.state.lock().unwrap().next;
     let init_byte = session.flushed.load(Ordering::SeqCst);
     Ticket {
@@ -196,8 +210,16 @@ impl Inner {
                 break;
             }
             let limit = if have || any_partial { deadline } else { empty_deadline };
-            if tokio::time::timeout_at(limit, notified).await.is_err() {
+            let now = tokio::time::Instant::now();
+            if now >= limit {
                 break;
+            }
+            let step = limit.min(now + FORCE_RETRY);
+            if tokio::time::timeout_at(step, notified).await.is_err() {
+                if tokio::time::Instant::now() >= limit {
+                    break;
+                }
+                let _ = self.session.cmd.send(Cmd::Force);
             }
         }
         let s = self.session.state.lock().unwrap();
@@ -219,10 +241,24 @@ impl Inner {
             if turn.text.is_empty() {
                 continue;
             }
+            let piece = if turn.words.first().is_some_and(|w| w.start < start_sec - 0.25) {
+                turn.words
+                    .iter()
+                    .filter(|w| w.end > start_sec - 0.12 && w.start < end_sec + 0.35)
+                    .map(|w| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                turn.text.clone()
+            };
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
             if !text.is_empty() {
                 text.push(' ');
             }
-            text.push_str(&turn.text);
+            text.push_str(piece);
         }
         Ok(Transcript { text })
     }

@@ -144,6 +144,12 @@ pub fn cut_view(text: &str) -> Option<String> {
     })
 }
 
+pub fn has_interruption() -> bool {
+    INTERRUPTED.lock().unwrap().is_some()
+        || STREAM_INTERRUPTED.lock().unwrap().is_some()
+        || crate::tts_stream::is_reconciling()
+}
+
 pub fn take_interruption() -> Option<String> {
     let chunk = INTERRUPTED.lock().unwrap().take();
     let stream = STREAM_INTERRUPTED.lock().unwrap().take();

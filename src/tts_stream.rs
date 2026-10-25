@@ -785,6 +785,10 @@ async fn reconcile(
     }
 }
 
+pub fn is_reconciling() -> bool {
+    RECONCILING.load(Ordering::SeqCst) > 0
+}
+
 pub async fn settle(max: Duration) {
     let deadline = Instant::now() + max;
     while RECONCILING.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
