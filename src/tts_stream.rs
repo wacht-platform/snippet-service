@@ -110,6 +110,11 @@ pub fn report_pos(device: &str, turn: i64, ms: i64, done: bool) {
         i.heard = Some((ms, now));
         done && !i.stopped && i.audio_ms.is_some()
     };
+    if done {
+        let generated = t.inner.lock().unwrap().audio_ms.unwrap_or(-1);
+        let flag = if generated > 0 && ms + 400 < generated { " CUT-SHORT" } else { "" };
+        eprintln!("[ambient-flux] turn {turn} phone played {ms}ms of {generated}ms generated{flag}");
+    }
     if finished {
         LIVE.lock().unwrap().retain(|x| !Arc::ptr_eq(x, &t));
         mark_played(&t);
@@ -513,6 +518,12 @@ fn finish_turn(t: &StreamTurn, ms: i64) {
         i.file = None;
         (i.stopped, i.text.clone())
     };
+    {
+        let chars = text.trim().chars().count().max(1) as i64;
+        let per = ms / chars;
+        let flag = if chars >= 20 && per < 35 { " SHORT-AUDIO" } else { "" };
+        eprintln!("[ambient-flux] turn {} generated {ms}ms for {chars} chars ({per}ms/char){flag}", t.turn);
+    }
     if let Ok(store) = crate::ambient::store() {
         let _ = store.with_connection(|c| {
             c.execute(
