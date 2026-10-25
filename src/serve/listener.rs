@@ -12,11 +12,12 @@ use super::Shared;
 
 const BPS: f64 = 32_000.0;
 const RING: usize = 32_000 * 180;
-const SEND_AT: u64 = 1_760;
-const MIN_SEND: u64 = 1_760;
+const SEND_AT: u64 = 1_024;
+const MIN_SEND: u64 = 1_024;
 const MAX_SEND: u64 = 24_000;
 const REPLAY: u64 = 32_000 * 10;
 const PAD: u64 = 9_600;
+const ECHO_HANGOVER_BYTES: u64 = 9_600;
 const IDLE_CLOSE: Duration = Duration::from_secs(60);
 const URGENT: &[&str] = &["stop", "wait", "hold", "pause", "no", "nope", "sorry", "actually", "hang", "snippet", "chief", "enough", "shut", "quiet"];
 const SAMPLE: Duration = Duration::from_millis(250);
@@ -113,7 +114,7 @@ fn active_mode() -> bool {
 }
 
 fn silences(active: bool) -> (u32, u32) {
-    if active { (160, 900) } else { (260, 1600) }
+    if active { (100, 500) } else { (200, 1000) }
 }
 
 fn at(marks: &VecDeque<(u64, bool)>, g: u64) -> bool {
@@ -127,6 +128,9 @@ fn trim(marks: &mut VecDeque<(u64, bool)>, from: u64) {
 }
 
 fn set(marks: &mut VecDeque<(u64, bool)>, g: u64, on: bool) {
+    while marks.back().is_some_and(|(m, _)| *m >= g) {
+        marks.pop_back();
+    }
     if marks.back().map(|(_, v)| *v) != Some(on) {
         marks.push_back((g, on));
     }
@@ -225,7 +229,8 @@ pub(super) fn flag(device: &str, kind: &str, on: bool) {
         _ => {
             s.play_flag = on;
             let v = on || s.audible;
-            set(&mut s.playing, g, v);
+            let at_g = if v { g } else { g + ECHO_HANGOVER_BYTES };
+            set(&mut s.playing, at_g, v);
         }
     }
 }
@@ -265,7 +270,8 @@ impl Listener {
         s.sampled = Some(Instant::now());
         s.audible = audible;
         let (g, v) = (s.g, audible || s.play_flag);
-        set(&mut s.playing, g, v);
+        let at_g = if v { g } else { g + ECHO_HANGOVER_BYTES };
+        set(&mut s.playing, at_g, v);
         if let Some(c) = s.conn.as_mut()
             && c.active != active
             && let Some(tx) = c.tx.as_ref()
@@ -273,7 +279,7 @@ impl Listener {
             c.active = active;
             let (min, max) = silences(active);
             let _ = tx.send(Cmd::Config(
-                serde_json::json!({"type":"UpdateConfiguration","min_turn_silence":min,"max_turn_silence":max}).to_string(),
+                serde_json::json!({"type":"UpdateConfiguration","mode":"min_latency","min_turn_silence":min,"max_turn_silence":max}).to_string(),
             ));
         }
     }
@@ -608,7 +614,7 @@ async fn connect(key: &str, terms: &[String], active: bool) -> Result<Ws, String
     let keyterms = serde_json::to_string(terms).map_err(|e| e.to_string())?;
     let (min, max) = silences(active);
     let url = format!(
-        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&mode=balanced&min_turn_silence={min}&max_turn_silence={max}&interruption_delay=80&language_codes={}&keyterms_prompt={}",
+        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&mode=min_latency&min_turn_silence={min}&max_turn_silence={max}&interruption_delay=80&language_codes={}&keyterms_prompt={}",
         urlencoding::encode("[\"en\"]"),
         urlencoding::encode(&keyterms)
     );

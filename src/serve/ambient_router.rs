@@ -212,13 +212,14 @@ async fn accept(
     }
     turn.push(part);
     let fast_interrupt = crate::speech::has_interruption();
-    if wake || fast_interrupt {
+    let live = crate::ambient::conversation().is_some();
+    if wake || fast_interrupt || (live && super::ambient_routes::assistant_recent(device, 25)) {
         let parts = std::mem::take(turn);
         *deadline = None;
         flush(d, device, parts, true, last, pending.take()).await;
     } else {
         classify_turn(d, turn, pending);
-        let hold = if crate::ambient::conversation().is_some() { FAST_HOLD } else { HOLD };
+        let hold = if live { FAST_HOLD } else { HOLD };
         *deadline = Some(Instant::now() + hold);
     }
 }
@@ -293,17 +294,27 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let mut delivered = false;
     let mut early: Option<Verdict> = None;
     if fast && routable {
-        early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
-        let go = match &early {
-            Some(v) => decide(live, pinned, v, wake, expecting).0,
-            None => wake || (live && (crate::speech::has_interruption() || super::ambient_routes::assistant_recent(device, 25))),
-        };
-        if go {
-            let v = wake_verdict(early.as_ref());
+        let speculative_go = wake || (live && (crate::speech::has_interruption() || super::ambient_routes::assistant_recent(device, 25)));
+        if speculative_go {
+            let v = wake_verdict(None);
             deliver(d, device, &parts, &v, wake, None, ttl, !live).await;
             delivered = true;
             if !live && !pinned {
                 crate::ambient::open_conversation(device, ttl);
+            }
+        } else {
+            early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
+            let go = match &early {
+                Some(v) => decide(live, pinned, v, wake, expecting).0,
+                None => false,
+            };
+            if go {
+                let v = wake_verdict(early.as_ref());
+                deliver(d, device, &parts, &v, wake, None, ttl, !live).await;
+                delivered = true;
+                if !live && !pinned {
+                    crate::ambient::open_conversation(device, ttl);
+                }
             }
         }
     }
