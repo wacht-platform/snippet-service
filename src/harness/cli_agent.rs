@@ -1247,7 +1247,7 @@ impl CodingHarness {
                         .context_window_tokens
                         .saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64)
                         / 100;
-                    let full = away && threshold > 0 && session.tokens >= threshold;
+                    let full = (away || once) && threshold > 0 && session.tokens >= threshold;
                     if rewritten || behind || full {
                         if let Some(mut p) = process.take() {
                             let _ = p.child.start_kill();

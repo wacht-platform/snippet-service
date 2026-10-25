@@ -21,9 +21,10 @@ use crate::llm::NativeToolDefinition;
 use crate::tools::{Tool, ToolContext, ToolError, ToolResult, coding_tools};
 
 /// Builds a fresh model instance for a child lane run. Accepts an optional
-/// inference profile name; when None, it constructs the parent session's active model
-/// to preserve prompt cache affinity.
-pub type ModelFactory = Arc<dyn Fn(Option<&str>) -> Result<Box<dyn AgentModel>, String> + Send + Sync>;
+/// inference profile name and the lane's own durable session id so each lane
+/// keeps its own sticky prompt-cache key without colliding with the parent.
+pub type ModelFactory =
+    Arc<dyn Fn(Option<&str>, Option<String>) -> Result<Box<dyn AgentModel>, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -991,7 +992,10 @@ async fn run_lane_once(
     approval: Option<LaneApprovalRoute>,
     link: LaneLink,
 ) -> Result<(String, String), String> {
-    let mut model = factory(profile.as_deref())?;
+    let lane_session_id = state_path
+        .starts_with(crate::config::workspaces_root())
+        .then(|| crate::session::session_id_for_state_path(&state_path));
+    let mut model = factory(profile.as_deref(), lane_session_id)?;
     let mut log = LaneLog::open(&owner).ok();
     if let Some(log) = log.as_mut() {
         let _ = log.write_start(&owner, &brief, read_only);

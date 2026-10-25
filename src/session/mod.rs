@@ -397,12 +397,13 @@ impl AgentRuntime {
         let base_model = i.base_model;
         let setups = i.setups;
         let delegate = i.delegate.unwrap_or_else(|| base_model.clone());
-        let lane_session_id = i.durable_id;
+        let parent_session_id = i.durable_id;
         Ok(Self {
-            factory: Some(Arc::new(move |profile: Option<&str>| {
+            factory: Some(Arc::new(move |profile: Option<&str>, lane_id: Option<String>| {
+                let session_id = lane_id.or_else(|| parent_session_id.clone());
                 if let Some(name) = profile {
                     if let Some(cfg) = setups.as_ref().and_then(|s| s.get(name)) {
-                        return Ok(cfg.build_model_for_session(lane_session_id.clone()));
+                        return Ok(cfg.build_model_for_session(session_id));
                     } else {
                         let known = setups
                             .as_ref()
@@ -414,7 +415,7 @@ impl AgentRuntime {
                         ));
                     }
                 }
-                Ok(delegate.build_model_for_session(lane_session_id.clone()))
+                Ok(delegate.build_model_for_session(session_id))
             })),
             context,
             tools,
