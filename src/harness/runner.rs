@@ -446,6 +446,9 @@ impl CodingHarness {
                                 _ => None,
                             })
                             .unwrap_or(false);
+                        if voice_turn {
+                            crate::ambient::release_hold();
+                        }
                         if matches!(kind, TurnEndKind::Complete)
                             && !voice_turn
                             && self.config.memory_enabled

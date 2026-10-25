@@ -151,12 +151,19 @@ fn trim_quiet(mut v: Vec<f32>) -> Vec<f32> {
     v
 }
 static REMOTE: Mutex<Option<(String, String)>> = Mutex::new(None);
+static HOST: Mutex<String> = Mutex::new(String::new());
+
+pub fn deepgram_host() -> String {
+    let h = HOST.lock().unwrap();
+    if h.is_empty() { "api.deepgram.com".to_string() } else { h.clone() }
+}
 static HTTP: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub fn apply_config(c: &crate::config::SnippetConfig) {
     let key = c.deepgram_api_key.clone().filter(|k| !k.trim().is_empty());
     let voice = if c.ambient.tts_voice.starts_with("aura") { c.ambient.tts_voice.clone() } else { "aura-2-thalia-en".to_string() };
     *REMOTE.lock().unwrap() = key.map(|k| (k, voice));
+    *HOST.lock().unwrap() = c.ambient.deepgram_host.trim().trim_start_matches("https://").trim_end_matches('/').to_string();
     crate::tts_stream::apply_config(c);
 }
 
@@ -172,7 +179,7 @@ fn http() -> &'static reqwest::Client {
 }
 async fn deepgram(key: &str, voice: &str, text: &str) -> Result<(Vec<u8>, u32), String> {
     let resp = http()
-        .post("https://api.deepgram.com/v1/speak")
+        .post(format!("https://{}/v1/speak", deepgram_host()))
         .query(&[("model", voice), ("encoding", "linear16"), ("sample_rate", "24000"), ("container", "none")])
         .header("Authorization", format!("Token {key}"))
         .json(&serde_json::json!({ "text": text }))
@@ -198,7 +205,7 @@ pub fn prewarm() {
         return;
     }
     tokio::spawn(async {
-        let _ = http().get("https://api.deepgram.com/").timeout(std::time::Duration::from_secs(4)).send().await;
+        let _ = http().get(format!("https://{}/", deepgram_host())).timeout(std::time::Duration::from_secs(4)).send().await;
     });
 }
 pub async fn speak_pcm(text: &str) -> Result<(Vec<u8>, u32), String> {

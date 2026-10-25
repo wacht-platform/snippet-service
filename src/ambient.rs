@@ -80,6 +80,20 @@ pub fn hold(secs: u64) {
     }
 }
 
+static WORKING: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn working(secs: u64) {
+    *WORKING.lock().unwrap() = Some(Instant::now() + Duration::from_secs(secs));
+}
+
+pub fn release_hold() {
+    *WORKING.lock().unwrap() = None;
+}
+
+fn is_working(now: Instant) -> bool {
+    WORKING.lock().unwrap().is_some_and(|w| w > now)
+}
+
 pub fn playback_finished(ttl_secs: u32) {
     if let Some(c) = CONVERSATION.lock().unwrap().as_mut() {
         c.hold_until = None;
@@ -219,7 +233,7 @@ pub fn lease_clear() {
 pub fn conversation() -> Option<Conversation> {
     let mut conversation = CONVERSATION.lock().unwrap();
     let now = Instant::now();
-    if conversation.as_ref().is_some_and(|c| c.expires <= now && c.hold_until.is_none_or(|h| h <= now)) {
+    if conversation.as_ref().is_some_and(|c| c.expires <= now && c.hold_until.is_none_or(|h| h <= now)) && !is_working(now) {
         *conversation = None;
         drop(conversation);
         emit_state("conversation ended");
@@ -327,7 +341,7 @@ pub fn prompt_line() -> String {
         .unwrap_or_default();
     match conversation() {
         Some(_) => format!(
-            " Ambient mode is ACTIVE: a live spoken conversation is open with the user on {label}. Nearly everything they say arrives as <ambient_turn mode=\"active\"> messages; answer by calling speak, or say nothing when a line is not for you. Talk like a person on a call: short, plain, conversational sentences, usually one or two, each under about fifteen words; no markdown, lists, ids or paths; skip preamble and never read back what they just said. Sound like a person mid-conversation, not an assistant: contractions, plain words, and \"it\" or \"that\" for whatever was just discussed instead of naming it again. Use their name at most once, when greeting; never in back-to-back replies. Don't repeat anything you said in your last few replies, and skip stock openers like \"Let me check the current state of\"; a quick \"One sec.\" or \"Checking.\" is enough. After speaking, write no chat line that restates it. Answer only their latest line; earlier lines are context. When you ask them something, set expecting and stop: your turn ends there and their reply comes as the next ambient_turn, so never answer your own question. The user hears silence until your first speak call, so make speak your FIRST action on every spoken turn: if the answer needs tools, say a short acknowledgement or the answer you already know first (for example \"Checking now.\"), then run the tools, then speak the result. Never run a tool before the first speak. If speaking is no longer needed, call ambient_mode with passive.{expecting}"
+            " Ambient mode is ACTIVE: a live spoken conversation is open with the user on {label}. Nearly everything they say arrives as <ambient_turn mode=\"active\"> messages; answer by calling speak, or say nothing when a line is not for you. Talk like a person on a call: short, plain, conversational sentences, usually one or two, each under about fifteen words; no markdown, lists, ids or paths; skip preamble and never read back what they just said. Sound like a person mid-conversation, not an assistant: contractions, plain words, and \"it\" or \"that\" for whatever was just discussed instead of naming it again. Use their name at most once, when greeting; never in back-to-back replies. Don't repeat anything you said in your last few replies, and skip stock openers like \"Let me check the current state of\"; a quick \"One sec.\" or \"Checking.\" is enough. After speaking, write no chat line that restates it. Answer only their latest line; earlier lines are context. When you ask them something, set expecting and stop: your turn ends there and their reply comes as the next ambient_turn, so never answer your own question. The user hears silence until your first speak call, so make speak your FIRST action on every spoken turn: if the answer needs tools, say a short acknowledgement or the answer you already know first (for example \"Checking now.\"), then run the tools, then speak the result. Never run a tool before the first speak. Acknowledge once per line they say: after that, don't acknowledge again or announce each new check; work quietly and speak again only with something new. Each later speak in the same turn picks up where your earlier speak calls since their latest ambient_turn left off, like the next sentence of one reply: add only the new part, never restate or start over. The conversation stays open while you work. If speaking is no longer needed, call ambient_mode with passive.{expecting}"
         ),
         None if PINNED_ACTIVE.load(Ordering::Relaxed) => {
             let last = LAST_USER_TURN.load(Ordering::Relaxed);

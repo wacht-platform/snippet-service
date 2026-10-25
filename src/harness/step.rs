@@ -191,6 +191,7 @@ impl CodingHarness {
         loop {
             if voice {
                 crate::ambient::mark_last("llm_request");
+                crate::ambient::working(300);
             }
             let error = match model
                 .generate(request_messages, definitions, false, sink.cloned())

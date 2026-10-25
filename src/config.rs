@@ -294,12 +294,22 @@ pub struct AmbientConfig {
     pub wake_phrases: Vec<String>,
     #[serde(default = "default_tts_voice")]
     pub tts_voice: String,
+    #[serde(default = "default_deepgram_host", skip_serializing_if = "is_default_deepgram_host")]
+    pub deepgram_host: String,
 }
 
 impl Eq for AmbientConfig {}
 
 fn default_tts_voice() -> String {
     "aura-2-thalia-en".into()
+}
+
+fn default_deepgram_host() -> String {
+    "api.deepgram.com".into()
+}
+
+fn is_default_deepgram_host(h: &String) -> bool {
+    *h == default_deepgram_host()
 }
 
 impl Default for AmbientConfig {
@@ -312,6 +322,7 @@ impl Default for AmbientConfig {
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
             tts_voice: default_tts_voice(),
+            deepgram_host: default_deepgram_host(),
         }
     }
 }

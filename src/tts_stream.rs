@@ -30,6 +30,7 @@ struct Config {
     key: String,
     voice: String,
     ttl: u32,
+    host: String,
 }
 
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
@@ -40,9 +41,9 @@ static LIVE: Mutex<Vec<Arc<StreamTurn>>> = Mutex::new(Vec::new());
 pub fn apply_config(c: &crate::config::SnippetConfig) {
     let key = c.deepgram_api_key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let voice = if c.ambient.tts_voice.starts_with("flux-") { c.ambient.tts_voice.clone() } else { DEFAULT_VOICE.to_string() };
-    let next = key.map(|key| Config { key, voice, ttl: c.ambient.conversation_timeout_secs });
+    let next = key.map(|key| Config { key, voice, ttl: c.ambient.conversation_timeout_secs, host: c.ambient.deepgram_host.clone() });
     let mut current = CONFIG.lock().unwrap();
-    if current.as_ref().map(|c| (&c.key, &c.voice)) != next.as_ref().map(|c| (&c.key, &c.voice)) {
+    if current.as_ref().map(|c| (&c.key, &c.voice, &c.host)) != next.as_ref().map(|c| (&c.key, &c.voice, &c.host)) {
         let stale: Vec<Arc<Session>> = hub().lock().unwrap().drain().map(|(_, s)| s).collect();
         for s in stale {
             if s.st.lock().unwrap().queue.is_empty() {
@@ -385,7 +386,8 @@ pub fn start_turn(session: &Arc<Session>, device: &str, conversation: &str) -> R
 
 async fn run(session: &Arc<Session>, key: String, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
     let url = format!(
-        "wss://api.deepgram.com/v2/speak?model={}&encoding=linear16&sample_rate=24000",
+        "wss://{}/v2/speak?model={}&encoding=linear16&sample_rate=24000",
+        crate::tts::deepgram_host(),
         urlencoding::encode(&session.voice)
     );
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
