@@ -409,10 +409,18 @@ impl CodingHarness {
     ) -> Result<(), ToolError> {
         const RECENT_FOCUS: usize = 12;
         const MIN_COMPACTABLE_MESSAGES: usize = 14;
+        const VOICE_READY_TOKENS: u64 = 48_000;
 
         let window = self.config.context_window_tokens.max(1);
-        let threshold =
+        let mut threshold =
             window.saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64) / 100;
+        if self.context.workspace_root() == crate::mission_control::workspace_path() {
+            threshold = if crate::ambient::conversation().is_some() {
+                threshold.max(window.saturating_mul(97) / 100)
+            } else {
+                threshold.min(VOICE_READY_TOKENS)
+            };
+        }
         if !force && (threshold == 0 || state.last_prompt_tokens < threshold) {
             return Ok(());
         }

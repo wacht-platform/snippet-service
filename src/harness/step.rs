@@ -15,6 +15,17 @@ struct ParsedTurn {
     progress_text: Option<String>,
 }
 
+fn voice_turn(messages: &[HarnessMessage]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            HarnessMessage::User { content } => Some(content.contains("<ambient_turn")),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 impl CodingHarness {
     /// One model call and the tools it asks for.
     #[allow(clippy::too_many_arguments)]
@@ -176,12 +187,21 @@ impl CodingHarness {
         definitions: &[NativeToolDefinition],
         sink: Option<&StreamHandle>,
     ) -> Result<crate::llm::ModelOutput, StepResult> {
+        let voice = sink.is_some_and(crate::llm::StreamBuffer::has_tool_tap) && voice_turn(request_messages);
         loop {
+            if voice {
+                crate::ambient::mark_last("llm_request");
+            }
             let error = match model
                 .generate(request_messages, definitions, false, sink.cloned())
                 .await
             {
-                Ok(output) => return Ok(output),
+                Ok(output) => {
+                    if voice {
+                        crate::ambient::mark_last("llm_done");
+                    }
+                    return Ok(output);
+                }
                 Err(error) => error,
             };
             let raw = error.to_string();

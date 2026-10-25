@@ -182,14 +182,18 @@ async fn prepare() -> Result<(String, crate::ambient::Conversation), String> {
     let Some((device, _)) = crate::ambient::lease_holder() else {
         return Err("no device is listening, so there is nobody to speak to".into());
     };
-    if !crate::ambient::effective_active().await {
-        return Err("ambient is passive: you cannot speak in this mode. Reply in the chat (the user gets a notification), or call ambient_mode with active first if a spoken back and forth is needed".into());
+    static TTL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if crate::ambient::conversation().is_none() || TTL.load(Ordering::Relaxed) == 0 {
+        if !crate::ambient::effective_active().await {
+            return Err("ambient is passive: you cannot speak in this mode. Reply in the chat (the user gets a notification), or call ambient_mode with active first if a spoken back and forth is needed".into());
+        }
+        let ttl = crate::config::SnippetConfig::load(crate::config::default_config_path())
+            .await
+            .map(|c| c.ambient.conversation_timeout_secs)
+            .unwrap_or(90);
+        TTL.store(ttl.max(1), Ordering::Relaxed);
     }
-    let ttl = crate::config::SnippetConfig::load(crate::config::default_config_path())
-        .await
-        .map(|c| c.ambient.conversation_timeout_secs)
-        .unwrap_or(90);
-    let conversation = crate::ambient::open_conversation("mission-control", ttl);
+    let conversation = crate::ambient::open_conversation("mission-control", TTL.load(Ordering::Relaxed));
     Ok((device, conversation))
 }
 
@@ -881,18 +885,22 @@ async fn open_flux(text: &str, done: bool) -> Route {
     if let Some(r) = direct_claims(text, done) {
         return r;
     }
+    let began = std::time::Instant::now();
     let Ok((device, conversation)) = prepare().await else {
         return Route::Off;
     };
+    let prepared = began.elapsed().as_millis();
     let Some(session) = crate::tts_stream::ready(&device).await else {
         return Route::Chunks;
     };
+    let readied = began.elapsed().as_millis();
     let mut guard = FLUX_STREAMING.lock().unwrap();
     if let Some(r) = direct_claims(text, done) {
         return r;
     }
     match crate::tts_stream::start_turn(&session, &device, &conversation.id) {
         Ok(turn) => {
+            eprintln!("[ambient-flux] open: prepare={prepared}ms ready={readied}ms started={}ms", began.elapsed().as_millis());
             let token = TOKEN.fetch_add(1, Ordering::SeqCst);
             *guard = Some(FluxProvisional { turn: turn.clone(), token });
             Route::Flux(turn, token)

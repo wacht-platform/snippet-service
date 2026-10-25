@@ -88,7 +88,8 @@ fn sections(
     ));
 
     if workspace == crate::mission_control::workspace_path() {
-        out.push(("autonomy", crate::mission_autonomy::mode_line(), None));
+        out.push(("autonomy", crate::mission_autonomy::base_mode_line(), None));
+        out.push(("ambient", crate::ambient::prompt_line().trim().to_string(), Some("No device is listening for ambient speech now.")));
         out.push(("clock", crate::mission_autonomy::clock_line(), None));
     }
 

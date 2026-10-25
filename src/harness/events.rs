@@ -7,6 +7,9 @@ impl CodingHarness {
         vars: &mut LoopVars,
         text: String,
     ) {
+        if text.contains("<ambient_turn") {
+            crate::ambient::mark_last("loop_accept");
+        }
         let answering =
             state.status == HarnessStatus::WaitingForInput && state.pending_question.is_some();
         // Snapshot the workspace before acting on a NEW request, so the whole turn
@@ -28,7 +31,9 @@ impl CodingHarness {
             // Fresh request: prior-turn loop/failure state belongs to the past run,
             // and the first step restates the current state.
             vars.bash_outputs.clear();
-            vars.reminded.clear();
+            if !text.contains("<ambient_turn") {
+                vars.reminded.clear();
+            }
             vars.file_reads.clear();
             vars.silent_turns = 0;
             vars.edits_since_check = 0;

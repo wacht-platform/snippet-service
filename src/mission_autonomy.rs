@@ -292,12 +292,14 @@ fn next_wake_status(state: &AutonomyState) -> String {
 }
 
 pub fn mode_line() -> String {
-    format!(
-        "{}{} You coordinate through sessions, tasks and agents; your bash is only for small read-only lookups (decoding a file, a quick df or git status), never for project work.",
-        mode_status(),
-        crate::ambient::prompt_line()
-    )
+    format!("{}{} {COORDINATE}", mode_status(), crate::ambient::prompt_line())
 }
+
+pub fn base_mode_line() -> String {
+    format!("{} {COORDINATE}", mode_status())
+}
+
+const COORDINATE: &str = "You coordinate through sessions, tasks and agents; your bash is only for small read-only lookups (decoding a file, a quick df or git status), never for project work.";
 
 fn mode_status() -> String {
     let state = load();

@@ -176,6 +176,10 @@ impl StreamBuffer {
         self.tool_tap = Some(tap);
     }
 
+    pub fn has_tool_tap(handle: &StreamHandle) -> bool {
+        handle.lock().is_ok_and(|buf| buf.tool_tap.is_some())
+    }
+
     pub fn tool_event<'a>(handle: impl Into<Option<&'a StreamHandle>>, ev: ToolArgEvent) {
         if let Some(handle) = handle.into() {
             if let Ok(buf) = handle.lock() {
