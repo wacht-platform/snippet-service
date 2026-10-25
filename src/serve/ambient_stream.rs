@@ -40,44 +40,8 @@ struct Open {
     quiet: usize,
     voiced: usize,
     checks: u8,
-    asm: Option<Live>,
-    shadow: Option<Live>,
+    asm: Option<super::assembly::Ticket>,
     forced: bool,
-    spec: Option<(usize, tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>)>,
-}
-
-enum Live {
-    Assembly(super::assembly::Ticket),
-    Flux(super::flux_stt::Ticket),
-}
-
-impl Live {
-    fn push(&mut self, pcm: &[u8]) {
-        match self {
-            Live::Assembly(t) => t.push(pcm),
-            Live::Flux(t) => t.push(pcm),
-        }
-    }
-
-    fn force(&mut self) {
-        if let Live::Assembly(t) = self {
-            t.force();
-        }
-    }
-
-    fn source(&self) -> &'static str {
-        match self {
-            Live::Assembly(_) => "assembly",
-            Live::Flux(_) => "flux",
-        }
-    }
-
-    async fn finish(self, id: &str, at: std::time::Instant) -> Result<(String, Vec<crate::stt::Word>), String> {
-        match self {
-            Live::Assembly(t) => t.finish().await.map(|t| (t.text, t.words)),
-            Live::Flux(t) => t.finish(id, at).await,
-        }
-    }
 }
 
 fn rms(bytes: &[u8]) -> f32 {
@@ -147,9 +111,6 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(a) = seg.asm.as_mut() {
                             a.push(body);
                         }
-                        if let Some(f) = seg.shadow.as_mut() {
-                            f.push(body);
-                        }
                         if body.len() <= 2048 {
                             let level = rms(body);
                             seg.peak = seg.peak.max(level);
@@ -163,28 +124,15 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                 let live_busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
                                 if due && !device.is_empty() && (crate::speech::is_audible(&device) || live_busy) {
                                     seg.checks += 1;
-                                    let first = seg.checks == 1;
-                                    let samples: Vec<f32> = seg.pcm.chunks_exact(2).take(16_000 * 3).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+                                    let _ = seg.checks;
                                     let (d, dev) = (d.clone(), device.clone());
-                                    let dd = d.clone();
                                     tokio::spawn(async move {
-                                        let sim = tokio::task::spawn_blocking(move || crate::diarize::user_similarity(&d.store, &samples)).await;
-                                        let go = match sim {
-                                            Ok(Ok(Some(s))) => s >= if first { 0.28 } else { 0.22 },
-                                            Ok(Ok(None)) => true,
-                                            _ => false,
-                                        };
-                                        eprintln!("[ambient-speech] interrupt check {dev} go={go}");
-                                        if go {
-                                            let spoke = crate::speech::interrupt(&dev);
-                                            if spoke || live_busy {
-                                                super::autonomy::interrupt_mission_control(&dd).await;
-                                            }
+                                        eprintln!("[ambient-speech] interrupt {dev} on voice");
+                                        let spoke = crate::speech::interrupt(&dev);
+                                        if spoke || live_busy {
+                                            super::autonomy::interrupt_mission_control(&d).await;
                                         }
                                     });
-                                }
-                                if let Some((_, h)) = seg.spec.take() {
-                                    h.abort();
                                 }
                             }
                             if seg.quiet >= QUIET_BYTES && seg.asm.is_some() && !seg.forced && seg.pcm.len() >= 16_000 {
@@ -192,22 +140,6 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                 if let Some(a) = seg.asm.as_mut() {
                                     a.force();
                                 }
-                                if let Some(a) = seg.shadow.as_mut() {
-                                    a.force();
-                                }
-                            }
-                            if seg.quiet >= QUIET_BYTES && seg.asm.is_none() && seg.spec.is_none() && seg.pcm.len() >= 16_000 {
-                                let samples: Vec<f32> =
-                                    seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
-                                let len = seg.pcm.len();
-                                let d = d.clone();
-                                let handle = tokio::spawn(async move {
-                                    let permit = super::ambient_routes::gate().acquire_owned().await.ok();
-                                    let r = super::transcribe::transcribe_samples(&d, samples).await;
-                                    drop(permit);
-                                    r
-                                });
-                                seg.spec = Some((len, handle));
                             }
                         }
                     }
@@ -226,36 +158,20 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             super::ambient_routes::announce(&d, &device, seq, false);
                         }
                         d.reload_config().await;
-                        let (asm, flux) = if v.get("live").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        let asm = if v.get("live").and_then(|x| x.as_bool()).unwrap_or(false) {
                             let c = d.config.lock().unwrap();
                             let key = c.assemblyai_api_key.clone().filter(|k| !k.trim().is_empty());
-                            let key2 = key.clone();
                             let mut terms: Vec<String> = c.ambient.wake_phrases.clone();
                             for extra in ["Snippet", "Mission Control"] {
                                 if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
                                     terms.push(extra.to_string());
                                 }
                             }
-                            let terms2 = terms.clone();
-                            let flux_params = if device.is_empty() { None } else { super::flux_stt::params(&c) };
-                            let asm = match c.ambient.stt.as_str() {
-                                "assemblyai" => key.map(|k| Live::Assembly(super::assembly::begin(&device, k, terms))),
-                                "flux" => flux_params.clone().and_then(|p| super::flux_stt::begin(&device, p)).map(Live::Flux),
-                                _ => None,
-                            };
-                            let flux = if c.ambient.stt_shadow.is_empty() {
-                                None
-                            } else {
-                                match c.ambient.stt.as_str() {
-                                    "flux" => key2.map(|k| Live::Assembly(super::assembly::begin(&device, k, terms2))),
-                                    _ => flux_params.and_then(|p| super::flux_stt::begin(&device, p)).map(Live::Flux),
-                                }
-                            };
-                            (asm, flux)
+                            key.map(|k| super::assembly::begin(&device, k, terms))
                         } else {
-                            (None, None)
+                            None
                         };
-                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, asm, shadow: flux, forced: false, spec: None });
+                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, asm, forced: false });
                     }
                     Some("skip") => {
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
@@ -281,80 +197,26 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(n) = v.get("bytes").and_then(|x| x.as_u64()) {
                             seg.pcm.truncate((n as usize) & !1);
                         }
-                        let ended = std::time::Instant::now();
-                        let shadow_job = seg.shadow.take().map(|s| {
-                            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("?").to_string();
-                            let src = s.source();
-                            tokio::spawn(async move {
-                                let t0 = std::time::Instant::now();
-                                let r = s.finish(&id, ended).await;
-                                (src, t0.elapsed().as_millis(), r)
-                            })
-                        });
-                        if let Some(handle) = seg.asm.take() {
+                        
+                        if let Some(ticket) = seg.asm.take() {
                             if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                                let samples: Vec<f32> = seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
                                 let (dd, ident) = (d.clone(), id.to_string());
-                                let phrases: Vec<String> = d.config.lock().unwrap().ambient.wake_phrases.iter().map(|p| p.to_lowercase()).collect();
+                                let _ = &dd;
                                 let task = tokio::spawn(async move {
-                                    let mut source = handle.source();
-                                    let t0 = std::time::Instant::now();
-                                    let mut outcome = handle.finish(&ident, ended).await;
-                                    let primary_ms = t0.elapsed().as_millis();
-                                    let other = match shadow_job {
-                                        Some(j) => j.await.ok(),
-                                        None => None,
-                                    };
-                                    if let Some((osrc, oms, or)) = other {
-                                        let short = &ident[ident.len().saturating_sub(8)..];
-                                        let txt = |r: &Result<(String, Vec<crate::stt::Word>), String>| match r {
-                                            Ok((t, _)) => t.clone(),
-                                            Err(e) => format!("ERR {e}"),
-                                        };
-                                        eprintln!("[ambient-cmp] {short} {source}={primary_ms}ms {:?} | {osrc}={oms}ms {:?}", txt(&outcome), txt(&or));
-                                        let primary_bad = !matches!(&outcome, Ok((t, _)) if !t.trim().is_empty());
-                                        let wakes = |r: &Result<(String, Vec<crate::stt::Word>), String>| match r {
-                                            Ok((t, _)) => {
-                                                let t = t.to_lowercase();
-                                                phrases.iter().any(|p| t.contains(p.as_str()))
-                                            }
-                                            Err(_) => false,
-                                        };
-                                        let other_wakes = !wakes(&outcome) && wakes(&or);
-                                        if primary_bad && matches!(&or, Ok((t, _)) if !t.trim().is_empty()) || other_wakes {
-                                            eprintln!("[ambient] {source} gave nothing, using {osrc}");
-                                            outcome = or;
-                                            source = osrc;
-                                        }
-                                    }
+                                    let outcome = ticket.finish().await;
                                     let permit = super::ambient_routes::gate().acquire_owned().await.ok();
                                     let result = match outcome {
-                                        Ok((text, words)) if !text.trim().is_empty() => {
-                                            crate::ambient::mark(&ident, source);
-                                            super::transcribe::transcribe_samples_with(&dd, samples, Some((text, words))).await
+                                        Ok(t) if !t.text.trim().is_empty() => {
+                                            crate::ambient::mark(&ident, "assembly");
+                                            Ok(super::transcribe::finish_text(&t.text))
                                         }
-                                        Ok(_) => super::transcribe::transcribe_samples_with(&dd, samples, Some((String::new(), Vec::new()))).await,
-                                        Err(e) => {
-                                            eprintln!("[ambient] {source} speech recognition failed, using local speech recognition: {e}");
-                                            super::transcribe::transcribe_samples(&dd, samples).await
-                                        }
+                                        Ok(_) => Ok(super::transcribe::finish_text("")),
+                                        Err(e) => Err(e),
                                     };
                                     drop(permit);
                                     result
                                 });
                                 super::ambient_routes::precomputed().lock().unwrap().insert(id.to_string(), task);
-                            }
-                        }
-                        if let Some((len, handle)) = seg.spec.take() {
-                            let tail_ok = len <= seg.pcm.len()
-                                && seg.pcm[len..]
-                                    .chunks(1024)
-                                    .all(|c| quiet(rms(c), seg.peak));
-                            match (tail_ok, v.get("id").and_then(|x| x.as_str())) {
-                                (true, Some(id)) => {
-                                    super::ambient_routes::precomputed().lock().unwrap().insert(id.to_string(), handle);
-                                }
-                                _ => handle.abort(),
                             }
                         }
                         if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
@@ -379,16 +241,6 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                 crate::tts_stream::unregister_phone(&device, old);
                             }
                             phone = Some(crate::tts_stream::register_phone(&device, out_tx.clone()));
-                        }
-                        if !device.is_empty() {
-                            let warm = {
-                                let c = d.config.lock().unwrap();
-                                let wanted = c.ambient.stt == "flux" || !c.ambient.stt_shadow.is_empty();
-                                if wanted { super::flux_stt::params(&c) } else { None }
-                            };
-                            if let Some(p) = warm {
-                                super::flux_stt::prewarm(&device, p);
-                            }
                         }
                     }
                     Some("tts_pos") => {

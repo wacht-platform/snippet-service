@@ -99,9 +99,14 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
     if !voice.enabled {
         return Err("voice notes are turned off in Settings → Voice".to_string());
     }
-    if !crate::models::is_ready(crate::models::STT_MODEL) {
-        return Err("download the speech model in Settings → Voice to use voice notes".to_string());
-    }
+    let key = d
+        .config
+        .lock()
+        .unwrap()
+        .assemblyai_api_key
+        .clone()
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| "set assemblyai_api_key in the server config to transcribe voice notes".to_string())?;
     let duration = audio_duration_seconds(path).await?;
     let limit = voice.max_seconds.max(crate::config::VOICE_MIN_SECONDS);
     if duration >= limit as f64 + 1.0 {
@@ -111,22 +116,7 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
             if limit % 60 == 0 { format!("{}-minute", limit / 60) } else { format!("{limit}-second") }
         ));
     }
-    let wav = std::env::temp_dir().join(format!("snippet-voice-{}.wav", uuid::Uuid::new_v4()));
-    let converted = Command::new("ffmpeg")
-        .args(["-v", "error", "-y", "-i"])
-        .arg(path)
-        .args(["-ar", "16000", "-ac", "1"])
-        .arg(&wav)
-        .output()
-        .await
-        .map_err(|e| format!("could not convert audio: {e}"))?;
-    if !converted.status.success() {
-        let _ = tokio::fs::remove_file(&wav).await;
-        return Err(format!("could not convert audio: {}", String::from_utf8_lossy(&converted.stderr).trim()));
-    }
-    let result = crate::stt::transcribe(crate::models::STT_MODEL, &wav).await;
-    let _ = tokio::fs::remove_file(&wav).await;
-    result
+    super::assembly::transcribe_file(&key, path).await
 }
 
 pub(super) struct Spoken {
@@ -136,143 +126,22 @@ pub(super) struct Spoken {
 }
 
 pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken, String> {
-    let owned = path.to_path_buf();
-    let samples = tokio::task::spawn_blocking(move || crate::diarize::read_audio_16k(&owned))
-        .await
-        .map_err(|e| e.to_string())??;
-    transcribe_samples(d, samples).await
+    let key = d
+        .config
+        .lock()
+        .unwrap()
+        .assemblyai_api_key
+        .clone()
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| "set assemblyai_api_key in the server config".to_string())?;
+    let text = super::assembly::transcribe_file(&key, path).await?;
+    Ok(finish_text(&text))
 }
 
-pub(super) async fn transcribe_samples(d: &Shared, samples: Vec<f32>) -> Result<Spoken, String> {
-    transcribe_samples_with(d, samples, None).await
-}
-
-pub(super) async fn transcribe_samples_with(
-    d: &Shared,
-    samples: Vec<f32>,
-    external: Option<(String, Vec<crate::stt::Word>)>,
-) -> Result<Spoken, String> {
-    let ready = crate::models::is_ready(crate::models::SPEAKER_MODEL);
-    let words = {
-        let samples = samples.clone();
-        async move {
-            match external {
-                Some(found) => Ok(found),
-                None => crate::stt::transcribe_words(crate::models::STT_MODEL, samples).await,
-            }
-        }
-    };
-    let analysis = {
-        let d = d.clone();
-        tokio::task::spawn_blocking(move || {
-            if ready { crate::diarize::analyze(&d.store, &samples) } else { Ok(Vec::new()) }
-        })
-    };
-    let (words, analysis) = tokio::join!(words, analysis);
-    let (text, words) = words?;
-    let text = fix_wake_spelling(&collapse_repeats(&text));
-    let words: Vec<crate::stt::Word> = {
-        let mut kept: Vec<crate::stt::Word> = Vec::new();
-        let mut run = 0;
-        for w in words {
-            if kept.last().is_some_and(|l| l.text.eq_ignore_ascii_case(&w.text)) {
-                run += 1;
-                if run >= 3 {
-                    continue;
-                }
-            } else {
-                run = 0;
-            }
-            kept.push(w);
-        }
-        kept
-    };
+pub(super) fn finish_text(text: &str) -> Spoken {
+    let text = fix_wake_spelling(&collapse_repeats(text)).trim().to_string();
     let text = if is_filler(&text) && crate::ambient::expectation().is_none() && crate::ambient::conversation().is_none() { String::new() } else { text };
-    let turns = match analysis.map_err(|e| e.to_string())? {
-        Ok(turns) => turns,
-        Err(e) => {
-            eprintln!("[ambient] speaker analysis failed: {e}");
-            Vec::new()
-        }
-    };
-    if text.is_empty() {
-        return Ok(Spoken { text, speakers: String::new(), summary: "unknown" });
-    }
-    let infos = crate::diarize::speakers(&d.store);
-    let enrolled = infos.iter().any(|s| s.is_user);
-    let owner = |w: &crate::stt::Word| -> i64 {
-        let mid = (w.start + w.end) / 2.0;
-        turns
-            .iter()
-            .min_by(|a, b| {
-                let da = if mid < a.start { a.start - mid } else if mid > a.end { mid - a.end } else { 0.0 };
-                let db = if mid < b.start { b.start - mid } else if mid > b.end { mid - b.end } else { 0.0 };
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|t| t.speaker)
-            .unwrap_or(-1)
-    };
-    let mut lines: Vec<(i64, String, f32, f32)> = Vec::new();
-    for w in &words {
-        let who = owner(w);
-        match lines.last_mut() {
-            Some(last) if last.0 == who => {
-                last.1.push(' ');
-                last.1.push_str(&w.text);
-                last.3 = w.end;
-            }
-            _ => lines.push((who, w.text.clone(), w.start, w.end)),
-        }
-    }
-    if lines.is_empty() {
-        let mut totals: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
-        for t in &turns {
-            *totals.entry(t.speaker).or_default() += t.end - t.start;
-        }
-        let lead = totals
-            .into_iter()
-            .filter(|(id, _)| *id != -1)
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(id, _)| id)
-            .unwrap_or(-1);
-        lines.push((lead, text.clone(), 0.0, 0.0));
-    } else if lines.len() == 1 {
-        lines[0].1 = text.clone();
-    }
-    let named = |id: i64| infos.iter().find(|s| s.id == id);
-    let has_user = lines.iter().any(|l| named(l.0).is_some_and(|s| s.is_user));
-    let has_other = lines.iter().any(|l| l.0 != -1 && !named(l.0).is_some_and(|s| s.is_user));
-    let distinct: std::collections::HashSet<i64> = lines.iter().map(|l| l.0).filter(|id| *id != -1).collect();
-    let summary = if enrolled {
-        match (has_user, has_other) {
-            (true, false) => "you",
-            (false, true) => "other",
-            (true, true) => "mixed",
-            _ => "unknown",
-        }
-    } else if distinct.len() > 1 {
-        "mixed"
-    } else {
-        "unknown"
-    };
-    let speakers = serde_json::Value::Array(
-        lines
-            .iter()
-            .map(|(id, t, a, b)| {
-                let info = named(*id);
-                serde_json::json!({
-                    "speaker": id,
-                    "label": info.map(crate::diarize::display_name).unwrap_or_else(|| "Unknown".to_string()),
-                    "is_user": info.is_some_and(|s| s.is_user),
-                    "text": t,
-                    "start": a,
-                    "end": b,
-                })
-            })
-            .collect(),
-    )
-    .to_string();
-    Ok(Spoken { text, speakers, summary })
+    Spoken { text, speakers: String::new(), summary: "unknown" }
 }
 
 fn collapse_repeats(text: &str) -> String {

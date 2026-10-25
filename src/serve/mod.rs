@@ -40,8 +40,6 @@ mod ambient_context;
 mod ambient_router;
 mod ambient_stream;
 mod assembly;
-mod flux_stt;
-pub mod flux_replay_tmp;
 mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
@@ -879,18 +877,6 @@ pub async fn run_serve(
         .route("/ambient/stream", get(ambient_stream::stream))
         .route("/ambient/stats", get(ambient_routes::stats))
         .route("/ambient/lease", post(ambient_routes::lease))
-        .route("/ambient/speakers", get(ambient_routes::speakers_list))
-        .route(
-            "/ambient/speakers/enroll",
-            post(ambient_routes::speakers_enroll).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
-        )
-        .route("/ambient/speakers/unenroll", post(ambient_routes::speakers_unenroll))
-        .route("/ambient/speakers/clear", post(ambient_routes::speakers_clear))
-        .route("/ambient/speakers/label", post(ambient_routes::speakers_label))
-        .route("/ambient/speakers/claim", post(ambient_routes::speakers_claim))
-        .route("/models", get(ambient_routes::models))
-        .route("/models/download", post(ambient_routes::model_download))
-        .route("/models/delete", post(ambient_routes::model_delete))
         .route("/ambient/turns", get(ambient_routes::turns))
         .route("/ambient/turns/played", post(ambient_routes::played))
         .route("/ambient/turns/{id}/audio", get(ambient_routes::turn_audio))

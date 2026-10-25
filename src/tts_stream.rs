@@ -40,7 +40,7 @@ static LIVE: Mutex<Vec<Arc<StreamTurn>>> = Mutex::new(Vec::new());
 pub fn apply_config(c: &crate::config::SnippetConfig) {
     let key = c.deepgram_api_key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let voice = if c.ambient.tts_voice.starts_with("flux-") { c.ambient.tts_voice.clone() } else { DEFAULT_VOICE.to_string() };
-    let next = if c.ambient.tts == "flux" { key.map(|key| Config { key, voice, ttl: c.ambient.conversation_timeout_secs }) } else { None };
+    let next = key.map(|key| Config { key, voice, ttl: c.ambient.conversation_timeout_secs });
     let mut current = CONFIG.lock().unwrap();
     if current.as_ref().map(|c| (&c.key, &c.voice)) != next.as_ref().map(|c| (&c.key, &c.voice)) {
         let stale: Vec<Arc<Session>> = hub().lock().unwrap().drain().map(|(_, s)| s).collect();

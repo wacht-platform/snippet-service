@@ -52,11 +52,13 @@ pub(crate) struct SettingsReq {
 }
 
 fn settings_view(d: &Daemon) -> serde_json::Value {
-    let (ambient, watcher_key_set) = {
+    let (ambient, watcher_key_set, c_assembly_key_set, c_deepgram_key_set) = {
         let c = d.config.lock().unwrap();
         (
             c.ambient.clone(),
             c.typesafe_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
+            has_key(&c.assemblyai_api_key),
+            has_key(&c.deepgram_api_key),
         )
     };
     crate::ambient::note_enabled(ambient.enabled);
@@ -90,7 +92,8 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "expecting": crate::ambient::expectation().map(|e| serde_json::json!({"kind": e.kind, "about": e.about})),
         "watcher": if ambient.watcher == "jev" { "classifier" } else { ambient.watcher.as_str() },
         "watcher_chat_context": ambient.watcher_chat_context,
-        "models_ready": crate::models::is_ready(crate::models::STT_MODEL) && crate::models::is_ready(crate::models::TTS_VOICE) && crate::models::is_ready(crate::models::SPEAKER_MODEL),
+        "assemblyai_key_set": c_assembly_key_set,
+        "deepgram_key_set": c_deepgram_key_set,
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
@@ -150,17 +153,10 @@ pub(crate) async fn set_settings(
         }
         match ambient.normalized() {
             Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-            Ok(ambient)
-                if ambient.enabled
-                    && !(crate::models::is_ready(crate::models::STT_MODEL)
-                        && crate::models::is_ready(crate::models::TTS_VOICE)
-                        && crate::models::is_ready(crate::models::SPEAKER_MODEL)) =>
-            {
-                Err((
-                    StatusCode::BAD_REQUEST,
-                    "Download a speech model, a reply voice and a speaker model in Settings, Voice, before turning ambient listening on".into(),
-                ))
-            }
+            Ok(ambient) if ambient.enabled && !(has_key(&c.assemblyai_api_key) && has_key(&c.deepgram_api_key)) => Err((
+                StatusCode::BAD_REQUEST,
+                "Set assemblyai_api_key and deepgram_api_key in the server config before turning ambient listening on".into(),
+            )),
             Ok(ambient) => {
                 c.ambient = ambient;
                 if let Some(key) = req.typesafe_api_key {
@@ -174,10 +170,7 @@ pub(crate) async fn set_settings(
     };
     match result {
         Ok(()) => {
-            let ambient = d.config.lock().unwrap().ambient.clone();
-            if ambient.enabled {
-                warm_models(crate::models::STT_MODEL.to_string(), crate::models::TTS_VOICE.to_string());
-            }
+            crate::tts::apply_config(&d.config.lock().unwrap());
             Json(settings_view(&d)).into_response()
         }
         Err((code, e)) => (code, e).into_response(),
@@ -363,12 +356,19 @@ fn spawn_transcription(d: Shared, id: String) {
     tokio::spawn(async move {
         let path = audio_path(&id);
         let early = precomputed().lock().unwrap().remove(&id);
-        let result = match early {
+        let live = match early {
             Some(handle) => match handle.await {
-                Ok(r) => r,
-                Err(e) => Err(e.to_string()),
+                Ok(r) => Some(r),
+                Err(e) => Some(Err(e.to_string())),
             },
-            None => {
+            None => None,
+        };
+        let result = match live {
+            Some(Ok(done)) => Ok(done),
+            failed => {
+                if let Some(Err(e)) = &failed {
+                    eprintln!("[ambient] live AssemblyAI failed, retrying from the saved audio: {e}");
+                }
                 let permit = gate().acquire_owned().await.ok();
                 let r = super::transcribe::transcribe_ambient(&d, &path).await;
                 drop(permit);
@@ -773,204 +773,15 @@ pub(crate) async fn turn_audio(
     }
 }
 
-fn warm_models(stt: String, voice: String) {
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::stt::warm(&stt) {
-            eprintln!("[ambient] could not load speech model {stt}: {e}");
-        }
-        if let Err(e) = crate::tts::warm(&voice) {
-            eprintln!("[ambient] could not load voice {voice}: {e}");
-        }
-        if let Err(e) = crate::diarize::warm() {
-            eprintln!("[ambient] could not load speaker model: {e}");
-        }
-    });
+fn has_key(k: &Option<String>) -> bool {
+    k.as_deref().is_some_and(|k| !k.trim().is_empty())
 }
 
 pub(crate) fn warm_voice(d: Shared) {
-    let reaper = d.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            if reaper.config.lock().unwrap().ambient.enabled {
-                continue;
-            }
-            let _ = tokio::task::spawn_blocking(|| {
-                let idle = std::time::Duration::from_secs(600);
-                crate::stt::unload_idle(idle);
-                crate::tts::unload_idle(idle);
-                crate::diarize::unload_idle(idle);
-            })
-            .await;
-        }
-    });
     tokio::spawn(async move {
         crate::tts::clean_old_replies().await;
-        let stt = crate::models::STT_MODEL.to_string();
-        let voice = crate::models::TTS_VOICE.to_string();
         crate::tts::apply_config(&d.config.lock().unwrap());
-        let enabled = d.config.lock().unwrap().ambient.enabled;
-        if enabled && crate::models::is_ready(&stt) && crate::models::is_ready(&voice) && crate::models::is_ready(crate::models::SPEAKER_MODEL) {
-            warm_models(stt, voice);
-        }
     });
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ModelReq {
-    id: String,
-}
-
-pub(crate) async fn models(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    Json(serde_json::json!({ "models": crate::models::list() })).into_response()
-}
-
-pub(crate) async fn model_download(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<ModelReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    match crate::models::start_download(&req.id) {
-        Ok(()) => Json(serde_json::json!({ "models": crate::models::list() })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
-    }
-}
-
-pub(crate) async fn model_delete(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<ModelReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    {
-        let c = d.config.lock().unwrap();
-        if c.ambient.enabled && (crate::models::STT_MODEL == req.id || crate::models::TTS_VOICE == req.id || crate::models::SPEAKER_MODEL == req.id) {
-            return (StatusCode::CONFLICT, "turn ambient listening off before removing the model it uses").into_response();
-        }
-    }
-    if let Err(e) = crate::models::delete(&req.id).await {
-        return (StatusCode::BAD_REQUEST, e).into_response();
-    }
-    Json(serde_json::json!({ "models": crate::models::list() })).into_response()
-}
-
-pub(crate) async fn speakers_list(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    let list: Vec<serde_json::Value> = crate::diarize::speakers(&d.store)
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "label": crate::diarize::display_name(s),
-                "is_user": s.is_user,
-                "lines": s.lines,
-                "last_seen": s.last_seen,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({
-        "models_ready": crate::models::is_ready(crate::models::SPEAKER_MODEL),
-        "enrolled": crate::diarize::enrolled(&d.store),
-        "speakers": list,
-    }))
-    .into_response()
-}
-
-pub(crate) async fn speakers_enroll(State(d): State<Shared>, Query(a): Query<Auth>, body: Bytes) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    if !crate::models::is_ready(crate::models::SPEAKER_MODEL) {
-        return (StatusCode::BAD_REQUEST, "Download the speaker model first").into_response();
-    }
-    let path = std::env::temp_dir().join(format!("snippet-enrol-{}", uuid::Uuid::new_v4()));
-    if let Err(e) = tokio::fs::write(&path, &body).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-    }
-    let worker = d.clone();
-    let file = path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let samples = crate::diarize::read_audio_16k(&file)?;
-        crate::diarize::enroll(&worker.store, &samples)
-    })
-    .await
-    .map_err(|e| e.to_string())
-    .and_then(|r| r);
-    let _ = tokio::fs::remove_file(&path).await;
-    match result {
-        Ok(seconds) => Json(serde_json::json!({"enrolled": true, "seconds": seconds})).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
-    }
-}
-
-pub(crate) async fn speakers_unenroll(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    match crate::diarize::unenroll(&d.store) {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub(crate) async fn speakers_clear(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    match crate::diarize::clear(&d.store) {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub(crate) struct SpeakerLabelReq {
-    id: i64,
-    label: String,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct SpeakerClaimReq {
-    id: i64,
-}
-
-pub(crate) async fn speakers_claim(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<SpeakerClaimReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    match crate::diarize::claim(&d.store, req.id, true) {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) if e == "no such speaker" => (StatusCode::NOT_FOUND, e).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-pub(crate) async fn speakers_label(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<SpeakerLabelReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    match crate::diarize::rename(&d.store, req.id, &req.label) {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
 }
 
 fn assistant_was_speaking(device: &str, started_at: &str, duration_ms: i64) -> bool {

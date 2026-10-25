@@ -188,10 +188,6 @@ fn compatible(a: &Part, b: &Part) -> bool {
     !((a.summary == "you" && b.summary == "other") || (a.summary == "other" && b.summary == "you"))
 }
 
-fn enrolled(d: &Shared) -> bool {
-    crate::diarize::enrolled(&d.store)
-}
-
 async fn accept(
     d: &Shared,
     device: &str,
@@ -205,13 +201,13 @@ async fn accept(
         let c = d.config.lock().unwrap();
         (c.ambient.wake_phrases.clone(), c.ambient.conversation_timeout_secs)
     };
-    let gated = enrolled(d) && part.summary == "other";
+    let gated = false && part.summary == "other";
     let wake = !gated && ambient_watch::wake_word(&part.text, &phrases);
     if turn.is_empty() && !gated {
         if let Some(l) = last.as_mut() {
             let gap = part.started - l.ended;
             let routable = crate::ambient::lease_holder().is_some_and(|(h, _)| h == device);
-            if l.delivered && routable && crate::ambient::conversation().is_some() && l.at.elapsed() < LATE_WINDOW && gap <= CONTINUED_GAP && part.summary != "other" && (part.summary == "you" || !enrolled(d)) {
+            if l.delivered && routable && crate::ambient::conversation().is_some() && l.at.elapsed() < LATE_WINDOW && gap <= CONTINUED_GAP && part.summary != "other" && (part.summary == "you" || !false) {
                 let parent = l.ids.clone();
                 let ended = part.ended;
                 let ids = vec![part.id.clone()];
@@ -304,10 +300,9 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     };
     let holder = crate::ambient::lease_holder().map(|(h, _)| h);
     let routable = holder.as_deref() == Some(device);
-    let from_others = enrolled(d) && summary == "other";
+    let from_others = false && summary == "other";
     let wake = !from_others && ambient_watch::wake_word(&text, &phrases);
-    if wake && !enrolled(d) {
-        claim_wake_speaker(d, &parts);
+    if wake && !false {
     }
     let expecting = crate::ambient::expectation().is_some();
     let live = crate::ambient::conversation().is_some();
@@ -328,7 +323,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     if fast && routable && !from_others {
         early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
         let go = match &early {
-            Some(v) => decide(live, pinned, v, wake, expecting, from_others, summary == "you", enrolled(d) && summary != "you").0,
+            Some(v) => decide(live, pinned, v, wake, expecting, from_others, summary == "you", false && summary != "you").0,
             None => wake,
         };
         if go {
@@ -362,7 +357,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         super::ambient_routes::mark(last, "classified");
     }
     if !delivered && routable {
-        let (go, open) = decide(live, pinned, &verdict, wake, expecting, from_others, summary == "you", enrolled(d) && summary != "you");
+        let (go, open) = decide(live, pinned, &verdict, wake, expecting, from_others, summary == "you", false && summary != "you");
         if go {
             if open {
                 crate::ambient::open_conversation(device, ttl);
@@ -531,18 +526,3 @@ async fn deliver(
     }
 }
 
-fn claim_wake_speaker(d: &Shared, parts: &[Part]) {
-    let phrases = d.config.lock().unwrap().ambient.wake_phrases.clone();
-    let ids: std::collections::HashSet<i64> = parts
-        .iter()
-        .flat_map(|p| p.speakers.iter())
-        .filter(|l| ambient_watch::wake_word(l["text"].as_str().unwrap_or(""), &phrases))
-        .filter_map(|l| l["speaker"].as_i64())
-        .filter(|id| *id != -1)
-        .collect();
-    if ids.len() == 1 {
-        if let Some(id) = ids.into_iter().next() {
-            let _ = crate::diarize::claim(&d.store, id, false);
-        }
-    }
-}

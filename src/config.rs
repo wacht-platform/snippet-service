@@ -157,10 +157,10 @@ pub struct SnippetConfig {
     /// TypeSafe key for the ambient voice classifier; local config only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub typesafe_api_key: Option<String>,
-    /// AssemblyAI key for streaming speech recognition (ambient `stt = "assemblyai"`); local config only.
+    /// AssemblyAI key for streaming speech recognition (ambient); local config only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assemblyai_api_key: Option<String>,
-    /// Deepgram key for hosted reply speech (ambient `tts = "deepgram"`); local config only.
+    /// Deepgram key for hosted reply speech (ambient); local config only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepgram_api_key: Option<String>,
     /// TUI color theme. Ignored — AMOLED is the only palette.
@@ -292,45 +292,14 @@ pub struct AmbientConfig {
     pub conversation_timeout_secs: u32,
     #[serde(default = "default_wake_phrases")]
     pub wake_phrases: Vec<String>,
-    #[serde(default = "default_ambient_stt")]
-    pub stt: String,
-    #[serde(default = "default_ambient_stt")]
-    pub tts: String,
     #[serde(default = "default_tts_voice")]
     pub tts_voice: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub stt_shadow: String,
-    #[serde(default = "default_flux_eot_threshold")]
-    pub flux_eot_threshold: f32,
-    #[serde(default = "default_flux_eager_eot_threshold")]
-    pub flux_eager_eot_threshold: f32,
-    #[serde(default = "default_flux_keyterms")]
-    pub flux_keyterms: Vec<String>,
 }
 
 impl Eq for AmbientConfig {}
 
-fn default_flux_eot_threshold() -> f32 {
-    0.7
-}
-
-fn default_flux_eager_eot_threshold() -> f32 {
-    0.5
-}
-
-fn default_flux_keyterms() -> Vec<String> {
-    ["Snippet", "Mission Control", "Technoxi", "Deepgram", "AssemblyAI", "Kokoro", "Tailscale", "ambient", "diarization"]
-        .into_iter()
-        .map(String::from)
-        .collect()
-}
-
 fn default_tts_voice() -> String {
     "aura-2-thalia-en".into()
-}
-
-fn default_ambient_stt() -> String {
-    "local".into()
 }
 
 impl Default for AmbientConfig {
@@ -342,13 +311,7 @@ impl Default for AmbientConfig {
             watcher_chat_context: false,
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
-            stt: default_ambient_stt(),
-            tts: default_ambient_stt(),
             tts_voice: default_tts_voice(),
-            stt_shadow: String::new(),
-            flux_eot_threshold: default_flux_eot_threshold(),
-            flux_eager_eot_threshold: default_flux_eager_eot_threshold(),
-            flux_keyterms: default_flux_keyterms(),
         }
     }
 }
@@ -371,13 +334,6 @@ impl AmbientConfig {
             return Err(format!("voice classifier setting must be one of: {}", AMBIENT_WATCHERS.join(", ")));
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
-        self.stt_shadow = self.stt_shadow.trim().to_ascii_lowercase();
-        if !self.flux_eot_threshold.is_finite() {
-            self.flux_eot_threshold = default_flux_eot_threshold();
-        }
-        if !self.flux_eager_eot_threshold.is_finite() {
-            self.flux_eager_eot_threshold = default_flux_eager_eot_threshold();
-        }
         self.wake_phrases = self
             .wake_phrases
             .iter()
