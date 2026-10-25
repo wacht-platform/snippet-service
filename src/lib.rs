@@ -45,7 +45,6 @@ pub mod shell_guard;
 pub mod signals;
 pub mod skills;
 pub mod speech;
-pub mod stt;
 pub mod sse;
 pub mod store;
 pub mod term;

@@ -121,8 +121,6 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
 
 pub(super) struct Spoken {
     pub text: String,
-    pub speakers: String,
-    pub summary: &'static str,
 }
 
 pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken, String> {
@@ -141,7 +139,7 @@ pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken
 pub(super) fn finish_text(text: &str) -> Spoken {
     let text = fix_wake_spelling(&collapse_repeats(text)).trim().to_string();
     let text = if is_filler(&text) && crate::ambient::expectation().is_none() && crate::ambient::conversation().is_none() { String::new() } else { text };
-    Spoken { text, speakers: String::new(), summary: "unknown" }
+    Spoken { text }
 }
 
 fn collapse_repeats(text: &str) -> String {

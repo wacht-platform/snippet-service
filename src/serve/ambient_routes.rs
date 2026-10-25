@@ -376,18 +376,16 @@ fn spawn_transcription(d: Shared, id: String) {
             }
         };
         mark(&id, "transcribed");
-        let speaker_is_you = result.as_ref().is_ok_and(|s| s.summary == "you");
-        let (status, text, error, speakers, summary) = match result {
-            Ok(s) if s.text.is_empty() => ("empty", String::new(), None, None, None),
-            Ok(s) => ("done", s.text, None, Some(s.speakers), Some(s.summary)),
-            Err(e) => ("failed", String::new(), Some(e), None, None),
+        let (status, text, error) = match result {
+            Ok(s) if s.text.is_empty() => ("empty", String::new(), None),
+            Ok(s) => ("done", s.text, None),
+            Err(e) => ("failed", String::new(), Some(e)),
         };
         let _ = d.store.with_connection(|c| {
             c.execute(
                 "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4,
-                     kept = CASE WHEN ?2 = 'done' THEN 0 ELSE 1 END,
-                     speakers = ?5, speaker_summary = ?6 WHERE id = ?1",
-                rusqlite::params![id, status, text, error, speakers, summary],
+                     kept = CASE WHEN ?2 = 'done' THEN 0 ELSE 1 END WHERE id = ?1",
+                rusqlite::params![id, status, text, error],
             )?;
             Ok(())
         });
@@ -426,7 +424,7 @@ fn spawn_transcription(d: Shared, id: String) {
             .store
             .with_connection(|c| c.query_row("SELECT media FROM ambient_events WHERE id = ?1", [&id], |r| r.get(0)))
             .unwrap_or(0);
-        if media != 0 && !speaker_is_you {
+        if media != 0 {
             let _ = d.store.with_connection(|c| {
                 c.execute("UPDATE ambient_events SET status = 'media', kept = 0 WHERE id = ?1", [&id])?;
                 Ok(())
@@ -448,10 +446,6 @@ fn spawn_transcription(d: Shared, id: String) {
         let started = chrono::DateTime::parse_from_rfc3339(&started_at)
             .map(|t| t.timestamp_millis() as f64 / 1000.0)
             .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
-        let lines = speakers
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
-            .unwrap_or_default();
         super::ambient_router::submit(
             &d,
             &device,
@@ -462,8 +456,6 @@ fn spawn_transcription(d: Shared, id: String) {
                 started,
                 ended: started + duration_ms as f64 / 1000.0,
                 started_at,
-                summary: summary.unwrap_or("unknown").to_string(),
-                speakers: lines,
                 continued: continued != 0,
             }),
         );

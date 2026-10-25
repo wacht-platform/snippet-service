@@ -69,21 +69,6 @@ pub(super) fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-pub(super) fn speaker_state(d: &Shared, id: &str) -> (String, Vec<Value>) {
-    let row: (Option<String>, Option<String>) = d
-        .store
-        .with_connection(|c| {
-            c.query_row("SELECT speakers, speaker_summary FROM ambient_events WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-        })
-        .unwrap_or_default();
-    let lines = row
-        .0
-        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
-        .unwrap_or_default();
-    (row.1.unwrap_or_else(|| "unknown".into()), lines)
-}
 
 fn rule(text: &str, phrases: &[String]) -> Verdict {
     Verdict {
@@ -298,7 +283,6 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
         mission = super::ambient_context::mission_control(d);
         with_pending = mission["waiting_for_user"] == true;
     }
-    let (speaker_summary, speaker_lines) = speaker_state(d, id);
     let (media_playing, during_playback): (bool, bool) = d
         .store
         .with_connection(|c| {
@@ -309,7 +293,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
             )
         })
         .unwrap_or((false, false));
-    if media_playing && !wake_word(text, &phrases) && speaker_summary != "you" {
+    if media_playing && !wake_word(text, &phrases) {
         return Verdict { kind: "media".into(), intent: "ignore".into(), judge: "rule", ..Verdict::inherited() };
     }
     let expectation = crate::ambient::expectation();
@@ -319,8 +303,6 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
         .unwrap_or(Value::Null);
     let state = json!({
         "utterance": text,
-        "speaker": speaker_summary,
-        "speaker_lines": if speaker_lines.len() > 1 { Value::Array(speaker_lines) } else { Value::Null },
         "utterance_audio": {"length": length, "words": words},
         "spoken_exchange": exchange,
         "assistant": {
