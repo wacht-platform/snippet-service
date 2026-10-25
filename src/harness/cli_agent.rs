@@ -935,6 +935,14 @@ impl CodingHarness {
         if let Some(effort) = Self::effort_arg(profile) {
             cmd.args(["--effort", effort]);
         }
+        let compact_threshold = profile
+            .context_window
+            .saturating_mul(profile.compact_at_pct.clamp(1, 100) as u64)
+            / 100;
+        if compact_threshold > 0 {
+            let auto_tokens = compact_threshold.clamp(100_000, 1_000_000);
+            cmd.args(["--autocompact", &auto_tokens.to_string()]);
+        }
         if let Some(id) = session.id.as_deref() {
             cmd.args([if session.started { "--resume" } else { "--session-id" }, id]);
             if session.forking {

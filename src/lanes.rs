@@ -1042,6 +1042,12 @@ async fn run_lane_once(
         });
         (agent_name.to_string(), body)
     });
+    let cli_profile = model.cli_agent_profile();
+    let defaults = HarnessConfig::default();
+    let (context_window_tokens, compact_at_pct) = match &cli_profile {
+        Some(cli) => (cli.context_window, cli.compact_at_pct),
+        None => (defaults.context_window_tokens, defaults.compact_at_pct),
+    };
     let harness = CodingHarness::new(
         HarnessConfig {
             system_prompt: lane_prompt(
@@ -1054,11 +1060,13 @@ async fn run_lane_once(
             state_path: Some(state_path),
             resume,
             exa_api_key,
+            context_window_tokens,
+            compact_at_pct,
             progress_tx: Some(progress_tx),
             progress_id: Some(owner.clone()),
             lane_approval: approval,
             lane_mailbox: Some(link.mailbox.clone()),
-            ..HarnessConfig::default()
+            ..defaults
         },
         tools,
         context,
@@ -1068,11 +1076,16 @@ async fn run_lane_once(
     } else {
         ""
     };
+    let finish_how = if cli_profile.is_some() {
+        "When you're done, write your final summary directly as your closing response (do not call `message_parent` with the final report)."
+    } else {
+        "When you're done, finish with terminate_loop."
+    };
     let brief = format!(
-        "{brief}\n\n---\n{}\n\n{role}When you're done, finish with terminate_loop. The agent that handed you this reads that summary, so cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so it can go straight there without searching again.",
+        "{brief}\n\n---\n{}\n\n{role}{finish_how} The agent that handed you this reads that summary, so cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so it can go straight there without searching again.",
         link.context
     );
-    let run = match model.cli_agent_profile() {
+    let run = match cli_profile {
         Some(cli) => harness.run_cli_lane(cli, brief).await,
         None => harness.run(&mut *model, brief).await,
     };
