@@ -168,19 +168,7 @@ async fn ask_classifier(key: &str, state: Value, with_pending: bool, expecting: 
         return Err(format!("typesafe returned {}", response.status()));
     }
     let value: Value = response.json().await.map_err(|e| e.to_string())?;
-    let kind = value["answers"]["kind"]["choice"]
-        .as_str()
-        .ok_or("typesafe answer had no kind")?
-        .to_string();
-    let intent = value["answers"]["intent"]["choice"].as_str().unwrap_or("note").to_string();
-    let intent_confidence = value["answers"]["intent"]["confidence"].as_f64().unwrap_or(1.0);
-    let addressed = value["answers"]["expects_reply"]["noul"].as_f64().unwrap_or(0.0);
-    let answers_pending = value["answers"]["answers_pending"]["noul"].as_f64().unwrap_or(0.0);
-    let matches = value["answers"]["matches_expectation"]["noul"].as_f64().unwrap_or(0.0).max(answers_pending);
-    let continues = value["answers"]["continues_previous"]["noul"].as_f64().unwrap_or(0.0);
-    let suggest = value["answers"]["suggest_conversation"]["noul"].as_f64().unwrap_or(0.0);
-    let memorable = value["answers"]["worth_remembering"]["noul"].as_f64().unwrap_or(0.0);
-    Ok(Verdict { kind, intent, addressed, intent_confidence, answers_pending, matches, continues, suggest, memorable, judge: "classifier" })
+    verdict_from(&value)
 }
 
 pub(super) fn inner_turn(content: &str) -> Option<String> {
@@ -204,6 +192,110 @@ pub(super) fn inner_turn(content: &str) -> Option<String> {
     )
 }
 
+pub(super) struct Heard {
+    pub text: String,
+    pub ago: i64,
+    pub kind: String,
+}
+
+pub(super) struct Said {
+    pub text: String,
+    pub ago: i64,
+}
+
+pub(super) struct Moment {
+    pub text: String,
+    pub duration_ms: i64,
+    pub users: Vec<Heard>,
+    pub assistant: Vec<Said>,
+    pub open: bool,
+    pub mode: String,
+    pub phrases: Vec<String>,
+    pub expecting: Option<(String, String)>,
+    pub media_playing: bool,
+    pub during_playback: bool,
+    pub local_time: String,
+    pub ambient_mode: String,
+    pub parts: usize,
+    pub mission: Value,
+}
+
+pub(super) fn classifier_state(m: &Moment) -> Value {
+    let mut history: Vec<(i64, Value)> = Vec::new();
+    for u in &m.users {
+        let mut line = json!({"who": "user", "when": super::ambient_context::bucket_ago(u.ago), "text": u.text});
+        if !u.kind.is_empty() {
+            line["judged_as"] = json!(u.kind);
+        }
+        history.push((-u.ago, line));
+    }
+    for a in &m.assistant {
+        history.push((-a.ago, json!({"who": "assistant", "when": super::ambient_context::bucket_ago(a.ago), "text": a.text})));
+    }
+    history.sort_by_key(|(at, _)| *at);
+    let last_assistant = history.iter().rev().find(|(_, v)| v["who"] == "assistant").map(|(at, v)| {
+        (-at, v["text"].as_str().is_some_and(|t| t.trim_end().ends_with('?')))
+    });
+    let exchange: Vec<Value> = history.into_iter().map(|(_, v)| v).collect();
+    let words = m.text.split_whitespace().count();
+    let length = match m.duration_ms {
+        ms if ms < 2500 => "short",
+        ms if ms < 12000 => "medium",
+        _ => "long",
+    };
+    let expecting_state = m
+        .expecting
+        .as_ref()
+        .map(|(kind, about)| json!({"kind": kind, "about": about}))
+        .unwrap_or(Value::Null);
+    json!({
+        "utterance": m.text,
+        "utterance_audio": {"length": length, "words": words},
+        "spoken_exchange": exchange,
+        "assistant": {
+            "mode": if m.mode == "active" || m.open { "active" } else { "passive" },
+            "spoken_conversation": if m.open { "open" } else { "closed" },
+            "last_spoke": last_assistant.map(|(s, _)| super::ambient_context::bucket_ago(s)).unwrap_or("not recently"),
+            "last_spoken_reply_was_a_question": last_assistant.is_some_and(|(s, q)| q && s < 120),
+            "wake_phrases": m.phrases,
+            "expecting": expecting_state,
+        },
+        "capture": {"phone_media_playing": m.media_playing, "assistant_was_speaking": m.during_playback},
+        "local_time": m.local_time,
+        "ambient_mode": m.ambient_mode,
+        "parts": m.parts,
+        "mission_control": m.mission,
+    })
+}
+
+pub(super) fn verdict_from(value: &Value) -> Result<Verdict, String> {
+    let kind = value["answers"]["kind"]["choice"]
+        .as_str()
+        .ok_or("typesafe answer had no kind")?
+        .to_string();
+    let intent = value["answers"]["intent"]["choice"].as_str().unwrap_or("note").to_string();
+    let intent_confidence = value["answers"]["intent"]["confidence"].as_f64().unwrap_or(1.0);
+    let addressed = value["answers"]["expects_reply"]["noul"].as_f64().unwrap_or(0.0);
+    let answers_pending = value["answers"]["answers_pending"]["noul"].as_f64().unwrap_or(0.0);
+    let matches = value["answers"]["matches_expectation"]["noul"].as_f64().unwrap_or(0.0).max(answers_pending);
+    let continues = value["answers"]["continues_previous"]["noul"].as_f64().unwrap_or(0.0);
+    let suggest = value["answers"]["suggest_conversation"]["noul"].as_f64().unwrap_or(0.0);
+    let memorable = value["answers"]["worth_remembering"]["noul"].as_f64().unwrap_or(0.0);
+    Ok(Verdict { kind, intent, addressed, intent_confidence, answers_pending, matches, continues, suggest, memorable, judge: "classifier" })
+}
+
+pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Verdict {
+    if wake_word(text, phrases) && verdict.kind == "conversation" {
+        verdict.intent = "for_assistant".into();
+        verdict.addressed = verdict.addressed.max(0.9);
+    }
+    if verdict.matches >= 0.7 && verdict.kind != "media" {
+        verdict.intent = "for_assistant".into();
+        verdict.addressed = verdict.addressed.max(0.85);
+    }
+    verdict
+}
+
 pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict {
     let id = ids.last().map(String::as_str).unwrap_or("");
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
@@ -222,20 +314,14 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
     };
     let now = chrono::Utc::now().timestamp();
     let cutoff = now - 5 * 60;
-    let (duration_ms, started_at): (i64, String) = d
+    let duration_ms: i64 = d
         .store
-        .with_connection(|c| {
-            c.query_row(
-                "SELECT duration_ms, started_at FROM ambient_events WHERE id = ?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-        })
+        .with_connection(|c| c.query_row("SELECT duration_ms FROM ambient_events WHERE id = ?1", [id], |r| r.get(0)))
         .unwrap_or_default();
-    let mut history: Vec<(i64, Value)> = d
+    let (users, assistant): (Vec<Heard>, Vec<Said>) = d
         .store
         .with_connection(|c| {
-            let mut out = Vec::new();
+            let mut users = Vec::new();
             let mut stmt = c.prepare(
                 "SELECT text, created_at, COALESCE(verdict, '') FROM ambient_events
                  WHERE status = 'done' AND text != '' AND id NOT IN (SELECT value FROM json_each(?1)) AND created_at >= ?2
@@ -247,35 +333,20 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
             })? {
                 let (text, at, kind) = row?;
-                let mut line = json!({"who": "user", "when": super::ambient_context::bucket_ago(now - at), "text": text});
-                if !kind.is_empty() {
-                    line["judged_as"] = json!(kind);
-                }
-                out.push((at, line));
+                users.push(Heard { text, ago: now - at, kind });
             }
+            let mut assistant = Vec::new();
             let mut stmt = c.prepare(
                 "SELECT text, created_at FROM ambient_turns
                  WHERE role = 'assistant' AND created_at >= ?1 ORDER BY id DESC LIMIT 2",
             )?;
             for row in stmt.query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
                 let (text, at) = row?;
-                out.push((at, json!({"who": "assistant", "when": super::ambient_context::bucket_ago(now - at), "text": text})));
+                assistant.push(Said { text, ago: now - at });
             }
-            Ok(out)
+            Ok((users, assistant))
         })
         .unwrap_or_default();
-    history.sort_by_key(|(at, _)| *at);
-    let last_assistant = history.iter().rev().find(|(_, v)| v["who"] == "assistant").map(|(at, v)| {
-        (now - at, v["text"].as_str().is_some_and(|t| t.trim_end().ends_with('?')))
-    });
-    let exchange: Vec<Value> = history.into_iter().map(|(_, v)| v).collect();
-    let words = text.split_whitespace().count();
-    let length = match duration_ms {
-        ms if ms < 2500 => "short",
-        ms if ms < 12000 => "medium",
-        _ => "long",
-    };
-    let _ = started_at;
     let open = crate::ambient::conversation().is_some();
     let mut mission = json!({});
     let mut with_pending = false;
@@ -298,39 +369,24 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
     }
     let expectation = crate::ambient::expectation();
     let expecting = expectation.is_some();
-    let expecting_state = expectation
-        .map(|e| json!({"kind": e.kind, "about": e.about}))
-        .unwrap_or(Value::Null);
-    let state = json!({
-        "utterance": text,
-        "utterance_audio": {"length": length, "words": words},
-        "spoken_exchange": exchange,
-        "assistant": {
-            "mode": if mode == "active" || open { "active" } else { "passive" },
-            "spoken_conversation": if open { "open" } else { "closed" },
-            "last_spoke": last_assistant.map(|(s, _)| super::ambient_context::bucket_ago(s)).unwrap_or("not recently"),
-            "last_spoken_reply_was_a_question": last_assistant.is_some_and(|(s, q)| q && s < 120),
-            "wake_phrases": phrases,
-            "expecting": expecting_state,
-        },
-        "capture": {"phone_media_playing": media_playing, "assistant_was_speaking": during_playback},
-        "local_time": chrono::Local::now().format("%a %H:%M").to_string(),
-        "ambient_mode": crate::ambient::state_name(),
-        "parts": ids.len(),
-        "mission_control": mission,
-    });
-    match ask_classifier(&key, state, with_pending, expecting).await {
-        Ok(mut verdict) => {
-            if wake_word(text, &phrases) && verdict.kind == "conversation" {
-                verdict.intent = "for_assistant".into();
-                verdict.addressed = verdict.addressed.max(0.9);
-            }
-            if verdict.matches >= 0.7 && verdict.kind != "media" {
-                verdict.intent = "for_assistant".into();
-                verdict.addressed = verdict.addressed.max(0.85);
-            }
-            verdict
-        }
+    let moment = Moment {
+        text: text.to_string(),
+        duration_ms,
+        users,
+        assistant,
+        open,
+        mode,
+        phrases: phrases.clone(),
+        expecting: expectation.map(|e| (e.kind, e.about)),
+        media_playing,
+        during_playback,
+        local_time: chrono::Local::now().format("%a %H:%M").to_string(),
+        ambient_mode: crate::ambient::state_name().to_string(),
+        parts: ids.len(),
+        mission,
+    };
+    match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
+        Ok(verdict) => settle(verdict, text, &phrases),
         Err(e) => {
             eprintln!("[ambient] voice classifier failed: {e}");
             rule(text, &phrases)
