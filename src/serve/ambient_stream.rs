@@ -295,6 +295,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
                                 let samples: Vec<f32> = seg.pcm.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
                                 let (dd, ident) = (d.clone(), id.to_string());
+                                let phrases: Vec<String> = d.config.lock().unwrap().ambient.wake_phrases.iter().map(|p| p.to_lowercase()).collect();
                                 let task = tokio::spawn(async move {
                                     let mut source = handle.source();
                                     let t0 = std::time::Instant::now();
@@ -312,7 +313,15 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                         };
                                         eprintln!("[ambient-cmp] {short} {source}={primary_ms}ms {:?} | {osrc}={oms}ms {:?}", txt(&outcome), txt(&or));
                                         let primary_bad = !matches!(&outcome, Ok((t, _)) if !t.trim().is_empty());
-                                        if primary_bad && matches!(&or, Ok((t, _)) if !t.trim().is_empty()) {
+                                        let wakes = |r: &Result<(String, Vec<crate::stt::Word>), String>| match r {
+                                            Ok((t, _)) => {
+                                                let t = t.to_lowercase();
+                                                phrases.iter().any(|p| t.contains(p.as_str()))
+                                            }
+                                            Err(_) => false,
+                                        };
+                                        let other_wakes = !wakes(&outcome) && wakes(&or);
+                                        if primary_bad && matches!(&or, Ok((t, _)) if !t.trim().is_empty()) || other_wakes {
                                             eprintln!("[ambient] {source} gave nothing, using {osrc}");
                                             outcome = or;
                                             source = osrc;
