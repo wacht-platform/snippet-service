@@ -338,9 +338,18 @@ pub fn prompt_line() -> String {
                 String::new()
             }
         }
-        None => format!(
-            " Ambient mode is PASSIVE on {label}: speech addressed to you arrives as <ambient_turn mode=\"passive\"> messages; you have no speak tool in this mode, so reply in the chat (the user gets a notification for each reply) and end with one plain line. If a spoken back and forth would help (a question, hands busy), call ambient_mode with active and then speak.{expecting}"
-        ),
+        None => {
+            let last = LAST_USER_TURN.load(Ordering::Relaxed);
+            let recent = last > 0 && chrono::Utc::now().timestamp() - last < 30 * 60;
+            let presence = if recent {
+                " The user spoke to you in the last 30 minutes, so they are near the device: say such updates aloud."
+            } else {
+                " The user has not spoken to you in the last 30 minutes: still say such updates aloud, except during quiet hours, when you ping instead."
+            };
+            format!(
+                " Ambient mode is PASSIVE on {label}: speech addressed to you arrives as <ambient_turn mode=\"passive\"> messages and you reply in the chat (the user gets a notification for each reply), ending with one plain line. speak fails until you call ambient_mode with active, which opens a spoken conversation; then call speak. Do that whenever you have an update worth hearing: a task they care about finished, failed or is blocked, an answer they were waiting for, or a decision only they can make. Speak it in one or two short sentences and keep the details in the chat. Also switch to active when a spoken back and forth would help (a question, hands busy). Routine progress stays in the chat.{presence}{expecting}"
+            )
+        }
     }
 }
 
