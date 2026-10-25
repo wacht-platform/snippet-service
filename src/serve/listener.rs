@@ -279,7 +279,7 @@ impl Listener {
             c.active = active;
             let (min, max) = silences(active);
             let _ = tx.send(Cmd::Config(
-                serde_json::json!({"type":"UpdateConfiguration","mode":"min_latency","min_turn_silence":min,"max_turn_silence":max}).to_string(),
+                serde_json::json!({"type":"UpdateConfiguration","min_turn_silence":min,"max_turn_silence":max}).to_string(),
             ));
         }
     }

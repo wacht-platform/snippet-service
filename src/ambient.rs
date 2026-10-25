@@ -327,7 +327,7 @@ pub fn prompt_line() -> String {
         .unwrap_or_default();
     match conversation() {
         Some(c) => format!(
-            " Ambient mode is ACTIVE: a live spoken conversation is open with the user on {label} (about {}s left). Nearly everything they say arrives as <ambient_turn mode=\"active\"> messages; answer by calling speak with one to three plain sentences (it is read aloud, so no markdown or lists), or say nothing when a line is not for you. If speaking is no longer needed, call ambient_mode with passive.{expecting}",
+            " Ambient mode is ACTIVE: a live spoken conversation is open with the user on {label} (about {}s left). Nearly everything they say arrives as <ambient_turn mode=\"active\"> messages; answer by calling speak with one to three plain sentences (it is read aloud, so no markdown or lists), or say nothing when a line is not for you. The user hears silence until your first speak call, so make speak your FIRST action on every spoken turn: if the answer needs tools, say a short acknowledgement or the answer you already know first (for example \"Checking now.\"), then run the tools, then speak the result. Never run a tool before the first speak. If speaking is no longer needed, call ambient_mode with passive.{expecting}",
             c.seconds_left()
         ),
         None if PINNED_ACTIVE.load(Ordering::Relaxed) => {
