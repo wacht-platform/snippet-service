@@ -2,6 +2,7 @@ use super::*;
 
 use serde_json::{Value, json};
 
+#[derive(Clone)]
 pub(crate) struct Verdict {
     pub kind: String,
     pub intent: String,
@@ -12,16 +13,23 @@ pub(crate) struct Verdict {
     pub continues: f64,
     pub suggest: f64,
     pub memorable: f64,
+    pub echo: f64,
+    pub other: f64,
+    pub played: f64,
     pub judge: &'static str,
 }
 
 impl Verdict {
     pub fn kept(&self) -> bool {
-        !matches!(self.kind.as_str(), "media" | "background" | "noise") && self.intent != "ignore"
+        !matches!(self.kind.as_str(), "media" | "background" | "noise") && self.intent != "ignore" && self.echo < 0.7
     }
 
     pub fn for_assistant(&self) -> bool {
         self.intent == "for_assistant"
+    }
+
+    pub fn veto(&self) -> f64 {
+        self.echo.max(self.other).max(self.played)
     }
 
     pub fn inherited() -> Self {
@@ -35,19 +43,37 @@ impl Verdict {
             continues: 1.0,
             suggest: 0.0,
             memorable: 0.0,
+            echo: 0.0,
+            other: 0.0,
+            played: 0.0,
             judge: "continuation",
         }
     }
 }
 
-pub(super) fn wake_word(text: &str, phrases: &[String]) -> bool {
-    let words: Vec<String> = text
-        .to_lowercase()
+const NOUN_LEAD: &[&str] = &[
+    "a", "an", "the", "this", "that", "these", "those", "code", "of", "my", "his", "her", "their", "our", "each", "every", "some", "any",
+    "another",
+];
+
+fn words_of(text: &str) -> Vec<String> {
+    text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
-        .take(7)
         .map(str::to_string)
-        .collect();
+        .collect()
+}
+
+fn as_call(words: &[String], at: usize, len: usize) -> bool {
+    at == 0 || at + len >= words.len() || !NOUN_LEAD.contains(&words[at - 1].as_str())
+}
+
+fn in_call_position(words: &[String], at: usize) -> bool {
+    at < 10 || at + 4 >= words.len()
+}
+
+pub(super) fn wake_word(text: &str, phrases: &[String]) -> bool {
+    let words = words_of(text);
     let near = words.iter().take(3).any(|w| w == "snipit" || w == "snippit")
         || words.windows(2).take(2).any(|w| w[0] == "snip" && matches!(w[1].as_str(), "it" | "but" | "bit" | "pet"));
     if near && phrases.iter().any(|p| p == "snippet") {
@@ -56,10 +82,64 @@ pub(super) fn wake_word(text: &str, phrases: &[String]) -> bool {
     phrases.iter().any(|p| {
         let parts: Vec<&str> = p.split_whitespace().collect();
         !parts.is_empty()
-            && words
-                .windows(parts.len())
-                .any(|w| w.iter().zip(&parts).all(|(a, b)| a == b))
+            && words.windows(parts.len()).enumerate().any(|(at, w)| {
+                in_call_position(&words, at) && w.iter().zip(&parts).all(|(a, b)| a == b) && as_call(&words, at, parts.len())
+            })
     })
+}
+
+fn edits(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for j in 0..b.len() {
+            let cur = row[j + 1];
+            row[j + 1] = (prev + usize::from(ca != b[j])).min(row[j] + 1).min(cur + 1);
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+pub(super) fn near_wake(text: &str, phrases: &[String]) -> bool {
+    let words = words_of(text);
+    let short = words.len() <= 3;
+    phrases.iter().filter(|p| !p.contains(' ') && p.len() >= 5).any(|p| {
+        let close = |w: &str| {
+            let d = edits(w, p);
+            w != p.as_str() && w.len() >= 4 && (d <= 2 || (short && d <= 3))
+        };
+        (0..words.len()).filter(|&at| in_call_position(&words, at) && as_call(&words, at, 1)).any(|at| {
+            close(&words[at]) || words.get(at + 1).is_some_and(|next| close(&format!("{}{}", words[at], next)))
+        })
+    })
+}
+
+fn shared_words(utterance: &str, said: &str) -> &'static str {
+    let heard = words_of(utterance);
+    if heard.len() <= 2 {
+        return "too short to compare";
+    }
+    let said = words_of(said);
+    let share = heard.iter().filter(|w| said.contains(w)).count() as f64 / heard.len() as f64;
+    match share {
+        s if s >= 0.8 => "almost all",
+        s if s >= 0.5 => "about half",
+        s if s > 0.0 => "a few",
+        _ => "none",
+    }
+}
+
+fn ended_ago(secs: i64) -> &'static str {
+    match secs {
+        s if s < 0 => "still speaking",
+        s if s < 10 => "seconds ago",
+        s if s < 60 => "under a minute ago",
+        s if s < 180 => "a few minutes ago",
+        _ => "not in the last few minutes",
+    }
 }
 
 pub(super) fn escape(text: &str) -> String {
@@ -69,19 +149,15 @@ pub(super) fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-
 fn rule(text: &str, phrases: &[String]) -> Verdict {
+    let wake = wake_word(text, phrases);
     Verdict {
         kind: "unjudged".into(),
-        intent: if wake_word(text, phrases) { "for_assistant".into() } else { "unjudged".into() },
-        addressed: if wake_word(text, phrases) { 1.0 } else { 0.0 },
-        intent_confidence: 1.0,
-        answers_pending: 0.0,
-        matches: 0.0,
+        intent: if wake { "for_assistant".into() } else { "unjudged".into() },
+        addressed: if wake { 1.0 } else { 0.0 },
         continues: 0.0,
-        suggest: 0.0,
-        memorable: 0.0,
         judge: "rule",
+        ..Verdict::inherited()
     }
 }
 
@@ -99,47 +175,77 @@ fn classifier_client() -> &'static reqwest::Client {
 
 fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
     let mut questions = json!({
+        "to_assistant": {
+            "type": "noul",
+            "instructions": "Is `utterance` directed at the assistant: a call, a question, a request or instruction, an answer, a confirmation, a correction, or the rest of something just said to it?",
+            "criteria": {
+                "true": [
+                    "Uses the assistant's name, or `name_in_utterance` is not 'no'",
+                    "Asks whether the assistant can hear them or is there, whether or not the conversation is open",
+                    "Asks a question or gives an instruction that a personal AI assistant would handle, such as the status of work, tasks, reminders, information, advice, chat or jokes, unless `recent` shows the speaker talking with someone else",
+                    "Answers, confirms, refuses, thanks or picks an option after `assistant.last_said`",
+                    "Continues or corrects a line in `recent` that was handled as sent to the assistant, even a fragment cut off by a pause"
+                ],
+                "false": [
+                    "Thinking aloud, an exclamation, a filler sound, or a remark about the speaker's own activity that asks nothing of anyone",
+                    "Clearly part of an exchange with someone else shown in `recent`",
+                    "Uses the word snippet for a thing, such as a code snippet, instead of calling the assistant"
+                ]
+            }
+        },
+        "assistant_echo": {
+            "type": "noul",
+            "instructions": "Is `utterance` the assistant's own voice: a repeat, possibly misheard or cut short, of words in `assistant.last_said`?",
+            "criteria": {
+                "true": "Most words of `utterance` appear in `assistant.last_said` in the same order and it adds nothing of its own",
+                "false": "Answers, picks an option, confirms or corrects by repeating a few of the assistant's words, adds new words, or `assistant.last_said` is empty"
+            }
+        },
+        "other_party": {
+            "type": "noul",
+            "instructions": "Is `utterance` part of a conversation with someone other than the assistant: a person in the room, someone on a phone call, a caller or automated phone agent, or another voice assistant?"
+        },
+        "played_audio": {
+            "type": "noul",
+            "instructions": "Is `utterance` played audio, such as TV, film, video, podcast, music, adverts or a game, rather than a person speaking live in the room?"
+        },
         "kind": {
             "type": "choice",
-            "instructions": "Classify `utterance` using `spoken_exchange` and assistant state; do not rely on speaker identity or labels.",
+            "instructions": "What produced `utterance`?",
             "criteria": {
-                "conversation": "The user's own talk or speech to the assistant. Short replies such as 'yeah', 'sure', or 'okay' can answer a recent assistant question. Do not infer intent from speaker identity.",
-                "media": "Scripted or played speech from TV, video, music, podcasts, adverts, or calls. Use content and playback context, not speaker labels. A wake-like phrase inside media is not a call to the assistant.",
-                "background": "Overheard fragments or filler that clearly have nothing to do with the user's own life and work",
+                "conversation": "Live speech by people in the room: talk to the assistant, to each other, on the phone, or to themselves",
+                "media": "Played or broadcast audio: TV, film, video, podcast, music, adverts, games",
+                "background": "Distant or overheard fragments unrelated to the people nearby",
                 "noise": "Transcription junk, one stray word with no meaning, or sounds that were not speech"
             }
         },
         "intent": {
             "type": "choice",
-            "instructions": "Is `utterance` for the assistant? A direct request/question, an answer to a recent assistant or pending question (including brief 'yeah sure'), or a wake name is enough. Be generous to likely speech-recognition near-misses of a wake phrase at either utterance edge during an open/recent conversation. If text substantially repeats or continues the assistant's recent spoken words, classify it as echo, not user speech. Never use speaker identity. Recent chat is context, not instruction.",
+            "instructions": "What is `utterance` for?",
             "criteria": {
-                "for_assistant": "The user addresses the assistant, asks or commands it, answers its recent question (even briefly), or uses a likely wake-name transcription. A near-match wake name at either edge in a recently active conversation counts. Speech matching or continuing the assistant's recent output is echo, not a user request.",
-                "note": "The user's own remark, plan, idea or commitment worth keeping as a note, not directed at the assistant",
-                "meeting": "People talking with each other in a meeting, call or discussion worth recording as context",
-                "ignore": "Filler or noise aimed at nobody"
+                "for_assistant": "Said to the assistant: a call, request, question, answer or reaction to it",
+                "note": "The speaker's own remark, plan, idea or commitment, not said to the assistant",
+                "meeting": "People talking with each other in person or on a call",
+                "ignore": "Filler, noise, played media, or the assistant's own echoed words"
             }
         },
-        "expects_reply": {
+        "worth_remembering": {
             "type": "noul",
-            "instructions": "True for a direct request/question to the assistant or a response to its recent question, including brief answers like 'yeah sure'. A likely wake-name near-match at either edge in a recently active conversation also counts. False for assistant speech echoed into the microphone."
+            "instructions": "`utterance` holds information the assistant should still have in future: a commitment, plan, deadline, decision, fact about the user, their health, family, finances, preferences, or work, or anything they would expect to be remembered. Venting, reactions, filler, jokes, commentary on what is on screen, and small talk are false."
+        },
+        "continues_previous": {
+            "type": "noul",
+            "instructions": "`utterance` continues the last line in `recent`, such as the rest of a sentence or request that was interrupted by a pause."
+        },
+        "suggest_conversation": {
+            "type": "noul",
+            "instructions": "The speaker would be better served by a spoken back and forth with the assistant than by a written reply: a conversational question, thinking aloud with the assistant, or hands-busy talk."
         }
-    });
-    questions["worth_remembering"] = json!({
-        "type": "noul",
-        "instructions": "`utterance` holds information the assistant should still have in future: a commitment, plan, deadline, decision, fact about the user, their health, family, finances, preferences, or work, or anything they would expect to be remembered. Venting, reactions, filler, jokes, commentary on what is on screen, and small talk are false."
-    });
-    questions["continues_previous"] = json!({
-        "type": "noul",
-        "instructions": "`utterance` continues the speaker's previous line in `spoken_exchange`, such as the rest of a sentence or request that was interrupted by a pause."
-    });
-    questions["suggest_conversation"] = json!({
-        "type": "noul",
-        "instructions": "The speaker would be better served by a spoken back and forth with the assistant than by a written reply: a conversational question, thinking aloud with the assistant, or hands-busy talk."
     });
     if with_pending {
         questions["answers_pending"] = json!({
             "type": "noul",
-            "instructions": "`utterance` answers `mission_control.pending_question`."
+            "instructions": "`utterance` answers `assistant.pending_question`."
         });
     }
     if expecting {
@@ -196,11 +302,14 @@ pub(super) struct Heard {
     pub text: String,
     pub ago: i64,
     pub kind: String,
+    pub intent: String,
+    pub delivered: bool,
 }
 
 pub(super) struct Said {
     pub text: String,
     pub ago: i64,
+    pub heard: Option<String>,
 }
 
 pub(super) struct Moment {
@@ -209,83 +318,135 @@ pub(super) struct Moment {
     pub users: Vec<Heard>,
     pub assistant: Vec<Said>,
     pub open: bool,
-    pub mode: String,
     pub phrases: Vec<String>,
     pub expecting: Option<(String, String)>,
+    pub pending: Option<String>,
     pub media_playing: bool,
     pub during_playback: bool,
-    pub local_time: String,
-    pub ambient_mode: String,
-    pub parts: usize,
-    pub mission: Value,
+}
+
+fn handled_as(h: &Heard) -> &'static str {
+    if h.delivered {
+        "sent to the assistant"
+    } else if matches!(h.kind.as_str(), "media" | "background") {
+        "played audio"
+    } else if h.intent == "meeting" {
+        "people talking"
+    } else {
+        "not sent to the assistant"
+    }
 }
 
 pub(super) fn classifier_state(m: &Moment) -> Value {
-    let mut history: Vec<(i64, Value)> = Vec::new();
+    let mut recent: Vec<(i64, Value)> = Vec::new();
     for u in &m.users {
-        let mut line = json!({"who": "user", "when": super::ambient_context::bucket_ago(u.ago), "text": u.text});
-        if !u.kind.is_empty() {
-            line["judged_as"] = json!(u.kind);
-        }
-        history.push((-u.ago, line));
+        recent.push((-u.ago, json!({"from": "microphone", "when": ended_ago(u.ago), "text": u.text, "handled_as": handled_as(u)})));
     }
     for a in &m.assistant {
-        history.push((-a.ago, json!({"who": "assistant", "when": super::ambient_context::bucket_ago(a.ago), "text": a.text})));
+        recent.push((-a.ago, json!({"from": "assistant", "when": ended_ago(a.ago), "text": a.text})));
     }
-    history.sort_by_key(|(at, _)| *at);
-    let last_assistant = history.iter().rev().find(|(_, v)| v["who"] == "assistant").map(|(at, v)| {
-        (-at, v["text"].as_str().is_some_and(|t| t.trim_end().ends_with('?')))
-    });
-    let exchange: Vec<Value> = history.into_iter().map(|(_, v)| v).collect();
-    let words = m.text.split_whitespace().count();
+    recent.sort_by_key(|(at, _)| *at);
+    let last = m.assistant.iter().min_by_key(|a| a.ago);
+    let last_text = last.map(|a| a.text.clone());
+    let shared = m
+        .assistant
+        .iter()
+        .map(|a| shared_words(&m.text, &a.text))
+        .min_by_key(|s| ["almost all", "about half", "a few", "none", "too short to compare"].iter().position(|x| x == s))
+        .unwrap_or("none");
     let length = match m.duration_ms {
         ms if ms < 2500 => "short",
         ms if ms < 12000 => "medium",
         _ => "long",
     };
-    let expecting_state = m
-        .expecting
-        .as_ref()
-        .map(|(kind, about)| json!({"kind": kind, "about": about}))
-        .unwrap_or(Value::Null);
+    let name = if wake_word(&m.text, &m.phrases) {
+        "yes"
+    } else if near_wake(&m.text, &m.phrases) {
+        "likely, misheard"
+    } else {
+        "no"
+    };
+    let mut assistant = json!({
+        "names": m.phrases,
+        "speaking_when_utterance_was_heard": m.during_playback,
+        "last_said": last_text,
+        "last_said_ended": last.map(|a| ended_ago(a.ago)).unwrap_or("not in the last few minutes"),
+        "last_said_was_cut_off": last.is_some_and(|a| a.heard.is_some()),
+        "last_said_was_question": last.is_some_and(|a| a.ago < 120 && a.text.trim_end().ends_with('?')),
+        "words_shared_with_utterance": shared,
+    });
+    if let Some((kind, about)) = &m.expecting {
+        assistant["expecting"] = json!({"kind": kind, "about": about});
+    }
+    if let Some(q) = &m.pending {
+        assistant["pending_question"] = json!(q);
+    }
     json!({
         "utterance": m.text,
-        "utterance_audio": {"length": length, "words": words},
-        "spoken_exchange": exchange,
-        "assistant": {
-            "mode": if m.mode == "active" || m.open { "active" } else { "passive" },
-            "spoken_conversation": if m.open { "open" } else { "closed" },
-            "last_spoke": last_assistant.map(|(s, _)| super::ambient_context::bucket_ago(s)).unwrap_or("not recently"),
-            "last_spoken_reply_was_a_question": last_assistant.is_some_and(|(s, q)| q && s < 120),
-            "wake_phrases": m.phrases,
-            "expecting": expecting_state,
-        },
-        "capture": {"phone_media_playing": m.media_playing, "assistant_was_speaking": m.during_playback},
-        "local_time": m.local_time,
-        "ambient_mode": m.ambient_mode,
-        "parts": m.parts,
-        "mission_control": m.mission,
+        "utterance_length": length,
+        "name_in_utterance": name,
+        "conversation": if m.open { "open: the user and the assistant are talking back and forth" } else { "closed" },
+        "assistant": assistant,
+        "recent": recent.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        "phone_playing_media": m.media_playing,
     })
 }
 
 pub(super) fn verdict_from(value: &Value) -> Result<Verdict, String> {
-    let kind = value["answers"]["kind"]["choice"]
-        .as_str()
-        .ok_or("typesafe answer had no kind")?
-        .to_string();
-    let intent = value["answers"]["intent"]["choice"].as_str().unwrap_or("note").to_string();
-    let intent_confidence = value["answers"]["intent"]["confidence"].as_f64().unwrap_or(1.0);
-    let addressed = value["answers"]["expects_reply"]["noul"].as_f64().unwrap_or(0.0);
-    let answers_pending = value["answers"]["answers_pending"]["noul"].as_f64().unwrap_or(0.0);
-    let matches = value["answers"]["matches_expectation"]["noul"].as_f64().unwrap_or(0.0).max(answers_pending);
-    let continues = value["answers"]["continues_previous"]["noul"].as_f64().unwrap_or(0.0);
-    let suggest = value["answers"]["suggest_conversation"]["noul"].as_f64().unwrap_or(0.0);
-    let memorable = value["answers"]["worth_remembering"]["noul"].as_f64().unwrap_or(0.0);
-    Ok(Verdict { kind, intent, addressed, intent_confidence, answers_pending, matches, continues, suggest, memorable, judge: "classifier" })
+    let a = &value["answers"];
+    let kind = a["kind"]["choice"].as_str().ok_or("typesafe answer had no kind")?.to_string();
+    let noul = |k: &str| a[k]["noul"].as_f64().unwrap_or(0.0);
+    let answers_pending = noul("answers_pending");
+    Ok(Verdict {
+        kind,
+        intent: a["intent"]["choice"].as_str().unwrap_or("note").to_string(),
+        addressed: noul("to_assistant"),
+        intent_confidence: a["intent"]["confidence"].as_f64().unwrap_or(1.0),
+        answers_pending,
+        matches: noul("matches_expectation").max(answers_pending),
+        continues: noul("continues_previous"),
+        suggest: noul("suggest_conversation"),
+        memorable: noul("worth_remembering"),
+        echo: noul("assistant_echo"),
+        other: noul("other_party"),
+        played: noul("played_audio").max(a["kind"]["probabilities"]["media"].as_f64().unwrap_or(0.0)),
+        judge: "classifier",
+    })
+}
+
+const FILLERS: &[&str] = &[
+    "hmm", "hm", "mm", "mmm", "uh", "uhh", "um", "umm", "ah", "oh", "er", "erm", "so", "huh", "eh", "ooh", "aah", "and", "but", "the", "a",
+];
+
+const OTHER_ASSISTANTS: &[&str] = &["alexa", "siri", "google", "gemini", "cortana", "bixby"];
+
+fn other_assistant(text: &str) -> bool {
+    let words = words_of(text);
+    words.iter().take(3).any(|w| OTHER_ASSISTANTS.contains(&w.as_str()))
+        && !words.iter().take(3).any(|w| matches!(w.as_str(), "is" | "was" | "the" | "my" | "use" | "using"))
+}
+
+pub(super) fn filler(text: &str) -> bool {
+    words_of(text).iter().all(|w| FILLERS.contains(&w.as_str()))
 }
 
 pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Verdict {
-    if wake_word(text, phrases) && verdict.kind == "conversation" {
+    if filler(text) {
+        verdict.intent = "ignore".into();
+        verdict.addressed = verdict.addressed.min(0.2);
+        return verdict;
+    }
+    if other_assistant(text) {
+        verdict.other = verdict.other.max(0.95);
+    }
+    if near_wake(text, phrases) && verdict.addressed >= 0.35 && verdict.veto() < 0.5 {
+        verdict.addressed = verdict.addressed.max(0.75);
+        if verdict.kind == "noise" {
+            verdict.kind = "conversation".into();
+            verdict.intent = "for_assistant".into();
+        }
+    }
+    if wake_word(text, phrases) && verdict.kind == "conversation" && verdict.played < 0.7 && verdict.other < 0.8 {
         verdict.intent = "for_assistant".into();
         verdict.addressed = verdict.addressed.max(0.9);
     }
@@ -293,18 +454,20 @@ pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Ve
         verdict.intent = "for_assistant".into();
         verdict.addressed = verdict.addressed.max(0.85);
     }
+    if verdict.addressed >= 0.5 && verdict.veto() < 0.5 && verdict.kind == "conversation" {
+        verdict.intent = "for_assistant".into();
+    }
     verdict
 }
 
 pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict {
     let id = ids.last().map(String::as_str).unwrap_or("");
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
-    let (key, watcher, mode, phrases, chat_context) = {
+    let (key, watcher, phrases, chat_context) = {
         let c = d.config.lock().unwrap();
         (
             c.typesafe_api_key.clone().filter(|k| !k.trim().is_empty()),
             c.ambient.watcher.clone(),
-            c.ambient.mode.clone(),
             c.ambient.wake_phrases.clone(),
             c.ambient.watcher_chat_context,
         )
@@ -313,47 +476,58 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
         return rule(text, &phrases);
     };
     let now = chrono::Utc::now().timestamp();
-    let cutoff = now - 5 * 60;
-    let duration_ms: i64 = d
-        .store
-        .with_connection(|c| c.query_row("SELECT duration_ms FROM ambient_events WHERE id = ?1", [id], |r| r.get(0)))
-        .unwrap_or_default();
-    let (users, assistant): (Vec<Heard>, Vec<Said>) = d
+    let (duration_ms, users, assistant): (i64, Vec<Heard>, Vec<Said>) = d
         .store
         .with_connection(|c| {
+            let duration_ms: i64 =
+                c.query_row("SELECT duration_ms FROM ambient_events WHERE id = ?1", [id], |r| r.get(0)).unwrap_or(0);
             let mut users = Vec::new();
             let mut stmt = c.prepare(
-                "SELECT text, created_at, COALESCE(verdict, '') FROM ambient_events
+                "SELECT text, created_at, COALESCE(verdict, ''), COALESCE(intent, ''), delivered FROM ambient_events
                  WHERE status = 'done' AND text != '' AND id NOT IN (SELECT value FROM json_each(?1)) AND created_at >= ?2
-                   AND COALESCE(verdict, '') NOT IN ('media', 'background', 'noise')
                    AND device = (SELECT device FROM ambient_events WHERE id = ?3)
-                 ORDER BY started_at DESC LIMIT 6",
+                 ORDER BY started_at DESC LIMIT 4",
             )?;
-            for row in stmt.query_map(rusqlite::params![excluded, cutoff, id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            for row in stmt.query_map(rusqlite::params![excluded, now - 180, id], |r| {
+                Ok(Heard {
+                    text: r.get(0)?,
+                    ago: now - r.get::<_, i64>(1)?,
+                    kind: r.get(2)?,
+                    intent: r.get(3)?,
+                    delivered: r.get::<_, i64>(4)? != 0,
+                })
             })? {
-                let (text, at, kind) = row?;
-                users.push(Heard { text, ago: now - at, kind });
+                users.push(row?);
             }
             let mut assistant = Vec::new();
             let mut stmt = c.prepare(
-                "SELECT text, created_at FROM ambient_turns
-                 WHERE role = 'assistant' AND created_at >= ?1 ORDER BY id DESC LIMIT 2",
+                "SELECT t.text, t.created_at + COALESCE((SELECT SUM(ms) FROM ambient_chunks WHERE turn_id = t.id), 0) / 1000,
+                        t.status, COALESCE(t.heard_text, '')
+                 FROM ambient_turns t
+                 WHERE t.role = 'assistant' AND t.created_at >= ?1 AND t.text != '' AND t.status != 'cancelled'
+                   AND t.device = (SELECT device FROM ambient_events WHERE id = ?2)
+                 ORDER BY t.id DESC LIMIT 2",
             )?;
-            for row in stmt.query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
-                let (text, at) = row?;
-                assistant.push(Said { text, ago: now - at });
+            for row in stmt.query_map(rusqlite::params![now - 300, id], |r| {
+                let status: String = r.get(2)?;
+                let heard: String = r.get(3)?;
+                Ok(Said {
+                    text: r.get(0)?,
+                    ago: now - r.get::<_, i64>(1)?,
+                    heard: (status == "interrupted" && !heard.trim().is_empty()).then_some(heard),
+                })
+            })? {
+                assistant.push(row?);
             }
-            Ok((users, assistant))
+            Ok((duration_ms, users, assistant))
         })
         .unwrap_or_default();
-    let open = crate::ambient::conversation().is_some();
-    let mut mission = json!({});
-    let mut with_pending = false;
-    if chat_context {
-        mission = super::ambient_context::mission_control(d);
-        with_pending = mission["waiting_for_user"] == true;
-    }
+    let pending = if chat_context {
+        super::ambient_context::mission_control(d)["pending_question"].as_str().map(str::to_string)
+    } else {
+        None
+    };
+    let with_pending = pending.is_some();
     let (media_playing, during_playback): (bool, bool) = d
         .store
         .with_connection(|c| {
@@ -374,16 +548,12 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
         duration_ms,
         users,
         assistant,
-        open,
-        mode,
+        open: crate::ambient::conversation().is_some(),
         phrases: phrases.clone(),
         expecting: expectation.map(|e| (e.kind, e.about)),
+        pending,
         media_playing,
         during_playback,
-        local_time: chrono::Local::now().format("%a %H:%M").to_string(),
-        ambient_mode: crate::ambient::state_name().to_string(),
-        parts: ids.len(),
-        mission,
     };
     match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
         Ok(verdict) => settle(verdict, text, &phrases),

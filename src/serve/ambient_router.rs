@@ -18,9 +18,10 @@ const MERGE_GAP: f64 = 1.5;
 const CONTINUED_GAP: f64 = 4.0;
 const MAX_PARTS: usize = 5;
 const MAX_SPAN: f64 = 30.0;
-const PASSIVE_THRESHOLD: f64 = 0.55;
-const PINNED_THRESHOLD: f64 = 0.4;
-const LIVE_REPLY_THRESHOLD: f64 = 0.35;
+const PASSIVE_THRESHOLD: f64 = 0.6;
+const PINNED_THRESHOLD: f64 = 0.5;
+const LIVE_REPLY_THRESHOLD: f64 = 0.5;
+const VETO_THRESHOLD: f64 = 0.6;
 const MATCH_THRESHOLD: f64 = 0.7;
 const MEMORABLE_THRESHOLD: f64 = 0.65;
 
@@ -246,20 +247,16 @@ fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool) ->
         return (false, false);
     }
     let matched = expecting && v.matches >= MATCH_THRESHOLD;
+    let clear = v.veto() < VETO_THRESHOLD;
+    let wake = wake && v.veto() < 0.8;
     if live {
-        if wake || matched || v.continues >= 0.4 {
-            return (true, false);
-        }
-        return (v.addressed >= LIVE_REPLY_THRESHOLD && (v.for_assistant() || v.addressed >= 0.45), false);
+        return (wake || matched || (clear && v.addressed >= LIVE_REPLY_THRESHOLD), false);
     }
     if pinned {
-        let asked = v.for_assistant() && v.addressed >= PINNED_THRESHOLD;
-        let go = wake || asked || matched;
+        let go = wake || matched || (clear && v.addressed >= PINNED_THRESHOLD);
         return (go, go);
     }
-    let bar = if v.kind == "conversation" { 0.45 } else { PASSIVE_THRESHOLD };
-    let asked = v.for_assistant() && v.addressed >= bar;
-    (wake || asked || matched, false)
+    (wake || matched || (clear && v.addressed >= PASSIVE_THRESHOLD), false)
 }
 
 async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mut Option<Flushed>, pending: Option<Pending>) {
@@ -355,18 +352,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
 
 fn wake_verdict(early: Option<&Verdict>) -> Verdict {
     match early {
-        Some(v) => Verdict {
-            kind: v.kind.clone(),
-            intent: v.intent.clone(),
-            addressed: v.addressed.max(0.9),
-            intent_confidence: v.intent_confidence,
-            answers_pending: v.answers_pending,
-            matches: v.matches,
-            continues: v.continues,
-            suggest: v.suggest,
-            memorable: v.memorable,
-            judge: v.judge,
-        },
+        Some(v) => Verdict { addressed: v.addressed.max(0.9), ..v.clone() },
         None => Verdict { addressed: 0.9, ..Verdict::inherited() },
     }
 }

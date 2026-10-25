@@ -477,7 +477,25 @@ fn spoken_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
+const ANSWER_LEAD: &[&str] = &["yeah", "yes", "yep", "yup", "no", "nope", "nah", "okay", "ok", "sure", "right", "exactly", "correct", "haan", "han"];
+
+fn longest_run(heard: &[String], said: &[String]) -> usize {
+    let mut best = 0;
+    let mut row = vec![0usize; said.len() + 1];
+    for h in heard {
+        let mut next = vec![0usize; said.len() + 1];
+        for (j, w) in said.iter().enumerate() {
+            if h == w {
+                next[j + 1] = row[j] + 1;
+                best = best.max(next[j + 1]);
+            }
+        }
+        row = next;
+    }
+    best
+}
+
+pub(super) fn echo_match(text: &str, replies: &[String], ratio: f64) -> bool {
     let heard = spoken_words(text);
     let mut content: Vec<&String> = heard.iter().filter(|w| !ECHO_STOP.contains(&w.as_str())).collect();
     content.sort();
@@ -485,6 +503,15 @@ pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
     if content.len() < 2 {
         return false;
     }
+    replies.iter().any(|reply| {
+        let said = spoken_words(reply);
+        let answers = ANSWER_LEAD.contains(&heard[0].as_str()) && !said.windows(2).any(|w| w[0] == heard[0] && w[1] == heard[1]);
+        let shared = content.iter().filter(|w| said.contains(**w)).count();
+        !answers && shared as f64 / content.len() as f64 >= ratio && longest_run(&heard, &said) as f64 >= 0.6 * heard.len() as f64
+    })
+}
+
+pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
     let since = chrono::Utc::now().timestamp() - 180;
     let replies: Vec<String> = crate::ambient::store()
         .ok()
@@ -502,12 +529,7 @@ pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
             .ok()
         })
         .unwrap_or_default();
-    let n = if heard.len() >= 5 { 3 } else { 2 };
-    replies.iter().any(|reply| {
-        let said = spoken_words(reply);
-        let shared = content.iter().filter(|w| said.contains(**w)).count();
-        shared as f64 / content.len() as f64 >= ratio && heard.windows(n).any(|h| said.windows(n).any(|r| r == h))
-    })
+    echo_match(text, &replies, ratio)
 }
 
 #[derive(Deserialize)]
