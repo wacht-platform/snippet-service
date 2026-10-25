@@ -30,55 +30,9 @@ pub(crate) async fn stream(ws: WebSocketUpgrade, State(d): State<Shared>, Query(
         .on_upgrade(move |socket| run(socket, d, device, token))
 }
 
-const QUIET_FLOOR: f32 = 200.0;
-const QUIET_BYTES: usize = 9_600;
-
 struct Open {
     meta: serde_json::Value,
     pcm: Vec<u8>,
-    peak: f32,
-    quiet: usize,
-    voiced: usize,
-    checks: u8,
-    asm: Option<super::assembly::Ticket>,
-    forced: bool,
-}
-
-fn rms(bytes: &[u8]) -> f32 {
-    let n = bytes.len() / 2;
-    if n == 0 {
-        return 0.0;
-    }
-    let sum: f64 = bytes
-        .chunks_exact(2)
-        .map(|b| {
-            let v = i16::from_le_bytes([b[0], b[1]]) as f64;
-            v * v
-        })
-        .sum();
-    (sum / n as f64).sqrt() as f32
-}
-
-fn quiet(level: f32, peak: f32) -> bool {
-    level < QUIET_FLOOR.max(peak * 0.08)
-}
-
-fn wav(pcm: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(44 + pcm.len());
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVEfmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&16_000u32.to_le_bytes());
-    out.extend_from_slice(&32_000u32.to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
-    out.extend_from_slice(pcm);
-    out
 }
 
 async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>) {
@@ -104,61 +58,13 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                     continue;
                 }
                 let h = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                if let Some(seg) = open.get_mut(&h) {
-                    if seg.pcm.len() + b.len() - 4 <= MAX_SEGMENT_PCM {
-                        let body = &b[4..];
-                        seg.pcm.extend_from_slice(body);
-                        let level = rms(body);
-                        seg.peak = seg.peak.max(level);
-                        let is_quiet = body.len() <= 2048 && quiet(level, seg.peak);
-                        if let Some(a) = seg.asm.as_mut() {
-                            a.push(body, !is_quiet);
-                        }
-                        if body.len() <= 2048 {
-                            if is_quiet {
-                                seg.quiet += body.len();
-                            } else {
-                                seg.quiet = 0;
-                                seg.voiced += body.len();
-                                seg.forced = false;
-                                let due = (seg.checks == 0 && seg.voiced >= 12_800) || (seg.checks == 1 && seg.voiced >= 38_400);
-                                let live_busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
-                                if due && !device.is_empty() && (crate::speech::is_audible(&device) || live_busy) {
-                                    seg.checks += 1;
-                                    let _ = seg.checks;
-                                    let (d, dev) = (d.clone(), device.clone());
-                                    let heard = seg.asm.as_ref().and_then(|a| a.heard());
-                                    tokio::spawn(async move {
-                                        if let Some(h) = heard {
-                                            let mut real = false;
-                                            for _ in 0..24 {
-                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                                let text = h.text();
-                                                if text.split_whitespace().count() >= 1 {
-                                                    real = !super::ambient_routes::echo_of_reply(&text, &dev, 0.6);
-                                                    eprintln!("[ambient-speech] interrupt check {dev} real={real} heard={text:?}");
-                                                    break;
-                                                }
-                                            }
-                                            if !real {
-                                                return;
-                                            }
-                                        }
-                                        let spoke = crate::speech::interrupt(&dev);
-                                        if spoke || live_busy {
-                                            super::autonomy::interrupt_mission_control(&d).await;
-                                        }
-                                    });
-                                }
-                            }
-                            if seg.quiet >= QUIET_BYTES && seg.asm.is_some() && !seg.forced && seg.voiced >= 9_600 {
-                                seg.forced = true;
-                                if let Some(a) = seg.asm.as_mut() {
-                                    a.force();
-                                }
-                            }
-                        }
-                    }
+                if super::listener::audio(&device, h, &b[4..]) {
+                    continue;
+                }
+                if let Some(seg) = open.get_mut(&h)
+                    && seg.pcm.len() + b.len() - 4 <= MAX_SEGMENT_PCM
+                {
+                    seg.pcm.extend_from_slice(&b[4..]);
                 }
             }
             Message::Text(t) => {
@@ -173,21 +79,22 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
                             super::ambient_routes::announce(&d, &device, seq, false);
                         }
-                        d.reload_config().await;
-                        let asm = if v.get("live").and_then(|x| x.as_bool()).unwrap_or(false) {
-                            let c = d.config.lock().unwrap();
-                            let key = c.assemblyai_api_key.clone().filter(|k| !k.trim().is_empty());
-                            let mut terms: Vec<String> = c.ambient.wake_phrases.clone();
-                            for extra in ["Snippet", "Mission Control"] {
-                                if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
-                                    terms.push(extra.to_string());
-                                }
-                            }
-                            key.map(|k| super::assembly::begin(&device, k, terms))
-                        } else {
-                            None
+                        open.insert(h, Open { meta: v, pcm: Vec::new() });
+                    }
+                    Some("open") => {
+                        let started = v.get("started_at").and_then(|x| x.as_str()).map(str::to_string);
+                        let reply = match super::listener::open(&d, &device, h, started.as_deref()).await {
+                            Ok(()) => serde_json::json!({"t":"opened","h":h}),
+                            Err(code) => serde_json::json!({"t":"err","h":h,"code":code}),
                         };
-                        open.insert(h, Open { meta: v, pcm: Vec::new(), peak: 0.0, quiet: 0, voiced: 0, checks: 0, asm, forced: false });
+                        let _ = out_tx.send(PhoneFrame::Text(reply.to_string()));
+                    }
+                    Some("close") => {
+                        super::listener::close(&device, Some(h));
+                    }
+                    Some(kind @ ("media" | "play")) => {
+                        let on = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
+                        super::listener::flag(&device, kind, on);
                     }
                     Some("skip") => {
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
@@ -214,30 +121,6 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             seg.pcm.truncate((n as usize) & !1);
                         }
                         
-                        if let Some(ticket) = seg.asm.take() {
-                            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                                let (dd, ident, voiced_bytes) = (d.clone(), id.to_string(), seg.voiced);
-                                let _ = &dd;
-                                let task = tokio::spawn(async move {
-                                    let outcome = ticket.finish().await;
-                                    let permit = super::ambient_routes::gate().acquire_owned().await.ok();
-                                    let result = match outcome {
-                                        Ok(t) if !t.text.trim().is_empty() => {
-                                            crate::ambient::mark(&ident, "assembly");
-                                            Ok(super::transcribe::finish_text(&t.text))
-                                        }
-                                        Ok(_) if voiced_bytes >= 8_000 => {
-                                            Err("AssemblyAI streaming returned empty for voiced segment".into())
-                                        }
-                                        Ok(_) => Ok(super::transcribe::finish_text("")),
-                                        Err(e) => Err(e),
-                                    };
-                                    drop(permit);
-                                    result
-                                });
-                                super::ambient_routes::precomputed().lock().unwrap().insert(id.to_string(), task);
-                            }
-                        }
                         if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
                             super::ambient_routes::mark(id, "end");
                         }
@@ -255,19 +138,6 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         eprintln!("[ambient-stat] {device} {v}");
                     }
                     Some("caps") => {
-                        if !device.is_empty() {
-                            let (key, terms) = {
-                                let c = d.config.lock().unwrap();
-                                let mut terms = c.ambient.wake_phrases.clone();
-                                for extra in ["Snippet", "Mission Control"] {
-                                    if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
-                                        terms.push(extra.to_string());
-                                    }
-                                }
-                                (c.assemblyai_api_key.clone().unwrap_or_default(), terms)
-                            };
-                            super::assembly::prewarm(&device, key, terms);
-                        }
                         if !device.is_empty() && v.get("tts_stream").and_then(|x| x.as_i64()).unwrap_or(0) > 0 {
                             if let Some(old) = phone.take() {
                                 crate::tts_stream::unregister_phone(&device, old);
@@ -296,6 +166,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
     if let Some(id) = phone {
         crate::tts_stream::unregister_phone(&device, id);
     }
+    if !device.is_empty() {
+        super::listener::close(&device, None);
+    }
     drop(out_tx);
     let _ = writer.await;
 }
@@ -314,7 +187,7 @@ async fn finish(d: Shared, device: String, token: Option<String>, seg: Open) -> 
         Ok(q) => q,
         Err(e) => return (400, e.to_string()),
     };
-    let response = super::ambient_routes::ingest(State(d), Query(q), Bytes::from(wav(&seg.pcm))).await;
+    let response = super::ambient_routes::ingest(State(d), Query(q), Bytes::from(super::listener::wav(&seg.pcm))).await;
     let code = response.status().as_u16();
     let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap_or_default();
     let status = serde_json::from_slice::<serde_json::Value>(&body)

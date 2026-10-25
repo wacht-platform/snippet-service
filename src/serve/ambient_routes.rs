@@ -326,7 +326,7 @@ pub(super) fn mark(id: &str, stage: &str) {
     crate::ambient::mark(id, stage);
 }
 
-async fn prune_audio(keep: usize) {
+pub(super) async fn prune_audio(keep: usize) {
     let Ok(mut dir) = tokio::fs::read_dir(audio_dir()).await else { return };
     let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
     while let Ok(Some(entry)) = dir.next_entry().await {
@@ -340,13 +340,6 @@ async fn prune_audio(keep: usize) {
     }
 }
 
-type Early = tokio::task::JoinHandle<Result<super::transcribe::Spoken, String>>;
-
-pub(super) fn precomputed() -> &'static std::sync::Mutex<std::collections::HashMap<String, Early>> {
-    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Early>>> = std::sync::OnceLock::new();
-    MAP.get_or_init(Default::default)
-}
-
 pub(super) fn gate() -> std::sync::Arc<tokio::sync::Semaphore> {
     static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TRANSCRIPTIONS))).clone()
@@ -355,26 +348,9 @@ pub(super) fn gate() -> std::sync::Arc<tokio::sync::Semaphore> {
 fn spawn_transcription(d: Shared, id: String) {
     tokio::spawn(async move {
         let path = audio_path(&id);
-        let early = precomputed().lock().unwrap().remove(&id);
-        let live = match early {
-            Some(handle) => match handle.await {
-                Ok(r) => Some(r),
-                Err(e) => Some(Err(e.to_string())),
-            },
-            None => None,
-        };
-        let result = match live {
-            Some(Ok(done)) => Ok(done),
-            failed => {
-                if let Some(Err(e)) = &failed {
-                    eprintln!("[ambient] live AssemblyAI failed, retrying from the saved audio: {e}");
-                }
-                let permit = gate().acquire_owned().await.ok();
-                let r = super::transcribe::transcribe_ambient(&d, &path).await;
-                drop(permit);
-                r
-            }
-        };
+        let permit = gate().acquire_owned().await.ok();
+        let result = super::transcribe::transcribe_ambient(&d, &path).await;
+        drop(permit);
         mark(&id, "transcribed");
         let (status, text, error) = match result {
             Ok(s) if s.text.is_empty() => ("empty", String::new(), None),
@@ -512,6 +488,10 @@ pub(super) fn echo_match(text: &str, replies: &[String], ratio: f64) -> bool {
 }
 
 pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
+    echo_match(text, &recent_replies(device), ratio)
+}
+
+pub(super) fn recent_replies(device: &str) -> Vec<String> {
     let since = chrono::Utc::now().timestamp() - 180;
     let replies: Vec<String> = crate::ambient::store()
         .ok()
@@ -529,7 +509,7 @@ pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
             .ok()
         })
         .unwrap_or_default();
-    echo_match(text, &replies, ratio)
+    replies
 }
 
 #[derive(Deserialize)]
@@ -556,6 +536,55 @@ pub(crate) async fn activity(
         }
     }
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::Event) {
+    let started_at = chrono::DateTime::from_timestamp_millis((e.started * 1000.0) as i64)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339();
+    if !e.pcm.is_empty() && tokio::fs::create_dir_all(audio_dir()).await.is_ok() {
+        let _ = tokio::fs::write(audio_path(&e.id), super::listener::wav(&e.pcm)).await;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let _ = d.store.with_connection(|c| {
+        c.execute(
+            "INSERT OR IGNORE INTO ambient_events
+                 (id, device, started_at, duration_ms, status, text, created_at, seq, continued, during_playback, routed, media, kept)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, 1, ?10, ?11)",
+            rusqlite::params![
+                e.id,
+                device,
+                started_at,
+                e.duration_ms,
+                e.status,
+                e.text,
+                now,
+                e.seq,
+                e.during_playback as i64,
+                e.media as i64,
+                (e.status == "empty") as i64
+            ],
+        )
+    });
+    eprintln!("[listener] {device} {} {}ms {:?}", e.status, e.duration_ms, e.text);
+    if e.status != "done" {
+        announce(d, device, e.seq, true);
+    } else {
+        super::ambient_router::submit(
+            d,
+            device,
+            super::ambient_router::Msg::Done(super::ambient_router::Part {
+                id: e.id,
+                seq: e.seq,
+                text: e.text,
+                started: e.started,
+                ended: e.started + e.duration_ms as f64 / 1000.0,
+                started_at,
+                continued: false,
+            }),
+        );
+    }
+    prune_audio(40).await;
 }
 
 pub(super) fn announce(d: &Shared, device: &str, seq: i64, skip: bool) {
