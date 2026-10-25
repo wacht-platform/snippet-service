@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::ambient_watch::{self, Verdict};
 
 const HOLD: Duration = Duration::from_millis(1600);
-const FAST_HOLD: Duration = Duration::from_millis(300);
+const FAST_HOLD: Duration = Duration::from_millis(150);
 const ACTIVITY_HOLD: Duration = Duration::from_secs(30);
 const STALL: Duration = Duration::from_millis(2000);
 const WAKE_VETO: Duration = Duration::from_millis(400);
@@ -296,7 +296,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
         let go = match &early {
             Some(v) => decide(live, pinned, v, wake, expecting).0,
-            None => wake || (live && crate::speech::has_interruption()),
+            None => wake || (live && (crate::speech::has_interruption() || super::ambient_routes::assistant_recent(device, 25))),
         };
         if go {
             let v = wake_verdict(early.as_ref());

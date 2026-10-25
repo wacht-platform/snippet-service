@@ -12,12 +12,13 @@ use super::Shared;
 
 const BPS: f64 = 32_000.0;
 const RING: usize = 32_000 * 180;
-const SEND_AT: u64 = 3_200;
+const SEND_AT: u64 = 1_760;
 const MIN_SEND: u64 = 1_760;
 const MAX_SEND: u64 = 24_000;
 const REPLAY: u64 = 32_000 * 10;
 const PAD: u64 = 9_600;
 const IDLE_CLOSE: Duration = Duration::from_secs(60);
+const URGENT: &[&str] = &["stop", "wait", "hold", "pause", "no", "nope", "sorry", "actually", "hang", "snippet", "chief", "enough", "shut", "quiet"];
 const SAMPLE: Duration = Duration::from_millis(250);
 
 enum Cmd {
@@ -112,7 +113,7 @@ fn active_mode() -> bool {
 }
 
 fn silences(active: bool) -> (u32, u32) {
-    if active { (160, 900) } else { (400, 1600) }
+    if active { (160, 900) } else { (260, 1600) }
 }
 
 fn at(marks: &VecDeque<(u64, bool)>, g: u64) -> bool {
@@ -393,9 +394,12 @@ impl Listener {
         let replies = super::ambient_routes::recent_replies(&self.device);
         let mask = echo_mask(&words, &replies);
         let real = words.iter().zip(&mask).filter(|(_, e)| !**e).count();
+        let vocab: std::collections::HashSet<String> = replies.iter().flat_map(|r| r.split_whitespace().map(norm)).collect();
+        let novel = words.iter().zip(&mask).filter(|(w, e)| !**e && !vocab.contains(&w.key)).count();
         let audible = s.audible || s.play_flag;
         let live = s.live.as_mut().unwrap();
-        let barge = !live.interrupted && real >= if ended { 1 } else { 2 } && {
+        let urgent = words.iter().zip(&mask).any(|(w, e)| !*e && URGENT.contains(&w.key.as_str()));
+        let barge = !live.interrupted && ((novel >= 1 && real >= 2) || (urgent && real >= 1) || (ended && novel >= 1)) && {
             let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
             audible || busy
         };
@@ -416,6 +420,7 @@ impl Listener {
         if let Some(last) = words.last() {
             s.last_final = s.last_final.max(last.end);
         }
+        let tail_ms = s.g.saturating_sub(words.last().map(|w| w.end).unwrap_or(s.g)) / 32;
         let (first_g, last_g) = match (words.first(), words.last()) {
             (Some(f), Some(l)) => (f.start, l.end),
             _ => (s.g, s.g),
@@ -455,8 +460,11 @@ impl Listener {
         }
         let started = wall.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
         let duration_ms = ((last_g.saturating_sub(first_g)) as f64 / BPS * 1000.0) as i64;
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::ambient::mark(&id, "end");
+        eprintln!("[listener] {} final after {tail_ms}ms of trailing audio", self.device);
         let event = Event {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             seq,
             status,
             text,
@@ -472,7 +480,8 @@ impl Listener {
 
     fn barge_in(&self, words: &[Heard], mask: &[bool]) {
         let heard: Vec<&str> = words.iter().zip(mask).filter(|(_, e)| !**e).map(|(w, _)| w.text.as_str()).collect();
-        eprintln!("[ambient-speech] barge-in {} heard={:?}", self.device, heard.join(" "));
+        let lag = words.last().map(|w| self.inner.lock().unwrap().g.saturating_sub(w.end) / 32).unwrap_or(0);
+        eprintln!("[ambient-speech] barge-in {} heard={:?} audio_lag={lag}ms", self.device, heard.join(" "));
         let (d, device) = (self.d.clone(), self.device.clone());
         tokio::spawn(async move {
             let spoke = crate::speech::interrupt(&device);
@@ -509,6 +518,35 @@ fn norm(w: &str) -> String {
     w.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
+fn lev(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut prev = row[0];
+        row[0] = i;
+        for j in 1..=b.len() {
+            let cur = row[j];
+            row[j] = (row[j] + 1).min(row[j - 1] + 1).min(prev + usize::from(a[i - 1] != b[j - 1]));
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+fn similar(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (la, lb) = (a.chars().count(), b.chars().count());
+    if la.min(lb) < 3 {
+        return false;
+    }
+    if (a.starts_with(b) || b.starts_with(a)) && la.min(lb) >= 3 {
+        return true;
+    }
+    lev(a, b) <= (la.max(lb) / 4).max(1)
+}
+
 fn echo_mask(words: &[Heard], replies: &[String]) -> Vec<bool> {
     let mut mask = vec![false; words.len()];
     if !words.iter().any(|w| w.playing) {
@@ -516,29 +554,49 @@ fn echo_mask(words: &[Heard], replies: &[String]) -> Vec<bool> {
     }
     for reply in replies {
         let said: Vec<String> = reply.split_whitespace().map(norm).filter(|w| !w.is_empty()).collect();
-        for i in 0..words.len() {
-            let mut best = 0;
+        let mut i = 0;
+        while i < words.len() {
+            let mut best: Option<(usize, usize)> = None;
             for j in 0..said.len() {
-                let mut k = 0;
-                while i + k < words.len() && j + k < said.len() && words[i + k].key == said[j + k] {
-                    k += 1;
+                let (mut k, mut skipped, mut matched, mut last_match) = (0usize, 0usize, 0usize, 0usize);
+                while i + k < words.len() && j + k + skipped < said.len() {
+                    if similar(&words[i + k].key, &said[j + k + skipped]) {
+                        matched += 1;
+                        last_match = k + 1;
+                        k += 1;
+                    } else if skipped < 2 && j + k + skipped + 1 < said.len() && similar(&words[i + k].key, &said[j + k + skipped + 1]) {
+                        skipped += 1;
+                    } else if k + 1 < words.len() - i && matched >= 2 && words[i + k].playing {
+                        k += 1;
+                        if k - last_match > 1 {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
-                best = best.max(k);
+                if last_match > best.map(|b| b.1).unwrap_or(0) {
+                    best = Some((matched, last_match));
+                }
             }
-            let playing = words[i..i + best].iter().filter(|w| w.playing).count();
-            if (best >= 2 || (best == 1 && words.len() == 1)) && playing * 2 >= best.max(1) {
-                mask[i..i + best].iter_mut().for_each(|m| *m = true);
+            match best {
+                Some((matched, len)) if matched >= 2 || (matched == 1 && len == 1 && words.len() == 1 && words[i].playing) => {
+                    let playing = words[i..i + len].iter().filter(|w| w.playing).count();
+                    if playing * 2 >= len {
+                        mask[i..i + len].iter_mut().for_each(|m| *m = true);
+                    }
+                    i += len.max(1);
+                }
+                _ => i += 1,
             }
         }
     }
-    for i in 1..words.len().saturating_sub(1) {
-        if !mask[i] && mask[i - 1] && mask[i + 1] && words[i].playing {
-            mask[i] = true;
-        }
-    }
-    for i in 0..words.len() {
-        if !mask[i] && words[i].key.is_empty() && words[i].playing && (i == 0 || mask[i - 1]) {
-            mask[i] = true;
+    for gap in [1usize, 2] {
+        for i in 1..words.len().saturating_sub(gap) {
+            let end = i + gap;
+            if end < words.len() && mask[i - 1] && mask[end] && (i..end).all(|k| !mask[k] && words[k].playing) {
+                (i..end).for_each(|k| mask[k] = true);
+            }
         }
     }
     mask
@@ -550,7 +608,7 @@ async fn connect(key: &str, terms: &[String], active: bool) -> Result<Ws, String
     let keyterms = serde_json::to_string(terms).map_err(|e| e.to_string())?;
     let (min, max) = silences(active);
     let url = format!(
-        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&mode=balanced&min_turn_silence={min}&max_turn_silence={max}&language_codes={}&keyterms_prompt={}",
+        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&mode=balanced&min_turn_silence={min}&max_turn_silence={max}&interruption_delay=80&language_codes={}&keyterms_prompt={}",
         urlencoding::encode("[\"en\"]"),
         urlencoding::encode(&keyterms)
     );

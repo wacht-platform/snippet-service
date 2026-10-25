@@ -542,9 +542,6 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
     let started_at = chrono::DateTime::from_timestamp_millis((e.started * 1000.0) as i64)
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339();
-    if !e.pcm.is_empty() && tokio::fs::create_dir_all(audio_dir()).await.is_ok() {
-        let _ = tokio::fs::write(audio_path(&e.id), super::listener::wav(&e.pcm)).await;
-    }
     let now = chrono::Utc::now().timestamp();
     let _ = d.store.with_connection(|c| {
         c.execute(
@@ -566,6 +563,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
             ],
         )
     });
+    mark(&e.id, "transcribed");
     eprintln!("[listener] {device} {} {}ms {:?}", e.status, e.duration_ms, e.text);
     if e.status != "done" {
         announce(d, device, e.seq, true);
@@ -574,7 +572,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
             d,
             device,
             super::ambient_router::Msg::Done(super::ambient_router::Part {
-                id: e.id,
+                id: e.id.clone(),
                 seq: e.seq,
                 text: e.text,
                 started: e.started,
@@ -584,7 +582,28 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
             }),
         );
     }
+    if !e.pcm.is_empty() && tokio::fs::create_dir_all(audio_dir()).await.is_ok() {
+        let _ = tokio::fs::write(audio_path(&e.id), super::listener::wav(&e.pcm)).await;
+    }
     prune_audio(40).await;
+}
+
+pub(super) fn assistant_recent(device: &str, secs: i64) -> bool {
+    let since = chrono::Utc::now().timestamp() - secs;
+    crate::ambient::store()
+        .ok()
+        .and_then(|s| {
+            s.with_connection(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM ambient_turns WHERE role = 'assistant' AND device = ?1 AND created_at >= ?2",
+                    rusqlite::params![device, since],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .ok()
+        })
+        .unwrap_or(0)
+        > 0
 }
 
 pub(super) fn announce(d: &Shared, device: &str, seq: i64, skip: bool) {
