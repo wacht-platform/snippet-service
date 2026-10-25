@@ -347,6 +347,16 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             }
                             phone = Some(crate::tts_stream::register_phone(&device, out_tx.clone()));
                         }
+                        if !device.is_empty() {
+                            let warm = {
+                                let c = d.config.lock().unwrap();
+                                let wanted = c.ambient.stt == "flux" || c.ambient.stt_shadow == "flux";
+                                if wanted { super::flux_stt::params(&c) } else { None }
+                            };
+                            if let Some(p) = warm {
+                                super::flux_stt::prewarm(&device, p);
+                            }
+                        }
                     }
                     Some("tts_pos") => {
                         let turn = v.get("turn").and_then(|x| x.as_i64()).unwrap_or(0);

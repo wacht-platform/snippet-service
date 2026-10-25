@@ -41,6 +41,7 @@ mod ambient_router;
 mod ambient_stream;
 mod assembly;
 mod flux_stt;
+pub mod flux_replay_tmp;
 mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;

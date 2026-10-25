@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 const CONNECT_WAIT: Duration = Duration::from_millis(1500);
 const CONNECT_LIMIT: Duration = Duration::from_secs(6);
 const IDLE_CLOSE: Duration = Duration::from_secs(300);
+const PING_EVERY: Duration = Duration::from_secs(20);
 const POS_WAIT: Duration = Duration::from_millis(400);
 const INTERRUPT_WAIT: Duration = Duration::from_millis(1500);
 const POS_FRESH: Duration = Duration::from_secs(1);
@@ -385,8 +386,12 @@ async fn run(session: &Arc<Session>, key: String, mut cmd: mpsc::UnboundedReceiv
     session.changed.notify_waiters();
     let (mut tx, mut rx) = ws.split();
     let mut tick = tokio::time::interval(Duration::from_secs(10));
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                tx.send(Message::Ping(Vec::new().into())).await.map_err(|e| format!("Flux ping failed: {e}"))?;
+            }
             c = cmd.recv() => match c {
                 Some(Cmd::Send(text)) => {
                     tx.send(Message::Text(text.into())).await.map_err(|e| format!("Flux send failed: {e}"))?;
