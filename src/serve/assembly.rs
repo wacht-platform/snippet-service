@@ -28,6 +28,7 @@ enum Cmd {
 #[derive(Clone)]
 struct Turn {
     text: String,
+    words: Vec<crate::stt::Word>,
 }
 
 #[derive(Default)]
@@ -74,12 +75,14 @@ pub(super) fn begin(device: &str, key: String, terms: Vec<String>) -> Ticket {
         }
     };
     let start = session.state.lock().unwrap().next;
-    Ticket { inner: Some(Inner { session, start, sent: 0, buf: Vec::new() }) }
+    let offset = session.flushed.load(Ordering::SeqCst) as f32 / 32_000.0;
+    Ticket { inner: Some(Inner { session, start, offset, sent: 0, buf: Vec::new() }) }
 }
 
 struct Inner {
     session: Arc<Session>,
     start: u64,
+    offset: f32,
     sent: u64,
     buf: Vec<u8>,
 }
@@ -109,12 +112,19 @@ impl Inner {
         let _ = self.session.cmd.send(Cmd::Audio(bytes));
     }
 
-    fn owns(&self, index: Option<u64>) -> bool {
-        index.is_some_and(|i| i >= self.start)
+    fn owns(&self, index: Option<u64>, turn: &Turn, end: f32) -> bool {
+        match (turn.words.first(), turn.words.last()) {
+            (Some(first), Some(last)) => {
+                let mid = (first.start + last.end) / 2.0;
+                mid >= self.offset && mid < end
+            }
+            _ => index.is_some_and(|i| i >= self.start),
+        }
     }
 
     async fn finish(mut self) -> Result<Transcript, String> {
         self.flush();
+        let end = self.offset + self.sent as f32 / 32_000.0;
         let _ = self.session.cmd.send(Cmd::Force);
         let deadline = tokio::time::Instant::now() + FINISH_WAIT;
         let empty_deadline = tokio::time::Instant::now() + EMPTY_WAIT;
@@ -124,7 +134,7 @@ impl Inner {
             notified.as_mut().enable();
             let (have, open, closed, any_partial) = {
                 let s = self.session.state.lock().unwrap();
-                (s.finals.iter().any(|(i, _)| self.owns(Some(*i))), s.partial.as_ref().is_some_and(|_| self.owns(None)), s.closed.clone(), s.partial.as_ref().is_some_and(|_| self.owns(None)))
+                (s.finals.iter().any(|(i, t)| self.owns(Some(*i), t, end)), s.partial.as_ref().is_some_and(|p| self.owns(None, p, end)), s.closed.clone(), s.partial.as_ref().is_some_and(|p| self.owns(None, p, end)))
             };
             if have && !open {
                 break;
@@ -142,8 +152,8 @@ impl Inner {
         }
         let s = self.session.state.lock().unwrap();
         let mut text = String::new();
-        let mut parts: Vec<&Turn> = s.finals.iter().filter(|(i, _)| self.owns(Some(*i))).map(|(_, t)| t).collect();
-        if let Some(p) = s.partial.as_ref().filter(|_| self.owns(None)) {
+        let mut parts: Vec<&Turn> = s.finals.iter().filter(|(i, t)| self.owns(Some(*i), t, end)).map(|(_, t)| t).collect();
+        if let Some(p) = s.partial.as_ref().filter(|p| self.owns(None, p, end)) {
             parts.push(p);
         }
         for turn in parts {
@@ -198,7 +208,22 @@ fn parse_turn(v: &serde_json::Value) -> Option<(bool, Turn)> {
     v.get("turn_order").and_then(|x| x.as_i64())?;
     let text = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
     let ended = v.get("end_of_turn").and_then(|x| x.as_bool()).unwrap_or(false);
-    Some((ended, Turn { text }))
+    let words = v
+        .get("words")
+        .and_then(|x| x.as_array())
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    Some(crate::stt::Word {
+                        text: w.get("text")?.as_str()?.to_string(),
+                        start: w.get("start")?.as_f64()? as f32 / 1000.0,
+                        end: w.get("end")?.as_f64()? as f32 / 1000.0,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((ended, Turn { text, words }))
 }
 
 async fn run(session: &Arc<Session>, key: String, terms: Vec<String>, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
