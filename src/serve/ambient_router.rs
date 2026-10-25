@@ -438,6 +438,12 @@ async fn deliver(
     if let Some(e) = &expecting {
         attrs.push_str(&format!(" expects=\"{}\" matched=\"{:.2}\"", ambient_watch::escape(&e.kind), v.matches));
     }
+    if v.other >= 0.3 {
+        attrs.push_str(&format!(" other_party=\"{:.2}\"", v.other));
+    }
+    if v.played >= 0.3 {
+        attrs.push_str(&format!(" played_audio=\"{:.2}\"", v.played));
+    }
     if v.suggest >= 0.6 {
         attrs.push_str(" suggest=\"conversation\"");
     }

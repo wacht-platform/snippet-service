@@ -7,10 +7,7 @@ pub(crate) struct Verdict {
     pub kind: String,
     pub intent: String,
     pub addressed: f64,
-    pub intent_confidence: f64,
-    pub answers_pending: f64,
     pub matches: f64,
-    pub continues: f64,
     pub suggest: f64,
     pub memorable: f64,
     pub echo: f64,
@@ -24,10 +21,6 @@ impl Verdict {
         !matches!(self.kind.as_str(), "media" | "background" | "noise") && self.intent != "ignore" && self.echo < 0.7
     }
 
-    pub fn for_assistant(&self) -> bool {
-        self.intent == "for_assistant"
-    }
-
     pub fn veto(&self) -> f64 {
         self.echo.max(self.other).max(self.played)
     }
@@ -37,10 +30,7 @@ impl Verdict {
             kind: "conversation".into(),
             intent: "for_assistant".into(),
             addressed: 1.0,
-            intent_confidence: 1.0,
-            answers_pending: 0.0,
             matches: 0.0,
-            continues: 1.0,
             suggest: 0.0,
             memorable: 0.0,
             echo: 0.0,
@@ -50,6 +40,8 @@ impl Verdict {
         }
     }
 }
+
+const POSSESSIVE: &[&str] = &["my", "his", "her", "their", "our", "its"];
 
 const NOUN_LEAD: &[&str] = &[
     "a", "an", "the", "this", "that", "these", "those", "code", "of", "my", "his", "her", "their", "our", "each", "every", "some", "any",
@@ -65,7 +57,8 @@ fn words_of(text: &str) -> Vec<String> {
 }
 
 fn as_call(words: &[String], at: usize, len: usize) -> bool {
-    at == 0 || at + len >= words.len() || !NOUN_LEAD.contains(&words[at - 1].as_str())
+    at == 0
+        || (!POSSESSIVE.contains(&words[at - 1].as_str()) && (at + len >= words.len() || !NOUN_LEAD.contains(&words[at - 1].as_str())))
 }
 
 fn in_call_position(words: &[String], at: usize) -> bool {
@@ -155,7 +148,6 @@ fn rule(text: &str, phrases: &[String]) -> Verdict {
         kind: "unjudged".into(),
         intent: if wake { "for_assistant".into() } else { "unjudged".into() },
         addressed: if wake { 1.0 } else { 0.0 },
-        continues: 0.0,
         judge: "rule",
         ..Verdict::inherited()
     }
@@ -232,10 +224,6 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
         "worth_remembering": {
             "type": "noul",
             "instructions": "`utterance` holds information the assistant should still have in future: a commitment, plan, deadline, decision, fact about the user, their health, family, finances, preferences, or work, or anything they would expect to be remembered. Venting, reactions, filler, jokes, commentary on what is on screen, and small talk are false."
-        },
-        "continues_previous": {
-            "type": "noul",
-            "instructions": "`utterance` continues the last line in `recent`, such as the rest of a sentence or request that was interrupted by a pause."
         },
         "suggest_conversation": {
             "type": "noul",
@@ -396,15 +384,11 @@ pub(super) fn verdict_from(value: &Value) -> Result<Verdict, String> {
     let a = &value["answers"];
     let kind = a["kind"]["choice"].as_str().ok_or("typesafe answer had no kind")?.to_string();
     let noul = |k: &str| a[k]["noul"].as_f64().unwrap_or(0.0);
-    let answers_pending = noul("answers_pending");
     Ok(Verdict {
         kind,
         intent: a["intent"]["choice"].as_str().unwrap_or("note").to_string(),
         addressed: noul("to_assistant"),
-        intent_confidence: a["intent"]["confidence"].as_f64().unwrap_or(1.0),
-        answers_pending,
-        matches: noul("matches_expectation").max(answers_pending),
-        continues: noul("continues_previous"),
+        matches: noul("matches_expectation").max(noul("answers_pending")),
         suggest: noul("suggest_conversation"),
         memorable: noul("worth_remembering"),
         echo: noul("assistant_echo"),
