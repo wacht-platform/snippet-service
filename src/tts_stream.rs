@@ -168,6 +168,7 @@ struct TurnInner {
 
 pub struct StreamTurn {
     pub turn: i64,
+    created: Instant,
     device: String,
     session: Arc<Session>,
     inner: Mutex<TurnInner>,
@@ -342,6 +343,19 @@ pub async fn ready(device: &str) -> Option<Arc<Session>> {
     }
 }
 
+pub fn find_recent(device: &str, text: &str, secs: u64) -> Option<Arc<StreamTurn>> {
+    let want = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if want.is_empty() {
+        return None;
+    }
+    LIVE.lock().unwrap().iter().find(|t| {
+        t.device == device && t.created.elapsed().as_secs() < secs && {
+            let i = t.inner.lock().unwrap();
+            !i.stopped && i.text.split_whitespace().collect::<Vec<_>>().join(" ") == want
+        }
+    }).cloned()
+}
+
 pub fn start_turn(session: &Arc<Session>, device: &str, conversation: &str) -> Result<Arc<StreamTurn>, String> {
     let turn = crate::ambient::record_turn_status(conversation, "assistant", "", device, "speaking")?;
     crate::ambient::note_spoke();
@@ -350,6 +364,7 @@ pub fn start_turn(session: &Arc<Session>, device: &str, conversation: &str) -> R
     let file = std::fs::create_dir_all(&dir).and_then(|_| std::fs::File::create(dir.join("stream.pcm"))).ok();
     let t = Arc::new(StreamTurn {
         turn,
+        created: Instant::now(),
         device: device.to_string(),
         session: session.clone(),
         inner: Mutex::new(TurnInner { file, ..Default::default() }),

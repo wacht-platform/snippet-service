@@ -237,6 +237,7 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
         }
         p
     };
+    eprintln!("[ambient-flux] speak: provisional={} chars={}", flux.as_ref().map(|p| p.turn.turn.to_string()).unwrap_or_else(|| "none".into()), text.chars().count());
     if let Some(p) = flux {
         let sent = p.turn.text();
         if normalise(text).starts_with(&normalise(&sent)) {
@@ -253,6 +254,20 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
                 return Ok(json!({"spoken": true, "turn": p.turn.turn, "queued": true, "streamed": true}));
             }
             say = rest.trim().to_string();
+        } else {
+            let said: Vec<&str> = sent.split_whitespace().collect();
+            let want: Vec<&str> = text.split_whitespace().collect();
+            let common = said.iter().zip(&want).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count();
+            if !p.turn.is_stopped() && !said.is_empty() && common >= said.len().min(3) {
+                eprintln!("[ambient-flux] turn {} reused for a diverging final text (common {common} of {} streamed words)", p.turn.turn, said.len());
+                let extra = want.iter().skip(said.len()).copied().collect::<Vec<_>>().join(" ");
+                if !extra.is_empty() {
+                    p.turn.push(&format!(" {extra}"));
+                }
+                p.turn.flush();
+                finalise_text(p.turn.turn, text);
+                return Ok(json!({"spoken": true, "turn": p.turn.turn, "queued": true, "streamed": true}));
+            }
         }
         p.turn.flush();
     }
@@ -272,6 +287,12 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
             return Ok(json!({"spoken": true, "turn": p.turn, "queued": true, "streamed": true}));
         }
         p.live.close();
+    }
+    if let Some(t) = crate::tts_stream::find_recent(&device, text, 8) {
+        eprintln!("[ambient-flux] turn {} already carries this text, not speaking it twice", t.turn);
+        t.flush();
+        finalise_text(t.turn, text);
+        return Ok(json!({"spoken": true, "turn": t.turn, "queued": true, "streamed": true}));
     }
     *DIRECT.lock().unwrap() = Some((std::time::Instant::now(), normalise(text)));
     let chunks = crate::tts::chunk_text(text);
