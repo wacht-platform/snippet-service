@@ -485,7 +485,7 @@ fn spoken_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
+pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
     let heard = spoken_words(text);
     let mut content: Vec<&String> = heard.iter().filter(|w| !ECHO_STOP.contains(&w.as_str())).collect();
     content.sort();

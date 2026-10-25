@@ -126,8 +126,23 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                     seg.checks += 1;
                                     let _ = seg.checks;
                                     let (d, dev) = (d.clone(), device.clone());
+                                    let heard = seg.asm.as_ref().and_then(|a| a.heard());
                                     tokio::spawn(async move {
-                                        eprintln!("[ambient-speech] interrupt {dev} on voice");
+                                        if let Some(h) = heard {
+                                            let mut real = false;
+                                            for _ in 0..24 {
+                                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                                let text = h.text();
+                                                if text.split_whitespace().count() >= 1 {
+                                                    real = !super::ambient_routes::echo_of_reply(&text, &dev, 0.6);
+                                                    eprintln!("[ambient-speech] interrupt check {dev} real={real} heard={text:?}");
+                                                    break;
+                                                }
+                                            }
+                                            if !real {
+                                                return;
+                                            }
+                                        }
                                         let spoke = crate::speech::interrupt(&dev);
                                         if spoke || live_busy {
                                             super::autonomy::interrupt_mission_control(&d).await;

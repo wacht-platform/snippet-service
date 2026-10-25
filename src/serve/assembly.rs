@@ -352,3 +352,25 @@ pub(super) async fn transcribe_file(key: &str, path: &std::path::Path) -> Result
         }
     }
 }
+
+impl Ticket {
+    pub(super) fn heard(&self) -> Option<Heard> {
+        self.inner.as_ref().map(|i| Heard { session: i.session.clone(), start: i.start })
+    }
+}
+
+pub(super) struct Heard {
+    session: Arc<Session>,
+    start: u64,
+}
+
+impl Heard {
+    pub(super) fn text(&self) -> String {
+        let st = self.session.state.lock().unwrap();
+        let mut out: Vec<String> = st.finals.iter().filter(|(i, _)| *i >= self.start).map(|(_, t)| t.text.clone()).collect();
+        if let Some(p) = &st.partial {
+            out.push(p.text.clone());
+        }
+        out.join(" ").trim().to_string()
+    }
+}
