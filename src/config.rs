@@ -277,6 +277,7 @@ impl Default for SnippetConfig {
 
 pub const AMBIENT_MODES: &[&str] = &["passive", "active"];
 pub const AMBIENT_WATCHERS: &[&str] = &["classifier", "off"];
+pub const AMBIENT_STT: &[&str] = &["assemblyai", "flux"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AmbientConfig {
@@ -296,6 +297,8 @@ pub struct AmbientConfig {
     pub tts_voice: String,
     #[serde(default = "default_deepgram_host", skip_serializing_if = "is_default_deepgram_host")]
     pub deepgram_host: String,
+    #[serde(default = "default_stt", skip_serializing_if = "is_default_stt")]
+    pub stt: String,
 }
 
 impl Eq for AmbientConfig {}
@@ -312,6 +315,14 @@ fn is_default_deepgram_host(h: &String) -> bool {
     *h == default_deepgram_host()
 }
 
+fn default_stt() -> String {
+    "assemblyai".into()
+}
+
+fn is_default_stt(s: &String) -> bool {
+    *s == default_stt()
+}
+
 impl Default for AmbientConfig {
     fn default() -> Self {
         Self {
@@ -323,6 +334,7 @@ impl Default for AmbientConfig {
             wake_phrases: default_wake_phrases(),
             tts_voice: default_tts_voice(),
             deepgram_host: default_deepgram_host(),
+            stt: default_stt(),
         }
     }
 }
@@ -343,6 +355,10 @@ impl AmbientConfig {
         }
         if !AMBIENT_WATCHERS.contains(&self.watcher.as_str()) {
             return Err(format!("voice classifier setting must be one of: {}", AMBIENT_WATCHERS.join(", ")));
+        }
+        self.stt = self.stt.trim().to_ascii_lowercase();
+        if !AMBIENT_STT.contains(&self.stt.as_str()) {
+            return Err(format!("speech recognition must be one of: {}", AMBIENT_STT.join(", ")));
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
         self.wake_phrases = self

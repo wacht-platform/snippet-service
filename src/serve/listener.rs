@@ -30,6 +30,7 @@ enum Cmd {
 
 struct Conn {
     id: u64,
+    flux: bool,
     tx: Option<mpsc::UnboundedSender<Cmd>>,
     base: u64,
     sent: u64,
@@ -62,6 +63,7 @@ struct Inner {
     last_final: u64,
     live: Option<Live>,
     stream: Option<u32>,
+    eager: Option<(u64, i64, usize)>,
 }
 
 pub(super) struct Listener {
@@ -97,16 +99,26 @@ fn next_seq() -> i64 {
     }
 }
 
-fn credentials(d: &Shared) -> Option<(String, Vec<String>)> {
+struct Creds {
+    flux: bool,
+    key: String,
+    terms: Vec<String>,
+    host: String,
+}
+
+fn credentials(d: &Shared) -> Option<Creds> {
     let c = d.config.lock().unwrap();
-    let key = c.assemblyai_api_key.clone().filter(|k| !k.trim().is_empty())?;
+    let flux = c.ambient.stt == "flux";
+    let key = if flux { &c.deepgram_api_key } else { &c.assemblyai_api_key };
+    let key = key.clone().filter(|k| !k.trim().is_empty())?;
     let mut terms = c.ambient.wake_phrases.clone();
     for extra in ["Snippet", "Mission Control"] {
         if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
             terms.push(extra.to_string());
         }
     }
-    Some((key, terms))
+    let host = c.ambient.deepgram_host.trim().to_string();
+    Some(Creds { flux, key, terms, host: if host.is_empty() { "api.deepgram.com".into() } else { host } })
 }
 
 fn active_mode() -> bool {
@@ -115,6 +127,48 @@ fn active_mode() -> bool {
 
 fn silences(active: bool) -> (u32, u32) {
     if active { (100, 500) } else { (200, 1000) }
+}
+
+const FLUX_EAGER: f64 = 0.4;
+
+fn flux_eot(active: bool) -> (f64, u32) {
+    if active { (0.7, 1200) } else { (0.8, 2500) }
+}
+
+fn tuning(flux: bool, active: bool) -> String {
+    if flux {
+        let (eot, timeout) = flux_eot(active);
+        serde_json::json!({"type":"Configure","thresholds":{"eager_eot_threshold":FLUX_EAGER,"eot_threshold":eot,"eot_timeout_ms":timeout}}).to_string()
+    } else {
+        let (min, max) = silences(active);
+        serde_json::json!({"type":"UpdateConfiguration","min_turn_silence":min,"max_turn_silence":max}).to_string()
+    }
+}
+
+fn flux_turn(v: &serde_json::Value) -> Option<serde_json::Value> {
+    let event = v.get("event")?.as_str()?;
+    let event = if event == "EagerEndOfTurn" { "EndOfTurn" } else { event };
+    let words: Vec<serde_json::Value> = v
+        .get("words")
+        .and_then(|w| w.as_array())
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    Some(serde_json::json!({
+                        "text": w.get("word")?.as_str()?,
+                        "start": w.get("start")?.as_f64()? * 1000.0,
+                        "end": w.get("end")?.as_f64()? * 1000.0,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let transcript = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("");
+    let ended = event == "EndOfTurn";
+    if !ended && words.is_empty() && transcript.trim().is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({"turn_order": v.get("turn_index")?, "end_of_turn": ended, "transcript": transcript, "words": words}))
 }
 
 fn at(marks: &VecDeque<(u64, bool)>, g: u64) -> bool {
@@ -210,6 +264,15 @@ pub(super) fn audio(device: &str, h: u32, pcm: &[u8]) -> bool {
     true
 }
 
+pub(super) fn restart_all() {
+    let all: Vec<Arc<Listener>> = hub().lock().unwrap().values().cloned().collect();
+    for l in all {
+        if let Some(c) = l.inner.lock().unwrap().conn.as_mut() {
+            c.tx = None;
+        }
+    }
+}
+
 pub(super) fn close(device: &str, h: Option<u32>) {
     let Some(l) = hub().lock().unwrap().get(device).cloned() else { return };
     if h.is_none() || l.inner.lock().unwrap().stream == h {
@@ -277,10 +340,7 @@ impl Listener {
             && let Some(tx) = c.tx.as_ref()
         {
             c.active = active;
-            let (min, max) = silences(active);
-            let _ = tx.send(Cmd::Config(
-                serde_json::json!({"type":"UpdateConfiguration","min_turn_silence":min,"max_turn_silence":max}).to_string(),
-            ));
+            let _ = tx.send(Cmd::Config(tuning(c.flux, active)));
         }
     }
 
@@ -290,16 +350,17 @@ impl Listener {
         if s.conn.is_some() || s.stream.is_none() || s.retry_at.is_some_and(|t| t > Instant::now()) {
             return;
         }
-        let Some((key, terms)) = credentials(&self.d) else { return };
+        let Some(creds) = credentials(&self.d) else { return };
         let id = IDS.fetch_add(1, Ordering::SeqCst);
         let base = s.pending_from.max(s.ring_start).min(s.g);
         let active = active_mode();
-        s.conn = Some(Conn { id, tx: None, base, sent: base, active });
+        let flux = creds.flux;
+        s.conn = Some(Conn { id, flux, tx: None, base, sent: base, active });
         drop(s);
         let me = self.clone();
         tokio::spawn(async move {
             let (tx, rx) = mpsc::unbounded_channel();
-            let ws = connect(&key, &terms, active).await;
+            let ws = connect(&creds, active).await;
             let ws = match ws {
                 Ok(ws) => {
                     {
@@ -319,7 +380,7 @@ impl Listener {
                     return;
                 }
             };
-            let idle = run(&me, id, ws, rx).await;
+            let idle = run(&me, id, ws, rx, flux).await;
             if let Err(e) = &idle {
                 eprintln!("[listener] {} stream ended: {e}", me.device);
             }
@@ -610,7 +671,11 @@ fn echo_mask(words: &[Heard], replies: &[String]) -> Vec<bool> {
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn connect(key: &str, terms: &[String], active: bool) -> Result<Ws, String> {
+async fn connect(creds: &Creds, active: bool) -> Result<Ws, String> {
+    if creds.flux {
+        return connect_flux(creds, active).await;
+    }
+    let (key, terms) = (&creds.key, &creds.terms);
     let keyterms = serde_json::to_string(terms).map_err(|e| e.to_string())?;
     let (min, max) = silences(active);
     let url = format!(
@@ -627,7 +692,72 @@ async fn connect(key: &str, terms: &[String], active: bool) -> Result<Ws, String
     Ok(ws)
 }
 
-async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
+async fn connect_flux(creds: &Creds, active: bool) -> Result<Ws, String> {
+    let (eot, timeout) = flux_eot(active);
+    let mut url = format!(
+        "wss://{}/v2/listen?model=flux-general-en&encoding=linear16&sample_rate=16000&eager_eot_threshold={FLUX_EAGER}&eot_threshold={eot}&eot_timeout_ms={timeout}",
+        creds.host
+    );
+    for term in &creds.terms {
+        url.push_str("&keyterm=");
+        url.push_str(&urlencoding::encode(term));
+    }
+    let mut request = url.into_client_request().map_err(|e| e.to_string())?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Token {}", creds.key.trim()).parse().map_err(|_| "invalid Deepgram key".to_string())?);
+    let began = Instant::now();
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async(request))
+        .await
+        .map_err(|_| "Deepgram Flux connect timed out".to_string())?
+        .map_err(|e| format!("Deepgram Flux connect failed: {e}"))?;
+    eprintln!("[listener] flux connected to {} in {}ms", creds.host, began.elapsed().as_millis());
+    Ok(ws)
+}
+
+fn on_message(l: &Arc<Listener>, id: u64, flux: bool, v: &serde_json::Value, raw: &str) -> Result<bool, String> {
+    let name = if flux { "Deepgram Flux" } else { "AssemblyAI" };
+    match v.get("type").and_then(|x| x.as_str()) {
+        Some("Turn") if !flux => l.on_turn(id, v),
+        Some("TurnInfo") if flux => {
+            let event = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
+            let index = v.get("turn_index").and_then(|x| x.as_i64()).unwrap_or(-1);
+            let words = v.get("words").and_then(|x| x.as_array()).map_or(0, |w| w.len());
+            let active = l.inner.lock().unwrap().conn.as_ref().is_some_and(|c| c.id == id && c.active);
+            match event {
+                "EagerEndOfTurn" if !active => return Ok(false),
+                "EagerEndOfTurn" => {
+                    crate::tts_stream::prewarm(&l.device);
+                    l.inner.lock().unwrap().eager = Some((id, index, words));
+                }
+                "EndOfTurn" => {
+                    let early = l.inner.lock().unwrap().eager.take();
+                    if early.is_some_and(|(c, t, n)| c == id && t == index && words <= n) {
+                        eprintln!("[listener] {} flux final matches the eager turn, already delivered", l.device);
+                        return Ok(false);
+                    }
+                }
+                _ => {}
+            }
+            if let Some(turn) = flux_turn(v) {
+                l.on_turn(id, &turn);
+            }
+        }
+        Some("Termination") => return Ok(true),
+        Some("ConfigureFailure") | Some("Warning") => eprintln!("[listener] {} {name}: {}", l.device, raw.chars().take(300).collect::<String>()),
+        Some(other) if other.eq_ignore_ascii_case("error") || other == "FatalError" => return Err(format!("{name} error: {raw}")),
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceiver<Cmd>, flux: bool) -> Result<(), String> {
+    let name = if flux { "Deepgram Flux" } else { "AssemblyAI" };
+    let (force, terminate) = if flux {
+        ("{\"type\":\"ForceEndTurn\"}", "{\"type\":\"CloseStream\"}")
+    } else {
+        ("{\"type\":\"ForceEndpoint\"}", "{\"type\":\"Terminate\"}")
+    };
     let (mut tx, mut rx) = ws.split();
     let mut last_audio = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -637,30 +767,27 @@ async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceive
             c = cmd.recv() => match c {
                 Some(Cmd::Audio(b)) => {
                     last_audio = Instant::now();
-                    tx.send(Message::Binary(b.into())).await.map_err(|_| "AssemblyAI connection dropped".to_string())?;
+                    tx.send(Message::Binary(b.into())).await.map_err(|_| format!("{name} connection dropped"))?;
                 }
                 Some(Cmd::Config(text)) => {
                     let _ = tx.send(Message::Text(text.into())).await;
                 }
                 Some(Cmd::Force) => {
-                    let _ = tx.send(Message::Text("{\"type\":\"ForceEndpoint\"}".into())).await;
+                    let _ = tx.send(Message::Text(force.into())).await;
                 }
                 None => break,
             },
             m = rx.next() => match m {
                 Some(Ok(Message::Text(t))) => {
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
-                    match v.get("type").and_then(|x| x.as_str()) {
-                        Some("Turn") => l.on_turn(id, &v),
-                        Some("Termination") => return Err("AssemblyAI ended the session".into()),
-                        Some(other) if other.eq_ignore_ascii_case("error") => return Err(format!("AssemblyAI error: {t}")),
-                        _ => {}
+                    if on_message(l, id, flux, &v, &t)? {
+                        return Err(format!("{name} ended the session"));
                     }
                 }
-                Some(Ok(Message::Close(f))) => return Err(format!("AssemblyAI closed the connection: {f:?}")),
-                None => return Err("AssemblyAI closed the connection".into()),
+                Some(Ok(Message::Close(f))) => return Err(format!("{name} closed the connection: {f:?}")),
+                None => return Err(format!("{name} closed the connection")),
                 Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(format!("AssemblyAI stream error: {e}")),
+                Some(Err(e)) => return Err(format!("{name} stream error: {e}")),
             },
             _ = tick.tick() => {
                 if pinged.elapsed() >= Duration::from_secs(10) {
@@ -675,17 +802,18 @@ async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceive
         }
     }
     l.inner.lock().unwrap().conn.as_mut().filter(|c| c.id == id).map(|c| c.tx = None);
-    let _ = tx.send(Message::Text("{\"type\":\"Terminate\"}".into())).await;
+    let _ = tx.send(Message::Text(terminate.into())).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while let Ok(Some(Ok(m))) = tokio::time::timeout_at(deadline, rx.next()).await {
-        if let Message::Text(t) = m
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&t)
-        {
-            match v.get("type").and_then(|x| x.as_str()) {
-                Some("Turn") => l.on_turn(id, &v),
-                Some("Termination") => break,
-                _ => {}
+        match m {
+            Message::Text(t) => {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+                if !matches!(on_message(l, id, flux, &v, &t), Ok(false)) {
+                    break;
+                }
             }
+            Message::Close(_) => break,
+            _ => {}
         }
     }
     Ok(())

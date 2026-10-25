@@ -53,6 +53,7 @@ pub(crate) struct SettingsReq {
     deepgram_api_key: Option<String>,
     deepgram_host: Option<String>,
     tts_voice: Option<String>,
+    stt: Option<String>,
 }
 
 const DEEPGRAM_HOSTS: &[(&str, &str)] = &[
@@ -129,6 +130,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "deepgram_key_set": c_deepgram_key_set,
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "deepgram_host": ambient.deepgram_host,
+        "stt": ambient.stt,
         "deepgram_hosts": DEEPGRAM_HOSTS.iter().map(|(h, l)| serde_json::json!({"host": h, "label": l})).collect::<Vec<_>>(),
         "tts_voice": if ambient.tts_voice.starts_with("flux-") { ambient.tts_voice.clone() } else { "flux-priya-en".to_string() },
         "tts_voices": FLUX_VOICES.iter().map(|(n, a, g)| serde_json::json!({"model": format!("flux-{n}-en"), "accent": a, "gender": g})).collect::<Vec<_>>(),
@@ -188,6 +190,9 @@ pub(crate) async fn set_settings(
         if let Some(v) = req.wake_phrases {
             ambient.wake_phrases = v;
         }
+        if let Some(v) = req.stt {
+            ambient.stt = v;
+        }
         let mut invalid = None;
         if let Some(v) = req.deepgram_host {
             let v = v.trim().to_ascii_lowercase();
@@ -213,11 +218,22 @@ pub(crate) async fn set_settings(
         let deepgram = next_key(req.deepgram_api_key, &c.deepgram_api_key);
         match invalid.map_or_else(|| ambient.normalized(), Err) {
             Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-            Ok(ambient) if ambient.enabled && !(has_key(&assemblyai) && has_key(&deepgram)) => Err((
+            Ok(ambient) if ambient.enabled && !has_key(&deepgram) => Err((
                 StatusCode::BAD_REQUEST,
-                "Add the AssemblyAI and Deepgram keys in Settings → Voice before turning ambient listening on".into(),
+                "Add the Deepgram key in Settings → Voice before turning ambient listening on".into(),
+            )),
+            Ok(ambient) if ambient.enabled && ambient.stt == "assemblyai" && !has_key(&assemblyai) => Err((
+                StatusCode::BAD_REQUEST,
+                "Add the AssemblyAI key in Settings → Voice, or switch speech recognition to Deepgram Flux".into(),
             )),
             Ok(ambient) => {
+                let restart = ambient.stt != c.ambient.stt
+                    || ambient.deepgram_host != c.ambient.deepgram_host
+                    || assemblyai != c.assemblyai_api_key
+                    || deepgram != c.deepgram_api_key;
+                if restart {
+                    super::listener::restart_all();
+                }
                 c.ambient = ambient;
                 c.assemblyai_api_key = assemblyai;
                 c.deepgram_api_key = deepgram;
