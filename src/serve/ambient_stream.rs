@@ -108,13 +108,14 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                     if seg.pcm.len() + b.len() - 4 <= MAX_SEGMENT_PCM {
                         let body = &b[4..];
                         seg.pcm.extend_from_slice(body);
+                        let level = rms(body);
+                        seg.peak = seg.peak.max(level);
+                        let is_quiet = body.len() <= 2048 && quiet(level, seg.peak);
                         if let Some(a) = seg.asm.as_mut() {
-                            a.push(body);
+                            a.push(body, !is_quiet);
                         }
                         if body.len() <= 2048 {
-                            let level = rms(body);
-                            seg.peak = seg.peak.max(level);
-                            if quiet(level, seg.peak) {
+                            if is_quiet {
                                 seg.quiet += body.len();
                             } else {
                                 seg.quiet = 0;
@@ -150,12 +151,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                     });
                                 }
                             }
-                            if seg.quiet >= QUIET_BYTES && seg.asm.is_some() && !seg.forced && seg.pcm.len() >= 16_000 {
-                                seg.forced = true;
-                                if let Some(a) = seg.asm.as_mut() {
-                                    a.force();
-                                }
-                            }
+                            let _ = QUIET_BYTES;
                         }
                     }
                 }
@@ -215,7 +211,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         
                         if let Some(ticket) = seg.asm.take() {
                             if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                                let (dd, ident) = (d.clone(), id.to_string());
+                                let (dd, ident, voiced_bytes) = (d.clone(), id.to_string(), seg.voiced);
                                 let _ = &dd;
                                 let task = tokio::spawn(async move {
                                     let outcome = ticket.finish().await;
@@ -224,6 +220,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                                         Ok(t) if !t.text.trim().is_empty() => {
                                             crate::ambient::mark(&ident, "assembly");
                                             Ok(super::transcribe::finish_text(&t.text))
+                                        }
+                                        Ok(_) if voiced_bytes >= 8_000 => {
+                                            Err("AssemblyAI streaming returned empty for voiced segment".into())
                                         }
                                         Ok(_) => Ok(super::transcribe::finish_text("")),
                                         Err(e) => Err(e),
