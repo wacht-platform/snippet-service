@@ -402,10 +402,17 @@ impl CodingHarness {
         lane_rx: &mut mpsc::UnboundedReceiver<LaneResult>,
         progress_rx: &mut mpsc::UnboundedReceiver<crate::lanes::LaneProgress>,
         watch_rx: &mut mpsc::UnboundedReceiver<WatchEvent>,
+        after_interrupt: &mut Vec<LoopInput>,
     ) -> (bool, bool) {
         let mut interrupted = false;
         let mut wants_compact = false;
         while let Ok(input) = input_rx.try_recv() {
+            if interrupted {
+                if !matches!(input, LoopInput::Interrupt) {
+                    after_interrupt.push(input);
+                }
+                continue;
+            }
             if matches!(input, LoopInput::Compact) {
                 wants_compact = true;
                 continue;
@@ -458,104 +465,6 @@ impl CodingHarness {
             }
             _ => true,
         });
-    }
-
-    /// Apply any inputs buffered during a step when the run is interrupted.
-    ///
-    /// When a step is interrupted (e.g. user stops inference), the in-flight assistant
-    /// turn is closed. Any messages sent by the user during or right before stopping —
-    /// such as sending a held queued message immediately via `SteerQueued`, or a
-    /// mid-run `UserMessage`/`Answer`, or queueing a message — must not be discarded.
-    /// They are folded into the transcript and persistent state so that the user's
-    /// sent words survive and are preserved across interrupts.
-    pub(super) fn apply_interrupted_pending(
-        &self,
-        state: &mut HarnessState,
-        pending: &mut Vec<LoopInput>,
-    ) {
-        // First pass: register any newly queued inputs so subsequent SteerQueued/Unqueue
-        // commands in the same batch can resolve them by ID.
-        for input in pending.iter_mut() {
-            if let LoopInput::Queue(item) = input {
-                queue_held(state, item.clone());
-                item.text.clear();
-            }
-        }
-
-        // Second pass: apply all remaining inputs (steers, user messages, unqueue, notices, mode/title/goal).
-        for input in std::mem::take(pending) {
-            match input {
-                LoopInput::Notice(event) => {
-                    self.record_notice(state, event);
-                }
-                LoopInput::Queue(item) => {
-                    queue_held(state, item);
-                }
-                LoopInput::Unqueue(id) => {
-                    take_queued(state, &id);
-                }
-                LoopInput::DropQueued => {
-                    state.queued_inputs.clear();
-                }
-                LoopInput::SteerQueued(id) => {
-                    if let Some(text) = take_queued(state, &id) {
-                        state.messages.push(HarnessMessage::User {
-                            content: steer_message(&text),
-                        });
-                        state.events.push(HarnessEvent::Steer { text });
-                        self.bump_activity();
-                    }
-                }
-                LoopInput::UserMessage(text) => {
-                    let text = text.trim().to_string();
-                    if !text.is_empty() {
-                        state.messages.push(HarnessMessage::User {
-                            content: steer_message(&text),
-                        });
-                        state.events.push(HarnessEvent::Steer { text });
-                        self.bump_activity();
-                    }
-                }
-                LoopInput::Answer(text) => {
-                    let text = text.trim().to_string();
-                    if !text.is_empty() {
-                        state.messages.push(HarnessMessage::User {
-                            content: format!("[answer]\n{text}"),
-                        });
-                        state.events.push(HarnessEvent::UserInput { text });
-                        self.bump_activity();
-                    }
-                }
-                LoopInput::SetMode(mode) => {
-                    state.approval_mode = mode;
-                }
-                LoopInput::SetTitle(title) => {
-                    let t = title.trim();
-                    state.title = if t.is_empty() {
-                        None
-                    } else {
-                        Some(t.to_string())
-                    };
-                }
-                LoopInput::SetGoal(text) => {
-                    self.begin_goal(state, text);
-                }
-                LoopInput::ResumeGoal => {
-                    self.resume_goal(state);
-                }
-                LoopInput::CancelGoal => {
-                    self.end_goal(state);
-                }
-                LoopInput::Rewind { checkpoint } => {
-                    let _ = state.apply_checkpoint_rewind(&checkpoint);
-                }
-                LoopInput::Compact
-                | LoopInput::Interrupt
-                | LoopInput::Approve
-                | LoopInput::ApproveAll
-                | LoopInput::Deny => {}
-            }
-        }
     }
 
     /// Apply one queued input while a run is active: a message/answer becomes a

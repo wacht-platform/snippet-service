@@ -379,7 +379,7 @@ impl Tool for Speak {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "speak".into(),
-            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: one to three short plain sentences, no markdown, no lists, nothing the user would need to read. It fails when nobody is listening or ambient is passive; in passive reply in the chat, or call ambient_mode with active first.".into(),
+            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: short conversational sentences, usually one or two, no markdown, no lists, nothing the user would need to read. A speak that sets expecting to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening or ambient is passive; in passive reply in the chat, or call ambient_mode with active first.".into(),
             input_schema: schema(json!({
                 "text": {"type": "string", "description": "What to say, in plain spoken sentences."},
                 "expecting": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation", "none"], "description": "Set this when you are asking something: it tells the voice classifier a short reply is meant for you."},

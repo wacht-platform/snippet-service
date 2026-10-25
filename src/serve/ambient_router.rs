@@ -471,8 +471,8 @@ async fn deliver(
     }
     let ctx = context(d, device, &ids);
     let envelope = format!("<ambient_turn{attrs}>{ctx}{}</ambient_turn>", ambient_watch::escape(&rendered));
-    if mode == "active" && super::autonomy::interrupt_mission_control(d).await {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    if mode == "active" {
+        super::autonomy::interrupt_mission_control(d).await;
     }
     crate::tts::prewarm();
     super::autonomy::deliver_to_mission_control(d, envelope).await;
