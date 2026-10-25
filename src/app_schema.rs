@@ -123,14 +123,6 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              text TEXT NOT NULL,
              PRIMARY KEY (turn_id, seq)
          );
-         CREATE TABLE IF NOT EXISTS speakers (
-             id INTEGER PRIMARY KEY AUTOINCREMENT,
-             label TEXT NOT NULL DEFAULT '',
-             is_user INTEGER NOT NULL DEFAULT 0,
-             centroid BLOB NOT NULL,
-             lines INTEGER NOT NULL DEFAULT 0,
-             last_seen INTEGER NOT NULL DEFAULT 0
-         );
 "#,
     )?;
     let have: Vec<String> = {
@@ -151,11 +143,15 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
         ("routed", "ALTER TABLE ambient_events ADD COLUMN routed INTEGER NOT NULL DEFAULT 1"),
         ("delivered", "ALTER TABLE ambient_events ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0"),
         ("turn_key", "ALTER TABLE ambient_events ADD COLUMN turn_key TEXT"),
-        ("speakers", "ALTER TABLE ambient_events ADD COLUMN speakers TEXT"),
-        ("speaker_summary", "ALTER TABLE ambient_events ADD COLUMN speaker_summary TEXT"),
     ] {
         if !have.iter().any(|c| c == name) {
             connection.execute(ddl, [])?;
+        }
+    }
+    connection.execute("DROP TABLE IF EXISTS speakers", [])?;
+    for column in ["speakers", "speaker_summary"] {
+        if have.iter().any(|c| c == column) {
+            connection.execute(&format!("ALTER TABLE ambient_events DROP COLUMN {column}"), [])?;
         }
     }
     let have_turns: Vec<String> = {
