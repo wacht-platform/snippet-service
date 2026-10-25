@@ -582,7 +582,7 @@ fn start_session_with_role(
         let harness = CodingHarness::new(
             HarnessConfig {
                 system_prompt: runtime.prompt,
-                state_path: Some(sp),
+                state_path: Some(sp.clone()),
                 resume,
                 exa_api_key: exa_api_key.clone(),
                 context_window_tokens,
@@ -598,10 +598,20 @@ fn start_session_with_role(
             runtime.context,
         );
         if let Some(profile) = cli_profile {
-            return harness
+            let result = harness
                 .run_cli_agent(profile, initial, rx, runtime.factory, stream)
                 .await
                 .map_err(|e| e.to_string());
+            if let Err(error) = &result
+                && let Some(mut state) = read_session_state(&sp)
+            {
+                state.status = crate::harness::HarnessStatus::Failed;
+                state.events.push(crate::harness::HarnessEvent::ModelError {
+                    message: format!("CLI driver stopped: {error}"),
+                });
+                let _ = write_session_state(&sp, &state);
+            }
+            return result;
         }
         harness
             .run_interactive(&mut model, initial, rx, runtime.factory, stream)

@@ -1024,7 +1024,11 @@ impl CodingHarness {
             let mut tail = String::new();
             if let Some(stderr) = stderr {
                 let mut err_reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = err_reader.next_line().await {
+                while let Ok(Some(line)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), err_reader.next_line())
+                        .await
+                        .unwrap_or(Ok(None))
+                {
                     tail.push_str(&line);
                     tail.push('\n');
                     if tail.len() > 4000 {
@@ -1722,7 +1726,7 @@ impl CodingHarness {
                         }
                         CliLine::Exited(g, stderr) if g == generation => {
                             process = None;
-                            if state.status == HarnessStatus::Running {
+                            if matches!(state.status, HarnessStatus::Running | HarnessStatus::WaitingForInput) {
                                 let message = if stderr.is_empty() {
                                     format!("{} exited before finishing the turn", kind.label())
                                 } else {
