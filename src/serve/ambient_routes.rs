@@ -49,6 +49,39 @@ pub(crate) struct SettingsReq {
     typesafe_api_key: Option<String>,
     conversation_timeout_secs: Option<u32>,
     wake_phrases: Option<Vec<String>>,
+    assemblyai_api_key: Option<String>,
+    deepgram_api_key: Option<String>,
+    deepgram_host: Option<String>,
+    tts_voice: Option<String>,
+}
+
+const DEEPGRAM_HOSTS: &[(&str, &str)] = &[
+    ("api.deepgram.com", "Global (US)"),
+    ("api.in.deepgram.com", "India"),
+    ("api.eu.deepgram.com", "Europe"),
+    ("api.au.deepgram.com", "Australia"),
+];
+
+const FLUX_VOICES: &[(&str, &str, &str)] = &[
+    ("hannah", "American", "Female"), ("kit", "British", "Male"), ("alexis", "American", "Female"),
+    ("cliff", "American", "Male"), ("sienna", "American", "Female"), ("cole", "American", "Male"),
+    ("brooke", "American", "Female"), ("colin", "British", "Male"), ("gemma", "British", "Female"),
+    ("haley", "American", "Female"), ("heather", "American", "Female"), ("miles", "American", "Male"),
+    ("sean", "British", "Male"), ("bree", "American", "Female"), ("brittany", "American", "Female"),
+    ("bruce", "American", "Male"), ("conor", "British", "Male"), ("donovan", "American", "Male"),
+    ("drew", "American", "Male"), ("elise", "American", "Female"), ("jack", "British", "Male"),
+    ("kai", "Singaporean", "Male"), ("kelsey", "American", "Female"), ("maeve", "Irish", "Female"),
+    ("marcelo", "Filipino", "Male"), ("marcus", "American", "Male"), ("meena", "Indian", "Female"),
+    ("meghan", "American", "Female"), ("naveen", "Indian", "Male"), ("paige", "American", "Female"),
+    ("priya", "Indian", "Female"), ("rufus", "British", "Male"), ("sharon", "Australian", "Female"),
+    ("tanner", "British", "Male"), ("wade", "American", "Male"), ("wes", "American", "Male"),
+];
+
+fn valid_voice(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('-').collect();
+    parts.len() == 3
+        && parts[0] == "flux"
+        && parts[1..].iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
 }
 
 fn settings_view(d: &Daemon) -> serde_json::Value {
@@ -95,6 +128,10 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "assemblyai_key_set": c_assembly_key_set,
         "deepgram_key_set": c_deepgram_key_set,
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
+        "deepgram_host": ambient.deepgram_host,
+        "deepgram_hosts": DEEPGRAM_HOSTS.iter().map(|(h, l)| serde_json::json!({"host": h, "label": l})).collect::<Vec<_>>(),
+        "tts_voice": if ambient.tts_voice.starts_with("flux-") { ambient.tts_voice.clone() } else { "flux-priya-en".to_string() },
+        "tts_voices": FLUX_VOICES.iter().map(|(n, a, g)| serde_json::json!({"model": format!("flux-{n}-en"), "accent": a, "gender": g})).collect::<Vec<_>>(),
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
         "conversation": crate::ambient::conversation().map(|c| serde_json::json!({
@@ -151,14 +188,39 @@ pub(crate) async fn set_settings(
         if let Some(v) = req.wake_phrases {
             ambient.wake_phrases = v;
         }
-        match ambient.normalized() {
+        let mut invalid = None;
+        if let Some(v) = req.deepgram_host {
+            let v = v.trim().to_ascii_lowercase();
+            if DEEPGRAM_HOSTS.iter().any(|(h, _)| *h == v) {
+                ambient.deepgram_host = v;
+            } else {
+                invalid = Some(format!("Unknown Deepgram region {v}"));
+            }
+        }
+        if let Some(v) = req.tts_voice {
+            let v = v.trim().to_ascii_lowercase();
+            if valid_voice(&v) {
+                ambient.tts_voice = v;
+            } else {
+                invalid = Some(format!("Unknown voice {v}"));
+            }
+        }
+        let next_key = |value: Option<String>, current: &Option<String>| match value {
+            Some(key) => Some(key.trim().to_string()).filter(|k| !k.is_empty()),
+            None => current.clone(),
+        };
+        let assemblyai = next_key(req.assemblyai_api_key, &c.assemblyai_api_key);
+        let deepgram = next_key(req.deepgram_api_key, &c.deepgram_api_key);
+        match invalid.map_or_else(|| ambient.normalized(), Err) {
             Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-            Ok(ambient) if ambient.enabled && !(has_key(&c.assemblyai_api_key) && has_key(&c.deepgram_api_key)) => Err((
+            Ok(ambient) if ambient.enabled && !(has_key(&assemblyai) && has_key(&deepgram)) => Err((
                 StatusCode::BAD_REQUEST,
-                "Set assemblyai_api_key and deepgram_api_key in the server config before turning ambient listening on".into(),
+                "Add the AssemblyAI and Deepgram keys in Settings → Voice before turning ambient listening on".into(),
             )),
             Ok(ambient) => {
                 c.ambient = ambient;
+                c.assemblyai_api_key = assemblyai;
+                c.deepgram_api_key = deepgram;
                 if let Some(key) = req.typesafe_api_key {
                     let key = key.trim().to_string();
                     c.typesafe_api_key = (!key.is_empty()).then_some(key);
