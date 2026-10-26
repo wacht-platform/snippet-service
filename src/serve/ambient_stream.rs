@@ -96,11 +96,6 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         let on = v.get("on").and_then(|x| x.as_bool()).unwrap_or(false);
                         super::listener::flag(&device, kind, on);
                     }
-                    Some("skip") => {
-                        if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
-                            super::ambient_routes::announce(&d, &device, seq, true);
-                        }
-                    }
                     Some("abort") => {
                         open.remove(&h);
                     }
@@ -112,15 +107,9 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         if let Some(ms) = v.get("duration_ms") {
                             seg.meta["duration_ms"] = ms.clone();
                         }
-                        for key in ["media", "during_playback"] {
-                            if let Some(m) = v.get(key) {
-                                seg.meta[key] = m.clone();
-                            }
-                        }
                         if let Some(n) = v.get("bytes").and_then(|x| x.as_u64()) {
                             seg.pcm.truncate((n as usize) & !1);
                         }
-                        
                         if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
                             super::ambient_routes::mark(id, "end");
                         }
