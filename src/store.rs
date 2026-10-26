@@ -135,6 +135,12 @@ impl Store {
         Ok(f(&connection)?)
     }
 
+    pub fn write<T>(&self, f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>) {
+        if let Err(e) = self.with_connection(f) {
+            eprintln!("[store] write failed: {e}");
+        }
+    }
+
 }
 
 fn configure(connection: &Connection) -> Result<(), rusqlite::Error> {

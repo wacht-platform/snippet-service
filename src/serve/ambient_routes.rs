@@ -79,10 +79,9 @@ const FLUX_VOICES: &[(&str, &str, &str)] = &[
 ];
 
 fn valid_voice(v: &str) -> bool {
-    let parts: Vec<&str> = v.split('-').collect();
-    parts.len() == 3
-        && parts[0] == "flux"
-        && parts[1..].iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
+    v.strip_prefix("flux-")
+        .and_then(|rest| rest.strip_suffix("-en"))
+        .is_some_and(|name| FLUX_VOICES.iter().any(|(n, _, _)| *n == name))
 }
 
 fn settings_view(d: &Daemon) -> serde_json::Value {
@@ -116,6 +115,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
             Ok(rows)
         })
         .unwrap_or_default();
+    let listening = lease_holder();
     serde_json::json!({
         "enabled": ambient.enabled,
         "mode": ambient.mode,
@@ -141,8 +141,8 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
             "opened_by": c.opened_by,
             "seconds_left": c.seconds_left(),
         })),
-        "listening_id": lease_holder().map(|(d, _)| d),
-        "listening_device": lease_holder().map(|(_, l)| l),
+        "listening_id": listening.as_ref().map(|(id, _)| id),
+        "listening_device": listening.as_ref().map(|(_, label)| label),
     })
 }
 
@@ -270,10 +270,6 @@ pub(crate) struct IngestQuery {
     #[serde(default)]
     continued: bool,
     #[serde(default)]
-    during_playback: bool,
-    #[serde(default)]
-    media: bool,
-    #[serde(default)]
     backlog: bool,
 }
 
@@ -372,8 +368,8 @@ pub(crate) async fn ingest(
     let inserted = d.store.with_connection(|c| {
         c.execute(
             "INSERT OR IGNORE INTO ambient_events
-                 (id, device, started_at, duration_ms, status, created_at, seq, continued, during_playback, routed, media)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, device, started_at, duration_ms, status, created_at, seq, continued, routed)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 q.id,
                 q.device,
@@ -382,9 +378,7 @@ pub(crate) async fn ingest(
                 now,
                 q.seq,
                 q.continued as i64,
-                q.during_playback as i64,
-                !q.backlog as i64,
-                q.media as i64
+                !q.backlog as i64
             ],
         )
     });
@@ -435,7 +429,7 @@ fn spawn_transcription(d: Shared, id: String) {
             Ok(s) => ("done", s.text, None),
             Err(e) => ("failed", String::new(), Some(e)),
         };
-        let _ = d.store.with_connection(|c| {
+        d.store.write(|c| {
             c.execute(
                 "UPDATE ambient_events SET status = ?2, text = ?3, error = ?4,
                      kept = CASE WHEN ?2 = 'done' THEN 0 ELSE 1 END WHERE id = ?1",
@@ -446,18 +440,18 @@ fn spawn_transcription(d: Shared, id: String) {
         if status != "failed" {
             prune_audio(40).await;
         }
-        let row: Option<(String, Option<i64>, String, i64, i64, i64, i64)> = d
+        let row: Option<(String, Option<i64>, String, i64, i64, i64)> = d
             .store
             .with_connection(|c| {
                 c.query_row(
-                    "SELECT device, seq, started_at, duration_ms, continued, during_playback, routed
+                    "SELECT device, seq, started_at, duration_ms, continued, routed
                      FROM ambient_events WHERE id = ?1",
                     [&id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )
             })
             .ok();
-        let Some((device, seq, started_at, duration_ms, continued, during_playback, routed)) = row else {
+        let Some((device, seq, started_at, duration_ms, continued, routed)) = row else {
             return;
         };
         let seq = seq.unwrap_or(-1);
@@ -465,29 +459,16 @@ fn spawn_transcription(d: Shared, id: String) {
             super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));
             return;
         }
-        let spoke_then = during_playback != 0 || assistant_was_speaking(&device, &started_at, duration_ms);
-        if spoke_then && echo_of_reply(&text, &device, if during_playback != 0 { 0.6 } else { 0.8 }) {
-            let _ = d.store.with_connection(|c| {
+        if assistant_was_speaking(&device, &started_at, duration_ms) && echo_of_reply(&text, &device, 0.8) {
+            d.store.write(|c| {
                 c.execute("UPDATE ambient_events SET status = 'echo', kept = 0 WHERE id = ?1", [&id])?;
                 Ok(())
             });
             super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));
             return;
         }
-        let media: i64 = d
-            .store
-            .with_connection(|c| c.query_row("SELECT media FROM ambient_events WHERE id = ?1", [&id], |r| r.get(0)))
-            .unwrap_or(0);
-        if media != 0 {
-            let _ = d.store.with_connection(|c| {
-                c.execute("UPDATE ambient_events SET status = 'media', kept = 0 WHERE id = ?1", [&id])?;
-                Ok(())
-            });
-            super::ambient_router::submit(&d, &device, super::ambient_router::Msg::Skip(seq));
-            return;
-        }
         if routed == 0 {
-            let _ = d.store.with_connection(|c| {
+            d.store.write(|c| {
                 c.execute("UPDATE ambient_events SET kept = 1 WHERE id = ?1", [&id])?;
                 c.execute(
                     "INSERT INTO ambient_events_fts(rowid, text) SELECT rowid, text FROM ambient_events WHERE id = ?1",
@@ -621,7 +602,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
         .unwrap_or_else(chrono::Utc::now)
         .to_rfc3339();
     let now = chrono::Utc::now().timestamp();
-    let _ = d.store.with_connection(|c| {
+    d.store.write(|c| {
         c.execute(
             "INSERT OR IGNORE INTO ambient_events
                  (id, device, started_at, duration_ms, status, text, created_at, seq, continued, during_playback, routed, media, kept)
@@ -686,12 +667,12 @@ pub(crate) fn resume(d: Shared) {
         })
         .unwrap_or_default();
     let stale = chrono::Utc::now().timestamp() - 60;
-    let _ = d.store.with_connection(|c| c.execute("UPDATE ambient_events SET routed = 0 WHERE status = 'pending' AND created_at < ?1", [stale]));
+    d.store.write(|c| c.execute("UPDATE ambient_events SET routed = 0 WHERE status = 'pending' AND created_at < ?1", [stale]));
     for id in pending {
         if audio_path(&id).exists() {
             spawn_transcription(d.clone(), id);
         } else {
-            let _ = d.store.with_connection(|c| {
+            d.store.write(|c| {
                 c.execute(
                     "UPDATE ambient_events SET status = 'failed', error = 'audio file missing' WHERE id = ?1",
                     [&id],

@@ -62,6 +62,12 @@ struct Flushed {
     delivered: bool,
 }
 
+impl Flushed {
+    fn new(ids: Vec<String>, parts: &[Part], delivered: bool) -> Self {
+        Self { ids, ended: parts.last().map(|p| p.ended).unwrap_or(0.0), at: Instant::now(), delivered }
+    }
+}
+
 static ROUTERS: Mutex<Option<HashMap<String, mpsc::UnboundedSender<Msg>>>> = Mutex::new(None);
 
 pub(crate) fn submit(d: &Shared, device: &str, msg: Msg) {
@@ -223,7 +229,7 @@ async fn accept(
 fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
     let kept = v.kept();
     for id in ids {
-        let _ = d.store.with_connection(|c| {
+        d.store.write(|c| {
             c.execute(
                 "UPDATE ambient_events SET verdict = ?2, addressed = ?3, judge = ?4, kept = ?5, intent = ?6, delivered = ?7
                  WHERE id = ?1",
@@ -290,23 +296,16 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let mut delivered = false;
     let mut early: Option<Verdict> = None;
     if fast && routable {
-        if wake {
-            let v = wake_verdict(None);
+        if !wake {
+            early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
+        }
+        let go = wake || early.as_ref().is_some_and(|v| decide(live, pinned, v, wake, expecting).0);
+        if go {
+            let v = wake_verdict(early.as_ref());
             deliver(d, device, &parts, &v, wake, None, !live).await;
             delivered = true;
             if !live && !pinned {
                 crate::ambient::open_conversation(device, ttl);
-            }
-        } else {
-            early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
-            let go = early.as_ref().is_some_and(|v| decide(live, pinned, v, wake, expecting).0);
-            if go {
-                let v = wake_verdict(early.as_ref());
-                deliver(d, device, &parts, &v, wake, None, !live).await;
-                delivered = true;
-                if !live && !pinned {
-                    crate::ambient::open_conversation(device, ttl);
-                }
             }
         }
     }
@@ -315,7 +314,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         tokio::spawn(async move {
             let v = task.await.unwrap_or_else(|_| Verdict::inherited());
             mark_verdict(&d3, &ids3, &v, true);
-            if !wake && !pinned && (!v.kept() || v.other >= 0.7 || matches!(v.intent.as_str(), "meeting" | "ignore") || matches!(v.kind.as_str(), "background" | "media" | "noise")) {
+            if !wake && !pinned && is_unrelated(&v) {
                 crate::ambient::end_conversation();
                 let _ = crate::speech::interrupt(&dev3);
                 if super::autonomy::interrupt_mission_control(&d3).await {
@@ -323,12 +322,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
                 }
             }
         });
-        *last = Some(Flushed {
-            ids,
-            ended: parts.last().map(|p| p.ended).unwrap_or(0.0),
-            at: Instant::now(),
-            delivered,
-        });
+        *last = Some(Flushed::new(ids, &parts, delivered));
         return;
     }
     let verdict = match early {
@@ -350,36 +344,43 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
                 note_out_of_context_reset(device);
             }
         } else if live {
-            let ooc = verdict.out_of_context >= 0.55
-                || verdict.other >= 0.55
-                || matches!(verdict.intent.as_str(), "meeting" | "note")
-                || matches!(verdict.kind.as_str(), "background" | "media");
-            if ooc {
-                let (streak, samples) = note_out_of_context(device, &text, &verdict);
-                if streak == 2 && !super::autonomy::mission_control_busy() {
-                    let msg = format!(
-                        "<ambient_context_alert device=\"{}\" streak=\"{streak}\">The voice classifier blocked {streak} consecutive spoken turns as out of context or directed at someone else:\n{}\nConfirm without disturbing the user: stay silent and either call schedule_wake with in_seconds: 10 (unless_user_speaks: true) to check if they say anything else for you, or call ambient_mode with passive if they have moved on to another conversation.</ambient_context_alert>",
-                        ambient_watch::escape(device),
-                        samples.join("\n")
-                    );
-                    super::autonomy::deliver_to_mission_control(d, msg).await;
-                } else if !pinned && (streak >= 3 || verdict.other >= 0.75 || matches!(verdict.intent.as_str(), "meeting") || matches!(verdict.kind.as_str(), "background" | "media")) {
-                    crate::ambient::end_conversation();
-                    note_out_of_context_reset(device);
-                }
-            }
+            handle_out_of_context(d, device, &text, &verdict, pinned).await;
         }
     }
     if !delivered && verdict.kept() && verdict.memorable >= MEMORABLE_THRESHOLD {
         super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &text, false).await;
     }
     mark_verdict(d, &ids, &verdict, delivered);
-    *last = Some(Flushed {
-        ids,
-        ended: parts.last().map(|p| p.ended).unwrap_or(0.0),
-        at: Instant::now(),
-        delivered,
-    });
+    *last = Some(Flushed::new(ids, &parts, delivered));
+}
+
+fn is_unrelated(v: &Verdict) -> bool {
+    !v.kept()
+        || v.other >= 0.7
+        || matches!(v.intent.as_str(), "meeting" | "ignore")
+        || matches!(v.kind.as_str(), "background" | "media" | "noise")
+}
+
+async fn handle_out_of_context(d: &Shared, device: &str, text: &str, verdict: &Verdict, pinned: bool) {
+    let out_of_context = verdict.out_of_context >= 0.55
+        || verdict.other >= 0.55
+        || matches!(verdict.intent.as_str(), "meeting" | "note")
+        || matches!(verdict.kind.as_str(), "background" | "media");
+    if !out_of_context {
+        return;
+    }
+    let (streak, samples) = note_out_of_context(device, text, verdict);
+    if streak == 2 && !super::autonomy::mission_control_busy() {
+        let msg = format!(
+            "<ambient_context_alert device=\"{}\" streak=\"{streak}\">The voice classifier blocked {streak} consecutive spoken turns as out of context or directed at someone else:\n{}\nConfirm without disturbing the user: stay silent and either call schedule_wake with in_seconds: 10 (unless_user_speaks: true) to check if they say anything else for you, or call ambient_mode with passive if they have moved on to another conversation.</ambient_context_alert>",
+            ambient_watch::escape(device),
+            samples.join("\n")
+        );
+        super::autonomy::deliver_to_mission_control(d, msg).await;
+    } else if !pinned && (streak >= 3 || verdict.other >= 0.75 || matches!(verdict.intent.as_str(), "meeting") || matches!(verdict.kind.as_str(), "background" | "media")) {
+        crate::ambient::end_conversation();
+        note_out_of_context_reset(device);
+    }
 }
 
 fn wake_verdict(early: Option<&Verdict>) -> Verdict {
@@ -529,7 +530,7 @@ async fn deliver(
     crate::tts::prewarm();
     super::autonomy::deliver_to_mission_control(d, envelope).await;
     for id in &ids {
-        let _ = d.store.with_connection(|c| {
+        d.store.write(|c| {
             c.execute("UPDATE ambient_events SET delivered = 1 WHERE id = ?1", [id])?;
             Ok(())
         });

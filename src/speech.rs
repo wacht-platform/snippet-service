@@ -171,7 +171,7 @@ fn emit(value: Value) {
 
 fn set_status(turn: i64, status: &str) {
     if let Ok(store) = crate::ambient::store() {
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute("UPDATE ambient_turns SET status = ?2 WHERE id = ?1", rusqlite::params![turn, status])?;
             Ok(())
         });
@@ -216,7 +216,7 @@ fn create_job(device: &str, conversation: &str) -> Result<(Arc<Live>, i64, Arc<A
 
 fn finalise_text(turn: i64, text: &str) {
     if let Ok(store) = crate::ambient::store() {
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute("UPDATE ambient_turns SET text = ?2 WHERE id = ?1", rusqlite::params![turn, text])?;
             Ok(())
         });
@@ -370,7 +370,7 @@ async fn run_job(job: Job) {
                     break;
                 }
                 if let Ok(store) = crate::ambient::store() {
-                    let _ = store.with_connection(|c| {
+                    store.write(|c| {
                         c.execute(
                             "INSERT OR REPLACE INTO ambient_chunks (turn_id, seq, ms, text) VALUES (?1, ?2, ?3, ?4)",
                             rusqlite::params![job.turn, seq, ms, text],
@@ -402,7 +402,7 @@ async fn run_job(job: Job) {
     let cancelled = job.cancel.load(Ordering::SeqCst);
     if let Ok(store) = crate::ambient::store() {
         let status = if failed { "failed" } else if cancelled { "cancelled" } else { "synthesised" };
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute(
                 "UPDATE ambient_turns SET ended = 1, chunk_count = ?2,
                      status = CASE WHEN status IN ('interrupted', 'played', 'missed') THEN status ELSE ?3 END
@@ -495,7 +495,7 @@ pub fn interrupt(device: &str) -> bool {
     cancel_all("interrupted");
     if let Ok(store) = crate::ambient::store() {
         for turn in &open {
-            let _ = store.with_connection(|c| {
+            store.write(|c| {
                 c.execute(
                     "UPDATE ambient_turns SET status = 'interrupted' WHERE id = ?1 AND status NOT IN ('played', 'missed', 'interrupted', 'cancelled')",
                     [turn],
@@ -513,7 +513,7 @@ pub fn interrupt(device: &str) -> bool {
             .unwrap_or(-1);
         let text = heard(*turn, through, 0);
         if let Ok(store) = crate::ambient::store() {
-            let _ = store.with_connection(|c| {
+            store.write(|c| {
                 c.execute(
                     "UPDATE ambient_turns SET status = 'interrupted', heard_text = ?2 WHERE id = ?1 AND status NOT IN ('played', 'missed')",
                     rusqlite::params![turn, text],
@@ -548,7 +548,7 @@ pub fn cancel_all(reason: &str) {
             .unwrap_or(-1);
         let text = heard(turn, through, 0);
         if let Ok(store) = crate::ambient::store() {
-            let _ = store.with_connection(|c| {
+            store.write(|c| {
                 c.execute(
                     "UPDATE ambient_turns SET status = 'cancelled', heard_text = ?2 WHERE id = ?1 AND status NOT IN ('played', 'missed')",
                     rusqlite::params![turn, text],
@@ -563,7 +563,7 @@ pub fn cancel_all(reason: &str) {
 pub fn played(turn: i64, seq: Option<i64>, complete: bool, ttl_secs: u32) {
     if let Ok(store) = crate::ambient::store() {
         let now = chrono::Utc::now().timestamp();
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             if let Some(seq) = seq {
                 c.execute(
                     "UPDATE ambient_turns SET played_through = MAX(played_through, ?2) WHERE id = ?1",
@@ -609,7 +609,7 @@ pub fn barge(turn: i64, seq: i64, played_ms: i64) {
         return;
     }
     if let Ok(store) = crate::ambient::store() {
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute(
                 "UPDATE ambient_turns SET status = 'interrupted', heard_text = ?2,
                      played_through = MAX(played_through, ?3) WHERE id = ?1",

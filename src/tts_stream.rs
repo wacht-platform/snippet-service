@@ -123,7 +123,7 @@ pub fn report_pos(device: &str, turn: i64, ms: i64, done: bool) {
 fn mark_played(t: &StreamTurn) {
     if let Ok(store) = crate::ambient::store() {
         let now = chrono::Utc::now().timestamp();
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute(
                 "UPDATE ambient_turns SET status = 'played', played_at = ?2, heard_text = text WHERE id = ?1 AND status = 'speaking'",
                 rusqlite::params![t.turn, now],
@@ -135,7 +135,7 @@ fn mark_played(t: &StreamTurn) {
 
 fn set_status(turn: i64, status: &str) {
     if let Ok(store) = crate::ambient::store() {
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute("UPDATE ambient_turns SET status = ?2 WHERE id = ?1 AND status = 'speaking'", rusqlite::params![turn, status])?;
             Ok(())
         });
@@ -526,7 +526,7 @@ fn finish_turn(t: &StreamTurn, ms: i64) {
         (i.stopped, i.text.clone())
     };
     if let Ok(store) = crate::ambient::store() {
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute(
                 "INSERT OR REPLACE INTO ambient_chunks (turn_id, seq, ms, text) VALUES (?1, 0, ?2, ?3)",
                 rusqlite::params![t.turn, ms, text.trim()],
@@ -623,7 +623,7 @@ fn heard_estimate(t: &StreamTurn, played: Option<i64>) -> String {
 
 fn write_heard(turn: i64, status: &str, heard: &str) {
     if let Ok(store) = crate::ambient::store() {
-        let _ = store.with_connection(|c| {
+        store.write(|c| {
             c.execute(
                 "UPDATE ambient_turns SET status = ?2, heard_text = ?3 WHERE id = ?1 AND status IN ('speaking', 'interrupted', 'cancelled')",
                 rusqlite::params![turn, status, heard],
