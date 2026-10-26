@@ -94,7 +94,7 @@ impl Default for HarnessConfig {
             system_prompt: coding_system_prompt(),
             state_path: None,
             resume: false,
-            max_consecutive_recovery: 8,
+            max_consecutive_recovery: 3,
             recovery_base_ms: 1_000,
             recovery_max_ms: 30_000,
             exa_api_key: None,
