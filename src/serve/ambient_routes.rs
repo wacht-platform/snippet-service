@@ -511,6 +511,7 @@ fn spawn_transcription(d: Shared, id: String) {
                 ended: started + duration_ms as f64 / 1000.0,
                 started_at,
                 continued: continued != 0,
+                during_playback: false,
             }),
         );
     });
@@ -657,6 +658,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
                 ended: e.started + e.duration_ms as f64 / 1000.0,
                 started_at,
                 continued: false,
+                during_playback: e.during_playback,
             }),
         );
     }

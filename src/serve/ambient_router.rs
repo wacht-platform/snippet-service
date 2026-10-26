@@ -47,6 +47,7 @@ pub(crate) struct Part {
     pub ended: f64,
     pub started_at: String,
     pub continued: bool,
+    pub during_playback: bool,
 }
 
 pub(crate) enum Msg {
@@ -211,9 +212,12 @@ async fn accept(
         flush(d, device, parts, crate::ambient::conversation().is_some(), last, pending.take()).await;
     }
     turn.push(part);
-    let fast_interrupt = crate::speech::has_interruption();
+    let words: Vec<&str> = turn.iter().flat_map(|p| p.text.split_whitespace()).collect();
+    let during_playback = turn.iter().any(|p| p.during_playback);
+    let needs_classifier = !wake && (words.len() <= 2 || during_playback);
+    let fast_interrupt = crate::speech::has_interruption() && !needs_classifier;
     let live = crate::ambient::conversation().is_some();
-    if wake || fast_interrupt || (live && super::ambient_routes::assistant_recent(device, 25)) {
+    if wake || fast_interrupt || (live && !needs_classifier && super::ambient_routes::assistant_recent(device, 25)) {
         let parts = std::mem::take(turn);
         *deadline = None;
         flush(d, device, parts, true, last, pending.take()).await;
@@ -291,10 +295,13 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await })
         }
     };
+    let words_count = text.split_whitespace().count();
+    let during_playback = parts.iter().any(|p| p.during_playback);
+    let needs_classifier = !wake && (words_count <= 2 || during_playback);
     let mut delivered = false;
     let mut early: Option<Verdict> = None;
     if fast && routable {
-        let speculative_go = wake || (live && (crate::speech::has_interruption() || super::ambient_routes::assistant_recent(device, 25)));
+        let speculative_go = wake || (live && !needs_classifier && (crate::speech::has_interruption() || super::ambient_routes::assistant_recent(device, 25)));
         if speculative_go {
             let v = wake_verdict(None);
             deliver(d, device, &parts, &v, wake, None, ttl, !live).await;
@@ -319,10 +326,18 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         }
     }
     if delivered && early.is_none() {
-        let (d3, ids3) = (d.clone(), ids.clone());
+        let (d3, ids3, dev3) = (d.clone(), ids.clone(), device.to_string());
         tokio::spawn(async move {
             let v = task.await.unwrap_or_else(|_| Verdict::inherited());
             mark_verdict(&d3, &ids3, &v, true);
+            if !wake && !pinned && (!v.kept() || v.other >= 0.7 || matches!(v.intent.as_str(), "meeting" | "ignore") || matches!(v.kind.as_str(), "background" | "media" | "noise")) {
+                eprintln!("[ambient-router] speculative turn on {dev3} classified as unrelated ({}/{}, other={:.2}); cancelling and closing conversation", v.kind, v.intent, v.other);
+                crate::ambient::end_conversation();
+                let _ = crate::speech::interrupt(&dev3);
+                if super::autonomy::interrupt_mission_control(&d3).await {
+                    super::autonomy::resume_unless_heard(d3);
+                }
+            }
         });
         *last = Some(Flushed {
             ids,
@@ -347,6 +362,9 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             }
             deliver(d, device, &parts, &verdict, wake, None, ttl, false).await;
             delivered = true;
+        } else if live && !pinned && (verdict.other >= 0.65 || matches!(verdict.intent.as_str(), "meeting") || matches!(verdict.kind.as_str(), "background" | "media")) {
+            eprintln!("[ambient-router] background/other-party conversation detected on {device} ({}/{}, other={:.2}); closing active conversation", verdict.kind, verdict.intent, verdict.other);
+            crate::ambient::end_conversation();
         }
     }
     if !delivered && verdict.kept() && verdict.memorable >= MEMORABLE_THRESHOLD {

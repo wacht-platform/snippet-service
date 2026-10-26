@@ -180,22 +180,23 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
                 ],
                 "false": [
                     "Thinking aloud, an exclamation, a filler sound, or a remark about the speaker's own activity that asks nothing of anyone",
-                    "Clearly part of an exchange with someone else shown in `recent`",
+                    "A stray 1-2 word fragment heard while `assistant.speaking_when_utterance_was_heard` is true that is not a stop/wait command or a direct answer to a question in `assistant.last_said`",
+                    "Clearly part of an exchange with someone else shown in `recent`, or third-person chatter ('he asked...', 'they said...', 'you guys')",
                     "Uses the word snippet for a thing, such as a code snippet, instead of calling the assistant"
                 ]
             }
         },
         "assistant_echo": {
             "type": "noul",
-            "instructions": "Is `utterance` the assistant's own voice: a repeat, possibly misheard or cut short, of words in `assistant.last_said`?",
+            "instructions": "Is `utterance` the assistant's own voice: a repeat, possibly misheard, phonetically similar (e.g. 'Duo' heard as 'Two'), or cut short, of words in `assistant.last_said`?",
             "criteria": {
-                "true": "Most words of `utterance` appear in `assistant.last_said` in the same order and it adds nothing of its own",
+                "true": "Most words of `utterance` appear in or sound like words in `assistant.last_said` (especially when `assistant.speaking_when_utterance_was_heard` is true) and it adds nothing of its own",
                 "false": "Answers, picks an option, confirms or corrects by repeating a few of the assistant's words, adds new words, or `assistant.last_said` is empty"
             }
         },
         "other_party": {
             "type": "noul",
-            "instructions": "Is `utterance` part of a conversation with someone other than the assistant: a person in the room, someone on a phone call, a caller or automated phone agent, or another voice assistant?"
+            "instructions": "Is `utterance` part of a conversation with someone other than the assistant: a person or background actors in the room, someone on a phone call, third-person remarks about the user ('he asked...', 'tell him...'), a caller or automated phone agent, or another voice assistant?"
         },
         "played_audio": {
             "type": "noul",
@@ -437,6 +438,9 @@ pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Ve
     if verdict.matches >= 0.7 && verdict.kind != "media" {
         verdict.intent = "for_assistant".into();
         verdict.addressed = verdict.addressed.max(0.85);
+    }
+    if matches!(verdict.intent.as_str(), "meeting" | "note") || matches!(verdict.kind.as_str(), "background" | "media") {
+        verdict.other = verdict.other.max(0.75);
     }
     if verdict.addressed >= 0.5 && verdict.veto() < 0.5 && verdict.kind == "conversation" {
         verdict.intent = "for_assistant".into();

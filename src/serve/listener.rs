@@ -462,12 +462,18 @@ impl Listener {
         let replies = super::ambient_routes::recent_replies(&self.device);
         let mask = echo_mask(&words, &replies);
         let real = words.iter().zip(&mask).filter(|(_, e)| !**e).count();
-        let vocab: std::collections::HashSet<String> = replies.iter().flat_map(|r| r.split_whitespace().map(norm)).collect();
-        let novel = words.iter().zip(&mask).filter(|(w, e)| !**e && !vocab.contains(&w.key)).count();
+        let vocab: Vec<String> = replies.iter().flat_map(|r| r.split_whitespace().map(norm)).filter(|w| !w.is_empty()).collect();
+        let novel = words.iter().zip(&mask).filter(|(w, e)| !**e && !vocab.iter().any(|v| similar(&w.key, v))).count();
         let audible = s.audible || s.play_flag;
         let live = s.live.as_mut().unwrap();
         let urgent = words.iter().zip(&mask).any(|(w, e)| !*e && URGENT.contains(&w.key.as_str()));
-        let barge = !live.interrupted && ((novel >= 1 && real >= 2) || (urgent && real >= 1) || (ended && novel >= 1)) && {
+        let no_hw_aec = self.device.starts_with("macos-") || self.device.starts_with("linux-") || self.device.starts_with("windows-");
+        let barge_ready = if audible && no_hw_aec {
+            urgent && real >= 1
+        } else {
+            (novel >= 1 && real >= 2) || (urgent && real >= 1)
+        };
+        let barge = !live.interrupted && barge_ready && {
             let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
             audible || busy
         };
@@ -507,9 +513,10 @@ impl Listener {
         if barge {
             self.barge_in(&words, &mask);
         }
-        let echo_all = !words.is_empty() && real == 0;
-        let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
+        let filtered = words.len().saturating_sub(real);
         let during_playback = words.iter().any(|w| w.playing);
+        let echo_all = !words.is_empty() && (real == 0 || (during_playback && filtered >= 2 && real == 1 && !urgent));
+        let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
         let text = if words.is_empty() || real == words.len() {
             if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }
         } else {
@@ -609,11 +616,45 @@ fn lev(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+fn phonetic(w: &str) -> String {
+    let s = w
+        .replace("duo", "to")
+        .replace("two", "to")
+        .replace("too", "to")
+        .replace("ch", "k")
+        .replace("th", "t")
+        .replace("ph", "f")
+        .replace("gh", "g");
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        let mapped = match c {
+            'd' => 't',
+            'b' => 'p',
+            'g' | 'c' | 'q' | 'x' => 'k',
+            'z' => 's',
+            'v' => 'f',
+            'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'w' | 'h' if i > 0 => continue,
+            other => other,
+        };
+        if out.chars().last() != Some(mapped) {
+            out.push(mapped);
+        }
+    }
+    out
+}
+
 fn similar(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
     let (la, lb) = (a.chars().count(), b.chars().count());
+    if la.min(lb) < 2 {
+        return false;
+    }
+    let (pa, pb) = (phonetic(a), phonetic(b));
+    if !pa.is_empty() && (pa == pb || (pa.len().min(pb.len()) >= 3 && (pa.starts_with(&pb) || pb.starts_with(&pa)))) {
+        return true;
+    }
     if la.min(lb) < 3 {
         return false;
     }
