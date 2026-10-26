@@ -430,6 +430,7 @@ impl Listener {
 
     fn on_turn(&self, conn: u64, v: &serde_json::Value) {
         let Some(order) = v.get("turn_order").and_then(|x| x.as_i64()) else { return };
+        super::autonomy::note_heard();
         let ended = v.get("end_of_turn").and_then(|x| x.as_bool()).unwrap_or(false);
         let transcript = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
         let mut s = self.inner.lock().unwrap();
@@ -562,7 +563,7 @@ impl Listener {
                 return;
             }
             if super::autonomy::interrupt_mission_control(&d).await {
-                super::autonomy::note_barge();
+                super::autonomy::resume_unless_heard(d);
             }
         });
     }
@@ -745,7 +746,12 @@ fn on_message(l: &Arc<Listener>, id: u64, flux: bool, v: &serde_json::Value, raw
                     }
                     s.delivered = Some((id, index, words));
                 }
-                _ => {}
+                _ => {
+                    let s = l.inner.lock().unwrap();
+                    if s.delivered.is_some_and(|(c, t, n)| c == id && t == index && words <= n) {
+                        return Ok(false);
+                    }
+                }
             }
             if let Some(turn) = flux_turn(v) {
                 l.on_turn(id, &turn);

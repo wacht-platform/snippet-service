@@ -67,7 +67,7 @@ pub(super) fn human_at() -> Option<chrono::DateTime<chrono::Utc>> {
 }
 
 static MC_INPUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static BARGED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+static HEARD_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 pub(super) fn mission_control_inputs() -> u64 {
     MC_INPUTS.load(std::sync::atomic::Ordering::SeqCst)
@@ -77,24 +77,35 @@ pub(super) fn note_input() {
     MC_INPUTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-pub(super) fn note_barge() {
-    *BARGED.lock().unwrap() = Some(std::time::Instant::now());
+pub(super) fn note_heard() {
+    *HEARD_AT.lock().unwrap() = Some(std::time::Instant::now());
 }
 
-pub(super) async fn heard_after_barge(daemon: &Shared, delivered: bool) {
-    let barged = BARGED.lock().unwrap().take();
-    if delivered || barged.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(20)) {
-        return;
-    }
-    if mission_control_busy() {
-        return;
-    }
-    eprintln!("[ambient-speech] barge-in was not speech for Mission Control; resuming it");
-    deliver_to_mission_control(
-        daemon,
-        "<ambient_resume>Background sound cut you off, not Chief. Pick up where you left off without mentioning it.</ambient_resume>".to_string(),
-    )
-    .await;
+pub(super) fn resume_unless_heard(daemon: Shared) {
+    use std::time::{Duration, Instant};
+    let sent = mission_control_inputs();
+    let started = Instant::now();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if mission_control_inputs() != sent {
+                return;
+            }
+            let quiet = HEARD_AT.lock().unwrap().is_none_or(|t| t.elapsed() >= Duration::from_millis(2500));
+            if quiet || started.elapsed() >= Duration::from_secs(60) {
+                break;
+            }
+        }
+        if mission_control_busy() {
+            return;
+        }
+        eprintln!("[ambient-speech] no new turn followed the barge-in; resuming Mission Control");
+        deliver_to_mission_control(
+            &daemon,
+            "<ambient_resume>Something cut you off but no new request followed. Carry on: answer Chief's latest turn or continue what you were doing, without mentioning the interruption.</ambient_resume>".to_string(),
+        )
+        .await;
+    });
 }
 
 pub(super) async fn deliver_to_mission_control(daemon: &Shared, text: String) {
