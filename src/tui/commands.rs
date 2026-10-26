@@ -197,29 +197,18 @@ impl App {
 
     /// Close the login form, optionally restoring the pre-login config (Esc).
 
-    pub(crate) fn conversations_dir(&self) -> PathBuf {
-        let parent = self
-            .options
-            .config
-            .state_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let dir = parent.join("conversations");
-        let _ = std::fs::create_dir_all(&dir);
-        dir
-    }
-
-    /// The state path a picker entry names.
+    /// The state path a picker entry names, from its name alone.
     ///
-    /// `default` is the workspace-root state; anything else is a saved
-    /// conversation under `conversations/`. THE one mapping — `switch_conversation`
-    /// and the delete/rename paths all need it, and a drift between them would
-    /// mutate a different session than the one the user selected.
+    /// `default` is the workspace's own session; anything else is a conversation
+    /// under it. A session id is its path below the workspaces root, so the
+    /// conversation has to sit inside the workspace directory: anywhere else maps
+    /// to an id the store has never heard of, and the TUI starts a new session.
+    /// Entries that come from the picker carry their real id and use that instead.
     pub(crate) fn state_path_for_conversation(&self, name: &str) -> PathBuf {
         if name == "default" {
             self.options.config.state_path.clone()
         } else {
-            self.conversations_dir().join(format!("{name}.json"))
+            self.options.config.state_path.join("conversations").join(name)
         }
     }
 
@@ -468,7 +457,7 @@ impl App {
         if c.folder != self.options.config.workspace {
             self.options.config = self.options.config.for_workspace(c.folder.clone());
         }
-        self.resume_conversation(&c.name);
+        self.resume_conversation(c);
     }
 
     /// Start a new session. In a git repository the new-session screen asks
@@ -727,6 +716,11 @@ impl App {
     }
 
     pub(crate) fn switch_conversation(&mut self, name: &str) {
+        let path = self.state_path_for_conversation(name);
+        self.switch_conversation_at(name, path);
+    }
+
+    pub(crate) fn switch_conversation_at(&mut self, name: &str, state_path: PathBuf) {
         // Tear down any resident agent SYNCHRONOUSLY. The interactive loop
         // idle-blocks on input and never exits on its own, so a mere async
         // Interrupt would still leave the task "alive" when the next spawn_loop
@@ -747,7 +741,7 @@ impl App {
 
         // Update active_conversation and active_state_path
         self.active_conversation = name.to_string();
-        self.active_state_path = self.state_path_for_conversation(name);
+        self.active_state_path = state_path;
 
         // Force a fresh state read for the new session's file.
         self.last_state_stamp = None;

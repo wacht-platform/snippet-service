@@ -244,7 +244,7 @@ pub fn write_forked_conversation_in(
     let conv_dir = if parent.file_name().and_then(|s| s.to_str()) == Some("conversations") {
         parent.to_path_buf()
     } else {
-        parent.join("conversations")
+        source_state_path.join("conversations")
     };
 
     let name = uuid::Uuid::new_v4().to_string();
