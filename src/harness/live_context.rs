@@ -213,6 +213,7 @@ fn render_lanes(state: &HarnessState) -> String {
         let status = match l.status {
             LaneStatus::Completed => "completed",
             LaneStatus::Failed => "failed",
+            LaneStatus::Paused => "paused",
             LaneStatus::Cancelled => "cancelled",
             LaneStatus::Running => unreachable!("filtered above"),
         };

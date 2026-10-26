@@ -643,6 +643,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
     });
     mark(&e.id, "transcribed");
     eprintln!("[listener] {device} {} {}ms {:?}", e.status, e.duration_ms, e.text);
+    super::autonomy::heard_after_barge(d, e.status == "done").await;
     if e.status != "done" {
         announce(d, device, e.seq, true);
     } else {

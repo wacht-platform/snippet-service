@@ -63,7 +63,7 @@ struct Inner {
     last_final: u64,
     live: Option<Live>,
     stream: Option<u32>,
-    eager: Option<(u64, i64, usize)>,
+    delivered: Option<(u64, i64, usize)>,
 }
 
 pub(super) struct Listener {
@@ -550,11 +550,19 @@ impl Listener {
         let lag = words.last().map(|w| self.inner.lock().unwrap().g.saturating_sub(w.end) / 32).unwrap_or(0);
         eprintln!("[ambient-speech] barge-in {} heard={:?} audio_lag={lag}ms", self.device, heard.join(" "));
         let (d, device) = (self.d.clone(), self.device.clone());
+        let sent = super::autonomy::mission_control_inputs();
         tokio::spawn(async move {
             let spoke = crate::speech::interrupt(&device);
             let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
-            if spoke || busy {
-                super::autonomy::interrupt_mission_control(&d).await;
+            if !(spoke || busy) {
+                return;
+            }
+            if super::autonomy::mission_control_inputs() != sent {
+                eprintln!("[ambient-speech] barge-in {device} skipped: a newer turn already reached Mission Control");
+                return;
+            }
+            if super::autonomy::interrupt_mission_control(&d).await {
+                super::autonomy::note_barge();
             }
         });
     }
@@ -726,16 +734,16 @@ fn on_message(l: &Arc<Listener>, id: u64, flux: bool, v: &serde_json::Value, raw
             let active = l.inner.lock().unwrap().conn.as_ref().is_some_and(|c| c.id == id && c.active);
             match event {
                 "EagerEndOfTurn" if !active => return Ok(false),
-                "EagerEndOfTurn" => {
-                    crate::tts_stream::prewarm(&l.device);
-                    l.inner.lock().unwrap().eager = Some((id, index, words));
-                }
-                "EndOfTurn" => {
-                    let early = l.inner.lock().unwrap().eager.take();
-                    if early.is_some_and(|(c, t, n)| c == id && t == index && words <= n) {
-                        eprintln!("[listener] {} flux final matches the eager turn, already delivered", l.device);
+                "EagerEndOfTurn" | "EndOfTurn" => {
+                    if event == "EagerEndOfTurn" {
+                        crate::tts_stream::prewarm(&l.device);
+                    }
+                    let mut s = l.inner.lock().unwrap();
+                    if s.delivered.is_some_and(|(c, t, n)| c == id && t == index && words <= n) {
+                        eprintln!("[listener] {} flux {event} adds nothing to turn {index}, already delivered", l.device);
                         return Ok(false);
                     }
+                    s.delivered = Some((id, index, words));
                 }
                 _ => {}
             }

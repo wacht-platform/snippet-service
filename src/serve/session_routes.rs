@@ -393,6 +393,53 @@ pub(crate) async fn delete_session(
 }
 
 #[derive(Deserialize)]
+pub(crate) struct InterruptReq {
+    session: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+pub(crate) async fn interrupt_session(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<InterruptReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    let Some(sp) = state_path_for_id(&req.session) else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    let live = d
+        .sessions
+        .lock()
+        .await
+        .get(&req.session)
+        .is_some_and(|s| !s.join.is_finished());
+    let status = crate::session::read_session_state(&sp).map(|s| s.status);
+    let working = matches!(
+        status,
+        Some(crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)
+    );
+    if !live || !working {
+        return Json(serde_json::json!({"stopped": false, "status": status, "note": "the session isn't running"}))
+            .into_response();
+    }
+    d.deliver(&req.session, LoopInput::Interrupt).await;
+    if let Some(reason) = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        d.deliver(
+            &req.session,
+            LoopInput::Notice(crate::harness::HarnessEvent::SystemDecision {
+                step: "stopped_by_mission_control".to_string(),
+                reasoning: format!("Stopped by Mission Control: {reason}"),
+            }),
+        )
+        .await;
+    }
+    Json(serde_json::json!({"stopped": true, "was": status})).into_response()
+}
+
+#[derive(Deserialize)]
 pub(crate) struct RenameReq {
     session: String,
     title: String,

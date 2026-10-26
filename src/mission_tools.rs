@@ -71,6 +71,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
     registry.insert(CleanUpSessions);
+    registry.insert(StopSession);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
     registry.insert(Speak);
@@ -1753,6 +1754,51 @@ impl Tool for CleanUpSessions {
             }
         }
         Ok(ToolResult::success(json!({"deleted": deleted, "refused": refused})))
+    }
+}
+
+pub struct StopSession;
+#[async_trait]
+impl Tool for StopSession {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "stop_session".into(),
+            description: "Stop a session that is working: its current run ends the way the stop button ends it, keeping everything done so far, and the session waits for its next message. Use it when a session is stuck in a loop, burning time on the wrong thing, or the user asks you to stop it. Give a short reason; it's recorded in that session's transcript. A task the session holds stays on the board, so cancel, retry or reassign it separately. To restart the session, message it (send_agent_message to session:<id>).".into(),
+            input_schema: schema(
+                json!({
+                    "session_id": {"type": "string", "description": "exactly as list_sessions shows it"},
+                    "reason": {"type": "string", "description": "one line on why, shown in that session"}
+                }),
+                &["session_id", "reason"],
+            ),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let id = arguments.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        let reason = arguments.get("reason").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        if id.is_empty() || reason.is_empty() {
+            return Err(ToolError::msg("stop_session needs session_id and reason"));
+        }
+        if id == crate::mission_control::SESSION_ID {
+            return Err(ToolError::msg("that's your own session; end your turn instead"));
+        }
+        let info = crate::serve::sidecar::read_daemon_info()
+            .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
+        let url = format!("{}/session/interrupt?token={}", info.api_url.trim_end_matches('/'), info.token);
+        let response = reqwest::Client::new()
+            .post(&url)
+            .json(&json!({"session": id, "reason": reason}))
+            .send()
+            .await
+            .map_err(|e| ToolError::msg(format!("stop failed: {e}")))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ToolError::msg(format!("no session `{id}`")));
+        }
+        if !response.status().is_success() {
+            return Err(ToolError::msg(format!("stop failed: HTTP {}", response.status())));
+        }
+        let body: Value = response.json().await.unwrap_or_default();
+        Ok(ToolResult::success(body))
     }
 }
 

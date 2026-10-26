@@ -907,6 +907,7 @@ pub async fn run_serve(
         .route("/session/fork", post(fork_session))
         .route("/session/exec", post(exec_in_session))
         .route("/session/delete", post(delete_session))
+        .route("/session/interrupt", post(session_routes::interrupt_session))
         .route("/session/rename", post(rename_session))
         .route("/git/worktrees", get(git_worktrees))
         .route("/git/status", post(git_status))

@@ -389,6 +389,7 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
                     LaneStatus::Running => ("◐", accent(), "running"),
                     LaneStatus::Completed => ("✓", success(), "done"),
                     LaneStatus::Failed => ("✕", danger(), "failed"),
+                    LaneStatus::Paused => ("‖", warn(), "paused"),
                     LaneStatus::Cancelled => ("○", faint(), "cancelled"),
                 };
                 let selected = focused && i == app.shell.pane_index;

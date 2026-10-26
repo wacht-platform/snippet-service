@@ -30,6 +30,7 @@ pub type ModelFactory =
 #[serde(rename_all = "snake_case")]
 pub enum LaneStatus {
     Running,
+    Paused,
     Cancelled,
     Completed,
     Failed,
@@ -261,7 +262,14 @@ const MAX_ACTIVE_LANES: usize = 8;
 /// Wall-clock cap per lane. Without one, a hung lane (stalled provider, endless
 /// tool loop under the iteration backstop) never reports, and the orchestrator —
 /// told that ending its turn is how it waits — waits forever.
-const LANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+async fn lane_timeout() -> std::time::Duration {
+    let mins = crate::config::SnippetConfig::load(crate::config::default_config_path())
+        .await
+        .map(|c| c.lane_timeout_mins)
+        .unwrap_or(30)
+        .clamp(1, 24 * 60);
+    std::time::Duration::from_secs(u64::from(mins) * 60)
+}
 
 /// Finished lanes older than this are dropped from the session snapshot and disk.
 const LANE_FINISHED_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
@@ -570,7 +578,7 @@ impl LaneManager {
                 "no delegated task `{lane_id}` is known in this conversation."
             ));
         };
-        if record.status != LaneStatus::Running {
+        if !matches!(record.status, LaneStatus::Running | LaneStatus::Paused) {
             return Err(format!(
                 "delegated task `{lane_id}` is not running (status: {:?}).",
                 record.status
@@ -627,8 +635,10 @@ impl LaneManager {
 
         let handle = tokio::spawn(async move {
             let _live = LiveLane::register(link.origin_session.as_deref(), &lane_id, &link.mailbox);
+            let limit = lane_timeout().await;
+            let mut timed_out = false;
             let result = tokio::time::timeout(
-                LANE_TIMEOUT,
+                limit,
                 run_lane(
                     factory,
                     workspace_root,
@@ -647,13 +657,10 @@ impl LaneManager {
             )
             .await
             .unwrap_or_else(|_| {
-                let error = format!(
-                    "lane timed out after {} minutes and was aborted — its partial work (if any) \
-                     is in the workspace; re-delegate a narrower brief if the task is still needed",
-                    LANE_TIMEOUT.as_secs() / 60
-                );
+                timed_out = true;
+                let error = format!("paused after running for {} minutes, the lane time limit", limit.as_secs() / 60);
                 if let Ok(mut log) = crate::lane_log::LaneLog::open(&lane_id) {
-                    let _ = log.write_end(&lane_id, "failed", None, Some(&error), None);
+                    let _ = log.write_end(&lane_id, "paused", None, Some(&error), None);
                 }
                 Err(error)
             });
@@ -669,7 +676,7 @@ impl LaneManager {
                 Err(error) => LaneResult {
                     id: lane_id,
                     title,
-                    status: LaneStatus::Failed,
+                    status: if timed_out { LaneStatus::Paused } else { LaneStatus::Failed },
                     summary: None,
                     report: None,
                     error: Some(error),
@@ -747,6 +754,7 @@ impl LaneManager {
             let text = match result.status {
                 LaneStatus::Completed => "completed",
                 LaneStatus::Failed => "failed",
+                LaneStatus::Paused => "paused",
                 LaneStatus::Cancelled => "cancelled",
                 LaneStatus::Running => "running",
             };

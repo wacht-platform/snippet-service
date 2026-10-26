@@ -954,6 +954,7 @@ pub(super) fn lane_completed_lines(
     let (tag, color) = match status {
         LaneStatus::Completed => ("done", success()),
         LaneStatus::Failed => ("failed", danger()),
+        LaneStatus::Paused => ("paused", warn()),
         LaneStatus::Cancelled => ("cancelled", muted()),
         LaneStatus::Running => ("running", lane()),
     };

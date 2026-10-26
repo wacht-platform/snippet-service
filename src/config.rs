@@ -177,6 +177,8 @@ pub struct SnippetConfig {
     pub memory_reflect: bool,
     #[serde(default = "default_keep_task_profile")]
     pub keep_task_profile: bool,
+    #[serde(default = "default_lane_timeout_mins", skip_serializing_if = "is_default_lane_timeout")]
+    pub lane_timeout_mins: u32,
     #[serde(default, skip_serializing_if = "crate::routing::RoutingConfig::is_empty")]
     pub routing: crate::routing::RoutingConfig,
     #[serde(default, skip_serializing_if = "VoiceConfig::is_default")]
@@ -268,11 +270,20 @@ impl Default for SnippetConfig {
             memory_enabled: default_memory_enabled(),
             memory_reflect: default_memory_reflect(),
             keep_task_profile: default_keep_task_profile(),
+            lane_timeout_mins: default_lane_timeout_mins(),
             routing: Default::default(),
             voice: VoiceConfig::default(),
             ambient: AmbientConfig::default(),
         }
     }
+}
+
+fn default_lane_timeout_mins() -> u32 {
+    30
+}
+
+fn is_default_lane_timeout(m: &u32) -> bool {
+    *m == default_lane_timeout_mins()
 }
 
 pub const AMBIENT_MODES: &[&str] = &["passive", "active"];

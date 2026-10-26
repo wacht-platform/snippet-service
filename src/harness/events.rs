@@ -751,6 +751,13 @@ impl CodingHarness {
                     .unwrap_or_else(|| "unknown error".to_string()),
                 result.id,
             ),
+            LaneStatus::Paused => format!(
+                "PAUSED: {}. Its context and partial work are saved. Check its activity, then decide: \
+                 continue it (delegate_task with lane_id=\"{}\" and a short instruction, narrower if it was \
+                 circling), take the slice over yourself, or cancel_delegated_task if it's no longer needed.",
+                result.error.clone().unwrap_or_else(|| "hit the lane time limit".to_string()),
+                result.id,
+            ),
             LaneStatus::Cancelled => "cancelled".to_string(),
             LaneStatus::Running => "still running".to_string(),
         };
