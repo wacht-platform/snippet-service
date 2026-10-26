@@ -156,6 +156,54 @@ pub(crate) async fn get_settings(State(d): State<Shared>, Query(a): Query<Auth>)
     Json(settings_view(&d)).into_response()
 }
 
+fn patched_ambient(mut ambient: crate::config::AmbientConfig, req: &SettingsReq) -> (crate::config::AmbientConfig, Option<String>) {
+    if let Some(v) = req.enabled {
+        ambient.enabled = v;
+        if !v {
+            lease_clear();
+        }
+    }
+    if let Some(v) = req.mode.clone() {
+        if v == "passive" {
+            crate::ambient::end_conversation();
+        }
+        ambient.mode = v;
+    }
+    if let Some(v) = req.watcher.clone() {
+        ambient.watcher = v;
+    }
+    if let Some(v) = req.watcher_chat_context {
+        ambient.watcher_chat_context = v;
+    }
+    if let Some(v) = req.conversation_timeout_secs {
+        ambient.conversation_timeout_secs = v;
+    }
+    if let Some(v) = req.wake_phrases.clone() {
+        ambient.wake_phrases = v;
+    }
+    if let Some(v) = req.stt.clone() {
+        ambient.stt = v;
+    }
+    let mut invalid = None;
+    if let Some(v) = req.deepgram_host.clone() {
+        let v = v.trim().to_ascii_lowercase();
+        if DEEPGRAM_HOSTS.iter().any(|(h, _)| *h == v) {
+            ambient.deepgram_host = v;
+        } else {
+            invalid = Some(format!("Unknown Deepgram region {v}"));
+        }
+    }
+    if let Some(v) = req.tts_voice.clone() {
+        let v = v.trim().to_ascii_lowercase();
+        if valid_voice(&v) {
+            ambient.tts_voice = v;
+        } else {
+            invalid = Some(format!("Unknown voice {v}"));
+        }
+    }
+    (ambient, invalid)
+}
+
 pub(crate) async fn set_settings(
     State(d): State<Shared>,
     Query(a): Query<Auth>,
@@ -167,51 +215,7 @@ pub(crate) async fn set_settings(
     d.reload_config().await;
     let result = {
         let mut c = d.config.lock().unwrap();
-        let mut ambient = c.ambient.clone();
-        if let Some(v) = req.enabled {
-            ambient.enabled = v;
-            if !v {
-                lease_clear();
-            }
-        }
-        if let Some(v) = req.mode {
-            if v == "passive" {
-                crate::ambient::end_conversation();
-            }
-            ambient.mode = v;
-        }
-        if let Some(v) = req.watcher {
-            ambient.watcher = v;
-        }
-        if let Some(v) = req.watcher_chat_context {
-            ambient.watcher_chat_context = v;
-        }
-        if let Some(v) = req.conversation_timeout_secs {
-            ambient.conversation_timeout_secs = v;
-        }
-        if let Some(v) = req.wake_phrases {
-            ambient.wake_phrases = v;
-        }
-        if let Some(v) = req.stt {
-            ambient.stt = v;
-        }
-        let mut invalid = None;
-        if let Some(v) = req.deepgram_host {
-            let v = v.trim().to_ascii_lowercase();
-            if DEEPGRAM_HOSTS.iter().any(|(h, _)| *h == v) {
-                ambient.deepgram_host = v;
-            } else {
-                invalid = Some(format!("Unknown Deepgram region {v}"));
-            }
-        }
-        if let Some(v) = req.tts_voice {
-            let v = v.trim().to_ascii_lowercase();
-            if valid_voice(&v) {
-                ambient.tts_voice = v;
-            } else {
-                invalid = Some(format!("Unknown voice {v}"));
-            }
-        }
+        let (ambient, invalid) = patched_ambient(c.ambient.clone(), &req);
         let next_key = |value: Option<String>, current: &Option<String>| match value {
             Some(key) => Some(key.trim().to_string()).filter(|k| !k.is_empty()),
             None => current.clone(),
