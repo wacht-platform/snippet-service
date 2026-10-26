@@ -894,12 +894,21 @@ struct CreateTaskArgs {
     reply_to: Option<String>,
     #[serde(default)]
     blocked_by: Vec<String>,
+    #[serde(default)]
+    crew: Vec<CrewArg>,
+}
+
+#[derive(Deserialize)]
+struct CrewArg {
+    agent_id: String,
+    #[serde(default)]
+    role: Option<String>,
 }
 pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's for rescuing a rate-limited session. Work that simply needs another model belongs in a session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's for rescuing a rate-limited session. Work that simply needs another model belongs in a session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -1062,8 +1071,26 @@ async fn create_task(
             added_at: task.created_at.clone(),
             removed_at: None,
         };
+        let mut roster = vec![worker];
+        for member in &args.crew {
+            let id = member.agent_id.trim();
+            if id.is_empty() || roster.iter().any(|m| m.agent_id == id) {
+                continue;
+            }
+            require_working_agent(&store, id)?;
+            roster.push(crate::coordination::TaskAgent {
+                task_id: task.id.clone(),
+                agent_id: id.to_string(),
+                work_session_id: None,
+                scope: String::new(),
+                status: "waiting".into(),
+                role: member.role.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("reviewer").to_string(),
+                added_at: task.created_at.clone(),
+                removed_at: None,
+            });
+        }
         store
-            .create_task_with_agents(&task, &[worker])
+            .create_task_with_agents(&task, &roster)
             .map_err(|e| ToolError::msg(format!("create task: {e}")))?;
         for blocker in &blockers {
             store
@@ -1093,15 +1120,21 @@ async fn create_task(
                 blockers.iter().map(|b| format!("\"{}\" ({})", b.title, b.id)).collect::<Vec<_>>().join(", ")
             )
         };
-        Ok(ToolResult::success(
-            json!({
-                "task": task_view(&task),
-                "agent_id": agent_id,
-                "profile": profile,
-                "waiting_on": blockers.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
-                "note": note
-            }),
-        ))
+        let mut result = json!({
+            "task": task_view(&task),
+            "agent_id": agent_id,
+            "profile": profile,
+            "waiting_on": blockers.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
+            "crew": roster.iter().skip(1).map(|m| format!("{} ({})", m.agent_id, m.role)).collect::<Vec<_>>(),
+            "note": note
+        });
+        if created_by.1 == crate::mission_control::SESSION_ID
+            && agent_id == crate::coordination::SNIPPET_AGENT_ID
+            && roster.len() == 1
+        {
+            result["specialists"] = json!(specialist_directory(&store));
+        }
+        Ok(ToolResult::success(result))
     }
 }
 
@@ -1149,6 +1182,7 @@ impl Tool for FileFollowUpTask {
             profile: None,
             reply_to: None,
             blocked_by,
+            crew: Vec::new(),
         };
         create_task(ctx, args, (kind, &who)).await
     }
@@ -1172,6 +1206,24 @@ struct UpdateMissionTaskArgs {
 }
 
 /// Refuse to hand work to an agent that is unknown or not active.
+fn specialist_directory(store: &Store) -> String {
+    let list: Vec<String> = store
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| {
+            a.status == crate::coordination::types::AgentStatus::Active
+                && a.kind == crate::coordination::types::AgentKind::Worker
+                && a.id != crate::coordination::SNIPPET_AGENT_ID
+        })
+        .map(|a| format!("{} ({})", a.id, format!("{:?}", a.role).to_lowercase()))
+        .collect();
+    format!(
+        "No specialist or crew is on this task. Specialists available: {}. Seat one if the work needs a review, QA or research role; if no agent covers a role it needs, ask the user whether to create one.",
+        if list.is_empty() { "none".to_string() } else { list.join(", ") }
+    )
+}
+
 pub(crate) fn require_working_agent(store: &Store, agent_id: &str) -> Result<(), ToolError> {
     match store
         .get_agent(agent_id)
