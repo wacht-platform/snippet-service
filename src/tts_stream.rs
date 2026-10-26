@@ -389,7 +389,7 @@ async fn run(session: &Arc<Session>, key: String, mut cmd: mpsc::UnboundedReceiv
     request
         .headers_mut()
         .insert("Authorization", format!("Token {key}").parse().map_err(|_| "invalid Deepgram key".to_string())?);
-    let (ws, _) = tokio::time::timeout(CONNECT_LIMIT, tokio_tungstenite::connect_async(request))
+    let (ws, _) = tokio::time::timeout(CONNECT_LIMIT, tokio_tungstenite::connect_async_with_config(request, None, true))
         .await
         .map_err(|_| "Flux connect timed out".to_string())?
         .map_err(|e| format!("Flux connect failed: {e}"))?;

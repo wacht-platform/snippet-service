@@ -935,6 +935,9 @@ pub async fn run_serve(
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
 
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     let mut server = tokio::spawn(async move { axum::serve(listener, app).await });
 
     // A tunnel the user asked for by name is fatal when it fails. Auto mode with

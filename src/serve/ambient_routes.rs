@@ -1,6 +1,5 @@
 use super::*;
 
-use axum::body::Bytes;
 
 const MAX_TRANSCRIPTIONS: usize = 4;
 use crate::ambient::{lease_clear, lease_holder, lease_release, lease_touch};
@@ -32,6 +31,9 @@ pub(crate) async fn lease(
         return Json(serde_json::json!({"held": false, "holder": serde_json::Value::Null})).into_response();
     }
     let held = lease_touch(&req.device, Some(&req.label), req.claim);
+    if held {
+        super::listener::warm(&d, &req.device);
+    }
     let holder = lease_holder();
     Json(serde_json::json!({
         "held": held,
@@ -256,8 +258,7 @@ pub(crate) async fn set_settings(
 }
 
 #[derive(Deserialize)]
-pub(crate) struct IngestQuery {
-    token: Option<String>,
+pub(crate) struct Segment {
     id: String,
     #[serde(default)]
     device: String,
@@ -325,73 +326,53 @@ fn fetch(d: &Daemon, id: &str) -> Option<serde_json::Value> {
         .ok()
 }
 
-pub(crate) async fn ingest(
-    State(d): State<Shared>,
-    Query(q): Query<IngestQuery>,
-    body: Bytes,
-) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
+pub(super) async fn store_segment(d: &Shared, q: Segment, wav: &[u8]) -> Result<String, (u16, String)> {
     d.reload_config().await;
     if !d.config.lock().unwrap().ambient.enabled {
-        return (StatusCode::FORBIDDEN, "ambient listening is turned off on the server").into_response();
+        return Err((403, "ambient listening is turned off on the server".into()));
     }
     if q.device.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "device is required").into_response();
+        return Err((400, "device is required".into()));
     }
     if !q.backlog && !lease_touch(&q.device, None, false) {
-        return (StatusCode::CONFLICT, "another device is listening").into_response();
+        return Err((409, "another device is listening".into()));
     }
     if !valid_id(&q.id) {
-        return (StatusCode::BAD_REQUEST, "id must be 1-64 letters, digits or dashes").into_response();
+        return Err((400, "id must be 1-64 letters, digits or dashes".into()));
     }
-    if body.is_empty() {
-        return (StatusCode::BAD_REQUEST, "empty audio").into_response();
+    if wav.is_empty() {
+        return Err((400, "empty audio".into()));
     }
-    if let Some(existing) = fetch(&d, &q.id) {
-        return Json(existing).into_response();
+    let status_of = |e: Option<serde_json::Value>| e.and_then(|v| v["status"].as_str().map(str::to_string));
+    if let Some(status) = status_of(fetch(d, &q.id)) {
+        return Ok(status);
     }
-    let started = if q.started_at.is_empty() {
-        chrono::Utc::now().to_rfc3339()
-    } else {
-        q.started_at.clone()
-    };
-    if let Err(e) = tokio::fs::create_dir_all(audio_dir()).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not store audio: {e}")).into_response();
-    }
+    let started = if q.started_at.is_empty() { chrono::Utc::now().to_rfc3339() } else { q.started_at.clone() };
     let path = audio_path(&q.id);
-    if let Err(e) = tokio::fs::write(&path, &body).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not store audio: {e}")).into_response();
+    let stored = async {
+        tokio::fs::create_dir_all(audio_dir()).await?;
+        tokio::fs::write(&path, wav).await
+    };
+    if let Err(e) = stored.await {
+        return Err((500, format!("could not store audio: {e}")));
     }
-    let now = chrono::Utc::now().timestamp();
     let inserted = d.store.with_connection(|c| {
         c.execute(
             "INSERT OR IGNORE INTO ambient_events
                  (id, device, started_at, duration_ms, status, created_at, seq, continued, routed)
              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                q.id,
-                q.device,
-                started,
-                q.duration_ms,
-                now,
-                q.seq,
-                q.continued as i64,
-                !q.backlog as i64
-            ],
+            rusqlite::params![q.id, q.device, started, q.duration_ms, chrono::Utc::now().timestamp(), q.seq, q.continued as i64, !q.backlog as i64],
         )
     });
-    let fresh = matches!(inserted, Ok(1));
-    if let Err(e) = inserted {
-        let _ = tokio::fs::remove_file(&path).await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("could not record event: {e}")).into_response();
+    match inserted {
+        Ok(1) => spawn_transcription(d.clone(), q.id.clone()),
+        Ok(_) => {}
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err((500, format!("could not record event: {e}")));
+        }
     }
-    if fresh {
-        spawn_transcription(d.clone(), q.id.clone());
-    }
-    Json(fetch(&d, &q.id).unwrap_or_else(|| serde_json::json!({"id": q.id, "status": "pending"})))
-        .into_response()
+    Ok(status_of(fetch(d, &q.id)).unwrap_or_else(|| "pending".into()))
 }
 
 pub(super) fn mark(id: &str, stage: &str) {

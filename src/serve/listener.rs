@@ -18,6 +18,7 @@ const REPLAY: u64 = 32_000 * 10;
 const PAD: u64 = 9_600;
 const ECHO_HANGOVER_BYTES: u64 = 9_600;
 const IDLE_CLOSE: Duration = Duration::from_secs(60);
+const FLUX_IDLE_CLOSE: Duration = Duration::from_secs(600);
 const URGENT: &[&str] = &["stop", "wait", "hold", "pause", "no", "nope", "sorry", "actually", "hang", "snippet", "chief", "enough", "shut", "quiet"];
 const SAMPLE: Duration = Duration::from_millis(250);
 
@@ -83,6 +84,19 @@ fn get(d: &Shared, device: &str) -> Arc<Listener> {
         .entry(device.to_string())
         .or_insert_with(|| Arc::new(Listener { device: device.to_string(), d: d.clone(), inner: Mutex::new(Inner::default()) }))
         .clone()
+}
+
+fn copy_range(ring: &VecDeque<u8>, from: usize, len: usize) -> Vec<u8> {
+    let (a, b) = ring.as_slices();
+    let mut out = Vec::with_capacity(len);
+    if from < a.len() {
+        out.extend_from_slice(&a[from..a.len().min(from + len)]);
+    }
+    if out.len() < len {
+        let skip = from.saturating_sub(a.len());
+        out.extend_from_slice(&b[skip..skip + (len - out.len())]);
+    }
+    out
 }
 
 fn next_seq() -> i64 {
@@ -239,6 +253,13 @@ pub(super) async fn open(d: &Shared, device: &str, h: u32, started_at: Option<&s
     Ok(())
 }
 
+pub(super) fn warm(d: &Shared, device: &str) {
+    let flux = credentials(d).is_some_and(|c| c.flux);
+    if flux && d.config.lock().unwrap().ambient.enabled {
+        get(d, device).connect_if_needed(true);
+    }
+}
+
 pub(super) fn audio(device: &str, h: u32, pcm: &[u8]) -> bool {
     let Some(l) = hub().lock().unwrap().get(device).cloned() else { return false };
     {
@@ -246,7 +267,7 @@ pub(super) fn audio(device: &str, h: u32, pcm: &[u8]) -> bool {
         if s.stream != Some(h) {
             return false;
         }
-        s.ring.extend(pcm.iter().copied());
+        s.ring.extend(pcm);
         s.g += pcm.len() as u64;
         if s.ring.len() > RING {
             let n = s.ring.len() - RING;
@@ -344,9 +365,13 @@ impl Listener {
     }
 
     fn ensure(self: &Arc<Self>) {
+        self.connect_if_needed(false);
+    }
+
+    fn connect_if_needed(self: &Arc<Self>, warm: bool) {
         static IDS: AtomicU64 = AtomicU64::new(1);
         let mut s = self.inner.lock().unwrap();
-        if s.conn.is_some() || s.stream.is_none() || s.retry_at.is_some_and(|t| t > Instant::now()) {
+        if s.conn.is_some() || (s.stream.is_none() && !warm) || s.retry_at.is_some_and(|t| t > Instant::now()) {
             return;
         }
         let Some(creds) = credentials(&self.d) else { return };
@@ -383,7 +408,8 @@ impl Listener {
             if let Err(e) = &idle {
                 eprintln!("[listener] {} stream ended: {e}", me.device);
             }
-            me.dropped(id, idle.is_ok());
+            let quiet = me.inner.lock().unwrap().stream.is_none();
+            me.dropped(id, idle.is_ok() || quiet);
         });
     }
 
@@ -415,7 +441,7 @@ impl Listener {
         while g - sent >= MIN_SEND || (all && g > sent) {
             let n = (g - sent).min(MAX_SEND);
             let from = (sent - ring_start) as usize;
-            chunks.push(s.ring.range(from..from + n as usize).copied().collect::<Vec<u8>>());
+            chunks.push(copy_range(&s.ring, from, n as usize));
             sent += n;
         }
         if let Some(c) = s.conn.as_mut() {
@@ -727,7 +753,7 @@ async fn connect(creds: &Creds, active: bool) -> Result<Ws, String> {
     );
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     request.headers_mut().insert("Authorization", key.trim().parse().map_err(|_| "invalid AssemblyAI key".to_string())?);
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async(request))
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async_with_config(request, None, true))
         .await
         .map_err(|_| "AssemblyAI connect timed out".to_string())?
         .map_err(|e| format!("AssemblyAI connect failed: {e}"))?;
@@ -748,7 +774,7 @@ async fn connect_flux(creds: &Creds, active: bool) -> Result<Ws, String> {
     request
         .headers_mut()
         .insert("Authorization", format!("Token {}", creds.key.trim()).parse().map_err(|_| "invalid Deepgram key".to_string())?);
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async(request))
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async_with_config(request, None, true))
         .await
         .map_err(|_| "Deepgram Flux connect timed out".to_string())?
         .map_err(|e| format!("Deepgram Flux connect failed: {e}"))?;
@@ -839,7 +865,7 @@ async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceive
                     let _ = tx.send(Message::Ping(Default::default())).await;
                 }
                 let open = l.inner.lock().unwrap().stream.is_some();
-                if !open && last_audio.elapsed() >= IDLE_CLOSE {
+                if !open && last_audio.elapsed() >= if flux { FLUX_IDLE_CLOSE } else { IDLE_CLOSE } {
                     break;
                 }
             }

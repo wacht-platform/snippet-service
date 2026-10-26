@@ -560,6 +560,8 @@ pub(crate) struct AttachQuery {
     pub(crate) session: String,
     #[serde(default)]
     pub(crate) compact: Option<String>,
+    #[serde(default)]
+    pub(crate) stream_delta: Option<String>,
 }
 
 

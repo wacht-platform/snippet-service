@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
-use axum::body::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 
@@ -25,9 +24,8 @@ pub(crate) async fn stream(ws: WebSocketUpgrade, State(d): State<Shared>, Query(
         return unauthorized();
     }
     let device = q.device.trim().to_string();
-    let token = q.token.clone();
     ws.max_message_size(1 << 20)
-        .on_upgrade(move |socket| run(socket, d, device, token))
+        .on_upgrade(move |socket| run(socket, d, device))
 }
 
 struct Open {
@@ -35,7 +33,7 @@ struct Open {
     pcm: Vec<u8>,
 }
 
-async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>) {
+async fn run(socket: WebSocket, d: Shared, device: String) {
     let (mut tx, mut rx) = socket.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<PhoneFrame>();
     let writer = tokio::spawn(async move {
@@ -116,9 +114,8 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         let d = d.clone();
                         let out = out_tx.clone();
                         let device = device.clone();
-                        let token = token.clone();
                         tokio::spawn(async move {
-                            let (code, status) = finish(d, device, token, seg).await;
+                            let (code, status) = finish(d, device, seg).await;
                             let id = v.get("id").cloned().unwrap_or_default();
                             reply(&out, serde_json::json!({"t":"done","h":h,"id":id,"code":code,"status":status}));
                         });
@@ -163,26 +160,21 @@ fn reply(out: &tokio::sync::mpsc::UnboundedSender<PhoneFrame>, value: serde_json
     let _ = out.send(PhoneFrame::Text(value.to_string()));
 }
 
-async fn finish(d: Shared, device: String, token: Option<String>, seg: Open) -> (u16, String) {
+async fn finish(d: Shared, device: String, seg: Open) -> (u16, String) {
     if seg.pcm.is_empty() {
         return (400, "empty audio".into());
     }
     let mut meta = seg.meta;
     meta["device"] = serde_json::Value::String(device);
-    meta["token"] = token.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
     if meta.get("id").is_none() {
         return (400, "id required".into());
     }
-    let q: super::ambient_routes::IngestQuery = match serde_json::from_value(meta) {
+    let q: super::ambient_routes::Segment = match serde_json::from_value(meta) {
         Ok(q) => q,
         Err(e) => return (400, e.to_string()),
     };
-    let response = super::ambient_routes::ingest(State(d), Query(q), Bytes::from(super::listener::wav(&seg.pcm))).await;
-    let code = response.status().as_u16();
-    let body = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap_or_default();
-    let status = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("status").and_then(|s| s.as_str().map(str::to_string)))
-        .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
-    (code, status)
+    match super::ambient_routes::store_segment(&d, q, &super::listener::wav(&seg.pcm)).await {
+        Ok(status) => (200, status),
+        Err((code, message)) => (code, message),
+    }
 }
