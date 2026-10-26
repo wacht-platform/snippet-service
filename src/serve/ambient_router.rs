@@ -494,7 +494,10 @@ async fn deliver(
         v.addressed
     );
     if let Some(e) = &expecting {
-        attrs.push_str(&format!(" expects=\"{}\" matched=\"{:.2}\"", ambient_watch::escape(&e.kind), v.matches));
+        attrs.push_str(&format!(" expects=\"{}\"", ambient_watch::escape(&e.kind)));
+    }
+    if expecting.is_some() || v.matches >= 0.3 {
+        attrs.push_str(&format!(" matched=\"{:.2}\"", v.matches));
     }
     if v.other >= 0.3 {
         attrs.push_str(&format!(" other_party=\"{:.2}\"", v.other));

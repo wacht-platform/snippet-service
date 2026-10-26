@@ -11,6 +11,7 @@ use crate::mission_control::SESSION_ID;
 use crate::mission_autonomy;
 
 const TICK: Duration = Duration::from_secs(1);
+const ROUND_EVERY: Duration = Duration::from_secs(5);
 const STALL_SECS: i64 = 20 * 60;
 
 fn spawn_quick_wake(daemon: Shared, w: crate::ambient::QuickWake) {
@@ -64,6 +65,7 @@ fn spawn_quick_wake(daemon: Shared, w: crate::ambient::QuickWake) {
 }
 
 pub async fn autonomy_loop(daemon: Shared) {
+    let mut last_round = std::time::Instant::now();
     loop {
         tokio::time::sleep(TICK).await;
         for w in crate::ambient::take_quick_wakes() {
@@ -72,6 +74,10 @@ pub async fn autonomy_loop(daemon: Shared) {
         for queued in mission_autonomy::take_answers() {
             daemon.deliver(&queued.session_id, LoopInput::Answer(queued.answer)).await;
         }
+        if last_round.elapsed() < ROUND_EVERY {
+            continue;
+        }
+        last_round = std::time::Instant::now();
         let state = mission_autonomy::load();
         if !state.settings.on {
             continue;

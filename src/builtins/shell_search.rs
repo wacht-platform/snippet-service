@@ -238,16 +238,17 @@ impl Tool for BashTool {
         let total_bytes = stdout_str.len() + stderr_str.len();
 
         let byte_budget = args.max_bytes.max(4000);
+        let stderr_budget = stderr_str.len().min(byte_budget / 4);
         let (stdout_display, stdout_truncated) = format_output_preview(
             &stdout_str,
             args.max_lines,
-            byte_budget,
+            byte_budget - stderr_budget,
             &rel_log_path,
         );
         let (stderr_display, stderr_truncated) = format_output_preview(
             &stderr_str,
             args.max_lines,
-            byte_budget,
+            stderr_budget,
             &rel_log_path,
         );
         let is_truncated = stdout_truncated || stderr_truncated;

@@ -822,7 +822,7 @@ impl LaneManager {
         // Then enforce max finished count (oldest first among survivors).
         let mut survivors: Vec<(usize, chrono::DateTime<Utc>)> = finished_idx
             .into_iter()
-            .filter(|(i, _)| !drop.contains(i))
+            .filter(|(i, _)| !drop.contains(i) && self.records[*i].status != LaneStatus::Paused)
             .collect();
         if survivors.len() > MAX_FINISHED_LANES {
             survivors.sort_by_key(|(_, when)| *when); // oldest first

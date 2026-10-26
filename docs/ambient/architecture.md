@@ -24,8 +24,8 @@ MC alone decides when a spoken conversation opens; the classifier only advises. 
 ## Delivery rules
 
 - `media`, `background` and `noise` lines are never delivered, but stay searchable.
-- Passive delivers a wake phrase, an addressed line, a line matching MC's stated expectation, or a continuation of a delivered turn.
-- Active delivers every kept user turn except intent `ignore`, with an `addressed` score so MC can choose silence.
+- A turn is delivered when it carries a wake phrase, matches MC's stated expectation (or a pending question), or the classifier clears it as not meant for someone else and its `addressed` score reaches the threshold for the current state: 0.6 in Passive, 0.5 in Active and Pinned.
+- Active also keeps a conversation open, so follow-ups need only clear that lower bar; a turn the classifier marks `ignore`, or that is not kept, is never delivered.
 - Repeated out-of-context turns during a conversation raise an `<ambient_context_alert>` to MC, which can stay silent, schedule a check-in with `schedule_wake`, or return to Passive.
 
 ## Interruption

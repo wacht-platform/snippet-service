@@ -490,6 +490,13 @@ async fn parse_anthropic_sse(
                     );
                 }
             }
+            Some("content_block_stop") => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(tool) = tools.get(&index) {
+                    let call_id = if tool.id.is_empty() { index.to_string() } else { tool.id.clone() };
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id });
+                }
+            }
             Some("content_block_delta") => {
                 let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
                 let delta = event.get("delta");

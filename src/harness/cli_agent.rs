@@ -941,7 +941,7 @@ impl CodingHarness {
             / 100;
         if compact_threshold > 0 {
             let auto_tokens = compact_threshold.clamp(100_000, 1_000_000);
-            cmd.args(["--autocompact", &auto_tokens.to_string()]);
+            cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", auto_tokens.to_string());
         }
         if let Some(id) = session.id.as_deref() {
             cmd.args([if session.started { "--resume" } else { "--session-id" }, id]);

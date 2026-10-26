@@ -128,7 +128,8 @@ pub fn chunk_text(text: &str) -> Vec<String> {
     for piece in merged {
         let mut rest = piece.as_str();
         while rest.len() > 160 {
-            let cut = rest[..160].rfind(' ').unwrap_or(160);
+            let limit = (0..=160).rev().find(|&i| rest.is_char_boundary(i)).unwrap_or(0);
+            let cut = rest[..limit].rfind(' ').unwrap_or(limit);
             final_chunks.push(rest[..cut].trim().to_string());
             rest = rest[cut..].trim_start();
         }
