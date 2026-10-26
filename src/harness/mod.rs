@@ -938,6 +938,12 @@ pub(crate) fn is_held_envelope(text: &str) -> bool {
 
 pub(crate) fn is_daemon_envelope(text: &str) -> bool {
     let first = text.lines().next().unwrap_or("").trim();
+    if first.starts_with("<ambient_resume>")
+        || first.starts_with("<ambient_context_alert")
+        || first.starts_with("<ambient_check_in")
+    {
+        return true;
+    }
     first.len() > 2
         && first.starts_with('[')
         && first.ends_with(']')

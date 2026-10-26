@@ -13,6 +13,7 @@ pub(crate) struct Verdict {
     pub echo: f64,
     pub other: f64,
     pub played: f64,
+    pub out_of_context: f64,
     pub judge: &'static str,
 }
 
@@ -36,6 +37,7 @@ impl Verdict {
             echo: 0.0,
             other: 0.0,
             played: 0.0,
+            out_of_context: 0.0,
             judge: "continuation",
         }
     }
@@ -198,6 +200,10 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
             "type": "noul",
             "instructions": "Is `utterance` part of a conversation with someone other than the assistant: a person or background actors in the room, someone on a phone call, third-person remarks about the user ('he asked...', 'tell him...'), a caller or automated phone agent, or another voice assistant?"
         },
+        "out_of_context": {
+            "type": "noul",
+            "instructions": "Is `utterance` out of context for the assistant: unrelated to `assistant.last_said`, `mission_control.recent_chat`, `mission_control.recent_tools`, and `recent` turns sent to the assistant (for example side chatter with someone else, an incomplete cut-off fragment with no clear request, or a remark that makes no sense in the ongoing conversation without a wake word)?"
+        },
         "played_audio": {
             "type": "noul",
             "instructions": "Is `utterance` played audio, such as TV, film, video, podcast, music, adverts or a game, rather than a person speaking live in the room?"
@@ -310,6 +316,8 @@ pub(super) struct Moment {
     pub phrases: Vec<String>,
     pub expecting: Option<(String, String)>,
     pub pending: Option<String>,
+    pub mc_chat: Vec<Value>,
+    pub mc_tools: Vec<Value>,
     pub media_playing: bool,
     pub during_playback: bool,
 }
@@ -376,6 +384,10 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
         "name_in_utterance": name,
         "conversation": if m.open { "open: the user and the assistant are talking back and forth" } else { "closed" },
         "assistant": assistant,
+        "mission_control": {
+            "recent_chat": m.mc_chat,
+            "recent_tools": m.mc_tools,
+        },
         "recent": recent.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
         "phone_playing_media": m.media_playing,
     })
@@ -395,6 +407,7 @@ pub(super) fn verdict_from(value: &Value) -> Result<Verdict, String> {
         echo: noul("assistant_echo"),
         other: noul("other_party"),
         played: noul("played_audio").max(a["kind"]["probabilities"]["media"].as_f64().unwrap_or(0.0)),
+        out_of_context: noul("out_of_context"),
         judge: "classifier",
     })
 }
@@ -442,7 +455,13 @@ pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Ve
     if matches!(verdict.intent.as_str(), "meeting" | "note") || matches!(verdict.kind.as_str(), "background" | "media") {
         verdict.other = verdict.other.max(0.75);
     }
-    if verdict.addressed >= 0.5 && verdict.veto() < 0.5 && verdict.kind == "conversation" {
+    if !wake_word(text, phrases) && verdict.out_of_context >= 0.68 && verdict.matches < 0.7 {
+        verdict.addressed = verdict.addressed.min(0.40);
+        if verdict.intent == "for_assistant" {
+            verdict.intent = "note".into();
+        }
+    }
+    if verdict.addressed >= 0.5 && verdict.veto() < 0.5 && verdict.out_of_context < 0.68 && verdict.kind == "conversation" {
         verdict.intent = "for_assistant".into();
     }
     verdict
@@ -510,10 +529,15 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
             Ok((duration_ms, users, assistant))
         })
         .unwrap_or_default();
-    let pending = if chat_context {
-        super::ambient_context::mission_control(d)["pending_question"].as_str().map(str::to_string)
+    let (pending, mc_chat, mc_tools) = if chat_context {
+        let mc = super::ambient_context::mission_control(d);
+        (
+            mc["pending_question"].as_str().map(str::to_string),
+            mc["recent_chat"].as_array().cloned().unwrap_or_default(),
+            mc["recent_tools"].as_array().cloned().unwrap_or_default(),
+        )
     } else {
-        None
+        (None, Vec::new(), Vec::new())
     };
     let with_pending = pending.is_some();
     let (media_playing, during_playback): (bool, bool) = d
@@ -540,6 +564,8 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
         phrases: phrases.clone(),
         expecting: expectation.map(|e| (e.kind, e.about)),
         pending,
+        mc_chat,
+        mc_tools,
         media_playing,
         during_playback,
     };

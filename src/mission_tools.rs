@@ -229,10 +229,15 @@ impl Tool for UpdateBrief {
 
 #[derive(Deserialize)]
 struct ScheduleFollowupArgs {
-    in_minutes: i64,
+    #[serde(default)]
+    in_minutes: Option<i64>,
+    #[serde(default)]
+    in_seconds: Option<u64>,
     note: String,
     #[serde(default)]
     next_wake: bool,
+    #[serde(default)]
+    unless_user_speaks: Option<bool>,
 }
 
 pub struct ScheduleFollowup;
@@ -241,12 +246,14 @@ impl Tool for ScheduleFollowup {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "schedule_wake".into(),
-            description: "Be woken at a time: a deploy window, a check you promised the user, a job that won't report on its own, the morning after quiet hours. You're woken with this note when it's due. Running tasks report by themselves, so their progress needs no wake-up. next_wake marks your one general next look, replacing the previous one.".into(),
+            description: "Be woken after a delay: pass in_seconds (5 to 3600, e.g. 10s to quietly check whether the user continued a cut-off or out-of-context spoken turn without disturbing them) or in_minutes (1 to 10080, for a deploy window, a check you promised, or the morning after quiet hours). When in_seconds is used (or unless_user_speaks is true), the wake fires with a snapshot of recent microphone lines even if automated wakes are off, and cancels itself automatically if the user speaks to you first.".into(),
             input_schema: schema(json!({
+                "in_seconds": {"type": "integer", "description": "How many seconds from now (5 to 3600) for a quick ambient or follow-up check."},
                 "in_minutes": {"type": "integer", "description": "How many minutes from now (1 to 10080)."},
-                "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."},
+                "note": {"type": "string", "description": "What to check or do when woken."},
+                "unless_user_speaks": {"type": "boolean", "description": "Cancel the wake if the user speaks or messages you before it fires. Default true for in_seconds."},
                 "next_wake": {"type": "boolean", "description": "This is your next general check-in; replaces any earlier one."}
-            }), &["in_minutes", "note"]),
+            }), &["note"]),
         }
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
@@ -254,7 +261,18 @@ impl Tool for ScheduleFollowup {
         if args.note.trim().is_empty() {
             return Err(ToolError::msg("note must say what to do when the wake-up is due"));
         }
-        let minutes = args.in_minutes.clamp(1, 10080);
+        if let Some(secs) = args.in_seconds {
+            let secs = secs.clamp(3, 3600);
+            let unless = args.unless_user_speaks.unwrap_or(true);
+            crate::ambient::schedule_quick_wake(secs, args.note.trim().to_string(), unless);
+            return Ok(ToolResult::success(json!({
+                "scheduled": true,
+                "in_seconds": secs,
+                "unless_user_speaks": unless,
+                "note": "Quick check-in timer started; cancels automatically if the user speaks to you first.",
+            })));
+        }
+        let minutes = args.in_minutes.unwrap_or(1).clamp(1, 10080);
         let due_at = chrono::Utc::now().timestamp() + minutes * 60;
         let followup = crate::mission_autonomy::schedule_followup(due_at, args.note.trim(), args.next_wake).map_err(ToolError::msg)?;
         let on = crate::mission_autonomy::is_on();

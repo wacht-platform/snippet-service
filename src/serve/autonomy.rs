@@ -10,12 +10,65 @@ use crate::harness::{HarnessStatus, LoopInput};
 use crate::mission_control::SESSION_ID;
 use crate::mission_autonomy;
 
-const TICK: Duration = Duration::from_secs(5);
+const TICK: Duration = Duration::from_secs(1);
 const STALL_SECS: i64 = 20 * 60;
+
+fn spawn_quick_wake(daemon: Shared, w: crate::ambient::QuickWake) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(w.seconds)).await;
+        if w.unless_user_speaks && crate::ambient::run_generation() != w.generation {
+            eprintln!("[ambient] quick wake ({}s) cancelled: user spoke first", w.seconds);
+            return;
+        }
+        if mission_control_busy() {
+            return;
+        }
+        let since = chrono::Utc::now().timestamp() - (w.seconds as i64 + 15);
+        let recent: Vec<String> = daemon
+            .store
+            .with_connection(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT COALESCE(verdict, 'unjudged'), COALESCE(intent, 'unjudged'), delivered, text
+                     FROM ambient_events
+                     WHERE status = 'done' AND text != '' AND created_at >= ?1
+                     ORDER BY started_at ASC LIMIT 8",
+                )?;
+                let rows = stmt
+                    .query_map([since], |r| {
+                        let v: String = r.get(0)?;
+                        let i: String = r.get(1)?;
+                        let del: i64 = r.get(2)?;
+                        let t: String = r.get(3)?;
+                        Ok(format!(
+                            "- [judged={v}/{i}, delivered={}] {}",
+                            if del != 0 { "yes" } else { "no" },
+                            super::ambient_watch::escape(&t.chars().take(180).collect::<String>())
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap_or_default();
+        let mic = if recent.is_empty() {
+            "No new speech was heard on the microphone during the wait.".to_string()
+        } else {
+            format!("Recent microphone lines (including any filtered out by the classifier):\n{}", recent.join("\n"))
+        };
+        let envelope = format!(
+            "<ambient_check_in waited_secs=\"{}\" note=\"{}\">{mic}</ambient_check_in>",
+            w.seconds,
+            super::ambient_watch::escape(&w.note)
+        );
+        deliver_to_mission_control(&daemon, envelope).await;
+    });
+}
 
 pub async fn autonomy_loop(daemon: Shared) {
     loop {
         tokio::time::sleep(TICK).await;
+        for w in crate::ambient::take_quick_wakes() {
+            spawn_quick_wake(daemon.clone(), w);
+        }
         for queued in mission_autonomy::take_answers() {
             daemon.deliver(&queued.session_id, LoopInput::Answer(queued.answer)).await;
         }

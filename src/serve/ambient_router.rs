@@ -47,7 +47,6 @@ pub(crate) struct Part {
     pub ended: f64,
     pub started_at: String,
     pub continued: bool,
-    pub during_playback: bool,
 }
 
 pub(crate) enum Msg {
@@ -212,12 +211,8 @@ async fn accept(
         flush(d, device, parts, crate::ambient::conversation().is_some(), last, pending.take()).await;
     }
     turn.push(part);
-    let words: Vec<&str> = turn.iter().flat_map(|p| p.text.split_whitespace()).collect();
-    let during_playback = turn.iter().any(|p| p.during_playback);
-    let needs_classifier = !wake && (words.len() <= 2 || during_playback);
-    let fast_interrupt = crate::speech::has_interruption() && !needs_classifier;
     let live = crate::ambient::conversation().is_some();
-    if wake || fast_interrupt || (live && !needs_classifier && super::ambient_routes::assistant_recent(device, 25)) {
+    if wake {
         let parts = std::mem::take(turn);
         *deadline = None;
         flush(d, device, parts, true, last, pending.take()).await;
@@ -295,13 +290,10 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await })
         }
     };
-    let words_count = text.split_whitespace().count();
-    let during_playback = parts.iter().any(|p| p.during_playback);
-    let needs_classifier = !wake && (words_count <= 2 || during_playback);
     let mut delivered = false;
     let mut early: Option<Verdict> = None;
     if fast && routable {
-        let speculative_go = wake || (live && !needs_classifier && (crate::speech::has_interruption() || super::ambient_routes::assistant_recent(device, 25)));
+        let speculative_go = wake;
         if speculative_go {
             let v = wake_verdict(None);
             deliver(d, device, &parts, &v, wake, None, ttl, !live).await;
@@ -362,9 +354,33 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             }
             deliver(d, device, &parts, &verdict, wake, None, ttl, false).await;
             delivered = true;
-        } else if live && !pinned && (verdict.other >= 0.65 || matches!(verdict.intent.as_str(), "meeting") || matches!(verdict.kind.as_str(), "background" | "media")) {
-            eprintln!("[ambient-router] background/other-party conversation detected on {device} ({}/{}, other={:.2}); closing active conversation", verdict.kind, verdict.intent, verdict.other);
-            crate::ambient::end_conversation();
+            if verdict.out_of_context < 0.50 {
+                note_out_of_context_reset(device);
+            }
+        } else if live {
+            let ooc = verdict.out_of_context >= 0.55
+                || verdict.other >= 0.55
+                || matches!(verdict.intent.as_str(), "meeting" | "note")
+                || matches!(verdict.kind.as_str(), "background" | "media");
+            if ooc {
+                let (streak, samples) = note_out_of_context(device, &text, &verdict);
+                eprintln!(
+                    "[ambient-router] out-of-context/unrelated turn #{streak} on {device} ({}/{}, ooc={:.2}, other={:.2}): {text:?}",
+                    verdict.kind, verdict.intent, verdict.out_of_context, verdict.other
+                );
+                if streak == 2 && !super::autonomy::mission_control_busy() {
+                    let msg = format!(
+                        "<ambient_context_alert device=\"{}\" streak=\"{streak}\">The voice classifier blocked {streak} consecutive spoken turns as out of context or directed at someone else:\n{}\nConfirm without disturbing the user: stay silent and either call schedule_wake with in_seconds: 10 (unless_user_speaks: true) to check if they say anything else for you, or call ambient_mode with passive if they have moved on to another conversation.</ambient_context_alert>",
+                        ambient_watch::escape(device),
+                        samples.join("\n")
+                    );
+                    super::autonomy::deliver_to_mission_control(d, msg).await;
+                } else if !pinned && (streak >= 3 || verdict.other >= 0.75 || matches!(verdict.intent.as_str(), "meeting") || matches!(verdict.kind.as_str(), "background" | "media")) {
+                    eprintln!("[ambient-router] closing active conversation on {device} after out-of-context/background speech");
+                    crate::ambient::end_conversation();
+                    note_out_of_context_reset(device);
+                }
+            }
         }
     }
     if !delivered && verdict.kept() && verdict.memorable >= MEMORABLE_THRESHOLD {
@@ -389,6 +405,36 @@ fn wake_verdict(early: Option<&Verdict>) -> Verdict {
 
 fn render(fallback: &str) -> String {
     fallback.to_string()
+}
+
+fn ooc_streaks() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static MAP: std::sync::OnceLock<Mutex<HashMap<String, Vec<String>>>> = std::sync::OnceLock::new();
+    MAP.get_or_init(Default::default)
+}
+
+fn note_out_of_context(device: &str, text: &str, v: &Verdict) -> (usize, Vec<String>) {
+    let mut map = ooc_streaks().lock().unwrap();
+    let list = map.entry(device.to_string()).or_default();
+    list.push(format!(
+        "- [judged={}/{}, out_of_context={:.2}, other_party={:.2}] {}",
+        v.kind,
+        v.intent,
+        v.out_of_context,
+        v.other,
+        ambient_watch::escape(&text.chars().take(180).collect::<String>())
+    ));
+    if list.len() > 5 {
+        list.remove(0);
+    }
+    (list.len(), list.clone())
+}
+
+fn out_of_context_streak(device: &str) -> usize {
+    ooc_streaks().lock().unwrap().get(device).map_or(0, Vec::len)
+}
+
+fn note_out_of_context_reset(device: &str) {
+    ooc_streaks().lock().unwrap().remove(device);
 }
 
 fn attached() -> &'static Mutex<std::collections::HashSet<String>> {
@@ -472,6 +518,13 @@ async fn deliver(
     }
     if v.other >= 0.3 {
         attrs.push_str(&format!(" other_party=\"{:.2}\"", v.other));
+    }
+    if v.out_of_context >= 0.3 {
+        attrs.push_str(&format!(" out_of_context=\"{:.2}\"", v.out_of_context));
+    }
+    let prior_ooc = out_of_context_streak(device);
+    if prior_ooc > 0 {
+        attrs.push_str(&format!(" prior_out_of_context_streak=\"{prior_ooc}\""));
     }
     if v.played >= 0.3 {
         attrs.push_str(&format!(" played_audio=\"{:.2}\"", v.played));

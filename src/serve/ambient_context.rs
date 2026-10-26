@@ -57,47 +57,87 @@ fn plain_text(content: &str) -> String {
     out
 }
 
+fn summarize_tool(tc: &crate::llm::ToolCallRecord) -> Option<String> {
+    let s = |k: &str| tc.arguments.get(k).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+    let summary = match tc.name.as_str() {
+        "speak" => return None,
+        "create_mission_task" | "update_mission_task" => {
+            format!("{}: {}", tc.name, clip(s("title").or_else(|| s("task_id")).unwrap_or("task"), 80, false))
+        }
+        "inspect_session" | "stop_session" | "create_mission_session" => {
+            format!("{}: {}", tc.name, clip(s("session_id").or_else(|| s("title")).unwrap_or("session"), 80, false))
+        }
+        "ambient_mode" => format!("ambient_mode: {}", s("mode").unwrap_or("")),
+        "ambient_expect" => format!("ambient_expect: {} ({})", s("kind").unwrap_or(""), clip(s("about").unwrap_or(""), 60, false)),
+        "schedule_wake" => format!("schedule_wake: {}", clip(s("note").unwrap_or(""), 70, false)),
+        "ping_user" => format!("ping_user: {}", clip(s("title").unwrap_or(""), 70, false)),
+        "list_mission_tasks" | "list_sessions" | "ambient_search" => tc.name.clone(),
+        other => format!("{other}"),
+    };
+    Some(redact(&summary))
+}
+
 pub(crate) fn mission_control(d: &Shared) -> Value {
     let now = chrono::Utc::now();
     let rows = d
         .store
-        .load_recent_conversation(crate::mission_control::SESSION_ID, 24)
+        .load_recent_conversation(crate::mission_control::SESSION_ID, 32)
         .unwrap_or_default();
     let mut chat: Vec<Value> = Vec::new();
-    let mut budget = 2000usize;
+    let mut tools: Vec<Value> = Vec::new();
+    let mut budget = 2400usize;
     for row in rows.iter().rev() {
-        if chat.len() >= 6 || budget < 80 {
+        if chat.len() >= 8 && tools.len() >= 5 {
             break;
-        }
-        let (who, via, raw, limit, end) = match &row.message {
-            crate::llm::HarnessMessage::User { content } => {
-                if crate::harness::is_daemon_envelope(content) {
-                    continue;
-                }
-                match super::ambient_watch::inner_turn(content) {
-                    Some(inner) => ("user", "spoken", inner, 240, false),
-                    None => ("user", "typed", content.clone(), 240, false),
-                }
-            }
-            crate::llm::HarnessMessage::Assistant { content, .. } => {
-                if content.trim().is_empty() {
-                    continue;
-                }
-                ("assistant", "chat", content.clone(), 300, true)
-            }
-            _ => continue,
-        };
-        let text = redact(&clip(&plain_text(&raw), limit, end));
-        if text.is_empty() {
-            continue;
         }
         let secs = chrono::DateTime::parse_from_rfc3339(&row.created_at)
             .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds())
             .unwrap_or(3600);
-        budget = budget.saturating_sub(text.len());
-        chat.push(json!({"who": who, "via": via, "when": bucket_ago(secs), "text": text}));
+        let when = bucket_ago(secs);
+        match &row.message {
+            crate::llm::HarnessMessage::User { content } => {
+                if chat.len() >= 8 || budget < 80 || crate::harness::is_daemon_envelope(content) {
+                    continue;
+                }
+                let (via, raw) = match super::ambient_watch::inner_turn(content) {
+                    Some(inner) => ("spoken", inner),
+                    None => ("typed", content.clone()),
+                };
+                let text = redact(&clip(&plain_text(&raw), 240, false));
+                if !text.is_empty() {
+                    budget = budget.saturating_sub(text.len());
+                    chat.push(json!({"who": "user", "via": via, "when": when, "text": text}));
+                }
+            }
+            crate::llm::HarnessMessage::Assistant { content, tool_calls } => {
+                for tc in tool_calls.iter().rev() {
+                    if tc.name == "speak" && chat.len() < 8 && budget >= 80 {
+                        if let Some(spoken) = tc.arguments.get("text").and_then(Value::as_str) {
+                            let text = redact(&clip(spoken, 260, false));
+                            if !text.is_empty() {
+                                budget = budget.saturating_sub(text.len());
+                                chat.push(json!({"who": "assistant", "via": "spoken", "when": when, "text": text}));
+                            }
+                        }
+                    } else if tools.len() < 5 {
+                        if let Some(summary) = summarize_tool(tc) {
+                            tools.push(json!({"when": when, "action": summary}));
+                        }
+                    }
+                }
+                if !content.trim().is_empty() && chat.len() < 8 && budget >= 80 {
+                    let text = redact(&clip(&plain_text(content), 280, true));
+                    if !text.is_empty() {
+                        budget = budget.saturating_sub(text.len());
+                        chat.push(json!({"who": "assistant", "via": "chat", "when": when, "text": text}));
+                    }
+                }
+            }
+            _ => continue,
+        }
     }
     chat.reverse();
+    tools.reverse();
     let pending = crate::session::state_path_for_id(crate::mission_control::SESSION_ID)
         .and_then(|p| crate::session::read_session_state(&p))
         .and_then(|s| s.pending_question)
@@ -106,5 +146,6 @@ pub(crate) fn mission_control(d: &Shared) -> Value {
         "waiting_for_user": pending.is_some(),
         "pending_question": pending,
         "recent_chat": chat,
+        "recent_tools": tools,
     })
 }

@@ -511,7 +511,6 @@ fn spawn_transcription(d: Shared, id: String) {
                 ended: started + duration_ms as f64 / 1000.0,
                 started_at,
                 continued: continued != 0,
-                during_playback: false,
             }),
         );
     });
@@ -658,7 +657,6 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
                 ended: e.started + e.duration_ms as f64 / 1000.0,
                 started_at,
                 continued: false,
-                during_playback: e.during_playback,
             }),
         );
     }
@@ -666,24 +664,6 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
         let _ = tokio::fs::write(audio_path(&e.id), super::listener::wav(&e.pcm)).await;
     }
     prune_audio(40).await;
-}
-
-pub(super) fn assistant_recent(device: &str, secs: i64) -> bool {
-    let since = chrono::Utc::now().timestamp() - secs;
-    crate::ambient::store()
-        .ok()
-        .and_then(|s| {
-            s.with_connection(|c| {
-                c.query_row(
-                    "SELECT COUNT(*) FROM ambient_turns WHERE role = 'assistant' AND device = ?1 AND created_at >= ?2",
-                    rusqlite::params![device, since],
-                    |r| r.get::<_, i64>(0),
-                )
-            })
-            .ok()
-        })
-        .unwrap_or(0)
-        > 0
 }
 
 pub(super) fn announce(d: &Shared, device: &str, seq: i64, skip: bool) {
