@@ -1212,9 +1212,7 @@ pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<S
             state_path,
             None,
             resume,
-            Some(Arc::new(std::sync::Mutex::new(
-                crate::llm::StreamBuffer::default(),
-            ))),
+            Some(crate::speech::mission_control_stream()),
         );
         sessions.insert(id.clone(), live_from_handle(handle, profile));
         if !resume {

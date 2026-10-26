@@ -35,6 +35,13 @@ use crate::session::{
 
 pub mod agent_routes;
 mod account_routes;
+mod ambient_routes;
+mod ambient_context;
+mod ambient_router;
+mod ambient_stream;
+mod assembly;
+mod listener;
+mod ambient_watch;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
 pub(crate) use config_routes::*;
@@ -250,6 +257,7 @@ impl Daemon {
     /// transiently fails (never wipes profiles on a bad read).
     async fn reload_config(&self) {
         if let Ok(fresh) = SnippetConfig::load(&self.config_path).await {
+            crate::tts::apply_config(&fresh);
             *self.config.lock().unwrap() = fresh;
         }
     }
@@ -337,7 +345,7 @@ impl Daemon {
                 sp,
                 initial,
                 true,
-                stream(),
+                Some(crate::speech::mission_control_stream()),
             );
         }
         if let Some(agent_id) = sidecar.as_ref().and_then(|s| s.agent_id.as_deref()) {
@@ -747,6 +755,19 @@ pub async fn run_serve(
 
     // Register the built-in agents before anything can address them.
     mission_control::register_builtin_agents(&daemon);
+    ambient_routes::resume(daemon.clone());
+    ambient_routes::warm_voice(daemon.clone());
+    {
+        let d = daemon.clone();
+        let handle = tokio::runtime::Handle::current();
+        crate::ambient::set_mode_hook(Box::new(move |mode, reason| {
+            let d = d.clone();
+            let body = format!("Ambient mode is now {mode} ({reason}).");
+            handle.spawn(async move {
+                agent_routes::record_agent_message(&d, crate::mission_control::SESSION_ID, "ambient mode", &body, false).await;
+            });
+        }));
+    }
 
     // Background self-update: periodically check for a newer release, replace the
     // binary in place, wait for every session to be between turns (so nothing
@@ -853,6 +874,21 @@ pub async fn run_serve(
             "/vault",
             get(vault_list).put(vault_set).delete(vault_delete),
         )
+        .route("/ambient/events", get(ambient_routes::list))
+        .route("/ambient/stream", get(ambient_stream::stream))
+        .route("/ambient/stats", get(ambient_routes::stats))
+        .route("/ambient/lease", post(ambient_routes::lease))
+        .route("/ambient/turns", get(ambient_routes::turns))
+        .route("/ambient/turns/played", post(ambient_routes::played))
+        .route("/ambient/turns/{id}/audio", get(ambient_routes::turn_audio))
+        .route("/ambient/turns/{id}/chunks/{seq}", get(ambient_routes::turn_chunk))
+        .route("/ambient/barge", post(ambient_routes::barge))
+        .route("/ambient/activity", post(ambient_routes::activity))
+        .route("/ambient/conversation/end", post(ambient_routes::end_conversation))
+        .route(
+            "/ambient/settings",
+            get(ambient_routes::get_settings).post(ambient_routes::set_settings),
+        )
         .route("/accounts", get(account_routes::list_accounts))
         .route("/accounts/add", post(account_routes::add_account))
         .route("/accounts/remove", post(account_routes::remove_account))
@@ -871,6 +907,7 @@ pub async fn run_serve(
         .route("/session/fork", post(fork_session))
         .route("/session/exec", post(exec_in_session))
         .route("/session/delete", post(delete_session))
+        .route("/session/interrupt", post(session_routes::interrupt_session))
         .route("/session/rename", post(rename_session))
         .route("/git/worktrees", get(git_worktrees))
         .route("/git/status", post(git_status))
@@ -898,6 +935,9 @@ pub async fn run_serve(
         .await
         .map_err(|e| format!("bind {addr}: {e}"))?;
 
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     let mut server = tokio::spawn(async move { axum::serve(listener, app).await });
 
     // A tunnel the user asked for by name is fatal when it fails. Auto mode with

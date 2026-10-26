@@ -49,7 +49,7 @@ pub fn conversation_meta_definitions_for(
 fn cancel_delegated_task_tool() -> NativeToolDefinition {
     NativeToolDefinition {
         name: "cancel_delegated_task".to_string(),
-        description: "Stop one RUNNING delegated task and reclaim its scope before doing that work yourself. Use only when the user redirects, the work is now unnecessary, or you must deliberately take over. Give the lane_id and a concise reason. The lane's partial workspace changes are preserved; validate them before relying on them.".to_string(),
+        description: "Stop one running or paused delegated task and reclaim its scope before doing that work yourself. Use only when the user redirects, the work is now unnecessary, or you must deliberately take over. Give the lane_id and a concise reason. The lane's partial workspace changes are preserved; validate them before relying on them.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {

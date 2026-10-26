@@ -935,6 +935,14 @@ impl CodingHarness {
         if let Some(effort) = Self::effort_arg(profile) {
             cmd.args(["--effort", effort]);
         }
+        let compact_threshold = profile
+            .context_window
+            .saturating_mul(profile.compact_at_pct.clamp(1, 100) as u64)
+            / 100;
+        if compact_threshold > 0 {
+            let auto_tokens = compact_threshold.clamp(100_000, 1_000_000);
+            cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", auto_tokens.to_string());
+        }
         if let Some(id) = session.id.as_deref() {
             cmd.args([if session.started { "--resume" } else { "--session-id" }, id]);
             if session.forking {
@@ -1016,7 +1024,11 @@ impl CodingHarness {
             let mut tail = String::new();
             if let Some(stderr) = stderr {
                 let mut err_reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = err_reader.next_line().await {
+                while let Ok(Some(line)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), err_reader.next_line())
+                        .await
+                        .unwrap_or(Ok(None))
+                {
                     tail.push_str(&line);
                     tail.push('\n');
                     if tail.len() > 4000 {
@@ -1239,7 +1251,7 @@ impl CodingHarness {
                         .context_window_tokens
                         .saturating_mul(self.config.compact_at_pct.clamp(1, 100) as u64)
                         / 100;
-                    let full = away && threshold > 0 && session.tokens >= threshold;
+                    let full = (away || once) && threshold > 0 && session.tokens >= threshold;
                     if rewritten || behind || full {
                         if let Some(mut p) = process.take() {
                             let _ = p.child.start_kill();
@@ -1376,7 +1388,7 @@ impl CodingHarness {
                             if text.is_empty() {
                                 continue;
                             }
-                            if state.pending_question.is_some() && is_daemon_envelope(&text) {
+                            if state.pending_question.is_some() && is_held_envelope(&text) {
                                 held_envelopes.push(text);
                                 continue;
                             }
@@ -2302,6 +2314,12 @@ impl CodingHarness {
                     let message = event.get("result").and_then(Value::as_str)
                         .or_else(|| event.get("subtype").and_then(Value::as_str))
                         .unwrap_or("Claude Code reported an error").to_string();
+                    if matches!(state.events.last(), Some(HarnessEvent::AssistantText { text }) if text.trim() == message.trim()) {
+                        state.events.pop();
+                        if matches!(state.messages.last(), Some(HarnessMessage::Assistant { content, tool_calls }) if tool_calls.is_empty() && content.trim() == message.trim()) {
+                            state.messages.pop();
+                        }
+                    }
                     state.events.push(HarnessEvent::ModelError { message });
                 } else if let Some(text) = event.get("result").and_then(Value::as_str) {
                     state.final_text = Some(text.to_string());

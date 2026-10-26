@@ -225,7 +225,7 @@ impl CodingHarness {
                             let hold = !was_running
                                 && state.status == HarnessStatus::WaitingForInput
                                 && state.pending_question.is_some()
-                                && is_daemon_envelope(&text);
+                                && is_held_envelope(&text);
                             had_user_msg |= !hold;
                             if was_running {
                                 // Mid-run steer: the step continues; fold it in.
@@ -330,15 +330,11 @@ impl CodingHarness {
                     &mut lane_rx,
                     &mut progress_rx,
                     &mut watch_rx,
+                    &mut pending_inputs,
                 );
                 if interrupted {
-                    state.status = HarnessStatus::Interrupted;
-                    state.events.push(HarnessEvent::SystemDecision {
-                        step: "interrupted".to_string(),
-                        reasoning: "User interrupted the run.".to_string(),
-                    });
-                    self.persist(&mut state, &lanes).await?;
-                    break;
+                    self.park_interrupted(&mut state, &lanes).await?;
+                    continue;
                 }
                 if wants_compact {
                     self.run_manual_compaction(model, &mut state, &lanes)
@@ -416,17 +412,10 @@ impl CodingHarness {
                     }
                     repair_unanswered_tool_events(&mut state.events, evt_mark);
                     repair_unanswered_tool_calls(&mut state.messages);
-                    // Apply any pending inputs (such as queued messages sent immediately via SteerQueued,
-                    // UserMessages, newly queued inputs, and notices) so they survive into the transcript.
-                    self.apply_interrupted_pending(&mut state, &mut pending_inputs);
+                    trim_spoken_calls(&mut state, evt_mark);
                     state.history_rewritten = true;
-                    state.status = HarnessStatus::Interrupted;
-                    state.events.push(HarnessEvent::SystemDecision {
-                        step: "interrupted".to_string(),
-                        reasoning: "User interrupted the run.".to_string(),
-                    });
-                    self.persist(&mut state, &lanes).await?;
-                    break;
+                    self.park_interrupted(&mut state, &lanes).await?;
+                    continue;
                 };
 
                 match result {
@@ -448,7 +437,20 @@ impl CodingHarness {
                         if self.config.memory_enabled && self.context.lane_origin().is_none() {
                             self.tidy_memory();
                         }
+                        let voice_turn = state
+                            .messages
+                            .iter()
+                            .rev()
+                            .find_map(|m| match m {
+                                HarnessMessage::User { content } => Some(content.contains("<ambient_turn")),
+                                _ => None,
+                            })
+                            .unwrap_or(false);
+                        if voice_turn {
+                            crate::ambient::release_hold();
+                        }
                         if matches!(kind, TurnEndKind::Complete)
+                            && !voice_turn
                             && self.config.memory_enabled
                             && self.config.memory_reflect
                             && self.context.owner() == "main"
@@ -526,14 +528,8 @@ impl CodingHarness {
                                         pending_inputs.push(msg);
                                     }
                                 }
-                                self.apply_interrupted_pending(&mut state, &mut pending_inputs);
-                                state.status = HarnessStatus::Interrupted;
-                                state.events.push(HarnessEvent::SystemDecision {
-                                    step: "interrupted".to_string(),
-                                    reasoning: "User interrupted the run.".to_string(),
-                                });
-                                self.persist(&mut state, &lanes).await?;
-                                break;
+                                self.park_interrupted(&mut state, &lanes).await?;
+                                continue;
                             }
                             Some(RecoveryAction::Retry) => {
                                 self.persist(&mut state, &lanes).await?;
@@ -578,7 +574,7 @@ impl CodingHarness {
                             }
                             if state.status == HarnessStatus::WaitingForInput
                                 && state.pending_question.is_some()
-                                && is_daemon_envelope(&text)
+                                && is_held_envelope(&text)
                             {
                                 state.queued_inputs.push(QueuedInput {
                                     id: uuid::Uuid::new_v4().simple().to_string(),
@@ -664,7 +660,13 @@ impl CodingHarness {
                                 self.persist(&mut state, &lanes).await?;
                             }
                         }
-                        Some(LoopInput::Interrupt) | None => {
+                        Some(LoopInput::Interrupt) => {
+                            state.pending_question = None;
+                            state.status = HarnessStatus::Interrupted;
+                            self.persist(&mut state, &lanes).await?;
+                            state.status = HarnessStatus::Idle;
+                        }
+                        None => {
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;
                             break;
@@ -787,3 +789,48 @@ pub(super) fn backoff_delay(attempt: usize, base_ms: u64, max_ms: u64) -> Durati
     Duration::from_millis(delay)
 }
 
+
+
+impl CodingHarness {
+    async fn park_interrupted(&self, state: &mut HarnessState, lanes: &LaneManager) -> Result<(), ToolError> {
+        state.pending_question = None;
+        state.status = HarnessStatus::Interrupted;
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "interrupted".to_string(),
+            reasoning: "User interrupted the run.".to_string(),
+        });
+        self.persist(state, lanes).await?;
+        state.status = HarnessStatus::Idle;
+        Ok(())
+    }
+}
+
+fn is_speak_tool(name: &str) -> bool {
+    name == "speak" || name.ends_with("__speak")
+}
+
+fn trim_spoken_calls(state: &mut HarnessState, evt_mark: usize) {
+    for message in state.messages.iter_mut().rev() {
+        match message {
+            HarnessMessage::User { .. } => break,
+            HarnessMessage::Assistant { tool_calls, .. } => {
+                for call in tool_calls.iter_mut().filter(|c| is_speak_tool(&c.name)) {
+                    if let Some(cut) = call.arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
+                        call.arguments["text"] = serde_json::Value::String(cut);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let from = evt_mark.min(state.events.len());
+    for event in state.events[from..].iter_mut() {
+        if let HarnessEvent::ToolCall { tool_name, arguments } = event {
+            if is_speak_tool(tool_name) {
+                if let Some(cut) = arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
+                    arguments["text"] = serde_json::Value::String(cut);
+                }
+            }
+        }
+    }
+}

@@ -85,6 +85,7 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
         LaneStatus::Running => warn(),
         LaneStatus::Completed => success(),
         LaneStatus::Failed => danger(),
+        LaneStatus::Paused => warn(),
         LaneStatus::Cancelled => faint(),
     };
     let mut list_lines = Vec::new();
@@ -129,7 +130,7 @@ pub(crate) fn render_lanes(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App
                 .as_deref()
                 .or(item.report.as_deref())
                 .unwrap_or("completed"),
-            LaneStatus::Failed | LaneStatus::Cancelled => {
+            LaneStatus::Failed | LaneStatus::Paused | LaneStatus::Cancelled => {
                 item.error.as_deref().unwrap_or("cancelled")
             }
         };

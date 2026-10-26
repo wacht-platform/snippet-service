@@ -154,6 +154,9 @@ impl AnthropicModel {
 
         let mut anthropic_tools: Vec<AnthropicTool> =
             tools.iter().map(anthropic_tool_from_definition).collect();
+        if let Some(speak) = anthropic_tools.iter_mut().find(|tool| tool.name == "speak") {
+            speak.eager_input_streaming = Some(true);
+        }
         if self.config.cache_prompt {
             if let Some(last_tool) = anthropic_tools.last_mut() {
                 last_tool.cache_control = Some(json!({"type": "ephemeral"}));
@@ -466,6 +469,9 @@ async fn parse_anthropic_sse(
                     _ => {}
                 }
                 if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("tool_use") {
+                    let call_id = block.and_then(|b| b.get("id")).and_then(Value::as_str).unwrap_or(index.to_string().as_str()).to_string();
+                    let name = block.and_then(|b| b.get("name")).and_then(Value::as_str).unwrap_or("").to_string();
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Start { call_id, name });
                     tools.insert(
                         index,
                         PendingTool {
@@ -482,6 +488,13 @@ async fn parse_anthropic_sse(
                             partial: String::new(),
                         },
                     );
+                }
+            }
+            Some("content_block_stop") => {
+                let index = event.get("index").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(tool) = tools.get(&index) {
+                    let call_id = if tool.id.is_empty() { index.to_string() } else { tool.id.clone() };
+                    StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id });
                 }
             }
             Some("content_block_delta") => {
@@ -509,22 +522,20 @@ async fn parse_anthropic_sse(
                             }
                         }
                     }
+                    Some("input_json_delta") => {
+                        if let Some(chunk) = delta.and_then(|d| d.get("partial_json")).and_then(Value::as_str) {
+                            if let Some(tool) = tools.get_mut(&index) {
+                                tool.partial.push_str(chunk);
+                                StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: if tool.id.is_empty() { index.to_string() } else { tool.id.clone() }, chunk: chunk.to_string() });
+                            }
+                        }
+                    }
                     Some("signature_delta") => {
                         if let (Some(block), Some(sig)) = (
                             thinking.get_mut(&index),
                             delta.and_then(|d| d.get("signature")).and_then(Value::as_str),
                         ) {
                             block["signature"] = json!(format!("{}{sig}", block["signature"].as_str().unwrap_or("")));
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        if let (Some(tool), Some(chunk)) = (
-                            tools.get_mut(&index),
-                            delta
-                                .and_then(|d| d.get("partial_json"))
-                                .and_then(Value::as_str),
-                        ) {
-                            tool.partial.push_str(chunk);
                         }
                     }
                     _ => {}
@@ -794,6 +805,8 @@ struct AnthropicTool {
     input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eager_input_streaming: Option<bool>,
 }
 
 fn anthropic_tool_from_definition(definition: &NativeToolDefinition) -> AnthropicTool {
@@ -802,6 +815,7 @@ fn anthropic_tool_from_definition(definition: &NativeToolDefinition) -> Anthropi
         description: definition.description.clone(),
         input_schema: definition.input_schema.clone(),
         cache_control: None,
+        eager_input_streaming: None,
     }
 }
 

@@ -4,6 +4,7 @@
 unsafe extern "C" {}
 
 pub mod accounts;
+pub mod ambient;
 pub mod agent_tools;
 pub mod anthropic;
 pub mod artifacts;
@@ -43,10 +44,14 @@ pub mod session;
 pub mod shell_guard;
 pub mod signals;
 pub mod skills;
+pub mod speech;
+pub mod stt;
 pub mod sse;
 pub mod store;
 pub mod term;
 pub mod tools;
+pub mod tts;
+pub mod tts_stream;
 pub mod tui;
 pub mod update;
 pub mod usage_ledger;

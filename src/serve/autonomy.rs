@@ -10,15 +10,74 @@ use crate::harness::{HarnessStatus, LoopInput};
 use crate::mission_control::SESSION_ID;
 use crate::mission_autonomy;
 
-const TICK: Duration = Duration::from_secs(5);
+const TICK: Duration = Duration::from_secs(1);
+const ROUND_EVERY: Duration = Duration::from_secs(5);
 const STALL_SECS: i64 = 20 * 60;
 
+fn spawn_quick_wake(daemon: Shared, w: crate::ambient::QuickWake) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(w.seconds)).await;
+        if w.unless_user_speaks && crate::ambient::run_generation() != w.generation {
+            eprintln!("[ambient] quick wake ({}s) cancelled: user spoke first", w.seconds);
+            return;
+        }
+        if mission_control_busy() {
+            return;
+        }
+        let since = chrono::Utc::now().timestamp() - (w.seconds as i64 + 15);
+        let recent: Vec<String> = daemon
+            .store
+            .with_connection(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT COALESCE(verdict, 'unjudged'), COALESCE(intent, 'unjudged'), delivered, text
+                     FROM ambient_events
+                     WHERE status = 'done' AND text != '' AND created_at >= ?1
+                     ORDER BY started_at ASC LIMIT 8",
+                )?;
+                let rows = stmt
+                    .query_map([since], |r| {
+                        let v: String = r.get(0)?;
+                        let i: String = r.get(1)?;
+                        let del: i64 = r.get(2)?;
+                        let t: String = r.get(3)?;
+                        Ok(format!(
+                            "- [judged={v}/{i}, delivered={}] {}",
+                            if del != 0 { "yes" } else { "no" },
+                            super::ambient_watch::escape(&t.chars().take(180).collect::<String>())
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap_or_default();
+        let mic = if recent.is_empty() {
+            "No new speech was heard on the microphone during the wait.".to_string()
+        } else {
+            format!("Recent microphone lines (including any filtered out by the classifier):\n{}", recent.join("\n"))
+        };
+        let envelope = format!(
+            "<ambient_check_in waited_secs=\"{}\" note=\"{}\">{mic}</ambient_check_in>",
+            w.seconds,
+            super::ambient_watch::escape(&w.note)
+        );
+        deliver_to_mission_control(&daemon, envelope).await;
+    });
+}
+
 pub async fn autonomy_loop(daemon: Shared) {
+    let mut last_round = std::time::Instant::now();
     loop {
         tokio::time::sleep(TICK).await;
+        for w in crate::ambient::take_quick_wakes() {
+            spawn_quick_wake(daemon.clone(), w);
+        }
         for queued in mission_autonomy::take_answers() {
             daemon.deliver(&queued.session_id, LoopInput::Answer(queued.answer)).await;
         }
+        if last_round.elapsed() < ROUND_EVERY {
+            continue;
+        }
+        last_round = std::time::Instant::now();
         let state = mission_autonomy::load();
         if !state.settings.on {
             continue;
@@ -56,7 +115,60 @@ pub async fn autonomy_loop(daemon: Shared) {
     }
 }
 
-async fn deliver_to_mission_control(daemon: &Shared, text: String) {
+static HUMAN_AT: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> = std::sync::Mutex::new(None);
+
+pub(super) fn note_human() {
+    *HUMAN_AT.lock().unwrap() = Some(chrono::Utc::now());
+}
+
+pub(super) fn human_at() -> Option<chrono::DateTime<chrono::Utc>> {
+    *HUMAN_AT.lock().unwrap()
+}
+
+static MC_INPUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEARD_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+pub(super) fn mission_control_inputs() -> u64 {
+    MC_INPUTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(super) fn note_input() {
+    MC_INPUTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(super) fn note_heard() {
+    *HEARD_AT.lock().unwrap() = Some(std::time::Instant::now());
+}
+
+pub(super) fn resume_unless_heard(daemon: Shared) {
+    use std::time::{Duration, Instant};
+    let sent = mission_control_inputs();
+    let started = Instant::now();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if mission_control_inputs() != sent {
+                return;
+            }
+            let quiet = HEARD_AT.lock().unwrap().is_none_or(|t| t.elapsed() >= Duration::from_millis(2500));
+            if quiet || started.elapsed() >= Duration::from_secs(60) {
+                break;
+            }
+        }
+        if mission_control_busy() {
+            return;
+        }
+        eprintln!("[ambient-speech] no new turn followed the barge-in; resuming Mission Control");
+        deliver_to_mission_control(
+            &daemon,
+            "<ambient_resume>Something cut you off but no new request followed. Carry on: answer Chief's latest turn or continue what you were doing, without mentioning the interruption.</ambient_resume>".to_string(),
+        )
+        .await;
+    });
+}
+
+pub(super) async fn deliver_to_mission_control(daemon: &Shared, text: String) {
+    note_input();
     if let Err(error) = super::mission_control::open_mission_control(daemon, None).await {
         eprintln!("[autonomy] could not open Mission Control: {error}");
         return;
@@ -64,7 +176,15 @@ async fn deliver_to_mission_control(daemon: &Shared, text: String) {
     daemon.deliver(SESSION_ID, LoopInput::UserMessage(text)).await;
 }
 
-fn mission_control_busy() -> bool {
+pub(super) async fn interrupt_mission_control(daemon: &Shared) -> bool {
+    if !mission_control_busy() {
+        return false;
+    }
+    daemon.deliver(SESSION_ID, LoopInput::Interrupt).await;
+    true
+}
+
+pub(super) fn mission_control_busy() -> bool {
     crate::session::read_session_state(&crate::mission_control::session_state_path())
         .is_some_and(|s| matches!(s.status, HarnessStatus::Running | HarnessStatus::WaitingForInput))
 }
@@ -106,7 +226,7 @@ fn session_status(id: &str) -> Option<crate::harness::HarnessState> {
     crate::session::state_path_for_id(id).and_then(|p| crate::session::read_session_state(&p))
 }
 
-fn question_text(question: &Value) -> String {
+pub(super) fn question_text(question: &Value) -> String {
     let mut lines = Vec::new();
     if let Some(context) = question.get("context").and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
         lines.push(context.trim().to_string());

@@ -1,0 +1,892 @@
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+use super::Shared;
+
+const BPS: f64 = 32_000.0;
+const RING: usize = 32_000 * 180;
+const MIN_SEND: u64 = 1_024;
+const MAX_SEND: u64 = 24_000;
+const REPLAY: u64 = 32_000 * 10;
+const PAD: u64 = 9_600;
+const ECHO_HANGOVER_BYTES: u64 = 9_600;
+const IDLE_CLOSE: Duration = Duration::from_secs(60);
+const FLUX_IDLE_CLOSE: Duration = Duration::from_secs(600);
+const URGENT: &[&str] = &["stop", "wait", "hold", "pause", "no", "nope", "sorry", "actually", "hang", "snippet", "chief", "enough", "shut", "quiet"];
+const SAMPLE: Duration = Duration::from_millis(250);
+
+enum Cmd {
+    Audio(Vec<u8>),
+    Config(String),
+    Force,
+}
+
+struct Conn {
+    id: u64,
+    flux: bool,
+    tx: Option<mpsc::UnboundedSender<Cmd>>,
+    base: u64,
+    sent: u64,
+    active: bool,
+}
+
+struct Live {
+    conn: u64,
+    turn: i64,
+    seq: i64,
+    interrupted: bool,
+}
+
+#[derive(Default)]
+struct Inner {
+    ring: VecDeque<u8>,
+    ring_start: u64,
+    g: u64,
+    anchors: VecDeque<(u64, f64)>,
+    playing: VecDeque<(u64, bool)>,
+    media: VecDeque<(u64, bool)>,
+    play_flag: bool,
+    media_flag: bool,
+    audible: bool,
+    sampled: Option<Instant>,
+    conn: Option<Conn>,
+    retry_at: Option<Instant>,
+    failures: u32,
+    pending_from: u64,
+    last_final: u64,
+    live: Option<Live>,
+    stream: Option<u32>,
+    delivered: Option<(u64, i64, usize)>,
+}
+
+pub(super) struct Listener {
+    device: String,
+    d: Shared,
+    inner: Mutex<Inner>,
+}
+
+fn hub() -> &'static Mutex<HashMap<String, Arc<Listener>>> {
+    static HUB: OnceLock<Mutex<HashMap<String, Arc<Listener>>>> = OnceLock::new();
+    HUB.get_or_init(Default::default)
+}
+
+fn get(d: &Shared, device: &str) -> Arc<Listener> {
+    hub()
+        .lock()
+        .unwrap()
+        .entry(device.to_string())
+        .or_insert_with(|| Arc::new(Listener { device: device.to_string(), d: d.clone(), inner: Mutex::new(Inner::default()) }))
+        .clone()
+}
+
+fn copy_range(ring: &VecDeque<u8>, from: usize, len: usize) -> Vec<u8> {
+    let (a, b) = ring.as_slices();
+    let mut out = Vec::with_capacity(len);
+    if from < a.len() {
+        out.extend_from_slice(&a[from..a.len().min(from + len)]);
+    }
+    if out.len() < len {
+        let skip = from.saturating_sub(a.len());
+        out.extend_from_slice(&b[skip..skip + (len - out.len())]);
+    }
+    out
+}
+
+fn next_seq() -> i64 {
+    static SEQ: AtomicI64 = AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut prev = SEQ.load(Ordering::SeqCst);
+    loop {
+        let next = (prev + 1).max(now);
+        match SEQ.compare_exchange(prev, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(p) => prev = p,
+        }
+    }
+}
+
+struct Creds {
+    flux: bool,
+    key: String,
+    terms: Vec<String>,
+    host: String,
+}
+
+fn credentials(d: &Shared) -> Option<Creds> {
+    let c = d.config.lock().unwrap();
+    let flux = c.ambient.stt == "flux";
+    let key = if flux { &c.deepgram_api_key } else { &c.assemblyai_api_key };
+    let key = key.clone().filter(|k| !k.trim().is_empty())?;
+    let mut terms = c.ambient.wake_phrases.clone();
+    for extra in ["Snippet", "Mission Control"] {
+        if !terms.iter().any(|t| t.eq_ignore_ascii_case(extra)) {
+            terms.push(extra.to_string());
+        }
+    }
+    let host = c.ambient.deepgram_host.trim().to_string();
+    Some(Creds { flux, key, terms, host: if host.is_empty() { "api.deepgram.com".into() } else { host } })
+}
+
+fn active_mode() -> bool {
+    crate::ambient::conversation().is_some() || crate::ambient::expectation().is_some()
+}
+
+fn silences(active: bool) -> (u32, u32) {
+    if active { (100, 500) } else { (200, 1000) }
+}
+
+const FLUX_EAGER: f64 = 0.4;
+
+fn flux_eot(active: bool) -> (f64, u32) {
+    if active { (0.7, 1200) } else { (0.8, 2500) }
+}
+
+fn tuning(flux: bool, active: bool) -> String {
+    if flux {
+        let (eot, timeout) = flux_eot(active);
+        serde_json::json!({"type":"Configure","thresholds":{"eager_eot_threshold":FLUX_EAGER,"eot_threshold":eot,"eot_timeout_ms":timeout}}).to_string()
+    } else {
+        let (min, max) = silences(active);
+        serde_json::json!({"type":"UpdateConfiguration","min_turn_silence":min,"max_turn_silence":max}).to_string()
+    }
+}
+
+fn flux_turn(v: &serde_json::Value) -> Option<serde_json::Value> {
+    let event = v.get("event")?.as_str()?;
+    let event = if event == "EagerEndOfTurn" { "EndOfTurn" } else { event };
+    let words: Vec<serde_json::Value> = v
+        .get("words")
+        .and_then(|w| w.as_array())
+        .map(|ws| {
+            ws.iter()
+                .filter_map(|w| {
+                    Some(serde_json::json!({
+                        "text": w.get("word")?.as_str()?,
+                        "start": w.get("start")?.as_f64()? * 1000.0,
+                        "end": w.get("end")?.as_f64()? * 1000.0,
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let transcript = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("");
+    let ended = event == "EndOfTurn";
+    if !ended && words.is_empty() && transcript.trim().is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({"turn_order": v.get("turn_index")?, "end_of_turn": ended, "transcript": transcript, "words": words}))
+}
+
+fn at(marks: &VecDeque<(u64, bool)>, g: u64) -> bool {
+    marks.iter().rev().find(|(m, _)| *m <= g).map(|(_, v)| *v).unwrap_or(false)
+}
+
+fn trim(marks: &mut VecDeque<(u64, bool)>, from: u64) {
+    while marks.len() > 1 && marks[1].0 <= from {
+        marks.pop_front();
+    }
+}
+
+fn set(marks: &mut VecDeque<(u64, bool)>, g: u64, on: bool) {
+    while marks.back().is_some_and(|(m, _)| *m >= g) {
+        marks.pop_back();
+    }
+    if marks.back().map(|(_, v)| *v) != Some(on) {
+        marks.push_back((g, on));
+    }
+}
+
+pub(super) fn wav(pcm: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(44 + pcm.len());
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&16_000u32.to_le_bytes());
+    out.extend_from_slice(&32_000u32.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    out.extend_from_slice(pcm);
+    out
+}
+
+pub(super) async fn open(d: &Shared, device: &str, h: u32, started_at: Option<&str>) -> Result<(), u16> {
+    d.reload_config().await;
+    if !d.config.lock().unwrap().ambient.enabled {
+        return Err(403);
+    }
+    if device.is_empty() {
+        return Err(400);
+    }
+    if !crate::ambient::lease_touch(device, None, false) {
+        return Err(409);
+    }
+    if credentials(d).is_none() {
+        return Err(503);
+    }
+    let wall = started_at
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.timestamp_millis() as f64 / 1000.0)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+    let l = get(d, device);
+    l.finish_stream(false);
+    let mut s = l.inner.lock().unwrap();
+    let g = s.g;
+    s.anchors.push_back((g, wall));
+    while s.anchors.len() > 64 {
+        s.anchors.pop_front();
+    }
+    s.stream = Some(h);
+    drop(s);
+    l.ensure();
+    Ok(())
+}
+
+pub(super) fn warm(d: &Shared, device: &str) {
+    let flux = credentials(d).is_some_and(|c| c.flux);
+    if flux && d.config.lock().unwrap().ambient.enabled {
+        get(d, device).connect_if_needed(true);
+    }
+}
+
+pub(super) fn audio(device: &str, h: u32, pcm: &[u8]) -> bool {
+    let Some(l) = hub().lock().unwrap().get(device).cloned() else { return false };
+    {
+        let mut s = l.inner.lock().unwrap();
+        if s.stream != Some(h) {
+            return false;
+        }
+        s.ring.extend(pcm);
+        s.g += pcm.len() as u64;
+        if s.ring.len() > RING {
+            let n = s.ring.len() - RING;
+            s.ring.drain(..n);
+            s.ring_start += n as u64;
+            let from = s.ring_start;
+            trim(&mut s.playing, from);
+            trim(&mut s.media, from);
+        }
+    }
+    l.sample();
+    l.ensure();
+    l.pump(false);
+    true
+}
+
+pub(super) fn restart_all() {
+    let all: Vec<Arc<Listener>> = hub().lock().unwrap().values().cloned().collect();
+    for l in all {
+        if let Some(c) = l.inner.lock().unwrap().conn.as_mut() {
+            c.tx = None;
+        }
+    }
+}
+
+pub(super) fn close(device: &str, h: Option<u32>) {
+    let Some(l) = hub().lock().unwrap().get(device).cloned() else { return };
+    if h.is_none() || l.inner.lock().unwrap().stream == h {
+        l.finish_stream(true);
+    }
+}
+
+pub(super) fn flag(device: &str, kind: &str, on: bool) {
+    let Some(l) = hub().lock().unwrap().get(device).cloned() else { return };
+    let mut s = l.inner.lock().unwrap();
+    let g = s.g;
+    match kind {
+        "media" => {
+            s.media_flag = on;
+            set(&mut s.media, g, on);
+        }
+        _ => {
+            s.play_flag = on;
+            let v = on || s.audible;
+            let at_g = if v { g } else { g + ECHO_HANGOVER_BYTES };
+            set(&mut s.playing, at_g, v);
+        }
+    }
+}
+
+impl Listener {
+    fn finish_stream(&self, force: bool) {
+        let mut s = self.inner.lock().unwrap();
+        if s.stream.take().is_none() {
+            return;
+        }
+        let unsent = s.conn.as_ref().map(|c| s.g - c.sent).unwrap_or(0);
+        if unsent > 0 && unsent < MIN_SEND {
+            let pad = (MIN_SEND - unsent) as usize;
+            s.ring.extend(std::iter::repeat_n(0u8, pad));
+            s.g += pad as u64;
+        }
+        drop(s);
+        self.pump(true);
+        if force {
+            if let Some(tx) = self.inner.lock().unwrap().conn.as_ref().and_then(|c| c.tx.clone()) {
+                let _ = tx.send(Cmd::Force);
+            }
+        }
+    }
+
+    fn sample(&self) {
+        let due = {
+            let s = self.inner.lock().unwrap();
+            s.sampled.is_none_or(|t| t.elapsed() >= SAMPLE)
+        };
+        if !due {
+            return;
+        }
+        let audible = crate::speech::is_audible(&self.device);
+        let active = active_mode();
+        let mut s = self.inner.lock().unwrap();
+        s.sampled = Some(Instant::now());
+        s.audible = audible;
+        let (g, v) = (s.g, audible || s.play_flag);
+        let at_g = if v { g } else { g + ECHO_HANGOVER_BYTES };
+        set(&mut s.playing, at_g, v);
+        if let Some(c) = s.conn.as_mut()
+            && c.active != active
+            && let Some(tx) = c.tx.as_ref()
+        {
+            c.active = active;
+            let _ = tx.send(Cmd::Config(tuning(c.flux, active)));
+        }
+    }
+
+    fn ensure(self: &Arc<Self>) {
+        self.connect_if_needed(false);
+    }
+
+    fn connect_if_needed(self: &Arc<Self>, warm: bool) {
+        static IDS: AtomicU64 = AtomicU64::new(1);
+        let mut s = self.inner.lock().unwrap();
+        if s.conn.is_some() || (s.stream.is_none() && !warm) || s.retry_at.is_some_and(|t| t > Instant::now()) {
+            return;
+        }
+        let Some(creds) = credentials(&self.d) else { return };
+        let id = IDS.fetch_add(1, Ordering::SeqCst);
+        let base = s.pending_from.max(s.ring_start).min(s.g);
+        let active = active_mode();
+        let flux = creds.flux;
+        s.conn = Some(Conn { id, flux, tx: None, base, sent: base, active });
+        drop(s);
+        let me = self.clone();
+        tokio::spawn(async move {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let ws = connect(&creds, active).await;
+            let ws = match ws {
+                Ok(ws) => {
+                    {
+                        let mut s = me.inner.lock().unwrap();
+                        s.failures = 0;
+                        s.retry_at = None;
+                        if let Some(c) = s.conn.as_mut().filter(|c| c.id == id) {
+                            c.tx = Some(tx);
+                        }
+                    }
+                    me.pump(false);
+                    ws
+                }
+                Err(e) => {
+                    eprintln!("[listener] {} connect failed: {e}", me.device);
+                    me.dropped(id, false);
+                    return;
+                }
+            };
+            let idle = run(&me, id, ws, rx, flux).await;
+            if let Err(e) = &idle {
+                eprintln!("[listener] {} stream ended: {e}", me.device);
+            }
+            let quiet = me.inner.lock().unwrap().stream.is_none();
+            me.dropped(id, idle.is_ok() || quiet);
+        });
+    }
+
+    fn dropped(self: &Arc<Self>, id: u64, idle: bool) {
+        let mut s = self.inner.lock().unwrap();
+        let Some(c) = s.conn.take_if(|c| c.id == id) else { return };
+        if idle {
+            s.pending_from = c.sent;
+        } else {
+            s.failures += 1;
+            let wait = Duration::from_millis((500u64 << s.failures.min(6)).min(30_000));
+            s.retry_at = Some(Instant::now() + wait);
+            s.pending_from = s.last_final.max(c.base).max(s.g.saturating_sub(REPLAY));
+        }
+        let stale = s.live.take();
+        drop(s);
+        if let Some(live) = stale {
+            super::ambient_routes::announce(&self.d, &self.device, live.seq, true);
+        }
+    }
+
+    fn pump(&self, all: bool) {
+        let mut s = self.inner.lock().unwrap();
+        let (g, ring_start) = (s.g, s.ring_start);
+        let Some(c) = s.conn.as_ref() else { return };
+        let Some(tx) = c.tx.clone() else { return };
+        let mut sent = c.sent.max(ring_start);
+        let mut chunks = Vec::new();
+        while g - sent >= MIN_SEND || (all && g > sent) {
+            let n = (g - sent).min(MAX_SEND);
+            let from = (sent - ring_start) as usize;
+            chunks.push(copy_range(&s.ring, from, n as usize));
+            sent += n;
+        }
+        if let Some(c) = s.conn.as_mut() {
+            c.sent = sent;
+        }
+        drop(s);
+        for chunk in chunks {
+            let _ = tx.send(Cmd::Audio(chunk));
+        }
+    }
+
+    fn on_turn(&self, conn: u64, v: &serde_json::Value) {
+        let Some(order) = v.get("turn_order").and_then(|x| x.as_i64()) else { return };
+        super::autonomy::note_heard();
+        let ended = v.get("end_of_turn").and_then(|x| x.as_bool()).unwrap_or(false);
+        let transcript = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        let mut s = self.inner.lock().unwrap();
+        let Some(base) = s.conn.as_ref().filter(|c| c.id == conn).map(|c| c.base) else { return };
+        let words: Vec<Heard> = v
+            .get("words")
+            .and_then(|x| x.as_array())
+            .map(|ws| {
+                ws.iter()
+                    .filter_map(|w| {
+                        let start = (base + (w.get("start")?.as_f64()? / 1000.0 * BPS) as u64) & !1;
+                        let end = (base + (w.get("end")?.as_f64()? / 1000.0 * BPS) as u64) & !1;
+                        let text = w.get("text")?.as_str()?.to_string();
+                        let mid = (start + end) / 2;
+                        Some(Heard { key: norm(&text), text, start, end, playing: at(&s.playing, mid), media: at(&s.media, mid) })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fresh = s.live.as_ref().is_none_or(|l| l.conn != conn || l.turn != order);
+        if fresh {
+            if ended && words.is_empty() && transcript.is_empty() {
+                return;
+            }
+            s.live = Some(Live { conn, turn: order, seq: next_seq(), interrupted: false });
+        }
+        let live = s.live.as_mut().unwrap();
+        let seq = live.seq;
+        let replies = super::ambient_routes::recent_replies(&self.device);
+        let mask = echo_mask(&words, &replies);
+        let real = words.iter().zip(&mask).filter(|(_, e)| !**e).count();
+        let vocab: Vec<String> = replies.iter().flat_map(|r| r.split_whitespace().map(norm)).filter(|w| !w.is_empty()).collect();
+        let novel = words.iter().zip(&mask).filter(|(w, e)| !**e && !vocab.iter().any(|v| similar(&w.key, v))).count();
+        let audible = s.audible || s.play_flag;
+        let live = s.live.as_mut().unwrap();
+        let urgent = words.iter().zip(&mask).any(|(w, e)| !*e && URGENT.contains(&w.key.as_str()));
+        let no_hw_aec = self.device.starts_with("macos-") || self.device.starts_with("linux-") || self.device.starts_with("windows-");
+        let barge_ready = if audible && no_hw_aec {
+            urgent && real >= 1
+        } else {
+            (novel >= 1 && real >= 2) || (urgent && real >= 1)
+        };
+        let barge = !live.interrupted && barge_ready && {
+            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+            audible || busy
+        };
+        if barge {
+            live.interrupted = true;
+        }
+        if !ended {
+            drop(s);
+            if fresh {
+                super::ambient_routes::announce(&self.d, &self.device, seq, false);
+            }
+            if barge {
+                self.barge_in();
+            }
+            return;
+        }
+        s.live = None;
+        if let Some(last) = words.last() {
+            s.last_final = s.last_final.max(last.end);
+        }
+        let (first_g, last_g) = match (words.first(), words.last()) {
+            (Some(f), Some(l)) => (f.start, l.end),
+            _ => (s.g, s.g),
+        };
+        let opened = s.anchors.iter().rev().find(|(a, _)| *a <= last_g).map(|(a, _)| *a).unwrap_or(0);
+        let first_g = first_g.max(opened).min(last_g);
+        let wall = s.anchors.iter().rev().find(|(a, _)| *a <= first_g).or(s.anchors.front()).map(|(a, w)| w + (first_g as f64 - *a as f64) / BPS);
+        let from = first_g.saturating_sub(PAD).max(s.ring_start);
+        let to = (last_g + PAD).min(s.g);
+        let pcm: Vec<u8> = if to > from {
+            s.ring.range((from - s.ring_start) as usize..(to - s.ring_start) as usize).copied().collect()
+        } else {
+            Vec::new()
+        };
+        drop(s);
+        if barge {
+            self.barge_in();
+        }
+        let filtered = words.len().saturating_sub(real);
+        let during_playback = words.iter().any(|w| w.playing);
+        let echo_all = !words.is_empty() && (real == 0 || (during_playback && filtered >= 2 && real == 1 && !urgent));
+        let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
+        let text = if words.is_empty() || real == words.len() {
+            if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }
+        } else {
+            words.iter().zip(&mask).filter(|(_, e)| !**e).map(|(w, _)| w.text.as_str()).collect::<Vec<_>>().join(" ")
+        };
+        let (status, text) = if echo_all {
+            ("echo", transcript.clone())
+        } else if media {
+            ("media", text)
+        } else {
+            let spoken = super::transcribe::finish_text(&text).text;
+            if spoken.is_empty() { ("empty", String::new()) } else { ("done", spoken) }
+        };
+        if real < words.len() {
+        }
+        let started = wall.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+        let duration_ms = ((last_g.saturating_sub(first_g)) as f64 / BPS * 1000.0) as i64;
+        let id = uuid::Uuid::new_v4().to_string();
+        crate::ambient::mark(&id, "end");
+        let event = Event {
+            id,
+            seq,
+            status,
+            text,
+            started,
+            duration_ms,
+            during_playback,
+            media,
+            pcm,
+        };
+        let (d, device) = (self.d.clone(), self.device.clone());
+        tokio::spawn(async move { super::ambient_routes::record_heard(&d, &device, event).await });
+    }
+
+    fn barge_in(&self) {
+        let (d, device) = (self.d.clone(), self.device.clone());
+        let sent = super::autonomy::mission_control_inputs();
+        tokio::spawn(async move {
+            let spoke = crate::speech::interrupt(&device);
+            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+            if !(spoke || busy) {
+                return;
+            }
+            if super::autonomy::mission_control_inputs() != sent {
+                return;
+            }
+            if super::autonomy::interrupt_mission_control(&d).await {
+                super::autonomy::resume_unless_heard(d);
+            }
+        });
+    }
+}
+
+pub(super) struct Event {
+    pub id: String,
+    pub seq: i64,
+    pub status: &'static str,
+    pub text: String,
+    pub started: f64,
+    pub duration_ms: i64,
+    pub during_playback: bool,
+    pub media: bool,
+    pub pcm: Vec<u8>,
+}
+
+struct Heard {
+    text: String,
+    key: String,
+    start: u64,
+    end: u64,
+    playing: bool,
+    media: bool,
+}
+
+fn norm(w: &str) -> String {
+    w.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+fn lev(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut prev = row[0];
+        row[0] = i;
+        for j in 1..=b.len() {
+            let cur = row[j];
+            row[j] = (row[j] + 1).min(row[j - 1] + 1).min(prev + usize::from(a[i - 1] != b[j - 1]));
+            prev = cur;
+        }
+    }
+    row[b.len()]
+}
+
+fn phonetic(w: &str) -> String {
+    let s = w
+        .replace("duo", "to")
+        .replace("two", "to")
+        .replace("too", "to")
+        .replace("ch", "k")
+        .replace("th", "t")
+        .replace("ph", "f")
+        .replace("gh", "g");
+    let mut out = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        let mapped = match c {
+            'd' => 't',
+            'b' => 'p',
+            'g' | 'c' | 'q' | 'x' => 'k',
+            'z' => 's',
+            'v' => 'f',
+            'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'w' | 'h' if i > 0 => continue,
+            other => other,
+        };
+        if !out.ends_with(mapped) {
+            out.push(mapped);
+        }
+    }
+    out
+}
+
+fn similar(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (la, lb) = (a.chars().count(), b.chars().count());
+    if la.min(lb) < 2 {
+        return false;
+    }
+    let (pa, pb) = (phonetic(a), phonetic(b));
+    if !pa.is_empty() && (pa == pb || (pa.len().min(pb.len()) >= 3 && (pa.starts_with(&pb) || pb.starts_with(&pa)))) {
+        return true;
+    }
+    if la.min(lb) < 3 {
+        return false;
+    }
+    if (a.starts_with(b) || b.starts_with(a)) && la.min(lb) >= 3 {
+        return true;
+    }
+    lev(a, b) <= (la.max(lb) / 4).max(1)
+}
+
+fn echo_mask(words: &[Heard], replies: &[String]) -> Vec<bool> {
+    let mut mask = vec![false; words.len()];
+    if !words.iter().any(|w| w.playing) {
+        return mask;
+    }
+    for reply in replies {
+        let said: Vec<String> = reply.split_whitespace().map(norm).filter(|w| !w.is_empty()).collect();
+        let mut i = 0;
+        while i < words.len() {
+            let mut best: Option<(usize, usize)> = None;
+            for j in 0..said.len() {
+                let (mut k, mut skipped, mut matched, mut last_match) = (0usize, 0usize, 0usize, 0usize);
+                while i + k < words.len() && j + k + skipped < said.len() {
+                    if similar(&words[i + k].key, &said[j + k + skipped]) {
+                        matched += 1;
+                        last_match = k + 1;
+                        k += 1;
+                    } else if skipped < 2 && j + k + skipped + 1 < said.len() && similar(&words[i + k].key, &said[j + k + skipped + 1]) {
+                        skipped += 1;
+                    } else if k + 1 < words.len() - i && matched >= 2 && words[i + k].playing {
+                        k += 1;
+                        if k - last_match > 1 {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if last_match > best.map(|b| b.1).unwrap_or(0) {
+                    best = Some((matched, last_match));
+                }
+            }
+            match best {
+                Some((matched, len)) if matched >= 2 || (matched == 1 && len == 1 && words.len() == 1 && words[i].playing) => {
+                    let playing = words[i..i + len].iter().filter(|w| w.playing).count();
+                    if playing * 2 >= len {
+                        mask[i..i + len].iter_mut().for_each(|m| *m = true);
+                    }
+                    i += len.max(1);
+                }
+                _ => i += 1,
+            }
+        }
+    }
+    for gap in [1usize, 2] {
+        for i in 1..words.len().saturating_sub(gap) {
+            let end = i + gap;
+            if end < words.len() && mask[i - 1] && mask[end] && (i..end).all(|k| !mask[k] && words[k].playing) {
+                (i..end).for_each(|k| mask[k] = true);
+            }
+        }
+    }
+    mask
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect(creds: &Creds, active: bool) -> Result<Ws, String> {
+    if creds.flux {
+        return connect_flux(creds, active).await;
+    }
+    let (key, terms) = (&creds.key, &creds.terms);
+    let keyterms = serde_json::to_string(terms).map_err(|e| e.to_string())?;
+    let (min, max) = silences(active);
+    let url = format!(
+        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&mode=min_latency&min_turn_silence={min}&max_turn_silence={max}&interruption_delay=80&language_codes={}&keyterms_prompt={}",
+        urlencoding::encode("[\"en\"]"),
+        urlencoding::encode(&keyterms)
+    );
+    let mut request = url.into_client_request().map_err(|e| e.to_string())?;
+    request.headers_mut().insert("Authorization", key.trim().parse().map_err(|_| "invalid AssemblyAI key".to_string())?);
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async_with_config(request, None, true))
+        .await
+        .map_err(|_| "AssemblyAI connect timed out".to_string())?
+        .map_err(|e| format!("AssemblyAI connect failed: {e}"))?;
+    Ok(ws)
+}
+
+async fn connect_flux(creds: &Creds, active: bool) -> Result<Ws, String> {
+    let (eot, timeout) = flux_eot(active);
+    let mut url = format!(
+        "wss://{}/v2/listen?model=flux-general-en&encoding=linear16&sample_rate=16000&eager_eot_threshold={FLUX_EAGER}&eot_threshold={eot}&eot_timeout_ms={timeout}",
+        creds.host
+    );
+    for term in &creds.terms {
+        url.push_str("&keyterm=");
+        url.push_str(&urlencoding::encode(term));
+    }
+    let mut request = url.into_client_request().map_err(|e| e.to_string())?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Token {}", creds.key.trim()).parse().map_err(|_| "invalid Deepgram key".to_string())?);
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async_with_config(request, None, true))
+        .await
+        .map_err(|_| "Deepgram Flux connect timed out".to_string())?
+        .map_err(|e| format!("Deepgram Flux connect failed: {e}"))?;
+    Ok(ws)
+}
+
+fn on_message(l: &Arc<Listener>, id: u64, flux: bool, v: &serde_json::Value, raw: &str) -> Result<bool, String> {
+    let name = if flux { "Deepgram Flux" } else { "AssemblyAI" };
+    match v.get("type").and_then(|x| x.as_str()) {
+        Some("Turn") if !flux => l.on_turn(id, v),
+        Some("TurnInfo") if flux => {
+            let event = v.get("event").and_then(|x| x.as_str()).unwrap_or("");
+            let index = v.get("turn_index").and_then(|x| x.as_i64()).unwrap_or(-1);
+            let words = v.get("words").and_then(|x| x.as_array()).map_or(0, |w| w.len());
+            let active = l.inner.lock().unwrap().conn.as_ref().is_some_and(|c| c.id == id && c.active);
+            match event {
+                "EagerEndOfTurn" if !active => return Ok(false),
+                "EagerEndOfTurn" | "EndOfTurn" => {
+                    if event == "EagerEndOfTurn" {
+                        crate::tts_stream::prewarm(&l.device);
+                    }
+                    let mut s = l.inner.lock().unwrap();
+                    if s.delivered.is_some_and(|(c, t, n)| c == id && t == index && words <= n) {
+                        return Ok(false);
+                    }
+                    s.delivered = Some((id, index, words));
+                }
+                _ => {
+                    let s = l.inner.lock().unwrap();
+                    if s.delivered.is_some_and(|(c, t, n)| c == id && t == index && words <= n) {
+                        return Ok(false);
+                    }
+                }
+            }
+            if let Some(turn) = flux_turn(v) {
+                l.on_turn(id, &turn);
+            }
+        }
+        Some("Termination") => return Ok(true),
+        Some("ConfigureFailure") | Some("Warning") => eprintln!("[listener] {} {name}: {}", l.device, raw.chars().take(300).collect::<String>()),
+        Some(other) if other.eq_ignore_ascii_case("error") || other == "FatalError" => return Err(format!("{name} error: {raw}")),
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceiver<Cmd>, flux: bool) -> Result<(), String> {
+    let name = if flux { "Deepgram Flux" } else { "AssemblyAI" };
+    let (force, terminate) = if flux {
+        ("{\"type\":\"ForceEndTurn\"}", "{\"type\":\"CloseStream\"}")
+    } else {
+        ("{\"type\":\"ForceEndpoint\"}", "{\"type\":\"Terminate\"}")
+    };
+    let (mut tx, mut rx) = ws.split();
+    let mut last_audio = Instant::now();
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let mut pinged = Instant::now();
+    loop {
+        tokio::select! {
+            c = cmd.recv() => match c {
+                Some(Cmd::Audio(b)) => {
+                    last_audio = Instant::now();
+                    tx.send(Message::Binary(b.into())).await.map_err(|_| format!("{name} connection dropped"))?;
+                }
+                Some(Cmd::Config(text)) => {
+                    let _ = tx.send(Message::Text(text.into())).await;
+                }
+                Some(Cmd::Force) => {
+                    let _ = tx.send(Message::Text(force.into())).await;
+                }
+                None => break,
+            },
+            m = rx.next() => match m {
+                Some(Ok(Message::Text(t))) => {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+                    if on_message(l, id, flux, &v, &t)? {
+                        return Err(format!("{name} ended the session"));
+                    }
+                }
+                Some(Ok(Message::Close(f))) => return Err(format!("{name} closed the connection: {f:?}")),
+                None => return Err(format!("{name} closed the connection")),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(format!("{name} stream error: {e}")),
+            },
+            _ = tick.tick() => {
+                if pinged.elapsed() >= Duration::from_secs(10) {
+                    pinged = Instant::now();
+                    let _ = tx.send(Message::Ping(Default::default())).await;
+                }
+                let open = l.inner.lock().unwrap().stream.is_some();
+                if !open && last_audio.elapsed() >= if flux { FLUX_IDLE_CLOSE } else { IDLE_CLOSE } {
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(c) = l.inner.lock().unwrap().conn.as_mut().filter(|c| c.id == id) {
+        c.tx = None;
+    }
+    let _ = tx.send(Message::Text(terminate.into())).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(Ok(m))) = tokio::time::timeout_at(deadline, rx.next()).await {
+        match m {
+            Message::Text(t) => {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+                if !matches!(on_message(l, id, flux, &v, &t), Ok(false)) {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}

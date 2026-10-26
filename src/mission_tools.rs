@@ -71,8 +71,13 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(RetryMissionTask);
     registry.insert(CancelMissionTask);
     registry.insert(CleanUpSessions);
+    registry.insert(StopSession);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
+    registry.insert(Speak);
+    registry.insert(AmbientMode);
+    registry.insert(AmbientExpect);
+    registry.insert(AmbientSearch);
     registry.insert(UpdateBrief);
     registry.insert(ScheduleFollowup);
     registry.insert(PingUser);
@@ -224,10 +229,15 @@ impl Tool for UpdateBrief {
 
 #[derive(Deserialize)]
 struct ScheduleFollowupArgs {
-    in_minutes: i64,
+    #[serde(default)]
+    in_minutes: Option<i64>,
+    #[serde(default)]
+    in_seconds: Option<u64>,
     note: String,
     #[serde(default)]
     next_wake: bool,
+    #[serde(default)]
+    unless_user_speaks: Option<bool>,
 }
 
 pub struct ScheduleFollowup;
@@ -236,12 +246,14 @@ impl Tool for ScheduleFollowup {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "schedule_wake".into(),
-            description: "Be woken at a time: a deploy window, a check you promised the user, a job that won't report on its own, the morning after quiet hours. You're woken with this note when it's due. Running tasks report by themselves, so their progress needs no wake-up. next_wake marks your one general next look, replacing the previous one.".into(),
+            description: "Be woken after a delay: pass in_seconds (5 to 3600, e.g. 10s to quietly check whether the user continued a cut-off or out-of-context spoken turn without disturbing them) or in_minutes (1 to 10080, for a deploy window, a check you promised, or the morning after quiet hours). When in_seconds is used (or unless_user_speaks is true), the wake fires with a snapshot of recent microphone lines even if automated wakes are off, and cancels itself automatically if the user speaks to you first.".into(),
             input_schema: schema(json!({
+                "in_seconds": {"type": "integer", "description": "How many seconds from now (5 to 3600) for a quick ambient or follow-up check."},
                 "in_minutes": {"type": "integer", "description": "How many minutes from now (1 to 10080)."},
-                "note": {"type": "string", "description": "What to do when it's due, written so you can act on it cold."},
+                "note": {"type": "string", "description": "What to check or do when woken."},
+                "unless_user_speaks": {"type": "boolean", "description": "Cancel the wake if the user speaks or messages you before it fires. Default true for in_seconds."},
                 "next_wake": {"type": "boolean", "description": "This is your next general check-in; replaces any earlier one."}
-            }), &["in_minutes", "note"]),
+            }), &["note"]),
         }
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
@@ -249,7 +261,18 @@ impl Tool for ScheduleFollowup {
         if args.note.trim().is_empty() {
             return Err(ToolError::msg("note must say what to do when the wake-up is due"));
         }
-        let minutes = args.in_minutes.clamp(1, 10080);
+        if let Some(secs) = args.in_seconds {
+            let secs = secs.clamp(3, 3600);
+            let unless = args.unless_user_speaks.unwrap_or(true);
+            crate::ambient::schedule_quick_wake(secs, args.note.trim().to_string(), unless);
+            return Ok(ToolResult::success(json!({
+                "scheduled": true,
+                "in_seconds": secs,
+                "unless_user_speaks": unless,
+                "note": "Quick check-in timer started; cancels automatically if the user speaks to you first.",
+            })));
+        }
+        let minutes = args.in_minutes.unwrap_or(1).clamp(1, 10080);
         let due_at = chrono::Utc::now().timestamp() + minutes * 60;
         let followup = crate::mission_autonomy::schedule_followup(due_at, args.note.trim(), args.next_wake).map_err(ToolError::msg)?;
         let on = crate::mission_autonomy::is_on();
@@ -268,6 +291,134 @@ struct PingUserArgs {
     message: String,
     #[serde(default)]
     kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SpeakArgs {
+    text: String,
+    #[serde(default)]
+    expecting: Option<String>,
+    #[serde(default)]
+    about: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AmbientModeArgs {
+    mode: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AmbientExpectArgs {
+    kind: String,
+    about: String,
+    #[serde(default)]
+    minutes: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct AmbientSearchArgs {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    include_hidden: bool,
+}
+
+pub struct AmbientSearch;
+#[async_trait]
+impl Tool for AmbientSearch {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ambient_search".into(),
+            description: "Search what the user's always-on microphone has heard (transcripts of real conversation only; TV and noise are already filtered out). Empty query returns the most recent lines. Use it to answer questions like what they said earlier or to recall a commitment; never ask for the whole stream.".into(),
+            input_schema: schema(json!({
+                "query": {"type": "string", "description": "Words to look for; leave empty for the latest lines."},
+                "limit": {"type": "integer", "description": "How many lines, up to 50. Default 15."},
+                "include_hidden": {"type": "boolean", "description": "Also return lines the voice classifier filtered out as TV, background or noise, each with judged_as. Use it when a request looks cut off or out of context: the voice classifier can misjudge."}
+            }), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AmbientSearchArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let rows = crate::ambient::search(&args.query, args.limit.unwrap_or(15), args.include_hidden).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"lines": rows})))
+    }
+}
+
+pub struct AmbientMode;
+#[async_trait]
+impl Tool for AmbientMode {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ambient_mode".into(),
+            description: "Switch ambient listening between passive and active. Passive: the microphone takes notes and passes along what is addressed to you as chat messages; you cannot speak and the user is notified of each reply. Active: a spoken back and forth with the user, and `speak` works. Call it with active when a conversation would help (the user asks something conversational, their hands are busy, a quick exchange of questions) and whenever you have an update worth saying aloud (a task finished, failed or is blocked, an awaited answer, a decision only they can make), then call speak; call it with passive when speaking is no longer needed, for example the user is typing, or asks you to stop listening or speaking. It never changes unless you call it; the voice classifier only advises.".into(),
+            input_schema: schema(json!({
+                "mode": {"type": "string", "enum": ["passive", "active"], "description": "The mode to switch to."},
+                "reason": {"type": "string", "description": "One short phrase the user may see, for example 'quick back and forth' or 'you are typing'."}
+            }), &["mode"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AmbientModeArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let out = crate::ambient::set_mode(&args.mode, args.reason.as_deref().unwrap_or("")).await.map_err(ToolError::msg)?;
+        Ok(ToolResult::success(out))
+    }
+}
+
+pub struct AmbientExpect;
+#[async_trait]
+impl Tool for AmbientExpect {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ambient_expect".into(),
+            description: "Tell the voice classifier what kind of spoken message you expect next, so a short reply such as 'yes' or 'the second one' is recognised as meant for you. Use it after asking the user something in the chat that they may answer aloud, or before waiting on a dictation. It lapses after the given minutes or at the next thing the user says. `speak` can set the same hint with its `expecting` argument.".into(),
+            input_schema: schema(json!({
+                "kind": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation"], "description": "What you expect."},
+                "about": {"type": "string", "description": "What it is about, in a short phrase, for example 'whether to delete the old branch'."},
+                "minutes": {"type": "integer", "description": "How long to expect it, 1 to 30. Default 10."}
+            }), &["kind", "about"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AmbientExpectArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        crate::ambient::set_expectation(&args.kind, &args.about, args.minutes.unwrap_or(10));
+        crate::ambient::emit_state("expectation set");
+        Ok(ToolResult::success(json!({"expecting": args.kind, "about": args.about})))
+    }
+}
+
+pub struct Speak;
+#[async_trait]
+impl Tool for Speak {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "speak".into(),
+            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: short conversational sentences, usually one or two, no markdown, no lists, nothing the user would need to read. Speaking is never the action itself: when you say you will do something, make those tool calls in the same response, right after the speak. Set expecting only on a line that asks a question aloud, never on an acknowledgement or status line: a spoken question with expecting set to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening or ambient is passive; in passive reply in the chat, or call ambient_mode with active first.".into(),
+            input_schema: schema(json!({
+                "text": {"type": "string", "description": "What to say, in plain spoken sentences."},
+                "expecting": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation", "none"], "description": "Set this when you are asking something: it tells the voice classifier a short reply is meant for you."},
+                "about": {"type": "string", "description": "What the expected reply is about, in a short phrase."},
+                "mode": {"type": "string", "enum": ["append", "replace"], "description": "append (default) queues after what is still being said; replace stops anything unplayed first."}
+            }), &["text"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: SpeakArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let asking = crate::speech::asks_aloud(&args.text, args.expecting.as_deref());
+        let expecting = args.expecting.as_deref().filter(|_| asking);
+        let mut out = crate::speech::speak(&args.text, expecting, args.about.as_deref(), args.mode.as_deref() == Some("replace")).await.map_err(ToolError::msg)?;
+        if !asking {
+            let ignored = args.expecting.as_deref().is_some_and(|k| !k.is_empty() && k != "none");
+            let lead = if ignored { "Speech is playing; `expecting` was ignored because the line asks no question. " } else { "Speech is playing. " };
+            out["next"] = Value::String(format!("{lead}Your turn continues: if what you said promises an action or a check, make those tool calls now; if nothing is left to do, end without a chat line."));
+        }
+        Ok(ToolResult::success(out))
+    }
 }
 
 pub struct PingUser;
@@ -746,12 +897,21 @@ struct CreateTaskArgs {
     reply_to: Option<String>,
     #[serde(default)]
     blocked_by: Vec<String>,
+    #[serde(default)]
+    crew: Vec<CrewArg>,
+}
+
+#[derive(Deserialize)]
+struct CrewArg {
+    agent_id: String,
+    #[serde(default)]
+    role: Option<String>,
 }
 pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to a specialized agent.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the agent that will do the work. Defaults to the general coding agent. Recorded on the task so completion reports to that agent's own board."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's for rescuing a rate-limited session. Work that simply needs another model belongs in a session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's for rescuing a rate-limited session. Work that simply needs another model belongs in a session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -914,8 +1074,26 @@ async fn create_task(
             added_at: task.created_at.clone(),
             removed_at: None,
         };
+        let mut roster = vec![worker];
+        for member in &args.crew {
+            let id = member.agent_id.trim();
+            if id.is_empty() || roster.iter().any(|m| m.agent_id == id) {
+                continue;
+            }
+            require_working_agent(&store, id)?;
+            roster.push(crate::coordination::TaskAgent {
+                task_id: task.id.clone(),
+                agent_id: id.to_string(),
+                work_session_id: None,
+                scope: String::new(),
+                status: "waiting".into(),
+                role: member.role.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("reviewer").to_string(),
+                added_at: task.created_at.clone(),
+                removed_at: None,
+            });
+        }
         store
-            .create_task_with_agents(&task, &[worker])
+            .create_task_with_agents(&task, &roster)
             .map_err(|e| ToolError::msg(format!("create task: {e}")))?;
         for blocker in &blockers {
             store
@@ -945,15 +1123,21 @@ async fn create_task(
                 blockers.iter().map(|b| format!("\"{}\" ({})", b.title, b.id)).collect::<Vec<_>>().join(", ")
             )
         };
-        Ok(ToolResult::success(
-            json!({
-                "task": task_view(&task),
-                "agent_id": agent_id,
-                "profile": profile,
-                "waiting_on": blockers.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
-                "note": note
-            }),
-        ))
+        let mut result = json!({
+            "task": task_view(&task),
+            "agent_id": agent_id,
+            "profile": profile,
+            "waiting_on": blockers.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
+            "crew": roster.iter().skip(1).map(|m| format!("{} ({})", m.agent_id, m.role)).collect::<Vec<_>>(),
+            "note": note
+        });
+        if created_by.1 == crate::mission_control::SESSION_ID
+            && agent_id == crate::coordination::SNIPPET_AGENT_ID
+            && roster.len() == 1
+        {
+            result["specialists"] = json!(specialist_directory(&store));
+        }
+        Ok(ToolResult::success(result))
     }
 }
 
@@ -1001,6 +1185,7 @@ impl Tool for FileFollowUpTask {
             profile: None,
             reply_to: None,
             blocked_by,
+            crew: Vec::new(),
         };
         create_task(ctx, args, (kind, &who)).await
     }
@@ -1024,6 +1209,24 @@ struct UpdateMissionTaskArgs {
 }
 
 /// Refuse to hand work to an agent that is unknown or not active.
+fn specialist_directory(store: &Store) -> String {
+    let list: Vec<String> = store
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| {
+            a.status == crate::coordination::types::AgentStatus::Active
+                && a.kind == crate::coordination::types::AgentKind::Worker
+                && a.id != crate::coordination::SNIPPET_AGENT_ID
+        })
+        .map(|a| format!("{} ({})", a.id, format!("{:?}", a.role).to_lowercase()))
+        .collect();
+    format!(
+        "No specialist or crew is on this task. Specialists available: {}. Seat one if the work needs a review, QA or research role; if no agent covers a role it needs, ask the user whether to create one.",
+        if list.is_empty() { "none".to_string() } else { list.join(", ") }
+    )
+}
+
 pub(crate) fn require_working_agent(store: &Store, agent_id: &str) -> Result<(), ToolError> {
     match store
         .get_agent(agent_id)
@@ -1628,6 +1831,51 @@ impl Tool for CleanUpSessions {
             }
         }
         Ok(ToolResult::success(json!({"deleted": deleted, "refused": refused})))
+    }
+}
+
+pub struct StopSession;
+#[async_trait]
+impl Tool for StopSession {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "stop_session".into(),
+            description: "Stop a session that is working: its current run ends the way the stop button ends it, keeping everything done so far, and the session waits for its next message. Use it when a session is stuck in a loop, burning time on the wrong thing, or the user asks you to stop it. Give a short reason; it's recorded in that session's transcript. A task the session holds stays on the board, so cancel, retry or reassign it separately. To restart the session, message it (send_agent_message to session:<id>).".into(),
+            input_schema: schema(
+                json!({
+                    "session_id": {"type": "string", "description": "exactly as list_sessions shows it"},
+                    "reason": {"type": "string", "description": "one line on why, shown in that session"}
+                }),
+                &["session_id", "reason"],
+            ),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let id = arguments.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        let reason = arguments.get("reason").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        if id.is_empty() || reason.is_empty() {
+            return Err(ToolError::msg("stop_session needs session_id and reason"));
+        }
+        if id == crate::mission_control::SESSION_ID {
+            return Err(ToolError::msg("that's your own session; end your turn instead"));
+        }
+        let info = crate::serve::sidecar::read_daemon_info()
+            .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
+        let url = format!("{}/session/interrupt?token={}", info.api_url.trim_end_matches('/'), info.token);
+        let response = reqwest::Client::new()
+            .post(&url)
+            .json(&json!({"session": id, "reason": reason}))
+            .send()
+            .await
+            .map_err(|e| ToolError::msg(format!("stop failed: {e}")))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(ToolError::msg(format!("no session `{id}`")));
+        }
+        if !response.status().is_success() {
+            return Err(ToolError::msg(format!("stop failed: HTTP {}", response.status())));
+        }
+        let body: Value = response.json().await.unwrap_or_default();
+        Ok(ToolResult::success(body))
     }
 }
 
