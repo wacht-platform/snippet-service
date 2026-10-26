@@ -358,12 +358,28 @@ async fn handle_ws(
                 }
             }
             if let Ok((before, limit)) = history_rx.try_recv() {
-                if let Some((state, _)) = read_session_state_tail(&state_path, 0) {
-                    let (start, end, has_older) =
-                        session_event_page(&state.events, Some(before), limit);
+                let paged = match limit {
+                    Some(size) => {
+                        let path = state_path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::session::read_session_event_page(&path, Some(before), size.clamp(1, 500))
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                    None => None,
+                };
+                let paged = paged.or_else(|| {
+                    let (state, _) = read_session_state_tail(&state_path, 0)?;
+                    let (start, end, _) = session_event_page(&state.events, Some(before), limit);
+                    Some((state.events[start..end].to_vec(), start, end))
+                });
+                if let Some((events, start, end)) = paged {
+                    let has_older = start > 0;
                     let frame = serde_json::json!({
                         "wire": "history",
-                        "events": wire_events(&state.events[start..end], compact),
+                        "events": wire_events(&events, compact),
                         "start": start,
                         "end": end,
                         "has_older": has_older,

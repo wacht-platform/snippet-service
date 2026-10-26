@@ -1171,6 +1171,35 @@ impl Store {
             Ok((events, count as usize))
         })
     }
+
+    pub fn load_conversation_event_page(
+        &self,
+        session_id: &str,
+        before: Option<usize>,
+        size: usize,
+    ) -> Result<(Vec<HarnessEvent>, usize, usize), StoreError> {
+        self.with_connection(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            let count = count as usize;
+            let end = before.unwrap_or(count).min(count);
+            let start = end.saturating_sub(size);
+            let mut stmt = conn.prepare(
+                "SELECT payload_json FROM session_events
+                 WHERE session_id = ?1 ORDER BY ordinal LIMIT ?2 OFFSET ?3",
+            )?;
+            let rows = stmt.query_map(params![session_id, (end - start) as i64, start as i64], |row| {
+                let raw: String = row.get(0)?;
+                serde_json::from_str(&raw).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })
+            })?;
+            Ok((rows.collect::<Result<Vec<HarnessEvent>, _>>()?, start, end))
+        })
+    }
 }
 
 fn insert_event(

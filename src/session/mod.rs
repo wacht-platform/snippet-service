@@ -1137,6 +1137,19 @@ pub fn read_session_state_tail(state_path: &Path, from: usize) -> Option<(Harnes
     Some((state, count))
 }
 
+pub fn read_session_event_page(
+    state_path: &Path,
+    before: Option<usize>,
+    size: usize,
+) -> Option<(Vec<crate::harness::HarnessEvent>, usize, usize)> {
+    let id = session_id_for_state_path(state_path);
+    let store = store_for_sessions()?;
+    if !store.has_conversation(&id).ok()? {
+        return None;
+    }
+    store.load_conversation_event_page(&id, before, size).ok()
+}
+
 /// Open the session store, if one exists at the canonical path.
 pub(crate) fn store_for_sessions() -> Option<crate::store::Store> {
     crate::store::Store::open_cached(crate::store::default_db_path()).ok()
