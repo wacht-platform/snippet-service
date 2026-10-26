@@ -253,6 +253,7 @@ struct LaneLink {
     store_path: Option<PathBuf>,
     context: String,
     mailbox: Arc<LaneMailbox>,
+    title: String,
 }
 
 /// Max lanes running at once — a runaway/cost guard so "spawn several" can't
@@ -436,6 +437,12 @@ impl LaneManager {
             store_path: parent.and_then(|p| p.store_path()),
             context,
             mailbox,
+            title: self
+                .records
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.title.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -1078,6 +1085,7 @@ async fn run_lane_once(
             progress_id: Some(owner.clone()),
             lane_approval: approval,
             lane_mailbox: Some(link.mailbox.clone()),
+            session_title: Some(link.title.clone()).filter(|t| !t.trim().is_empty()),
             ..defaults
         },
         tools,

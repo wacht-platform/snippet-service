@@ -83,6 +83,7 @@ pub struct HarnessConfig {
     pub allow_lane_control: bool,
     pub lane_approval: Option<crate::lanes::LaneApprovalRoute>,
     pub lane_mailbox: Option<std::sync::Arc<crate::lanes::LaneMailbox>>,
+    pub session_title: Option<String>,
     pub hidden_meta: &'static [&'static str],
 }
 
@@ -107,6 +108,7 @@ impl Default for HarnessConfig {
             allow_lane_control: true,
             lane_approval: None,
             lane_mailbox: None,
+            session_title: None,
             hidden_meta: &[],
         }
     }
