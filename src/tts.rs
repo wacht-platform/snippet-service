@@ -1,5 +1,4 @@
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
 const RATE: u32 = 24000;
 
@@ -210,9 +209,7 @@ pub fn prewarm() {
 }
 pub async fn speak_pcm(text: &str) -> Result<(Vec<u8>, u32), String> {
     let (key, voice) = REMOTE.lock().unwrap().clone().ok_or("set deepgram_api_key in the config to enable spoken replies")?;
-    let started = Instant::now();
     let done = deepgram(&key, &voice, text).await?;
-    eprintln!("[ambient-tts] deepgram {}ms for {}ms of audio", started.elapsed().as_millis(), done.1);
     Ok(done)
 }
 

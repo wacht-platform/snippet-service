@@ -486,7 +486,7 @@ impl Listener {
                 super::ambient_routes::announce(&self.d, &self.device, seq, false);
             }
             if barge {
-                self.barge_in(&words, &mask);
+                self.barge_in();
             }
             return;
         }
@@ -494,7 +494,6 @@ impl Listener {
         if let Some(last) = words.last() {
             s.last_final = s.last_final.max(last.end);
         }
-        let tail_ms = s.g.saturating_sub(words.last().map(|w| w.end).unwrap_or(s.g)) / 32;
         let (first_g, last_g) = match (words.first(), words.last()) {
             (Some(f), Some(l)) => (f.start, l.end),
             _ => (s.g, s.g),
@@ -511,7 +510,7 @@ impl Listener {
         };
         drop(s);
         if barge {
-            self.barge_in(&words, &mask);
+            self.barge_in();
         }
         let filtered = words.len().saturating_sub(real);
         let during_playback = words.iter().any(|w| w.playing);
@@ -531,13 +530,11 @@ impl Listener {
             if spoken.is_empty() { ("empty", String::new()) } else { ("done", spoken) }
         };
         if real < words.len() {
-            eprintln!("[listener] {} echo filtered {}/{} words: {transcript:?} -> {text:?}", self.device, words.len() - real, words.len());
         }
         let started = wall.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
         let duration_ms = ((last_g.saturating_sub(first_g)) as f64 / BPS * 1000.0) as i64;
         let id = uuid::Uuid::new_v4().to_string();
         crate::ambient::mark(&id, "end");
-        eprintln!("[listener] {} final after {tail_ms}ms of trailing audio", self.device);
         let event = Event {
             id,
             seq,
@@ -553,10 +550,7 @@ impl Listener {
         tokio::spawn(async move { super::ambient_routes::record_heard(&d, &device, event).await });
     }
 
-    fn barge_in(&self, words: &[Heard], mask: &[bool]) {
-        let heard: Vec<&str> = words.iter().zip(mask).filter(|(_, e)| !**e).map(|(w, _)| w.text.as_str()).collect();
-        let lag = words.last().map(|w| self.inner.lock().unwrap().g.saturating_sub(w.end) / 32).unwrap_or(0);
-        eprintln!("[ambient-speech] barge-in {} heard={:?} audio_lag={lag}ms", self.device, heard.join(" "));
+    fn barge_in(&self) {
         let (d, device) = (self.d.clone(), self.device.clone());
         let sent = super::autonomy::mission_control_inputs();
         tokio::spawn(async move {
@@ -566,7 +560,6 @@ impl Listener {
                 return;
             }
             if super::autonomy::mission_control_inputs() != sent {
-                eprintln!("[ambient-speech] barge-in {device} skipped: a newer turn already reached Mission Control");
                 return;
             }
             if super::autonomy::interrupt_mission_control(&d).await {
@@ -756,12 +749,10 @@ async fn connect_flux(creds: &Creds, active: bool) -> Result<Ws, String> {
     request
         .headers_mut()
         .insert("Authorization", format!("Token {}", creds.key.trim()).parse().map_err(|_| "invalid Deepgram key".to_string())?);
-    let began = Instant::now();
     let (ws, _) = tokio::time::timeout(Duration::from_secs(6), tokio_tungstenite::connect_async(request))
         .await
         .map_err(|_| "Deepgram Flux connect timed out".to_string())?
         .map_err(|e| format!("Deepgram Flux connect failed: {e}"))?;
-    eprintln!("[listener] flux connected to {} in {}ms", creds.host, began.elapsed().as_millis());
     Ok(ws)
 }
 
@@ -782,7 +773,6 @@ fn on_message(l: &Arc<Listener>, id: u64, flux: bool, v: &serde_json::Value, raw
                     }
                     let mut s = l.inner.lock().unwrap();
                     if s.delivered.is_some_and(|(c, t, n)| c == id && t == index && words <= n) {
-                        eprintln!("[listener] {} flux {event} adds nothing to turn {index}, already delivered", l.device);
                         return Ok(false);
                     }
                     s.delivered = Some((id, index, words));

@@ -134,9 +134,6 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                             let _ = out.send(PhoneFrame::Text(serde_json::json!({"t":"done","h":h,"id":id,"code":code,"status":status}).to_string()));
                         });
                     }
-                    Some("stat") => {
-                        eprintln!("[ambient-stat] {device} {v}");
-                    }
                     Some("caps") => {
                         if !device.is_empty() && v.get("tts_stream").and_then(|x| x.as_i64()).unwrap_or(0) > 0 {
                             if let Some(old) = phone.take() {

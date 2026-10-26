@@ -111,11 +111,6 @@ pub fn report_pos(device: &str, turn: i64, ms: i64, done: bool) {
         i.heard = Some((ms, now));
         done && !i.stopped && i.audio_ms.is_some()
     };
-    if done {
-        let generated = t.inner.lock().unwrap().audio_ms.unwrap_or(-1);
-        let flag = if generated > 0 && ms + 400 < generated { " CUT-SHORT" } else { "" };
-        eprintln!("[ambient-flux] turn {turn} phone played {ms}ms of {generated}ms generated{flag}");
-    }
     if finished {
         LIVE.lock().unwrap().retain(|x| !Arc::ptr_eq(x, &t));
         mark_played(&t);
@@ -394,12 +389,10 @@ async fn run(session: &Arc<Session>, key: String, mut cmd: mpsc::UnboundedReceiv
     request
         .headers_mut()
         .insert("Authorization", format!("Token {key}").parse().map_err(|_| "invalid Deepgram key".to_string())?);
-    let began = Instant::now();
     let (ws, _) = tokio::time::timeout(CONNECT_LIMIT, tokio_tungstenite::connect_async(request))
         .await
         .map_err(|_| "Flux connect timed out".to_string())?
         .map_err(|e| format!("Flux connect failed: {e}"))?;
-    eprintln!("[ambient-flux] {} connected in {}ms", session.device, began.elapsed().as_millis());
     {
         let mut st = session.st.lock().unwrap();
         st.connected = true;
@@ -467,9 +460,6 @@ fn on_audio(session: &Session, pcm: &[u8]) {
     begin(&t, &mut i);
     if i.bytes == 0 {
         crate::ambient::mark_last("first_chunk");
-        if let Some(at) = i.first_push {
-            eprintln!("[ambient-flux] turn {} first audio {}ms after first text", t.turn, at.elapsed().as_millis());
-        }
     }
     i.bytes += pcm.len() as u64;
     if let Some(f) = i.file.as_mut() {
@@ -535,12 +525,6 @@ fn finish_turn(t: &StreamTurn, ms: i64) {
         i.file = None;
         (i.stopped, i.text.clone())
     };
-    {
-        let chars = text.trim().chars().count().max(1) as i64;
-        let per = ms / chars;
-        let flag = if chars >= 20 && per < 35 { " SHORT-AUDIO" } else { "" };
-        eprintln!("[ambient-flux] turn {} generated {ms}ms for {chars} chars ({per}ms/char){flag}", t.turn);
-    }
     if let Ok(store) = crate::ambient::store() {
         let _ = store.with_connection(|c| {
             c.execute(
@@ -709,7 +693,6 @@ pub fn stop(device: Option<&str>, reason: &str, hint: Option<(i64, i64)>) -> Vec
         }
     }
     let ids: Vec<i64> = turns.iter().map(|t| t.turn).collect();
-    eprintln!("[ambient-flux] stop reason={reason} turns={ids:?} generating={}", active.len());
     RECONCILING.fetch_add(1, Ordering::SeqCst);
     let reason = reason.to_string();
     tokio::spawn(async move {
@@ -764,23 +747,16 @@ async fn reconcile(
             .unwrap_or(0);
         let (tx, rx) = oneshot::channel();
         s.st.lock().unwrap().interrupted = Some(tx);
-        let sent = Instant::now();
         s.send(json!({"type": "Interrupt", "playback_offset": {"type": "time_ms", "value": at}}));
         match tokio::time::timeout(INTERRUPT_WAIT, rx).await {
             Ok(Ok(v)) => {
-                eprintln!(
-                    "[ambient-flux] interrupt turn={} offset={at} played={} after {}ms",
-                    current.turn,
-                    v.get("audio_played_ms").and_then(|x| x.as_i64()).unwrap_or(-1),
-                    sent.elapsed().as_millis()
-                );
                 if heard_by_turn.contains_key(&current.turn) {
                     if let Some(text) = v.get("text_spoken").and_then(|x| x.as_str()) {
                         spoken.insert(current.turn, text.trim().to_string());
                     }
                 }
             }
-            _ => eprintln!("[ambient-flux] no SpeechInterrupted for turn {}", current.turn),
+            _ => {}
         }
         let _ = s.cmd.send(Cmd::Close);
     }

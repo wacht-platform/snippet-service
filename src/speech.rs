@@ -241,7 +241,6 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
         }
         p
     };
-    eprintln!("[ambient-flux] speak: provisional={} chars={}", flux.as_ref().map(|p| p.turn.turn.to_string()).unwrap_or_else(|| "none".into()), text.chars().count());
     if let Some(p) = flux {
         let sent = p.turn.text();
         if normalise(text).starts_with(&normalise(&sent)) {
@@ -263,7 +262,6 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
             let want: Vec<&str> = text.split_whitespace().collect();
             let common = said.iter().zip(&want).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count();
             if !p.turn.is_stopped() && !said.is_empty() && common >= said.len().min(3) {
-                eprintln!("[ambient-flux] turn {} reused for a diverging final text (common {common} of {} streamed words)", p.turn.turn, said.len());
                 let extra = want.iter().skip(said.len()).copied().collect::<Vec<_>>().join(" ");
                 if !extra.is_empty() {
                     p.turn.push(&format!(" {extra}"));
@@ -293,7 +291,6 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
         p.live.close();
     }
     if let Some(t) = crate::tts_stream::find_recent(&device, text, 8) {
-        eprintln!("[ambient-flux] turn {} already carries this text, not speaking it twice", t.turn);
         t.flush();
         finalise_text(t.turn, text);
         return Ok(json!({"spoken": true, "turn": t.turn, "queued": true, "streamed": true}));
@@ -495,7 +492,6 @@ pub fn interrupt(device: &str) -> bool {
     if turns.is_empty() && open.is_empty() && CURRENT.lock().unwrap().is_none() && !crate::tts_stream::busy_for(device) {
         return false;
     }
-    eprintln!("[ambient-speech] interrupt device={device} turns={turns:?} open={open:?}");
     cancel_all("interrupted");
     if let Ok(store) = crate::ambient::store() {
         for turn in &open {
@@ -536,7 +532,6 @@ pub fn interrupt(device: &str) -> bool {
 }
 
 pub fn cancel_all(reason: &str) {
-    eprintln!("[ambient-speech] cancel_all reason={reason}");
     crate::tts_stream::stop(None, reason, None);
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
     chunk_ready().notify_waiters();
@@ -592,7 +587,6 @@ pub fn played(turn: i64, seq: Option<i64>, complete: bool, ttl_secs: u32) {
 }
 
 pub fn barge(turn: i64, seq: i64, played_ms: i64) {
-    eprintln!("[ambient-speech] barge turn={turn} seq={seq} played_ms={played_ms}");
     let streamed = crate::tts_stream::stop(None, "interrupted", Some((turn, played_ms))).contains(&turn);
     let text = heard(turn, seq, played_ms);
     let queued: Vec<Job> = QUEUE.lock().unwrap().drain(..).collect();
@@ -885,22 +879,18 @@ async fn open_flux(text: &str, done: bool) -> Route {
     if let Some(r) = direct_claims(text, done) {
         return r;
     }
-    let began = std::time::Instant::now();
     let Ok((device, conversation)) = prepare().await else {
         return Route::Off;
     };
-    let prepared = began.elapsed().as_millis();
     let Some(session) = crate::tts_stream::ready(&device).await else {
         return Route::Chunks;
     };
-    let readied = began.elapsed().as_millis();
     let mut guard = FLUX_STREAMING.lock().unwrap();
     if let Some(r) = direct_claims(text, done) {
         return r;
     }
     match crate::tts_stream::start_turn(&session, &device, &conversation.id) {
         Ok(turn) => {
-            eprintln!("[ambient-flux] open: prepare={prepared}ms ready={readied}ms started={}ms", began.elapsed().as_millis());
             let token = TOKEN.fetch_add(1, Ordering::SeqCst);
             *guard = Some(FluxProvisional { turn: turn.clone(), token });
             Route::Flux(turn, token)
