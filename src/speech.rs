@@ -223,6 +223,63 @@ fn finalise_text(turn: i64, text: &str) {
     }
 }
 
+enum Reuse {
+    Done,
+    Rest(String),
+    Unrelated,
+}
+
+fn streamed(turn: i64) -> Value {
+    json!({"spoken": true, "turn": turn, "queued": true, "streamed": true})
+}
+
+fn reuse_flux_turn(p: &FluxProvisional, text: &str) -> Reuse {
+    let sent = p.turn.text();
+    if normalise(text).starts_with(&normalise(&sent)) {
+        let rest = match text.strip_prefix(sent.trim_start()) {
+            Some(r) => r.to_string(),
+            None => {
+                let skip = sent.split_whitespace().count();
+                format!(" {}", text.split_whitespace().skip(skip).collect::<Vec<_>>().join(" "))
+            }
+        };
+        if p.turn.is_stopped() || rest.trim().is_empty() || p.turn.push(&rest) {
+            p.turn.flush();
+            finalise_text(p.turn.turn, text);
+            return Reuse::Done;
+        }
+        return Reuse::Rest(rest.trim().to_string());
+    }
+    let said: Vec<&str> = sent.split_whitespace().collect();
+    let want: Vec<&str> = text.split_whitespace().collect();
+    let common = said.iter().zip(&want).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count();
+    if p.turn.is_stopped() || said.is_empty() || common < said.len().min(3) {
+        return Reuse::Unrelated;
+    }
+    let extra = want.iter().skip(said.len()).copied().collect::<Vec<_>>().join(" ");
+    if !extra.is_empty() {
+        p.turn.push(&format!(" {extra}"));
+    }
+    p.turn.flush();
+    finalise_text(p.turn.turn, text);
+    Reuse::Done
+}
+
+fn reuse_provisional(p: &Provisional, text: &str) -> bool {
+    let spoken = p.live.text.lock().unwrap().clone();
+    let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if p.live.closed.load(Ordering::SeqCst) || !norm(text).starts_with(&norm(&spoken)) {
+        return false;
+    }
+    let rest = text.split_whitespace().skip(spoken.split_whitespace().count()).collect::<Vec<_>>().join(" ");
+    for chunk in crate::tts::chunk_text(&rest) {
+        p.live.push(chunk);
+    }
+    p.live.close();
+    finalise_text(p.turn, text);
+    true
+}
+
 pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, replace: bool) -> Result<Value, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -242,58 +299,24 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
         p
     };
     if let Some(p) = flux {
-        let sent = p.turn.text();
-        if normalise(text).starts_with(&normalise(&sent)) {
-            let rest = match text.strip_prefix(sent.trim_start()) {
-                Some(r) => r.to_string(),
-                None => {
-                    let skip = sent.split_whitespace().count();
-                    format!(" {}", text.split_whitespace().skip(skip).collect::<Vec<_>>().join(" "))
-                }
-            };
-            if p.turn.is_stopped() || rest.trim().is_empty() || p.turn.push(&rest) {
-                p.turn.flush();
-                finalise_text(p.turn.turn, text);
-                return Ok(json!({"spoken": true, "turn": p.turn.turn, "queued": true, "streamed": true}));
-            }
-            say = rest.trim().to_string();
-        } else {
-            let said: Vec<&str> = sent.split_whitespace().collect();
-            let want: Vec<&str> = text.split_whitespace().collect();
-            let common = said.iter().zip(&want).take_while(|(a, b)| a.eq_ignore_ascii_case(b)).count();
-            if !p.turn.is_stopped() && !said.is_empty() && common >= said.len().min(3) {
-                let extra = want.iter().skip(said.len()).copied().collect::<Vec<_>>().join(" ");
-                if !extra.is_empty() {
-                    p.turn.push(&format!(" {extra}"));
-                }
-                p.turn.flush();
-                finalise_text(p.turn.turn, text);
-                return Ok(json!({"spoken": true, "turn": p.turn.turn, "queued": true, "streamed": true}));
-            }
+        match reuse_flux_turn(&p, text) {
+            Reuse::Done => return Ok(streamed(p.turn.turn)),
+            Reuse::Rest(rest) => say = rest,
+            Reuse::Unrelated => {}
         }
         p.turn.flush();
     }
     let text = say.as_str();
-    let provisional = STREAMING.lock().unwrap().take();
-    if let Some(p) = provisional {
-        let spoken = p.live.text.lock().unwrap().clone();
-        let words_spoken = spoken.split_whitespace().count();
-        let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !p.live.closed.load(Ordering::SeqCst) && norm(text).starts_with(&norm(&spoken)) {
-            let rest = text.split_whitespace().skip(words_spoken).collect::<Vec<_>>().join(" ");
-            for chunk in crate::tts::chunk_text(&rest) {
-                p.live.push(chunk);
-            }
-            p.live.close();
-            finalise_text(p.turn, text);
-            return Ok(json!({"spoken": true, "turn": p.turn, "queued": true, "streamed": true}));
+    if let Some(p) = STREAMING.lock().unwrap().take() {
+        if reuse_provisional(&p, text) {
+            return Ok(streamed(p.turn));
         }
         p.live.close();
     }
     if let Some(t) = crate::tts_stream::find_recent(&device, text, 8) {
         t.flush();
         finalise_text(t.turn, text);
-        return Ok(json!({"spoken": true, "turn": t.turn, "queued": true, "streamed": true}));
+        return Ok(streamed(t.turn));
     }
     *DIRECT.lock().unwrap() = Some((std::time::Instant::now(), normalise(text)));
     let chunks = crate::tts::chunk_text(text);
@@ -309,7 +332,7 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
                 finalise_text(t.turn, text);
                 if t.push(text) {
                     t.flush();
-                    return Ok(json!({"spoken": true, "turn": t.turn, "queued": true, "streamed": true}));
+                    return Ok(streamed(t.turn));
                 }
                 t.flush();
                 eprintln!("[ambient-flux] turn {} could not be sent, using chunk speech", t.turn);
