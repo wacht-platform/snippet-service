@@ -93,11 +93,10 @@ fn is_error_result(result: &Value) -> bool {
 
 fn speak_asks(call: &GeneratedToolCall) -> bool {
     (call.tool_name == "speak" || call.tool_name.ends_with("__speak"))
-        && call
-            .arguments
-            .get("expecting")
-            .and_then(Value::as_str)
-            .is_some_and(|k| matches!(k, "answer" | "confirmation" | "choice" | "dictation"))
+        && crate::speech::asks_aloud(
+            call.arguments.get("text").and_then(Value::as_str).unwrap_or(""),
+            call.arguments.get("expecting").and_then(Value::as_str),
+        )
 }
 
 fn last_result_ok(state: &HarnessState) -> bool {

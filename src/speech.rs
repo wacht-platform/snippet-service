@@ -223,6 +223,10 @@ fn finalise_text(turn: i64, text: &str) {
     }
 }
 
+pub fn asks_aloud(text: &str, expecting: Option<&str>) -> bool {
+    text.contains('?') && expecting.is_some_and(|k| matches!(k, "answer" | "confirmation" | "choice" | "dictation"))
+}
+
 enum Reuse {
     Done,
     Rest(String),

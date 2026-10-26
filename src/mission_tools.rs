@@ -398,7 +398,7 @@ impl Tool for Speak {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "speak".into(),
-            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: short conversational sentences, usually one or two, no markdown, no lists, nothing the user would need to read. Speaking is never the action itself: when you say you will do something, make those tool calls in the same response, right after the speak. A speak that sets expecting to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening or ambient is passive; in passive reply in the chat, or call ambient_mode with active first.".into(),
+            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: short conversational sentences, usually one or two, no markdown, no lists, nothing the user would need to read. Speaking is never the action itself: when you say you will do something, make those tool calls in the same response, right after the speak. Set expecting only on a line that asks a question aloud, never on an acknowledgement or status line: a spoken question with expecting set to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening or ambient is passive; in passive reply in the chat, or call ambient_mode with active first.".into(),
             input_schema: schema(json!({
                 "text": {"type": "string", "description": "What to say, in plain spoken sentences."},
                 "expecting": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation", "none"], "description": "Set this when you are asking something: it tells the voice classifier a short reply is meant for you."},
@@ -409,10 +409,13 @@ impl Tool for Speak {
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: SpeakArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let asking = args.expecting.as_deref().is_some_and(|k| !k.is_empty() && k != "none");
-        let mut out = crate::speech::speak(&args.text, args.expecting.as_deref(), args.about.as_deref(), args.mode.as_deref() == Some("replace")).await.map_err(ToolError::msg)?;
+        let asking = crate::speech::asks_aloud(&args.text, args.expecting.as_deref());
+        let expecting = args.expecting.as_deref().filter(|_| asking);
+        let mut out = crate::speech::speak(&args.text, expecting, args.about.as_deref(), args.mode.as_deref() == Some("replace")).await.map_err(ToolError::msg)?;
         if !asking {
-            out["next"] = Value::String("Speech is playing. Your turn continues: if what you said promises an action or a check, make those tool calls now; if nothing is left to do, end without a chat line.".into());
+            let ignored = args.expecting.as_deref().is_some_and(|k| !k.is_empty() && k != "none");
+            let lead = if ignored { "Speech is playing; `expecting` was ignored because the line asks no question. " } else { "Speech is playing. " };
+            out["next"] = Value::String(format!("{lead}Your turn continues: if what you said promises an action or a check, make those tool calls now; if nothing is left to do, end without a chat line."));
         }
         Ok(ToolResult::success(out))
     }
