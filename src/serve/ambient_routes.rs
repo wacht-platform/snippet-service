@@ -173,7 +173,7 @@ pub(crate) async fn set_settings(
             }
         }
         if let Some(v) = req.mode {
-            if v == "passive" && ambient.mode != "passive" {
+            if v == "passive" {
                 crate::ambient::end_conversation();
             }
             ambient.mode = v;
