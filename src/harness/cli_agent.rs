@@ -2314,6 +2314,12 @@ impl CodingHarness {
                     let message = event.get("result").and_then(Value::as_str)
                         .or_else(|| event.get("subtype").and_then(Value::as_str))
                         .unwrap_or("Claude Code reported an error").to_string();
+                    if matches!(state.events.last(), Some(HarnessEvent::AssistantText { text }) if text.trim() == message.trim()) {
+                        state.events.pop();
+                        if matches!(state.messages.last(), Some(HarnessMessage::Assistant { content, tool_calls }) if tool_calls.is_empty() && content.trim() == message.trim()) {
+                            state.messages.pop();
+                        }
+                    }
                     state.events.push(HarnessEvent::ModelError { message });
                 } else if let Some(text) = event.get("result").and_then(Value::as_str) {
                     state.final_text = Some(text.to_string());
