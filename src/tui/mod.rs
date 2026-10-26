@@ -95,7 +95,7 @@ const ALL_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/voice",
-        "Voice notes: /voice shows settings · on|off · model … · language <code>|auto · terms a, b · max 3m · key <AssemblyAI key>|clear",
+        "Voice notes: /voice shows settings · on|off · max 3m",
     ),
 ];
 

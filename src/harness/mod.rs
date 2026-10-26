@@ -83,6 +83,7 @@ pub struct HarnessConfig {
     pub allow_lane_control: bool,
     pub lane_approval: Option<crate::lanes::LaneApprovalRoute>,
     pub lane_mailbox: Option<std::sync::Arc<crate::lanes::LaneMailbox>>,
+    pub session_title: Option<String>,
     pub hidden_meta: &'static [&'static str],
 }
 
@@ -93,7 +94,7 @@ impl Default for HarnessConfig {
             system_prompt: coding_system_prompt(),
             state_path: None,
             resume: false,
-            max_consecutive_recovery: 8,
+            max_consecutive_recovery: 3,
             recovery_base_ms: 1_000,
             recovery_max_ms: 30_000,
             exa_api_key: None,
@@ -107,6 +108,7 @@ impl Default for HarnessConfig {
             allow_lane_control: true,
             lane_approval: None,
             lane_mailbox: None,
+            session_title: None,
             hidden_meta: &[],
         }
     }
@@ -917,8 +919,31 @@ pub(crate) use transcript::notice_text;
 #[cfg(test)]
 mod tests;
 
+pub(crate) fn is_held_envelope(text: &str) -> bool {
+    if is_daemon_envelope(text) {
+        return true;
+    }
+    let first = text.lines().next().unwrap_or("");
+    if !first.starts_with("<ambient_turn") {
+        return false;
+    }
+    let matched = first
+        .split("matched=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    matched < 0.7
+}
+
 pub(crate) fn is_daemon_envelope(text: &str) -> bool {
     let first = text.lines().next().unwrap_or("").trim();
+    if first.starts_with("<ambient_resume>")
+        || first.starts_with("<ambient_context_alert")
+        || first.starts_with("<ambient_check_in")
+    {
+        return true;
+    }
     first.len() > 2
         && first.starts_with('[')
         && first.ends_with(']')

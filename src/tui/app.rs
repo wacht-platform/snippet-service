@@ -391,8 +391,24 @@ impl App {
         app.init_settings_form();
 
         if let Some(id) = app.options.resume.clone() {
-            // Explicit --resume <id> wins: reopen exactly that conversation.
-            app.switch_conversation(&id);
+            let found = crate::session::list_device_sessions().into_iter().find(|s| {
+                s.id == id
+                    || s.id.rsplit('/').next().is_some_and(|tail| tail.trim_end_matches(".json") == id)
+            });
+            match found {
+                Some(s) => {
+                    if std::path::Path::new(&s.folder) != app.options.config.workspace {
+                        app.options.config = app.options.config.for_workspace(std::path::PathBuf::from(&s.folder));
+                    }
+                    let name = if s.id == crate::session::session_id_for_state_path(&app.options.config.state_path) {
+                        "default".to_string()
+                    } else {
+                        s.id.rsplit('/').next().unwrap_or(&s.id).trim_end_matches(".json").to_string()
+                    };
+                    app.switch_conversation_at(&name, crate::config::workspaces_root().join(&s.id));
+                }
+                None => app.switch_conversation(&id),
+            }
         } else {
             // Nothing to resume: a new session, and in a git repository the
             // new-session screen asks where it works.

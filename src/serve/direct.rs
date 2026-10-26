@@ -232,22 +232,29 @@ async fn deliver_direct(
                 return Ok(());
             }
         }
-        if answers_own_message(d, event, &session_id) && !session_running(&session_id) {
-            if let Some((tx, _path, _stream)) = d.ensure_live(&session_id).await {
-                let note = match lane.as_deref() {
-                    Some(lane) => format!(
-                        "this answers a message your lane {lane} sent, and that lane has finished. Use it yourself, or pass it on with delegate_task (lane_id {lane}) if the lane should act on it."
-                    ),
-                    None => "this answers the message this session sent; carry on with what you were doing, using it. No reply is needed unless you have a follow-up.".to_string(),
-                };
-                let envelope = format!(
-                    "[agent_reply]\nfrom: {}:{}\nthread_id: {}\nnote: {note}\nbody: {body}\n[/agent_reply]",
-                    event.actor_kind, event.actor_id, event.thread_id
-                );
-                if tx.send(LoopInput::UserMessage(envelope)).is_ok() {
-                    return Ok(());
-                }
-            }
+        if answers_own_message(d, event, &session_id) {
+            let note = match lane.as_deref() {
+                Some(lane) => format!(
+                    "this answers a message your lane {lane} sent, and that lane has finished. Use it yourself, or pass it on with delegate_task (lane_id {lane}) if the lane should act on it."
+                ),
+                None => "this answers the message this session sent; carry on with what you were doing, using it. No reply is needed unless you have a follow-up.".to_string(),
+            };
+            let envelope = format!(
+                "[agent_reply]\nfrom: {}:{}\nthread_id: {}\nnote: {note}\nbody: {body}\n[/agent_reply]",
+                event.actor_kind, event.actor_id, event.thread_id
+            );
+            d.deliver(&session_id, LoopInput::UserMessage(envelope)).await;
+            return Ok(());
+        }
+        let from_self = session_id.starts_with(event.actor_id.as_str()) || event.actor_id.starts_with(session_id.as_str());
+        if !from_self && !crate::session::is_lane_session_id(&session_id) {
+            let reply_to = if event.actor_kind == "agent" { event.actor_id.clone() } else { "human".to_string() };
+            let envelope = format!(
+                "[direct_message]\nthread_id: {}\nfrom: {}:{}\nreply_to: {reply_to}\nnote: this was sent to this session directly; act on it or answer it with send_agent_message to reply_to.\nbody: {body}\n[/direct_message]",
+                event.thread_id, event.actor_kind, event.actor_id
+            );
+            d.deliver(&session_id, LoopInput::UserMessage(envelope)).await;
+            return Ok(());
         }
         super::record_agent_message(d, &session_id, &event.actor_id, body, false).await;
         return Ok(());
@@ -276,12 +283,6 @@ async fn deliver_direct(
     tx.send(LoopInput::UserMessage(envelope))
         .map_err(|error| format!("deliver direct message: {error}"))?;
     Ok(())
-}
-
-fn session_running(session_id: &str) -> bool {
-    crate::session::state_path_for_id(session_id)
-        .and_then(|path| crate::session::read_session_state(&path))
-        .is_some_and(|state| state.status == crate::harness::HarnessStatus::Running)
 }
 
 /// The lane that sent the latest message from this session on the thread, when

@@ -21,14 +21,16 @@ use crate::llm::NativeToolDefinition;
 use crate::tools::{Tool, ToolContext, ToolError, ToolResult, coding_tools};
 
 /// Builds a fresh model instance for a child lane run. Accepts an optional
-/// inference profile name; when None, it constructs the parent session's active model
-/// to preserve prompt cache affinity.
-pub type ModelFactory = Arc<dyn Fn(Option<&str>) -> Result<Box<dyn AgentModel>, String> + Send + Sync>;
+/// inference profile name and the lane's own durable session id so each lane
+/// keeps its own sticky prompt-cache key without colliding with the parent.
+pub type ModelFactory =
+    Arc<dyn Fn(Option<&str>, Option<String>) -> Result<Box<dyn AgentModel>, String> + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaneStatus {
     Running,
+    Paused,
     Cancelled,
     Completed,
     Failed,
@@ -251,6 +253,7 @@ struct LaneLink {
     store_path: Option<PathBuf>,
     context: String,
     mailbox: Arc<LaneMailbox>,
+    title: String,
 }
 
 /// Max lanes running at once — a runaway/cost guard so "spawn several" can't
@@ -260,7 +263,14 @@ const MAX_ACTIVE_LANES: usize = 8;
 /// Wall-clock cap per lane. Without one, a hung lane (stalled provider, endless
 /// tool loop under the iteration backstop) never reports, and the orchestrator —
 /// told that ending its turn is how it waits — waits forever.
-const LANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+async fn lane_timeout() -> std::time::Duration {
+    let mins = crate::config::SnippetConfig::load(crate::config::default_config_path())
+        .await
+        .map(|c| c.lane_timeout_mins)
+        .unwrap_or(30)
+        .clamp(1, 24 * 60);
+    std::time::Duration::from_secs(u64::from(mins) * 60)
+}
 
 /// Finished lanes older than this are dropped from the session snapshot and disk.
 const LANE_FINISHED_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
@@ -427,6 +437,12 @@ impl LaneManager {
             store_path: parent.and_then(|p| p.store_path()),
             context,
             mailbox,
+            title: self
+                .records
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.title.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -569,7 +585,7 @@ impl LaneManager {
                 "no delegated task `{lane_id}` is known in this conversation."
             ));
         };
-        if record.status != LaneStatus::Running {
+        if !matches!(record.status, LaneStatus::Running | LaneStatus::Paused) {
             return Err(format!(
                 "delegated task `{lane_id}` is not running (status: {:?}).",
                 record.status
@@ -626,8 +642,10 @@ impl LaneManager {
 
         let handle = tokio::spawn(async move {
             let _live = LiveLane::register(link.origin_session.as_deref(), &lane_id, &link.mailbox);
+            let limit = lane_timeout().await;
+            let mut timed_out = false;
             let result = tokio::time::timeout(
-                LANE_TIMEOUT,
+                limit,
                 run_lane(
                     factory,
                     workspace_root,
@@ -646,13 +664,10 @@ impl LaneManager {
             )
             .await
             .unwrap_or_else(|_| {
-                let error = format!(
-                    "lane timed out after {} minutes and was aborted — its partial work (if any) \
-                     is in the workspace; re-delegate a narrower brief if the task is still needed",
-                    LANE_TIMEOUT.as_secs() / 60
-                );
+                timed_out = true;
+                let error = format!("paused after running for {} minutes, the lane time limit", limit.as_secs() / 60);
                 if let Ok(mut log) = crate::lane_log::LaneLog::open(&lane_id) {
-                    let _ = log.write_end(&lane_id, "failed", None, Some(&error), None);
+                    let _ = log.write_end(&lane_id, "paused", None, Some(&error), None);
                 }
                 Err(error)
             });
@@ -668,7 +683,7 @@ impl LaneManager {
                 Err(error) => LaneResult {
                     id: lane_id,
                     title,
-                    status: LaneStatus::Failed,
+                    status: if timed_out { LaneStatus::Paused } else { LaneStatus::Failed },
                     summary: None,
                     report: None,
                     error: Some(error),
@@ -746,6 +761,7 @@ impl LaneManager {
             let text = match result.status {
                 LaneStatus::Completed => "completed",
                 LaneStatus::Failed => "failed",
+                LaneStatus::Paused => "paused",
                 LaneStatus::Cancelled => "cancelled",
                 LaneStatus::Running => "running",
             };
@@ -806,7 +822,7 @@ impl LaneManager {
         // Then enforce max finished count (oldest first among survivors).
         let mut survivors: Vec<(usize, chrono::DateTime<Utc>)> = finished_idx
             .into_iter()
-            .filter(|(i, _)| !drop.contains(i))
+            .filter(|(i, _)| !drop.contains(i) && self.records[*i].status != LaneStatus::Paused)
             .collect();
         if survivors.len() > MAX_FINISHED_LANES {
             survivors.sort_by_key(|(_, when)| *when); // oldest first
@@ -991,7 +1007,10 @@ async fn run_lane_once(
     approval: Option<LaneApprovalRoute>,
     link: LaneLink,
 ) -> Result<(String, String), String> {
-    let mut model = factory(profile.as_deref())?;
+    let lane_session_id = state_path
+        .starts_with(crate::config::workspaces_root())
+        .then(|| crate::session::session_id_for_state_path(&state_path));
+    let mut model = factory(profile.as_deref(), lane_session_id)?;
     let mut log = LaneLog::open(&owner).ok();
     if let Some(log) = log.as_mut() {
         let _ = log.write_start(&owner, &brief, read_only);
@@ -1042,6 +1061,12 @@ async fn run_lane_once(
         });
         (agent_name.to_string(), body)
     });
+    let cli_profile = model.cli_agent_profile();
+    let defaults = HarnessConfig::default();
+    let (context_window_tokens, compact_at_pct) = match &cli_profile {
+        Some(cli) => (cli.context_window, cli.compact_at_pct),
+        None => (defaults.context_window_tokens, defaults.compact_at_pct),
+    };
     let harness = CodingHarness::new(
         HarnessConfig {
             system_prompt: lane_prompt(
@@ -1054,11 +1079,14 @@ async fn run_lane_once(
             state_path: Some(state_path),
             resume,
             exa_api_key,
+            context_window_tokens,
+            compact_at_pct,
             progress_tx: Some(progress_tx),
             progress_id: Some(owner.clone()),
             lane_approval: approval,
             lane_mailbox: Some(link.mailbox.clone()),
-            ..HarnessConfig::default()
+            session_title: Some(link.title.clone()).filter(|t| !t.trim().is_empty()),
+            ..defaults
         },
         tools,
         context,
@@ -1068,11 +1096,16 @@ async fn run_lane_once(
     } else {
         ""
     };
+    let finish_how = if cli_profile.is_some() {
+        "When you're done, write your final summary directly as your closing response (do not call `message_parent` with the final report)."
+    } else {
+        "When you're done, finish with terminate_loop."
+    };
     let brief = format!(
-        "{brief}\n\n---\n{}\n\n{role}When you're done, finish with terminate_loop. The agent that handed you this reads that summary, so cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so it can go straight there without searching again.",
+        "{brief}\n\n---\n{}\n\n{role}{finish_how} The agent that handed you this reads that summary, so cite exact `file:line` locations (e.g. `src/foo.rs:42`) for everything you found or changed, so it can go straight there without searching again.",
         link.context
     );
-    let run = match model.cli_agent_profile() {
+    let run = match cli_profile {
         Some(cli) => harness.run_cli_lane(cli, brief).await,
         None => harness.run(&mut *model, brief).await,
     };

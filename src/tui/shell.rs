@@ -389,6 +389,7 @@ pub(crate) fn render_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App)
                     LaneStatus::Running => ("◐", accent(), "running"),
                     LaneStatus::Completed => ("✓", success(), "done"),
                     LaneStatus::Failed => ("✕", danger(), "failed"),
+                    LaneStatus::Paused => ("‖", warn(), "paused"),
                     LaneStatus::Cancelled => ("○", faint(), "cancelled"),
                 };
                 let selected = focused && i == app.shell.pane_index;
@@ -619,9 +620,9 @@ pub(crate) fn render_key_hints(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
 }
 
 impl App {
-    pub(crate) fn resume_conversation(&mut self, name: &str) {
+    pub(crate) fn resume_conversation(&mut self, c: &crate::tui::commands::Conversation) {
         self.conv_cache = None;
-        self.switch_conversation(name);
+        self.switch_conversation_at(&c.name, crate::config::workspaces_root().join(&c.id));
         self.screen = Screen::Main;
         if self.session_known() {
             self.spawn_loop(None, true);

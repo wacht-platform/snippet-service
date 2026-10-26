@@ -397,12 +397,13 @@ impl AgentRuntime {
         let base_model = i.base_model;
         let setups = i.setups;
         let delegate = i.delegate.unwrap_or_else(|| base_model.clone());
-        let lane_session_id = i.durable_id;
+        let parent_session_id = i.durable_id;
         Ok(Self {
-            factory: Some(Arc::new(move |profile: Option<&str>| {
+            factory: Some(Arc::new(move |profile: Option<&str>, lane_id: Option<String>| {
+                let session_id = lane_id.or_else(|| parent_session_id.clone());
                 if let Some(name) = profile {
                     if let Some(cfg) = setups.as_ref().and_then(|s| s.get(name)) {
-                        return Ok(cfg.build_model_for_session(lane_session_id.clone()));
+                        return Ok(cfg.build_model_for_session(session_id));
                     } else {
                         let known = setups
                             .as_ref()
@@ -414,7 +415,7 @@ impl AgentRuntime {
                         ));
                     }
                 }
-                Ok(delegate.build_model_for_session(lane_session_id.clone()))
+                Ok(delegate.build_model_for_session(session_id))
             })),
             context,
             tools,
@@ -581,7 +582,7 @@ fn start_session_with_role(
         let harness = CodingHarness::new(
             HarnessConfig {
                 system_prompt: runtime.prompt,
-                state_path: Some(sp),
+                state_path: Some(sp.clone()),
                 resume,
                 exa_api_key: exa_api_key.clone(),
                 context_window_tokens,
@@ -597,10 +598,20 @@ fn start_session_with_role(
             runtime.context,
         );
         if let Some(profile) = cli_profile {
-            return harness
+            let result = harness
                 .run_cli_agent(profile, initial, rx, runtime.factory, stream)
                 .await
                 .map_err(|e| e.to_string());
+            if let Err(error) = &result
+                && let Some(mut state) = read_session_state(&sp)
+            {
+                state.status = crate::harness::HarnessStatus::Failed;
+                state.events.push(crate::harness::HarnessEvent::ModelError {
+                    message: format!("CLI driver stopped: {error}"),
+                });
+                let _ = write_session_state(&sp, &state);
+            }
+            return result;
         }
         harness
             .run_interactive(&mut model, initial, rx, runtime.factory, stream)
@@ -1124,6 +1135,19 @@ pub fn read_session_state_tail(state_path: &Path, from: usize) -> Option<(Harnes
     let (events, count) = store.load_conversation_events_from(&id, from).ok()?;
     let state = crate::harness::state_from_scalar(&scalar, Vec::new(), events).ok()?;
     Some((state, count))
+}
+
+pub fn read_session_event_page(
+    state_path: &Path,
+    before: Option<usize>,
+    size: usize,
+) -> Option<(Vec<crate::harness::HarnessEvent>, usize, usize)> {
+    let id = session_id_for_state_path(state_path);
+    let store = store_for_sessions()?;
+    if !store.has_conversation(&id).ok()? {
+        return None;
+    }
+    store.load_conversation_event_page(&id, before, size).ok()
 }
 
 /// Open the session store, if one exists at the canonical path.

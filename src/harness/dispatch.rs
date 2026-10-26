@@ -91,6 +91,18 @@ fn is_error_result(result: &Value) -> bool {
     result.get("status").and_then(Value::as_str) == Some("error")
 }
 
+fn speak_asks(call: &GeneratedToolCall) -> bool {
+    (call.tool_name == "speak" || call.tool_name.ends_with("__speak"))
+        && crate::speech::asks_aloud(
+            call.arguments.get("text").and_then(Value::as_str).unwrap_or(""),
+            call.arguments.get("expecting").and_then(Value::as_str),
+        )
+}
+
+fn last_result_ok(state: &HarnessState) -> bool {
+    matches!(state.messages.last(), Some(HarnessMessage::ToolResult { content, .. }) if !is_error_result(content))
+}
+
 fn execution_error(error: ToolError) -> Value {
     json!({
         "schema_version": 1,
@@ -153,6 +165,7 @@ impl CodingHarness {
             }
             let call = calls[i].clone();
             i += 1;
+            let asks_aloud = conversation_mode && i == calls.len() && speak_asks(&call);
             if let Some(end_turn) = self
                 .run_call(
                     state,
@@ -171,6 +184,12 @@ impl CodingHarness {
                 .await
             {
                 return Err(end_turn);
+            }
+            if asks_aloud && last_result_ok(state) {
+                return Err(StepResult::TurnEnded {
+                    kind: TurnEndKind::Complete,
+                    final_text: None,
+                });
             }
         }
         Ok(stats)

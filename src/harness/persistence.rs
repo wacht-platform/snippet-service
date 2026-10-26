@@ -72,9 +72,13 @@ impl CodingHarness {
             } else {
                 ApprovalMode::Auto
             };
-            return self
+            let mut state = self
                 .resume_loaded_state(state, seeded_system, initial_request)
-                .await;
+                .await?;
+            if let Some(title) = self.config.session_title.clone() {
+                state.title = Some(title);
+            }
+            return Ok(state);
         }
 
         let now = Utc::now().to_rfc3339();
@@ -95,6 +99,7 @@ impl CodingHarness {
             }
             None => (HarnessStatus::Idle, None),
         };
+        let title = self.config.session_title.clone().or(title);
         let mut state = HarnessState {
             version: 1,
             status,

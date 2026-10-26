@@ -740,11 +740,15 @@ fn agent_chain_exhausted(history: &[CoordinationEvent], event: &CoordinationEven
     if !chatter(&event) {
         return false;
     }
+    let human = super::autonomy::human_at();
+    let after_human = |e: &&CoordinationEvent| {
+        human.is_none_or(|h| chrono::DateTime::parse_from_rfc3339(&e.created_at).is_ok_and(|t| t > h))
+    };
     let tail: Vec<&CoordinationEvent> = history
         .iter()
         .chain(std::iter::once(event))
         .rev()
-        .take_while(|e| e.actor_kind != "human" && chatter(e))
+        .take_while(|e| e.actor_kind != "human" && chatter(e) && after_human(e))
         .collect();
     let mut actors: Vec<&str> = tail.iter().map(|e| e.actor_id.as_str()).collect();
     actors.sort();

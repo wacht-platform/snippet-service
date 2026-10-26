@@ -93,32 +93,20 @@ pub(super) async fn prepare_message(d: &Daemon, text: String) -> Result<String, 
     Ok(out)
 }
 
-pub(super) fn transcript_request(voice: &crate::config::VoiceConfig, upload_url: &str) -> serde_json::Value {
-    let mut body = serde_json::json!({"audio_url": upload_url});
-    if !voice.speech_model.is_empty() {
-        body["speech_models"] = serde_json::json!([voice.speech_model]);
-    }
-    if !voice.language.is_empty() {
-        body["language_code"] = serde_json::json!(voice.language);
-    }
-    if !voice.keyterms.is_empty() {
-        body["keyterms_prompt"] = serde_json::json!(voice.keyterms);
-    }
-    body
-}
-
 async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String> {
     d.reload_config().await;
-    let (voice, key) = {
-        let c = d.config.lock().unwrap();
-        (c.voice.clone(), c.assemblyai_api_key.clone())
-    };
+    let voice = d.config.lock().unwrap().voice.clone();
     if !voice.enabled {
         return Err("voice notes are turned off in Settings → Voice".to_string());
     }
-    let key = key
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "no AssemblyAI API key is set (Settings → Voice)".to_string())?;
+    let key = d
+        .config
+        .lock()
+        .unwrap()
+        .assemblyai_api_key
+        .clone()
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| "set assemblyai_api_key in the server config to transcribe voice notes".to_string())?;
     let duration = audio_duration_seconds(path).await?;
     let limit = voice.max_seconds.max(crate::config::VOICE_MIN_SECONDS);
     if duration >= limit as f64 + 1.0 {
@@ -128,96 +116,67 @@ async fn transcribe_audio_file(d: &Daemon, path: &Path) -> Result<String, String
             if limit % 60 == 0 { format!("{}-minute", limit / 60) } else { format!("{limit}-second") }
         ));
     }
-    let audio = tokio::fs::read(path)
-        .await
-        .map_err(|e| format!("could not read audio attachment: {e}"))?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| format!("could not create transcription client: {e}"))?;
+    super::assembly::transcribe_file(&key, path).await
+}
 
-    let upload_response = client
-        .post("https://api.assemblyai.com/v2/upload")
-        .header("authorization", &key)
-        .header("content-type", "application/octet-stream")
-        .body(audio)
-        .send()
-        .await
-        .map_err(|e| format!("AssemblyAI upload request failed: {e}"))?;
-    if !upload_response.status().is_success() {
-        let status = upload_response.status();
-        let body = upload_response.text().await.unwrap_or_default();
-        return Err(format!("AssemblyAI upload failed ({status}): {body}"));
-    }
-    let upload: serde_json::Value = upload_response
-        .json()
-        .await
-        .map_err(|e| format!("invalid AssemblyAI upload response: {e}"))?;
-    let upload_url = upload
-        .get("upload_url")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "AssemblyAI upload response did not contain upload_url".to_string())?;
+pub(super) struct Spoken {
+    pub text: String,
+}
 
-    let submit_response = client
-        .post("https://api.assemblyai.com/v2/transcript")
-        .header("authorization", &key)
-        .json(&transcript_request(&voice, &upload_url))
-        .send()
-        .await
-        .map_err(|e| format!("AssemblyAI transcript request failed: {e}"))?;
-    if !submit_response.status().is_success() {
-        let status = submit_response.status();
-        let body = submit_response.text().await.unwrap_or_default();
-        return Err(format!(
-            "AssemblyAI transcript submission failed ({status}): {body}"
-        ));
-    }
-    let submitted: serde_json::Value = submit_response
-        .json()
-        .await
-        .map_err(|e| format!("invalid AssemblyAI transcript response: {e}"))?;
-    let id = submitted
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "AssemblyAI response did not contain transcript id".to_string())?;
-    let poll_url = format!("https://api.assemblyai.com/v2/transcript/{id}");
+pub(super) async fn transcribe_ambient(d: &Shared, path: &Path) -> Result<Spoken, String> {
+    let key = d
+        .config
+        .lock()
+        .unwrap()
+        .assemblyai_api_key
+        .clone()
+        .filter(|k| !k.trim().is_empty())
+        .ok_or_else(|| "set assemblyai_api_key in the server config".to_string())?;
+    let text = super::assembly::transcribe_file(&key, path).await?;
+    Ok(finish_text(&text))
+}
 
-    for _ in 0..300 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let response = client
-            .get(&poll_url)
-            .header("authorization", &key)
-            .send()
-            .await
-            .map_err(|e| format!("AssemblyAI polling failed: {e}"))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("AssemblyAI polling failed ({status}): {body}"));
+pub(super) fn finish_text(text: &str) -> Spoken {
+    let text = fix_wake_spelling(&collapse_repeats(text)).trim().to_string();
+    let text = if is_filler(&text) && crate::ambient::expectation().is_none() && crate::ambient::conversation().is_none() { String::new() } else { text };
+    Spoken { text }
+}
+
+fn collapse_repeats(text: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut run = 0;
+    for w in text.split_whitespace() {
+        let key = |x: &str| x.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if out.last().is_some_and(|l| key(l) == key(w) && !key(w).is_empty()) {
+            run += 1;
+            if run >= 3 {
+                continue;
+            }
+        } else {
+            run = 0;
         }
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("invalid AssemblyAI polling response: {e}"))?;
-        match result.get("status").and_then(serde_json::Value::as_str) {
-            Some("completed") => {
-                return Ok(result
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string());
-            }
-            Some("error") => {
-                return Err(result
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("AssemblyAI transcription failed")
-                    .to_string());
-            }
-            _ => {}
+        out.push(w);
+    }
+    out.join(" ")
+}
+
+fn is_filler(text: &str) -> bool {
+    const FILLER: [&str; 12] = ["uh", "um", "okay", "ok", "wow", "hmm", "well", "oh", "ah", "mm", "yeah", "huh"];
+    let words: Vec<String> = text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    !words.is_empty() && words.len() <= 3 && words.iter().all(|w| FILLER.contains(&w.as_str()))
+}
+
+fn fix_wake_spelling(text: &str) -> String {
+    let lower = text.to_lowercase();
+    for variant in ["snip it", "snip but", "snip bit", "snippit", "snipit", "snip pet"] {
+        if lower.starts_with(variant) && !lower[variant.len()..].starts_with(|c: char| c.is_alphanumeric()) {
+            return format!("Snippet{}", &text[variant.len()..]);
         }
     }
-    Err("AssemblyAI transcription timed out".to_string())
+    text.to_string()
 }

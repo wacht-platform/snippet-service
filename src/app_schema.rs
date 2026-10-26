@@ -85,8 +85,91 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              id INTEGER PRIMARY KEY CHECK (id = 1),
              created_at INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS ambient_events (
+             id TEXT PRIMARY KEY NOT NULL,
+             device TEXT NOT NULL DEFAULT '',
+             started_at TEXT NOT NULL,
+             duration_ms INTEGER NOT NULL DEFAULT 0,
+             status TEXT NOT NULL,
+             text TEXT NOT NULL DEFAULT '',
+             error TEXT,
+             created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS ambient_events_started
+             ON ambient_events(started_at);
+         CREATE INDEX IF NOT EXISTS ambient_events_created
+             ON ambient_events(created_at);
+         CREATE INDEX IF NOT EXISTS ambient_events_status
+             ON ambient_events(status);
+         CREATE VIRTUAL TABLE IF NOT EXISTS ambient_events_fts
+             USING fts5(text, content='ambient_events', content_rowid='rowid');
+         CREATE TABLE IF NOT EXISTS ambient_turns (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             conversation_id TEXT NOT NULL,
+             role TEXT NOT NULL,
+             text TEXT NOT NULL,
+             device TEXT NOT NULL DEFAULT '',
+             created_at INTEGER NOT NULL,
+             played_at INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS ambient_turns_device
+             ON ambient_turns(device, id);
+         CREATE INDEX IF NOT EXISTS ambient_turns_created
+             ON ambient_turns(created_at);
+         CREATE TABLE IF NOT EXISTS ambient_chunks (
+             turn_id INTEGER NOT NULL,
+             seq INTEGER NOT NULL,
+             ms INTEGER NOT NULL,
+             text TEXT NOT NULL,
+             PRIMARY KEY (turn_id, seq)
+         );
 "#,
     )?;
+    let have: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(ambient_events)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (name, ddl) in [
+        ("verdict", "ALTER TABLE ambient_events ADD COLUMN verdict TEXT"),
+        ("addressed", "ALTER TABLE ambient_events ADD COLUMN addressed REAL"),
+        ("judge", "ALTER TABLE ambient_events ADD COLUMN judge TEXT"),
+        ("intent", "ALTER TABLE ambient_events ADD COLUMN intent TEXT"),
+        ("kept", "ALTER TABLE ambient_events ADD COLUMN kept INTEGER NOT NULL DEFAULT 1"),
+        ("seq", "ALTER TABLE ambient_events ADD COLUMN seq INTEGER"),
+        ("continued", "ALTER TABLE ambient_events ADD COLUMN continued INTEGER NOT NULL DEFAULT 0"),
+        ("during_playback", "ALTER TABLE ambient_events ADD COLUMN during_playback INTEGER NOT NULL DEFAULT 0"),
+        ("media", "ALTER TABLE ambient_events ADD COLUMN media INTEGER NOT NULL DEFAULT 0"),
+        ("routed", "ALTER TABLE ambient_events ADD COLUMN routed INTEGER NOT NULL DEFAULT 1"),
+        ("delivered", "ALTER TABLE ambient_events ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0"),
+        ("turn_key", "ALTER TABLE ambient_events ADD COLUMN turn_key TEXT"),
+    ] {
+        if !have.iter().any(|c| c == name) {
+            connection.execute(ddl, [])?;
+        }
+    }
+    connection.execute("DROP TABLE IF EXISTS speakers", [])?;
+    for column in ["speakers", "speaker_summary"] {
+        if have.iter().any(|c| c == column) {
+            connection.execute(&format!("ALTER TABLE ambient_events DROP COLUMN {column}"), [])?;
+        }
+    }
+    let have_turns: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(ambient_turns)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (name, ddl) in [
+        ("status", "ALTER TABLE ambient_turns ADD COLUMN status TEXT NOT NULL DEFAULT 'played'"),
+        ("heard_text", "ALTER TABLE ambient_turns ADD COLUMN heard_text TEXT"),
+        ("chunk_count", "ALTER TABLE ambient_turns ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0"),
+        ("ended", "ALTER TABLE ambient_turns ADD COLUMN ended INTEGER NOT NULL DEFAULT 0"),
+        ("played_through", "ALTER TABLE ambient_turns ADD COLUMN played_through INTEGER NOT NULL DEFAULT -1"),
+    ] {
+        if !have_turns.iter().any(|c| c == name) {
+            connection.execute(ddl, [])?;
+        }
+    }
     let legacy: bool = connection.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mission_duty')",
         [],

@@ -99,10 +99,9 @@ pub(crate) async fn attach_ws(
     if !d.authed(&q.token) {
         return unauthorized();
     }
-    let compact = q
-        .compact
-        .as_deref()
-        .is_some_and(|v| v != "0" && v != "false");
+    let on = |v: &Option<String>| v.as_deref().is_some_and(|v| v != "0" && v != "false");
+    let compact = on(&q.compact);
+    let stream_delta = on(&q.stream_delta);
     if crate::session::is_lane_session_id(&q.session) {
         let Some(state_path) = state_path_for_id(&q.session)
             .filter(|path| crate::session::read_session_meta(path).is_some())
@@ -114,7 +113,7 @@ pub(crate) async fn attach_ws(
         let daemon = d.clone();
         let session = q.session.clone();
         return ws.on_upgrade(move |socket| {
-            handle_ws(socket, daemon, session, state_path, stream, None, compact, true)
+            handle_ws(socket, daemon, session, state_path, stream, None, AttachOptions { compact, stream_delta, read_only: true })
         });
     }
     match d.ensure_live(&q.session).await {
@@ -126,11 +125,18 @@ pub(crate) async fn attach_ws(
             let daemon = d.clone();
             let session = q.session.clone();
             ws.on_upgrade(move |socket| {
-                handle_ws(socket, daemon, session, state_path, stream, terms, compact, false)
+                handle_ws(socket, daemon, session, state_path, stream, terms, AttachOptions { compact, stream_delta, read_only: false })
             })
         }
         None => (StatusCode::NOT_FOUND, "no such session").into_response(),
     }
+}
+
+#[derive(Clone, Copy)]
+struct AttachOptions {
+    compact: bool,
+    stream_delta: bool,
+    read_only: bool,
 }
 
 async fn handle_ws(
@@ -140,9 +146,9 @@ async fn handle_ws(
     state_path: PathBuf,
     stream: crate::llm::StreamHandle,
     terms: Option<std::sync::Arc<crate::term::SessionTerms>>,
-    compact: bool,
-    read_only: bool,
+    options: AttachOptions,
 ) {
+    let AttachOptions { compact, stream_delta, read_only } = options;
     let (mut sender, mut receiver) = socket.split();
     let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Option<usize>)>();
     let history_request_tx = history_tx.clone();
@@ -166,6 +172,9 @@ async fn handle_ws(
         let mut last_event_offset = 0usize;
         let mut last_lanes_json: Option<String> = None;
         let mut last_stream_fp: u64 = 0;
+        let mut sent_text = String::new();
+        let mut sent_thinking = String::new();
+        let mut sent_once = false;
         let mut last_queue_revision = 0;
         let mut attach_revision: u64 = 0;
         let mut term_seq: u64 = 0;
@@ -270,12 +279,29 @@ async fn handle_ws(
                 let fp = h.finish();
                 if fp != last_stream_fp {
                     last_stream_fp = fp;
-                    let frame = serde_json::json!({
-                        "wire": "stream",
-                        "text": snap,
-                        "thinking": think,
-                        "text_visible": visible,
-                    });
+                    let append = stream_delta
+                        && sent_once
+                        && snap.starts_with(&sent_text)
+                        && think.starts_with(&sent_thinking);
+                    let frame = if append {
+                        serde_json::json!({
+                            "wire": "stream",
+                            "append": true,
+                            "text": &snap[sent_text.len()..],
+                            "thinking": &think[sent_thinking.len()..],
+                            "text_visible": visible,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "wire": "stream",
+                            "text": snap,
+                            "thinking": think,
+                            "text_visible": visible,
+                        })
+                    };
+                    sent_once = true;
+                    sent_text = snap;
+                    sent_thinking = think;
                     if let Ok(json) = serde_json::to_string(&frame) {
                         if sender.send(Message::Text(json.into())).await.is_err() {
                             break;
@@ -332,12 +358,28 @@ async fn handle_ws(
                 }
             }
             if let Ok((before, limit)) = history_rx.try_recv() {
-                if let Some((state, _)) = read_session_state_tail(&state_path, 0) {
-                    let (start, end, has_older) =
-                        session_event_page(&state.events, Some(before), limit);
+                let paged = match limit {
+                    Some(size) => {
+                        let path = state_path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::session::read_session_event_page(&path, Some(before), size.clamp(1, 500))
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                    }
+                    None => None,
+                };
+                let paged = paged.or_else(|| {
+                    let (state, _) = read_session_state_tail(&state_path, 0)?;
+                    let (start, end, _) = session_event_page(&state.events, Some(before), limit);
+                    Some((state.events[start..end].to_vec(), start, end))
+                });
+                if let Some((events, start, end)) = paged {
+                    let has_older = start > 0;
                     let frame = serde_json::json!({
                         "wire": "history",
-                        "events": wire_events(&state.events[start..end], compact),
+                        "events": wire_events(&events, compact),
                         "start": start,
                         "end": end,
                         "has_older": has_older,
@@ -409,6 +451,14 @@ async fn handle_ws(
                     continue;
                 }
                 if let Ok(input) = serde_json::from_str::<LoopInput>(t.as_str()) {
+                    if crate::mission_control::is_session_id(&session)
+                        && matches!(
+                            input,
+                            LoopInput::UserMessage(_) | LoopInput::Queue(_) | LoopInput::Answer(_) | LoopInput::SteerQueued(_)
+                        )
+                    {
+                        super::autonomy::note_human();
+                    }
                     daemon.deliver(&session, input).await;
                 }
             }

@@ -197,29 +197,18 @@ impl App {
 
     /// Close the login form, optionally restoring the pre-login config (Esc).
 
-    pub(crate) fn conversations_dir(&self) -> PathBuf {
-        let parent = self
-            .options
-            .config
-            .state_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let dir = parent.join("conversations");
-        let _ = std::fs::create_dir_all(&dir);
-        dir
-    }
-
-    /// The state path a picker entry names.
+    /// The state path a picker entry names, from its name alone.
     ///
-    /// `default` is the workspace-root state; anything else is a saved
-    /// conversation under `conversations/`. THE one mapping — `switch_conversation`
-    /// and the delete/rename paths all need it, and a drift between them would
-    /// mutate a different session than the one the user selected.
+    /// `default` is the workspace's own session; anything else is a conversation
+    /// under it. A session id is its path below the workspaces root, so the
+    /// conversation has to sit inside the workspace directory: anywhere else maps
+    /// to an id the store has never heard of, and the TUI starts a new session.
+    /// Entries that come from the picker carry their real id and use that instead.
     pub(crate) fn state_path_for_conversation(&self, name: &str) -> PathBuf {
         if name == "default" {
             self.options.config.state_path.clone()
         } else {
-            self.conversations_dir().join(format!("{name}.json"))
+            self.options.config.state_path.join("conversations").join(name)
         }
     }
 
@@ -468,7 +457,7 @@ impl App {
         if c.folder != self.options.config.workspace {
             self.options.config = self.options.config.for_workspace(c.folder.clone());
         }
-        self.resume_conversation(&c.name);
+        self.resume_conversation(c);
     }
 
     /// Start a new session. In a git repository the new-session screen asks
@@ -727,6 +716,11 @@ impl App {
     }
 
     pub(crate) fn switch_conversation(&mut self, name: &str) {
+        let path = self.state_path_for_conversation(name);
+        self.switch_conversation_at(name, path);
+    }
+
+    pub(crate) fn switch_conversation_at(&mut self, name: &str, state_path: PathBuf) {
         // Tear down any resident agent SYNCHRONOUSLY. The interactive loop
         // idle-blocks on input and never exits on its own, so a mere async
         // Interrupt would still leave the task "alive" when the next spawn_loop
@@ -747,7 +741,7 @@ impl App {
 
         // Update active_conversation and active_state_path
         self.active_conversation = name.to_string();
-        self.active_state_path = self.state_path_for_conversation(name);
+        self.active_state_path = state_path;
 
         // Force a fresh state read for the new session's file.
         self.last_state_stamp = None;
@@ -1034,22 +1028,12 @@ impl App {
                 return;
             }
         };
-        let usage = "/voice · on|off · model universal-3-5-pro|universal-2|auto · language <code>|auto · terms <a, b, …>|clear · max <90s|3m> · key <api key>|clear";
+        let usage = "/voice · on|off · max <90s|3m>";
         let mut voice = config.voice.clone();
-        let mut key_change: Option<Option<String>> = None;
         match verb.as_str() {
             "" | "show" => {}
             "on" => voice.enabled = true,
             "off" => voice.enabled = false,
-            "model" => voice.speech_model = if arg.eq_ignore_ascii_case("auto") { String::new() } else { arg.to_string() },
-            "language" | "lang" => voice.language = if arg.eq_ignore_ascii_case("auto") { String::new() } else { arg.to_string() },
-            "terms" | "keyterms" => {
-                voice.keyterms = if arg.eq_ignore_ascii_case("clear") || arg.is_empty() {
-                    Vec::new()
-                } else {
-                    arg.split(',').map(|t| t.trim().to_string()).collect()
-                }
-            }
             "max" => {
                 let raw = arg.to_ascii_lowercase();
                 let parsed = if let Some(m) = raw.strip_suffix('m') {
@@ -1065,13 +1049,6 @@ impl App {
                     }
                 }
             }
-            "key" => {
-                if arg.is_empty() {
-                    self.status = "voice: /voice key <AssemblyAI API key>  ·  /voice key clear".into();
-                    return;
-                }
-                key_change = Some((!arg.eq_ignore_ascii_case("clear")).then(|| arg.to_string()));
-            }
             _ => {
                 self.status = format!("voice: {usage}");
                 return;
@@ -1086,11 +1063,7 @@ impl App {
                     return;
                 }
             }
-            if let Some(key) = key_change {
-                config.assemblyai_api_key = key;
-            }
             self.options.config.voice = config.voice.clone();
-            self.options.config.assemblyai_api_key = config.assemblyai_api_key.clone();
             let saved = toml::to_string_pretty(&config)
                 .map_err(|e| e.to_string())
                 .and_then(|out| {
@@ -1104,17 +1077,12 @@ impl App {
             crate::config::set_private(&self.options.config_path);
         }
         let v = &config.voice;
-        let key_set = config.assemblyai_api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
         let max = if v.max_seconds % 60 == 0 { format!("{}m", v.max_seconds / 60) } else { format!("{}s", v.max_seconds) };
         self.status = format!(
-            "{}Voice notes: {}\n  model     {}\n  language  {}\n  key terms {}\n  max       {}\n  API key   {}\n{usage}",
+            "{}Voice notes: {}\n  max       {}\n{usage}",
             if changed { "Saved. " } else { "" },
             if v.enabled { "on" } else { "off" },
-            if v.speech_model.is_empty() { "auto" } else { v.speech_model.as_str() },
-            if v.language.is_empty() { "auto-detect" } else { v.language.as_str() },
-            if v.keyterms.is_empty() { "none".to_string() } else { v.keyterms.join(", ") },
             max,
-            if key_set { "set" } else { "not set" },
         );
     }
 
