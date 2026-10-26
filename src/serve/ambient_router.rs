@@ -426,6 +426,7 @@ async fn deliver(
 ) {
     let _ = ttl;
     super::autonomy::note_input();
+    super::autonomy::note_human();
     crate::tts_stream::prewarm(device);
     let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
     if let Some(last) = ids.last() {

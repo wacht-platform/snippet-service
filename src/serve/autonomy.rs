@@ -56,6 +56,16 @@ pub async fn autonomy_loop(daemon: Shared) {
     }
 }
 
+static HUMAN_AT: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> = std::sync::Mutex::new(None);
+
+pub(super) fn note_human() {
+    *HUMAN_AT.lock().unwrap() = Some(chrono::Utc::now());
+}
+
+pub(super) fn human_at() -> Option<chrono::DateTime<chrono::Utc>> {
+    *HUMAN_AT.lock().unwrap()
+}
+
 static MC_INPUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BARGED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
