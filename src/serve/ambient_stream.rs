@@ -73,7 +73,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                 match v.get("t").and_then(|x| x.as_str()) {
                     Some("start") => {
                         if open.len() >= MAX_OPEN {
-                            let _ = out_tx.send(PhoneFrame::Text(serde_json::json!({"t":"err","h":h,"code":429}).to_string()));
+                            reply(&out_tx, serde_json::json!({"t":"err","h":h,"code":429}));
                             continue;
                         }
                         if let Some(seq) = v.get("seq").and_then(|x| x.as_i64()) {
@@ -83,11 +83,11 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                     }
                     Some("open") => {
                         let started = v.get("started_at").and_then(|x| x.as_str()).map(str::to_string);
-                        let reply = match super::listener::open(&d, &device, h, started.as_deref()).await {
+                        let answer = match super::listener::open(&d, &device, h, started.as_deref()).await {
                             Ok(()) => serde_json::json!({"t":"opened","h":h}),
                             Err(code) => serde_json::json!({"t":"err","h":h,"code":code}),
                         };
-                        let _ = out_tx.send(PhoneFrame::Text(reply.to_string()));
+                        reply(&out_tx, answer);
                     }
                     Some("close") => {
                         super::listener::close(&device, Some(h));
@@ -101,7 +101,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                     }
                     Some("end") => {
                         let Some(mut seg) = open.remove(&h) else {
-                            let _ = out_tx.send(PhoneFrame::Text(serde_json::json!({"t":"err","h":h,"code":404}).to_string()));
+                            reply(&out_tx, serde_json::json!({"t":"err","h":h,"code":404}));
                             continue;
                         };
                         if let Some(ms) = v.get("duration_ms") {
@@ -120,7 +120,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         tokio::spawn(async move {
                             let (code, status) = finish(d, device, token, seg).await;
                             let id = v.get("id").cloned().unwrap_or_default();
-                            let _ = out.send(PhoneFrame::Text(serde_json::json!({"t":"done","h":h,"id":id,"code":code,"status":status}).to_string()));
+                            reply(&out, serde_json::json!({"t":"done","h":h,"id":id,"code":code,"status":status}));
                         });
                     }
                     Some("caps") => {
@@ -140,7 +140,7 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
                         }
                     }
                     Some("ping") => {
-                        let _ = out_tx.send(PhoneFrame::Text(serde_json::json!({"t":"pong"}).to_string()));
+                        reply(&out_tx, serde_json::json!({"t":"pong"}));
                     }
                     _ => {}
                 }
@@ -157,6 +157,10 @@ async fn run(socket: WebSocket, d: Shared, device: String, token: Option<String>
     }
     drop(out_tx);
     let _ = writer.await;
+}
+
+fn reply(out: &tokio::sync::mpsc::UnboundedSender<PhoneFrame>, value: serde_json::Value) {
+    let _ = out.send(PhoneFrame::Text(value.to_string()));
 }
 
 async fn finish(d: Shared, device: String, token: Option<String>, seg: Open) -> (u16, String) {

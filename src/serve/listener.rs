@@ -12,7 +12,6 @@ use super::Shared;
 
 const BPS: f64 = 32_000.0;
 const RING: usize = 32_000 * 180;
-const SEND_AT: u64 = 1_024;
 const MIN_SEND: u64 = 1_024;
 const MAX_SEND: u64 = 24_000;
 const REPLAY: u64 = 32_000 * 10;
@@ -413,7 +412,7 @@ impl Listener {
         let Some(tx) = c.tx.clone() else { return };
         let mut sent = c.sent.max(ring_start);
         let mut chunks = Vec::new();
-        while g - sent >= SEND_AT || (all && g > sent) {
+        while g - sent >= MIN_SEND || (all && g > sent) {
             let n = (g - sent).min(MAX_SEND);
             let from = (sent - ring_start) as usize;
             chunks.push(s.ring.range(from..from + n as usize).copied().collect::<Vec<u8>>());
@@ -441,8 +440,8 @@ impl Listener {
             .map(|ws| {
                 ws.iter()
                     .filter_map(|w| {
-                        let start = base + (w.get("start")?.as_f64()? / 1000.0 * BPS) as u64 & !1;
-                        let end = base + (w.get("end")?.as_f64()? / 1000.0 * BPS) as u64 & !1;
+                        let start = (base + (w.get("start")?.as_f64()? / 1000.0 * BPS) as u64) & !1;
+                        let end = (base + (w.get("end")?.as_f64()? / 1000.0 * BPS) as u64) & !1;
                         let text = w.get("text")?.as_str()?.to_string();
                         let mid = (start + end) / 2;
                         Some(Heard { key: norm(&text), text, start, end, playing: at(&s.playing, mid), media: at(&s.media, mid) })
@@ -629,7 +628,7 @@ fn phonetic(w: &str) -> String {
             'a' | 'e' | 'i' | 'o' | 'u' | 'y' | 'w' | 'h' if i > 0 => continue,
             other => other,
         };
-        if out.chars().last() != Some(mapped) {
+        if !out.ends_with(mapped) {
             out.push(mapped);
         }
     }
@@ -846,7 +845,9 @@ async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceive
             }
         }
     }
-    l.inner.lock().unwrap().conn.as_mut().filter(|c| c.id == id).map(|c| c.tx = None);
+    if let Some(c) = l.inner.lock().unwrap().conn.as_mut().filter(|c| c.id == id) {
+        c.tx = None;
+    }
     let _ = tx.send(Message::Text(terminate.into())).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     while let Ok(Some(Ok(m))) = tokio::time::timeout_at(deadline, rx.next()).await {
