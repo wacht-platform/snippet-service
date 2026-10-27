@@ -1,110 +1,88 @@
 <div align="center">
 
-<img src="snippet-mascot/png/snip-mascot-256.png" alt="Mochi, the snippet mascot" width="120" height="120" />
+<img src="snippet-mascot/png/snip-mascot-256.png" alt="Mochi, the snippet mascot" width="96" height="96" />
 
 # snippet
 
-**An open-source AI coding agent for your terminal, with a remote app for your phone and desktop.**
+A coding agent for your terminal, with a phone and desktop app to steer it from anywhere.
 
 [![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
-[![remote app](https://img.shields.io/badge/remote%20app-Android%20%7C%20macOS%20%7C%20Windows-6c5ce7.svg)](https://github.com/wacht-platform/snippet-mobile)
 
 </div>
 
----
+![The terminal UI answering a question about a repository](docs/screenshots/tui.png)
 
-`snippet` runs on your machine, works in your project, and keeps sessions durable on disk. The Rust binary provides both the terminal UI and the authenticated `serve` daemon. The companion Flutter app can attach to the same sessions remotely.
+`snippet` runs on your machine, works in your project and keeps every session on disk. One Rust binary provides the terminal UI and the `serve` daemon that the [companion app](https://github.com/wacht-platform/snippet-mobile) connects to.
 
-## What it does
+## Features
 
-- Durable coding sessions with checkpoints, rewind, and history compaction; compacted messages stay searchable with `snippet history`.
-- Persistent memory per repository — rules, learnings, and a generated table of contents of notes — shared by all of its worktrees.
-- A small tool set: a stateful shell, one all-or-nothing file-change tool, image viewing, and web search; agents can operate a real computer through a computer-use driver they set up.
-- Multiple provider profiles with global and per-conversation model selection.
-- Anthropic, OpenAI, Gemini, OpenRouter, OpenAI-compatible endpoints, local models, and ChatGPT subscription login.
-- Delegated background lanes with live progress and recovery after reconnects.
-- Detached background processes for servers and watchers.
-- Remote control through the companion Android, macOS, and Windows app.
+- Durable sessions: checkpoints, rewind and history compaction. Compacted messages stay searchable with `snippet history`.
+- Memory per repository, shared by its worktrees: rules, learnings and notes.
+- A small tool set: a stateful shell, one all-or-nothing file-change tool, image viewing and web search.
+- Several model profiles, chosen globally or per conversation: Anthropic, OpenAI, Gemini, OpenRouter, any OpenAI-compatible endpoint, local models, or a ChatGPT subscription.
+- Delegated background lanes with live progress, and detached processes for servers and watchers.
+- Mission Control, a coordinating session that hands work to specialised agents, with optional voice (see [docs/ambient](docs/ambient/architecture.md)).
+- Remote control from Android, macOS, Linux and Windows.
 
 ## Install
-
-### Prebuilt Linux or macOS binary
 
 ```sh
 curl -fsSL https://snippet.wacht.dev/install.sh | sh
 ```
 
-Or download a package from the [service releases](https://github.com/wacht-platform/snippet-service/releases).
-
-### Build from source
-
-Requires [Rust](https://rustup.rs).
+Or download a package from the [releases](https://github.com/wacht-platform/snippet-service/releases), or build from source with [Rust](https://rustup.rs):
 
 ```sh
 git clone https://github.com/wacht-platform/snippet-service.git
 cd snippet-service
-cargo run                  # build and start the TUI
 cargo build --release      # target/release/snippet
 ```
 
 The first run opens model setup and writes `~/.snippet/config.toml`.
 
-## Use the terminal UI
+## Terminal UI
 
-Start the agent with:
+Run `snippet` in a project folder.
 
-```sh
-snippet
-```
-
-Useful commands and keys include:
-
-| Command / key | Action |
+| Command or key | Action |
 | --- | --- |
 | `/new` | Start a new conversation |
-| `/model` or `/models` | Select a configured model profile |
+| `/resume` or `Ctrl-F` | Pick a previous session |
+| `/model` | Choose a model profile |
 | `/mode` | Toggle manual approval |
-| `/compact` | Compact history immediately |
+| `/compact` | Compact history now |
 | `/rewind` | Restore a checkpoint |
-| `/theme` | Change the UI theme |
-| `Ctrl-R` | Resume a previous conversation |
-| `Ctrl-A` | Open delegated-lanes activity |
+| `Ctrl-O` | Show steps |
+| `Esc` | Stop the current turn |
+
+`snippet --resume <id>` reopens a session by id.
 
 ## Remote control with `serve`
 
 Run the daemon on the machine that owns the project:
 
 ```sh
-snippet serve                       # start the daemon and the tunnel you have set up
-snippet serve --tunnel tailscale    # pick one: auto, tailscale, funnel, cloudflare, none
-snippet serve --status              # show the current connection details
-snippet serve --stop                # stop the daemon and tunnel
+snippet serve                       # start the daemon and any tunnel you have set up
+snippet serve --tunnel tailscale    # auto, tailscale, funnel, cloudflare or none
+snippet serve --status              # connection details and QR code
+snippet serve --stop
+snippet serve --enable              # run at login (launchd or systemd --user); --disable removes it
 ```
 
-Snippet does not install a tunnel for you. Set one up yourself:
+Snippet does not install a tunnel. Set one up yourself:
 
-- **Tailscale** (recommended): install it on this machine and your phone, run `tailscale up`. `--tunnel tailscale` uses `tailscale serve` on port 8443, private to your tailnet, with an address that never changes. `--tunnel funnel` makes it public with Tailscale Funnel.
-- **Cloudflare**: install `cloudflared`. `--tunnel cloudflare` opens a quick tunnel with a public `trycloudflare.com` link that changes on every restart.
+- **Tailscale** (recommended): install it on this machine and your phone and run `tailscale up`. `--tunnel tailscale` serves privately on your tailnet at a stable address; `--tunnel funnel` makes it public.
+- **Cloudflare**: install `cloudflared`. `--tunnel cloudflare` opens a quick tunnel whose address changes on every restart.
 
-With the default `auto`, serve uses Tailscale when it is connected, then cloudflared when it is installed. With neither, the daemon runs on this machine only and prints how to set one up.
+With the default `auto`, serve uses Tailscale if it is connected, then `cloudflared` if installed, otherwise it listens on this machine only. Other flags: `--port` (default 8787), `--host`, `--token`, `--no-tunnel`, `--public-url`.
 
-`serve` prints a QR code and a connection string containing a URL and token. Add that connection in the [companion app](https://github.com/wacht-platform/snippet-mobile). The daemon exposes authenticated HTTP endpoints and WebSockets for sessions, live state, streams, terminals, device events, and paginated transcript history over the existing session attachment socket.
+`serve` prints a QR code and a connection string. Add it in the app under **Add machine**.
 
-Useful flags include `--port` (default `8787`), `--host`, `--token`, `--tunnel`, `--no-tunnel`, and `--public-url` (bring your own tunnel or named Cloudflare tunnel).
-
-To install or remove a login service:
-
-```sh
-snippet serve --enable
-snippet serve --disable
-```
-
-## Configure model profiles
-
-Configuration is stored at `~/.snippet/config.toml`. The TUI and remote app can manage profiles; several profiles may coexist and can be selected per conversation.
+## Model profiles
 
 ```toml
+# ~/.snippet/config.toml
 active_setup = "anthropic"
 
 [setups.anthropic]
@@ -121,63 +99,58 @@ stream = true
 supports_images = false
 ```
 
-Supported provider values include `anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, and `openai-compatible`. Profile settings also cover temperature, image support, context size, compaction thresholds, prompt caching, and user-agent options.
-
-Optional top-level integrations include `exa_api_key` for web search. Keys remain on the daemon and are not returned by the configuration API.
+`provider` is one of `anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter` or `openai-compatible`. The TUI and the app can both edit profiles. Keys stay on the daemon and are never returned by the configuration API. Add `exa_api_key` for web search.
 
 ## Memory and history
 
-The agent keeps durable memory as plain markdown it reads and edits like any other file:
+Memory is plain markdown that the agent reads and edits like any other file:
 
 ```text
 ~/.snippet/projects/<repo>-<id>/memory/   one per repository, shared by its worktrees
-  rules.md                  standing directives, one `- [r1] …` line each
-  learnings.md              reusable lessons with helpful/harmful counts
-  notes/<section>/<id>.md   one topic per note, behind a title/summary header
-~/.snippet/memory/          rules.md and learnings.md that apply to every project
+  rules.md                  standing directives
+  learnings.md              reusable lessons
+  notes/<section>/<id>.md   one topic per note
+~/.snippet/memory/          rules and learnings for every project
 ```
 
-Each session's prompt carries the rules, the most helpful learnings, and a table of contents generated from the notes. After a request that did real work, a reflection pass marks what helped or hurt and records what is worth keeping. Set `memory_enabled = false` or `memory_reflect = false` in `~/.snippet/config.toml` to turn memory or the reflection pass off.
+Set `memory_enabled = false` or `memory_reflect = false` in the config to turn memory or the post-request reflection pass off.
 
-Messages moved out of context by compaction are archived and searchable from the agent's shell:
+Messages that compaction moves out of context are archived and searchable:
 
 ```sh
 snippet history search 'E0308'
 snippet history show 412 413
-snippet history show --from 410 --to 420
 ```
 
-## Data and security
+## Security
 
 - Sessions and configuration stay on the host running `snippet`.
-- Remote access is token-gated; tokens are compared in constant time.
-- Secrets are stored with restricted permissions and are never returned by `/config`.
-- The tunnel URL alone does not grant access.
-- `--no-tunnel` is available for local-only operation.
+- Remote access needs the token, which is compared in constant time. A tunnel address alone grants nothing.
+- Secrets are stored with restricted permissions and never returned by the API.
+- `--no-tunnel` keeps the daemon local.
 
 ## Architecture
 
 ```text
-terminal user ───────┐
-                     ├── durable harness ── ~/.snippet/
-remote app ─ serve ──┘
+terminal ───────────┐
+                    ├── durable harness ── ~/.snippet/
+app ─ serve daemon ─┘
 ```
 
-The terminal UI and remote app use the same persisted session state. The `serve` daemon sends live snapshots/deltas and stream frames over `/attach`; older transcript pages are requested on that same WebSocket with a `history` message. Device-wide notifications use `/events`.
+The terminal and the app share the same persisted sessions. The daemon sends snapshots, deltas and stream frames over `/attach`, pages older history on the same socket, and sends device-wide notifications over `/events`.
 
 ## Development
 
 ```sh
 cargo check --lib --offline
 cargo test --lib --offline
-cargo build --release
 ```
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Companion app
 
-Download the current Android, macOS, or Windows client from the [snippet app releases](https://github.com/wacht-platform/snippet-mobile/releases/tag/latest).
+Android, macOS, Linux and Windows builds are on the [app releases](https://github.com/wacht-platform/snippet-mobile/releases/tag/latest) page.
 
 ## License
 
