@@ -481,9 +481,16 @@ impl App {
         self.status = "↑↓ choose · Enter start · Esc cancel".to_string();
     }
 
-    /// Start the new session where `choice` says. It is created on the first
-    /// message, with this choice.
     pub(crate) fn start_new_session(&mut self, choice: NewChoice, name: String) {
+        if let NewChoice::Existing { ref path, .. } = choice
+            && let Some(existing) = self
+                .conversations(false)
+                .into_iter()
+                .find(|c| &c.folder == path || crate::session::linked_worktree_root(&c.folder).as_deref() == Some(path.as_path()))
+        {
+            self.open_conversation(&existing);
+            return;
+        }
         let (folder, mode) = match choice {
             NewChoice::Worktree(folder) => (folder, crate::session::WorkspaceMode::Worktree),
             NewChoice::Folder(folder) => (folder, crate::session::WorkspaceMode::Folder),
