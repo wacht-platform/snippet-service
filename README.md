@@ -4,7 +4,7 @@
 
 # snippet
 
-A coding agent for your terminal, with a phone and desktop app to steer it from anywhere.
+A code-first agent for your terminal, with a phone and desktop app to steer it from anywhere.
 
 [![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
