@@ -11,7 +11,7 @@ A coding agent for your terminal, with a phone and desktop app to steer it from 
 
 </div>
 
-![The terminal UI answering a question about a repository](docs/screenshots/tui.png)
+![The terminal UI answering a question about a repository](assets/tui.png)
 
 `snippet` runs on your machine, works in your project and keeps every session on disk. One Rust binary provides the terminal UI and the `serve` daemon that the [companion app](https://github.com/wacht-platform/snippet-mobile) connects to.
 
@@ -22,7 +22,7 @@ A coding agent for your terminal, with a phone and desktop app to steer it from 
 - A small tool set: a stateful shell, one all-or-nothing file-change tool, image viewing and web search.
 - Several model profiles, chosen globally or per conversation: Anthropic, OpenAI, Gemini, OpenRouter, any OpenAI-compatible endpoint, local models, or a ChatGPT subscription.
 - Delegated background lanes with live progress, and detached processes for servers and watchers.
-- Mission Control, a coordinating session that hands work to specialised agents, with optional voice (see [docs/ambient](docs/ambient/architecture.md)).
+- Mission Control, a coordinating session that hands work to specialised agents, with optional voice.
 - Remote control from Android, macOS, Linux and Windows.
 
 ## Install
