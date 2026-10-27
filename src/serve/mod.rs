@@ -878,11 +878,7 @@ pub async fn run_serve(
         .route("/ambient/stream", get(ambient_stream::stream))
         .route("/ambient/stats", get(ambient_routes::stats))
         .route("/ambient/lease", post(ambient_routes::lease))
-        .route("/ambient/turns", get(ambient_routes::turns))
-        .route("/ambient/turns/played", post(ambient_routes::played))
         .route("/ambient/turns/{id}/audio", get(ambient_routes::turn_audio))
-        .route("/ambient/turns/{id}/chunks/{seq}", get(ambient_routes::turn_chunk))
-        .route("/ambient/barge", post(ambient_routes::barge))
         .route("/ambient/activity", post(ambient_routes::activity))
         .route("/ambient/conversation/end", post(ambient_routes::end_conversation))
         .route(

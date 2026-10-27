@@ -306,6 +306,8 @@ pub struct AmbientConfig {
     pub wake_phrases: Vec<String>,
     #[serde(default = "default_tts_voice")]
     pub tts_voice: String,
+    #[serde(default = "default_tts_speed", skip_serializing_if = "is_default_tts_speed")]
+    pub tts_speed: u32,
     #[serde(default = "default_deepgram_host", skip_serializing_if = "is_default_deepgram_host")]
     pub deepgram_host: String,
     #[serde(default = "default_stt", skip_serializing_if = "is_default_stt")]
@@ -316,6 +318,14 @@ impl Eq for AmbientConfig {}
 
 fn default_tts_voice() -> String {
     "aura-2-thalia-en".into()
+}
+
+fn default_tts_speed() -> u32 {
+    115
+}
+
+fn is_default_tts_speed(s: &u32) -> bool {
+    *s == default_tts_speed()
 }
 
 fn default_deepgram_host() -> String {
@@ -344,6 +354,7 @@ impl Default for AmbientConfig {
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
             tts_voice: default_tts_voice(),
+            tts_speed: default_tts_speed(),
             deepgram_host: default_deepgram_host(),
             stt: default_stt(),
         }
@@ -372,6 +383,7 @@ impl AmbientConfig {
             return Err(format!("speech recognition must be one of: {}", AMBIENT_STT.join(", ")));
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
+        self.tts_speed = self.tts_speed.clamp(80, 150);
         self.wake_phrases = self
             .wake_phrases
             .iter()

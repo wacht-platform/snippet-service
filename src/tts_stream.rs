@@ -29,6 +29,7 @@ pub enum PhoneFrame {
 struct Config {
     key: String,
     voice: String,
+    speed: u32,
     ttl: u32,
     host: String,
 }
@@ -41,9 +42,10 @@ static LIVE: Mutex<Vec<Arc<StreamTurn>>> = Mutex::new(Vec::new());
 pub fn apply_config(c: &crate::config::SnippetConfig) {
     let key = c.deepgram_api_key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let voice = if c.ambient.tts_voice.starts_with("flux-") { c.ambient.tts_voice.clone() } else { DEFAULT_VOICE.to_string() };
-    let next = key.map(|key| Config { key, voice, ttl: c.ambient.conversation_timeout_secs, host: c.ambient.deepgram_host.clone() });
+    let speed = c.ambient.tts_speed.clamp(80, 150);
+    let next = key.map(|key| Config { key, voice, speed, ttl: c.ambient.conversation_timeout_secs, host: c.ambient.deepgram_host.clone() });
     let mut current = CONFIG.lock().unwrap();
-    if current.as_ref().map(|c| (&c.key, &c.voice, &c.host)) != next.as_ref().map(|c| (&c.key, &c.voice, &c.host)) {
+    if current.as_ref().map(|c| (&c.key, &c.voice, &c.host, c.speed)) != next.as_ref().map(|c| (&c.key, &c.voice, &c.host, c.speed)) {
         let stale: Vec<Arc<Session>> = hub().lock().unwrap().drain().map(|(_, s)| s).collect();
         for s in stale {
             if s.st.lock().unwrap().queue.is_empty() {
@@ -239,6 +241,7 @@ struct SessionState {
 pub struct Session {
     device: String,
     voice: String,
+    speed: u32,
     cmd: mpsc::UnboundedSender<Cmd>,
     st: Mutex<SessionState>,
     changed: Notify,
@@ -269,6 +272,7 @@ fn session(device: &str) -> Option<Arc<Session>> {
     let s = Arc::new(Session {
         device: device.to_string(),
         voice: cfg.voice.clone(),
+        speed: cfg.speed,
         cmd,
         st: Mutex::new(SessionState::default()),
         changed: Notify::new(),
@@ -380,10 +384,16 @@ pub fn start_turn(session: &Arc<Session>, device: &str, conversation: &str) -> R
 }
 
 async fn run(session: &Arc<Session>, key: String, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
+    let speed_q = if session.speed == 100 {
+        String::new()
+    } else {
+        format!("&speed={:.2}", session.speed as f64 / 100.0)
+    };
     let url = format!(
-        "wss://{}/v2/speak?model={}&encoding=linear16&sample_rate=24000",
+        "wss://{}/v2/speak?model={}&encoding=linear16&sample_rate=24000{}",
         crate::tts::deepgram_host(),
-        urlencoding::encode(&session.voice)
+        urlencoding::encode(&session.voice),
+        speed_q,
     );
     let mut request = url.into_client_request().map_err(|e| e.to_string())?;
     request

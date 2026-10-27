@@ -55,6 +55,7 @@ pub(crate) struct SettingsReq {
     deepgram_api_key: Option<String>,
     deepgram_host: Option<String>,
     tts_voice: Option<String>,
+    tts_speed: Option<u32>,
     stt: Option<String>,
 }
 
@@ -135,6 +136,7 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "stt": ambient.stt,
         "deepgram_hosts": DEEPGRAM_HOSTS.iter().map(|(h, l)| serde_json::json!({"host": h, "label": l})).collect::<Vec<_>>(),
         "tts_voice": if ambient.tts_voice.starts_with("flux-") { ambient.tts_voice.clone() } else { "flux-priya-en".to_string() },
+        "tts_speed": ambient.tts_speed,
         "tts_voices": FLUX_VOICES.iter().map(|(n, a, g)| serde_json::json!({"model": format!("flux-{n}-en"), "accent": a, "gender": g})).collect::<Vec<_>>(),
         "wake_phrases": ambient.wake_phrases,
         "watcher_key_set": watcher_key_set,
@@ -200,6 +202,9 @@ fn patched_ambient(mut ambient: crate::config::AmbientConfig, req: &SettingsReq)
         } else {
             invalid = Some(format!("Unknown voice {v}"));
         }
+    }
+    if let Some(v) = req.tts_speed {
+        ambient.tts_speed = v.clamp(80, 150);
     }
     (ambient, invalid)
 }
@@ -746,97 +751,6 @@ pub(crate) async fn stats(State(d): State<Shared>, Query(a): Query<Auth>) -> Res
     }
 }
 
-
-#[derive(Deserialize)]
-pub(crate) struct TurnsQuery {
-    token: Option<String>,
-    #[serde(default)]
-    after: i64,
-    #[serde(default)]
-    device: String,
-}
-
-pub(crate) async fn turns(State(d): State<Shared>, Query(q): Query<TurnsQuery>) -> Response {
-    if !d.authed(&q.token) {
-        return unauthorized();
-    }
-    match crate::speech::turns_after(q.after, &q.device) {
-        Ok(turns) => Json(serde_json::json!({ "turns": turns })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub(crate) struct PlayedReq {
-    id: i64,
-    #[serde(default)]
-    seq: Option<i64>,
-    #[serde(default)]
-    complete: Option<bool>,
-}
-
-pub(crate) async fn played(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<PlayedReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    let ttl = d.config.lock().unwrap().ambient.conversation_timeout_secs;
-    crate::speech::played(req.id, req.seq, req.complete.unwrap_or(req.seq.is_none()), ttl);
-    Json(serde_json::json!({"ok": true})).into_response()
-}
-
-#[derive(Deserialize)]
-pub(crate) struct BargeReq {
-    turn: i64,
-    #[serde(default = "no_chunk")]
-    seq: i64,
-    #[serde(default)]
-    played_ms: i64,
-}
-
-fn no_chunk() -> i64 {
-    -1
-}
-
-pub(crate) async fn barge(
-    State(d): State<Shared>,
-    Query(a): Query<Auth>,
-    Json(req): Json<BargeReq>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    crate::speech::barge(req.turn, req.seq, req.played_ms);
-    Json(serde_json::json!({"ok": true})).into_response()
-}
-
-pub(crate) async fn turn_chunk(
-    State(d): State<Shared>,
-    axum::extract::Path((id, seq)): axum::extract::Path<(i64, i64)>,
-    Query(a): Query<Auth>,
-) -> Response {
-    if !d.authed(&a.token) {
-        return unauthorized();
-    }
-    let path = crate::speech::chunk_path(id, seq);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let ready = crate::speech::chunk_ready().notified();
-        tokio::pin!(ready);
-        ready.as_mut().enable();
-        if let Ok(bytes) = tokio::fs::read(&path).await {
-            return ([(axum::http::header::CONTENT_TYPE, "audio/L16;rate=24000;channels=1")], bytes).into_response();
-        }
-        if !crate::speech::chunk_wanted(id) || tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        let _ = tokio::time::timeout_at(deadline, ready).await;
-    }
-    (StatusCode::NOT_FOUND, "chunk not ready").into_response()
-}
 
 pub(crate) async fn end_conversation(State(d): State<Shared>, Query(a): Query<Auth>) -> Response {
     if !d.authed(&a.token) {

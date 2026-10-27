@@ -925,7 +925,8 @@ impl CodingHarness {
             .args(["--permission-prompts", "none"])
             .args(["--setting-sources", ""])
             .env("MCP_TOOL_TIMEOUT", "3600000")
-            .env("MCP_TIMEOUT", "30000");
+            .env("MCP_TIMEOUT", "30000")
+            .env("CLAUDE_CODE_ENTRYPOINT", "snippet");
         if let Some(token) = account.and_then(claude_account_token) {
             cmd.env("CLAUDE_CODE_OAUTH_TOKEN", token);
         }
