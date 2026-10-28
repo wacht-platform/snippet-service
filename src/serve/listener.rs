@@ -494,7 +494,7 @@ impl Listener {
         let urgent = words.iter().zip(&mask).any(|(w, e)| !*e && URGENT.contains(&w.key.as_str()));
         let no_hw_aec = self.device.starts_with("macos-") || self.device.starts_with("linux-") || self.device.starts_with("windows-");
         let barge_ready = if audible && no_hw_aec {
-            urgent && real >= 1
+            (novel >= 2 && real >= 2) || (urgent && real >= 1)
         } else {
             (novel >= 1 && real >= 2) || (urgent && real >= 1)
         };
