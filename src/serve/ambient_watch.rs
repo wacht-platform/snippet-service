@@ -177,11 +177,12 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
                     "Uses the assistant's name, or `name_in_utterance` is not 'no'",
                     "Asks whether the assistant can hear them or is there, whether or not the conversation is open",
                     "Asks a question or gives an instruction that a personal AI assistant would handle, such as the status of work, tasks, reminders, information, advice, chat or jokes, unless `recent` shows the speaker talking with someone else",
+                    "When it is the user's own voice (`user_voice_likelihood` >= 0.55 or unset) and there is no conversation with another person in the room, be friendly and generous: any question, request, follow-up, topic change, or remark that could potentially be directed to the assistant is true, even without a wake word",
                     "Answers, confirms, refuses, thanks or picks an option after `assistant.last_said`",
                     "Continues or corrects a line in `recent` that was handled as sent to the assistant, even a fragment cut off by a pause"
                 ],
                 "false": [
-                    "Thinking aloud, an exclamation, a filler sound, or a remark about the speaker's own activity that asks nothing of anyone",
+                    "A filler sound or an exclamation ('hmm', 'ouch') that asks nothing of anyone",
                     "A stray 1-2 word fragment heard while `assistant.speaking_when_utterance_was_heard` is true that is not a stop/wait command or a direct answer to a question in `assistant.last_said`",
                     "Clearly part of an exchange with someone else shown in `recent`, or third-person chatter ('he asked...', 'they said...', 'you guys')",
                     "Uses the word snippet for a thing, such as a code snippet, instead of calling the assistant"
@@ -202,7 +203,7 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
         },
         "out_of_context": {
             "type": "noul",
-            "instructions": "Is `utterance` out of context for the assistant: unrelated to `assistant.last_said`, `mission_control.recent_chat`, `mission_control.recent_tools`, and `recent` turns sent to the assistant (for example side chatter with someone else, an incomplete cut-off fragment with no clear request, or a remark that makes no sense in the ongoing conversation without a wake word)?"
+            "instructions": "Is `utterance` side chatter with someone else or a meaningless cut-off fragment? Note: a new question, topic change, or request from the user themselves is NOT out of context even without a wake word."
         },
         "played_audio": {
             "type": "noul",
@@ -433,6 +434,34 @@ pub(super) fn filler(text: &str) -> bool {
     words_of(text).iter().all(|w| FILLERS.contains(&w.as_str()))
 }
 
+fn looks_directed_or_question(text: &str) -> bool {
+    if text.contains('?') {
+        return true;
+    }
+    let ws = words_of(text);
+    if ws.len() < 2 {
+        return false;
+    }
+    const LEADS: &[&str] = &[
+        "what", "whats", "how", "why", "when", "where", "who", "which", "can", "could", "would", "will", "should", "do", "does",
+        "did", "is", "are", "was", "were", "tell", "give", "show", "check", "make", "fix", "help", "explain", "find", "search",
+        "open", "run", "build", "please", "pls", "hey", "yo", "listen", "look", "let", "lets",
+    ];
+    if LEADS.contains(&ws[0].as_str()) || (ws.len() >= 3 && LEADS.contains(&ws[1].as_str())) {
+        return true;
+    }
+    let joined = ws.join(" ");
+    joined.contains("i want")
+        || joined.contains("i need")
+        || joined.contains("can you")
+        || joined.contains("could you")
+        || joined.contains("for me")
+        || joined.contains("about me")
+        || joined.contains("about myself")
+        || joined.contains("do you")
+        || joined.contains("what do you")
+}
+
 pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Verdict {
     if filler(text) {
         verdict.intent = "ignore".into();
@@ -457,16 +486,24 @@ pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Ve
         verdict.intent = "for_assistant".into();
         verdict.addressed = verdict.addressed.max(0.85);
     }
-    if matches!(verdict.intent.as_str(), "meeting" | "note") || matches!(verdict.kind.as_str(), "background" | "media") {
+    // When it is a live person (not media/echo) and not clearly a meeting with another party,
+    // be friendly toward questions or requests that could be directed to Snippet.
+    if verdict.echo < 0.5 && verdict.played < 0.5 && verdict.other < 0.55 && looks_directed_or_question(text) && verdict.addressed >= 0.25 {
+        verdict.addressed = verdict.addressed.max(0.68);
+        verdict.out_of_context = verdict.out_of_context.min(0.45);
+        verdict.kind = "conversation".into();
+        verdict.intent = "for_assistant".into();
+    }
+    if matches!(verdict.intent.as_str(), "meeting") || matches!(verdict.kind.as_str(), "background" | "media") {
         verdict.other = verdict.other.max(0.75);
     }
-    if !wake_word(text, phrases) && verdict.out_of_context >= 0.68 && verdict.matches < 0.7 {
+    if !wake_word(text, phrases) && verdict.out_of_context >= 0.78 && verdict.other >= 0.50 && verdict.matches < 0.7 {
         verdict.addressed = verdict.addressed.min(0.40);
         if verdict.intent == "for_assistant" {
             verdict.intent = "note".into();
         }
     }
-    if verdict.addressed >= 0.5 && verdict.veto() < 0.5 && verdict.out_of_context < 0.68 && verdict.kind == "conversation" {
+    if verdict.addressed >= 0.5 && verdict.veto() < 0.5 && verdict.out_of_context < 0.75 && verdict.kind == "conversation" {
         verdict.intent = "for_assistant".into();
     }
     verdict
@@ -578,11 +615,16 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice:
     match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
         Ok(mut verdict) => {
             if let Some(uv) = user_voice {
-                if uv < 0.35 && !wake_word(text, &phrases) {
+                if uv < 0.32 && !wake_word(text, &phrases) {
                     verdict.other = verdict.other.max(0.65);
                     verdict.addressed = verdict.addressed.min(0.45);
-                } else if uv >= 0.78 && verdict.addressed >= 0.45 && verdict.veto() < 0.55 {
-                    verdict.addressed = (verdict.addressed + 0.08).min(1.0);
+                } else if uv >= 0.55 && verdict.echo < 0.5 && verdict.played < 0.5 && verdict.other < 0.55 {
+                    if looks_directed_or_question(text) || verdict.addressed >= 0.32 {
+                        verdict.addressed = (verdict.addressed + 0.22).max(0.68).min(1.0);
+                        verdict.out_of_context = verdict.out_of_context.min(0.40);
+                        verdict.kind = "conversation".into();
+                        verdict.intent = "for_assistant".into();
+                    }
                 }
             }
             settle(verdict, text, &phrases)
@@ -689,9 +731,16 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
     match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
         Ok(mut verdict) => {
             if let Some(uv) = user_voice {
-                if uv < 0.35 && !wake_word(text, &phrases) {
+                if uv < 0.32 && !wake_word(text, &phrases) {
                     verdict.other = verdict.other.max(0.68);
                     verdict.addressed = verdict.addressed.min(0.40);
+                } else if uv >= 0.55 && verdict.echo < 0.5 && verdict.played < 0.5 && verdict.other < 0.55 {
+                    if looks_directed_or_question(text) || verdict.addressed >= 0.35 {
+                        verdict.addressed = (verdict.addressed + 0.20).max(0.65).min(1.0);
+                        verdict.out_of_context = verdict.out_of_context.min(0.40);
+                        verdict.kind = "conversation".into();
+                        verdict.intent = "for_assistant".into();
+                    }
                 }
             }
             settle(verdict, text, &phrases)
