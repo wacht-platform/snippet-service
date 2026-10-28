@@ -180,25 +180,26 @@ impl VoiceprintAccumulator {
         for m in 0..NUM_CEPSTRA {
             vec.push((self.cep_sum[m] / n) as f32);
         }
-        // [12..20]: Cepstral standard deviations (articulation dynamics)
+        // [12..20]: Centered cepstral standard deviations (zero-mean so different speakers don't share positive bias)
+        const TYPICAL_STD: [f64; 8] = [0.65, 0.55, 0.48, 0.42, 0.38, 0.35, 0.32, 0.30];
         for m in 0..8 {
             let mean = self.cep_sum[m] / n;
             let var = (self.cep_sq_sum[m] / n - mean * mean).max(0.0);
-            vec.push((var.sqrt() * 0.6) as f32);
+            vec.push(((var.sqrt() - TYPICAL_STD[m]) * 0.5) as f32);
         }
-        // [20..24]: Pitch (F0 mean, F0 std), harmonicity, and spectral centroid
+        // [20..24]: Pitch (F0 mean heavily weighted, centered F0 std), harmonicity, and spectral centroid
         let (f0_mean, f0_std) = if self.f0_count > 0 {
             let fn_cnt = self.f0_count as f64;
             let m = self.f0_sum / fn_cnt;
             let v = (self.f0_sq_sum / fn_cnt - m * m).max(0.0);
-            (m * 1.8, v.sqrt() * 1.2)
+            (m * 2.6, (v.sqrt() - 0.12) * 0.8)
         } else {
             (0.0, 0.0)
         };
         vec.push(f0_mean as f32);
         vec.push(f0_std as f32);
-        vec.push(((self.harm_sum / n) - 0.5) as f32);
-        vec.push(((self.centroid_sum / n) - 0.35) as f32);
+        vec.push(((self.harm_sum / n) - 0.62) as f32);
+        vec.push(((self.centroid_sum / n) - 0.38) as f32);
 
         normalize(&mut vec);
         Some(vec)
@@ -227,7 +228,7 @@ pub fn score_vector(live: &[f32], samples: &[VoiceprintSample]) -> Option<f64> {
     if samples.is_empty() || live.len() != DIM {
         return None;
     }
-    let mut best_cos = -1.0f64;
+    let mut best_score = -1.0f64;
     for s in samples {
         if s.vector.len() != DIM {
             continue;
@@ -237,15 +238,19 @@ pub fn score_vector(live: &[f32], samples: &[VoiceprintSample]) -> Option<f64> {
             .zip(&s.vector)
             .map(|(a, b)| (*a as f64) * (*b as f64))
             .sum();
-        if dot > best_cos {
-            best_cos = dot;
+        // Penalize pitch (F0 index 20) mismatch directly so a speaker in a different pitch register scores low
+        let pitch_diff = (live[20] as f64 - s.vector[20] as f64).abs();
+        let pitch_penalty = (pitch_diff * 0.35).min(0.35);
+        let adj = dot - pitch_penalty;
+        if adj > best_score {
+            best_score = adj;
         }
     }
-    if best_cos <= -0.99 {
+    if best_score <= -0.99 {
         return None;
     }
-    // Map cosine similarity [-0.10 .. 0.92] smoothly onto [0.00 .. 1.00]
-    let mapped = ((best_cos - 0.15) / 0.72).clamp(0.0, 1.0);
+    // Strict discriminative mapping: adj <= 0.42 -> 0.0, adj >= 0.88 -> 1.0
+    let mapped = ((best_score - 0.42) / 0.46).clamp(0.0, 1.0);
     Some((mapped * 100.0).round() / 100.0)
 }
 
