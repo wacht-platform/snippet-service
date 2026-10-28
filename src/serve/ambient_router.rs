@@ -263,6 +263,17 @@ fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool) ->
     (wake || matched || (clear && v.addressed >= PASSIVE_THRESHOLD), false)
 }
 
+pub(super) fn should_interrupt(d: &Shared, v: &Verdict, text: &str) -> bool {
+    if !v.kept() || v.echo >= 0.45 || v.veto() >= 0.55 {
+        return false;
+    }
+    let phrases = d.config.lock().unwrap().ambient.wake_phrases.clone();
+    let wake = ambient_watch::wake_word(text, &phrases);
+    let expecting = crate::ambient::expectation().is_some();
+    let pinned = crate::ambient::is_pinned();
+    decide(true, pinned, v, wake, expecting).0
+}
+
 async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mut Option<Flushed>, pending: Option<Pending>) {
     if parts.is_empty() {
         return;

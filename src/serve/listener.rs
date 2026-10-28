@@ -16,7 +16,7 @@ const MIN_SEND: u64 = 1_024;
 const MAX_SEND: u64 = 24_000;
 const REPLAY: u64 = 32_000 * 10;
 const PAD: u64 = 9_600;
-const ECHO_HANGOVER_BYTES: u64 = 9_600;
+const ECHO_HANGOVER_BYTES: u64 = 25_600;
 const IDLE_CLOSE: Duration = Duration::from_secs(60);
 const FLUX_IDLE_CLOSE: Duration = Duration::from_secs(600);
 const SAMPLE: Duration = Duration::from_millis(250);
@@ -40,6 +40,9 @@ struct Live {
     conn: u64,
     turn: i64,
     seq: i64,
+    interrupted: bool,
+    classifying: bool,
+    classified_words: usize,
 }
 
 #[derive(Default)]
@@ -478,17 +481,75 @@ impl Listener {
             if ended && words.is_empty() && transcript.is_empty() {
                 return;
             }
-            s.live = Some(Live { conn, turn: order, seq: next_seq() });
+            s.live = Some(Live { conn, turn: order, seq: next_seq(), interrupted: false, classifying: false, classified_words: 0 });
         }
+        let audible = s.audible || s.play_flag;
         let live = s.live.as_mut().unwrap();
         let seq = live.seq;
         let replies = super::ambient_routes::recent_replies(&self.device);
         let mask = echo_mask(&words, &replies);
         let real = words.iter().zip(&mask).filter(|(_, e)| !**e).count();
+        let filtered = words.len().saturating_sub(real);
+        let during_playback = words.iter().any(|w| w.playing) || audible;
+        let echo_all = !words.is_empty() && (real == 0 || (during_playback && filtered >= 2 && real * 3 <= words.len()));
         if !ended {
+            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+            let should_probe = !echo_all
+                && (audible || busy)
+                && !live.interrupted
+                && !live.classifying
+                && real >= 1
+                && real > live.classified_words;
+            let probe_text = if should_probe {
+                live.classifying = true;
+                live.classified_words = real;
+                let clean = words
+                    .iter()
+                    .zip(&mask)
+                    .filter(|(_, e)| !**e)
+                    .map(|(w, _)| w.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(clean)
+            } else {
+                None
+            };
             drop(s);
             if fresh {
                 super::ambient_routes::announce(&self.d, &self.device, seq, false);
+            }
+            if let Some(clean_text) = probe_text {
+                if !clean_text.trim().is_empty() {
+                    let me = get(&self.d, &self.device);
+                    let d = self.d.clone();
+                    let device = self.device.clone();
+                    let sent = super::autonomy::mission_control_inputs();
+                    tokio::spawn(async move {
+                        let verdict = super::ambient_watch::classify_live(&d, &device, &clean_text, during_playback).await;
+                        let go = super::ambient_router::should_interrupt(&d, &verdict, &clean_text);
+                        let mut do_interrupt = false;
+                        {
+                            let mut s = me.inner.lock().unwrap();
+                            if let Some(l) = s.live.as_mut().filter(|l| l.conn == conn && l.turn == order) {
+                                l.classifying = false;
+                                if go && !l.interrupted {
+                                    l.interrupted = true;
+                                    do_interrupt = true;
+                                }
+                            }
+                        }
+                        if do_interrupt {
+                            let spoke = crate::speech::interrupt(&device);
+                            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+                            if (spoke || busy)
+                                && super::autonomy::mission_control_inputs() == sent
+                                && super::autonomy::interrupt_mission_control(&d).await
+                            {
+                                super::autonomy::resume_unless_heard(d);
+                            }
+                        }
+                    });
+                }
             }
             return;
         }
@@ -511,8 +572,6 @@ impl Listener {
             Vec::new()
         };
         drop(s);
-        let during_playback = words.iter().any(|w| w.playing);
-        let echo_all = !words.is_empty() && real == 0;
         let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
         let text = if words.is_empty() || real == words.len() {
             if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }

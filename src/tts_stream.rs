@@ -191,6 +191,18 @@ impl StreamTurn {
             i.first_push = Some(Instant::now());
         }
         i.text.push_str(delta);
+        let current_text = i.text.clone();
+        drop(i);
+        if let Ok(store) = crate::ambient::store() {
+            let turn_id = self.turn;
+            store.write(|c| {
+                c.execute(
+                    "UPDATE ambient_turns SET text = ?2 WHERE id = ?1",
+                    rusqlite::params![turn_id, current_text.trim()],
+                )?;
+                Ok(())
+            });
+        }
         self.session.st.lock().unwrap().last_used = Some(Instant::now());
         self.session.send(json!({"type": "Speak", "text": delta}))
     }
@@ -587,6 +599,20 @@ pub fn busy() -> bool {
 pub fn busy_for(device: &str) -> bool {
     prune();
     LIVE.lock().unwrap().iter().any(|t| t.device == device)
+}
+
+pub fn live_texts(device: &str) -> Vec<String> {
+    prune();
+    LIVE.lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .filter(|t| t.device == device)
+        .filter_map(|t| {
+            let txt = t.inner.lock().unwrap().text.trim().to_string();
+            (!txt.is_empty()).then_some(txt)
+        })
+        .collect()
 }
 
 pub fn audible(device: &str) -> bool {

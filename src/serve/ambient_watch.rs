@@ -577,3 +577,100 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
         }
     }
 }
+
+/// Real-time parallel classification on partial streaming transcripts while the user
+/// is still speaking, enabling fast classifier-driven barge-in/interruption.
+pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_playback: bool) -> Verdict {
+    let (key, watcher, phrases, chat_context) = {
+        let c = d.config.lock().unwrap();
+        (
+            c.typesafe_api_key.clone().filter(|k| !k.trim().is_empty()),
+            c.ambient.watcher.clone(),
+            c.ambient.wake_phrases.clone(),
+            c.ambient.watcher_chat_context,
+        )
+    };
+    let Some(key) = key.filter(|_| watcher == "classifier" || watcher == "jev") else {
+        return rule(text, &phrases);
+    };
+    let now = chrono::Utc::now().timestamp();
+    let (users, mut assistant): (Vec<Heard>, Vec<Said>) = d
+        .store
+        .with_connection(|c| {
+            let mut users = Vec::new();
+            let mut stmt = c.prepare(
+                "SELECT text, created_at, COALESCE(verdict, ''), COALESCE(intent, ''), delivered FROM ambient_events
+                 WHERE status = 'done' AND text != '' AND created_at >= ?1 AND device = ?2
+                 ORDER BY started_at DESC LIMIT 4",
+            )?;
+            for row in stmt.query_map(rusqlite::params![now - 180, device], |r| {
+                Ok(Heard {
+                    text: r.get(0)?,
+                    ago: now - r.get::<_, i64>(1)?,
+                    kind: r.get(2)?,
+                    intent: r.get(3)?,
+                    delivered: r.get::<_, i64>(4)? != 0,
+                })
+            })? {
+                users.push(row?);
+            }
+            let mut assistant = Vec::new();
+            let mut stmt = c.prepare(
+                "SELECT t.text, t.created_at + COALESCE((SELECT SUM(ms) FROM ambient_chunks WHERE turn_id = t.id), 0) / 1000,
+                        t.status, COALESCE(t.heard_text, '')
+                 FROM ambient_turns t
+                 WHERE t.role = 'assistant' AND t.created_at >= ?1 AND t.text != '' AND t.status != 'cancelled'
+                   AND t.device = ?2
+                 ORDER BY t.id DESC LIMIT 2",
+            )?;
+            for row in stmt.query_map(rusqlite::params![now - 300, device], |r| {
+                let status: String = r.get(2)?;
+                let heard: String = r.get(3)?;
+                Ok(Said {
+                    text: r.get(0)?,
+                    ago: (now - r.get::<_, i64>(1)?).max(0),
+                    heard: (status == "interrupted" && !heard.trim().is_empty()).then_some(heard),
+                })
+            })? {
+                assistant.push(row?);
+            }
+            Ok((users, assistant))
+        })
+        .unwrap_or_default();
+    for live_txt in crate::tts_stream::live_texts(device) {
+        if !assistant.iter().any(|a| a.text.trim() == live_txt.trim()) {
+            assistant.insert(0, Said { text: live_txt, ago: 0, heard: None });
+        }
+    }
+    let (pending, mc_chat, mc_tools) = if chat_context {
+        let mc = super::ambient_context::mission_control(d);
+        (
+            mc["pending_question"].as_str().map(str::to_string),
+            mc["recent_chat"].as_array().cloned().unwrap_or_default(),
+            mc["recent_tools"].as_array().cloned().unwrap_or_default(),
+        )
+    } else {
+        (None, Vec::new(), Vec::new())
+    };
+    let with_pending = pending.is_some();
+    let expectation = crate::ambient::expectation();
+    let expecting = expectation.is_some();
+    let moment = Moment {
+        text: text.to_string(),
+        duration_ms: 800,
+        users,
+        assistant,
+        open: crate::ambient::conversation().is_some() || during_playback,
+        phrases: phrases.clone(),
+        expecting: expectation.map(|e| (e.kind, e.about)),
+        pending,
+        mc_chat,
+        mc_tools,
+        media_playing: false,
+        during_playback,
+    };
+    match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
+        Ok(verdict) => settle(verdict, text, &phrases),
+        Err(_) => rule(text, &phrases),
+    }
+}
