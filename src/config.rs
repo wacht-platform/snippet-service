@@ -298,7 +298,7 @@ pub struct AmbientConfig {
     pub mode: String,
     #[serde(default = "default_ambient_watcher")]
     pub watcher: String,
-    #[serde(default)]
+    #[serde(default = "default_watcher_chat_context")]
     pub watcher_chat_context: bool,
     #[serde(default = "default_conversation_timeout")]
     pub conversation_timeout_secs: u32,
@@ -346,13 +346,17 @@ fn is_default_stt(s: &String) -> bool {
     *s == default_stt()
 }
 
+fn default_watcher_chat_context() -> bool {
+    true
+}
+
 impl Default for AmbientConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             mode: default_ambient_mode(),
             watcher: default_ambient_watcher(),
-            watcher_chat_context: false,
+            watcher_chat_context: true,
             conversation_timeout_secs: default_conversation_timeout(),
             wake_phrases: default_wake_phrases(),
             tts_voice: default_tts_voice(),

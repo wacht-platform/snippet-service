@@ -77,16 +77,27 @@ fn summarize_tool(tc: &crate::llm::ToolCallRecord) -> Option<String> {
     Some(redact(&summary))
 }
 
+fn is_ignored_ambient_dismissal(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    (lower.contains("staying quiet") || lower.contains("no reply needed"))
+        && (lower.contains("out-of-context")
+            || lower.contains("not meant for me")
+            || lower.contains("not addressed to me")
+            || lower.contains("not for me"))
+}
+
 pub(crate) fn mission_control(d: &Shared) -> Value {
     let now = chrono::Utc::now();
     let rows = d
         .store
-        .load_recent_conversation(crate::mission_control::SESSION_ID, 32)
+        .load_recent_conversation(crate::mission_control::SESSION_ID, 64)
         .unwrap_or_default();
     let mut chat: Vec<Value> = Vec::new();
     let mut tools: Vec<Value> = Vec::new();
     let mut budget = 2400usize;
-    for row in rows.iter().rev() {
+    let mut skip_prev_user_ambient = false;
+
+    for (idx, row) in rows.iter().enumerate().rev() {
         if chat.len() >= 8 && tools.len() >= 5 {
             break;
         }
@@ -96,6 +107,11 @@ pub(crate) fn mission_control(d: &Shared) -> Value {
         let when = bucket_ago(secs);
         match &row.message {
             crate::llm::HarnessMessage::User { content } => {
+                if skip_prev_user_ambient && super::ambient_watch::inner_turn(content).is_some() {
+                    skip_prev_user_ambient = false;
+                    continue;
+                }
+                skip_prev_user_ambient = false;
                 if chat.len() >= 8 || budget < 80 || crate::harness::is_daemon_envelope(content) {
                     continue;
                 }
@@ -110,6 +126,23 @@ pub(crate) fn mission_control(d: &Shared) -> Value {
                 }
             }
             crate::llm::HarnessMessage::Assistant { content, tool_calls } => {
+                // Skip internal assistant replies to daemon wakes/board envelopes when no speak tool was called
+                let prev_user_is_daemon = rows[..idx]
+                    .iter()
+                    .rev()
+                    .find_map(|r| match &r.message {
+                        crate::llm::HarnessMessage::User { content } => Some(crate::harness::is_daemon_envelope(content)),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                let has_speak = tool_calls.iter().any(|tc| tc.name == "speak");
+                if is_ignored_ambient_dismissal(content) && !has_speak {
+                    skip_prev_user_ambient = true;
+                    continue;
+                }
+                if prev_user_is_daemon && !has_speak {
+                    continue;
+                }
                 for tc in tool_calls.iter().rev() {
                     if tc.name == "speak" && chat.len() < 8 && budget >= 80 {
                         if let Some(spoken) = tc.arguments.get("text").and_then(Value::as_str) {
@@ -125,7 +158,7 @@ pub(crate) fn mission_control(d: &Shared) -> Value {
                         }
                     }
                 }
-                if !content.trim().is_empty() && chat.len() < 8 && budget >= 80 {
+                if !content.trim().is_empty() && !has_speak && chat.len() < 8 && budget >= 80 {
                     let text = redact(&clip(&plain_text(content), 280, true));
                     if !text.is_empty() {
                         budget = budget.saturating_sub(text.len());
