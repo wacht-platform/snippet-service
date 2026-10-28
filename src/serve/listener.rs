@@ -19,7 +19,6 @@ const PAD: u64 = 9_600;
 const ECHO_HANGOVER_BYTES: u64 = 9_600;
 const IDLE_CLOSE: Duration = Duration::from_secs(60);
 const FLUX_IDLE_CLOSE: Duration = Duration::from_secs(600);
-const URGENT: &[&str] = &["stop", "wait", "hold", "pause", "no", "nope", "sorry", "actually", "hang", "snippet", "chief", "enough", "shut", "quiet"];
 const SAMPLE: Duration = Duration::from_millis(250);
 
 enum Cmd {
@@ -41,7 +40,6 @@ struct Live {
     conn: u64,
     turn: i64,
     seq: i64,
-    interrupted: bool,
 }
 
 #[derive(Default)]
@@ -480,38 +478,17 @@ impl Listener {
             if ended && words.is_empty() && transcript.is_empty() {
                 return;
             }
-            s.live = Some(Live { conn, turn: order, seq: next_seq(), interrupted: false });
+            s.live = Some(Live { conn, turn: order, seq: next_seq() });
         }
         let live = s.live.as_mut().unwrap();
         let seq = live.seq;
         let replies = super::ambient_routes::recent_replies(&self.device);
         let mask = echo_mask(&words, &replies);
         let real = words.iter().zip(&mask).filter(|(_, e)| !**e).count();
-        let vocab: Vec<String> = replies.iter().flat_map(|r| r.split_whitespace().map(norm)).filter(|w| !w.is_empty()).collect();
-        let novel = words.iter().zip(&mask).filter(|(w, e)| !**e && !vocab.iter().any(|v| similar(&w.key, v))).count();
-        let audible = s.audible || s.play_flag;
-        let live = s.live.as_mut().unwrap();
-        let urgent = words.iter().zip(&mask).any(|(w, e)| !*e && URGENT.contains(&w.key.as_str()));
-        let no_hw_aec = self.device.starts_with("macos-") || self.device.starts_with("linux-") || self.device.starts_with("windows-");
-        let barge_ready = if audible && no_hw_aec {
-            (novel >= 2 && real >= 2) || (urgent && real >= 1)
-        } else {
-            (novel >= 1 && real >= 2) || (urgent && real >= 1)
-        };
-        let barge = !live.interrupted && barge_ready && {
-            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
-            audible || busy
-        };
-        if barge {
-            live.interrupted = true;
-        }
         if !ended {
             drop(s);
             if fresh {
                 super::ambient_routes::announce(&self.d, &self.device, seq, false);
-            }
-            if barge {
-                self.barge_in();
             }
             return;
         }
@@ -534,12 +511,8 @@ impl Listener {
             Vec::new()
         };
         drop(s);
-        if barge {
-            self.barge_in();
-        }
-        let filtered = words.len().saturating_sub(real);
         let during_playback = words.iter().any(|w| w.playing);
-        let echo_all = !words.is_empty() && (real == 0 || (during_playback && filtered >= 2 && real == 1 && !urgent));
+        let echo_all = !words.is_empty() && real == 0;
         let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
         let text = if words.is_empty() || real == words.len() {
             if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }
@@ -573,24 +546,6 @@ impl Listener {
         };
         let (d, device) = (self.d.clone(), self.device.clone());
         tokio::spawn(async move { super::ambient_routes::record_heard(&d, &device, event).await });
-    }
-
-    fn barge_in(&self) {
-        let (d, device) = (self.d.clone(), self.device.clone());
-        let sent = super::autonomy::mission_control_inputs();
-        tokio::spawn(async move {
-            let spoke = crate::speech::interrupt(&device);
-            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
-            if !(spoke || busy) {
-                return;
-            }
-            if super::autonomy::mission_control_inputs() != sent {
-                return;
-            }
-            if super::autonomy::interrupt_mission_control(&d).await {
-                super::autonomy::resume_unless_heard(d);
-            }
-        });
     }
 }
 

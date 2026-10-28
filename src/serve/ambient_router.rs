@@ -214,7 +214,7 @@ async fn accept(
         flush(d, device, parts, crate::ambient::conversation().is_some(), last, pending.take()).await;
     }
     turn.push(part);
-    let live = crate::ambient::conversation().is_some();
+    let live = crate::ambient::conversation().is_some() || crate::tts_stream::busy_for(device);
     if wake {
         let parts = std::mem::take(turn);
         *deadline = None;
@@ -280,7 +280,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let routable = holder.as_deref() == Some(device);
     let wake = ambient_watch::wake_word(&text, &phrases);
     let expecting = crate::ambient::expectation().is_some();
-    let live = crate::ambient::conversation().is_some();
+    let live = crate::ambient::conversation().is_some() || crate::tts_stream::busy_for(device);
     let pinned = crate::ambient::is_pinned();
 
     let mut task = match pending {
@@ -521,6 +521,7 @@ async fn deliver(
     if let Some(parent) = continuation_of {
         attrs.push_str(&format!(" continuation_of=\"{}\"", ambient_watch::escape(&parent.join(","))));
     }
+    let _ = crate::speech::interrupt(device);
     crate::tts_stream::settle(Duration::from_millis(120)).await;
     if let Some(heard) = crate::speech::take_interruption() {
         attrs.push_str(&format!(" interrupted_reply=\"{}\"", ambient_watch::escape(&heard)));
