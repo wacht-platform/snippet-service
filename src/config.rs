@@ -312,6 +312,8 @@ pub struct AmbientConfig {
     pub deepgram_host: String,
     #[serde(default = "default_stt", skip_serializing_if = "is_default_stt")]
     pub stt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voiceprints: Vec<crate::voiceprint::VoiceprintSample>,
 }
 
 impl Eq for AmbientConfig {}
@@ -357,6 +359,7 @@ impl Default for AmbientConfig {
             tts_speed: default_tts_speed(),
             deepgram_host: default_deepgram_host(),
             stt: default_stt(),
+            voiceprints: Vec::new(),
         }
     }
 }

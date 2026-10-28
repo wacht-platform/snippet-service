@@ -65,6 +65,7 @@ struct Inner {
     live: Option<Live>,
     stream: Option<u32>,
     delivered: Option<(u64, i64, usize)>,
+    vp_acc: crate::voiceprint::VoiceprintAccumulator,
 }
 
 pub(super) struct Listener {
@@ -248,6 +249,7 @@ pub(super) async fn open(d: &Shared, device: &str, h: u32, started_at: Option<&s
     while s.anchors.len() > 64 {
         s.anchors.pop_front();
     }
+    s.vp_acc.reset();
     s.stream = Some(h);
     drop(s);
     l.ensure();
@@ -268,6 +270,8 @@ pub(super) fn audio(device: &str, h: u32, pcm: &[u8]) -> bool {
         if s.stream != Some(h) {
             return false;
         }
+        // Accumulate 24-D speaker voiceprint features in parallel as PCM streams in
+        s.vp_acc.feed_pcm(pcm);
         s.ring.extend(pcm);
         s.g += pcm.len() as u64;
         if s.ring.len() > RING {
@@ -514,6 +518,12 @@ impl Listener {
             } else {
                 None
             };
+            let live_vp = if probe_text.is_some() {
+                let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
+                s.vp_acc.score(&vps)
+            } else {
+                None
+            };
             drop(s);
             if fresh {
                 super::ambient_routes::announce(&self.d, &self.device, seq, false);
@@ -525,7 +535,7 @@ impl Listener {
                     let device = self.device.clone();
                     let sent = super::autonomy::mission_control_inputs();
                     tokio::spawn(async move {
-                        let verdict = super::ambient_watch::classify_live(&d, &device, &clean_text, during_playback).await;
+                        let verdict = super::ambient_watch::classify_live(&d, &device, &clean_text, during_playback, live_vp).await;
                         let go = super::ambient_router::should_interrupt(&d, &verdict, &clean_text);
                         let mut do_interrupt = false;
                         {
@@ -571,7 +581,11 @@ impl Listener {
         } else {
             Vec::new()
         };
+        let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
+        let acc_score = s.vp_acc.score(&vps);
+        s.vp_acc.reset();
         drop(s);
+        let user_voice = crate::voiceprint::score_pcm(&pcm, &vps).or(acc_score);
         let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
         let text = if words.is_empty() || real == words.len() {
             if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }
@@ -602,6 +616,7 @@ impl Listener {
             during_playback,
             media,
             pcm,
+            user_voice,
         };
         let (d, device) = (self.d.clone(), self.device.clone());
         tokio::spawn(async move { super::ambient_routes::record_heard(&d, &device, event).await });
@@ -618,6 +633,7 @@ pub(super) struct Event {
     pub during_playback: bool,
     pub media: bool,
     pub pcm: Vec<u8>,
+    pub user_voice: Option<f64>,
 }
 
 struct Heard {

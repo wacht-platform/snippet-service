@@ -320,6 +320,7 @@ pub(super) struct Moment {
     pub mc_tools: Vec<Value>,
     pub media_playing: bool,
     pub during_playback: bool,
+    pub user_voice: Option<f64>,
 }
 
 fn handled_as(h: &Heard) -> &'static str {
@@ -378,7 +379,7 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
     if let Some(q) = &m.pending {
         assistant["pending_question"] = json!(q);
     }
-    json!({
+    let mut state = json!({
         "utterance": m.text,
         "utterance_length": length,
         "name_in_utterance": name,
@@ -390,7 +391,11 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
         },
         "recent": recent.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
         "phone_playing_media": m.media_playing,
-    })
+    });
+    if let Some(uv) = m.user_voice {
+        state["user_voice_likelihood"] = json!((uv * 100.0).round() / 100.0);
+    }
+    state
 }
 
 pub(super) fn verdict_from(value: &Value) -> Result<Verdict, String> {
@@ -467,7 +472,7 @@ pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Ve
     verdict
 }
 
-pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict {
+pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice: Option<f64>) -> Verdict {
     let id = ids.last().map(String::as_str).unwrap_or("");
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
     let (key, watcher, phrases, chat_context) = {
@@ -568,9 +573,20 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
         mc_tools,
         media_playing,
         during_playback,
+        user_voice,
     };
     match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
-        Ok(verdict) => settle(verdict, text, &phrases),
+        Ok(mut verdict) => {
+            if let Some(uv) = user_voice {
+                if uv < 0.35 && !wake_word(text, &phrases) {
+                    verdict.other = verdict.other.max(0.65);
+                    verdict.addressed = verdict.addressed.min(0.45);
+                } else if uv >= 0.78 && verdict.addressed >= 0.45 && verdict.veto() < 0.55 {
+                    verdict.addressed = (verdict.addressed + 0.08).min(1.0);
+                }
+            }
+            settle(verdict, text, &phrases)
+        }
         Err(e) => {
             eprintln!("[ambient] voice classifier failed: {e}");
             rule(text, &phrases)
@@ -580,7 +596,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str) -> Verdict 
 
 /// Real-time parallel classification on partial streaming transcripts while the user
 /// is still speaking, enabling fast classifier-driven barge-in/interruption.
-pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_playback: bool) -> Verdict {
+pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_playback: bool, user_voice: Option<f64>) -> Verdict {
     let (key, watcher, phrases, chat_context) = {
         let c = d.config.lock().unwrap();
         (
@@ -668,9 +684,18 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         mc_tools,
         media_playing: false,
         during_playback,
+        user_voice,
     };
     match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
-        Ok(verdict) => settle(verdict, text, &phrases),
+        Ok(mut verdict) => {
+            if let Some(uv) = user_voice {
+                if uv < 0.35 && !wake_word(text, &phrases) {
+                    verdict.other = verdict.other.max(0.68);
+                    verdict.addressed = verdict.addressed.min(0.40);
+                }
+            }
+            settle(verdict, text, &phrases)
+        }
         Err(_) => rule(text, &phrases),
     }
 }

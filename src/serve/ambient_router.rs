@@ -27,14 +27,21 @@ const MEMORABLE_THRESHOLD: f64 = 0.65;
 
 type Pending = (Vec<String>, String, tokio::task::JoinHandle<Verdict>);
 
+fn best_user_voice(turn: &[Part]) -> Option<f64> {
+    turn.iter()
+        .filter_map(|p| p.user_voice)
+        .reduce(f64::max)
+}
+
 fn classify_turn(d: &Shared, turn: &[Part], pending: &mut Option<Pending>) {
     if let Some((_, _, h)) = pending.take() {
         h.abort();
     }
     let ids: Vec<String> = turn.iter().map(|p| p.id.clone()).collect();
     let text = turn.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
+    let uv = best_user_voice(turn);
     let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await });
+    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv).await });
     *pending = Some((ids, text, h));
 }
 
@@ -47,6 +54,7 @@ pub(crate) struct Part {
     pub ended: f64,
     pub started_at: String,
     pub continued: bool,
+    pub user_voice: Option<f64>,
 }
 
 pub(crate) enum Msg {
@@ -300,8 +308,9 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             if let Some((_, _, h)) = other {
                 h.abort();
             }
+            let uv = best_user_voice(&parts);
             let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-            tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2).await })
+            tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv).await })
         }
     };
     let mut delivered = false;
@@ -531,6 +540,9 @@ async fn deliver(
     }
     if let Some(parent) = continuation_of {
         attrs.push_str(&format!(" continuation_of=\"{}\"", ambient_watch::escape(&parent.join(","))));
+    }
+    if let Some(uv) = best_user_voice(parts) {
+        attrs.push_str(&format!(" user_voice=\"{uv:.2}\""));
     }
     let _ = crate::speech::interrupt(device);
     crate::tts_stream::settle(Duration::from_millis(120)).await;

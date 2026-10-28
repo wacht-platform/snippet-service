@@ -41,6 +41,7 @@ pub mod routing;
 pub mod sanitize;
 pub mod serve;
 pub mod session;
+pub mod voiceprint;
 pub mod shell_guard;
 pub mod signals;
 pub mod skills;

@@ -147,6 +147,11 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         })),
         "listening_id": listening.as_ref().map(|(id, _)| id),
         "listening_device": listening.as_ref().map(|(_, label)| label),
+        "voiceprints": ambient.voiceprints.iter().map(|vp| serde_json::json!({
+            "id": vp.id,
+            "label": vp.label,
+            "created_at": vp.created_at,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -471,6 +476,16 @@ fn spawn_transcription(d: Shared, id: String) {
         let started = chrono::DateTime::parse_from_rfc3339(&started_at)
             .map(|t| t.timestamp_millis() as f64 / 1000.0)
             .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+        let vps = d.config.lock().unwrap().ambient.voiceprints.clone();
+        let user_voice = if vps.is_empty() {
+            None
+        } else {
+            tokio::fs::read(audio_path(&id))
+                .await
+                .ok()
+                .and_then(|bytes| crate::voiceprint::extract_from_pcm_or_wav(&bytes).ok())
+                .and_then(|vec| crate::voiceprint::score_vector(&vec, &vps))
+        };
         super::ambient_router::submit(
             &d,
             &device,
@@ -482,6 +497,7 @@ fn spawn_transcription(d: Shared, id: String) {
                 ended: started + duration_ms as f64 / 1000.0,
                 started_at,
                 continued: continued != 0,
+                user_voice,
             }),
         );
     });
@@ -633,6 +649,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
                 ended: e.started + e.duration_ms as f64 / 1000.0,
                 started_at,
                 continued: false,
+                user_voice: e.user_voice,
             }),
         );
     }
@@ -651,6 +668,113 @@ pub(super) fn announce(d: &Shared, device: &str, seq: i64, skip: bool) {
     } else {
         super::ambient_router::submit(d, device, super::ambient_router::Msg::Activity(Some(seq)));
     }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EnrollVoiceprintReq {
+    #[serde(default)]
+    audio_base64: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    from_recent: bool,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DeleteVoiceprintQuery {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+pub(crate) async fn enroll_voiceprint(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<EnrollVoiceprintReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let audio_bytes = if req.from_recent {
+        let Ok(mut dir) = tokio::fs::read_dir(audio_dir()).await else {
+            return (StatusCode::BAD_REQUEST, "No recent ambient voice recordings found").into_response();
+        };
+        let mut latest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            if let Ok(modified) = entry.metadata().await.and_then(|m| m.modified()) {
+                if latest.as_ref().is_none_or(|(t, _)| modified > *t) {
+                    latest = Some((modified, entry.path()));
+                }
+            }
+        }
+        let Some((_, path)) = latest else {
+            return (StatusCode::BAD_REQUEST, "No recent ambient voice recordings found").into_response();
+        };
+        match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("Failed to read recording: {e}")).into_response(),
+        }
+    } else {
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(req.audio_base64.trim()) {
+            Ok(b) if !b.is_empty() => b,
+            _ => return (StatusCode::BAD_REQUEST, "audio_base64 is required").into_response(),
+        }
+    };
+
+    let vec = match crate::voiceprint::extract_from_pcm_or_wav(&audio_bytes) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let save_res = {
+        let mut c = d.config.lock().unwrap();
+        let next_num = c.ambient.voiceprints.len() + 1;
+        let label = if req.label.trim().is_empty() {
+            format!("Sample {next_num}")
+        } else {
+            req.label.trim().to_string()
+        };
+        c.ambient.voiceprints.push(crate::voiceprint::VoiceprintSample {
+            id: uuid::Uuid::new_v4().to_string(),
+            label,
+            created_at: chrono::Utc::now().timestamp(),
+            vector: vec,
+        });
+        while c.ambient.voiceprints.len() > 8 {
+            c.ambient.voiceprints.remove(0);
+        }
+        crate::config::save_config(&c, &d.config_path)
+    };
+    if let Err(e) = save_res {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(settings_view(&d)).into_response()
+}
+
+pub(crate) async fn delete_voiceprint(
+    State(d): State<Shared>,
+    Query(q): Query<DeleteVoiceprintQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    d.reload_config().await;
+    let save_res = {
+        let mut c = d.config.lock().unwrap();
+        if let Some(id) = q.id.as_deref().filter(|s| !s.trim().is_empty()) {
+            c.ambient.voiceprints.retain(|vp| vp.id != id);
+        } else {
+            c.ambient.voiceprints.clear();
+        }
+        crate::config::save_config(&c, &d.config_path)
+    };
+    if let Err(e) = save_res {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    Json(settings_view(&d)).into_response()
 }
 
 pub(crate) fn resume(d: Shared) {
