@@ -451,6 +451,16 @@ async fn handle_ws(
                     continue;
                 }
                 if let Ok(input) = serde_json::from_str::<LoopInput>(t.as_str()) {
+                    if matches!(
+                        input,
+                        LoopInput::UserMessage(_)
+                            | LoopInput::Queue(_)
+                            | LoopInput::Answer(_)
+                            | LoopInput::SteerQueued(_)
+                            | LoopInput::Interrupt
+                    ) {
+                        crate::speech::cancel_all("interrupted");
+                    }
                     if crate::mission_control::is_session_id(&session)
                         && matches!(
                             input,
