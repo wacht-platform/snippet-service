@@ -229,7 +229,13 @@ async fn accept(
         if let Some(l) = last.as_mut() {
             let gap = part.started - l.ended;
             let routable = crate::ambient::lease_holder().is_some_and(|(h, _)| h == device);
-            if l.delivered && routable && crate::ambient::conversation().is_some() && l.at.elapsed() < LATE_WINDOW && gap <= CONTINUED_GAP {
+            if l.delivered
+                && routable
+                && crate::ambient::conversation().is_some()
+                && l.at.elapsed() < LATE_WINDOW
+                && gap <= CONTINUED_GAP
+                && !super::call_track::holds(device)
+            {
                 let parent = l.ids.clone();
                 let ended = part.ended;
                 let ids = vec![part.id.clone()];
@@ -277,9 +283,9 @@ fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
         d.store.write(|c| {
             c.execute(
                 "UPDATE ambient_events SET verdict = ?2, addressed = ?3, judge = ?4, kept = ?5, intent = ?6, delivered = ?7,
-                        user_voice = COALESCE(?8, user_voice)
+                        user_voice = COALESCE(?8, user_voice), other_party = ?9, played = ?10
                  WHERE id = ?1",
-                rusqlite::params![id, v.kind, v.addressed, v.judge, kept as i64, v.intent, delivered as i64, v.user_voice()],
+                rusqlite::params![id, v.kind, v.addressed, v.judge, kept as i64, v.intent, delivered as i64, v.user_voice(), v.other, v.played],
             )?;
             if kept {
                 c.execute(
@@ -357,7 +363,11 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         if !wake {
             early = tokio::time::timeout(WAKE_VETO, &mut task).await.ok().and_then(|r| r.ok());
         }
-        let go = wake || early.as_ref().is_some_and(|v| decide(live, pinned, v, wake, expecting).0);
+        let go = wake
+            || early.as_ref().is_some_and(|v| {
+                decide(live, pinned, v, wake, expecting).0
+                    && (!super::call_track::holds(device) || super::call_track::clearly_for_assistant(v, wake))
+            });
         if go {
             let v = wake_verdict(early.as_ref());
             deliver(d, device, &parts, &v, wake, None, !live).await;
@@ -368,10 +378,11 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         }
     }
     if delivered && early.is_none() {
-        let (d3, ids3, dev3) = (d.clone(), ids.clone(), device.to_string());
+        let (d3, ids3, dev3, parts3) = (d.clone(), ids.clone(), device.to_string(), parts.clone());
         tokio::spawn(async move {
             let v = task.await.unwrap_or_else(|_| Verdict::inherited());
             mark_verdict(&d3, &ids3, &v, true);
+            super::call_track::observe(&d3, &dev3, &parts3, &v, true, wake).await;
             adapt(&dev3, &ids3, &v, wake || live);
             if !wake && !pinned && is_unrelated(&v) {
                 crate::ambient::end_conversation();
@@ -391,9 +402,10 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     if let Some(last) = ids.last() {
         super::ambient_routes::mark(last, "classified");
     }
+    let on_call = super::call_track::holds(device);
     if !delivered && routable {
         let (go, open) = decide(live, pinned, &verdict, wake, expecting);
-        if go {
+        if go && (!on_call || super::call_track::clearly_for_assistant(&verdict, wake)) {
             if open {
                 crate::ambient::open_conversation(device, ttl);
             }
@@ -402,14 +414,15 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             if verdict.out_of_context < 0.50 {
                 note_out_of_context_reset(device);
             }
-        } else if live {
+        } else if live && !on_call {
             handle_out_of_context(d, device, &text, &verdict, pinned).await;
         }
     }
-    if !delivered && verdict.kept() && verdict.memorable >= MEMORABLE_THRESHOLD {
+    if !delivered && !on_call && verdict.kept() && verdict.memorable >= MEMORABLE_THRESHOLD {
         super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &text, false).await;
     }
     mark_verdict(d, &ids, &verdict, delivered);
+    super::call_track::observe(d, device, &parts, &verdict, delivered, wake).await;
     if wake || (delivered && live) {
         adapt(device, &ids, &verdict, true);
     }

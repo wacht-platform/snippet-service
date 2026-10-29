@@ -14,6 +14,16 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SPOKE_GEN: AtomicU64 = AtomicU64::new(0);
 static EXPECT: Mutex<Option<Expectation>> = Mutex::new(None);
+static CALL_QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Set while a call is pending or tracked: Snippet must not speak over it.
+pub fn set_call_quiet(on: bool) {
+    CALL_QUIET.store(on, Ordering::Relaxed);
+}
+
+pub fn call_quiet() -> bool {
+    CALL_QUIET.load(Ordering::Relaxed)
+}
 
 static LEASE: Mutex<Option<(String, String, Instant)>> = Mutex::new(None);
 static CONVERSATION: Mutex<Option<Conversation>> = Mutex::new(None);

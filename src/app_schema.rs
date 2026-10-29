@@ -116,6 +116,23 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              ON ambient_turns(device, id);
          CREATE INDEX IF NOT EXISTS ambient_turns_created
              ON ambient_turns(created_at);
+         CREATE TABLE IF NOT EXISTS ambient_calls (
+             id TEXT PRIMARY KEY NOT NULL,
+             device TEXT NOT NULL,
+             detected_at INTEGER NOT NULL,
+             started_at INTEGER NOT NULL,
+             ended_at INTEGER,
+             state TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS ambient_call_lines (
+             call_id TEXT NOT NULL,
+             at_ms INTEGER NOT NULL,
+             speaker TEXT NOT NULL,
+             text TEXT NOT NULL,
+             event_ids TEXT NOT NULL DEFAULT '[]'
+         );
+         CREATE INDEX IF NOT EXISTS ambient_call_lines_call
+             ON ambient_call_lines(call_id, at_ms);
          CREATE TABLE IF NOT EXISTS ambient_chunks (
              turn_id INTEGER NOT NULL,
              seq INTEGER NOT NULL,
@@ -144,6 +161,8 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
         ("delivered", "ALTER TABLE ambient_events ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0"),
         ("turn_key", "ALTER TABLE ambient_events ADD COLUMN turn_key TEXT"),
         ("user_voice", "ALTER TABLE ambient_events ADD COLUMN user_voice REAL"),
+        ("other_party", "ALTER TABLE ambient_events ADD COLUMN other_party REAL"),
+        ("played", "ALTER TABLE ambient_events ADD COLUMN played REAL"),
     ] {
         if !have.iter().any(|c| c == name) {
             connection.execute(ddl, [])?;

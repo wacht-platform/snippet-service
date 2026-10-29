@@ -275,6 +275,11 @@ impl Store {
             .unwrap_or_default()
             .to_string();
         let now = chrono::Utc::now().timestamp();
+        let ttl = event
+            .as_object_mut()
+            .and_then(|o| o.remove("ttl_secs"))
+            .and_then(|v| v.as_i64())
+            .map_or(retention_secs, |t| t.clamp(1, retention_secs));
         self.with_connection(|conn| {
             let tx = conn.unchecked_transaction()?;
             if let Some(key) = event.get("source_key").and_then(|v| v.as_str()) {
@@ -322,7 +327,7 @@ impl Store {
                 obj.insert("event_id".into(), serde_json::json!(id));
                 obj.insert("notification_id".into(), serde_json::json!(uuid::Uuid::new_v4().to_string()));
                 obj.insert("created_at".into(), serde_json::json!(created_at));
-                obj.insert("expires_at".into(), serde_json::json!(now + retention_secs));
+                obj.insert("expires_at".into(), serde_json::json!(now + ttl));
             }
             tx.execute(
                 "INSERT INTO notification_journal (event_id, kind, created_at, payload_json)

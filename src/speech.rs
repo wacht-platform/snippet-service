@@ -146,6 +146,9 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
     if text.is_empty() {
         return Err("nothing to say".into());
     }
+    if crate::ambient::call_quiet() {
+        return Err("the user is on a call: speech is off until it ends, so reply in text".into());
+    }
     let (device, conversation) = prepare().await?;
     if let Some(kind) = expecting.filter(|k| !k.is_empty() && *k != "none") {
         crate::ambient::set_expectation(kind, about.unwrap_or(""), 10);
@@ -384,7 +387,7 @@ enum Route {
 }
 
 fn fresh_route() -> Route {
-    if crate::tts_stream::enabled() { Route::Pending } else { Route::Off }
+    if crate::tts_stream::enabled() && !crate::ambient::call_quiet() { Route::Pending } else { Route::Off }
 }
 
 fn direct_claims(text: &str, done: bool) -> Option<Route> {

@@ -1,0 +1,24 @@
+# Hand labels for call_history.tsv (ambient history 2026-10-22..29, no text).
+# kind	device	start_ms	end_ms	note. pos = conversation or call not with the assistant; amb = unclear, not scored.
+pos	phone	1792855900000	1792856130000	in-person/call, short exchange
+pos	phone	1792857960000	1792858390000	phone call, user side
+pos	phone	1792859070000	1792859145000	in-person Hindi/English chat
+pos	phone	1792866420000	1792866680000	call with an AI phone receptionist
+pos	phone	1793030640000	1793031320000	Hindi conversation, fragmentary transcript
+pos	phone	1793032920000	1793033650000	Hindi conversation, fragmentary transcript
+pos	phone	1793177160000	1793177310000	meeting/call before asking about main
+pos	mac	1793019990000	1793020140000	in-person chat
+pos	mac	1793020875000	1793020940000	in-person chat, short
+pos	mac	1793046180000	1793046660000	group conversation
+pos	mac	1793185000000	1793185320000	phone call
+pos	mac	1793268780000	1793269760000	work call with a customer
+pos	mac	1793282760000	1793284690000	lunch conversation
+pos	mac	1793285210000	1793285890000	conversation
+pos	mac	1793296800000	1793296950000	phone call
+amb	phone	1793110320000	1793111160000	fragmentary, unclear
+amb	mac	1793201580000	1793202180000	talk audio or conversation, unclear
+amb	mac	1793204340000	1793205720000	video mixed with conversation
+amb	mac	1793211060000	1793212320000	meeting or video, long chunks
+amb	mac	1793281110000	1793281260000	short conversation
+amb	mac	1793295660000	1793296260000	sparse remarks
+amb	mac	1793045340000	1793045460000	side chat between agent turns, maybe a video call

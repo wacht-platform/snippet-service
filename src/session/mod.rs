@@ -1296,6 +1296,8 @@ fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value
     if matches!(kind, "waiting" | "done" | "error" | "idle" | "ping") {
         let session = event.get("session")?.as_str()?;
         value["destination"] = serde_json::json!({"type": "session", "id": session});
+    } else if matches!(kind, "call_prompt" | "call_state") {
+        value["destination"] = serde_json::json!({"type": "session", "id": crate::mission_control::SESSION_ID});
     } else if kind == "coordination_event" {
         let source = event.get("event")?;
         let event_type = source.get("event_type")?.as_str()?;
@@ -1341,6 +1343,10 @@ fn notification_attention_current(store: &crate::store::Store, event: &serde_jso
 }
 
 fn notification_allowed(settings: &crate::mission_control::ControlSettings, event: &serde_json::Value) -> bool {
+    // A call prompt needs an answer whatever the policy; unanswered it just expires.
+    if matches!(event["kind"].as_str(), Some("call_prompt" | "call_state")) {
+        return true;
+    }
     let destination = &event["destination"];
     let session = if destination["type"] == "session" {
         destination["id"].as_str()

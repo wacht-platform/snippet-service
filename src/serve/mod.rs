@@ -42,6 +42,8 @@ mod ambient_stream;
 mod assembly;
 mod listener;
 mod ambient_watch;
+mod call_detect;
+mod call_track;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
 pub(crate) use config_routes::*;
@@ -882,6 +884,10 @@ pub async fn run_serve(
         .route("/ambient/turns/{id}/audio", get(ambient_routes::turn_audio))
         .route("/ambient/activity", post(ambient_routes::activity))
         .route("/ambient/conversation/end", post(ambient_routes::end_conversation))
+        .route("/ambient/call", get(call_track::status))
+        .route("/ambient/call/{call_id}/track", post(call_track::track))
+        .route("/ambient/call/{call_id}/ignore", post(call_track::ignore))
+        .route("/ambient/call/{call_id}/stop", post(call_track::stop))
         .route(
             "/ambient/settings",
             get(ambient_routes::get_settings).post(ambient_routes::set_settings),

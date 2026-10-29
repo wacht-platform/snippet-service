@@ -26,3 +26,31 @@ fn notification_frame_matches_durable_feed_and_preserves_ui_event() {
     assert_ne!(frame["kind"], "notification_available");
     assert!(frame.get("cursor").is_none());
 }
+
+#[test]
+fn call_events_reach_the_feed_whatever_the_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::store::Store::open(&dir.path().join("notifications.db")).unwrap();
+    let mut settings = crate::mission_control::ControlSettings::default();
+    settings.notification_policy = "none".into();
+    store.save_control_settings(&settings).unwrap();
+    let (events, mut receiver) = broadcast::channel(8);
+    let prompt = json!({"kind":"call_prompt","source_key":"call_prompt:c1","ttl_secs":120,
+        "payload":{"type":"call_prompt","call_id":"c1","expires_at":1,"title":"Track this call?","body":"b"}});
+
+    emit_device_event_with_store(prompt.clone(), Some(&store), &events);
+    emit_device_event_with_store(prompt.clone(), Some(&store), &events);
+
+    let frame = receiver.try_recv().unwrap();
+    let saved = &frame["notification"];
+    assert_eq!(frame["kind"], "notification");
+    assert_eq!(saved["kind"], "call_prompt");
+    assert_eq!(saved["destination"], json!({"type":"session","id":crate::mission_control::SESSION_ID}));
+    assert_eq!(saved["payload"], prompt["payload"]);
+    assert!(saved.get("ttl_secs").is_none());
+    let lifetime = saved["expires_at"].as_i64().unwrap() - saved["created_at"].as_i64().unwrap();
+    assert!((119..=121).contains(&lifetime), "{lifetime}");
+    let page = notification_page(store.notification_events_since(0, 501).unwrap(), &settings, 0, 100);
+    assert_eq!(page["events"].as_array().unwrap().len(), 1, "source_key dedupes a repeated prompt");
+    assert_eq!(&page["events"][0], saved);
+}
