@@ -163,6 +163,7 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
         ("user_voice", "ALTER TABLE ambient_events ADD COLUMN user_voice REAL"),
         ("other_party", "ALTER TABLE ambient_events ADD COLUMN other_party REAL"),
         ("played", "ALTER TABLE ambient_events ADD COLUMN played REAL"),
+        ("speaker", "ALTER TABLE ambient_events ADD COLUMN speaker TEXT"),
     ] {
         if !have.iter().any(|c| c == name) {
             connection.execute(ddl, [])?;

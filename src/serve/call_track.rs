@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use super::ambient_router::Part;
 use super::ambient_watch::Verdict;
 use super::call_detect::{Class, Detector, Signal, WINDOW_MS};
+use super::speakers::Speaker;
 
 pub(crate) const PROMPT_MS: i64 = 120_000;
 pub(crate) const END_QUIET_MS: i64 = 120_000;
@@ -24,18 +25,8 @@ pub(crate) struct Heard {
     pub at_ms: i64,
     pub ids: Vec<String>,
     pub text: String,
-    pub user_voice: Option<f64>,
+    pub speaker: Speaker,
     pub memorable: bool,
-}
-
-impl Heard {
-    pub fn speaker(&self) -> &'static str {
-        match self.user_voice {
-            Some(v) if v >= 0.5 => "You",
-            Some(_) => "Other",
-            None => "Unclear",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +53,8 @@ pub(crate) enum Effect {
     State { call_id: String, state: &'static str },
     Begin(Call),
     Append { call_id: String, line: Heard },
-    Scrub(Vec<String>),
+    Scrub { device: String, ids: Vec<String> },
+    Note(String),
     Summarise { call: Call, ended_at: i64 },
     Quiet(bool),
 }
@@ -76,6 +68,7 @@ pub(crate) struct CallBook {
     recent: HashMap<String, VecDeque<Heard>>,
     active: Option<Call>,
     resolved: VecDeque<(String, &'static str)>,
+    held: VecDeque<(String, i64, Heard)>,
 }
 
 impl CallBook {
@@ -83,6 +76,10 @@ impl CallBook {
         let mut fx = self.tick(now);
         let seen = self.detectors.entry(device.to_string()).or_default().observe(signal);
         let keep = !matches!(seen.class, Class::Assistant | Class::Played) && signal.words > 0;
+        let on_call = self.holds(device);
+        if heard.memorable && !(on_call && keep) {
+            self.held.push_back((device.to_string(), now, heard.clone()));
+        }
         if let Some(call) = self.active.as_mut().filter(|c| c.device == device) {
             if seen.class.call_like() {
                 call.last_call_like = now;
@@ -104,6 +101,7 @@ impl CallBook {
         }
         if let (Some(first), None) = (seen.trigger, &self.active) {
             let lines: Vec<Heard> = ring.drain(..).filter(|h| h.at_ms >= first).collect();
+            self.held.retain(|(d, _, h)| d != device || h.at_ms < first);
             let call = Call {
                 id: uuid::Uuid::new_v4().to_string(),
                 device: device.to_string(),
@@ -123,6 +121,12 @@ impl CallBook {
 
     pub fn tick(&mut self, now: i64) -> Vec<Effect> {
         let mut fx = Vec::new();
+        // Notes wait out a detection window so a call found later can still hold them back.
+        let busy = self.active.as_ref().map(|c| c.device.clone());
+        while let Some(i) = self.held.iter().position(|(d, at, _)| now - at >= WINDOW_MS && busy.as_deref() != Some(d)) {
+            let (_, _, h) = self.held.remove(i).unwrap();
+            fx.push(Effect::Note(h.text));
+        }
         let Some(call) = &self.active else { return fx };
         match call.phase {
             Phase::Pending if now >= call.expires_at => self.drop_call("expired", &mut fx),
@@ -201,7 +205,7 @@ impl CallBook {
 
     fn drop_call(&mut self, state: &'static str, fx: &mut Vec<Effect>) {
         let Some(call) = self.active.take() else { return };
-        fx.push(Effect::Scrub(call.lines.iter().flat_map(|l| l.ids.iter().cloned()).collect()));
+        fx.push(Effect::Scrub { device: call.device.clone(), ids: call.lines.iter().flat_map(|l| l.ids.iter().cloned()).collect() });
         fx.push(Effect::State { call_id: call.id.clone(), state });
         fx.push(Effect::Quiet(false));
         self.resolve(call.id, state);
@@ -250,14 +254,19 @@ pub(super) async fn observe(d: &Shared, device: &str, parts: &[Part], v: &Verdic
         during_playback: crate::tts_stream::busy_for(device),
         words: super::call_detect::meaningful_words(&text),
         user_voice: v.user_voice(),
+        other: v.other,
+        dur_ms: ((parts.last().map_or(first.ended, |p| p.ended) - first.started) * 1000.0) as i64,
+        speaker: None,
     };
-    let heard = Heard {
-        at_ms: signal.at_ms,
-        ids: parts.iter().map(|p| p.id.clone()).collect(),
-        text,
-        user_voice: signal.user_voice,
-        memorable: v.kept() && v.memorable >= MEMORABLE,
-    };
+    let played = v.kind == "media" || v.played >= 0.8;
+    let speaker = super::speakers::assign(device, &first.id, signal.at_ms, v.voice.as_deref(), played);
+    let signal = Signal { speaker: Some(speaker), ..signal };
+    let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
+    let label = speaker.label();
+    for id in &ids {
+        d.store.write(|c| c.execute("UPDATE ambient_events SET speaker = ?2 WHERE id = ?1", rusqlite::params![id, label]).map(|_| ()));
+    }
+    let heard = Heard { at_ms: signal.at_ms, ids, text, speaker, memorable: !delivered && v.kept() && v.memorable >= MEMORABLE };
     let fx = book().observe(device, &signal, heard, now_ms());
     if !fx.is_empty() {
         ensure_ticker(d);
@@ -295,7 +304,13 @@ async fn apply(d: &Shared, fx: Vec<Effect>) {
             Effect::Quiet(on) => crate::ambient::set_call_quiet(on),
             Effect::Begin(call) => persist_begin(d, &call),
             Effect::Append { call_id, line } => persist_line(d, &call_id, &line),
-            Effect::Scrub(ids) => scrub(d, &ids).await,
+            Effect::Scrub { device, ids } => {
+                super::ambient_router::forget_out_of_context(&device);
+                scrub(d, &ids).await
+            }
+            Effect::Note(text) => {
+                super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &text, false).await;
+            }
             Effect::Summarise { call, ended_at } => {
                 let d = d.clone();
                 tokio::spawn(async move { summarise(&d, call, ended_at).await });
@@ -343,7 +358,7 @@ fn persist_line(d: &Shared, call_id: &str, line: &Heard) {
     d.store.write(|c| {
         c.execute(
             "INSERT INTO ambient_call_lines (call_id, at_ms, speaker, text, event_ids) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![call_id, line.at_ms, line.speaker(), line.text, ids],
+            rusqlite::params![call_id, line.at_ms, line.speaker.label(), line.text, ids],
         )?;
         Ok(())
     });
@@ -383,7 +398,7 @@ pub(crate) fn transcript(lines: &[Heard]) -> String {
     let mut out = String::new();
     for line in lines {
         let at = chrono::DateTime::from_timestamp_millis(line.at_ms).map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_default();
-        let row = format!("[{at}] {}: {}\n", line.speaker(), line.text.trim());
+        let row = format!("[{at}] {}: {}\n", line.speaker.label(), line.text.trim());
         if out.len() + row.len() > TRANSCRIPT_CHARS {
             out.push_str("[transcript cut here: too long]\n");
             break;
@@ -400,7 +415,7 @@ async fn summarise(d: &Shared, call: Call, ended_at: i64) {
     }
     let iso = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339()).unwrap_or_default();
     let msg = format!(
-        "<call_ended id=\"{}\" device=\"{}\" started=\"{}\" ended=\"{}\" lines=\"{}\">The user asked Snippet to track this call and it has ended. Lines are labelled You (the user's voice), Other (someone else) or Unclear (no voice match). Reply in this chat in text only, without speaking: a short summary, the decisions made, and the action items with owners and dates where they were stated. Keep commitments the user made the way you keep other remembered notes. If nothing of substance was said, say so in one line.\n<transcript>\n{}</transcript></call_ended>",
+        "<call_ended id=\"{}\" device=\"{}\" started=\"{}\" ended=\"{}\" lines=\"{}\">The user asked Snippet to track this call and it has ended. Lines are labelled You (the user's voice), Voice 1, Voice 2 and so on (other people, grouped by voice) or unknown (too short to tell). Reply in this chat in text only, without speaking: a short summary, the decisions made, and the action items with owners and dates where they were stated. Keep commitments the user made the way you keep other remembered notes. If nothing of substance was said, say so in one line.\n<transcript>\n{}</transcript></call_ended>",
         super::ambient_watch::escape(&call.id),
         super::ambient_watch::escape(&call.device),
         iso(call.started_at),
@@ -480,7 +495,7 @@ mod tests {
     }
 
     fn heard(at_ms: i64, n: usize) -> Heard {
-        Heard { at_ms, ids: vec![format!("e{n}")], text: format!("line {n}"), user_voice: Some(if n % 2 == 0 { 0.9 } else { 0.1 }), memorable: n == 2 }
+        Heard { at_ms, ids: vec![format!("e{n}")], text: format!("line {n}"), speaker: if n % 2 == 0 { Speaker::You } else { Speaker::Voice(1) }, memorable: false }
     }
 
     /// Feeds a back-and-forth until it prompts; returns the effects and the clock.
@@ -525,8 +540,8 @@ mod tests {
         assert_eq!(book.track(&id, now + 1000, &mut fx), Ok("tracking"));
         let Some(Effect::Begin(call)) = fx.iter().find(|e| matches!(e, Effect::Begin(_))) else { panic!("no begin") };
         assert_eq!(call.lines.len(), 6);
-        assert_eq!(call.lines[0].speaker(), "You");
-        assert_eq!(call.lines[1].speaker(), "Other");
+        assert_eq!(call.lines[0].speaker.label(), "You");
+        assert_eq!(call.lines[1].speaker.label(), "Voice 1");
         assert_eq!(states(&fx), ["tracking"]);
         let more = book.observe("mac", &signal(now + 9000, "meeting"), heard(now + 9000, 7), now + 9000);
         assert!(matches!(more.as_slice(), [Effect::Append { .. }]));
@@ -544,7 +559,7 @@ mod tests {
         assert!(!persisted(&more));
         let mut fx = Vec::new();
         assert_eq!(book.ignore(&id, now + 6000, &mut fx), Ok("declined"));
-        let Some(Effect::Scrub(ids)) = fx.iter().find(|e| matches!(e, Effect::Scrub(_))) else { panic!("no scrub") };
+        let Some(Effect::Scrub { ids, .. }) = fx.iter().find(|e| matches!(e, Effect::Scrub { .. })) else { panic!("no scrub") };
         assert_eq!(ids.len(), 7);
         assert!(!persisted(&fx));
         assert_eq!(states(&fx), ["declined"]);
@@ -569,7 +584,7 @@ mod tests {
         assert!(book.tick(expires - 1).is_empty());
         let fx = book.tick(expires);
         assert_eq!(states(&fx), ["expired"]);
-        assert!(fx.iter().any(|e| matches!(e, Effect::Scrub(ids) if ids.len() == 6)));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Scrub { ids, .. } if ids.len() == 6)));
         assert!(!persisted(&fx));
         let mut late = Vec::new();
         assert_eq!(book.track(&id, expires + 1, &mut late), Err((StatusCode::CONFLICT, "expired")));
@@ -689,8 +704,8 @@ mod tests {
 
     #[test]
     fn transcript_labels_speakers() {
-        let lines = vec![heard(T0, 0), heard(T0 + 1000, 1), Heard { user_voice: None, ..heard(T0 + 2000, 3) }];
+        let lines = vec![heard(T0, 0), heard(T0 + 1000, 1), Heard { speaker: Speaker::Unknown, ..heard(T0 + 2000, 3) }];
         let t = transcript(&lines);
-        assert!(t.contains("You: line 0") && t.contains("Other: line 1") && t.contains("Unclear: line 3"), "{t}");
+        assert!(t.contains("You: line 0") && t.contains("Voice 1: line 1") && t.contains("unknown: line 3"), "{t}");
     }
 }

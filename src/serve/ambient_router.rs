@@ -23,7 +23,6 @@ const PINNED_THRESHOLD: f64 = 0.5;
 const LIVE_REPLY_THRESHOLD: f64 = 0.5;
 const VETO_THRESHOLD: f64 = 0.6;
 const MATCH_THRESHOLD: f64 = 0.7;
-const MEMORABLE_THRESHOLD: f64 = 0.65;
 
 type Pending = (Vec<String>, String, tokio::task::JoinHandle<Verdict>);
 
@@ -418,9 +417,6 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             handle_out_of_context(d, device, &text, &verdict, pinned).await;
         }
     }
-    if !delivered && !on_call && verdict.kept() && verdict.memorable >= MEMORABLE_THRESHOLD {
-        super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &text, false).await;
-    }
     mark_verdict(d, &ids, &verdict, delivered);
     super::call_track::observe(d, device, &parts, &verdict, delivered, wake).await;
     if wake || (delivered && live) {
@@ -501,6 +497,10 @@ fn note_out_of_context(device: &str, text: &str, v: &Verdict) -> (usize, Vec<Str
 
 fn out_of_context_streak(device: &str) -> usize {
     ooc_streaks().lock().unwrap().get(device).map_or(0, Vec::len)
+}
+
+pub(super) fn forget_out_of_context(device: &str) {
+    note_out_of_context_reset(device);
 }
 
 fn note_out_of_context_reset(device: &str) {
@@ -610,6 +610,17 @@ async fn deliver(
     }
     if let Some(parent) = continuation_of {
         attrs.push_str(&format!(" continuation_of=\"{}\"", ambient_watch::escape(&parent.join(","))));
+    }
+    if let Some(first) = parts.first() {
+        let voice = v.voice.clone().or_else(|| parts.iter().find_map(|p| p.voice.as_ref()?.ready()));
+        let speaker = super::speakers::assign(device, &first.id, (first.started * 1000.0) as i64, voice.as_deref(), v.played >= 0.8);
+        if speaker != super::speakers::Speaker::Unknown {
+            attrs.push_str(&format!(" speaker=\"{}\"", speaker.label()));
+        }
+        let present = super::speakers::peek(device, (first.started * 1000.0) as i64, None).1;
+        if present.len() > 1 {
+            attrs.push_str(&format!(" speakers_present=\"{}\"", ambient_watch::escape(&present.join(","))));
+        }
     }
     let ready = || parts.iter().filter_map(|p| p.voice.as_ref()?.ready()?.likelihood).reduce(f64::max);
     if let Some(uv) = v.user_voice().or_else(ready) {

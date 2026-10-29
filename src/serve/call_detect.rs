@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+
+use super::speakers::Speaker;
 
 pub(crate) const WINDOW_MS: i64 = 90_000;
 pub(crate) const MIN_LINES: usize = 4;
@@ -8,6 +10,11 @@ pub(crate) const MIN_SPAN_MS: i64 = 20_000;
 pub(crate) const MEDIA_QUIET_MS: i64 = 120_000;
 pub(crate) const QUIET_RESET_MS: i64 = 180_000;
 const MIN_SCORED: usize = 3;
+pub(crate) const ALT_MIN_TURNS: usize = 4;
+pub(crate) const ALT_MIN_SWITCHES: usize = 3;
+pub(crate) const ALT_MIN_SPAN_MS: i64 = 15_000;
+pub(crate) const ALT_MAX_TURN_MS: i64 = 25_000;
+const OTHER_PARTY: f64 = 0.6;
 const PLAYED: f64 = 0.8;
 
 const FILLERS: &[&str] = &[
@@ -32,6 +39,27 @@ pub(crate) struct Signal {
     pub during_playback: bool,
     pub words: usize,
     pub user_voice: Option<f64>,
+    pub other: f64,
+    pub dur_ms: i64,
+    pub speaker: Option<Speaker>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Party {
+    You,
+    Voice(u32),
+    Other,
+    Unknown,
+}
+
+fn party(s: &Signal) -> Party {
+    match s.speaker {
+        Some(Speaker::You) => Party::You,
+        Some(Speaker::Voice(n)) => Party::Voice(n),
+        // settle() lifts other_party for every note, so a remark alone is not evidence of a second person.
+        _ if s.other >= OTHER_PARTY && s.user_voice.map_or(s.intent == "meeting", |v| v < 0.5) => Party::Other,
+        _ => Party::Unknown,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +101,8 @@ struct Seen {
     at: i64,
     class: Class,
     voice: Option<f64>,
+    party: Party,
+    long: bool,
 }
 
 #[derive(Default)]
@@ -100,7 +130,7 @@ impl Detector {
             self.window.clear();
             return Observed { class, trigger: None };
         }
-        self.window.push_back(Seen { at, class, voice: s.user_voice });
+        self.window.push_back(Seen { at, class, voice: s.user_voice, party: party(s), long: s.dur_ms > ALT_MAX_TURN_MS });
         while self.window.front().is_some_and(|w| at - w.at > WINDOW_MS) {
             self.window.pop_front();
         }
@@ -113,7 +143,7 @@ impl Detector {
         if self.cooling || self.last_played.is_some_and(|t| at - t < MEDIA_QUIET_MS) {
             return Observed { class, trigger: None };
         }
-        let trigger = self.qualifies();
+        let trigger = self.qualifies().or_else(|| self.alternates());
         if trigger.is_some() {
             self.cooling = true;
         }
@@ -130,6 +160,24 @@ impl Detector {
         // Played dialogue has many voices but never the user's; a call always has the user in it.
         let user_absent = scored.len() >= MIN_SCORED && scored.iter().all(|v| *v < 0.5);
         (calls.len() >= MIN_LINES && meeting >= MIN_MEETING && share >= MIN_SHARE && last - first >= MIN_SPAN_MS && !user_absent)
+            .then_some(first)
+    }
+
+    /// The user taking turns with one or more other live voices, even when the text alone is unclear.
+    fn alternates(&self) -> Option<i64> {
+        let turns: Vec<&Seen> = self
+            .window
+            .iter()
+            .filter(|w| matches!(w.class, Class::Meeting | Class::Note | Class::Unclear) && !w.long && w.party != Party::Unknown)
+            .collect();
+        let parties: HashSet<Party> = turns.iter().map(|w| w.party).collect();
+        let switches = turns.windows(2).filter(|p| p[0].party != p[1].party).count();
+        let (first, last) = (turns.first()?.at, turns.last()?.at);
+        (parties.contains(&Party::You)
+            && parties.len() >= 2
+            && turns.len() >= ALT_MIN_TURNS
+            && switches >= ALT_MIN_SWITCHES
+            && last - first >= ALT_MIN_SPAN_MS)
             .then_some(first)
     }
 }

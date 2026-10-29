@@ -44,6 +44,7 @@ mod listener;
 mod ambient_watch;
 mod call_detect;
 mod call_track;
+mod speakers;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
 pub(crate) use config_routes::*;

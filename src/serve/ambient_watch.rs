@@ -209,7 +209,7 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
         },
         "other_party": {
             "type": "noul",
-            "instructions": "Is `utterance` spoken by or to someone other than the user talking to the assistant: another person in the room, a narrator/creator in a video or reel, someone on a phone call, third-person remarks, or when `user_voice_likelihood` is below 0.1?"
+            "instructions": "Is `utterance` spoken by or to someone other than the user talking to the assistant: another person in the room, a narrator/creator in a video or reel, someone on a phone call, third-person remarks, when `speaker` is a 'Voice N' label, or when `user_voice_likelihood` is below 0.1?"
         },
         "out_of_context": {
             "type": "noul",
@@ -332,6 +332,8 @@ pub(super) struct Moment {
     pub media_playing: bool,
     pub during_playback: bool,
     pub user_voice: Option<f64>,
+    pub speaker: Option<String>,
+    pub speakers_present: Vec<String>,
 }
 
 fn handled_as(h: &Heard) -> &'static str {
@@ -405,6 +407,12 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
     });
     if let Some(uv) = m.user_voice {
         state["user_voice_likelihood"] = json!((uv * 100.0).round() / 100.0);
+    }
+    if let Some(sp) = &m.speaker {
+        state["speaker"] = json!(sp);
+    }
+    if !m.speakers_present.is_empty() {
+        state["speakers_present"] = json!(m.speakers_present);
     }
     state
 }
@@ -542,11 +550,12 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         return Verdict { voice: ready_voice(&voices), ..rule(text, &phrases) };
     };
     let now = chrono::Utc::now().timestamp();
-    let (duration_ms, users, assistant): (i64, Vec<Heard>, Vec<Said>) = d
+    let (duration_ms, device, users, assistant): (i64, String, Vec<Heard>, Vec<Said>) = d
         .store
         .with_connection(|c| {
-            let duration_ms: i64 =
-                c.query_row("SELECT duration_ms FROM ambient_events WHERE id = ?1", [id], |r| r.get(0)).unwrap_or(0);
+            let (duration_ms, device): (i64, String) = c
+                .query_row("SELECT duration_ms, device FROM ambient_events WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap_or((0, String::new()));
             let mut users = Vec::new();
             let mut stmt = c.prepare(
                 "SELECT text, created_at, COALESCE(verdict, ''), COALESCE(intent, ''), delivered FROM ambient_events
@@ -585,7 +594,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
             })? {
                 assistant.push(row?);
             }
-            Ok((duration_ms, users, assistant))
+            Ok((duration_ms, device, users, assistant))
         })
         .unwrap_or_default();
     let (pending, mc_chat, mc_tools) = if chat_context {
@@ -628,6 +637,14 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         media_playing,
         during_playback,
         user_voice: ready_voice(&voices).filter(|v| v.neural).and_then(|v| v.likelihood),
+        speaker: None,
+        speakers_present: Vec::new(),
+    };
+    let (speaker, present) = super::speakers::peek(&device, now * 1000, ready_voice(&voices).as_deref());
+    let moment = Moment {
+        speaker: (speaker != super::speakers::Speaker::Unknown).then(|| speaker.label()),
+        speakers_present: present,
+        ..moment
     };
     let classifier = ask_classifier(&key, classifier_state(&moment), with_pending, expecting);
     let (classified, voice) = tokio::join!(classifier, wait_voice(id, &voices));
@@ -731,6 +748,8 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         media_playing: false,
         during_playback,
         user_voice: None,
+        speaker: None,
+        speakers_present: super::speakers::peek(device, now * 1000, None).1,
     };
     let legacy = user_voice.map(|l| {
         std::sync::Arc::new(VoiceScore { neural: false, similarity: None, likelihood: Some(l), voiced_secs: 0.0, embedding: None, ms: 0 })
