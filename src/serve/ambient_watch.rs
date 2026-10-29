@@ -473,7 +473,7 @@ pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Ve
     verdict
 }
 
-pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice: Option<f64>) -> Verdict {
+pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice: Option<f64>, voice_handles: Vec<std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Option<f64>>>>>>) -> Verdict {
     let id = ids.last().map(String::as_str).unwrap_or("");
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
     let (key, watcher, phrases, chat_context) = {
@@ -576,7 +576,18 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice:
         during_playback,
         user_voice,
     };
-    match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
+    let classifier = ask_classifier(&key, classifier_state(&moment), with_pending, expecting);
+    let (classified, computed_voice) = tokio::join!(classifier, async {
+        let mut best: Option<f64> = None;
+        for handle in voice_handles {
+            if let Ok(mut slot) = tokio::time::timeout(std::time::Duration::from_millis(300), handle.lock()).await {
+                if let Some(join) = slot.take() { if let Ok(Ok(Some(score))) = tokio::time::timeout(std::time::Duration::from_millis(300), join).await { best = Some(best.map_or(score, |v| v.max(score))); } }
+            }
+        }
+        best
+    });
+    let user_voice = computed_voice.or(user_voice);
+    match classified {
         Ok(mut verdict) => {
             if let Some(uv) = user_voice {
                 if uv < 0.50 && !wake_word(text, &phrases) {

@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+
+use ort::{session::{Session, builder::GraphOptimizationLevel}, value::Tensor};
 
 pub const DIM: usize = 24;
+pub const NEURAL_MODEL: &str = "wespeaker-resnet34-lm-v1";
+const NEURAL_DIM: usize = 256;
+const MODEL_URL: &str = "https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/main/voxceleb_resnet34_LM.onnx";
+const MODEL_SHA256: &str = "7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068";
 const FRAME_SAMPLES: usize = 512; // 32 ms at 16 kHz
 const SAMPLE_RATE: f32 = 16_000.0;
 const NUM_BANDS: usize = 16;
@@ -11,6 +20,10 @@ pub struct VoiceprintSample {
     pub id: String,
     pub label: String,
     pub created_at: i64,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub audio_path: Option<String>,
     pub vector: Vec<f32>,
 }
 
@@ -207,9 +220,7 @@ impl VoiceprintAccumulator {
 
     /// Computes how likely the accumulated voice belongs to the enrolled user (`0.00..=1.00`).
     pub fn score(&self, samples: &[VoiceprintSample]) -> Option<f64> {
-        if samples.is_empty() {
-            return None;
-        }
+        if samples.is_empty() { return None; }
         let live = self.finish_vector()?;
         score_vector(&live, samples)
     }
@@ -254,13 +265,103 @@ pub fn score_vector(live: &[f32], samples: &[VoiceprintSample]) -> Option<f64> {
     Some((mapped * 100.0).round() / 100.0)
 }
 
-pub fn score_pcm(pcm: &[u8], samples: &[VoiceprintSample]) -> Option<f64> {
-    if samples.is_empty() || pcm.len() < FRAME_SAMPLES * 4 {
-        return None;
+pub fn start_score(pcm: Vec<u8>, samples: Vec<VoiceprintSample>) -> tokio::task::JoinHandle<Option<f64>> {
+    tokio::task::spawn_blocking(move || score_blocking(&pcm, &samples))
+}
+
+pub fn score_blocking(pcm: &[u8], samples: &[VoiceprintSample]) -> Option<f64> {
+    let legacy: Vec<_> = samples.iter().filter(|s| s.model.is_empty() && s.vector.len() == DIM).cloned().collect();
+    if voiced_duration(pcm) < 1.0 { return None; }
+    let pcm = trim_last_voiced(pcm, 6.0);
+    neural_score(&pcm, samples).or_else(|| score_pcm_legacy(&pcm, &legacy))
+}
+
+fn score_pcm_legacy(pcm: &[u8], samples: &[VoiceprintSample]) -> Option<f64> {
+    if samples.is_empty() { return None; }
+    let mut acc=VoiceprintAccumulator::default(); acc.feed_pcm(pcm); acc.score(samples)
+}
+
+fn voiced_duration(pcm: &[u8]) -> f32 {
+    pcm.chunks_exact(640).filter(|frame| frame.iter().step_by(2).map(|b| (*b as i8 as f32).powi(2)).sum::<f32>() > 100.0).count() as f32 * 0.02
+}
+
+fn trim_last_voiced(pcm: &[u8], seconds: f32) -> Vec<u8> {
+    let cap = (seconds * 32_000.0) as usize;
+    pcm[pcm.len().saturating_sub(cap)..].to_vec()
+}
+
+fn model_path() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".snippet/models/wespeaker-resnet34-lm-v1.onnx")
+}
+
+fn load_model() -> Result<Session, String> {
+    let path = model_path();
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    if !path.exists() {
+        let bytes = reqwest::blocking::get(MODEL_URL).map_err(|e| e.to_string())?.bytes().map_err(|e| e.to_string())?;
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        if hash != MODEL_SHA256 { return Err(format!("model checksum mismatch: {hash}")); }
+        std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
     }
-    let mut acc = VoiceprintAccumulator::default();
-    acc.feed_pcm(pcm);
-    acc.score(samples)
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    if format!("{:x}", Sha256::digest(&bytes)) != MODEL_SHA256 { return Err("model checksum mismatch".into()); }
+    let session = Session::builder().map_err(|e| e.to_string())?.with_intra_threads(2).map_err(|e| e.to_string())?.with_inter_threads(1).map_err(|e| e.to_string())?.with_optimization_level(GraphOptimizationLevel::Level3).map_err(|e| e.to_string())?.commit_from_file(path).map_err(|e| e.to_string())?;
+    eprintln!("[voiceprint] model inputs {:?}", session.inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>());
+    Ok(session)
+}
+
+static MODEL: OnceLock<Option<Mutex<Session>>> = OnceLock::new();
+static MODEL_ERROR: OnceLock<String> = OnceLock::new();
+
+fn neural_score(pcm: &[u8], samples: &[VoiceprintSample]) -> Option<f64> {
+    let model = MODEL.get_or_init(|| match load_model() { Ok(s) => Some(Mutex::new(s)), Err(e) => { let _ = MODEL_ERROR.set(e); None } });
+    let mut session = model.as_ref()?.lock().ok()?;
+    let feats = kaldi_fbank(pcm)?;
+    let input = Tensor::from_array(([1usize, feats.len() / 80, 80], feats)).ok()?;
+    let outputs = session.run(ort::inputs![input]).ok()?;
+    let (_, emb) = outputs[0].try_extract_tensor::<f32>().ok()?;
+    let live = normalize_vec(emb.to_vec());
+    let mut best: Option<f64> = None;
+    for s in samples.iter().filter(|s| s.model == NEURAL_MODEL && s.vector.len() == NEURAL_DIM) {
+        let dot = live.iter().zip(&s.vector).map(|(a,b)| (*a as f64)*(*b as f64)).sum::<f64>();
+        best = Some(best.map_or(dot, |v| v.max(dot)));
+    }
+    best.map(|v| ((v - 0.25) / 0.65).clamp(0.0, 1.0))
+}
+
+fn normalize_vec(mut v: Vec<f32>) -> Vec<f32> {
+    let n = v.iter().map(|x| x*x).sum::<f32>().sqrt().max(1e-8);
+    for x in &mut v { *x /= n; }
+    v
+}
+
+fn kaldi_fbank(pcm: &[u8]) -> Option<Vec<f32>> {
+    const NFFT: usize = 512;
+    let samples: Vec<f32> = pcm.chunks_exact(2).map(|x| i16::from_le_bytes([x[0],x[1]]) as f32 / 32768.0).collect();
+    if samples.len() < 16000 { return None; }
+    let frames = (samples.len() - 400) / 160 + 1;
+    let mut out = Vec::with_capacity(frames * 80);
+    for f in 0..frames {
+        let mut spec = vec![0.0f32; NFFT];
+        for i in 0..400 {
+            let x = if i == 0 { samples[f*160] } else { samples[f*160+i] - 0.97*samples[f*160+i-1] };
+            let win = (0.5 - 0.5*(2.0*std::f32::consts::PI*i as f32/399.0).cos()).powf(0.85);
+            spec[i] = x * win;
+        }
+        let mut bins = vec![0.0; NFFT/2+1];
+        for k in 0..bins.len() { for n in 0..400 { let a=2.0*std::f32::consts::PI*k as f32*n as f32/NFFT as f32; bins[k]+=spec[n]*a.cos(); } bins[k] *= bins[k]; }
+        for m in 0..80 { let a=m*3+1; let b=(a+3).min(bins.len()-1); let sum=bins[a..=b].iter().sum::<f32>(); out.push(sum.max(1e-10).ln()); }
+    }
+    for j in 0..80 { let mean=out.iter().skip(j).step_by(80).sum::<f32>()/frames as f32; for row in 0..frames { out[row*80+j]-=mean; } }
+    Some(out)
+}
+
+pub fn store_enrolment_audio(audio: &[u8]) -> Result<String, String> {
+    let dir = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".snippet/voiceprints");
+    std::fs::create_dir_all(&dir).map_err(|e|e.to_string())?;
+    let path=dir.join(format!("{}.wav", uuid::Uuid::new_v4()));
+    std::fs::write(&path,audio).map_err(|e|e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Extracts a 24-D voiceprint vector from raw 16 kHz s16le PCM or a RIFF WAV file.

@@ -40,8 +40,9 @@ fn classify_turn(d: &Shared, turn: &[Part], pending: &mut Option<Pending>) {
     let ids: Vec<String> = turn.iter().map(|p| p.id.clone()).collect();
     let text = turn.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
     let uv = best_user_voice(turn);
+    let voice_handles: Vec<_> = turn.iter().filter_map(|p| p.voice_score.clone()).collect();
     let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv).await });
+    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv, voice_handles).await });
     *pending = Some((ids, text, h));
 }
 
@@ -55,6 +56,7 @@ pub(crate) struct Part {
     pub started_at: String,
     pub continued: bool,
     pub user_voice: Option<f64>,
+    pub voice_score: Option<std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Option<f64>>>>>>,
     pub revises: Option<String>,
 }
 
@@ -349,7 +351,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             }
             let uv = best_user_voice(&parts);
             let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-            tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv).await })
+            tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv, Vec::new()).await })
         }
     };
     let mut delivered = false;

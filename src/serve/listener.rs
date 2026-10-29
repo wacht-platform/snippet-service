@@ -590,7 +590,8 @@ impl Listener {
         let acc_score = s.vp_acc.score(&vps);
         s.vp_acc.reset();
         drop(s);
-        let user_voice = crate::voiceprint::score_pcm(&pcm, &vps).or(acc_score);
+        let user_voice = acc_score;
+        let voice_score = crate::voiceprint::start_score(pcm.clone(), vps);
         let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
         let text = if words.is_empty() || real == words.len() {
             if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }
@@ -637,6 +638,7 @@ impl Listener {
             media,
             pcm,
             user_voice,
+            voice_score,
             revises,
         };
         let (d, device) = (self.d.clone(), self.device.clone());
@@ -655,6 +657,7 @@ pub(super) struct Event {
     pub media: bool,
     pub pcm: Vec<u8>,
     pub user_voice: Option<f64>,
+    pub voice_score: tokio::task::JoinHandle<Option<f64>>,
     pub revises: Option<String>,
 }
 

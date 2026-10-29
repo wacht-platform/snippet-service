@@ -498,6 +498,7 @@ fn spawn_transcription(d: Shared, id: String) {
                 started_at,
                 continued: continued != 0,
                 user_voice,
+                voice_score: None,
                 revises: None,
             }),
         );
@@ -651,6 +652,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
                 started_at,
                 continued: false,
                 user_voice: e.user_voice,
+                voice_score: Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(e.voice_score)))),
                 revises: e.revises,
             }),
         );
@@ -739,10 +741,13 @@ pub(crate) async fn enroll_voiceprint(
         } else {
             req.label.trim().to_string()
         };
+        let audio_path = crate::voiceprint::store_enrolment_audio(&audio_bytes).ok();
         c.ambient.voiceprints.push(crate::voiceprint::VoiceprintSample {
             id: uuid::Uuid::new_v4().to_string(),
             label,
             created_at: chrono::Utc::now().timestamp(),
+            model: crate::voiceprint::NEURAL_MODEL.into(),
+            audio_path,
             vector: vec,
         });
         while c.ambient.voiceprints.len() > 8 {
