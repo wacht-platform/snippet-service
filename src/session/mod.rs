@@ -1375,15 +1375,20 @@ pub fn emit_status_transition(
     status: &str,
     title: Option<&str>,
     workspace: &str,
+    lanes_running: &[String],
 ) {
     if let Some(kind) = notify_kind(prev_status, status) {
-        emit_device_event(serde_json::json!({
+        let mut event = serde_json::json!({
             "session": session_id,
             "title": title.unwrap_or_default(),
             "workspace": workspace,
             "kind": kind,
             "status": status,
-        }));
+        });
+        if !lanes_running.is_empty() {
+            event["lanes_running"] = serde_json::json!(lanes_running);
+        }
+        emit_device_event(event);
     }
 }
 

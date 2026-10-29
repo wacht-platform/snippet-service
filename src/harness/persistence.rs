@@ -345,6 +345,12 @@ impl CodingHarness {
                     &status,
                     title.as_deref(),
                     &workspace,
+                    &state
+                        .lanes
+                        .iter()
+                        .filter(|lane| lane.status == crate::lanes::LaneStatus::Running)
+                        .map(|lane| lane.title.clone())
+                        .collect::<Vec<_>>(),
                 );
                 Ok(())
             }
