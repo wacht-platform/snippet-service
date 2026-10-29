@@ -209,7 +209,7 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
         },
         "other_party": {
             "type": "noul",
-            "instructions": "Is `utterance` spoken by or to someone other than the user talking to the assistant: another person in the room, a narrator/creator in a video or reel, someone on a phone call, third-person remarks, when `speaker` is a 'Voice N' label, or when `user_voice_likelihood` is below 0.1?"
+            "instructions": "Is `utterance` spoken by or to someone other than the user talking to the assistant: another person in the room, a narrator/creator in a video or reel, someone on a phone call, third-person remarks, or when `user_voice_likelihood` is below 0.1?"
         },
         "out_of_context": {
             "type": "noul",
@@ -332,7 +332,6 @@ pub(super) struct Moment {
     pub media_playing: bool,
     pub during_playback: bool,
     pub user_voice: Option<f64>,
-    pub speaker: Option<String>,
     pub speakers_present: Vec<String>,
 }
 
@@ -408,11 +407,8 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
     if let Some(uv) = m.user_voice {
         state["user_voice_likelihood"] = json!((uv * 100.0).round() / 100.0);
     }
-    if let Some(sp) = &m.speaker {
-        state["speaker"] = json!(sp);
-    }
-    if !m.speakers_present.is_empty() {
-        state["speakers_present"] = json!(m.speakers_present);
+    if m.speakers_present.len() > 1 {
+        state["voices_present"] = json!(m.speakers_present.len());
     }
     state
 }
@@ -637,12 +633,10 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         media_playing,
         during_playback,
         user_voice: ready_voice(&voices).filter(|v| v.neural).and_then(|v| v.likelihood),
-        speaker: None,
         speakers_present: Vec::new(),
     };
-    let (speaker, present) = super::speakers::peek(&device, now * 1000, ready_voice(&voices).as_deref());
+    let (_, present) = super::speakers::peek(&device, now * 1000, ready_voice(&voices).as_deref());
     let moment = Moment {
-        speaker: (speaker != super::speakers::Speaker::Unknown).then(|| speaker.label()),
         speakers_present: present,
         ..moment
     };
@@ -748,7 +742,6 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         media_playing: false,
         during_playback,
         user_voice: None,
-        speaker: None,
         speakers_present: super::speakers::peek(device, now * 1000, None).1,
     };
     let legacy = user_voice.map(|l| {

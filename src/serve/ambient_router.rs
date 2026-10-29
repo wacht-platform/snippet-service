@@ -614,12 +614,10 @@ async fn deliver(
     if let Some(first) = parts.first() {
         let voice = v.voice.clone().or_else(|| parts.iter().find_map(|p| p.voice.as_ref()?.ready()));
         let speaker = super::speakers::assign(device, &first.id, (first.started * 1000.0) as i64, voice.as_deref(), v.played >= 0.8);
-        if speaker != super::speakers::Speaker::Unknown {
-            attrs.push_str(&format!(" speaker=\"{}\"", speaker.label()));
-        }
+        let _ = speaker;
         let present = super::speakers::peek(device, (first.started * 1000.0) as i64, None).1;
         if present.len() > 1 {
-            attrs.push_str(&format!(" speakers_present=\"{}\"", ambient_watch::escape(&present.join(","))));
+            attrs.push_str(&format!(" voices_present=\"{}\"", present.len()));
         }
     }
     let ready = || parts.iter().filter_map(|p| p.voice.as_ref()?.ready()?.likelihood).reduce(f64::max);

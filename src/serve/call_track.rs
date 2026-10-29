@@ -7,7 +7,6 @@ use serde_json::{Value, json};
 use super::ambient_router::Part;
 use super::ambient_watch::Verdict;
 use super::call_detect::{Class, Detector, Signal, WINDOW_MS};
-use super::speakers::Speaker;
 
 pub(crate) const PROMPT_MS: i64 = 120_000;
 pub(crate) const END_QUIET_MS: i64 = 120_000;
@@ -25,7 +24,6 @@ pub(crate) struct Heard {
     pub at_ms: i64,
     pub ids: Vec<String>,
     pub text: String,
-    pub speaker: Speaker,
     pub memorable: bool,
 }
 
@@ -262,11 +260,7 @@ pub(super) async fn observe(d: &Shared, device: &str, parts: &[Part], v: &Verdic
     let speaker = super::speakers::assign(device, &first.id, signal.at_ms, v.voice.as_deref(), played);
     let signal = Signal { speaker: Some(speaker), ..signal };
     let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
-    let label = speaker.label();
-    for id in &ids {
-        d.store.write(|c| c.execute("UPDATE ambient_events SET speaker = ?2 WHERE id = ?1", rusqlite::params![id, label]).map(|_| ()));
-    }
-    let heard = Heard { at_ms: signal.at_ms, ids, text, speaker, memorable: !delivered && v.kept() && v.memorable >= MEMORABLE };
+    let heard = Heard { at_ms: signal.at_ms, ids, text, memorable: !delivered && v.kept() && v.memorable >= MEMORABLE };
     let fx = book().observe(device, &signal, heard, now_ms());
     if !fx.is_empty() {
         ensure_ticker(d);
@@ -358,7 +352,7 @@ fn persist_line(d: &Shared, call_id: &str, line: &Heard) {
     d.store.write(|c| {
         c.execute(
             "INSERT INTO ambient_call_lines (call_id, at_ms, speaker, text, event_ids) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![call_id, line.at_ms, line.speaker.label(), line.text, ids],
+            rusqlite::params![call_id, line.at_ms, "", line.text, ids],
         )?;
         Ok(())
     });
@@ -398,7 +392,7 @@ pub(crate) fn transcript(lines: &[Heard]) -> String {
     let mut out = String::new();
     for line in lines {
         let at = chrono::DateTime::from_timestamp_millis(line.at_ms).map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_default();
-        let row = format!("[{at}] {}: {}\n", line.speaker.label(), line.text.trim());
+        let row = format!("[{at}] {}\n", line.text.trim());
         if out.len() + row.len() > TRANSCRIPT_CHARS {
             out.push_str("[transcript cut here: too long]\n");
             break;
@@ -415,7 +409,7 @@ async fn summarise(d: &Shared, call: Call, ended_at: i64) {
     }
     let iso = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339()).unwrap_or_default();
     let msg = format!(
-        "<call_ended id=\"{}\" device=\"{}\" started=\"{}\" ended=\"{}\" lines=\"{}\">The user asked Snippet to track this call and it has ended. Lines are labelled You (the user's voice), Voice 1, Voice 2 and so on (other people, grouped by voice) or unknown (too short to tell). Reply in this chat in text only, without speaking: a short summary, the decisions made, and the action items with owners and dates where they were stated. Keep commitments the user made the way you keep other remembered notes. If nothing of substance was said, say so in one line.\n<transcript>\n{}</transcript></call_ended>",
+        "<call_ended id=\"{}\" device=\"{}\" started=\"{}\" ended=\"{}\" lines=\"{}\">The user asked Snippet to take notes on this conversation and it has ended. Lines are not labelled by speaker; infer who said what only where the content makes it clear, and never invent names. Reply in this chat in text only, without speaking: a short summary, the decisions made, and the action items with owners and dates where they were stated. Keep commitments the user made the way you keep other remembered notes. If nothing of substance was said, say so in one line.\n<transcript>\n{}</transcript></call_ended>",
         super::ambient_watch::escape(&call.id),
         super::ambient_watch::escape(&call.device),
         iso(call.started_at),
@@ -495,7 +489,7 @@ mod tests {
     }
 
     fn heard(at_ms: i64, n: usize) -> Heard {
-        Heard { at_ms, ids: vec![format!("e{n}")], text: format!("line {n}"), speaker: if n % 2 == 0 { Speaker::You } else { Speaker::Voice(1) }, memorable: false }
+        Heard { at_ms, ids: vec![format!("e{n}")], text: format!("line {n}"), memorable: false }
     }
 
     /// Feeds a back-and-forth until it prompts; returns the effects and the clock.
@@ -540,8 +534,6 @@ mod tests {
         assert_eq!(book.track(&id, now + 1000, &mut fx), Ok("tracking"));
         let Some(Effect::Begin(call)) = fx.iter().find(|e| matches!(e, Effect::Begin(_))) else { panic!("no begin") };
         assert_eq!(call.lines.len(), 6);
-        assert_eq!(call.lines[0].speaker.label(), "You");
-        assert_eq!(call.lines[1].speaker.label(), "Voice 1");
         assert_eq!(states(&fx), ["tracking"]);
         let more = book.observe("mac", &signal(now + 9000, "meeting"), heard(now + 9000, 7), now + 9000);
         assert!(matches!(more.as_slice(), [Effect::Append { .. }]));
@@ -703,10 +695,10 @@ mod tests {
     }
 
     #[test]
-    fn transcript_labels_speakers() {
-        let lines = vec![heard(T0, 0), heard(T0 + 1000, 1), Heard { speaker: Speaker::Unknown, ..heard(T0 + 2000, 3) }];
+    fn transcript_has_no_speaker_labels() {
+        let lines = vec![heard(T0, 0), heard(T0 + 1000, 1), heard(T0 + 2000, 3)];
         let t = transcript(&lines);
-        assert!(t.contains("You: line 0") && t.contains("Voice 1: line 1") && t.contains("unknown: line 3"), "{t}");
+        assert!(t.contains("] line 0") && t.contains("] line 1") && !t.contains("You") && !t.contains("Voice"), "{t}");
     }
 
     fn verdict(intent: &str, addressed: f64, other: f64) -> Verdict {
