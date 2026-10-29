@@ -28,7 +28,12 @@ impl CodingHarness {
                 state.history_rewritten = true;
             }
         } else {
-            state.messages.insert(0, HarnessMessage::System { content: seeded_system });
+            state.messages.insert(
+                0,
+                HarnessMessage::System {
+                    content: seeded_system,
+                },
+            );
             state.history_rewritten = true;
         }
         // A crash mid tool-batch persists an assistant `tool_calls` message whose
@@ -191,17 +196,12 @@ impl CodingHarness {
     /// The memory repos this session reads and writes, most general first. A
     /// lane shares its parent session's memory.
     pub(super) fn memory_scopes(&self) -> Vec<crate::memory::MemoryRepo> {
-        let agent = self
-            .context
-            .agent_id()
-            .map(str::to_string)
-            .or_else(|| (self.context.owner() == "mission_control").then(|| "mission-control".to_string()));
+        let agent = self.context.agent_id().map(str::to_string).or_else(|| {
+            (self.context.owner() == "mission_control").then(|| "mission-control".to_string())
+        });
         let workspace = self.context.workspace_root();
         let project = !workspace.starts_with(crate::config::snippet_home());
-        crate::memory::scopes_for(
-            project.then_some(workspace),
-            agent.as_deref(),
-        )
+        crate::memory::scopes_for(project.then_some(workspace), agent.as_deref())
     }
 
     /// Index and commit what the agent wrote to memory this turn.
@@ -228,10 +228,12 @@ impl CodingHarness {
     pub(super) fn tidy_memory(&self) {
         for repo in self.memory_scopes() {
             match repo.tidy() {
-                Ok((linked, committed)) if committed || !linked.is_empty() => self.debug_log(&format!(
-                    "memory tidy {}: linked {:?}, committed {committed}",
-                    repo.key, linked
-                )),
+                Ok((linked, committed)) if committed || !linked.is_empty() => {
+                    self.debug_log(&format!(
+                        "memory tidy {}: linked {:?}, committed {committed}",
+                        repo.key, linked
+                    ))
+                }
                 Ok(_) => {}
                 Err(e) => self.debug_log(&format!("memory tidy {}: {e}", repo.key)),
             }
@@ -274,8 +276,8 @@ impl CodingHarness {
             .unwrap_or_default();
 
         let result = async {
-            store
-                .save_session_scalar(
+            on_busy(|| {
+                store.save_session_scalar(
                     &id,
                     &key,
                     &workspace,
@@ -285,7 +287,8 @@ impl CodingHarness {
                     &state.created_at,
                     &now,
                 )
-                .map_err(|e| e.to_string())?;
+            })
+            .await?;
 
             let messages_rewritten = state.history_rewritten
                 || self
@@ -298,31 +301,27 @@ impl CodingHarness {
                     .load(std::sync::atomic::Ordering::Acquire)
                     > state.events.len();
             if messages_rewritten {
-                store
-                    .replace_conversation_messages(&id, &state.messages, &now)
-                    .map_err(|e| e.to_string())?;
+                on_busy(|| store.replace_conversation_messages(&id, &state.messages, &now)).await?;
             } else {
                 let from = self
                     .written_messages
                     .load(std::sync::atomic::Ordering::Acquire);
                 if from < state.messages.len() {
-                    store
-                        .append_conversation_messages(&id, &state.messages[from..], &now)
-                        .map_err(|e| e.to_string())?;
+                    on_busy(|| {
+                        store.append_conversation_messages(&id, &state.messages[from..], &now)
+                    })
+                    .await?;
                 }
             }
             if events_rewritten {
-                store
-                    .replace_conversation_events(&id, &state.events, &now)
-                    .map_err(|e| e.to_string())?;
+                on_busy(|| store.replace_conversation_events(&id, &state.events, &now)).await?;
             } else {
                 let from = self
                     .written_events
                     .load(std::sync::atomic::Ordering::Acquire);
                 if from < state.events.len() {
-                    store
-                        .append_conversation_events(&id, &state.events[from..], &now)
-                        .map_err(|e| e.to_string())?;
+                    on_busy(|| store.append_conversation_events(&id, &state.events[from..], &now))
+                        .await?;
                 }
             }
             Ok::<(), String>(())
@@ -461,4 +460,22 @@ pub(super) fn in_git_work_tree(dir: &Path) -> bool {
         cur = d.parent();
     }
     false
+}
+
+// Each store call is its own transaction, so retrying one after SQLITE_BUSY is safe; failing would end the session.
+async fn on_busy<T, E: std::fmt::Display>(
+    mut write: impl FnMut() -> Result<T, E>,
+) -> Result<T, String> {
+    let mut wait = std::time::Duration::from_millis(250);
+    for _ in 0..3 {
+        match write() {
+            Err(e) if e.to_string().contains("database is locked") => {
+                eprintln!("[store] database busy, retrying session save in {wait:?}");
+                tokio::time::sleep(wait).await;
+                wait *= 2;
+            }
+            other => return other.map_err(|e| e.to_string()),
+        }
+    }
+    write().map_err(|e| e.to_string())
 }
