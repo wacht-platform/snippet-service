@@ -43,6 +43,8 @@ struct Live {
     interrupted: bool,
     classifying: bool,
     classified_words: usize,
+    event_id: Option<String>,
+    done: bool,
 }
 
 #[derive(Default)]
@@ -429,7 +431,7 @@ impl Listener {
             s.retry_at = Some(Instant::now() + wait);
             s.pending_from = s.last_final.max(c.base).max(s.g.saturating_sub(REPLAY));
         }
-        let stale = s.live.take();
+        let stale = s.live.take().filter(|l| !l.done);
         drop(s);
         if let Some(live) = stale {
             super::ambient_routes::announce(&self.d, &self.device, live.seq, true);
@@ -485,11 +487,15 @@ impl Listener {
             if ended && words.is_empty() && transcript.is_empty() {
                 return;
             }
-            s.live = Some(Live { conn, turn: order, seq: next_seq(), interrupted: false, classifying: false, classified_words: 0 });
+            s.live = Some(Live { conn, turn: order, seq: next_seq(), interrupted: false, classifying: false, classified_words: 0, event_id: None, done: false });
         }
         let audible = s.audible || s.play_flag;
         let live = s.live.as_mut().unwrap();
         let seq = live.seq;
+        let resumed = !ended && live.done;
+        if resumed {
+            live.done = false;
+        }
         let replies = super::ambient_routes::recent_replies(&self.device);
         let mask = echo_mask(&words, &replies);
         let real = words.iter().zip(&mask).filter(|(_, e)| !**e).count();
@@ -503,7 +509,7 @@ impl Listener {
                 && !live.interrupted
                 && !live.classifying
                 && real >= 1
-                && real > live.classified_words;
+                && real >= live.classified_words.saturating_add(if live.classified_words == 0 { 0 } else { 2 });
             let probe_text = if should_probe {
                 live.classifying = true;
                 live.classified_words = real;
@@ -525,7 +531,7 @@ impl Listener {
                 None
             };
             drop(s);
-            if fresh {
+            if fresh || resumed {
                 super::ambient_routes::announce(&self.d, &self.device, seq, false);
             }
             if let Some(clean_text) = probe_text {
@@ -563,7 +569,6 @@ impl Listener {
             }
             return;
         }
-        s.live = None;
         if let Some(last) = words.last() {
             s.last_final = s.last_final.max(last.end);
         }
@@ -604,8 +609,23 @@ impl Listener {
         }
         let started = wall.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
         let duration_ms = ((last_g.saturating_sub(first_g)) as f64 / BPS * 1000.0) as i64;
-        let id = uuid::Uuid::new_v4().to_string();
-        crate::ambient::mark(&id, "end");
+        let (id, revises) = {
+            let mut s = self.inner.lock().unwrap();
+            let live = s.live.as_mut().filter(|live| live.conn == conn && live.turn == order);
+            if let Some(live) = live {
+                live.done = true;
+                if let Some(previous) = live.event_id.clone() {
+                    (uuid::Uuid::new_v4().to_string(), Some(previous))
+                } else {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    live.event_id = Some(id.clone());
+                    (id, None)
+                }
+            } else {
+                (uuid::Uuid::new_v4().to_string(), None)
+            }
+        };
+        crate::ambient::mark(&id, if revises.is_some() { "revision" } else { "end" });
         let event = Event {
             id,
             seq,
@@ -617,6 +637,7 @@ impl Listener {
             media,
             pcm,
             user_voice,
+            revises,
         };
         let (d, device) = (self.d.clone(), self.device.clone());
         tokio::spawn(async move { super::ambient_routes::record_heard(&d, &device, event).await });
@@ -634,6 +655,7 @@ pub(super) struct Event {
     pub media: bool,
     pub pcm: Vec<u8>,
     pub user_voice: Option<f64>,
+    pub revises: Option<String>,
 }
 
 struct Heard {

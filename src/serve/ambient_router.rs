@@ -55,6 +55,7 @@ pub(crate) struct Part {
     pub started_at: String,
     pub continued: bool,
     pub user_voice: Option<f64>,
+    pub revises: Option<String>,
 }
 
 pub(crate) enum Msg {
@@ -68,11 +69,17 @@ struct Flushed {
     ended: f64,
     at: Instant,
     delivered: bool,
+    verdict: Verdict,
+    revision: Option<(String, String)>,
 }
 
 impl Flushed {
-    fn new(ids: Vec<String>, parts: &[Part], delivered: bool) -> Self {
-        Self { ids, ended: parts.last().map(|p| p.ended).unwrap_or(0.0), at: Instant::now(), delivered }
+    fn new(ids: Vec<String>, parts: &[Part], delivered: bool, verdict: Verdict) -> Self {
+        Self { ids, ended: parts.last().map(|p| p.ended).unwrap_or(0.0), at: Instant::now(), delivered, verdict, revision: None }
+    }
+
+    fn latest(&self, original: &str) -> String {
+        self.revision.as_ref().filter(|(o, _)| o == original).map(|(_, l)| l.clone()).unwrap_or_else(|| original.to_string())
     }
 }
 
@@ -195,6 +202,31 @@ async fn accept(
 ) {
     let phrases = d.config.lock().unwrap().ambient.wake_phrases.clone();
     let wake = ambient_watch::wake_word(&part.text, &phrases);
+    if let Some(revised) = part.revises.clone() {
+        if let Some(l) = last.as_mut().filter(|l| l.delivered && l.ids.contains(&revised)) {
+            supersede(d, &l.latest(&revised));
+            l.revision = Some((revised.clone(), part.id.clone()));
+            let verdict = l.verdict.clone();
+            l.ids.push(part.id.clone());
+            l.ended = part.ended;
+            l.at = Instant::now();
+            deliver(d, device, std::slice::from_ref(&part), &verdict, false, None, false).await;
+            mark_verdict(d, &[part.id.clone()], &verdict, true);
+            return;
+        }
+        if let Some(i) = turn.iter().position(|p| p.id == revised || p.revises.as_deref() == Some(revised.as_str())) {
+            supersede(d, &turn[i].id);
+            turn[i] = part;
+            classify_turn(d, turn, pending);
+            let live = crate::ambient::conversation().is_some() || crate::tts_stream::busy_for(device);
+            *deadline = Some(Instant::now() + if live { FAST_HOLD } else { HOLD });
+            return;
+        }
+        if let Some(l) = last.as_mut().filter(|l| l.ids.contains(&revised)) {
+            l.delivered = false;
+            supersede(d, &l.latest(&revised));
+        }
+    }
     if turn.is_empty() {
         if let Some(l) = last.as_mut() {
             let gap = part.started - l.ended;
@@ -232,6 +264,13 @@ async fn accept(
         let hold = if live { FAST_HOLD } else { HOLD };
         *deadline = Some(Instant::now() + hold);
     }
+}
+
+fn supersede(d: &Shared, id: &str) {
+    d.store.write(|c| {
+        c.execute("UPDATE ambient_events SET kept = 0 WHERE id = ?1", [id])?;
+        Ok(())
+    });
 }
 
 fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
@@ -342,7 +381,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
                 }
             }
         });
-        *last = Some(Flushed::new(ids, &parts, delivered));
+        *last = Some(Flushed::new(ids, &parts, delivered, wake_verdict(early.as_ref())));
         return;
     }
     let verdict = match early {
@@ -371,7 +410,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &text, false).await;
     }
     mark_verdict(d, &ids, &verdict, delivered);
-    *last = Some(Flushed::new(ids, &parts, delivered));
+    *last = Some(Flushed::new(ids, &parts, delivered, verdict));
 }
 
 fn is_unrelated(v: &Verdict) -> bool {
@@ -513,6 +552,9 @@ async fn deliver(
         ambient_watch::escape(&v.intent),
         v.addressed
     );
+    if let Some(parent) = parts.iter().find_map(|p| p.revises.as_deref()) {
+        attrs.push_str(&format!(" revises=\"{}\"", ambient_watch::escape(parent)));
+    }
     if let Some(e) = &expecting {
         attrs.push_str(&format!(" expects=\"{}\"", ambient_watch::escape(&e.kind)));
     }
@@ -564,3 +606,17 @@ async fn deliver(
     }
 }
 
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    #[test]
+    fn latest_follows_only_the_revised_chain() {
+        let mut f = Flushed::new(vec!["a".into(), "b".into()], &[], true, Verdict::inherited());
+        assert_eq!(f.latest("a"), "a");
+        f.revision = Some(("a".into(), "a2".into()));
+        assert_eq!(f.latest("a"), "a2");
+        assert_eq!(f.latest("b"), "b");
+    }
+}

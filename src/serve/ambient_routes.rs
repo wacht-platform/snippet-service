@@ -498,6 +498,7 @@ fn spawn_transcription(d: Shared, id: String) {
                 started_at,
                 continued: continued != 0,
                 user_voice,
+                revises: None,
             }),
         );
     });
@@ -650,6 +651,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
                 started_at,
                 continued: false,
                 user_voice: e.user_voice,
+                revises: e.revises,
             }),
         );
     }
