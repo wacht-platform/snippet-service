@@ -547,10 +547,9 @@ impl Listener {
                         if do_interrupt {
                             let spoke = crate::speech::interrupt(&device);
                             let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
-                            if (spoke || busy)
-                                && super::autonomy::mission_control_inputs() == sent
-                                && super::autonomy::interrupt_mission_control(&d).await
-                            {
+                            // Resume even when the reply was fully generated: the audio usually outlives the run.
+                            if (spoke || busy) && super::autonomy::mission_control_inputs() == sent {
+                                super::autonomy::interrupt_mission_control(&d).await;
                                 super::autonomy::resume_unless_heard(d);
                             }
                         }
