@@ -1258,6 +1258,11 @@ fn emit_device_event_with_store(
                     let _ = events.send(event);
                     return;
                 };
+                let detail = attention["text"].as_str().unwrap_or("").to_string();
+                let body_empty = notification["body"].as_str().is_none_or(|b| b.trim().is_empty());
+                if body_empty && !detail.is_empty() {
+                    notification["body"] = detail.into();
+                }
                 notification["attention"] = attention;
             }
             if notification["kind"] == "idle" {

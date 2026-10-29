@@ -117,3 +117,21 @@ fn notification_resolved_attention_scan_is_bounded_and_advances_both_cursors() {
     assert!(notification_page_from_store(&store, &settings, 502, 1).unwrap()["events"].as_array().unwrap().is_empty());
     assert!(notification_tuple_page(&store, &settings, 0, 502, 500).unwrap()["events"].as_array().unwrap().iter().all(|event| event["attention"].is_object()));
 }
+
+#[test]
+fn notification_waiting_carries_question_text_and_choices() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = crate::store::Store::open(&dir.path().join("n.db")).unwrap();
+    let mut settings = crate::mission_control::ControlSettings::default();
+    settings.notification_policy = "all_sessions".into();
+    store.save_control_settings(&settings).unwrap();
+    let questions = json!({"questions":[{"id":"q0","text":"Ship it now?","answer_kind":{"kind":"single_choice",
+        "choices":[{"value":"now","label":"Ship now"},{"value":"later","label":"Wait"}]}}]});
+    store.save_session_scalar("worker", "workspace", "/workspace", None, "waiting_for_input",
+        &json!({"pending_question": questions}).to_string(), "s", "s").unwrap();
+    store.append_conversation_events("worker", &[HarnessEvent::UserQuestion { questions }], "s").unwrap();
+    let sent = send_wait(&store);
+    assert_eq!(sent["body"], "Ship it now?");
+    assert_eq!(sent["attention"]["text"], "Ship it now?");
+    assert_eq!(sent["attention"]["choices"][0], json!({"label":"Ship now","value":"now"}));
+}

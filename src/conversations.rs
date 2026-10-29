@@ -934,7 +934,7 @@ impl Store {
     pub fn current_attention(&self, id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         self.with_connection(|conn| {
             let request = conn.query_row(
-                "SELECT e.ordinal, e.created_at, json_extract(e.payload_json, '$.kind')
+                "SELECT e.ordinal, e.created_at, json_extract(e.payload_json, '$.kind'), e.payload_json
                  FROM sessions s JOIN session_events e ON e.session_id = s.id
                  WHERE s.id = ?1 AND s.status = 'waiting_for_input'
                    AND json_extract(e.payload_json, '$.kind') IN ('user_question', 'approval_request')
@@ -947,12 +947,17 @@ impl Store {
                         OR (json_extract(e.payload_json, '$.kind') = 'approval_request'
                             AND json_extract(s.state_json, '$.pending_question') IS NULL))",
                 params![id],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
             ).optional()?;
-            Ok(request.map(|(ordinal, created_at, kind)| serde_json::json!({
-                "type": if kind == "user_question" { "question" } else { "approval" },
-                "id": format!("{ordinal}:{created_at}")
-            })))
+            Ok(request.map(|(ordinal, created_at, kind, payload)| {
+                let mut attention = serde_json::json!({
+                    "type": if kind == "user_question" { "question" } else { "approval" },
+                    "id": format!("{ordinal}:{created_at}")
+                });
+                let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
+                attention_detail(&mut attention, &payload);
+                attention
+            }))
         })
     }
 
@@ -1626,5 +1631,54 @@ mod session_id_migration_tests {
         rewrite_legacy_session_ids(&conn).unwrap();
 
         assert_eq!(first, session_ids(&conn));
+    }
+}
+
+fn clip(text: &str, max: usize) -> String {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= max {
+        return text;
+    }
+    format!("{}…", text.chars().take(max).collect::<String>().trim_end())
+}
+
+/// What a notification needs to show the request without opening the chat.
+fn attention_detail(attention: &mut serde_json::Value, payload: &serde_json::Value) {
+    if payload["kind"] == "approval_request" {
+        attention["tool"] = payload["tool_name"].clone();
+        if let Some(summary) = payload["summary"].as_str() {
+            attention["text"] = clip(summary, 400).into();
+        }
+        return;
+    }
+    let Some(questions) = payload["questions"]["questions"].as_array() else { return };
+    let Some(first) = questions.first() else { return };
+    if let Some(text) = first["text"].as_str() {
+        attention["text"] = clip(text, 600).into();
+    }
+    if questions.len() > 1 {
+        attention["more"] = (questions.len() - 1).into();
+        return;
+    }
+    let kind = &first["answer_kind"];
+    let choices: Vec<serde_json::Value> = match kind["kind"].as_str() {
+        Some("single_choice") => kind["choices"].as_array().map(|cs| {
+            cs.iter()
+                .filter_map(|c| {
+                    let value = c["value"].as_str()?;
+                    let label = c["label"].as_str().unwrap_or(value);
+                    Some(serde_json::json!({"label": clip(label, 60), "value": value}))
+                })
+                .take(4)
+                .collect()
+        }).unwrap_or_default(),
+        Some("yes_no") => vec![
+            serde_json::json!({"label": "Yes", "value": "yes"}),
+            serde_json::json!({"label": "No", "value": "no"}),
+        ],
+        _ => Vec::new(),
+    };
+    if !choices.is_empty() {
+        attention["choices"] = choices.into();
     }
 }
