@@ -90,6 +90,18 @@ enum Command {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Check external tools and voice assets, and show how to install what is missing.
+    Doctor {
+        /// Machine output: one tab-separated line per missing item (id, required|optional, purpose, command).
+        #[arg(long)]
+        tsv: bool,
+        /// Package manager to give install commands for (detected when omitted).
+        #[arg(long, value_enum)]
+        pm: Option<snippet::doctor::Pm>,
+        /// Download and verify the voice runtime and model now.
+        #[arg(long)]
+        prefetch: bool,
+    },
     #[command(hide = true)]
     AgyHook,
 }
@@ -659,6 +671,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::History { action }) => return history_cli(action),
         Some(Command::Agent { action }) => return runtime()?.block_on(agent_cli(action)),
         Some(Command::AgyHook) => return Ok(snippet::antigravity::run_hook()?),
+        Some(Command::Doctor { tsv, pm, prefetch }) => {
+            snippet::doctor::run(tsv, pm, prefetch);
+            Ok(())
+        }
         Some(Command::Serve {
             port,
             token,

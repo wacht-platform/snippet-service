@@ -50,7 +50,11 @@ fn download(path: &std::path::Path) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
-pub fn load() -> Result<Session, String> {
+pub fn model_ok() -> bool {
+    verify(&model_path()).is_ok()
+}
+
+pub fn fetch_model() -> Result<PathBuf, String> {
     let path = model_path();
     if path.exists() {
         if let Err(e) = verify(&path) {
@@ -62,7 +66,12 @@ pub fn load() -> Result<Session, String> {
         eprintln!("[voiceprint] downloading {MODEL}");
         download(&path)?;
     }
-    open(&path)
+    Ok(path)
+}
+
+pub fn load() -> Result<Session, String> {
+    super::runtime::ensure()?;
+    open(&fetch_model()?)
 }
 
 fn open(path: &std::path::Path) -> Result<Session, String> {
@@ -155,6 +164,10 @@ mod tests {
         let path = dir.path().join("bad.onnx");
         std::fs::write(&path, b"not an onnx model").unwrap();
         assert!(super::verify(&path).is_err());
+        #[cfg(target_os = "linux")]
+        if super::super::runtime::installed().is_none() || super::super::runtime::ensure().is_err() {
+            return;
+        }
         assert!(super::open(&path).is_err());
         assert!(super::open(&dir.path().join("missing.onnx")).is_err());
     }

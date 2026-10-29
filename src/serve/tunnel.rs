@@ -97,7 +97,7 @@ fn first_working(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|bin| runs(bin, "version")).cloned()
 }
 
-fn find_cloudflared() -> Option<PathBuf> {
+pub(crate) fn find_cloudflared() -> Option<PathBuf> {
     first_working(&[
         PathBuf::from("cloudflared"),
         home_dir().join(".snippet").join("bin").join("cloudflared"),

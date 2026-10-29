@@ -21,6 +21,7 @@ pub mod config;
 pub mod coordination;
 pub mod coordination_tools;
 pub mod conversations;
+pub mod doctor;
 pub mod gemini;
 pub mod harness;
 pub mod history_archive;

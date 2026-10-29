@@ -67,6 +67,7 @@ use crate::term::SessionTerms;
 pub mod sidecar;
 mod transcribe;
 mod tunnel;
+pub(crate) use tunnel::find_cloudflared;
 pub mod ws;
 pub(crate) use ws::*;
 

@@ -161,7 +161,7 @@ impl State {
                     loaded().store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 Err(e) => {
-                    eprintln!("[voiceprint] model unavailable, using legacy scorer: {e}");
+                    eprintln!("[ambient] voice recognition unavailable, using fallback scorer; retrying in {}s: {e}", RETRY.as_secs());
                     self.failed = Some(Instant::now());
                 }
             }

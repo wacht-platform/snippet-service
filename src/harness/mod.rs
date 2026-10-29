@@ -892,6 +892,7 @@ pub struct CodingHarness {
 
 
 mod cli_agent;
+pub(crate) use cli_agent::claude_binary;
 mod compactor;
 mod dispatch;
 mod events;

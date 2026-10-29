@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 mod engine;
 pub mod fbank;
 pub mod neural;
+pub mod runtime;
 mod store;
 
 pub use engine::{VoiceHandle, VoiceScore, embed_enrolment, likelihood, neural_ready, start, warm};

@@ -514,7 +514,7 @@ enum CliLine {
     Exited(u64, String),
 }
 
-fn claude_binary() -> Option<PathBuf> {
+pub(crate) fn claude_binary() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("SNIPPET_CLAUDE_BIN") {
         let path = PathBuf::from(path);
         if path.is_file() {

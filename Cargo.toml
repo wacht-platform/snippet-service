@@ -41,9 +41,16 @@ urlencoding = "2"
 rmp-serde = "1.3"
 ignore = "0.4"
 libc = "0.2.189"
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs"] }
 vt100 = "0.15.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Linux loads Microsoft's onnxruntime .so at runtime (fetched on first use) so the binary gains no libstdc++ dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
+libloading = "0.8"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "download-binaries", "copy-dylibs"] }
 
 [dev-dependencies]
 tempfile = "3"
