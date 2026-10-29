@@ -16,8 +16,8 @@ const RING: usize = 40;
 const MAX_LINES: usize = 4000;
 const RESOLVED: usize = 32;
 const TRANSCRIPT_CHARS: usize = 60_000;
-pub(crate) const TITLE: &str = "Track this call?";
-pub(crate) const BODY: &str = "Sounds like you're talking with someone. Snippet can take notes.";
+pub(crate) const TITLE: &str = "Take notes on this conversation?";
+pub(crate) const BODY: &str = "Sounds like you're talking with someone. Snippet can keep notes.";
 
 #[derive(Clone, Debug)]
 pub(crate) struct Heard {
