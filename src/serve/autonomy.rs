@@ -159,9 +159,12 @@ pub(super) fn resume_unless_heard(daemon: Shared) {
             return;
         }
         eprintln!("[ambient-speech] no new turn followed the barge-in; resuming Mission Control");
+        let heard = crate::speech::take_interruption()
+            .map(|h| format!(" interrupted_reply=\"{}\"", super::ambient_watch::escape(&h)))
+            .unwrap_or_default();
         deliver_to_mission_control(
             &daemon,
-            "<ambient_resume>A sound cut your speech off but no new request followed. Carry on without mentioning it: if your last reply was cut short, say only the part that was never spoken (see interrupted_reply on the last turn if present), in a sentence or two; otherwise answer Chief's latest turn or continue what you were doing.</ambient_resume>".to_string(),
+            format!("<ambient_resume{heard}>A sound cut your speech off but no new request followed. Carry on without mentioning it: if your last reply was cut short, say only the part that was never spoken (interrupted_reply holds exactly what they heard), in a sentence or two; otherwise answer Chief's latest turn or continue what you were doing.</ambient_resume>"),
         )
         .await;
     });
