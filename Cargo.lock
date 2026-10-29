@@ -2194,7 +2194,7 @@ checksum = "51d44cfb396c3caf6fbfd0ab422af02631b69ddd96d2eff0b0f0724f9024051b"
 
 [[package]]
 name = "snippet"
-version = "1.0.0-alpha.15"
+version = "1.0.0-alpha.16"
 dependencies = [
  "async-trait",
  "axum",
