@@ -708,4 +708,29 @@ mod tests {
         let t = transcript(&lines);
         assert!(t.contains("You: line 0") && t.contains("Voice 1: line 1") && t.contains("unknown: line 3"), "{t}");
     }
+
+    fn verdict(intent: &str, addressed: f64, other: f64) -> Verdict {
+        Verdict {
+            kind: "conversation".into(),
+            intent: intent.into(),
+            addressed,
+            matches: 0.0,
+            suggest: 0.0,
+            memorable: 0.0,
+            echo: 0.0,
+            other,
+            played: 0.0,
+            out_of_context: 0.0,
+            judge: "test",
+            voice: None,
+        }
+    }
+
+    #[test]
+    fn asking_snippet_mid_call_still_gets_through() {
+        assert!(clearly_for_assistant(&verdict("for_assistant", 0.2, 0.9), true));
+        assert!(clearly_for_assistant(&verdict("for_assistant", 0.9, 0.1), false));
+        assert!(!clearly_for_assistant(&verdict("for_assistant", 0.7, 0.1), false));
+        assert!(!clearly_for_assistant(&verdict("meeting", 0.9, 0.8), false));
+    }
 }

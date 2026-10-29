@@ -320,3 +320,118 @@ mod replay {
         assert!(false_prompts <= 1, "false prompts regressed: {false_prompts}");
     }
 }
+
+#[cfg(test)]
+mod scenarios {
+    use super::*;
+
+    const YOU: Option<Speaker> = Some(Speaker::You);
+    const V1: Option<Speaker> = Some(Speaker::Voice(1));
+    const V2: Option<Speaker> = Some(Speaker::Voice(2));
+
+    fn say(at_s: i64, who: Option<Speaker>, intent: &str) -> Signal {
+        let user_voice = match who {
+            Some(Speaker::You) => Some(0.9),
+            Some(_) => Some(0.05),
+            None => None,
+        };
+        Signal {
+            at_ms: at_s * 1000,
+            kind: "conversation".into(),
+            intent: intent.into(),
+            addressed: 0.2,
+            words: 6,
+            dur_ms: 4_000,
+            user_voice,
+            speaker: who,
+            ..Signal::default()
+        }
+    }
+
+    fn turns(who: &[Option<Speaker>], intent: &str, gap_s: i64) -> Vec<Signal> {
+        who.iter().enumerate().map(|(i, w)| say(i as i64 * gap_s, *w, intent)).collect()
+    }
+
+    fn prompts(lines: &[Signal]) -> usize {
+        let mut d = Detector::default();
+        lines.iter().filter(|l| d.observe(l).trigger.is_some()).count()
+    }
+
+    fn quieter(at_s: i64) -> Signal {
+        Signal { user_voice: Some(0.2), other: 0.75, dur_ms: 900, speaker: None, ..say(at_s, None, "chat") }
+    }
+
+    // One row per line of the edge-case matrix; the expected outcome is what the detector must do today.
+    fn matrix() -> Vec<(&'static str, Vec<Signal>, usize)> {
+        let mut rows = Vec::new();
+        rows.push(("phone call, both sides audible", turns(&[YOU, V1, YOU, V1, YOU, V1, YOU, V1], "meeting", 6), 1));
+        rows.push((
+            "phone call, both sides, text unclear",
+            turns(&[YOU, V1, YOU, V1, YOU, V1], "chat", 5),
+            1,
+        ));
+        rows.push(("headset call, only the user heard", turns(&[YOU; 7], "meeting", 7), 1));
+        let mut in_person = Vec::new();
+        for i in 0..4 {
+            in_person.push(say(i * 10, YOU, "chat"));
+            in_person.push(quieter(i * 10 + 5));
+        }
+        rows.push(("in person one to one, other voice short and quiet", in_person, 1));
+        let unenrolled: Vec<Signal> =
+            (0..6).map(|i| Signal { user_voice: None, speaker: None, ..say(i * 6, None, "meeting") }).collect();
+        rows.push(("in person one to one, user not enrolled", unenrolled, 1));
+        rows.push((
+            "small meeting with cross-talk",
+            turns(&[YOU, V1, V2, V1, YOU, V2, V1, YOU], "meeting", 4),
+            1,
+        ));
+        rows.push((
+            "small meeting, text unclear",
+            turns(&[V1, V2, YOU, V1, V2, YOU, V1], "chat", 4),
+            1,
+        ));
+        rows.push(("tv drama, two voices, never the user", turns(&[V1, V2, V1, V2, V1, V2, V1, V2, V1, V2], "meeting", 6), 0));
+        let played: Vec<Signal> =
+            turns(&[V1, YOU, V1, YOU, V1, YOU], "meeting", 6).into_iter().map(|l| Signal { played: 0.9, ..l }).collect();
+        rows.push(("played audio scored as played", played, 0));
+        let media: Vec<Signal> =
+            turns(&[V1, V2, V1, V2, V1], "meeting", 6).into_iter().map(|l| Signal { media: true, ..l }).collect();
+        rows.push(("media flag from the device", media, 0));
+        let mut podcast = Vec::new();
+        for i in 0..6 {
+            podcast.push(Signal { dur_ms: 40_000, ..say(i * 45, V1, "chat") });
+            if i % 2 == 0 {
+                podcast.push(say(i * 45 + 41, YOU, "note"));
+            }
+        }
+        rows.push(("podcast with long turns and the odd remark", podcast, 0));
+        rows.push(("thinking aloud alone", turns(&[YOU; 8], "note", 8), 0));
+        let mut agent = Vec::new();
+        for i in 0..5 {
+            agent.push(Signal { wake: true, ..say(i * 12, YOU, "for_assistant") });
+            agent.push(say(i * 12 + 4, YOU, "meeting"));
+        }
+        rows.push(("talking to the assistant", agent, 0));
+        let mut stray = turns(&[YOU, YOU, YOU, YOU], "note", 8);
+        stray.insert(2, say(12, V1, "chat"));
+        rows.push(("one stray other voice", stray, 0));
+        let mut long_call = turns(&[YOU, V1, YOU, V1, YOU, V1], "meeting", 6);
+        long_call.extend((0..30).map(|i| say(40 + i * 6, if i % 2 == 0 { YOU } else { V1 }, "meeting")));
+        rows.push(("a long call prompts once", long_call, 1));
+        rows.push(("meeting where the user stays silent (known miss)", turns(&[V1, V2, V1, V2, V1, V2, V1], "meeting", 5), 0));
+        rows
+    }
+
+    #[test]
+    fn synthetic_edge_cases() {
+        let mut failed = Vec::new();
+        for (name, lines, want) in matrix() {
+            let got = prompts(&lines);
+            println!("{:<52} expected {want} prompt(s), got {got}", name);
+            if got != want {
+                failed.push(name);
+            }
+        }
+        assert!(failed.is_empty(), "scenarios off: {failed:?}");
+    }
+}
