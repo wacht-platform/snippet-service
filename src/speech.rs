@@ -25,7 +25,21 @@ pub fn pending() -> bool {
     crate::tts_stream::busy()
 }
 
-pub fn cut_view(text: &str) -> Option<String> {
+pub fn speakable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+pub fn cut_view(text: &str) -> Option<(String, &'static str)> {
     let wanted = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let (status, heard): (String, Option<String>) = crate::ambient::store()
         .ok()
@@ -42,12 +56,13 @@ pub fn cut_view(text: &str) -> Option<String> {
     if status != "interrupted" && status != "cancelled" {
         return None;
     }
-    let heard = heard.unwrap_or_default();
-    Some(if heard.trim().is_empty() {
-        "[the user interrupted before any of this was spoken]".to_string()
+    let heard = heard.unwrap_or_default().trim().to_string();
+    let note = if heard.is_empty() {
+        "the user interrupted before any of this was spoken"
     } else {
-        format!("{} [cut off by the user; the rest was never spoken]", heard.trim())
-    })
+        "the user cut this off here; the rest was never spoken"
+    };
+    Some((heard, note))
 }
 
 pub fn has_interruption() -> bool {
@@ -142,9 +157,10 @@ fn reuse_flux_turn(p: &FluxProvisional, text: &str) -> Reuse {
 }
 
 pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, replace: bool) -> Result<Value, String> {
-    let text = text.trim();
+    let clean = speakable(text);
+    let text = clean.trim();
     if text.is_empty() {
-        return Err("nothing to say".into());
+        return Err("nothing to say (bracketed notes are never spoken)".into());
     }
     if crate::ambient::call_quiet() {
         return Err("the user is on a call: speech is off until it ends, so reply in text".into());
@@ -474,6 +490,7 @@ pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<cr
                 }
                 raw.push_str(&chunk);
                 let Some((text, done)) = extract_text(&raw) else { continue };
+                let text = speakable(&text);
                 if matches!(route, Route::Pending) && !text.trim().is_empty() {
                     route = open_flux(&text, done).await;
                 }
@@ -485,7 +502,7 @@ pub async fn consume_tool_stream(mut rx: tokio::sync::mpsc::UnboundedReceiver<cr
                 if call.as_deref() != Some(call_id.as_str()) {
                     continue;
                 }
-                let text = extract_text(&raw).map(|(t, _)| t);
+                let text = extract_text(&raw).map(|(t, _)| speakable(&t));
                 if matches!(route, Route::Pending) {
                     route = match text.as_deref().filter(|t| !t.trim().is_empty() && !spoken_directly(t)) {
                         Some(t) => open_flux(t, true).await,
@@ -532,4 +549,17 @@ pub fn mission_control_stream() -> crate::llm::StreamHandle {
     let mut b = crate::llm::StreamBuffer::default();
     b.set_tool_tap(tx);
     Arc::new(Mutex::new(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::speakable;
+
+    #[test]
+    fn bracketed_notes_are_never_spoken() {
+        assert_eq!(speakable("[the user interrupted before any of this was spoken]").trim(), "");
+        assert_eq!(speakable("Got it [cut off by the user; the rest was never spoken]").trim(), "Got it");
+        assert_eq!(speakable("Hello [unfinished"), "Hello ");
+        assert_eq!(speakable("Plain reply."), "Plain reply.");
+    }
 }

@@ -815,8 +815,9 @@ fn trim_spoken_calls(state: &mut HarnessState, evt_mark: usize) {
             HarnessMessage::User { .. } => break,
             HarnessMessage::Assistant { tool_calls, .. } => {
                 for call in tool_calls.iter_mut().filter(|c| is_speak_tool(&c.name)) {
-                    if let Some(cut) = call.arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
-                        call.arguments["text"] = serde_json::Value::String(cut);
+                    if let Some((heard, note)) = call.arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
+                        call.arguments["text"] = serde_json::Value::String(heard);
+                        call.arguments["cut_off_by_user"] = serde_json::Value::String(note.into());
                     }
                 }
             }
@@ -827,8 +828,9 @@ fn trim_spoken_calls(state: &mut HarnessState, evt_mark: usize) {
     for event in state.events[from..].iter_mut() {
         if let HarnessEvent::ToolCall { tool_name, arguments } = event {
             if is_speak_tool(tool_name) {
-                if let Some(cut) = arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
-                    arguments["text"] = serde_json::Value::String(cut);
+                if let Some((heard, note)) = arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
+                    arguments["text"] = serde_json::Value::String(heard);
+                    arguments["cut_off_by_user"] = serde_json::Value::String(note.into());
                 }
             }
         }
