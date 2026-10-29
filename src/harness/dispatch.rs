@@ -1,6 +1,40 @@
 use super::*;
 
-fn tool_activity_text(name: &str) -> String {
+fn tool_activity_text(name: &str, args: &Value) -> String {
+    let arg = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let base = |p: &str| p.trim_end_matches('/').rsplit('/').next().unwrap_or(p).to_string();
+    let detail = match name {
+        "change_files" => {
+            let paths: Vec<String> = args
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|cs| cs.iter().filter_map(|c| c.get("path").and_then(Value::as_str)).map(base).collect())
+                .unwrap_or_default();
+            match paths.as_slice() {
+                [] => None,
+                [one] => Some(format!("Editing {one}")),
+                [first, rest @ ..] if rest.iter().all(|p| p == first) => Some(format!("Editing {first}")),
+                many => Some(format!("Editing {} files", many.len())),
+            }
+        }
+        "view_image" => arg("path").map(|p| format!("Viewing {}", base(p))),
+        "web_search" => arg("query").map(|q| format!("Searching: {q}")),
+        "web_read" => arg("url").map(|u| {
+            let host = u.split("://").nth(1).unwrap_or(u).split('/').next().unwrap_or(u);
+            format!("Reading {host}")
+        }),
+        "skill" => arg("name").map(|n| format!("Loading skill {n}")),
+        "delegate_task" => arg("title").map(|t| format!("Delegating: {t}")),
+        "update_plan" | "terminate_loop" => None,
+        _ => arg("label").map(str::to_string),
+    };
+    if let Some(d) = detail {
+        let mut d = d.replace('\n', " ");
+        if d.chars().count() > 90 {
+            d = d.chars().take(89).collect::<String>() + "…";
+        }
+        return d;
+    }
     match name {
         "bash" => "Running command".into(),
         "change_files" => "Editing files".into(),
@@ -20,6 +54,7 @@ fn tool_activity_text(name: &str) -> String {
 #[cfg(test)]
 #[test]
 fn tool_activity_uses_precise_labels_and_preserves_unknown_names() {
+    let none = Value::Null;
     for (name, expected) in [
         ("bash", "Running command"),
         ("change_files", "Editing files"),
@@ -34,8 +69,20 @@ fn tool_activity_uses_precise_labels_and_preserves_unknown_names() {
         ("terminate_loop", "Finishing task"),
         ("custom_tool", "Running custom_tool"),
     ] {
-        assert_eq!(tool_activity_text(name), expected);
+        assert_eq!(tool_activity_text(name, &none), expected);
     }
+    let j = |v: &str| serde_json::from_str::<Value>(v).unwrap();
+    assert_eq!(tool_activity_text("bash", &j(r#"{"label":"Read listener.rs"}"#)), "Read listener.rs");
+    assert_eq!(tool_activity_text("bash", &j(r#"{"label":"  "}"#)), "Running command");
+    assert_eq!(
+        tool_activity_text("change_files", &j(r#"{"changes":[{"path":"lib/a/transcript.dart"},{"path":"lib/a/transcript.dart"}]}"#)),
+        "Editing transcript.dart"
+    );
+    assert_eq!(tool_activity_text("change_files", &j(r#"{"changes":[{"path":"a.rs"},{"path":"b.rs"}]}"#)), "Editing 2 files");
+    assert_eq!(tool_activity_text("web_read", &j(r#"{"url":"https://docs.rs/tokio/latest"}"#)), "Reading docs.rs");
+    assert_eq!(tool_activity_text("update_plan", &j(r#"{"label":"x"}"#)), "Updating plan");
+    let long = "x".repeat(200);
+    assert_eq!(tool_activity_text("bash", &serde_json::json!({ "label": long })).chars().count(), 90);
 }
 
 /// Read-only tools with no side effects on the workspace or the session, so a
@@ -226,7 +273,7 @@ impl CodingHarness {
     ) {
         stats.only_delegations = false;
         for call in calls {
-            self.lane_progress("tool_call", tool_activity_text(&call.tool_name));
+            self.lane_progress("tool_call", tool_activity_text(&call.tool_name, &call.arguments));
         }
         let results = futures_util::future::join_all(calls.iter().map(|call| {
             self.tools
@@ -281,7 +328,7 @@ impl CodingHarness {
             tool_name: tool_name.clone(),
             arguments: call.arguments.clone(),
         });
-        self.lane_progress("tool_call", tool_activity_text(&tool_name));
+        self.lane_progress("tool_call", tool_activity_text(&tool_name, &call.arguments));
 
         // Headless explicit completion: a lane / one-shot run ends with a
         // structured `summary` (folded back into the caller). Not advertised to
