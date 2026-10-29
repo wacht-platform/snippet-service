@@ -733,4 +733,36 @@ mod tests {
         assert!(!clearly_for_assistant(&verdict("for_assistant", 0.7, 0.1), false));
         assert!(!clearly_for_assistant(&verdict("meeting", 0.9, 0.8), false));
     }
+
+    fn notes(fx: &[Effect]) -> Vec<String> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Note(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn held_notes_wait_out_the_window_and_die_with_a_declined_call() {
+        let mut book = CallBook::default();
+        let solo = Heard { memorable: true, ..heard(T0, 0) };
+        let fx = book.observe("mac", &signal(T0, "note"), solo, T0);
+        assert!(notes(&fx).is_empty());
+        assert!(notes(&book.tick(T0 + 30_000)).is_empty());
+        assert_eq!(notes(&book.tick(T0 + WINDOW_MS)), ["line 0"]);
+
+        let start = T0 + 500_000;
+        let mut fx = Vec::new();
+        for n in 0..6 {
+            let at = start + n as i64 * 8_000;
+            let h = Heard { memorable: true, ..heard(at, n) };
+            fx.extend(book.observe("mac", &signal(at, if n % 2 == 0 { "meeting" } else { "note" }), h, at));
+        }
+        let id = prompted(&fx).unwrap();
+        let mut fx = Vec::new();
+        book.ignore(&id, start + 50_000, &mut fx).unwrap();
+        fx.extend(book.tick(start + 400_000));
+        assert!(notes(&fx).is_empty(), "nothing said on a declined call becomes a memory");
+    }
 }
