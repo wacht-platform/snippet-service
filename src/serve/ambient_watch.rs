@@ -2,6 +2,10 @@ use super::*;
 
 use serde_json::{Value, json};
 
+use crate::voiceprint::{VoiceHandle, VoiceScore};
+
+const VOICE_NUDGE: f64 = 0.08;
+
 #[derive(Clone)]
 pub(crate) struct Verdict {
     pub kind: String,
@@ -15,6 +19,7 @@ pub(crate) struct Verdict {
     pub played: f64,
     pub out_of_context: f64,
     pub judge: &'static str,
+    pub voice: Option<std::sync::Arc<VoiceScore>>,
 }
 
 impl Verdict {
@@ -24,6 +29,10 @@ impl Verdict {
 
     pub fn veto(&self) -> f64 {
         self.echo.max(self.other).max(self.played)
+    }
+
+    pub fn user_voice(&self) -> Option<f64> {
+        self.voice.as_ref().and_then(|v| v.likelihood)
     }
 
     pub fn inherited() -> Self {
@@ -39,6 +48,7 @@ impl Verdict {
             played: 0.0,
             out_of_context: 0.0,
             judge: "continuation",
+            voice: None,
         }
     }
 }
@@ -176,7 +186,7 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
                 "true": [
                     "Uses the assistant's name, or `name_in_utterance` is not 'no'",
                     "Asks whether the assistant can hear them or is there, whether or not the conversation is open",
-                    "Directly asks the assistant a question or gives it an instruction that a personal AI coding/work assistant would handle (work, tasks, code, reminders, advice, or continuing the active topic in `assistant.last_said` / `mission_control.recent_chat`), when `user_voice_likelihood` is not low",
+                    "Directly asks the assistant a question or gives it an instruction that a personal AI coding/work assistant would handle (work, tasks, code, reminders, advice, or continuing the active topic in `assistant.last_said` / `mission_control.recent_chat`), unless `user_voice_likelihood` is below 0.1",
                     "Answers, confirms, refuses, thanks or picks an option after `assistant.last_said`",
                     "Continues or corrects a line in `recent` that was handled as sent to the assistant"
                 ],
@@ -185,7 +195,7 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
                     "Thinking aloud, an exclamation, a filler sound, or a remark about the speaker's own life/past that asks nothing of the assistant",
                     "A stray 1-2 word fragment ('Guess what?', 'Hello', 'I mean...') without a wake word when `conversation` is 'closed' or `assistant.speaking_when_utterance_was_heard` is true",
                     "Clearly part of an exchange with someone else shown in `recent`, or third-person chatter ('he asked...', 'she said...', 'they said...')",
-                    "When `user_voice_likelihood` is present and < 0.55 (likely a different speaker or played video/audio)"
+                    "When `user_voice_likelihood` is present and below 0.1 (confidently a different speaker)"
                 ]
             }
         },
@@ -199,7 +209,7 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
         },
         "other_party": {
             "type": "noul",
-            "instructions": "Is `utterance` spoken by or to someone other than the user talking to the assistant: another person in the room, a narrator/creator in a video or reel, someone on a phone call, third-person remarks, or when `user_voice_likelihood` is < 0.50?"
+            "instructions": "Is `utterance` spoken by or to someone other than the user talking to the assistant: another person in the room, a narrator/creator in a video or reel, someone on a phone call, third-person remarks, or when `user_voice_likelihood` is below 0.1?"
         },
         "out_of_context": {
             "type": "noul",
@@ -415,6 +425,7 @@ pub(super) fn verdict_from(value: &Value) -> Result<Verdict, String> {
         played: noul("played_audio").max(a["kind"]["probabilities"]["media"].as_f64().unwrap_or(0.0)),
         out_of_context: noul("out_of_context"),
         judge: "classifier",
+        voice: None,
     })
 }
 
@@ -434,7 +445,30 @@ pub(super) fn filler(text: &str) -> bool {
     words_of(text).iter().all(|w| FILLERS.contains(&w.as_str()))
 }
 
-pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Verdict {
+/// Strong cap only for a confident different speaker on enough neural audio; otherwise a bounded nudge.
+pub(super) fn apply_voice(verdict: &mut Verdict, voice: &VoiceScore, wake: bool) {
+    let Some(likelihood) = voice.likelihood else { return };
+    if wake {
+        return;
+    }
+    if voice.confident_other() {
+        verdict.other = verdict.other.max(0.72);
+        verdict.addressed = verdict.addressed.min(0.38);
+        return;
+    }
+    let weight = if voice.neural { VOICE_NUDGE } else { VOICE_NUDGE / 2.0 };
+    let delta = (likelihood - 0.5) * 2.0 * weight;
+    let clean = verdict.echo < 0.45 && verdict.played < 0.45 && verdict.other < 0.45 && verdict.out_of_context < 0.60;
+    if delta < 0.0 || clean {
+        verdict.addressed = (verdict.addressed + delta).clamp(0.0, 1.0);
+    }
+}
+
+pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String], voice: Option<std::sync::Arc<VoiceScore>>) -> Verdict {
+    if let Some(v) = &voice {
+        apply_voice(&mut verdict, v, wake_word(text, phrases));
+    }
+    verdict.voice = voice;
     if filler(text) {
         verdict.intent = "ignore".into();
         verdict.addressed = verdict.addressed.min(0.2);
@@ -473,7 +507,26 @@ pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String]) -> Ve
     verdict
 }
 
-pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice: Option<f64>, voice_handles: Vec<std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Option<f64>>>>>>) -> Verdict {
+fn ready_voice(voices: &[VoiceHandle]) -> Option<std::sync::Arc<VoiceScore>> {
+    best_voice(voices.iter().filter_map(VoiceHandle::ready))
+}
+
+fn best_voice(scores: impl Iterator<Item = std::sync::Arc<VoiceScore>>) -> Option<std::sync::Arc<VoiceScore>> {
+    scores.filter(|s| s.likelihood.is_some()).max_by(|a, b| a.voiced_secs.total_cmp(&b.voiced_secs))
+}
+
+async fn wait_voice(id: &str, voices: &[VoiceHandle]) -> Option<std::sync::Arc<VoiceScore>> {
+    let mut got = Vec::with_capacity(voices.len());
+    for v in voices {
+        got.extend(v.wait().await);
+    }
+    if !voices.is_empty() && got.len() < voices.len() {
+        eprintln!("[voiceprint] {} timed out", &id[..id.len().min(8)]);
+    }
+    best_voice(got.into_iter())
+}
+
+pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec<VoiceHandle>) -> Verdict {
     let id = ids.last().map(String::as_str).unwrap_or("");
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
     let (key, watcher, phrases, chat_context) = {
@@ -486,7 +539,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice:
         )
     };
     let Some(key) = key.filter(|_| watcher == "classifier" || watcher == "jev") else {
-        return rule(text, &phrases);
+        return Verdict { voice: ready_voice(&voices), ..rule(text, &phrases) };
     };
     let now = chrono::Utc::now().timestamp();
     let (duration_ms, users, assistant): (i64, Vec<Heard>, Vec<Said>) = d
@@ -557,7 +610,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice:
         })
         .unwrap_or((false, false));
     if media_playing && !wake_word(text, &phrases) {
-        return Verdict { kind: "media".into(), intent: "ignore".into(), judge: "rule", ..Verdict::inherited() };
+        return Verdict { kind: "media".into(), intent: "ignore".into(), judge: "rule", voice: ready_voice(&voices), ..Verdict::inherited() };
     }
     let expectation = crate::ambient::expectation();
     let expecting = expectation.is_some();
@@ -574,40 +627,15 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, user_voice:
         mc_tools,
         media_playing,
         during_playback,
-        user_voice,
+        user_voice: ready_voice(&voices).filter(|v| v.neural).and_then(|v| v.likelihood),
     };
     let classifier = ask_classifier(&key, classifier_state(&moment), with_pending, expecting);
-    let (classified, computed_voice) = tokio::join!(classifier, async {
-        let mut best: Option<f64> = None;
-        for handle in voice_handles {
-            if let Ok(mut slot) = tokio::time::timeout(std::time::Duration::from_millis(300), handle.lock()).await {
-                if let Some(join) = slot.take() { if let Ok(Ok(Some(score))) = tokio::time::timeout(std::time::Duration::from_millis(300), join).await { best = Some(best.map_or(score, |v| v.max(score))); } }
-            }
-        }
-        best
-    });
-    let user_voice = computed_voice.or(user_voice);
+    let (classified, voice) = tokio::join!(classifier, wait_voice(id, &voices));
     match classified {
-        Ok(mut verdict) => {
-            if let Some(uv) = user_voice {
-                if uv < 0.50 && !wake_word(text, &phrases) {
-                    verdict.other = verdict.other.max(0.72);
-                    verdict.addressed = verdict.addressed.min(0.38);
-                } else if uv >= 0.78
-                    && verdict.echo < 0.45
-                    && verdict.played < 0.45
-                    && verdict.other < 0.45
-                    && verdict.out_of_context < 0.60
-                    && verdict.addressed >= 0.48
-                {
-                    verdict.addressed = (verdict.addressed + 0.08).min(1.0);
-                }
-            }
-            settle(verdict, text, &phrases)
-        }
+        Ok(verdict) => settle(verdict, text, &phrases, voice),
         Err(e) => {
             eprintln!("[ambient] voice classifier failed: {e}");
-            rule(text, &phrases)
+            Verdict { voice, ..rule(text, &phrases) }
         }
     }
 }
@@ -702,18 +730,135 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         mc_tools,
         media_playing: false,
         during_playback,
-        user_voice,
+        user_voice: None,
     };
+    let legacy = user_voice.map(|l| {
+        std::sync::Arc::new(VoiceScore { neural: false, similarity: None, likelihood: Some(l), voiced_secs: 0.0, embedding: None, ms: 0 })
+    });
     match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
-        Ok(mut verdict) => {
-            if let Some(uv) = user_voice {
-                if uv < 0.50 && !wake_word(text, &phrases) {
-                    verdict.other = verdict.other.max(0.72);
-                    verdict.addressed = verdict.addressed.min(0.38);
-                }
-            }
-            settle(verdict, text, &phrases)
-        }
+        Ok(verdict) => settle(verdict, text, &phrases, legacy),
         Err(_) => rule(text, &phrases),
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn score(neural: bool, similarity: f32, voiced_secs: f32) -> Arc<VoiceScore> {
+        Arc::new(VoiceScore {
+            neural,
+            similarity: neural.then_some(similarity),
+            likelihood: Some(crate::voiceprint::likelihood(similarity)),
+            voiced_secs,
+            embedding: None,
+            ms: 0,
+        })
+    }
+
+    fn classified(addressed: f64) -> Verdict {
+        Verdict { kind: "conversation".into(), intent: "for_assistant".into(), addressed, judge: "classifier", ..Verdict::inherited() }
+    }
+
+    fn phrases() -> Vec<String> {
+        vec!["snippet".into()]
+    }
+
+    #[test]
+    fn confident_other_speaker_is_capped() {
+        let v = settle(classified(0.8), "what time is the meeting tomorrow", &phrases(), Some(score(true, 0.05, 2.5)));
+        assert!(v.addressed <= 0.38 && v.other >= 0.72);
+        assert_eq!(v.user_voice(), Some(crate::voiceprint::likelihood(0.05)));
+    }
+
+    #[test]
+    fn short_or_uncertain_audio_only_nudges() {
+        let v = settle(classified(0.8), "how are you this beautiful evening", &phrases(), Some(score(true, 0.05, 1.5)));
+        assert!(v.addressed >= 0.70 && v.addressed < 0.8, "{}", v.addressed);
+        assert_eq!(v.intent, "for_assistant");
+        let v = settle(classified(0.8), "how are you this beautiful evening", &phrases(), Some(score(true, 0.30, 4.0)));
+        assert!(v.addressed > 0.7 && v.other < 0.5);
+    }
+
+    #[test]
+    fn legacy_score_never_vetoes() {
+        let v = settle(classified(0.8), "listened to my last two messages", &phrases(), Some(score(false, 0.0, 0.0)));
+        assert!(v.addressed >= 0.75, "{}", v.addressed);
+        assert_eq!(v.intent, "for_assistant");
+    }
+
+    #[test]
+    fn wake_word_ignores_voice() {
+        let v = settle(classified(0.6), "snippet do you hear me", &phrases(), Some(score(true, 0.0, 3.0)));
+        assert!(v.addressed >= 0.9 && v.other < 0.5);
+    }
+
+    #[test]
+    fn matching_voice_boosts_only_clean_verdicts() {
+        let v = settle(classified(0.55), "can you check the build", &phrases(), Some(score(true, 0.8, 3.0)));
+        assert!((v.addressed - 0.63).abs() < 0.01, "{}", v.addressed);
+        let mut dirty = classified(0.55);
+        dirty.echo = 0.5;
+        let v = settle(dirty, "can you check the build", &phrases(), Some(score(true, 0.8, 3.0)));
+        assert!((v.addressed - 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn no_score_leaves_verdict_alone() {
+        let none = Arc::new(VoiceScore { neural: false, similarity: None, likelihood: None, voiced_secs: 0.4, embedding: None, ms: 0 });
+        let v = settle(classified(0.8), "thank you for that", &phrases(), Some(none));
+        assert!((v.addressed - 0.8).abs() < 1e-9 && v.user_voice().is_none());
+        let v = settle(classified(0.8), "thank you for that", &phrases(), None);
+        assert!((v.addressed - 0.8).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn unresolved_voice_times_out_to_none() {
+        let pending = crate::voiceprint::VoiceHandle::pending_for_test(Duration::from_millis(50));
+        let t = Instant::now();
+        assert!(wait_voice("t", &[pending]).await.is_none());
+        assert!(t.elapsed() < Duration::from_millis(200));
+    }
+
+    /// VP_BENCH_WAV=<wav> cargo test --release sim_end_to_deliver -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn sim_end_to_deliver() {
+        let Ok(path) = std::env::var("VP_BENCH_WAV") else { return };
+        let pcm = crate::voiceprint::pcm_from_audio(&std::fs::read(path).unwrap()).unwrap();
+        let (enrol, rest) = pcm.split_at(pcm.len() / 2);
+        let (vector, _) = crate::voiceprint::embed_enrolment(enrol).await.unwrap();
+        let samples = vec![crate::voiceprint::VoiceprintSample {
+            id: "s".into(),
+            label: "s".into(),
+            created_at: 0,
+            model: crate::voiceprint::NEURAL_MODEL.into(),
+            audio_path: None,
+            vector,
+        }];
+        let utterance = &rest[..rest.len().min(6 * 32000)];
+        for classifier_ms in [50u64, 350] {
+            for with_voice in [false, true, false, true] {
+                crate::ambient::mark("sim-utt", "end");
+                let t0 = Instant::now();
+                let voices: Vec<_> = if with_voice { crate::voiceprint::start("sim-utt", "sim", utterance, &samples).into_iter().collect() } else { Vec::new() };
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let classifier = async {
+                    tokio::time::sleep(Duration::from_millis(classifier_ms)).await;
+                    classified(0.7)
+                };
+                let (verdict, voice) = tokio::join!(classifier, wait_voice("sim-utt", &voices));
+                let v = settle(verdict, "can you check the build", &phrases(), voice.clone());
+                println!(
+                    "classifier {classifier_ms}ms voice={with_voice}: end->deliver {}ms (voice {:?}ms, user_voice {:?}, addressed {:.2})",
+                    t0.elapsed().as_millis(),
+                    voice.as_ref().map(|s| s.ms),
+                    v.user_voice(),
+                    v.addressed
+                );
+            }
+        }
     }
 }

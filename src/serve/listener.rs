@@ -208,21 +208,7 @@ fn set(marks: &mut VecDeque<(u64, bool)>, g: u64, on: bool) {
 }
 
 pub(super) fn wav(pcm: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(44 + pcm.len());
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"WAVEfmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&16_000u32.to_le_bytes());
-    out.extend_from_slice(&32_000u32.to_le_bytes());
-    out.extend_from_slice(&2u16.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes());
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
-    out.extend_from_slice(pcm);
-    out
+    crate::voiceprint::wav(pcm)
 }
 
 pub(super) async fn open(d: &Shared, device: &str, h: u32, started_at: Option<&str>) -> Result<(), u16> {
@@ -255,6 +241,9 @@ pub(super) async fn open(d: &Shared, device: &str, h: u32, started_at: Option<&s
     s.stream = Some(h);
     drop(s);
     l.ensure();
+    if d.config.lock().unwrap().ambient.voiceprints.iter().any(|v| v.model == crate::voiceprint::NEURAL_MODEL) {
+        crate::voiceprint::warm();
+    }
     Ok(())
 }
 
@@ -272,8 +261,9 @@ pub(super) fn audio(device: &str, h: u32, pcm: &[u8]) -> bool {
         if s.stream != Some(h) {
             return false;
         }
-        // Accumulate 24-D speaker voiceprint features in parallel as PCM streams in
-        s.vp_acc.feed_pcm(pcm);
+        if !crate::voiceprint::neural_ready() {
+            s.vp_acc.feed_pcm(pcm);
+        }
         s.ring.extend(pcm);
         s.g += pcm.len() as u64;
         if s.ring.len() > RING {
@@ -524,7 +514,7 @@ impl Listener {
             } else {
                 None
             };
-            let live_vp = if probe_text.is_some() {
+            let live_vp = if probe_text.is_some() && !crate::voiceprint::neural_ready() {
                 let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
                 s.vp_acc.score(&vps)
             } else {
@@ -586,12 +576,8 @@ impl Listener {
         } else {
             Vec::new()
         };
-        let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
-        let acc_score = s.vp_acc.score(&vps);
         s.vp_acc.reset();
         drop(s);
-        let user_voice = acc_score;
-        let voice_score = crate::voiceprint::start_score(pcm.clone(), vps);
         let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
         let text = if words.is_empty() || real == words.len() {
             if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }
@@ -606,8 +592,6 @@ impl Listener {
             let spoken = super::transcribe::finish_text(&text).text;
             if spoken.is_empty() { ("empty", String::new()) } else { ("done", spoken) }
         };
-        if real < words.len() {
-        }
         let started = wall.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
         let duration_ms = ((last_g.saturating_sub(first_g)) as f64 / BPS * 1000.0) as i64;
         let (id, revises) = {
@@ -627,6 +611,12 @@ impl Listener {
             }
         };
         crate::ambient::mark(&id, if revises.is_some() { "revision" } else { "end" });
+        let voice = if status == "done" {
+            let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
+            crate::voiceprint::start(&id, &self.device, &pcm, &vps)
+        } else {
+            None
+        };
         let event = Event {
             id,
             seq,
@@ -637,8 +627,7 @@ impl Listener {
             during_playback,
             media,
             pcm,
-            user_voice,
-            voice_score,
+            voice,
             revises,
         };
         let (d, device) = (self.d.clone(), self.device.clone());
@@ -656,8 +645,7 @@ pub(super) struct Event {
     pub during_playback: bool,
     pub media: bool,
     pub pcm: Vec<u8>,
-    pub user_voice: Option<f64>,
-    pub voice_score: tokio::task::JoinHandle<Option<f64>>,
+    pub voice: Option<crate::voiceprint::VoiceHandle>,
     pub revises: Option<String>,
 }
 

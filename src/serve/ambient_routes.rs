@@ -151,7 +151,13 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
             "id": vp.id,
             "label": vp.label,
             "created_at": vp.created_at,
+            "model": if vp.model.is_empty() { "legacy" } else { vp.model.as_str() },
+            "current": vp.model == crate::voiceprint::NEURAL_MODEL,
         })).collect::<Vec<_>>(),
+        "voiceprint_model": crate::voiceprint::NEURAL_MODEL,
+        "voiceprint_adaptive": listening.as_ref().map(|(id, _)| crate::voiceprint::adaptive_count(id)).unwrap_or(0),
+        "voiceprint_reenrol": !ambient.voiceprints.is_empty()
+            && !ambient.voiceprints.iter().any(|vp| vp.model == crate::voiceprint::NEURAL_MODEL),
     })
 }
 
@@ -302,7 +308,7 @@ fn audio_dir() -> PathBuf {
     crate::config::snippet_home().join("ambient").join("audio")
 }
 
-fn audio_path(id: &str) -> PathBuf {
+pub(super) fn audio_path(id: &str) -> PathBuf {
     audio_dir().join(format!("{id}.wav"))
 }
 
@@ -477,14 +483,13 @@ fn spawn_transcription(d: Shared, id: String) {
             .map(|t| t.timestamp_millis() as f64 / 1000.0)
             .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
         let vps = d.config.lock().unwrap().ambient.voiceprints.clone();
-        let user_voice = if vps.is_empty() {
+        let voice = if vps.is_empty() {
             None
         } else {
-            tokio::fs::read(audio_path(&id))
-                .await
-                .ok()
-                .and_then(|bytes| crate::voiceprint::extract_from_pcm_or_wav(&bytes).ok())
-                .and_then(|vec| crate::voiceprint::score_vector(&vec, &vps))
+            match tokio::fs::read(audio_path(&id)).await.ok().and_then(|b| crate::voiceprint::pcm_from_audio(&b).ok()) {
+                Some(pcm) => crate::voiceprint::start(&id, &device, &pcm, &vps),
+                None => None,
+            }
         };
         super::ambient_router::submit(
             &d,
@@ -497,8 +502,7 @@ fn spawn_transcription(d: Shared, id: String) {
                 ended: started + duration_ms as f64 / 1000.0,
                 started_at,
                 continued: continued != 0,
-                user_voice,
-                voice_score: None,
+                voice,
                 revises: None,
             }),
         );
@@ -651,8 +655,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
                 ended: e.started + e.duration_ms as f64 / 1000.0,
                 started_at,
                 continued: false,
-                user_voice: e.user_voice,
-                voice_score: Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(e.voice_score)))),
+                voice: e.voice,
                 revises: e.revises,
             }),
         );
@@ -728,9 +731,24 @@ pub(crate) async fn enroll_voiceprint(
         }
     };
 
-    let vec = match crate::voiceprint::extract_from_pcm_or_wav(&audio_bytes) {
-        Ok(v) => v,
+    let pcm = match crate::voiceprint::pcm_from_audio(&audio_bytes) {
+        Ok(p) => p,
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    let (model, vec) = match crate::voiceprint::embed_enrolment(&pcm).await {
+        Ok((v, _)) => (crate::voiceprint::NEURAL_MODEL.to_string(), v),
+        Err(e) if e.starts_with("Not enough") => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => {
+            eprintln!("[voiceprint] enrolling with legacy scorer: {e}");
+            match crate::voiceprint::extract_from_pcm_or_wav(&pcm) {
+                Ok(v) => (String::new(), v),
+                Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+            }
+        }
+    };
+    let audio_path = {
+        let pcm = pcm.clone();
+        tokio::task::spawn_blocking(move || crate::voiceprint::store_enrolment_audio(&pcm).ok()).await.ok().flatten()
     };
 
     let save_res = {
@@ -741,17 +759,17 @@ pub(crate) async fn enroll_voiceprint(
         } else {
             req.label.trim().to_string()
         };
-        let audio_path = crate::voiceprint::store_enrolment_audio(&audio_bytes).ok();
         c.ambient.voiceprints.push(crate::voiceprint::VoiceprintSample {
             id: uuid::Uuid::new_v4().to_string(),
             label,
             created_at: chrono::Utc::now().timestamp(),
-            model: crate::voiceprint::NEURAL_MODEL.into(),
+            model,
             audio_path,
             vector: vec,
         });
         while c.ambient.voiceprints.len() > 8 {
-            c.ambient.voiceprints.remove(0);
+            let old = c.ambient.voiceprints.remove(0);
+            crate::voiceprint::delete_audio(&old.audio_path);
         }
         crate::config::save_config(&c, &d.config_path)
     };
@@ -772,9 +790,16 @@ pub(crate) async fn delete_voiceprint(
     let save_res = {
         let mut c = d.config.lock().unwrap();
         if let Some(id) = q.id.as_deref().filter(|s| !s.trim().is_empty()) {
+            for vp in c.ambient.voiceprints.iter().filter(|vp| vp.id == id) {
+                crate::voiceprint::delete_audio(&vp.audio_path);
+            }
             c.ambient.voiceprints.retain(|vp| vp.id != id);
         } else {
+            for vp in &c.ambient.voiceprints {
+                crate::voiceprint::delete_audio(&vp.audio_path);
+            }
             c.ambient.voiceprints.clear();
+            crate::voiceprint::clear_adaptive();
         }
         crate::config::save_config(&c, &d.config_path)
     };

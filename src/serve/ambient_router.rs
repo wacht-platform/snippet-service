@@ -27,10 +27,8 @@ const MEMORABLE_THRESHOLD: f64 = 0.65;
 
 type Pending = (Vec<String>, String, tokio::task::JoinHandle<Verdict>);
 
-fn best_user_voice(turn: &[Part]) -> Option<f64> {
-    turn.iter()
-        .filter_map(|p| p.user_voice)
-        .reduce(f64::max)
+fn voices(turn: &[Part]) -> Vec<crate::voiceprint::VoiceHandle> {
+    turn.iter().filter_map(|p| p.voice.clone()).collect()
 }
 
 fn classify_turn(d: &Shared, turn: &[Part], pending: &mut Option<Pending>) {
@@ -39,10 +37,9 @@ fn classify_turn(d: &Shared, turn: &[Part], pending: &mut Option<Pending>) {
     }
     let ids: Vec<String> = turn.iter().map(|p| p.id.clone()).collect();
     let text = turn.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
-    let uv = best_user_voice(turn);
-    let voice_handles: Vec<_> = turn.iter().filter_map(|p| p.voice_score.clone()).collect();
+    let vs = voices(turn);
     let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv, voice_handles).await });
+    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, vs).await });
     *pending = Some((ids, text, h));
 }
 
@@ -55,8 +52,7 @@ pub(crate) struct Part {
     pub ended: f64,
     pub started_at: String,
     pub continued: bool,
-    pub user_voice: Option<f64>,
-    pub voice_score: Option<std::sync::Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Option<f64>>>>>>,
+    pub voice: Option<crate::voiceprint::VoiceHandle>,
     pub revises: Option<String>,
 }
 
@@ -280,9 +276,10 @@ fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
     for id in ids {
         d.store.write(|c| {
             c.execute(
-                "UPDATE ambient_events SET verdict = ?2, addressed = ?3, judge = ?4, kept = ?5, intent = ?6, delivered = ?7
+                "UPDATE ambient_events SET verdict = ?2, addressed = ?3, judge = ?4, kept = ?5, intent = ?6, delivered = ?7,
+                        user_voice = COALESCE(?8, user_voice)
                  WHERE id = ?1",
-                rusqlite::params![id, v.kind, v.addressed, v.judge, kept as i64, v.intent, delivered as i64],
+                rusqlite::params![id, v.kind, v.addressed, v.judge, kept as i64, v.intent, delivered as i64, v.user_voice()],
             )?;
             if kept {
                 c.execute(
@@ -349,9 +346,9 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
             if let Some((_, _, h)) = other {
                 h.abort();
             }
-            let uv = best_user_voice(&parts);
+            let vs = voices(&parts);
             let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-            tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, uv, Vec::new()).await })
+            tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, vs).await })
         }
     };
     let mut delivered = false;
@@ -375,6 +372,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         tokio::spawn(async move {
             let v = task.await.unwrap_or_else(|_| Verdict::inherited());
             mark_verdict(&d3, &ids3, &v, true);
+            adapt(&dev3, &ids3, &v, wake || live);
             if !wake && !pinned && is_unrelated(&v) {
                 crate::ambient::end_conversation();
                 let _ = crate::speech::interrupt(&dev3);
@@ -412,7 +410,22 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &text, false).await;
     }
     mark_verdict(d, &ids, &verdict, delivered);
+    if wake || (delivered && live) {
+        adapt(device, &ids, &verdict, true);
+    }
     *last = Some(Flushed::new(ids, &parts, delivered, verdict));
+}
+
+fn adapt(device: &str, ids: &[String], v: &Verdict, eligible: bool) {
+    let Some(voice) = v.voice.clone().filter(|s| eligible && s.confident_user() && v.echo < 0.3 && v.played < 0.3) else {
+        return;
+    };
+    let (device, src) = (device.to_string(), ids.last().map(|id| super::ambient_routes::audio_path(id)));
+    tokio::task::spawn_blocking(move || {
+        if crate::voiceprint::adapt(&device, &voice, src.as_deref().filter(|p| p.exists())) {
+            eprintln!("[voiceprint] adaptive sample added for {device} (sim {:.3})", voice.similarity.unwrap_or(0.0));
+        }
+    });
 }
 
 fn is_unrelated(v: &Verdict) -> bool {
@@ -585,7 +598,8 @@ async fn deliver(
     if let Some(parent) = continuation_of {
         attrs.push_str(&format!(" continuation_of=\"{}\"", ambient_watch::escape(&parent.join(","))));
     }
-    if let Some(uv) = best_user_voice(parts) {
+    let ready = || parts.iter().filter_map(|p| p.voice.as_ref()?.ready()?.likelihood).reduce(f64::max);
+    if let Some(uv) = v.user_voice().or_else(ready) {
         attrs.push_str(&format!(" user_voice=\"{uv:.2}\""));
     }
     let _ = crate::speech::interrupt(device);
