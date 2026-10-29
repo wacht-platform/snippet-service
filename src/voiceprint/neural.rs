@@ -52,18 +52,26 @@ fn download(path: &std::path::Path) -> Result<(), String> {
 
 pub fn load() -> Result<Session, String> {
     let path = model_path();
+    if path.exists() {
+        if let Err(e) = verify(&path) {
+            eprintln!("[voiceprint] {e}; re-downloading");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     if !path.exists() {
         eprintln!("[voiceprint] downloading {MODEL}");
         download(&path)?;
-    } else {
-        verify(&path)?;
     }
+    open(&path)
+}
+
+fn open(path: &std::path::Path) -> Result<Session, String> {
     Session::builder()
         .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
         .and_then(|b| b.with_intra_threads(2))
         .and_then(|b| b.with_inter_threads(1))
         .and_then(|b| b.with_parallel_execution(false))
-        .and_then(|b| b.commit_from_file(&path))
+        .and_then(|b| b.commit_from_file(path))
         .map_err(|e| e.to_string())
 }
 
@@ -137,4 +145,17 @@ impl Embedder {
 
 pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn corrupt_model_is_an_error_not_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.onnx");
+        std::fs::write(&path, b"not an onnx model").unwrap();
+        assert!(super::verify(&path).is_err());
+        assert!(super::open(&path).is_err());
+        assert!(super::open(&dir.path().join("missing.onnx")).is_err());
+    }
 }

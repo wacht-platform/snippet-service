@@ -292,6 +292,21 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_model_falls_back_to_legacy_or_none() {
+        let pcm: Vec<f32> = (0..16000 * 3).map(|i| ((i as f32) * 0.07).sin() * 8000.0 * (1.0 + ((i as f32) * 0.0013).sin())).collect();
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| (*s as i16).to_le_bytes()).collect();
+        let mut acc = VoiceprintAccumulator::default();
+        acc.feed_pcm(&bytes);
+        let legacy = VoiceprintSample { vector: acc.finish_vector().unwrap(), ..sample("", 0) };
+        let refs: Vec<Arc<[f32]>> = vec![Arc::from(vec![0.0625f32; 256].as_slice())];
+        let mut st = State { model: None, failed: Some(Instant::now()) };
+        let s = score(&mut st, &pcm, &refs, &[legacy]);
+        assert!(!s.neural && s.similarity.is_none() && s.likelihood.is_some());
+        let s = score(&mut st, &pcm, &refs, &[]);
+        assert!(!s.neural && s.likelihood.is_none());
+    }
+
+    #[test]
     fn short_clip_is_none() {
         let mut st = State { model: None, failed: Some(Instant::now()) };
         let pcm: Vec<f32> = (0..16000 * 3).map(|i| if i < 12000 { ((i as f32) * 0.07).sin() * 8000.0 } else { 0.0 }).collect();
