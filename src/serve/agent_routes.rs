@@ -43,6 +43,7 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                 }
             };
             let colors = d.store.agent_colors().unwrap_or_default();
+            let nicknames = d.store.agent_nicknames().unwrap_or_default();
             let profiles = d.store.agent_profiles().unwrap_or_default();
             let mut grouped: HashMap<String, serde_json::Map<String, serde_json::Value>> =
                 HashMap::new();
@@ -61,6 +62,9 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                         object.insert("task_counts_since".into(), since.clone().into());
                         if let Some(color) = colors.get(&agent.id) {
                             object.insert("color".into(), color.clone().into());
+                        }
+                        if let Some(nickname) = nicknames.get(&agent.id) {
+                            object.insert("nickname".into(), nickname.clone().into());
                         }
                         if let Some(profile) = profiles.get(&agent.id) {
                             object.insert("profile".into(), profile.clone().into());
@@ -268,6 +272,8 @@ pub(crate) struct AgentReq {
     pub(crate) capabilities: Vec<String>,
     #[serde(default)]
     pub(crate) profile: Option<String>,
+    #[serde(default)]
+    pub(crate) nickname: Option<String>,
 }
 fn default_agent_kind() -> crate::coordination::types::AgentKind {
     crate::coordination::types::AgentKind::Worker
@@ -296,6 +302,7 @@ pub(crate) async fn create_agent(
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
     }
+    let req_nickname = req.nickname.as_deref().map(|n| n.trim().to_string());
     let agent = crate::coordination::types::Agent {
         id: req.id,
         display_name: req.display_name,
@@ -328,6 +335,10 @@ pub(crate) async fn create_agent(
         Ok(()) => {
             if let Some(name) = profile.as_deref() {
                 let _ = d.store.set_agent_profile(&agent.id, Some(name));
+            }
+            let nickname = req_nickname.filter(|n| !n.is_empty());
+            if let Some(n) = nickname.as_deref() {
+                let _ = d.store.set_agent_nickname(&agent.id, Some(n));
             }
             let mut body = serde_json::to_value(&agent).unwrap_or_default();
             if let (Some(object), Some(name)) = (body.as_object_mut(), profile) {
@@ -412,6 +423,33 @@ pub(crate) async fn set_agent_color(
         Ok(true) => Json(serde_json::json!({ "id": agent_id, "color": color })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent color: {error}"))
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentNicknameReq {
+    pub(crate) nickname: Option<String>,
+}
+
+/// POST /agents/{id}/nickname — a short name shown instead of the display name, or null to clear it.
+pub(crate) async fn set_agent_nickname(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(req): Json<AgentNicknameReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let nickname = req.nickname.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+    if nickname.as_deref().is_some_and(|n| n.chars().count() > 40) {
+        return (StatusCode::BAD_REQUEST, "nickname is at most 40 characters").into_response();
+    }
+    match d.store.set_agent_nickname(&agent_id, nickname.as_deref()) {
+        Ok(true) => Json(serde_json::json!({ "id": agent_id, "nickname": nickname })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent nickname: {error}"))
             .into_response(),
     }
 }

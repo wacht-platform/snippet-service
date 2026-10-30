@@ -154,10 +154,41 @@ impl Store {
                 params![id],
             )?;
             tx.execute("DELETE FROM agent_colors WHERE agent_id = ?1", params![id])?;
+            tx.execute("DELETE FROM agent_nicknames WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agent_profiles WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(AgentRemoval::Removed)
+        })
+    }
+
+    pub fn agent_nicknames(&self) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare("SELECT agent_id, nickname FROM agent_nicknames")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub fn set_agent_nickname(&self, id: &str, nickname: Option<&str>) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            match nickname {
+                Some(nickname) => conn.execute(
+                    "INSERT INTO agent_nicknames (agent_id, nickname) VALUES (?1, ?2)
+                     ON CONFLICT(agent_id) DO UPDATE SET nickname = excluded.nickname",
+                    params![id, nickname],
+                )?,
+                None => conn.execute("DELETE FROM agent_nicknames WHERE agent_id = ?1", params![id])?,
+            };
+            Ok(true)
         })
     }
 
