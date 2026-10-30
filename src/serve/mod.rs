@@ -1052,8 +1052,24 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
     let live = d.sessions.lock().await;
     let out: Vec<serde_json::Value> = sessions
         .into_iter()
-        .map(|s| {
+        .map(|mut s| {
             let live_s = live.get(&s.id);
+            let alive = live_s.is_some_and(|l| !l.join.is_finished());
+            // A run left "running" by a killed worker stays stuck forever; with no loop
+            // and no activity for 10 minutes it is not running.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if s.status == "running" && !alive && now - s.last_active > 600 {
+                if let Some(sp) = state_path_for_id(&s.id) {
+                    if let Some(mut st) = crate::session::read_session_state(&sp) {
+                        st.status = crate::harness::HarnessStatus::Idle;
+                        let _ = crate::session::write_session_state(&sp, &st);
+                    }
+                }
+                s.status = "idle".to_string();
+            }
             let running = s.status == "running";
             let profile = live_s
                 .and_then(|l| l.profile.clone())
