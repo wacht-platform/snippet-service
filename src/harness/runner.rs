@@ -662,6 +662,7 @@ impl CodingHarness {
                         }
                         Some(LoopInput::Interrupt) => {
                             state.pending_question = None;
+                            pause_goal_on_interrupt(&mut state);
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;
                             state.status = HarnessStatus::Idle;
@@ -794,6 +795,7 @@ pub(super) fn backoff_delay(attempt: usize, base_ms: u64, max_ms: u64) -> Durati
 impl CodingHarness {
     async fn park_interrupted(&self, state: &mut HarnessState, lanes: &LaneManager) -> Result<(), ToolError> {
         state.pending_question = None;
+        pause_goal_on_interrupt(state);
         state.status = HarnessStatus::Interrupted;
         state.events.push(HarnessEvent::SystemDecision {
             step: "interrupted".to_string(),
@@ -802,6 +804,20 @@ impl CodingHarness {
         self.persist(state, lanes).await?;
         state.status = HarnessStatus::Idle;
         Ok(())
+    }
+}
+
+/// A manual stop must also stop the goal: left Active, the idle loop re-drives it
+/// and a scheduled job's later runs stay blocked behind it.
+fn pause_goal_on_interrupt(state: &mut HarnessState) {
+    if let Some(goal) = state.goal.as_mut().filter(|g| g.status == GoalStatus::Active) {
+        goal.status = GoalStatus::Paused;
+        goal.resume_at = 0;
+        let text = goal.text.clone();
+        state.events.push(HarnessEvent::SystemDecision {
+            step: "goal_paused".to_string(),
+            reasoning: format!("stopped by user — {text}"),
+        });
     }
 }
 
