@@ -89,7 +89,7 @@ async fn prepare() -> Result<(String, crate::ambient::Conversation), String> {
     static TTL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if crate::ambient::conversation().is_none() || TTL.load(Ordering::Relaxed) == 0 {
         if !crate::ambient::effective_active().await {
-            return Err("ambient is passive: you cannot speak in this mode. Reply in the chat (the user gets a notification), or call ambient_mode with active first if a spoken back and forth is needed".into());
+            crate::ambient::set_mode("active", "speaking to you").await?;
         }
         let ttl = crate::config::SnippetConfig::load(crate::config::default_config_path())
             .await
