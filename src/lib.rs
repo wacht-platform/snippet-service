@@ -47,6 +47,7 @@ pub mod voiceprint;
 pub mod shell_guard;
 pub mod signals;
 pub mod skills;
+pub mod recordings;
 pub mod speech;
 pub mod stt;
 pub mod sse;

@@ -165,6 +165,9 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
     if crate::ambient::call_quiet() {
         return Err("the user is on a call: speech is off until it ends, so reply in text".into());
     }
+    if crate::ambient::room_busy() {
+        return Err("people nearby are in a conversation or meeting, so speaking would talk over them: reply in the chat instead, and use ping_user if it cannot wait".into());
+    }
     let (device, conversation) = prepare().await?;
     if let Some(kind) = expecting.filter(|k| !k.is_empty() && *k != "none") {
         crate::ambient::set_expectation(kind, about.unwrap_or(""), 10);

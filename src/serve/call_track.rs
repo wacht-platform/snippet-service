@@ -236,8 +236,28 @@ pub(super) fn clearly_for_assistant(v: &Verdict, wake: bool) -> bool {
     wake || (v.kind == "conversation" && v.addressed >= CLEAR_TO_ASSISTANT && v.veto() < 0.5 && v.out_of_context < 0.5)
 }
 
+/// Human conversation that is not for the assistant: a meeting, other-party talk or out-of-context speech.
+fn heard_by_others(v: &Verdict, delivered: bool, wake: bool) -> bool {
+    if delivered || wake || matches!(v.kind.as_str(), "media" | "background" | "noise") || v.played >= 0.8 || v.echo >= 0.7 {
+        return false;
+    }
+    v.intent == "meeting" || v.other >= 0.5 || (v.kind == "conversation" && v.out_of_context >= 0.5)
+}
+
+/// The next room-busy timestamp (seconds): refreshed by others' talk, cleared by a direct address.
+fn room_after(last: i64, v: &Verdict, delivered: bool, wake: bool, now_s: i64) -> i64 {
+    if wake || delivered || clearly_for_assistant(v, wake) {
+        0
+    } else if heard_by_others(v, delivered, wake) {
+        now_s
+    } else {
+        last
+    }
+}
+
 pub(super) async fn observe(d: &Shared, device: &str, parts: &[Part], v: &Verdict, delivered: bool, wake: bool) {
     let Some(first) = parts.first() else { return };
+    crate::ambient::set_last_others(room_after(crate::ambient::last_others(), v, delivered, wake, chrono::Utc::now().timestamp()));
     let text = parts.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
     let signal = Signal {
         at_ms: (first.started * 1000.0) as i64,
@@ -359,7 +379,11 @@ fn persist_line(d: &Shared, call_id: &str, line: &Heard) {
 }
 
 fn set_row_state(d: &Shared, call_id: &str, state: &str) {
-    d.store.write(|c| {
+    set_state(&d.store, call_id, state);
+}
+
+fn set_state(store: &crate::store::Store, call_id: &str, state: &str) {
+    store.write(|c| {
         c.execute(
             "UPDATE ambient_calls SET state = ?2,
                  ended_at = CASE WHEN ?2 IN ('ended', 'summarised') THEN COALESCE(ended_at, ?3) ELSE ended_at END
@@ -389,11 +413,15 @@ fn scrub_row(c: &rusqlite::Connection, id: &str) -> rusqlite::Result<()> {
 }
 
 pub(crate) fn transcript(lines: &[Heard]) -> String {
+    transcript_to(lines, Some(TRANSCRIPT_CHARS))
+}
+
+fn transcript_to(lines: &[Heard], cap: Option<usize>) -> String {
     let mut out = String::new();
     for line in lines {
         let at = chrono::DateTime::from_timestamp_millis(line.at_ms).map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_default();
         let row = format!("[{at}] {}\n", line.text.trim());
-        if out.len() + row.len() > TRANSCRIPT_CHARS {
+        if cap.is_some_and(|cap| out.len() + row.len() > cap) {
             out.push_str("[transcript cut here: too long]\n");
             break;
         }
@@ -407,20 +435,90 @@ async fn summarise(d: &Shared, call: Call, ended_at: i64) {
         let body = format!("Said on a call: {}", line.text.trim());
         super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &body, false).await;
     }
-    let iso = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339()).unwrap_or_default();
-    let msg = format!(
-        "<call_ended id=\"{}\" device=\"{}\" started=\"{}\" ended=\"{}\" lines=\"{}\">The user asked Snippet to take notes on this conversation and it has ended. Lines are not labelled by speaker; infer who said what only where the content makes it clear, and never invent names. Reply in this chat in text only, without speaking: a short summary, the decisions made, and the action items with owners and dates where they were stated. Keep commitments the user made the way you keep other remembered notes. If nothing of substance was said, say so in one line.\n<transcript>\n{}</transcript></call_ended>",
-        super::ambient_watch::escape(&call.id),
-        super::ambient_watch::escape(&call.device),
-        iso(call.started_at),
-        iso(ended_at),
-        call.lines.len(),
-        super::ambient_watch::escape(&transcript(&call.lines)),
-    );
-    super::autonomy::deliver_to_mission_control(d, msg).await;
+    deliver_ended(d, &call.id, &call.device, call.started_at, ended_at, &call.lines).await;
     book().summarised(&call.id);
-    set_row_state(d, &call.id, "summarised");
-    crate::session::emit_device_event(state_event(&call.id, "summarised"));
+}
+
+/// Saves the recording, hands it to Mission Control and marks the call summarised.
+async fn deliver_ended(d: &Shared, id: &str, device: &str, started_at: i64, ended_at: i64, lines: &[Heard]) {
+    let saved = crate::recordings::write(&crate::recordings::dir(), id, device, started_at, ended_at, lines.len(), &transcript_to(lines, None));
+    let path = match saved {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("[call] {} recording not saved: {e}", short(id));
+            None
+        }
+    };
+    let msg = ended_message(id, device, started_at, ended_at, lines, path.as_deref());
+    super::autonomy::deliver_to_mission_control(d, msg).await;
+    set_row_state(d, id, "summarised");
+    crate::session::emit_device_event(state_event(id, "summarised"));
+}
+
+fn ended_message(id: &str, device: &str, started_at: i64, ended_at: i64, lines: &[Heard], path: Option<&std::path::Path>) -> String {
+    let iso = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339()).unwrap_or_default();
+    let saved = match path {
+        Some(p) => format!(" The full recording is saved at {}; when another agent needs this conversation, pass it that path (workers can read files), not the transcript.", p.display()),
+        None => " The recording could not be saved to a file.".into(),
+    };
+    let attr = path.map(|p| format!(" path=\"{}\"", super::ambient_watch::escape(&p.to_string_lossy()))).unwrap_or_default();
+    format!(
+        "<call_ended id=\"{}\" device=\"{}\" started=\"{}\" ended=\"{}\" lines=\"{}\"{attr}>The user asked Snippet to take notes on this conversation and it has ended.{saved} Lines are not labelled by speaker; infer who said what only where the content makes it clear, and never invent names. Reply in this chat in text only, without speaking: a short summary, the decisions made, and the action items with owners and dates where they were stated. Keep commitments the user made the way you keep other remembered notes. If nothing of substance was said, say so in one line.\n<transcript>\n{}</transcript></call_ended>",
+        super::ambient_watch::escape(id),
+        super::ambient_watch::escape(device),
+        iso(started_at),
+        iso(ended_at),
+        lines.len(),
+        super::ambient_watch::escape(&transcript(lines)),
+    )
+}
+
+struct Unsummarised {
+    id: String,
+    device: String,
+    started_at: i64,
+    ended_at: i64,
+    lines: Vec<Heard>,
+}
+
+/// Calls the user opted into that never reached a summary (the daemon stopped first).
+fn unsummarised(store: &crate::store::Store) -> Vec<Unsummarised> {
+    store
+        .with_connection(|c| {
+            let mut stmt = c.prepare("SELECT id, device, started_at, ended_at FROM ambient_calls WHERE state IN ('tracking', 'ended') ORDER BY started_at")?;
+            let calls = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, Option<i64>>(3)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut out = Vec::new();
+            for (id, device, started_at, ended_at) in calls {
+                let mut stmt = c.prepare("SELECT at_ms, text, event_ids FROM ambient_call_lines WHERE call_id = ?1 AND text != '' ORDER BY at_ms, rowid")?;
+                let lines = stmt
+                    .query_map([&id], |r| {
+                        let ids: String = r.get(2)?;
+                        Ok(Heard { at_ms: r.get(0)?, ids: serde_json::from_str(&ids).unwrap_or_default(), text: r.get(1)?, memorable: false })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let ended_at = ended_at.or_else(|| lines.last().map(|l| l.at_ms)).unwrap_or(started_at);
+                out.push(Unsummarised { id, device, started_at, ended_at, lines });
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
+}
+
+/// On startup: summarise tracked calls the previous run never finished.
+pub(crate) fn recover(d: Shared) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for call in unsummarised(&d.store) {
+            eprintln!("[call] {} recovering after restart", short(&call.id));
+            if call.lines.is_empty() {
+                set_row_state(&d, &call.id, "summarised");
+                continue;
+            }
+            deliver_ended(&d, &call.id, &call.device, call.started_at, call.ended_at, &call.lines).await;
+        }
+    });
 }
 
 pub(crate) fn status_json(call: Option<&Call>) -> Value {
@@ -756,5 +854,71 @@ mod tests {
         book.ignore(&id, start + 50_000, &mut fx).unwrap();
         fx.extend(book.tick(start + 400_000));
         assert!(notes(&fx).is_empty(), "nothing said on a declined call becomes a memory");
+    }
+
+    fn call_store() -> (tempfile::TempDir, crate::store::Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(&dir.path().join("calls.db")).unwrap();
+        (dir, store)
+    }
+
+    fn seed(store: &crate::store::Store, id: &str, state: &str, lines: &[&str]) {
+        store.write(|c| {
+            c.execute("INSERT INTO ambient_calls (id, device, detected_at, started_at, state) VALUES (?1, 'mac', 1, ?2, ?3)", rusqlite::params![id, T0, state])?;
+            for (n, text) in lines.iter().enumerate() {
+                c.execute(
+                    "INSERT INTO ambient_call_lines (call_id, at_ms, speaker, text, event_ids) VALUES (?1, ?2, '', ?3, '[\"e\"]')",
+                    rusqlite::params![id, T0 + n as i64 * 1000, text],
+                )?;
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn recovery_rebuilds_tracking_calls_and_skips_pending_and_declined() {
+        let (_dir, store) = call_store();
+        seed(&store, "t1", "tracking", &["first", "", "second"]);
+        seed(&store, "e1", "ended", &["only"]);
+        seed(&store, "p1", "pending", &["secret"]);
+        seed(&store, "d1", "declined", &["secret"]);
+        seed(&store, "s1", "summarised", &["done"]);
+        let found = unsummarised(&store);
+        let ids: Vec<&str> = found.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["t1", "e1"]);
+        let t = &found[0];
+        assert_eq!(t.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["first", "second"]);
+        assert_eq!(t.ended_at, T0 + 2000);
+        set_state(&store, "t1", "summarised");
+        set_state(&store, "e1", "summarised");
+        assert!(unsummarised(&store).is_empty());
+    }
+
+    #[test]
+    fn ended_message_carries_the_path_and_the_saved_file_the_whole_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lines: Vec<Heard> = (0..6000).map(|n| Heard { text: format!("line number {n} with some padding words"), ..heard(T0 + n as i64 * 1000, n) }).collect();
+        let full = transcript_to(&lines, None);
+        assert!(transcript(&lines).contains("too long") && !full.contains("too long"));
+        let path = crate::recordings::write(tmp.path(), "abcdef123456", "mac", T0, T0 + 9000, lines.len(), &full).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("- lines: 6000") && body.contains("line number 5999 "));
+        let msg = ended_message("abcdef123456", "mac", T0, T0 + 9000, &lines, Some(&path));
+        assert!(msg.contains(&format!("path=\"{}\"", path.display())) && msg.contains("pass it that path"));
+        assert!(msg.contains("too long"));
+    }
+
+    #[test]
+    fn out_of_context_talk_flips_the_room_flag_and_a_direct_address_clears_it() {
+        let mut v = verdict("note", 0.1, 0.0);
+        assert_eq!(room_after(0, &v, false, false, 500), 0);
+        v.out_of_context = 0.6;
+        assert_eq!(room_after(0, &v, false, false, 500), 500);
+        assert_eq!(room_after(0, &verdict("meeting", 0.1, 0.0), false, false, 600), 600);
+        assert_eq!(room_after(0, &verdict("note", 0.1, 0.7), false, false, 700), 700);
+        assert_eq!(room_after(500, &v, false, true, 510), 0);
+        assert_eq!(room_after(500, &verdict("for_assistant", 0.9, 0.1), true, false, 510), 0);
+        let media = Verdict { kind: "media".into(), ..verdict("meeting", 0.0, 0.0) };
+        assert_eq!(room_after(0, &media, false, false, 500), 0);
     }
 }

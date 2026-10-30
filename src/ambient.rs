@@ -15,6 +15,27 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 static SPOKE_GEN: AtomicU64 = AtomicU64::new(0);
 static EXPECT: Mutex<Option<Expectation>> = Mutex::new(None);
 static CALL_QUIET: AtomicBool = AtomicBool::new(false);
+static LAST_OTHERS: AtomicI64 = AtomicI64::new(0);
+
+pub const ROOM_QUIET_SECS: i64 = 120;
+
+/// Seconds timestamp of the last overheard human conversation not meant for the assistant; 0 clears it.
+pub fn set_last_others(at: i64) {
+    LAST_OTHERS.store(at, Ordering::Relaxed);
+}
+
+pub fn last_others() -> i64 {
+    LAST_OTHERS.load(Ordering::Relaxed)
+}
+
+pub fn room_busy_at(now: i64, last_others: i64, last_user_turn: i64) -> bool {
+    last_others > 0 && now - last_others < ROOM_QUIET_SECS && last_user_turn < last_others
+}
+
+/// People nearby were talking to each other recently and the user has not addressed the assistant since.
+pub fn room_busy() -> bool {
+    room_busy_at(chrono::Utc::now().timestamp(), last_others(), LAST_USER_TURN.load(Ordering::Relaxed))
+}
 
 /// Set while a call is pending or tracked: Snippet must not speak over it.
 pub fn set_call_quiet(on: bool) {
@@ -484,4 +505,19 @@ pub async fn set_mode(mode: &str, reason: &str) -> Result<Value, String> {
         _ => return Err("mode must be passive or active".into()),
     }
     Ok(json!({"mode": state_name()}))
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::room_busy_at;
+
+    #[test]
+    fn busy_until_the_user_speaks_or_two_minutes_pass() {
+        assert!(!room_busy_at(1000, 0, 0));
+        assert!(room_busy_at(1000, 950, 0));
+        assert!(room_busy_at(1000, 950, 900));
+        assert!(!room_busy_at(1000, 950, 960), "a direct address clears it");
+        assert!(room_busy_at(1069, 950, 0));
+        assert!(!room_busy_at(1070, 950, 0), "expires after 120 s");
+    }
 }

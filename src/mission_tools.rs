@@ -81,6 +81,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(AmbientMode);
     registry.insert(AmbientExpect);
     registry.insert(AmbientSearch);
+    registry.insert(ListRecordings);
     registry.insert(UpdateBrief);
     registry.insert(ScheduleFollowup);
     registry.insert(PingUser);
@@ -353,6 +354,30 @@ impl Tool for AmbientSearch {
     }
 }
 
+#[derive(Deserialize)]
+struct ListRecordingsArgs {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+pub struct ListRecordings;
+#[async_trait]
+impl Tool for ListRecordings {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "list_recordings".into(),
+            description: "List the saved transcripts of conversations the user asked Snippet to take notes on, newest first, each with id, started, ended, lines and the absolute path of its markdown file. Workers can read those files, so pass them the path rather than the transcript.".into(),
+            input_schema: schema(json!({
+                "limit": {"type": "integer", "description": "How many recordings, up to 100. Default 20."}
+            }), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: ListRecordingsArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        Ok(ToolResult::success(json!({"recordings": crate::recordings::list(&crate::recordings::dir(), args.limit.unwrap_or(20))})))
+    }
+}
+
 pub struct AmbientMode;
 #[async_trait]
 impl Tool for AmbientMode {
@@ -401,7 +426,7 @@ impl Tool for Speak {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "speak".into(),
-            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: one or two short conversational sentences per call, no markdown, no lists, nothing the user would need to read. For a longer answer make several calls in order, each picking up where the last left off, so the user can cut in between. Speaking is never the action itself: when you say you will do something, make those tool calls in the same response, right after the speak. Set expecting only on a line that asks a question aloud, never on an acknowledgement or status line: a spoken question with expecting set to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening. In passive mode it switches to active by itself, so anything meant for the user is spoken: call it, and keep detail for the chat.".into(),
+            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: one or two short conversational sentences per call, no markdown, no lists, nothing the user would need to read. For a longer answer make several calls in order, each picking up where the last left off, so the user can cut in between. Speaking is never the action itself: when you say you will do something, make those tool calls in the same response, right after the speak. Set expecting only on a line that asks a question aloud, never on an acknowledgement or status line: a spoken question with expecting set to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening, on a call, or when people nearby are in a conversation or meeting: do not speak into a meeting, recorded conversation or out-of-context talk, judge whether a spoken line would be welcome right now, and send unsolicited updates in those moments to the chat and ping_user instead. In passive mode it switches to active by itself, so anything meant for the user is spoken: call it, and keep detail for the chat.".into(),
             input_schema: schema(json!({
                 "text": {"type": "string", "description": "What to say, in plain spoken sentences."},
                 "expecting": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation", "none"], "description": "Set this when you are asking something: it tells the voice classifier a short reply is meant for you."},
