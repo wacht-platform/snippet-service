@@ -25,13 +25,21 @@ pub enum PhoneFrame {
     Binary(Vec<u8>),
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Provider {
+    Flux,
+    Rime,
+}
+
 #[derive(Clone, PartialEq)]
 struct Config {
+    provider: Provider,
     key: String,
     voice: String,
     speed: u32,
     ttl: u32,
     host: String,
+    model: String,
 }
 
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
@@ -40,12 +48,34 @@ static RECONCILING: AtomicUsize = AtomicUsize::new(0);
 static LIVE: Mutex<Vec<Arc<StreamTurn>>> = Mutex::new(Vec::new());
 
 pub fn apply_config(c: &crate::config::SnippetConfig) {
-    let key = c.deepgram_api_key.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
-    let voice = if c.ambient.tts_voice.starts_with("flux-") { c.ambient.tts_voice.clone() } else { DEFAULT_VOICE.to_string() };
+    let clean = |k: &Option<String>| k.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let speed = c.ambient.tts_speed.clamp(80, 150);
-    let next = key.map(|key| Config { key, voice, speed, ttl: c.ambient.conversation_timeout_secs, host: c.ambient.deepgram_host.clone() });
+    let rime_key = clean(&c.rime_api_key).filter(|_| c.ambient.tts_provider == "rime");
+    let next = if let Some(key) = rime_key {
+        Some(Config {
+            provider: Provider::Rime,
+            key,
+            voice: c.ambient.rime_voice.clone(),
+            speed,
+            ttl: c.ambient.conversation_timeout_secs,
+            host: String::new(),
+            model: c.ambient.rime_model.clone(),
+        })
+    } else {
+        let voice = if c.ambient.tts_voice.starts_with("flux-") { c.ambient.tts_voice.clone() } else { DEFAULT_VOICE.to_string() };
+        clean(&c.deepgram_api_key).map(|key| Config {
+            provider: Provider::Flux,
+            key,
+            voice,
+            speed,
+            ttl: c.ambient.conversation_timeout_secs,
+            host: c.ambient.deepgram_host.clone(),
+            model: String::new(),
+        })
+    };
     let mut current = CONFIG.lock().unwrap();
-    if current.as_ref().map(|c| (&c.key, &c.voice, &c.host, c.speed)) != next.as_ref().map(|c| (&c.key, &c.voice, &c.host, c.speed)) {
+    let ident = |c: &Config| (c.provider, c.key.clone(), c.voice.clone(), c.host.clone(), c.speed, c.model.clone());
+    if current.as_ref().map(ident) != next.as_ref().map(ident) {
         let stale: Vec<Arc<Session>> = hub().lock().unwrap().drain().map(|(_, s)| s).collect();
         for s in stale {
             if s.st.lock().unwrap().queue.is_empty() {
@@ -58,6 +88,10 @@ pub fn apply_config(c: &crate::config::SnippetConfig) {
 
 pub fn enabled() -> bool {
     CONFIG.lock().unwrap().is_some()
+}
+
+pub fn provider() -> Option<Provider> {
+    CONFIG.lock().unwrap().as_ref().map(|c| c.provider)
 }
 
 fn config() -> Option<Config> {
@@ -161,6 +195,7 @@ struct TurnInner {
     ended_at: Option<Instant>,
     heard: Option<(i64, Instant)>,
     first_push: Option<Instant>,
+    ctx_open: bool,
     file: Option<std::fs::File>,
 }
 
@@ -204,7 +239,17 @@ impl StreamTurn {
             });
         }
         self.session.st.lock().unwrap().last_used = Some(Instant::now());
-        self.session.send(json!({"type": "Speak", "text": delta}))
+        match self.session.provider {
+            Provider::Flux => self.session.send(json!({"type": "Speak", "text": delta})),
+            Provider::Rime => {
+                let ctx = ctx_id(self.turn);
+                let open = std::mem::replace(&mut self.inner.lock().unwrap().ctx_open, true);
+                if !open && !self.session.send(self.session.rime_start(&ctx)) {
+                    return false;
+                }
+                self.session.send(json!({"contextId": ctx, "text": delta}))
+            }
+        }
     }
 
     pub fn flush(self: &Arc<Self>) {
@@ -215,7 +260,14 @@ impl StreamTurn {
         i.flushed = true;
         if i.queued {
             drop(i);
-            self.session.send(json!({"type": "Flush"}));
+            match self.session.provider {
+                Provider::Flux => {
+                    self.session.send(json!({"type": "Flush"}));
+                }
+                Provider::Rime => {
+                    self.session.send(json!({"contextId": ctx_id(self.turn), "end": {}}));
+                }
+            }
             return;
         }
         i.stopped = true;
@@ -252,6 +304,8 @@ struct SessionState {
 
 pub struct Session {
     device: String,
+    provider: Provider,
+    model: String,
     voice: String,
     speed: u32,
     cmd: mpsc::UnboundedSender<Cmd>,
@@ -263,6 +317,24 @@ impl Session {
     fn send(&self, v: Value) -> bool {
         self.cmd.send(Cmd::Send(v.to_string())).is_ok()
     }
+
+    fn rime_start(&self, ctx: &str) -> Value {
+        let mut audio = json!({"audioFormat": "audio/pcm", "samplingRate": 24000});
+        if self.model == "coda" && self.speed != 100 {
+            audio["timeScaleFactor"] = json!((100.0 / self.speed as f64 * 100.0).round() / 100.0);
+        }
+        json!({"contextId": ctx, "start": {
+            "speaker": self.voice,
+            "language": "en",
+            "text": "",
+            "splitStrategy": "SPLIT_STRATEGY_ACCUMULATE_SENTENCE",
+            "audioParameters": audio,
+        }})
+    }
+}
+
+fn ctx_id(turn: i64) -> String {
+    format!("t{turn}")
 }
 
 fn hub() -> &'static Mutex<HashMap<String, Arc<Session>>> {
@@ -275,7 +347,7 @@ fn session(device: &str) -> Option<Arc<Session>> {
     let mut map = hub().lock().unwrap();
     if let Some(s) = map.get(device) {
         let st = s.st.lock().unwrap();
-        if !st.closed && !st.retired && s.voice == cfg.voice {
+        if !st.closed && !st.retired && s.voice == cfg.voice && s.provider == cfg.provider && s.model == cfg.model {
             drop(st);
             return Some(s.clone());
         }
@@ -283,6 +355,8 @@ fn session(device: &str) -> Option<Arc<Session>> {
     let (cmd, rx) = mpsc::unbounded_channel();
     let s = Arc::new(Session {
         device: device.to_string(),
+        provider: cfg.provider,
+        model: cfg.model.clone(),
         voice: cfg.voice.clone(),
         speed: cfg.speed,
         cmd,
@@ -292,7 +366,10 @@ fn session(device: &str) -> Option<Arc<Session>> {
     map.insert(device.to_string(), s.clone());
     let task = s.clone();
     tokio::spawn(async move {
-        let outcome = run(&task, cfg.key, rx).await;
+        let outcome = match task.provider {
+            Provider::Flux => run(&task, cfg.key, rx).await,
+            Provider::Rime => run_rime(&task, cfg.key, rx).await,
+        };
         if let Err(e) = &outcome {
             eprintln!("[ambient-flux] {} session ended: {e}", task.device);
         }
@@ -475,11 +552,15 @@ fn on_audio(session: &Session, pcm: &[u8]) {
         return;
     }
     let Some(t) = front(session) else { return };
+    deliver_audio(&t, pcm);
+}
+
+fn deliver_audio(t: &Arc<StreamTurn>, pcm: &[u8]) {
     let mut i = t.inner.lock().unwrap();
     if i.stopped {
         return;
     }
-    begin(&t, &mut i);
+    begin(t, &mut i);
     if i.bytes == 0 {
         crate::ambient::mark_last("first_chunk");
     }
@@ -533,6 +614,136 @@ fn on_event(session: &Session, raw: &str) {
             let _ = session.cmd.send(Cmd::Close);
         }
         _ => {}
+    }
+}
+
+async fn run_rime(session: &Arc<Session>, key: String, mut cmd: mpsc::UnboundedReceiver<Cmd>) -> Result<(), String> {
+    let host = if session.model == "coda" { "coda.api.rime.ai" } else { "mist.api.rime.ai" };
+    let mut request = format!("wss://{host}/ws").into_client_request().map_err(|e| e.to_string())?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {key}").parse().map_err(|_| "invalid Rime key".to_string())?);
+    request.headers_mut().insert("Sec-WebSocket-Protocol", "rime.v1.json".parse().map_err(|_| "bad protocol".to_string())?);
+    let (ws, _) = tokio::time::timeout(CONNECT_LIMIT, tokio_tungstenite::connect_async_with_config(request, None, true))
+        .await
+        .map_err(|_| "Rime connect timed out".to_string())?
+        .map_err(|e| format!("Rime connect failed: {e}"))?;
+    let (mut tx, mut rx) = ws.split();
+    let ready = tokio::time::timeout(CONNECT_LIMIT, async {
+        while let Some(m) = rx.next().await {
+            match m {
+                Ok(Message::Text(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap_or_default();
+                    if let Some(r) = v.get("ready") {
+                        return if r.get("protocol").and_then(|p| p.as_i64()) == Some(1) {
+                            Ok(())
+                        } else {
+                            Err(format!("Rime protocol {:?} is not supported", r.get("protocol")))
+                        };
+                    }
+                    if v.get("error").is_some() {
+                        return Err(format!("Rime refused the connection: {}", t.chars().take(200).collect::<String>()));
+                    }
+                }
+                Ok(Message::Close(f)) => return Err(format!("Rime closed the connection: {f:?}")),
+                Err(e) => return Err(format!("Rime stream error: {e}")),
+                _ => {}
+            }
+        }
+        Err("Rime connection ended before ready".to_string())
+    })
+    .await
+    .map_err(|_| "Rime was not ready in time".to_string())??;
+    let _ = ready;
+    {
+        let mut st = session.st.lock().unwrap();
+        st.connected = true;
+        st.last_used = Some(Instant::now());
+    }
+    session.changed.notify_waiters();
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
+    loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                tx.send(Message::Ping(Vec::new().into())).await.map_err(|e| format!("Rime ping failed: {e}"))?;
+            }
+            c = cmd.recv() => match c {
+                Some(Cmd::Send(text)) => {
+                    tx.send(Message::Text(text.into())).await.map_err(|e| format!("Rime send failed: {e}"))?;
+                }
+                Some(Cmd::Close) | None => break,
+            },
+            m = rx.next() => match m {
+                Some(Ok(Message::Text(t))) => on_rime_event(session, &t),
+                Some(Ok(Message::Close(frame))) => return Err(format!("Rime closed the connection: {frame:?}")),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(format!("Rime stream error: {e}")),
+                None => return Err("Rime connection ended".into()),
+            },
+            _ = tick.tick() => {
+                let st = session.st.lock().unwrap();
+                if st.queue.is_empty() && st.last_used.is_some_and(|at| at.elapsed() >= IDLE_CLOSE) {
+                    drop(st);
+                    break;
+                }
+            }
+        }
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
+fn rime_turn(session: &Session, ctx: &str) -> Option<Arc<StreamTurn>> {
+    session.st.lock().unwrap().queue.iter().find(|t| ctx_id(t.turn) == ctx).cloned()
+}
+
+fn rime_finish(session: &Session, t: &Arc<StreamTurn>) {
+    let ms = (t.inner.lock().unwrap().bytes / 48) as i64;
+    {
+        let mut st = session.st.lock().unwrap();
+        st.queue.retain(|x| !Arc::ptr_eq(x, t));
+        st.completed_ms += ms;
+    }
+    finish_turn(t, ms);
+}
+
+fn on_rime_event(session: &Session, raw: &str) {
+    use base64::Engine;
+    let Ok(v) = serde_json::from_str::<Value>(raw) else { return };
+    let ctx = v
+        .get("contextId")
+        .or_else(|| v.get("error").and_then(|e| e.get("contextId")))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    if v.get("error").is_some() {
+        eprintln!("[ambient-rime] {} {}", session.device, raw.chars().take(300).collect::<String>());
+        match ctx.as_deref().and_then(|c| rime_turn(session, c)) {
+            Some(t) => rime_finish(session, &t),
+            None => {
+                session.st.lock().unwrap().retired = true;
+                let _ = session.cmd.send(Cmd::Close);
+            }
+        }
+        return;
+    }
+    let Some(t) = ctx.as_deref().and_then(|c| rime_turn(session, c)) else { return };
+    if session.st.lock().unwrap().retired {
+        return;
+    }
+    if v.get("started").is_some() {
+        let mut i = t.inner.lock().unwrap();
+        if !i.stopped {
+            begin(&t, &mut i);
+        }
+    } else if let Some(b64) = v.get("audio").and_then(|a| a.as_str()) {
+        if let Ok(pcm) = base64::engine::general_purpose::STANDARD.decode(b64) {
+            deliver_audio(&t, &pcm);
+        }
+    } else if v.get("done").is_some() {
+        rime_finish(session, &t);
+    } else if v.get("cancelled").is_some() {
+        session.st.lock().unwrap().queue.retain(|x| !Arc::ptr_eq(x, &t));
     }
 }
 
@@ -695,6 +906,12 @@ pub fn stop(device: Option<&str>, reason: &str, hint: Option<(i64, i64)>) -> Vec
         i.stopped = true;
         i.flushed = true;
         drop(i);
+        if t.session.provider == Provider::Rime {
+            if t.inner.lock().unwrap().ctx_open {
+                t.session.send(json!({"contextId": ctx_id(t.turn), "cancel": {}}));
+            }
+            t.session.st.lock().unwrap().queue.retain(|x| !Arc::ptr_eq(x, t));
+        }
         write_heard(t.turn, status, &guess);
         emit(json!({"kind": "ambient_speech_cancel", "turn": t.turn, "after_seq": -1, "reason": reason, "device": t.device, "stream": true}));
     }
@@ -706,6 +923,9 @@ pub fn stop(device: Option<&str>, reason: &str, hint: Option<(i64, i64)>) -> Vec
     }
     let mut active: Vec<(Arc<Session>, Arc<StreamTurn>)> = Vec::new();
     for s in sessions {
+        if s.provider == Provider::Rime {
+            continue;
+        }
         let generating = {
             let mut st = s.st.lock().unwrap();
             let front = st.queue.front().cloned();
@@ -822,5 +1042,198 @@ pub async fn settle(max: Duration) {
     let deadline = Instant::now() + max;
     while RECONCILING.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rime_start_carries_voice_and_streaming_split() {
+        let (cmd, _rx) = mpsc::unbounded_channel();
+        let s = Session {
+            device: "d".into(),
+            provider: Provider::Rime,
+            model: "coda".into(),
+            voice: "lyra".into(),
+            speed: 125,
+            cmd,
+            st: Mutex::new(SessionState::default()),
+            changed: Notify::new(),
+        };
+        let v = s.rime_start("t9");
+        assert_eq!(v["contextId"], "t9");
+        assert_eq!(v["start"]["speaker"], "lyra");
+        assert_eq!(v["start"]["text"], "");
+        assert_eq!(v["start"]["splitStrategy"], "SPLIT_STRATEGY_ACCUMULATE_SENTENCE");
+        assert_eq!(v["start"]["audioParameters"]["audioFormat"], "audio/pcm");
+        assert_eq!(v["start"]["audioParameters"]["samplingRate"], 24000);
+        assert_eq!(v["start"]["audioParameters"]["timeScaleFactor"], 0.8);
+    }
+
+    #[test]
+    fn mist_ignores_time_scale() {
+        let (cmd, _rx) = mpsc::unbounded_channel();
+        let s = Session {
+            device: "d".into(),
+            provider: Provider::Rime,
+            model: "mistv3".into(),
+            voice: "cove".into(),
+            speed: 115,
+            cmd,
+            st: Mutex::new(SessionState::default()),
+            changed: Notify::new(),
+        };
+        assert!(s.rime_start("t1")["start"]["audioParameters"].get("timeScaleFactor").is_none());
+    }
+
+    #[test]
+    fn rime_is_chosen_only_with_its_key() {
+        let mut c = crate::config::SnippetConfig::default();
+        c.deepgram_api_key = Some("dg".into());
+        c.ambient.tts_provider = "rime".into();
+        apply_config(&c);
+        assert_eq!(provider(), Some(Provider::Flux));
+        c.rime_api_key = Some("rk".into());
+        apply_config(&c);
+        assert_eq!(provider(), Some(Provider::Rime));
+        c.ambient.tts_provider = "deepgram".into();
+        apply_config(&c);
+        assert_eq!(provider(), Some(Provider::Flux));
+        apply_config(&crate::config::SnippetConfig::default());
+        assert_eq!(provider(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs RIME_API_KEY and network"]
+    async fn live_rime_streams_and_survives_an_interruption() {
+        let key = std::env::var("RIME_API_KEY").expect("RIME_API_KEY");
+        let home = std::env::temp_dir().join(format!("snippet-rime-live-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+        let mut c = crate::config::SnippetConfig::default();
+        c.rime_api_key = Some(key);
+        c.ambient.tts_provider = "rime".into();
+        apply_config(&c);
+        assert_eq!(provider(), Some(Provider::Rime));
+        let (tx, mut frames) = mpsc::unbounded_channel();
+        let dev = "live-device";
+        let _id = register_phone(dev, tx);
+        let session = ready(dev).await.expect("rime session ready");
+        assert_eq!(session.provider, Provider::Rime);
+
+        async fn first_audio(frames: &mut mpsc::UnboundedReceiver<PhoneFrame>) -> (u64, bool) {
+            let mut bytes = 0u64;
+            let mut ended = false;
+            let started = Instant::now();
+            let mut first = None;
+            while started.elapsed() < Duration::from_secs(20) {
+                match tokio::time::timeout(Duration::from_millis(500), frames.recv()).await {
+                    Ok(Some(PhoneFrame::Binary(b))) => {
+                        bytes += b.len() as u64;
+                        first.get_or_insert(started.elapsed());
+                    }
+                    Ok(Some(PhoneFrame::Text(t))) if t.contains("tts_end") => {
+                        ended = true;
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    _ => {}
+                }
+            }
+            let _ = first;
+            (bytes, ended)
+        }
+
+        let t1 = start_turn(&session, dev, "live-conv").expect("turn 1");
+        let t0 = Instant::now();
+        for piece in ["Sure, ", "I can ", "help with that. ", "Let me check ", "the build status."] {
+            assert!(t1.push(piece));
+        }
+        t1.flush();
+        let (bytes, ended) = first_audio(&mut frames).await;
+        println!("turn 1: {bytes} bytes, ended={ended}, {}ms", t0.elapsed().as_millis());
+        assert!(bytes > 20_000 && ended);
+
+        let t2 = start_turn(&session, dev, "live-conv").expect("turn 2");
+        t2.push("This sentence will be cut off before it finishes speaking. And another one follows it.");
+        t2.flush();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let stopped = stop(Some(dev), "interrupted", None);
+        assert!(stopped.contains(&t2.turn));
+        settle(Duration::from_secs(3)).await;
+        while frames.try_recv().is_ok() {}
+
+        let s2 = ready(dev).await.expect("session still usable after an interruption");
+        assert!(Arc::ptr_eq(&session, &s2), "interruption must keep the Rime connection open");
+        let t3 = start_turn(&s2, dev, "live-conv").expect("turn 3");
+        t3.push("Back again.");
+        t3.flush();
+        let (bytes, ended) = first_audio(&mut frames).await;
+        println!("turn 3: {bytes} bytes, ended={ended}");
+        assert!(bytes > 5_000 && ended);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs RIME_API_KEY and DEEPGRAM_API_KEY and network"]
+    async fn live_latency_through_the_daemon_pipeline() {
+        let texts = [
+            "Sure, I can help with that. Let me check the build status for you.",
+            "The deploy finished a minute ago and all three checks passed.",
+            "I found two failing tests, both in the notification stack.",
+            "Okay, done. The daemon is running the new build now.",
+            "Good morning boss. You have one approval waiting and two tasks in progress.",
+            "Heads up, the Technoxi sync is overdue by about an hour.",
+            "I have updated the playbook and saved the notes to memory.",
+            "Understood. Starting the goal now and I will report back when it finishes.",
+        ];
+        let home = std::env::temp_dir().join(format!("snippet-lat-live-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        unsafe { std::env::set_var("HOME", &home) };
+        for (label, provider, model) in [("flux", "deepgram", ""), ("rime mistv3", "rime", "mistv3"), ("rime coda", "rime", "coda")] {
+            let mut c = crate::config::SnippetConfig::default();
+            c.rime_api_key = Some(std::env::var("RIME_API_KEY").unwrap());
+            c.deepgram_api_key = Some(std::env::var("DEEPGRAM_API_KEY").unwrap());
+            c.ambient.tts_provider = provider.into();
+            if !model.is_empty() {
+                c.ambient.rime_model = model.into();
+                if model == "coda" {
+                    c.ambient.rime_voice = "lyra".into();
+                }
+            }
+            apply_config(&c);
+            let (tx, mut frames) = mpsc::unbounded_channel();
+            let dev = format!("lat-{label}");
+            let _id = register_phone(&dev, tx);
+            let connect = Instant::now();
+            let session = ready(&dev).await.expect("session");
+            let connect_ms = connect.elapsed().as_millis();
+            let mut ttfa = Vec::new();
+            for text in texts {
+                let t = start_turn(&session, &dev, "lat-conv").unwrap();
+                let at = Instant::now();
+                for word in text.split_inclusive(' ') {
+                    t.push(word);
+                }
+                t.flush();
+                let mut first = None;
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(20), frames.recv()).await {
+                        Ok(Some(PhoneFrame::Binary(_))) => {
+                            first.get_or_insert(at.elapsed().as_millis());
+                        }
+                        Ok(Some(PhoneFrame::Text(m))) if m.contains("tts_end") => break,
+                        Ok(Some(_)) => {}
+                        _ => panic!("{label} stalled"),
+                    }
+                }
+                ttfa.push(first.unwrap());
+            }
+            ttfa.sort();
+            println!("PIPELINE {label:12} connect+ready {connect_ms}ms  TTFA p50 {}ms  min {}ms  max {}ms  all {:?}", ttfa[ttfa.len() / 2], ttfa[0], ttfa[ttfa.len() - 1], ttfa);
+            stop(Some(&dev), "cancelled", None);
+            settle(Duration::from_secs(2)).await;
+        }
     }
 }

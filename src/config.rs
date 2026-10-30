@@ -163,6 +163,9 @@ pub struct SnippetConfig {
     /// Deepgram key for hosted reply speech (ambient); local config only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepgram_api_key: Option<String>,
+    /// Rime key for hosted reply speech (ambient); local config only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rime_api_key: Option<String>,
     /// TUI color theme. Ignored — AMOLED is the only palette.
     /// Unset = default. Declared before `model` so it stays a top-level key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,6 +269,7 @@ impl Default for SnippetConfig {
             typesafe_api_key: None,
             assemblyai_api_key: None,
             deepgram_api_key: None,
+            rime_api_key: None,
             theme: None,
             memory_enabled: default_memory_enabled(),
             memory_reflect: default_memory_reflect(),
@@ -308,6 +312,12 @@ pub struct AmbientConfig {
     pub tts_voice: String,
     #[serde(default = "default_tts_speed", skip_serializing_if = "is_default_tts_speed")]
     pub tts_speed: u32,
+    #[serde(default = "default_tts_provider", skip_serializing_if = "is_default_tts_provider")]
+    pub tts_provider: String,
+    #[serde(default = "default_rime_model", skip_serializing_if = "is_default_rime_model")]
+    pub rime_model: String,
+    #[serde(default = "default_rime_voice", skip_serializing_if = "is_default_rime_voice")]
+    pub rime_voice: String,
     #[serde(default = "default_deepgram_host", skip_serializing_if = "is_default_deepgram_host")]
     pub deepgram_host: String,
     #[serde(default = "default_stt", skip_serializing_if = "is_default_stt")]
@@ -328,6 +338,33 @@ fn default_tts_speed() -> u32 {
 
 fn is_default_tts_speed(s: &u32) -> bool {
     *s == default_tts_speed()
+}
+
+pub const TTS_PROVIDERS: &[&str] = &["deepgram", "rime"];
+pub const RIME_MODELS: &[&str] = &["mistv3", "coda"];
+
+fn default_tts_provider() -> String {
+    "deepgram".into()
+}
+
+fn is_default_tts_provider(s: &String) -> bool {
+    *s == default_tts_provider()
+}
+
+fn default_rime_model() -> String {
+    "mistv3".into()
+}
+
+fn is_default_rime_model(s: &String) -> bool {
+    *s == default_rime_model()
+}
+
+fn default_rime_voice() -> String {
+    "cove".into()
+}
+
+fn is_default_rime_voice(s: &String) -> bool {
+    *s == default_rime_voice()
 }
 
 fn default_deepgram_host() -> String {
@@ -361,6 +398,9 @@ impl Default for AmbientConfig {
             wake_phrases: default_wake_phrases(),
             tts_voice: default_tts_voice(),
             tts_speed: default_tts_speed(),
+            tts_provider: default_tts_provider(),
+            rime_model: default_rime_model(),
+            rime_voice: default_rime_voice(),
             deepgram_host: default_deepgram_host(),
             stt: default_stt(),
             voiceprints: Vec::new(),
@@ -391,6 +431,21 @@ impl AmbientConfig {
         }
         self.conversation_timeout_secs = self.conversation_timeout_secs.clamp(20, 600);
         self.tts_speed = self.tts_speed.clamp(80, 150);
+        self.tts_provider = self.tts_provider.trim().to_ascii_lowercase();
+        if !TTS_PROVIDERS.contains(&self.tts_provider.as_str()) {
+            return Err(format!("voice provider must be one of: {}", TTS_PROVIDERS.join(", ")));
+        }
+        self.rime_model = self.rime_model.trim().to_ascii_lowercase();
+        if !RIME_MODELS.contains(&self.rime_model.as_str()) {
+            return Err(format!("Rime model must be one of: {}", RIME_MODELS.join(", ")));
+        }
+        self.rime_voice = self.rime_voice.trim().to_ascii_lowercase();
+        if self.rime_voice.is_empty()
+            || self.rime_voice.len() > 40
+            || !self.rime_voice.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err("Rime voice must be a short name such as cove or lyra".into());
+        }
         self.wake_phrases = self
             .wake_phrases
             .iter()

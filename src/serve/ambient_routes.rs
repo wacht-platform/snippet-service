@@ -53,6 +53,10 @@ pub(crate) struct SettingsReq {
     wake_phrases: Option<Vec<String>>,
     assemblyai_api_key: Option<String>,
     deepgram_api_key: Option<String>,
+    rime_api_key: Option<String>,
+    tts_provider: Option<String>,
+    rime_model: Option<String>,
+    rime_voice: Option<String>,
     deepgram_host: Option<String>,
     tts_voice: Option<String>,
     tts_speed: Option<u32>,
@@ -88,13 +92,14 @@ fn valid_voice(v: &str) -> bool {
 }
 
 fn settings_view(d: &Daemon) -> serde_json::Value {
-    let (ambient, watcher_key_set, c_assembly_key_set, c_deepgram_key_set) = {
+    let (ambient, watcher_key_set, c_assembly_key_set, c_deepgram_key_set, c_rime_key_set) = {
         let c = d.config.lock().unwrap();
         (
             c.ambient.clone(),
             c.typesafe_api_key.as_deref().is_some_and(|k| !k.trim().is_empty()),
             has_key(&c.assemblyai_api_key),
             has_key(&c.deepgram_api_key),
+            has_key(&c.rime_api_key),
         )
     };
     crate::ambient::note_enabled(ambient.enabled);
@@ -131,6 +136,11 @@ fn settings_view(d: &Daemon) -> serde_json::Value {
         "watcher_chat_context": ambient.watcher_chat_context,
         "assemblyai_key_set": c_assembly_key_set,
         "deepgram_key_set": c_deepgram_key_set,
+        "rime_key_set": c_rime_key_set,
+        "tts_provider": ambient.tts_provider,
+        "rime_model": ambient.rime_model,
+        "rime_voice": ambient.rime_voice,
+        "rime_models": crate::config::RIME_MODELS,
         "conversation_timeout_secs": ambient.conversation_timeout_secs,
         "deepgram_host": ambient.deepgram_host,
         "stt": ambient.stt,
@@ -217,6 +227,15 @@ fn patched_ambient(mut ambient: crate::config::AmbientConfig, req: &SettingsReq)
     if let Some(v) = req.tts_speed {
         ambient.tts_speed = v.clamp(80, 150);
     }
+    if let Some(v) = req.tts_provider.clone() {
+        ambient.tts_provider = v;
+    }
+    if let Some(v) = req.rime_model.clone() {
+        ambient.rime_model = v;
+    }
+    if let Some(v) = req.rime_voice.clone() {
+        ambient.rime_voice = v;
+    }
     (ambient, invalid)
 }
 
@@ -238,11 +257,16 @@ pub(crate) async fn set_settings(
         };
         let assemblyai = next_key(req.assemblyai_api_key, &c.assemblyai_api_key);
         let deepgram = next_key(req.deepgram_api_key, &c.deepgram_api_key);
+        let rime = next_key(req.rime_api_key.clone(), &c.rime_api_key);
         match invalid.map_or_else(|| ambient.normalized(), Err) {
             Err(e) => Err((StatusCode::BAD_REQUEST, e)),
             Ok(ambient) if ambient.enabled && !has_key(&deepgram) => Err((
                 StatusCode::BAD_REQUEST,
                 "Add the Deepgram key in Settings → Voice before turning ambient listening on".into(),
+            )),
+            Ok(ambient) if ambient.tts_provider == "rime" && !has_key(&rime) => Err((
+                StatusCode::BAD_REQUEST,
+                "Add the Rime key in Settings → Voice before switching reply speech to Rime".into(),
             )),
             Ok(ambient) if ambient.enabled && ambient.stt == "assemblyai" && !has_key(&assemblyai) => Err((
                 StatusCode::BAD_REQUEST,
@@ -259,6 +283,7 @@ pub(crate) async fn set_settings(
                 c.ambient = ambient;
                 c.assemblyai_api_key = assemblyai;
                 c.deepgram_api_key = deepgram;
+                c.rime_api_key = rime;
                 if let Some(key) = req.typesafe_api_key {
                     let key = key.trim().to_string();
                     c.typesafe_api_key = (!key.is_empty()).then_some(key);
