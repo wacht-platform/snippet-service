@@ -661,6 +661,11 @@ pub struct SessionInfo {
     /// active default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// What this session is waiting on the user for (`type`, `text`), present
+    /// only while its status is `waiting_for_input`. Lets a list consumer show
+    /// who needs the user without fetching every session's state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention: Option<serde_json::Value>,
 }
 
 /// The inbox session id for an agent: `inbox-<agent-id>`.
@@ -832,13 +837,23 @@ fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<S
 /// [`list_device_sessions`] instead.
 pub fn all_device_sessions() -> Vec<SessionInfo> {
     let workers = working_agents_by_session();
-    let mut out: Vec<SessionInfo> = store_for_sessions()
+    let store = store_for_sessions();
+    let mut out: Vec<SessionInfo> = store
+        .as_ref()
         .and_then(|store| store.list_all_sessions().ok())
         .unwrap_or_default()
         .into_iter()
         .map(|row| {
             let origin = worktree_origin(Path::new(&row.workspace));
+            let attention = (row.status == "waiting_for_input")
+                .then(|| {
+                    store
+                        .as_ref()
+                        .and_then(|s| s.current_attention(&row.id).ok().flatten())
+                })
+                .flatten();
             SessionInfo {
+                attention,
                 conversation: conversation_name_from_id(&row.id).to_string(),
                 // Read before `row.id` is moved out below — struct-literal
                 // fields evaluate in the order written.
@@ -1612,6 +1627,7 @@ pub fn create_blank_session_in(
         // Nor is anyone working in it yet — a dispatch sets this, not creation.
         worker_agent_id: None,
         profile: None,
+        attention: None,
     })
 }
 
