@@ -114,6 +114,7 @@ use super::*;
             role: crate::coordination::types::AgentRole::Researcher,
             capabilities: vec!["web_search".into()],
             profile: None,
+            nickname: None,
         }
     }
 

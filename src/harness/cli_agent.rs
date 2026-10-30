@@ -819,6 +819,25 @@ pub fn fork_cli_conversations(source: &str, fork: &str, source_len: usize, fork_
     }
 }
 
+// The MCP tool list is fixed when the bridge starts, so complete_goal is always served
+// (it errors without an active goal); without it a CLI goal could never finish.
+fn cli_meta_tool_definitions(once: bool, lanes: bool, hidden: &[&str]) -> Vec<NativeToolDefinition> {
+    meta::conversation_meta_definitions_for(!once, lanes)
+        .into_iter()
+        .filter(|d| !once || !matches!(d.name.as_str(), "ask_user" | "monitor"))
+        .filter(|d| !hidden.contains(&d.name.as_str()))
+        .collect()
+}
+
+fn cli_goal_due(state: &HarnessState, idle_pass: bool, outbox_empty: bool, once: bool) -> bool {
+    !once
+        && idle_pass
+        && outbox_empty
+        && state.status == HarnessStatus::Idle
+        && state.pending_question.is_none()
+        && state.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active)
+}
+
 async fn start_mcp_server(
     tools: Vec<NativeToolDefinition>,
     steers: SteerQueue,
@@ -846,11 +865,7 @@ async fn start_mcp_server(
 
 impl CodingHarness {
     fn cli_meta_definitions(&self, once: bool, lanes: bool) -> Vec<NativeToolDefinition> {
-        meta::conversation_meta_definitions_for(false, lanes)
-            .into_iter()
-            .filter(|d| !once || !matches!(d.name.as_str(), "ask_user" | "monitor"))
-            .filter(|d| !self.config.hidden_meta.contains(&d.name.as_str()))
-            .collect()
+        cli_meta_tool_definitions(once, lanes, self.config.hidden_meta)
     }
 
     fn cli_system_prompt(&self, state: &HarnessState, session: &CliSession) -> String {
@@ -1235,6 +1250,20 @@ impl CodingHarness {
                 });
                 state.status = HarnessStatus::WaitingForInput;
                 lane_prompt_shown = true;
+                self.persist(&mut state, &lanes).await?;
+            }
+            if cli_goal_due(
+                &state,
+                compaction == CliCompaction::Idle && !compact_wanted && pending_approval.is_none(),
+                outbox.is_empty(),
+                once,
+            ) {
+                self.drive_goal_turn(&mut state, &mut vars);
+                if state.status == HarnessStatus::Running
+                    && let Some(HarnessMessage::User { content }) = state.messages.last()
+                {
+                    outbox.push(content.clone());
+                }
                 self.persist(&mut state, &lanes).await?;
             }
             if !outbox.is_empty() {
@@ -1730,21 +1759,6 @@ impl CodingHarness {
                                 if !leftover.is_empty() {
                                     outbox.push(leftover.join("\n\n"));
                                     state.status = HarnessStatus::Running;
-                                }
-                                if state.status == HarnessStatus::Idle
-                                    && state.pending_question.is_none()
-                                    && matches!(compaction, CliCompaction::Idle)
-                                    && !compact_wanted
-                                    && outbox.is_empty()
-                                    && !once
-                                    && state.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active)
-                                {
-                                    self.drive_goal_turn(&mut state, &mut vars);
-                                    if state.status == HarnessStatus::Running
-                                        && let Some(HarnessMessage::User { content }) = state.messages.last()
-                                    {
-                                        outbox.push(content.clone());
-                                    }
                                 }
                             }
                             if !parse.calls.is_empty() {
@@ -2368,5 +2382,45 @@ impl CodingHarness {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod goal_tests {
+    use super::*;
+
+    fn active_goal_state(status: HarnessStatus) -> HarnessState {
+        HarnessState {
+            status,
+            goal: Some(Goal {
+                text: "ship it".into(),
+                dir: String::new(),
+                status: GoalStatus::Active,
+                autonomous_turns: 0,
+                resume_at: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cli_agents_are_served_complete_goal() {
+        let names = |once| -> Vec<String> {
+            cli_meta_tool_definitions(once, false, &[]).into_iter().map(|d| d.name).collect()
+        };
+        assert!(names(false).iter().any(|n| n == "complete_goal"));
+        assert!(!names(true).iter().any(|n| n == "complete_goal"));
+    }
+
+    #[test]
+    fn idle_cli_loop_drives_an_active_goal() {
+        assert!(cli_goal_due(&active_goal_state(HarnessStatus::Idle), true, true, false));
+        assert!(!cli_goal_due(&active_goal_state(HarnessStatus::Running), true, true, false));
+        assert!(!cli_goal_due(&active_goal_state(HarnessStatus::Idle), true, false, false));
+        assert!(!cli_goal_due(&active_goal_state(HarnessStatus::Idle), false, true, false));
+        assert!(!cli_goal_due(&active_goal_state(HarnessStatus::Idle), true, true, true));
+        let mut paused = active_goal_state(HarnessStatus::Idle);
+        paused.goal.as_mut().unwrap().status = GoalStatus::Paused;
+        assert!(!cli_goal_due(&paused, true, true, false));
     }
 }
