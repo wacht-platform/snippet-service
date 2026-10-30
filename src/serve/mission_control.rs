@@ -172,6 +172,8 @@ pub fn mission_error(error: String) -> Response {
 #[derive(Deserialize)]
 struct AgentBuildReq {
     prompt: String,
+    #[serde(default)]
+    nickname: Option<String>,
 }
 
 async fn build_agent_from_prompt(
@@ -196,8 +198,15 @@ async fn build_agent_from_prompt(
     let session_id = crate::mission_control::SESSION_ID;
     let task_id = uuid::Uuid::new_v4().to_string();
     let title = "Build specialized agent";
+    let nickname_note = req
+        .nickname
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| format!("\n\nThe user chose the nickname \"{n}\": pass it as `nickname` to register_agent."))
+        .unwrap_or_default();
     let description = format!(
-        "Build a specialized agent from this user brief:\n\n{prompt}\n\nResearch the role first (web_search / web_read when available): the domain's standards, the checks an expert runs, common failure modes. Choose a short kebab-case id and a display name, then write the identity: who the agent is, its mandate, how it works step by step, what it checks, and how it reports. Create the agent with register_agent, then report this task with report_mission_task: the agent id, a two-line identity summary, and the sources you used."
+        "Build a specialized agent from this user brief:\n\n{prompt}{nickname_note}\n\nResearch the role first (web_search / web_read when available): the domain's standards, the checks an expert runs, common failure modes. Choose a short kebab-case id and a display name, then write the identity: who the agent is, its mandate, how it works step by step, what it checks, and how it reports. Create the agent with register_agent, then report this task with report_mission_task: the agent id, a two-line identity summary, and the sources you used."
     );
     let task = Task::dispatched_to(
         task_id,

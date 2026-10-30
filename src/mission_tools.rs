@@ -1889,6 +1889,8 @@ struct RegisterAgentArgs {
     identity: String,
     #[serde(default)]
     profile: Option<String>,
+    #[serde(default)]
+    nickname: Option<String>,
 }
 /// The one step that makes a built agent real: its identity file and its
 /// directory row, written together so an agent is never half-created.
@@ -1906,7 +1908,8 @@ impl Tool for RegisterAgent {
                     "role": {"type": "string", "enum": ["implementer", "reviewer", "tester", "researcher", "release"]},
                     "capabilities": {"type": "array", "items": {"type": "string"}, "description": "short tags, e.g. rust, code-review"},
                     "identity": {"type": "string", "description": "identity.md in markdown: who the agent is, its mandate, how it works, what it checks, how it reports"},
-                    "profile": {"type": "string", "description": "optional; the inference profile this agent always works on, named exactly as list_profiles returns it. Cheaper profiles for routine work, stronger ones for hard reasoning. Omit to leave the agent's profile unchanged."}
+                    "profile": {"type": "string", "description": "optional; the inference profile this agent always works on, named exactly as list_profiles returns it. Cheaper profiles for routine work, stronger ones for hard reasoning. Omit to leave the agent's profile unchanged."},
+                    "nickname": {"type": "string", "description": "optional; a short name shown instead of the display name. Pass the nickname the user asked for, if any."}
                 }),
                 &["id", "display_name", "role", "identity"],
             ),
@@ -1952,6 +1955,11 @@ impl Tool for RegisterAgent {
             db(ctx)?
                 .set_agent_profile(&args.id, Some(name))
                 .map_err(|e| ToolError::msg(format!("set agent profile: {e}")))?;
+        }
+        if let Some(nickname) = args.nickname.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            db(ctx)?
+                .set_agent_nickname(&args.id, Some(nickname))
+                .map_err(|e| ToolError::msg(format!("set agent nickname: {e}")))?;
         }
         Ok(ToolResult::success(json!({
             "agent_id": args.id,
