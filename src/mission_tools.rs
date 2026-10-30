@@ -72,24 +72,15 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(CancelMissionTask);
     registry.insert(CleanUpSessions);
     registry.insert(StopSession);
-    registry.insert(SettleSession);
-    registry.insert(UnsettleSession);
-    registry.insert(KeepSessionAwake);
+    registry.insert(SessionState);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
     registry.insert(Speak);
     registry.insert(AmbientMode);
     registry.insert(AmbientExpect);
     registry.insert(AmbientSearch);
-    registry.insert(ListRecordings);
-    registry.insert(ExpectRecording);
-    registry.insert(BlockRecording);
-    registry.insert(SnoozeRecording);
-    registry.insert(GetRecordingPolicy);
-    registry.insert(SetRecordingRule);
-    registry.insert(RemoveRecordingRule);
-    registry.insert(RemoveRecordingWindow);
-    registry.insert(DeleteRecording);
+    registry.insert(Recordings);
+    registry.insert(RecordingPolicyTool);
     registry.insert(UpdateBrief);
     registry.insert(ScheduleFollowup);
     registry.insert(PingUser);
@@ -363,138 +354,59 @@ impl Tool for AmbientSearch {
 }
 
 #[derive(Deserialize)]
-struct ListRecordingsArgs {
+struct RecordingsArgs {
+    action: String,
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
 }
 
-pub struct ListRecordings;
+pub struct Recordings;
 #[async_trait]
-impl Tool for ListRecordings {
+impl Tool for Recordings {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
-            name: "list_recordings".into(),
-            description: "List the saved transcripts of conversations the user asked Snippet to take notes on, newest first, each with id, started, ended, lines and the absolute path of its markdown file. Workers can read those files, so pass them the path rather than the transcript.".into(),
+            name: "recordings".into(),
+            description: "List saved recordings of conversations the user had Snippet take notes on (newest first, with the path of each file), or delete or redact one on their request. Deleting cannot be undone; redact keeps the header and blanks the transcript.".into(),
             input_schema: schema(json!({
-                "limit": {"type": "integer", "description": "How many recordings, up to 100. Default 20."}
-            }), &[]),
+                "action": {"type": "string", "enum": ["list", "delete", "redact"]},
+                "id": {"type": "string", "description": "Required for delete and redact."},
+                "limit": {"type": "integer", "description": "List only; up to 100, default 20."}
+            }), &["action"]),
         }
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: ListRecordingsArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        Ok(ToolResult::success(json!({"recordings": crate::recordings::list(&crate::recordings::dir(), args.limit.unwrap_or(20))})))
+        let args: RecordingsArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let dir = crate::recordings::dir();
+        match args.action.as_str() {
+            "list" => Ok(ToolResult::success(json!({"recordings": crate::recordings::list(&dir, args.limit.unwrap_or(20))}))),
+            "delete" | "redact" => {
+                let id = args.id.as_deref().map(str::trim).filter(|i| !i.is_empty()).ok_or_else(|| ToolError::msg("id is required"))?;
+                let store = crate::ambient::store().map_err(ToolError::msg)?;
+                let out = crate::serve::call_track::delete_recording(&store, &dir, id, args.action == "redact").map_err(ToolError::msg)?;
+                Ok(ToolResult::success(out))
+            }
+            _ => Err(ToolError::msg("action must be list, delete or redact")),
+        }
     }
 }
 
 #[derive(Deserialize)]
-struct WindowArgs {
+struct PolicyArgs {
+    action: String,
+    #[serde(default)]
     from: String,
+    #[serde(default)]
     to: String,
+    #[serde(default)]
     label: String,
     #[serde(default)]
     basis: String,
     #[serde(default)]
     mode: Option<String>,
-}
-
-async fn add_recording_window(args: WindowArgs, mode: &str) -> Result<ToolResult, ToolError> {
-    use crate::recording_policy as rp;
-    let (from, to) = (rp::parse_when(&args.from).map_err(ToolError::msg)?, rp::parse_when(&args.to).map_err(ToolError::msg)?);
-    let (id, _) = rp::update(|p, now| p.add_window(&args.label, from, to, mode, &args.basis, now)).await.map_err(ToolError::msg)?;
-    Ok(ToolResult::success(json!({"id": id, "label": args.label, "mode": mode, "from_ms": from, "to_ms": to})))
-}
-
-const WINDOW_SCHEMA_NOTE: &str = "Times are RFC 3339 or local `YYYY-MM-DD HH:MM`; a window spans at most 12 hours. `basis` is required: quote what the user said or the standing approval this rests on. Tell the user what you set.";
-
-pub struct ExpectRecording;
-#[async_trait]
-impl Tool for ExpectRecording {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "expect_recording".into(),
-            description: format!("Declare a time range in which a conversation is expected and should be recorded without asking (mode auto, the default), for example a meeting the user said to record. {WINDOW_SCHEMA_NOTE}"),
-            input_schema: schema(json!({
-                "from": {"type": "string"}, "to": {"type": "string"},
-                "label": {"type": "string", "description": "Short name shown to the user, e.g. 'Board meeting'."},
-                "basis": {"type": "string"},
-                "mode": {"type": "string", "enum": ["auto", "never"]}
-            }), &["from", "to", "label", "basis"]),
-        }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: WindowArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let mode = args.mode.clone().unwrap_or_else(|| "auto".into());
-        add_recording_window(args, &mode).await
-    }
-}
-
-pub struct BlockRecording;
-#[async_trait]
-impl Tool for BlockRecording {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "block_recording".into(),
-            description: format!("Declare a time range in which nothing is recorded and no recording prompt is shown. {WINDOW_SCHEMA_NOTE}"),
-            input_schema: schema(json!({
-                "from": {"type": "string"}, "to": {"type": "string"},
-                "label": {"type": "string"}, "basis": {"type": "string"}
-            }), &["from", "to", "label", "basis"]),
-        }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: WindowArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        add_recording_window(args, "never").await
-    }
-}
-
-#[derive(Deserialize)]
-struct SnoozeArgs {
-    minutes: i64,
     #[serde(default)]
-    reason: String,
-}
-
-pub struct SnoozeRecording;
-#[async_trait]
-impl Tool for SnoozeRecording {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "snooze_recording".into(),
-            description: "Stop recording and recording prompts for a while (1 minute to 12 hours), on the user's word such as 'do not record for an hour'. Overrides every auto rule. The user can clear a snooze in the app.".into(),
-            input_schema: schema(json!({
-                "minutes": {"type": "integer", "description": "1 to 720."},
-                "reason": {"type": "string", "description": "What the user said."}
-            }), &["minutes"]),
-        }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: SnoozeArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let (until, _) = crate::recording_policy::update(|p, now| p.snooze(args.minutes, now)).await.map_err(ToolError::msg)?;
-        eprintln!("[recording] snoozed {} min: {}", args.minutes, args.reason);
-        Ok(ToolResult::success(json!({"snooze_until_ms": until})))
-    }
-}
-
-pub struct GetRecordingPolicy;
-#[async_trait]
-impl Tool for GetRecordingPolicy {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "get_recording_policy".into(),
-            description: "Show the current recording policy: retention days, snooze, standing rules and one-off windows with their ids and bases.".into(),
-            input_schema: schema(json!({}), &[]),
-        }
-    }
-    async fn execute(&self, _ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
-        let p = crate::recording_policy::current().await;
-        Ok(ToolResult::success(json!({"retention_days": p.retention_days, "snooze_until_ms": p.snooze_until_ms, "rules": p.rules, "windows": p.windows})))
-    }
-}
-
-#[derive(Deserialize)]
-struct RuleArgs {
-    label: String,
-    mode: String,
+    minutes: i64,
     #[serde(default)]
     keywords: Vec<String>,
     #[serde(default)]
@@ -504,102 +416,61 @@ struct RuleArgs {
     #[serde(default)]
     to_hhmm: Option<String>,
     #[serde(default)]
-    basis: String,
-}
-
-pub struct SetRecordingRule;
-#[async_trait]
-impl Tool for SetRecordingRule {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "set_recording_rule".into(),
-            description: "Create or replace (by label) a standing recording rule. mode auto starts recording without asking when a detected conversation matches; ask always asks; never drops it silently. A rule matches when the first lines heard contain any keyword (case-insensitive), the local weekday is listed (0 Sunday to 6 Saturday) and the local time is inside from_hhmm to to_hhmm (HH:MM, may wrap midnight); omitted conditions match anything. Create auto or never rules only from the user's explicit request or a standing approval you can quote in `basis` (required for auto and never); otherwise ask the user first. Tell the user what you set.".into(),
-            input_schema: schema(json!({
-                "label": {"type": "string"},
-                "mode": {"type": "string", "enum": ["auto", "ask", "never"]},
-                "keywords": {"type": "array", "items": {"type": "string"}},
-                "weekdays": {"type": "array", "items": {"type": "integer"}},
-                "from_hhmm": {"type": "string"}, "to_hhmm": {"type": "string"},
-                "basis": {"type": "string", "description": "The user's words or the standing approval this rests on."}
-            }), &["label", "mode", "basis"]),
-        }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: RuleArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let when = crate::recording_policy::When { keywords: args.keywords, weekdays: args.weekdays, from_hhmm: args.from_hhmm, to_hhmm: args.to_hhmm };
-        let (id, _) = crate::recording_policy::update(|p, now| p.set_rule(&args.label, &args.mode, when, &args.basis, now)).await.map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({"id": id, "label": args.label, "mode": args.mode})))
-    }
-}
-
-#[derive(Deserialize)]
-struct IdArgs {
     id: String,
 }
 
-pub struct RemoveRecordingRule;
+pub struct RecordingPolicyTool;
 #[async_trait]
-impl Tool for RemoveRecordingRule {
+impl Tool for RecordingPolicyTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
-            name: "remove_recording_rule".into(),
-            description: "Remove a standing recording rule by id (see get_recording_policy).".into(),
-            input_schema: schema(json!({"id": {"type": "string"}}), &["id"]),
-        }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: IdArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let (removed, _) = crate::recording_policy::update(|p, _| Ok(p.remove_rule(&args.id))).await.map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({"removed": removed})))
-    }
-}
-
-pub struct RemoveRecordingWindow;
-#[async_trait]
-impl Tool for RemoveRecordingWindow {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "remove_recording_window".into(),
-            description: "Remove an expected or blocked recording window by id (see get_recording_policy).".into(),
-            input_schema: schema(json!({"id": {"type": "string"}}), &["id"]),
-        }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: IdArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let (removed, _) = crate::recording_policy::update(|p, _| Ok(p.remove_window(&args.id))).await.map_err(ToolError::msg)?;
-        Ok(ToolResult::success(json!({"removed": removed})))
-    }
-}
-
-#[derive(Deserialize)]
-struct DeleteRecordingArgs {
-    id: String,
-    #[serde(default)]
-    mode: Option<String>,
-}
-
-pub struct DeleteRecording;
-#[async_trait]
-impl Tool for DeleteRecording {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "delete_recording".into(),
-            description: "Delete a saved recording on the user's request. mode delete (default) removes the markdown file, the stored lines and the call record; redact blanks the transcript text but keeps the header and metadata. Both also scrub the underlying ambient notes. Not undoable.".into(),
+            name: "recording_policy".into(),
+            description: "Read or edit what happens when a conversation is detected: recorded without asking (auto), asked about (ask) or dropped silently (never). `expect` and `block` set a window of at most 12 hours (RFC 3339 or local `YYYY-MM-DD HH:MM`), `snooze` pauses recording for 1 to 720 minutes, and `set_rule` creates or replaces by label a standing rule that matches on keywords in the first lines heard, weekdays (0 is Sunday) and a local from_hhmm to to_hhmm range (HH:MM, may wrap midnight). Auto and never entries require a `basis`.".into(),
             input_schema: schema(json!({
-                "id": {"type": "string", "description": "Recording id from list_recordings."},
-                "mode": {"type": "string", "enum": ["delete", "redact"]}
-            }), &["id"]),
+                "action": {"type": "string", "enum": ["get", "expect", "block", "snooze", "set_rule", "remove_rule", "remove_window"]},
+                "from": {"type": "string", "description": "expect, block"}, "to": {"type": "string", "description": "expect, block"},
+                "label": {"type": "string", "description": "expect, block, set_rule: name shown to the user."},
+                "basis": {"type": "string", "description": "The user's words or the standing approval this rests on."},
+                "mode": {"type": "string", "enum": ["auto", "ask", "never"], "description": "set_rule, or expect (auto or never). Default for expect: auto."},
+                "minutes": {"type": "integer", "description": "snooze"},
+                "keywords": {"type": "array", "items": {"type": "string"}, "description": "set_rule"},
+                "weekdays": {"type": "array", "items": {"type": "integer"}, "description": "set_rule"},
+                "from_hhmm": {"type": "string", "description": "set_rule"}, "to_hhmm": {"type": "string", "description": "set_rule"},
+                "id": {"type": "string", "description": "remove_rule, remove_window"}
+            }), &["action"]),
         }
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: DeleteRecordingArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let redact = match args.mode.as_deref().unwrap_or("delete") {
-            "delete" => false,
-            "redact" => true,
-            _ => return Err(ToolError::msg("mode must be delete or redact")),
+        use crate::recording_policy as rp;
+        let a: PolicyArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        fn err(m: impl ToString) -> ToolError {
+            ToolError::msg(m.to_string())
+        }
+        let out = match a.action.as_str() {
+            "get" => {
+                let p = rp::current().await;
+                json!({"retention_days": p.retention_days, "snooze_until_ms": p.snooze_until_ms, "rules": p.rules, "windows": p.windows})
+            }
+            "expect" | "block" => {
+                let mode = if a.action == "block" { "never".to_string() } else { a.mode.clone().unwrap_or_else(|| "auto".into()) };
+                let (from, to) = (rp::parse_when(&a.from).map_err(err)?, rp::parse_when(&a.to).map_err(err)?);
+                let (id, _) = rp::update(|p, now| p.add_window(&a.label, from, to, &mode, &a.basis, now)).await.map_err(err)?;
+                json!({"id": id, "label": a.label, "mode": mode, "from_ms": from, "to_ms": to})
+            }
+            "snooze" => {
+                let (until, _) = rp::update(|p, now| p.snooze(a.minutes, now)).await.map_err(err)?;
+                json!({"snooze_until_ms": until})
+            }
+            "set_rule" => {
+                let mode = a.mode.clone().ok_or_else(|| err("mode is required"))?;
+                let when = rp::When { keywords: a.keywords.clone(), weekdays: a.weekdays.clone(), from_hhmm: a.from_hhmm.clone(), to_hhmm: a.to_hhmm.clone() };
+                let (id, _) = rp::update(|p, now| p.set_rule(&a.label, &mode, when, &a.basis, now)).await.map_err(err)?;
+                json!({"id": id, "label": a.label, "mode": mode})
+            }
+            "remove_rule" => json!({"removed": rp::update(|p, _| Ok(p.remove_rule(&a.id))).await.map_err(err)?.0}),
+            "remove_window" => json!({"removed": rp::update(|p, _| Ok(p.remove_window(&a.id))).await.map_err(err)?.0}),
+            _ => return Err(err("unknown action")),
         };
-        let store = crate::ambient::store().map_err(ToolError::msg)?;
-        let out = crate::serve::call_track::delete_recording(&store, &crate::recordings::dir(), &args.id, redact).map_err(ToolError::msg)?;
         Ok(ToolResult::success(out))
     }
 }
@@ -652,7 +523,7 @@ impl Tool for Speak {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "speak".into(),
-            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: one or two short conversational sentences per call, no markdown, no lists, nothing the user would need to read. For a longer answer make several calls in order, each picking up where the last left off, so the user can cut in between. Speaking is never the action itself: when you say you will do something, make those tool calls in the same response, right after the speak. Set expecting only on a line that asks a question aloud, never on an acknowledgement or status line: a spoken question with expecting set to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening, on a call, or when people nearby are in a conversation or meeting: do not speak into a meeting, recorded conversation or out-of-context talk, judge whether a spoken line would be welcome right now, and send unsolicited updates in those moments to the chat and ping_user instead. In passive mode it switches to active by itself, so anything meant for the user is spoken: call it, and keep detail for the chat.".into(),
+            description: "Say something aloud to the user through the phone or computer that is listening. It returns at once and the speech plays as it is produced, so you can keep working. Use it in active mode to answer an <ambient_turn>: one or two short conversational sentences per call, no markdown, no lists, nothing the user would need to read. For a longer answer make several calls in order, each picking up where the last left off, so the user can cut in between. Speaking is never the action itself: when you say you will do something, make those tool calls in the same response, right after the speak. Set expecting only on a line that asks a question aloud, never on an acknowledgement or status line: a spoken question with expecting set to answer, confirmation, choice or dictation ends your turn when it is your last call. It fails when nobody is listening, on a call, or when people nearby are talking to each other. In passive mode it switches to active by itself, so anything meant for the user is spoken: call it, and keep detail for the chat.".into(),
             input_schema: schema(json!({
                 "text": {"type": "string", "description": "What to say, in plain spoken sentences."},
                 "expecting": {"type": "string", "enum": ["answer", "confirmation", "choice", "dictation", "none"], "description": "Set this when you are asking something: it tells the voice classifier a short reply is meant for you."},
@@ -725,7 +596,7 @@ impl Tool for ListSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_sessions".into(),
-            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity, and the profile a session is pinned to (none means the active default). Use it to find the session that owns a piece of work, and one already on the model the work needs. Each session also carries idle_secs (seconds since its last user activity) and cache: \"warm\" when idle under an hour (its prompt cache is likely alive, so a message is cheap) or \"cold\" (cache purged, so the next turn re-reads the whole history at full price). settled: true marks a session that was parked after an hour idle with its memory saved; it is not a routing target, and is deleted 15 days after settled_at. Sending it a message or task wakes it. keep_awake: true means the user opted that session out of automatic settling: never settle it on your own initiative, and say so if asked to.".into(),
+            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity and the profile a session is pinned to (none means the active default), to find the session that owns a piece of work or one already on the right model. Also idle_secs, cache (warm: idle under an hour; cold: prompt cache purged), settled (with settled_at) and keep_awake.".into(),
             input_schema: schema(json!({}), &[]),        }
     }
     async fn execute(
@@ -2148,19 +2019,10 @@ impl Tool for StopSession {
     }
 }
 
-async fn settle_call(path: &str, what: &str, arguments: &Value) -> Result<ToolResult, ToolError> {
-    let id = arguments.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
-    if id.is_empty() {
-        return Err(ToolError::msg(format!("{what} needs session_id")));
-    }
-    if id == crate::mission_control::SESSION_ID {
-        return Err(ToolError::msg("that's your own session"));
-    }
+async fn settle_call(path: &str, id: &str, on: Option<bool>) -> Result<Value, ToolError> {
     let mut body_in = json!({"session": id});
-    if let Some(on) = arguments.get("on").and_then(Value::as_bool) {
+    if let Some(on) = on {
         body_in["on"] = json!(on);
-    } else if path == "/session/keep_awake" {
-        return Err(ToolError::msg("keep_session_awake needs on (true or false)"));
     }
     let info = crate::serve::sidecar::read_daemon_info()
         .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
@@ -2171,7 +2033,7 @@ async fn settle_call(path: &str, what: &str, arguments: &Value) -> Result<ToolRe
         .timeout(std::time::Duration::from_secs(crate::settle::REFLECT_TIMEOUT_SECS + 60))
         .send()
         .await
-        .map_err(|e| ToolError::msg(format!("{what} failed: {e}")))?;
+        .map_err(|e| ToolError::msg(format!("session_state failed: {e}")))?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or_default();
     if status == reqwest::StatusCode::NOT_FOUND {
@@ -2181,51 +2043,44 @@ async fn settle_call(path: &str, what: &str, arguments: &Value) -> Result<ToolRe
         let reason = body.get("error").and_then(Value::as_str).unwrap_or("refused");
         return Err(ToolError::msg(reason.to_string()));
     }
-    Ok(ToolResult::success(body))
+    Ok(body)
 }
 
-pub struct SettleSession;
+pub struct SessionState;
 #[async_trait]
-impl Tool for SettleSession {
+impl Tool for SessionState {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
-            name: "settle_session".into(),
-            description: "Park a finished session early: its memory is saved first (this can take a minute), then it is marked settled, skipped by routing and deleted 15 days later (its saved memory stays). Settling is not deleting: a message or task sent into it wakes it with its transcript intact. Idle sessions settle by themselves after an hour; use this when work is clearly finished. Refused for a session that is running, waiting on the user, has a goal or an unfinished task, and for Mission Control, inboxes and lanes; the reason is returned.".into(),
-            input_schema: schema(json!({"session_id": {"type": "string", "description": "exactly as list_sessions shows it"}}), &["session_id"]),
+            name: "session_state".into(),
+            description: "Settle or unsettle a session, or exempt it from automatic settling. Settling parks a finished session (memory saved first, deleted 15 days later) and is refused with a reason for a busy session; any message to a settled session wakes it. Omitted fields stay unchanged.".into(),
+            input_schema: schema(json!({
+                "session_id": {"type": "string", "description": "Exactly as list_sessions shows it."},
+                "settled": {"type": "boolean", "description": "true parks the session, false wakes it."},
+                "keep_awake": {"type": "boolean", "description": "true stops automatic settling after an hour idle."}
+            }), &["session_id"]),
         }
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        settle_call("/session/settle", "settle_session", &arguments).await
-    }
-}
-
-pub struct KeepSessionAwake;
-#[async_trait]
-impl Tool for KeepSessionAwake {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "keep_session_awake".into(),
-            description: "Opt a session out of (on=true) or back into (on=false) AUTOMATIC settling after an hour idle. Memory saving is unaffected. A manual settle_session still works on it, and the 15-day deletion still applies once it is settled. Set it when the user asks a session to stay awake.".into(),
-            input_schema: schema(json!({"session_id": {"type": "string", "description": "exactly as list_sessions shows it"}, "on": {"type": "boolean"}}), &["session_id", "on"]),
+        let id = arguments.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+        if id.is_empty() {
+            return Err(ToolError::msg("session_state needs session_id"));
         }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        settle_call("/session/keep_awake", "keep_session_awake", &arguments).await
-    }
-}
-
-pub struct UnsettleSession;
-#[async_trait]
-impl Tool for UnsettleSession {
-    fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition {
-            name: "unsettle_session".into(),
-            description: "Wake a settled session so it can be routed to again; its transcript is intact and its 15-day deletion clock is cleared. Its prompt cache is still cold, so prefer a fresh session for work that does not need that thread.".into(),
-            input_schema: schema(json!({"session_id": {"type": "string", "description": "exactly as list_sessions shows it"}}), &["session_id"]),
+        if id == crate::mission_control::SESSION_ID {
+            return Err(ToolError::msg("that's your own session"));
         }
-    }
-    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        settle_call("/session/unsettle", "unsettle_session", &arguments).await
+        let settled = arguments.get("settled").and_then(Value::as_bool);
+        let keep = arguments.get("keep_awake").and_then(Value::as_bool);
+        if settled.is_none() && keep.is_none() {
+            return Err(ToolError::msg("give settled or keep_awake"));
+        }
+        let mut out = json!({});
+        if let Some(on) = keep {
+            out["keep_awake"] = settle_call("/session/keep_awake", id, Some(on)).await?;
+        }
+        if let Some(on) = settled {
+            out["settled"] = settle_call(if on { "/session/settle" } else { "/session/unsettle" }, id, None).await?;
+        }
+        Ok(ToolResult::success(out))
     }
 }
 
@@ -2925,5 +2780,21 @@ mod tests {
         // Verify thread event was emitted
         let events = db.events_for_thread(&task.thread_id, 0, 10).unwrap();
         assert!(events.iter().any(|e| e.event_type == "task.reported"));
+    }
+}
+
+#[cfg(test)]
+mod surface_tests {
+    #[test]
+    fn session_and_recording_controls_are_three_tools() {
+        let mut r = crate::tools::ToolRegistry::new();
+        super::add_mission_control_tools(&mut r);
+        let names: Vec<String> = r.definitions().into_iter().map(|d| d.name).collect();
+        for kept in ["session_state", "recordings", "recording_policy"] {
+            assert!(names.iter().any(|n| n == kept), "{kept}");
+        }
+        for gone in ["settle_session", "unsettle_session", "keep_session_awake", "list_recordings", "delete_recording", "expect_recording", "set_recording_rule"] {
+            assert!(!names.iter().any(|n| n == gone), "{gone}");
+        }
     }
 }
