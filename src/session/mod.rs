@@ -627,6 +627,54 @@ fn start_session_with_role(
     }
 }
 
+/// Run the post-request memory reflection for a stored session that has no live
+/// loop, as a plain conversation. `Ok(false)`: nothing to save, or the model is a
+/// CLI agent (those save memory in their own idle pass).
+pub async fn reflect_stored_session(config: &SnippetConfig, state_path: &Path) -> Result<bool, String> {
+    let workspace = config.workspace.clone();
+    let durable_id = Some(session_id_for_state_path(state_path));
+    let model_config = config.model.clone();
+    let mut model = model_config.build_model_for_session(durable_id.clone());
+    if model.cli_agent_profile().is_some() {
+        return Ok(false);
+    }
+    let prompt_ctx = crate::prompts::PromptContext {
+        worktree: workspace_is_worktree(&workspace),
+        memory: config.memory_enabled,
+        memory_writable: config.memory_enabled,
+        skills: false,
+        vault: false,
+        coordination: false,
+        images: model.supports_images(),
+    };
+    let runtime = AgentRuntime::resolve(
+        SessionConfig::standard(),
+        RuntimeInputs {
+            workspace,
+            durable_id,
+            prompt_ctx,
+            exa_api_key: None,
+            base_model: model_config,
+            setups: None,
+            delegate: None,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let harness = CodingHarness::new(
+        HarnessConfig {
+            system_prompt: runtime.prompt,
+            state_path: Some(state_path.to_path_buf()),
+            resume: true,
+            memory_enabled: config.memory_enabled && runtime.memory,
+            memory_reflect: config.memory_reflect,
+            ..HarnessConfig::default()
+        },
+        runtime.tools,
+        runtime.context,
+    );
+    harness.reflect_stored_session(&mut *model).await.map_err(|e| e.to_string())
+}
+
 /// One session as seen on disk, for the serve daemon's device-wide list.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
@@ -666,6 +714,13 @@ pub struct SessionInfo {
     /// who needs the user without fetching every session's state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attention: Option<serde_json::Value>,
+    /// Parked by auto-settle or Mission Control: not routed to, deleted later.
+    pub settled: bool,
+    pub settled_at: Option<i64>,
+    /// Seconds since `last_active`, never negative.
+    pub idle_secs: i64,
+    /// `warm` while the provider prompt cache is assumed alive, else `cold`.
+    pub cache: &'static str,
 }
 
 /// The inbox session id for an agent: `inbox-<agent-id>`.
@@ -838,6 +893,7 @@ fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<S
 pub fn all_device_sessions() -> Vec<SessionInfo> {
     let workers = working_agents_by_session();
     let store = store_for_sessions();
+    let now = now_unix_secs();
     let mut out: Vec<SessionInfo> = store
         .as_ref()
         .and_then(|store| store.list_all_sessions().ok())
@@ -867,6 +923,10 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                 agent_id: row.agent_id,
                 origin_folder: origin.as_ref().map(|o| o.folder.display().to_string()),
                 branch: origin.and_then(|o| o.branch),
+                settled: row.settled_at.is_some(),
+                settled_at: row.settled_at,
+                idle_secs: crate::settle::idle_secs(now, row.last_active.unwrap_or(0)),
+                cache: crate::settle::cache_state(crate::settle::idle_secs(now, row.last_active.unwrap_or(0))),
             }
         })
         .collect();
@@ -1499,6 +1559,16 @@ fn notification_page(rows: Vec<serde_json::Value>, settings: &crate::mission_con
     serde_json::json!({"events": events, "next_cursor": cursor, "has_more": has_more})
 }
 
+/// Wake a settled session because something addressed it. No-op for an awake one.
+pub fn wake_settled(id: &str) {
+    let Some(store) = store_for_sessions() else { return };
+    if let Ok(Some(row)) = store.get_session_row(id)
+        && row.settled_at.is_some()
+    {
+        let _ = store.set_session_last_active(&row.id, now_unix_secs());
+    }
+}
+
 /// Record that the user sent a message in this session. List sort uses this
 /// stamp, not state-file mtime.
 ///
@@ -1628,6 +1698,10 @@ pub fn create_blank_session_in(
         worker_agent_id: None,
         profile: None,
         attention: None,
+        settled: false,
+        settled_at: None,
+        idle_secs: 0,
+        cache: "warm",
     })
 }
 

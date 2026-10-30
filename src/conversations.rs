@@ -58,7 +58,10 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
              -- What kind of session this is: 'default' | 'conversation' |
              -- 'inbox' | 'mission_control'. This used to be parsed out of the
              -- id's suffix, which is the coupling opaque ids remove.
-             kind TEXT NOT NULL DEFAULT 'conversation'
+             kind TEXT NOT NULL DEFAULT 'conversation',
+             -- Unix seconds when the session was settled (parked: not routed to,
+             -- deleted 15 days later), or NULL while it is awake.
+             settled_at INTEGER
          );
          CREATE INDEX IF NOT EXISTS sessions_workspace
              ON sessions(workspace_key, updated_at DESC);
@@ -126,6 +129,9 @@ fn ensure_session_id_columns(connection: &rusqlite::Connection) -> Result<(), ru
     }
     if !existing.iter().any(|c| c == "legacy_id") {
         connection.execute("ALTER TABLE sessions ADD COLUMN legacy_id TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "settled_at") {
+        connection.execute("ALTER TABLE sessions ADD COLUMN settled_at INTEGER", [])?;
     }
     if !existing.iter().any(|c| c == "kind") {
         connection.execute(
@@ -445,6 +451,8 @@ pub struct SessionRow {
     pub legacy_id: Option<String>,
     /// `default` | `conversation` | `inbox` | `mission_control`.
     pub kind: String,
+    /// When the session was settled, unix seconds; `None` while awake.
+    pub settled_at: Option<i64>,
 }
 
 /// Session metadata that used to live in sidecar files.
@@ -734,10 +742,31 @@ impl Store {
     pub fn set_session_last_active(&self, id: &str, last_active: i64) -> Result<(), StoreError> {
         self.with_connection(|conn| {
             conn.execute(
-                "UPDATE sessions SET last_active = ?2 WHERE id = ?1",
+                "UPDATE sessions SET last_active = ?2, settled_at = NULL WHERE id = ?1",
                 params![id, last_active],
             )?;
             Ok(())
+        })
+    }
+
+    /// Settle (`Some(at)`) or wake (`None`) a session. Returns whether a row changed.
+    pub fn set_session_settled(&self, id: &str, settled_at: Option<i64>) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                "UPDATE sessions SET settled_at = ?2 WHERE (id = ?1 OR legacy_id = ?1) AND settled_at IS NOT ?2",
+                params![id, settled_at],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    /// Ids of sessions settled strictly before `cutoff` (unix seconds).
+    pub fn sessions_settled_before(&self, cutoff: i64) -> Result<Vec<String>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT id FROM sessions WHERE settled_at IS NOT NULL AND settled_at < ?1")?;
+            let rows = stmt.query_map(params![cutoff], |r| r.get::<_, String>(0))?;
+            rows.collect()
         })
     }
 
@@ -848,7 +877,7 @@ impl Store {
 }
 
 const SESSION_COLUMNS: &str = "id, workspace_key, workspace, title, status, created_at, \
-     updated_at, last_active, profile, role, agent_id, legacy_id, kind";
+     updated_at, last_active, profile, role, agent_id, legacy_id, kind, settled_at";
 
 impl Store {
     /// Save a session's scalar state, creating the row on first write.
@@ -1239,6 +1268,7 @@ fn session_row_from(row: &rusqlite::Row<'_>) -> Result<SessionRow, rusqlite::Err
         agent_id: row.get(10)?,
         legacy_id: row.get(11)?,
         kind: row.get(12)?,
+        settled_at: row.get(13)?,
     })
 }
 
@@ -1295,6 +1325,7 @@ mod tests {
             agent_id: None,
             legacy_id: None,
             kind: "conversation".into(),
+            settled_at: None,
         }
     }
 

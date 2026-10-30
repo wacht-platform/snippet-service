@@ -308,6 +308,23 @@ impl CodingHarness {
         Ok(true)
     }
 
+    /// Curate memory for a stored session with no live loop (used before settling it).
+    /// `Ok(false)` means there was nothing to reflect on or reflection is off.
+    pub async fn reflect_stored_session(&self, model: &mut dyn AgentModel) -> Result<bool, ToolError> {
+        if !self.config.memory_enabled || !self.config.memory_reflect || self.context.agent_id().is_some() {
+            return Ok(false);
+        }
+        let Some(mut state) = self.load_from_store().await? else {
+            return Err(ToolError::msg("session not found in the store"));
+        };
+        if !self.reflect_on_request(model, &state).await? {
+            return Ok(false);
+        }
+        state.reflected_events = Some(state.events.len());
+        self.persist_state(&mut state).await?;
+        Ok(true)
+    }
+
     fn memory_log(&self, line: &str) {
         self.debug_log(line);
         eprintln!("{} {line}", self.session_id().unwrap_or_default());

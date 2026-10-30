@@ -41,6 +41,7 @@ pub mod recurring;
 pub mod routing;
 pub mod sanitize;
 pub mod serve;
+pub mod settle;
 pub mod session;
 pub mod voiceprint;
 pub mod shell_guard;

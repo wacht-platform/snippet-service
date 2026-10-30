@@ -218,6 +218,7 @@ async fn deliver_direct(
                 .into_iter()
                 .filter(|prior| prior.sequence < event.sequence)
                 .collect();
+            crate::session::wake_settled(&session_id);
             tx.send(LoopInput::UserMessage(direct_message_envelope(event, &history)))
                 .map_err(|error| format!("deliver task message: {error}"))?;
             return Ok(());
@@ -280,6 +281,7 @@ async fn deliver_direct(
         .filter(|prior| prior.sequence < event.sequence)
         .collect();
     let envelope = direct_message_envelope(event, &history);
+    crate::session::wake_settled(&session_id);
     tx.send(LoopInput::UserMessage(envelope))
         .map_err(|error| format!("deliver direct message: {error}"))?;
     Ok(())

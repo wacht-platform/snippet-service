@@ -377,19 +377,27 @@ pub(crate) async fn delete_session(
     if !d.authed(&a.token) {
         return unauthorized();
     }
-    let Some(sp) = state_path_for_id(&req.session) else {
+    if !purge_session(&d, &req.session, false).await {
         return (StatusCode::NOT_FOUND, "no such session").into_response();
+    }
+    Json(serde_json::json!({"deleted": true})).into_response()
+}
+
+/// Stop a session's loop and remove its record, transcript and artifacts. Memory is removed
+/// too unless `keep_memory`. False when the session does not exist.
+pub(crate) async fn purge_session(d: &Shared, id: &str, keep_memory: bool) -> bool {
+    let Some(sp) = state_path_for_id(id) else {
+        return false;
     };
-    {
-        let mut sessions = d.sessions.lock().await;
-        if let Some(s) = sessions.remove(&req.session) {
-            s.join.abort();
-        }
+    if let Some(s) = d.sessions.lock().await.remove(id) {
+        s.join.abort();
     }
     crate::session::remove_session_files(&sp);
-    crate::memory::delete_session_memory(&req.session);
-    crate::artifacts::delete_session(&req.session);
-    Json(serde_json::json!({"deleted": true})).into_response()
+    if !keep_memory {
+        crate::memory::delete_session_memory(id);
+    }
+    crate::artifacts::delete_session(id);
+    true
 }
 
 #[derive(Deserialize)]

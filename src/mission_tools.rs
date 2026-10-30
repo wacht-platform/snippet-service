@@ -72,6 +72,8 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(CancelMissionTask);
     registry.insert(CleanUpSessions);
     registry.insert(StopSession);
+    registry.insert(SettleSession);
+    registry.insert(UnsettleSession);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
     registry.insert(Speak);
@@ -471,7 +473,7 @@ impl Tool for ListSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_sessions".into(),
-            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity, and the profile a session is pinned to (none means the active default). Use it to find the session that owns a piece of work, and one already on the model the work needs.".into(),
+            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity, and the profile a session is pinned to (none means the active default). Use it to find the session that owns a piece of work, and one already on the model the work needs. Each session also carries idle_secs (seconds since its last user activity) and cache: \"warm\" when idle under an hour (its prompt cache is likely alive, so a message is cheap) or \"cold\" (cache purged, so the next turn re-reads the whole history at full price). settled: true marks a session that was parked after an hour idle with its memory saved; it is not a routing target, and is deleted 15 days after settled_at. Sending it a message or task wakes it.".into(),
             input_schema: schema(json!({}), &[]),        }
     }
     async fn execute(
@@ -961,6 +963,7 @@ async fn create_task(
             )))?;
         // Store the CANONICAL id.
         let session_id = crate::session::session_id_for_state_path(&path);
+        let target_row = store.get_session_row(&session_id).ok().flatten();
         // The worker, in order of specificity: what the caller named, then the
         // agent the target session is already bound to, then the general coding
         // agent. The session's own binding is the right default because that is
@@ -1123,6 +1126,20 @@ async fn create_task(
                 blockers.iter().map(|b| format!("\"{}\" ({})", b.title, b.id)).collect::<Vec<_>>().join(", ")
             )
         };
+        let mut note = note;
+        if let Some(row) = target_row.as_ref() {
+            let idle = crate::settle::idle_secs(chrono::Utc::now().timestamp(), row.last_active.unwrap_or(0));
+            if row.settled_at.is_some() {
+                crate::session::wake_settled(&session_id);
+                note.push_str(" The target session was settled; it has been woken because it is being addressed.");
+            }
+            if crate::settle::cache_state(idle) == "cold" {
+                note.push_str(&format!(
+                    " Advisory: the target session was idle {} min, so its prompt cache is cold and the next turn re-reads its whole history at full price; a fresh session (create_mission_session, handoff_mode fresh) pointed at this one's saved memory may be cheaper.",
+                    idle / 60
+                ));
+            }
+        }
         let mut result = json!({
             "task": task_view(&task),
             "agent_id": agent_id,
@@ -1879,6 +1896,66 @@ impl Tool for StopSession {
     }
 }
 
+async fn settle_call(path: &str, what: &str, arguments: &Value) -> Result<ToolResult, ToolError> {
+    let id = arguments.get("session_id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if id.is_empty() {
+        return Err(ToolError::msg(format!("{what} needs session_id")));
+    }
+    if id == crate::mission_control::SESSION_ID {
+        return Err(ToolError::msg("that's your own session"));
+    }
+    let info = crate::serve::sidecar::read_daemon_info()
+        .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
+    let url = format!("{}{path}?token={}", info.api_url.trim_end_matches('/'), info.token);
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(&json!({"session": id}))
+        .timeout(std::time::Duration::from_secs(crate::settle::REFLECT_TIMEOUT_SECS + 60))
+        .send()
+        .await
+        .map_err(|e| ToolError::msg(format!("{what} failed: {e}")))?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(ToolError::msg(format!("no session `{id}`")));
+    }
+    if !status.is_success() {
+        let reason = body.get("error").and_then(Value::as_str).unwrap_or("refused");
+        return Err(ToolError::msg(reason.to_string()));
+    }
+    Ok(ToolResult::success(body))
+}
+
+pub struct SettleSession;
+#[async_trait]
+impl Tool for SettleSession {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "settle_session".into(),
+            description: "Park a finished session early: its memory is saved first (this can take a minute), then it is marked settled, skipped by routing and deleted 15 days later (its saved memory stays). Settling is not deleting: a message or task sent into it wakes it with its transcript intact. Idle sessions settle by themselves after an hour; use this when work is clearly finished. Refused for a session that is running, waiting on the user, has a goal or an unfinished task, and for Mission Control, inboxes and lanes; the reason is returned.".into(),
+            input_schema: schema(json!({"session_id": {"type": "string", "description": "exactly as list_sessions shows it"}}), &["session_id"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        settle_call("/session/settle", "settle_session", &arguments).await
+    }
+}
+
+pub struct UnsettleSession;
+#[async_trait]
+impl Tool for UnsettleSession {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "unsettle_session".into(),
+            description: "Wake a settled session so it can be routed to again; its transcript is intact and its 15-day deletion clock is cleared. Its prompt cache is still cold, so prefer a fresh session for work that does not need that thread.".into(),
+            input_schema: schema(json!({"session_id": {"type": "string", "description": "exactly as list_sessions shows it"}}), &["session_id"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        settle_call("/session/unsettle", "unsettle_session", &arguments).await
+    }
+}
+
 #[derive(Deserialize)]
 struct RegisterAgentArgs {
     id: String,
@@ -2528,6 +2605,7 @@ mod tests {
                 agent_id: None,
                 legacy_id: None,
                 kind: "conversation".into(),
+                settled_at: None,
             },
             &[],
             "[]",

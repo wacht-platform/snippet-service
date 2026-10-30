@@ -64,6 +64,7 @@ mod mission_control;
 pub use mission_control::{mission_error, validated_owned_paths};
 mod recurring;
 mod routing_routes;
+mod settle_routes;
 pub mod session_routes;
 pub(crate) use session_routes::*;
 use crate::term::SessionTerms;
@@ -652,6 +653,12 @@ impl Daemon {
             }
             _ => {}
         }
+        if matches!(
+            input,
+            LoopInput::UserMessage(_) | LoopInput::Answer(_) | LoopInput::Queue(_) | LoopInput::SteerQueued(_)
+        ) {
+            crate::session::wake_settled(id);
+        }
         let input = match input {
             LoopInput::UserMessage(text) => {
                 LoopInput::UserMessage(self.with_transcripts(text).await)
@@ -851,6 +858,10 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { memory_routes::consolidation_loop(d).await });
     }
+    {
+        let d = daemon.clone();
+        tokio::spawn(async move { settle_routes::settle_loop(d).await });
+    }
     if let Some(rx) = crate::routing::subscribe() {
         let d = daemon.clone();
         tokio::spawn(async move { routing_routes::routing_loop(d, rx).await });
@@ -950,6 +961,8 @@ pub async fn run_serve(
         .route("/session/fork", post(fork_session))
         .route("/session/exec", post(exec_in_session))
         .route("/session/delete", post(delete_session))
+        .route("/session/settle", post(settle_routes::settle_route))
+        .route("/session/unsettle", post(settle_routes::unsettle_route))
         .route("/session/interrupt", post(session_routes::interrupt_session))
         .route("/session/rename", post(rename_session))
         .route("/git/worktrees", get(git_worktrees))
