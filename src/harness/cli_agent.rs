@@ -829,6 +829,12 @@ fn cli_meta_tool_definitions(once: bool, lanes: bool, hidden: &[&str]) -> Vec<Na
         .collect()
 }
 
+const CLI_STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn cli_stall_watched(state: &HarnessState, process_alive: bool, tools_running: bool) -> bool {
+    state.status == HarnessStatus::Running && process_alive && !tools_running
+}
+
 fn cli_goal_due(state: &HarnessState, idle_pass: bool, outbox_empty: bool, once: bool) -> bool {
     !once
         && idle_pass
@@ -1186,6 +1192,7 @@ impl CodingHarness {
             FuturesUnordered::new();
         let mut outbox: Vec<String> = Vec::new();
         let mut held_envelopes: Vec<String> = Vec::new();
+        let mut last_heard = tokio::time::Instant::now();
 
         if state.status == HarnessStatus::Running
             && let Some(text) = state.messages.iter().rev().find_map(|m| match m {
@@ -1369,6 +1376,7 @@ impl CodingHarness {
                         *first = format!("<system-reminder>{}</system-reminder>\n\n{first}", reminder.join("\n\n"));
                     }
                     session.mark_synced(&state.messages, state.compactions, state.last_prompt_tokens);
+                    last_heard = tokio::time::Instant::now();
                     for text in std::mem::take(&mut outbox) {
                         let text = match text.strip_prefix(COMMAND_MARK) {
                             Some(command) => command.to_string(),
@@ -1392,6 +1400,30 @@ impl CodingHarness {
             }
 
             tokio::select! {
+                _ = tokio::time::sleep_until(last_heard + CLI_STALL_AFTER), if cli_stall_watched(&state, process.is_some(), !running.is_empty()) => {
+                    if let Some(mut p) = process.take() {
+                        let _ = p.child.start_kill();
+                    }
+                    generation += 1;
+                    if let Ok(mut queue) = steers.lock() {
+                        queue.clear();
+                    }
+                    if let Some(s) = sink.as_ref() {
+                        StreamBuffer::clear(s);
+                    }
+                    state.events.push(HarnessEvent::ModelError {
+                        message: format!(
+                            "{} went silent for {} minutes mid-turn, so it was stopped. Send a message to carry on.",
+                            kind.label(),
+                            CLI_STALL_AFTER.as_secs() / 60
+                        ),
+                    });
+                    state.status = HarnessStatus::Failed;
+                    self.persist(&mut state, &lanes).await?;
+                    if once {
+                        break;
+                    }
+                }
                 _ = tokio::time::sleep_until(save_at.unwrap_or_else(tokio::time::Instant::now)), if save_at.is_some() && state.status == HarnessStatus::Idle && outbox.is_empty() => {
                     save_at = None;
                     if super::memory_reflection::reflection_scope(&state).is_some()
@@ -1501,6 +1533,10 @@ impl CodingHarness {
                             }
                             generation += 1;
                             running.clear();
+                            // Already in history; left queued they'd fire after the next, unrelated turn.
+                            if let Ok(mut queue) = steers.lock() {
+                                queue.clear();
+                            }
                             pending_approval = None;
                             state.pending_question = None;
                             if let Some(s) = sink.as_ref() {
@@ -1575,6 +1611,7 @@ impl CodingHarness {
                     let Some(line) = line else { continue };
                     match line {
                         CliLine::Event(g, event) if g == generation => {
+                            last_heard = tokio::time::Instant::now();
                             if let Some(id) = event.get("conversation_id").and_then(Value::as_str)
                                 && kind == CliKind::Antigravity
                             {
@@ -1815,6 +1852,7 @@ impl CodingHarness {
                 }
                 call = mcp_rx.recv() => {
                     let Some(mut call) = call else { continue };
+                    last_heard = tokio::time::Instant::now();
                     if call.name == "custom_tool" {
                         call.name = call.arguments.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                         call.arguments = call.arguments.get("arguments").cloned().unwrap_or_else(|| json!({}));
@@ -1940,7 +1978,9 @@ impl CodingHarness {
                         _ => running.push(Box::pin(self.execute_cli_call(call))),
                     }
                 }
-                Some(()) = running.next(), if !running.is_empty() => {}
+                Some(()) = running.next(), if !running.is_empty() => {
+                    last_heard = tokio::time::Instant::now();
+                }
             }
         }
         if let Some(mut p) = process.take() {
@@ -2422,5 +2462,15 @@ mod goal_tests {
         let mut paused = active_goal_state(HarnessStatus::Idle);
         paused.goal.as_mut().unwrap().status = GoalStatus::Paused;
         assert!(!cli_goal_due(&paused, true, true, false));
+    }
+
+    #[test]
+    fn stall_watch_only_covers_a_silent_running_turn() {
+        let running = HarnessState { status: HarnessStatus::Running, ..Default::default() };
+        assert!(cli_stall_watched(&running, true, false));
+        assert!(!cli_stall_watched(&running, false, false));
+        assert!(!cli_stall_watched(&running, true, true));
+        let idle = HarnessState { status: HarnessStatus::Idle, ..Default::default() };
+        assert!(!cli_stall_watched(&idle, true, false));
     }
 }
