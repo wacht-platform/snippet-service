@@ -43,6 +43,7 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                 }
             };
             let colors = d.store.agent_colors().unwrap_or_default();
+            let profiles = d.store.agent_profiles().unwrap_or_default();
             let mut grouped: HashMap<String, serde_json::Map<String, serde_json::Value>> =
                 HashMap::new();
             for (agent_id, status, count) in counts {
@@ -60,6 +61,9 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                         object.insert("task_counts_since".into(), since.clone().into());
                         if let Some(color) = colors.get(&agent.id) {
                             object.insert("color".into(), color.clone().into());
+                        }
+                        if let Some(profile) = profiles.get(&agent.id) {
+                            object.insert("profile".into(), profile.clone().into());
                         }
                     }
                     value
@@ -262,6 +266,8 @@ pub(crate) struct AgentReq {
     pub(crate) role: crate::coordination::types::AgentRole,
     #[serde(default)]
     pub(crate) capabilities: Vec<String>,
+    #[serde(default)]
+    pub(crate) profile: Option<String>,
 }
 fn default_agent_kind() -> crate::coordination::types::AgentKind {
     crate::coordination::types::AgentKind::Worker
@@ -283,6 +289,12 @@ pub(crate) async fn create_agent(
     }
     if req.id.trim().is_empty() || req.handle.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "id and handle are required").into_response();
+    }
+    let profile = req.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
+    if let Some(name) = profile.as_deref() {
+        if let Err(error) = crate::mission_tools::check_profile(name).await {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
     }
     let agent = crate::coordination::types::Agent {
         id: req.id,
@@ -313,7 +325,16 @@ pub(crate) async fn create_agent(
             .into_response();
     }
     match d.store.create_agent(&agent) {
-        Ok(()) => (StatusCode::CREATED, Json(agent)).into_response(),
+        Ok(()) => {
+            if let Some(name) = profile.as_deref() {
+                let _ = d.store.set_agent_profile(&agent.id, Some(name));
+            }
+            let mut body = serde_json::to_value(&agent).unwrap_or_default();
+            if let (Some(object), Some(name)) = (body.as_object_mut(), profile) {
+                object.insert("profile".into(), name.into());
+            }
+            (StatusCode::CREATED, Json(body)).into_response()
+        }
         Err(error) => {
             if fresh_home {
                 let _ = std::fs::remove_dir_all(home.root());
@@ -391,6 +412,37 @@ pub(crate) async fn set_agent_color(
         Ok(true) => Json(serde_json::json!({ "id": agent_id, "color": color })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent color: {error}"))
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentProfileReq {
+    pub(crate) profile: Option<String>,
+}
+
+/// POST /agents/{id}/profile — the inference profile this agent works on in
+/// every session it takes, or null to fall back to the session's own model.
+pub(crate) async fn set_agent_profile(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(req): Json<AgentProfileReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let profile = req.profile.map(|p| p.trim().to_string()).filter(|p| !p.is_empty());
+    if let Some(name) = profile.as_deref() {
+        d.reload_config().await;
+        if let Err(error) = crate::mission_tools::check_profile(name).await {
+            return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+        }
+    }
+    match d.store.set_agent_profile(&agent_id, profile.as_deref()) {
+        Ok(true) => Json(serde_json::json!({ "id": agent_id, "profile": profile })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent profile: {error}"))
             .into_response(),
     }
 }

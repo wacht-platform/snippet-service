@@ -515,7 +515,8 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         },
         task.id,
     );
-    let switch_to = match task.profile.as_deref().filter(|p| !p.trim().is_empty()) {
+    let task_profile = d.task_profile(&task);
+    let switch_to = match task_profile.as_deref() {
         Some(profile) => {
             let sessions = d.sessions.lock().await;
             let same = sessions
@@ -526,7 +527,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         None => None,
     };
     let keep = d.config.lock().map(|c| c.keep_task_profile).unwrap_or(true);
-    if let Some(profile) = task.profile.as_deref().filter(|p| keep && !p.trim().is_empty()) {
+    if let Some(profile) = task_profile.as_deref().filter(|_| keep) {
         if let Some(sp) = crate::session::state_path_for_id(&session_id) {
             crate::session::write_session_profile(&sp, profile);
         }
@@ -796,9 +797,10 @@ async fn wait_for_idle_switch(d: &Daemon, task_id: &str) -> Result<Option<Task>,
     let Some(task) = d.store.get_task(task_id).map_err(|error| error.to_string())? else {
         return Ok(None);
     };
-    let Some(profile) = task.profile.as_deref().filter(|p| !p.trim().is_empty()) else {
+    let Some(profile) = d.task_profile(&task) else {
         return Ok(None);
     };
+    let profile = profile.as_str();
     let same = {
         let sessions = d.sessions.lock().await;
         match sessions.get(&task.session_id) {

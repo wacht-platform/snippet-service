@@ -440,13 +440,46 @@ impl Daemon {
                 tasks
                     .into_iter()
                     .filter(|t| t.session_id == id)
-                    .find_map(|t| t.profile.filter(|p| !p.trim().is_empty()))
+                    .find_map(|t| self.task_profile(&t))
             })
             .or_else(|| read_session_profile(sp))
             .or_else(|| self.routed_profile(id))
     }
 
+    /// The profile an agent is configured to work on, when it names one the
+    /// config still defines. A stale name is ignored rather than failing a start.
+    pub(crate) fn agent_profile(&self, agent_id: &str) -> Option<String> {
+        let profile = self.store.agent_profile(agent_id).ok().flatten()?;
+        let known = self
+            .config
+            .lock()
+            .map(|c| c.profile_names().iter().any(|name| *name == profile))
+            .unwrap_or(false);
+        if !known {
+            eprintln!("[agents] profile `{profile}` of `{agent_id}` is not defined; ignoring it");
+        }
+        known.then_some(profile)
+    }
+
+    /// The profile a task runs on: its own override first, then the profile of
+    /// the agent doing the work.
+    pub(crate) fn task_profile(&self, task: &crate::coordination::Task) -> Option<String> {
+        if let Some(profile) = task.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            return Some(profile.to_string());
+        }
+        let roster = self.store.list_task_agents(&task.id).ok()?;
+        let worker = roster
+            .iter()
+            .find(|m| m.status == "active" && m.removed_at.is_none())?;
+        self.agent_profile(&worker.agent_id)
+    }
+
     pub(crate) fn routed_profile(&self, id: &str) -> Option<String> {
+        if let Some(agent_id) = id.strip_prefix("inbox-") {
+            if let Some(profile) = self.agent_profile(agent_id) {
+                return Some(profile);
+            }
+        }
         let route = if id == crate::mission_control::SESSION_ID {
             crate::routing::Route::Mission
         } else if crate::session::is_inbox_session_id(id) {
@@ -834,6 +867,7 @@ pub async fn run_serve(
         .route("/agents/{agent_id}/board", get(agent_board))
         .route("/agents/{agent_id}/status", post(set_agent_status))
         .route("/agents/{agent_id}/color", post(set_agent_color))
+        .route("/agents/{agent_id}/profile", post(set_agent_profile))
         .route("/agents/{agent_id}", axum::routing::delete(delete_agent))
         .merge(coordination::router())
         .route(

@@ -113,6 +113,7 @@ use super::*;
             status: crate::coordination::types::AgentStatus::Active,
             role: crate::coordination::types::AgentRole::Researcher,
             capabilities: vec!["web_search".into()],
+            profile: None,
         }
     }
 

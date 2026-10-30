@@ -278,7 +278,7 @@ impl Tool for ListCoordinationAgents {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_coordination_agents".into(),
-            description: "The agent directory: every agent's id, role, status, capabilities and a one-line summary of what it is for. Use it to choose whom to message, invite onto a task (invite_task_agent) or run a lane as (delegate_task agent). Only active agents take new work.".into(),
+            description: "The agent directory: every agent's id, role, status, capabilities, the inference profile it works on (when it has one) and a one-line summary of what it is for. Use it to choose whom to message, invite onto a task (invite_task_agent) or run a lane as (delegate_task agent). Only active agents take new work.".into(),
             input_schema: schema(json!({}), &[]),
         }
     }
@@ -290,6 +290,7 @@ impl Tool for ListCoordinationAgents {
             &ctx.mission_control_root()
                 .unwrap_or_else(|| crate::config::snippet_home().join("mission-control")),
         );
+        let profiles = db(ctx)?.agent_profiles().unwrap_or_default();
         let agents: Vec<Value> = agents
             .into_iter()
             .map(|agent| {
@@ -301,6 +302,9 @@ impl Tool for ListCoordinationAgents {
                 let mut row = serde_json::to_value(&agent).unwrap_or(Value::Null);
                 if !summary.is_empty() {
                     row["summary"] = json!(summary);
+                }
+                if let Some(profile) = profiles.get(&agent.id) {
+                    row["profile"] = json!(profile);
                 }
                 row
             })

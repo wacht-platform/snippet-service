@@ -154,6 +154,7 @@ impl Store {
                 params![id],
             )?;
             tx.execute("DELETE FROM agent_colors WHERE agent_id = ?1", params![id])?;
+            tx.execute("DELETE FROM agent_profiles WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(AgentRemoval::Removed)
@@ -165,6 +166,52 @@ impl Store {
             let mut stmt = conn.prepare("SELECT agent_id, color FROM agent_colors")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub fn agent_profiles(&self) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare("SELECT agent_id, profile FROM agent_profiles")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// The inference profile an agent works on, if one is set.
+    pub fn agent_profile(&self, id: &str) -> Result<Option<String>, StoreError> {
+        self.with_connection(|conn| {
+            match conn.query_row(
+                "SELECT profile FROM agent_profiles WHERE agent_id = ?1",
+                params![id],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(profile) => Ok(Some(profile).filter(|p| !p.trim().is_empty())),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
+    /// Set or clear (`None`) the agent's profile. Returns whether the agent exists.
+    pub fn set_agent_profile(&self, id: &str, profile: Option<&str>) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            match profile {
+                Some(profile) => conn.execute(
+                    "INSERT INTO agent_profiles (agent_id, profile) VALUES (?1, ?2)
+                     ON CONFLICT(agent_id) DO UPDATE SET profile = excluded.profile",
+                    params![id, profile],
+                )?,
+                None => conn.execute("DELETE FROM agent_profiles WHERE agent_id = ?1", params![id])?,
+            };
+            Ok(true)
         })
     }
 

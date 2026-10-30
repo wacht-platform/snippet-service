@@ -735,7 +735,7 @@ impl Tool for ListProfiles {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_profiles".into(),
-            description: "The inference profiles a task may name with create_mission_task(profile=…), with the active default. Names are exact and an unknown one is rejected, so pick from this list; leave profile out to keep the target session's own model.".into(),
+            description: "The inference profiles a task may name with create_mission_task(profile=…), with the active default. Names are exact and an unknown one is rejected, so pick from this list. Leave profile out normally: the assigned agent's own profile (see list_coordination_agents), or else the target session's model, applies.".into(),
             input_schema: schema(json!({}), &[]),
         }
     }
@@ -911,7 +911,7 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's for rescuing a rate-limited session. Work that simply needs another model belongs in a session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session_id":{"type":"string"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session_id"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -1887,6 +1887,8 @@ struct RegisterAgentArgs {
     #[serde(default)]
     capabilities: Vec<String>,
     identity: String,
+    #[serde(default)]
+    profile: Option<String>,
 }
 /// The one step that makes a built agent real: its identity file and its
 /// directory row, written together so an agent is never half-created.
@@ -1903,7 +1905,8 @@ impl Tool for RegisterAgent {
                     "display_name": {"type": "string"},
                     "role": {"type": "string", "enum": ["implementer", "reviewer", "tester", "researcher", "release"]},
                     "capabilities": {"type": "array", "items": {"type": "string"}, "description": "short tags, e.g. rust, code-review"},
-                    "identity": {"type": "string", "description": "identity.md in markdown: who the agent is, its mandate, how it works, what it checks, how it reports"}
+                    "identity": {"type": "string", "description": "identity.md in markdown: who the agent is, its mandate, how it works, what it checks, how it reports"},
+                    "profile": {"type": "string", "description": "optional; the inference profile this agent always works on, named exactly as list_profiles returns it. Cheaper profiles for routine work, stronger ones for hard reasoning. Omit to leave the agent's profile unchanged."}
                 }),
                 &["id", "display_name", "role", "identity"],
             ),
@@ -1921,6 +1924,10 @@ impl Tool for RegisterAgent {
         }
         if args.id == crate::coordination::SNIPPET_AGENT_ID || args.id == mission_control::SESSION_ID {
             return Err(ToolError::msg(format!("`{}` is a built-in agent id", args.id)));
+        }
+        let profile = args.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
+        if let Some(name) = profile.as_deref() {
+            check_profile(name).await?;
         }
         let home = crate::coordination::AgentHome::new(
             crate::coordination::agents_root(&root(ctx)?),
@@ -1941,8 +1948,14 @@ impl Tool for RegisterAgent {
         db(ctx)?
             .upsert_agent(&agent)
             .map_err(|e| ToolError::msg(format!("register agent: {e}")))?;
+        if let Some(name) = profile.as_deref() {
+            db(ctx)?
+                .set_agent_profile(&args.id, Some(name))
+                .map_err(|e| ToolError::msg(format!("set agent profile: {e}")))?;
+        }
         Ok(ToolResult::success(json!({
             "agent_id": args.id,
+            "profile": profile,
             "home": home.root().display().to_string(),
             "identity_path": home.identity_path().display().to_string(),
         })))
