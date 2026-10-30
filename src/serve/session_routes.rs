@@ -421,6 +421,15 @@ pub(crate) async fn interrupt_session(
         status,
         Some(crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)
     );
+    if !live && working {
+        if let Some(mut state) = crate::session::read_session_state(&sp) {
+            state.status = crate::harness::HarnessStatus::Idle;
+            if crate::session::write_session_state(&sp, &state).is_ok() {
+                return Json(serde_json::json!({"stopped": true, "was": status, "note": "cleared a run left over from a restart"}))
+                    .into_response();
+            }
+        }
+    }
     if !live || !working {
         return Json(serde_json::json!({"stopped": false, "status": status, "note": "the session isn't running"}))
             .into_response();
