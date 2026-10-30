@@ -50,7 +50,10 @@ static LIVE: Mutex<Vec<Arc<StreamTurn>>> = Mutex::new(Vec::new());
 pub fn apply_config(c: &crate::config::SnippetConfig) {
     let clean = |k: &Option<String>| k.clone().map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
     let speed = c.ambient.tts_speed.clamp(80, 150);
-    let rime_key = clean(&c.rime_api_key).filter(|_| c.ambient.tts_provider == "rime");
+    let rime = clean(&c.rime_api_key);
+    let deepgram = clean(&c.deepgram_api_key);
+    let prefer_rime = c.ambient.tts_provider == "rime";
+    let rime_key = if prefer_rime || deepgram.is_none() { rime } else { None };
     let next = if let Some(key) = rime_key {
         Some(Config {
             provider: Provider::Rime,
@@ -63,7 +66,7 @@ pub fn apply_config(c: &crate::config::SnippetConfig) {
         })
     } else {
         let voice = if c.ambient.tts_voice.starts_with("flux-") { c.ambient.tts_voice.clone() } else { DEFAULT_VOICE.to_string() };
-        clean(&c.deepgram_api_key).map(|key| Config {
+        deepgram.map(|key| Config {
             provider: Provider::Flux,
             key,
             voice,
@@ -1101,6 +1104,9 @@ mod tests {
         c.ambient.tts_provider = "deepgram".into();
         apply_config(&c);
         assert_eq!(provider(), Some(Provider::Flux));
+        c.deepgram_api_key = None;
+        apply_config(&c);
+        assert_eq!(provider(), Some(Provider::Rime), "a Rime key alone is enough to start replies");
         apply_config(&crate::config::SnippetConfig::default());
         assert_eq!(provider(), None);
     }

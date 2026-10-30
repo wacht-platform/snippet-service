@@ -260,9 +260,13 @@ pub(crate) async fn set_settings(
         let rime = next_key(req.rime_api_key.clone(), &c.rime_api_key);
         match invalid.map_or_else(|| ambient.normalized(), Err) {
             Err(e) => Err((StatusCode::BAD_REQUEST, e)),
-            Ok(ambient) if ambient.enabled && !has_key(&deepgram) => Err((
+            Ok(ambient) if ambient.enabled && !has_key(&deepgram) && !has_key(&rime) => Err((
                 StatusCode::BAD_REQUEST,
-                "Add the Deepgram key in Settings → Voice before turning ambient listening on".into(),
+                "Add a Deepgram or Rime key in Settings → Voice before turning ambient listening on".into(),
+            )),
+            Ok(ambient) if ambient.enabled && ambient.stt == "flux" && !has_key(&deepgram) => Err((
+                StatusCode::BAD_REQUEST,
+                "Deepgram Flux speech recognition needs the Deepgram key in Settings → Voice".into(),
             )),
             Ok(ambient) if ambient.tts_provider == "rime" && !has_key(&rime) => Err((
                 StatusCode::BAD_REQUEST,
