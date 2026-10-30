@@ -1298,6 +1298,11 @@ fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value
     {
         return None;
     }
+    if matches!(kind, "done" | "idle")
+        && event.get("session").and_then(|s| s.as_str()).is_some_and(is_inbox_session_id)
+    {
+        return None;
+    }
     if matches!(kind, "waiting" | "done" | "error" | "idle" | "ping") {
         let session = event.get("session")?.as_str()?;
         value["destination"] = serde_json::json!({"type": "session", "id": session});
