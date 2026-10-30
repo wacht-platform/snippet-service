@@ -717,6 +717,8 @@ pub struct SessionInfo {
     /// Parked by auto-settle or Mission Control: not routed to, deleted later.
     pub settled: bool,
     pub settled_at: Option<i64>,
+    /// Opted out of automatic settling.
+    pub keep_awake: bool,
     /// Seconds since `last_active`, never negative.
     pub idle_secs: i64,
     /// `warm` while the provider prompt cache is assumed alive, else `cold`.
@@ -925,6 +927,7 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                 branch: origin.and_then(|o| o.branch),
                 settled: row.settled_at.is_some(),
                 settled_at: row.settled_at,
+                keep_awake: row.keep_awake,
                 idle_secs: crate::settle::idle_secs(now, row.last_active.unwrap_or(0)),
                 cache: crate::settle::cache_state(crate::settle::idle_secs(now, row.last_active.unwrap_or(0))),
             }
@@ -1700,6 +1703,7 @@ pub fn create_blank_session_in(
         attention: None,
         settled: false,
         settled_at: None,
+        keep_awake: false,
         idle_secs: 0,
         cache: "warm",
     })

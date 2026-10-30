@@ -74,6 +74,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(StopSession);
     registry.insert(SettleSession);
     registry.insert(UnsettleSession);
+    registry.insert(KeepSessionAwake);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
     registry.insert(Speak);
@@ -473,7 +474,7 @@ impl Tool for ListSessions {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "list_sessions".into(),
-            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity, and the profile a session is pinned to (none means the active default). Use it to find the session that owns a piece of work, and one already on the model the work needs. Each session also carries idle_secs (seconds since its last user activity) and cache: \"warm\" when idle under an hour (its prompt cache is likely alive, so a message is cheap) or \"cold\" (cache purged, so the next turn re-reads the whole history at full price). settled: true marks a session that was parked after an hour idle with its memory saved; it is not a routing target, and is deleted 15 days after settled_at. Sending it a message or task wakes it.".into(),
+            description: "Catalog of durable project sessions on this device: id, title, workspace, status, last activity, and the profile a session is pinned to (none means the active default). Use it to find the session that owns a piece of work, and one already on the model the work needs. Each session also carries idle_secs (seconds since its last user activity) and cache: \"warm\" when idle under an hour (its prompt cache is likely alive, so a message is cheap) or \"cold\" (cache purged, so the next turn re-reads the whole history at full price). settled: true marks a session that was parked after an hour idle with its memory saved; it is not a routing target, and is deleted 15 days after settled_at. Sending it a message or task wakes it. keep_awake: true means the user opted that session out of automatic settling: never settle it on your own initiative, and say so if asked to.".into(),
             input_schema: schema(json!({}), &[]),        }
     }
     async fn execute(
@@ -1904,12 +1905,18 @@ async fn settle_call(path: &str, what: &str, arguments: &Value) -> Result<ToolRe
     if id == crate::mission_control::SESSION_ID {
         return Err(ToolError::msg("that's your own session"));
     }
+    let mut body_in = json!({"session": id});
+    if let Some(on) = arguments.get("on").and_then(Value::as_bool) {
+        body_in["on"] = json!(on);
+    } else if path == "/session/keep_awake" {
+        return Err(ToolError::msg("keep_session_awake needs on (true or false)"));
+    }
     let info = crate::serve::sidecar::read_daemon_info()
         .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
     let url = format!("{}{path}?token={}", info.api_url.trim_end_matches('/'), info.token);
     let response = reqwest::Client::new()
         .post(&url)
-        .json(&json!({"session": id}))
+        .json(&body_in)
         .timeout(std::time::Duration::from_secs(crate::settle::REFLECT_TIMEOUT_SECS + 60))
         .send()
         .await
@@ -1938,6 +1945,21 @@ impl Tool for SettleSession {
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         settle_call("/session/settle", "settle_session", &arguments).await
+    }
+}
+
+pub struct KeepSessionAwake;
+#[async_trait]
+impl Tool for KeepSessionAwake {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "keep_session_awake".into(),
+            description: "Opt a session out of (on=true) or back into (on=false) AUTOMATIC settling after an hour idle. Memory saving is unaffected. A manual settle_session still works on it, and the 15-day deletion still applies once it is settled. Set it when the user asks a session to stay awake.".into(),
+            input_schema: schema(json!({"session_id": {"type": "string", "description": "exactly as list_sessions shows it"}, "on": {"type": "boolean"}}), &["session_id", "on"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        settle_call("/session/keep_awake", "keep_session_awake", &arguments).await
     }
 }
 
@@ -2606,6 +2628,7 @@ mod tests {
                 legacy_id: None,
                 kind: "conversation".into(),
                 settled_at: None,
+                keep_awake: false,
             },
             &[],
             "[]",

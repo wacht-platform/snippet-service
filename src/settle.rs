@@ -35,6 +35,7 @@ pub struct SettleFacts {
     pub role: String,
     pub status: String,
     pub settled: bool,
+    pub keep_awake: bool,
     pub live_busy: bool,
     pub has_goal: bool,
     pub has_open_task: bool,
@@ -74,7 +75,7 @@ pub fn refusal(f: &SettleFacts) -> Option<String> {
 
 /// Whether the auto-sweep should try to settle this session now.
 pub fn due_for_auto_settle(f: &SettleFacts, idle: i64) -> bool {
-    !f.settled && idle >= COLD_AFTER_SECS && refusal(f).is_none()
+    !f.settled && !f.keep_awake && idle >= COLD_AFTER_SECS && refusal(f).is_none()
 }
 
 /// Sessions whose settled time is more than `DELETE_AFTER_SECS` ago.
@@ -138,6 +139,9 @@ mod tests {
         assert!(due_for_auto_settle(&f, COLD_AFTER_SECS));
         let settled = SettleFacts { settled: true, ..facts() };
         assert!(!due_for_auto_settle(&settled, COLD_AFTER_SECS * 5));
+        let kept = SettleFacts { keep_awake: true, ..facts() };
+        assert!(!due_for_auto_settle(&kept, COLD_AFTER_SECS * 5));
+        assert!(refusal(&kept).is_none(), "manual settle stays allowed");
     }
 
     fn row(id: &str) -> SessionRow {
@@ -156,6 +160,7 @@ mod tests {
             legacy_id: None,
             kind: "conversation".into(),
             settled_at: None,
+            keep_awake: false,
         }
     }
 
@@ -198,5 +203,11 @@ mod tests {
         assert_eq!(row.settled_at, None);
         assert!(db.set_session_settled("legacy", Some(5)).unwrap());
         assert_eq!(db.get_session_row("legacy").unwrap().unwrap().settled_at, Some(5));
+        assert!(!row.keep_awake);
+        assert!(db.set_session_keep_awake("legacy", true).unwrap());
+        assert!(db.get_session_row("legacy").unwrap().unwrap().keep_awake);
+        assert!(!db.set_session_keep_awake("missing", true).unwrap());
+        db.set_session_last_active("legacy", 9).unwrap();
+        assert!(db.get_session_row("legacy").unwrap().unwrap().keep_awake, "waking keeps the flag");
     }
 }

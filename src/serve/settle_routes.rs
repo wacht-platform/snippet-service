@@ -53,6 +53,7 @@ async fn gather(d: &Shared, id: &str) -> Option<Gathered> {
         role: row.role.clone(),
         status: row.status.clone(),
         settled: row.settled_at.is_some(),
+        keep_awake: row.keep_awake,
         live_busy: (alive && busy_status) || state.compacting || state.pending_question.is_some(),
         has_goal: state
             .goal
@@ -206,6 +207,34 @@ pub(crate) async fn unsettle_route(
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct KeepAwakeReq {
+    session: String,
+    on: bool,
+}
+
+pub(crate) fn set_keep_awake(id: &str, on: bool) -> Option<serde_json::Value> {
+    let store = crate::session::store_for_sessions()?;
+    let row = store.get_session_row(id).ok()??;
+    store.set_session_keep_awake(&row.id, on).ok()?;
+    Some(session_json(&row.id))
+}
+
+// POST /session/keep_awake {session, on}
+pub(crate) async fn keep_awake_route(
+    State(d): State<Shared>,
+    Query(a): Query<Auth>,
+    Json(req): Json<KeepAwakeReq>,
+) -> Response {
+    if !d.authed(&a.token) {
+        return unauthorized();
+    }
+    match set_keep_awake(&req.session, req.on) {
+        Some(s) => Json(serde_json::json!({"ok": true, "session": s})).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such session").into_response(),
+    }
+}
+
 pub(crate) async fn settle_loop(d: Shared) {
     loop {
         tokio::time::sleep(Duration::from_secs(SWEEP_EVERY_SECS)).await;
@@ -229,7 +258,7 @@ pub(crate) async fn sweep_once(d: &Shared) -> (usize, usize) {
 
     let mut candidates: Vec<_> = crate::session::list_routable_sessions()
         .into_iter()
-        .filter(|s| !s.settled && s.idle_secs >= COLD_AFTER_SECS && s.status != "running")
+        .filter(|s| !s.settled && !s.keep_awake && s.idle_secs >= COLD_AFTER_SECS && s.status != "running")
         .collect();
     candidates.sort_by(|a, b| b.idle_secs.cmp(&a.idle_secs));
     let mut spent = 0;

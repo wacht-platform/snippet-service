@@ -61,7 +61,9 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
              kind TEXT NOT NULL DEFAULT 'conversation',
              -- Unix seconds when the session was settled (parked: not routed to,
              -- deleted 15 days later), or NULL while it is awake.
-             settled_at INTEGER
+             settled_at INTEGER,
+             -- 1 opts the session out of AUTOMATIC settling (manual settle still works).
+             keep_awake INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS sessions_workspace
              ON sessions(workspace_key, updated_at DESC);
@@ -132,6 +134,12 @@ fn ensure_session_id_columns(connection: &rusqlite::Connection) -> Result<(), ru
     }
     if !existing.iter().any(|c| c == "settled_at") {
         connection.execute("ALTER TABLE sessions ADD COLUMN settled_at INTEGER", [])?;
+    }
+    if !existing.iter().any(|c| c == "keep_awake") {
+        connection.execute(
+            "ALTER TABLE sessions ADD COLUMN keep_awake INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
     if !existing.iter().any(|c| c == "kind") {
         connection.execute(
@@ -453,6 +461,8 @@ pub struct SessionRow {
     pub kind: String,
     /// When the session was settled, unix seconds; `None` while awake.
     pub settled_at: Option<i64>,
+    /// Opted out of automatic settling.
+    pub keep_awake: bool,
 }
 
 /// Session metadata that used to live in sidecar files.
@@ -760,6 +770,17 @@ impl Store {
         })
     }
 
+    /// Opt a session in or out of automatic settling. Returns whether it exists.
+    pub fn set_session_keep_awake(&self, id: &str, on: bool) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let changed = conn.execute(
+                "UPDATE sessions SET keep_awake = ?2 WHERE id = ?1 OR legacy_id = ?1",
+                params![id, on as i64],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     /// Ids of sessions settled strictly before `cutoff` (unix seconds).
     pub fn sessions_settled_before(&self, cutoff: i64) -> Result<Vec<String>, StoreError> {
         self.with_connection(|conn| {
@@ -877,7 +898,7 @@ impl Store {
 }
 
 const SESSION_COLUMNS: &str = "id, workspace_key, workspace, title, status, created_at, \
-     updated_at, last_active, profile, role, agent_id, legacy_id, kind, settled_at";
+     updated_at, last_active, profile, role, agent_id, legacy_id, kind, settled_at, keep_awake";
 
 impl Store {
     /// Save a session's scalar state, creating the row on first write.
@@ -1269,6 +1290,7 @@ fn session_row_from(row: &rusqlite::Row<'_>) -> Result<SessionRow, rusqlite::Err
         legacy_id: row.get(11)?,
         kind: row.get(12)?,
         settled_at: row.get(13)?,
+        keep_awake: row.get::<_, i64>(14)? != 0,
     })
 }
 
@@ -1326,6 +1348,7 @@ mod tests {
             legacy_id: None,
             kind: "conversation".into(),
             settled_at: None,
+            keep_awake: false,
         }
     }
 

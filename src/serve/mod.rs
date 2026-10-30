@@ -962,6 +962,7 @@ pub async fn run_serve(
         .route("/session/exec", post(exec_in_session))
         .route("/session/delete", post(delete_session))
         .route("/session/settle", post(settle_routes::settle_route))
+        .route("/session/keep_awake", post(settle_routes::keep_awake_route))
         .route("/session/unsettle", post(settle_routes::unsettle_route))
         .route("/session/interrupt", post(session_routes::interrupt_session))
         .route("/session/rename", post(rename_session))
