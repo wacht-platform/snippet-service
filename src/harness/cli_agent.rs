@@ -1477,9 +1477,30 @@ impl CodingHarness {
                             if let Some(s) = sink.as_ref() {
                                 StreamBuffer::clear(s);
                             }
+                            super::runner::pause_goal_on_interrupt(&mut state);
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;
                             state.status = HarnessStatus::Idle;
+                        }
+                        goal_input @ (LoopInput::SetGoal(_) | LoopInput::ResumeGoal | LoopInput::CancelGoal) => {
+                            let mid_turn = state.status == HarnessStatus::Running && process.is_some();
+                            let before = state.messages.len();
+                            self.apply_input(&mut state, goal_input);
+                            if state.messages.len() > before
+                                && let Some(HarnessMessage::User { content }) = state.messages.last()
+                            {
+                                let directive = content.clone();
+                                if mid_turn && kind == CliKind::Antigravity {
+                                    if let Ok(mut queue) = steers.lock() {
+                                        queue.push(directive);
+                                    }
+                                } else {
+                                    outbox.push(directive);
+                                }
+                            } else if state.status == HarnessStatus::Running && process.is_none() && outbox.is_empty() {
+                                state.status = HarnessStatus::Idle;
+                            }
+                            self.persist(&mut state, &lanes).await?;
                         }
                         LoopInput::SteerQueued(id) => {
                             let Some(text) = take_queued(&mut state, &id) else {
@@ -1709,6 +1730,21 @@ impl CodingHarness {
                                 if !leftover.is_empty() {
                                     outbox.push(leftover.join("\n\n"));
                                     state.status = HarnessStatus::Running;
+                                }
+                                if state.status == HarnessStatus::Idle
+                                    && state.pending_question.is_none()
+                                    && matches!(compaction, CliCompaction::Idle)
+                                    && !compact_wanted
+                                    && outbox.is_empty()
+                                    && !once
+                                    && state.goal.as_ref().is_some_and(|g| g.status == GoalStatus::Active)
+                                {
+                                    self.drive_goal_turn(&mut state, &mut vars);
+                                    if state.status == HarnessStatus::Running
+                                        && let Some(HarnessMessage::User { content }) = state.messages.last()
+                                    {
+                                        outbox.push(content.clone());
+                                    }
                                 }
                             }
                             if !parse.calls.is_empty() {

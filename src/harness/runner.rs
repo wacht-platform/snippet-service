@@ -809,7 +809,7 @@ impl CodingHarness {
 
 /// A manual stop must also stop the goal: left Active, the idle loop re-drives it
 /// and a scheduled job's later runs stay blocked behind it.
-fn pause_goal_on_interrupt(state: &mut HarnessState) {
+pub(super) fn pause_goal_on_interrupt(state: &mut HarnessState) {
     if let Some(goal) = state.goal.as_mut().filter(|g| g.status == GoalStatus::Active) {
         goal.status = GoalStatus::Paused;
         goal.resume_at = 0;
