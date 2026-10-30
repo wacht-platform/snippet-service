@@ -82,6 +82,14 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(AmbientExpect);
     registry.insert(AmbientSearch);
     registry.insert(ListRecordings);
+    registry.insert(ExpectRecording);
+    registry.insert(BlockRecording);
+    registry.insert(SnoozeRecording);
+    registry.insert(GetRecordingPolicy);
+    registry.insert(SetRecordingRule);
+    registry.insert(RemoveRecordingRule);
+    registry.insert(RemoveRecordingWindow);
+    registry.insert(DeleteRecording);
     registry.insert(UpdateBrief);
     registry.insert(ScheduleFollowup);
     registry.insert(PingUser);
@@ -375,6 +383,224 @@ impl Tool for ListRecordings {
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ListRecordingsArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         Ok(ToolResult::success(json!({"recordings": crate::recordings::list(&crate::recordings::dir(), args.limit.unwrap_or(20))})))
+    }
+}
+
+#[derive(Deserialize)]
+struct WindowArgs {
+    from: String,
+    to: String,
+    label: String,
+    #[serde(default)]
+    basis: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+async fn add_recording_window(args: WindowArgs, mode: &str) -> Result<ToolResult, ToolError> {
+    use crate::recording_policy as rp;
+    let (from, to) = (rp::parse_when(&args.from).map_err(ToolError::msg)?, rp::parse_when(&args.to).map_err(ToolError::msg)?);
+    let (id, _) = rp::update(|p, now| p.add_window(&args.label, from, to, mode, &args.basis, now)).await.map_err(ToolError::msg)?;
+    Ok(ToolResult::success(json!({"id": id, "label": args.label, "mode": mode, "from_ms": from, "to_ms": to})))
+}
+
+const WINDOW_SCHEMA_NOTE: &str = "Times are RFC 3339 or local `YYYY-MM-DD HH:MM`; a window spans at most 12 hours. `basis` is required: quote what the user said or the standing approval this rests on. Tell the user what you set.";
+
+pub struct ExpectRecording;
+#[async_trait]
+impl Tool for ExpectRecording {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "expect_recording".into(),
+            description: format!("Declare a time range in which a conversation is expected and should be recorded without asking (mode auto, the default), for example a meeting the user said to record. {WINDOW_SCHEMA_NOTE}"),
+            input_schema: schema(json!({
+                "from": {"type": "string"}, "to": {"type": "string"},
+                "label": {"type": "string", "description": "Short name shown to the user, e.g. 'Board meeting'."},
+                "basis": {"type": "string"},
+                "mode": {"type": "string", "enum": ["auto", "never"]}
+            }), &["from", "to", "label", "basis"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: WindowArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let mode = args.mode.clone().unwrap_or_else(|| "auto".into());
+        add_recording_window(args, &mode).await
+    }
+}
+
+pub struct BlockRecording;
+#[async_trait]
+impl Tool for BlockRecording {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "block_recording".into(),
+            description: format!("Declare a time range in which nothing is recorded and no recording prompt is shown. {WINDOW_SCHEMA_NOTE}"),
+            input_schema: schema(json!({
+                "from": {"type": "string"}, "to": {"type": "string"},
+                "label": {"type": "string"}, "basis": {"type": "string"}
+            }), &["from", "to", "label", "basis"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: WindowArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        add_recording_window(args, "never").await
+    }
+}
+
+#[derive(Deserialize)]
+struct SnoozeArgs {
+    minutes: i64,
+    #[serde(default)]
+    reason: String,
+}
+
+pub struct SnoozeRecording;
+#[async_trait]
+impl Tool for SnoozeRecording {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "snooze_recording".into(),
+            description: "Stop recording and recording prompts for a while (1 minute to 12 hours), on the user's word such as 'do not record for an hour'. Overrides every auto rule. The user can clear a snooze in the app.".into(),
+            input_schema: schema(json!({
+                "minutes": {"type": "integer", "description": "1 to 720."},
+                "reason": {"type": "string", "description": "What the user said."}
+            }), &["minutes"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: SnoozeArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let (until, _) = crate::recording_policy::update(|p, now| p.snooze(args.minutes, now)).await.map_err(ToolError::msg)?;
+        eprintln!("[recording] snoozed {} min: {}", args.minutes, args.reason);
+        Ok(ToolResult::success(json!({"snooze_until_ms": until})))
+    }
+}
+
+pub struct GetRecordingPolicy;
+#[async_trait]
+impl Tool for GetRecordingPolicy {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "get_recording_policy".into(),
+            description: "Show the current recording policy: retention days, snooze, standing rules and one-off windows with their ids and bases.".into(),
+            input_schema: schema(json!({}), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, _arguments: Value) -> Result<ToolResult, ToolError> {
+        let p = crate::recording_policy::current().await;
+        Ok(ToolResult::success(json!({"retention_days": p.retention_days, "snooze_until_ms": p.snooze_until_ms, "rules": p.rules, "windows": p.windows})))
+    }
+}
+
+#[derive(Deserialize)]
+struct RuleArgs {
+    label: String,
+    mode: String,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    weekdays: Vec<u8>,
+    #[serde(default)]
+    from_hhmm: Option<String>,
+    #[serde(default)]
+    to_hhmm: Option<String>,
+    #[serde(default)]
+    basis: String,
+}
+
+pub struct SetRecordingRule;
+#[async_trait]
+impl Tool for SetRecordingRule {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "set_recording_rule".into(),
+            description: "Create or replace (by label) a standing recording rule. mode auto starts recording without asking when a detected conversation matches; ask always asks; never drops it silently. A rule matches when the first lines heard contain any keyword (case-insensitive), the local weekday is listed (0 Sunday to 6 Saturday) and the local time is inside from_hhmm to to_hhmm (HH:MM, may wrap midnight); omitted conditions match anything. Create auto or never rules only from the user's explicit request or a standing approval you can quote in `basis` (required for auto and never); otherwise ask the user first. Tell the user what you set.".into(),
+            input_schema: schema(json!({
+                "label": {"type": "string"},
+                "mode": {"type": "string", "enum": ["auto", "ask", "never"]},
+                "keywords": {"type": "array", "items": {"type": "string"}},
+                "weekdays": {"type": "array", "items": {"type": "integer"}},
+                "from_hhmm": {"type": "string"}, "to_hhmm": {"type": "string"},
+                "basis": {"type": "string", "description": "The user's words or the standing approval this rests on."}
+            }), &["label", "mode", "basis"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: RuleArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let when = crate::recording_policy::When { keywords: args.keywords, weekdays: args.weekdays, from_hhmm: args.from_hhmm, to_hhmm: args.to_hhmm };
+        let (id, _) = crate::recording_policy::update(|p, now| p.set_rule(&args.label, &args.mode, when, &args.basis, now)).await.map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"id": id, "label": args.label, "mode": args.mode})))
+    }
+}
+
+#[derive(Deserialize)]
+struct IdArgs {
+    id: String,
+}
+
+pub struct RemoveRecordingRule;
+#[async_trait]
+impl Tool for RemoveRecordingRule {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "remove_recording_rule".into(),
+            description: "Remove a standing recording rule by id (see get_recording_policy).".into(),
+            input_schema: schema(json!({"id": {"type": "string"}}), &["id"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: IdArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let (removed, _) = crate::recording_policy::update(|p, _| Ok(p.remove_rule(&args.id))).await.map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"removed": removed})))
+    }
+}
+
+pub struct RemoveRecordingWindow;
+#[async_trait]
+impl Tool for RemoveRecordingWindow {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "remove_recording_window".into(),
+            description: "Remove an expected or blocked recording window by id (see get_recording_policy).".into(),
+            input_schema: schema(json!({"id": {"type": "string"}}), &["id"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: IdArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let (removed, _) = crate::recording_policy::update(|p, _| Ok(p.remove_window(&args.id))).await.map_err(ToolError::msg)?;
+        Ok(ToolResult::success(json!({"removed": removed})))
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteRecordingArgs {
+    id: String,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+pub struct DeleteRecording;
+#[async_trait]
+impl Tool for DeleteRecording {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "delete_recording".into(),
+            description: "Delete a saved recording on the user's request. mode delete (default) removes the markdown file, the stored lines and the call record; redact blanks the transcript text but keeps the header and metadata. Both also scrub the underlying ambient notes. Not undoable.".into(),
+            input_schema: schema(json!({
+                "id": {"type": "string", "description": "Recording id from list_recordings."},
+                "mode": {"type": "string", "enum": ["delete", "redact"]}
+            }), &["id"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: DeleteRecordingArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let redact = match args.mode.as_deref().unwrap_or("delete") {
+            "delete" => false,
+            "redact" => true,
+            _ => return Err(ToolError::msg("mode must be delete or redact")),
+        };
+        let store = crate::ambient::store().map_err(ToolError::msg)?;
+        let out = crate::serve::call_track::delete_recording(&store, &crate::recordings::dir(), &args.id, redact).map_err(ToolError::msg)?;
+        Ok(ToolResult::success(out))
     }
 }
 

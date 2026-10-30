@@ -188,6 +188,8 @@ pub struct SnippetConfig {
     pub voice: VoiceConfig,
     #[serde(default, skip_serializing_if = "AmbientConfig::is_default")]
     pub ambient: AmbientConfig,
+    #[serde(default, skip_serializing_if = "crate::recording_policy::RecordingPolicy::is_default")]
+    pub recording: crate::recording_policy::RecordingPolicy,
     /// Saved provider profiles, keyed by name. Multiple can be configured; one is
     /// active (`active_setup`). Declared after the scalar keys so the emitted TOML
     /// stays valid (tables must follow top-level scalars).
@@ -278,6 +280,7 @@ impl Default for SnippetConfig {
             routing: Default::default(),
             voice: VoiceConfig::default(),
             ambient: AmbientConfig::default(),
+            recording: Default::default(),
         }
     }
 }

@@ -43,7 +43,8 @@ mod assembly;
 mod listener;
 mod ambient_watch;
 mod call_detect;
-mod call_track;
+pub(crate) mod call_track;
+mod recording_routes;
 mod speakers;
 pub(crate) use agent_routes::*;
 pub mod config_routes;
@@ -801,6 +802,7 @@ pub async fn run_serve(
     mission_control::register_builtin_agents(&daemon);
     ambient_routes::resume(daemon.clone());
     call_track::recover(daemon.clone());
+    call_track::sweep_loop(daemon.clone());
     ambient_routes::warm_voice(daemon.clone());
     {
         let d = daemon.clone();
@@ -932,6 +934,8 @@ pub async fn run_serve(
         .route("/ambient/turns/{id}/audio", get(ambient_routes::turn_audio))
         .route("/ambient/activity", post(ambient_routes::activity))
         .route("/ambient/conversation/end", post(ambient_routes::end_conversation))
+        .route("/ambient/recording", get(recording_routes::get).post(recording_routes::set))
+        .route("/ambient/recordings/delete", post(recording_routes::delete))
         .route("/ambient/call", get(call_track::status))
         .route("/ambient/call/{call_id}/track", post(call_track::track))
         .route("/ambient/call/{call_id}/ignore", post(call_track::ignore))

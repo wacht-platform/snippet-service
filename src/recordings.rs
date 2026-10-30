@@ -18,7 +18,7 @@ pub fn write(dir: &Path, id: &str, device: &str, started_ms: i64, ended_ms: i64,
     let short: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
     let path = dir.join(format!("{day}-{short}.md"));
     let body = format!(
-        "# Recorded conversation\n\n- id: {id}\n- device: {device}\n- started: {}\n- ended: {}\n- lines: {lines}\n\nLines are not labelled by speaker.\n\n## Transcript\n\n{transcript}",
+        "# Recorded conversation\n\n- id: {id}\n- device: {device}\n- started: {}\n- ended: {}\n- lines: {lines}\n\nSpeaker labels are best-effort voice matching; You is the user.\n\n## Transcript\n\n{transcript}",
         iso(started_ms),
         iso(ended_ms),
     );
@@ -28,6 +28,34 @@ pub fn write(dir: &Path, id: &str, device: &str, started_ms: i64, ended_ms: i64,
 
 /// Newest first by start time.
 pub fn list(dir: &Path, limit: usize) -> Vec<Value> {
+    let mut rows = all(dir);
+    rows.truncate(limit.clamp(1, 100));
+    rows
+}
+
+pub fn find(dir: &Path, id: &str) -> Option<PathBuf> {
+    all(dir).into_iter().find(|r| r["id"] == id).and_then(|r| r["path"].as_str().map(PathBuf::from))
+}
+
+/// Files whose recording started before the cutoff.
+pub fn older_than(dir: &Path, cutoff_ms: i64) -> Vec<PathBuf> {
+    all(dir)
+        .into_iter()
+        .filter(|r| {
+            r["started"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).is_some_and(|t| t.timestamp_millis() < cutoff_ms)
+        })
+        .filter_map(|r| r["path"].as_str().map(PathBuf::from))
+        .collect()
+}
+
+/// Blanks the transcript but keeps the header.
+pub fn redact(path: &Path) -> std::io::Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let Some(at) = text.find("## Transcript") else { return Ok(()) };
+    std::fs::write(path, format!("{}## Transcript\n\n[redacted]\n", &text[..at]))
+}
+
+fn all(dir: &Path) -> Vec<Value> {
     let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
     let mut rows: Vec<Value> = entries
         .flatten()
@@ -48,7 +76,6 @@ pub fn list(dir: &Path, limit: usize) -> Vec<Value> {
         })
         .collect();
     rows.sort_by(|a, b| b["started"].as_str().cmp(&a["started"].as_str()));
-    rows.truncate(limit.clamp(1, 100));
     rows
 }
 
