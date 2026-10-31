@@ -83,6 +83,8 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(crate::goal_tools::UpdateGoal);
     registry.insert(crate::goal_tools::CloseGoal);
     registry.insert(crate::goal_tools::ListGoals);
+    registry.insert(crate::goal_plan::PlanGoal);
+    registry.insert(crate::goal_plan::ReplanGoal);
     registry.insert(Speak);
     registry.insert(AmbientMode);
     registry.insert(AmbientExpect);
@@ -1224,7 +1226,7 @@ impl Tool for CreateMissionTask {
 /// The canonical id for however the caller named a session: an id in either
 /// form, a conversation uuid, a workspace path or a title fragment, plus
 /// `latest`. A miss or a tie names the three nearest sessions.
-fn resolve_target_session(query: &str) -> Result<String, ToolError> {
+pub(crate) fn resolve_target_session(query: &str) -> Result<String, ToolError> {
     let q = query.trim().trim_start_matches("session:");
     if q.is_empty() {
         return Err(ToolError::msg("name the target session"));
@@ -1242,6 +1244,13 @@ fn resolve_target_session(query: &str) -> Result<String, ToolError> {
             candidate_list(&candidates)
         ))),
     }
+}
+
+/// File one task from tool-shaped arguments; returns the tool's data (`task`, `waiting_on`, ...).
+pub(crate) async fn create_task_value(ctx: &ToolContext, args: Value) -> Result<Value, ToolError> {
+    let args: CreateTaskArgs = serde_json::from_value(args).map_err(|e| ToolError::msg(format!("slice arguments: {e}")))?;
+    let out = create_task(ctx, args, ("agent", crate::mission_control::SESSION_ID)).await?;
+    Ok(out.value["data"].clone())
 }
 
 fn candidate_list(candidates: &[crate::session_resolve::Candidate]) -> String {

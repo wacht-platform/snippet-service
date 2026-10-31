@@ -20,9 +20,14 @@ fn canonical_task_session(id: &str) -> String {
 /// memory when it has one. Empty if the task has no ledger yet and cannot be read.
 pub fn ledger_block(store: &Store, task: &Task, full: bool) -> String {
     match store.task_state(&task.id) {
-        Ok(Some(state)) => format!("{}{}", state.render(full), memory_line(task)),
+        Ok(Some(state)) => format!("{}{}{}", state.render(full), memory_line(task), goal_part(store, task, full)),
         _ => String::new(),
     }
+}
+
+fn goal_part(store: &Store, task: &Task, full: bool) -> String {
+    let block = crate::coordination::goals::goal_block(store, task, full);
+    if block.is_empty() { block } else { format!("\n{}", block.trim_end()) }
 }
 
 fn memory_line(task: &Task) -> String {
@@ -48,7 +53,7 @@ pub fn dispatch_ledger(store: &Store, task: &Task, workspace: &Path, scope: &str
     if state.brief.trim() == scope.trim() {
         state.brief.clear();
     }
-    format!("{}{}", state.render(true), memory_line(task))
+    format!("{}{}{}", state.render(true), memory_line(task), goal_part(store, task, true))
 }
 
 /// Gaps in a content brief worth fixing before the work starts.

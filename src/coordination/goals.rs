@@ -128,6 +128,70 @@ pub fn is_open(task: &Task) -> bool {
     !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
 }
 
+/// Slice number of a task in the goal's plan (0-based, stable across replans).
+pub fn slice_number(plan: &serde_json::Value, task_id: &str) -> Option<u64> {
+    plan["slices"].as_array()?.iter().find(|s| s["task_id"] == task_id)?["n"].as_u64()
+}
+
+fn slice_state(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Done => "done",
+        TaskStatus::InProgress => "in progress",
+        TaskStatus::InReview => "in review",
+        TaskStatus::Blocked => "waiting",
+        TaskStatus::Todo => "ready",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "dropped",
+    }
+}
+
+/// What a task's agent should know of the goal around it: the outcome, its own
+/// slice, what each neighbour owns and whether it is done, and (when `full`) the
+/// reports of finished neighbours its blockers do not already carry.
+pub fn goal_block(store: &Store, task: &Task, full: bool) -> String {
+    let Some(goal) = task.goal_id.as_deref().and_then(|id| store.get_goal(id).ok().flatten()) else {
+        return String::new();
+    };
+    let siblings: Vec<Task> = store.goal_tasks(&goal.id).unwrap_or_default().into_iter().filter(|t| t.id != task.id).collect();
+    let label = |t: &Task| match slice_number(&goal.plan, &t.id) {
+        Some(n) => format!("slice {n}"),
+        None => "task".to_string(),
+    };
+    let mut out = format!("[goal]\ngoal: {}: {}\n", clip(&goal.title, 120), clip(&goal.outcome, if full { 500 } else { 200 }));
+    if full && !goal.acceptance.is_empty() {
+        let checks: Vec<String> = goal.acceptance.iter().map(|c| clip(&c.criterion, 100)).collect();
+        out.push_str(&format!("goal acceptance: {}\n", checks.join("; ")));
+    }
+    out.push_str(&format!("this is {}: {}\n", label(task), clip(&task.title, 100)));
+    let others: Vec<&Task> = siblings.iter().filter(|t| t.status != TaskStatus::Cancelled).collect();
+    if !others.is_empty() {
+        out.push_str("other slices (each agent owns its own; do not redo theirs):\n");
+        for t in &others {
+            let agent = store
+                .list_task_agents(&t.id)
+                .ok()
+                .and_then(|r| r.into_iter().find(|m| m.removed_at.is_none()))
+                .map(|m| format!(", {}", m.agent_id))
+                .unwrap_or_default();
+            out.push_str(&format!("  - {} \"{}\" ({}{agent}): {}\n", label(t), clip(&t.title, 80), slice_state(&t.status), clip(&t.description, 100)));
+        }
+    }
+    if full {
+        let blockers = store.blockers_of(&task.id).unwrap_or_default();
+        let reports: Vec<String> = others
+            .iter()
+            .filter(|t| t.status == TaskStatus::Done && !blockers.contains(&t.id))
+            .filter_map(|t| t.result.as_ref().map(|r| format!("  - {} \"{}\": {}\n", label(t), clip(&t.title, 80), clip(&r.summary, 300))))
+            .take(6)
+            .collect();
+        if !reports.is_empty() {
+            out.push_str(&format!("reports from finished slices:\n{}", reports.concat()));
+        }
+    }
+    out.push_str("[/goal]\n");
+    out
+}
+
 const GOAL_COLUMNS: &str = "id, title, outcome, acceptance_json, status, requester, created_at, closed_at, plan_json";
 
 fn goal_from_row(row: &rusqlite::Row<'_>) -> Result<Goal, rusqlite::Error> {
