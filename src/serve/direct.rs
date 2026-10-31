@@ -304,7 +304,7 @@ async fn deliver_direct(
             deliver_by_urgency(d, &session_id, envelope, &event.payload).await;
             return Ok(());
         }
-        if !from_self && crate::session::is_lane_session_id(&session_id) {
+        if crate::session::is_lane_session_id(&session_id) {
             if let Some((parent, lane)) = session_id.rsplit_once("/lanes/") {
                 let envelope = format!(
                     "[direct_message]\nthread_id: {}\nfrom: {}:{}\n{tags}note: sent to this lane while it runs; act on it now.\nbody: {body}\n[/direct_message]",
