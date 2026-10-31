@@ -719,6 +719,12 @@ pub struct SessionInfo {
     pub settled_at: Option<i64>,
     /// Opted out of automatic settling.
     pub keep_awake: bool,
+    /// Uncommitted change size of the workspace; filled for the session list only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<crate::session_stats::Changes>,
+    /// Unix seconds when the current run began; only while running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_since: Option<i64>,
     /// Seconds since `last_active`, never negative.
     pub idle_secs: i64,
     /// `warm` while the provider prompt cache is assumed alive, else `cold`.
@@ -928,6 +934,8 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                 settled: row.settled_at.is_some(),
                 settled_at: row.settled_at,
                 keep_awake: row.keep_awake,
+                changes: None,
+                running_since: None,
                 idle_secs: crate::settle::idle_secs(now, row.last_active.unwrap_or(0)),
                 cache: crate::settle::cache_state(crate::settle::idle_secs(now, row.last_active.unwrap_or(0))),
             }
@@ -1704,6 +1712,8 @@ pub fn create_blank_session_in(
         settled: false,
         settled_at: None,
         keep_awake: false,
+        changes: None,
+        running_since: None,
         idle_secs: 0,
         cache: "warm",
     })

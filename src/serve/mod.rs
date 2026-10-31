@@ -1070,6 +1070,7 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
     if let Some(n) = q.limit {
         sessions.truncate(n);
     }
+    crate::session_stats::attach_changes(&mut sessions);
     let live = d.sessions.lock().await;
     let out: Vec<serde_json::Value> = sessions
         .into_iter()
@@ -1092,6 +1093,7 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
                 s.status = "idle".to_string();
             }
             let running = s.status == "running";
+            crate::session_stats::attach_running_since(&mut s);
             let profile = live_s
                 .and_then(|l| l.profile.clone())
                 .or_else(|| state_path_for_id(&s.id).and_then(|p| read_session_profile(&p)));
