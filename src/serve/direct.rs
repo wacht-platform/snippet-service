@@ -304,6 +304,18 @@ async fn deliver_direct(
             deliver_by_urgency(d, &session_id, envelope, &event.payload).await;
             return Ok(());
         }
+        if !from_self && crate::session::is_lane_session_id(&session_id) {
+            if let Some((parent, lane)) = session_id.rsplit_once("/lanes/") {
+                let envelope = format!(
+                    "[direct_message]\nthread_id: {}\nfrom: {}:{}\n{tags}note: sent to this lane while it runs; act on it now.\nbody: {body}\n[/direct_message]",
+                    event.thread_id, event.actor_kind, event.actor_id,
+                    tags = crate::coordination::typed::envelope_lines(&event.payload)
+                );
+                if crate::lanes::deliver_to_lane(parent, lane, envelope) {
+                    return Ok(());
+                }
+            }
+        }
         super::record_agent_message(d, &session_id, &event.actor_id, body, false).await;
         return Ok(());
     }
