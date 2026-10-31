@@ -6,6 +6,7 @@
 //! ~/.snippet/projects/<repo>-<id>/memory/     project: one per repository
 //! ~/.snippet/agents/<agent>/memory/           agent: a specialist's own expertise
 //! ~/.snippet/session-memory/<session>/        session: one conversation's working memory
+//! ~/.snippet/task-memory/<task>/              task: decisions shared by everyone on it
 //! ```
 //!
 //! Every repo has a short `MEMORY.md` entry point (entries, then `## Index` of
@@ -36,6 +37,7 @@ pub enum ScopeKind {
     Project,
     Agent,
     Session,
+    Task,
 }
 
 impl ScopeKind {
@@ -45,6 +47,7 @@ impl ScopeKind {
             "project" => Some(Self::Project),
             "agent" => Some(Self::Agent),
             "session" => Some(Self::Session),
+            "task" => Some(Self::Task),
             _ => None,
         }
     }
@@ -55,6 +58,7 @@ impl ScopeKind {
             Self::Project => "this repository: where things live, how to build, test and deploy, conventions and decisions; shared by every worktree and session of the repo",
             Self::Agent => "your own expertise as this agent: techniques, checks and lessons that carry across every job you take",
             Self::Session => "this conversation: decisions made, constraints, and the state of the work, so it survives compaction and restarts",
+            Self::Task => "this task: the decisions made on it, readable by everyone working on it",
         }
     }
 }
@@ -129,6 +133,20 @@ impl MemoryRepo {
         }
     }
 
+    /// The decisions of one task, shared by everyone on it. Not listed by
+    /// [`MemoryRepo::all`]: it belongs to the task, not to a person or project.
+    pub fn task(task_id: &str) -> Option<Self> {
+        if !safe_component(task_id) {
+            return None;
+        }
+        Some(Self {
+            kind: ScopeKind::Task,
+            key: format!("task:{task_id}"),
+            label: task_id.to_string(),
+            root: crate::config::snippet_home().join("task-memory").join(task_id),
+        })
+    }
+
     /// Resolve an address from [`MemoryRepo::key`].
     pub fn from_key(key: &str) -> Option<Self> {
         let (kind, rest) = key.split_once(':').unwrap_or((key, ""));
@@ -140,6 +158,7 @@ impl MemoryRepo {
             }
             "agent" => Self::agent(rest),
             "session" if !rest.is_empty() => Some(Self::session(rest)),
+            "task" => Self::task(rest),
             _ => None,
         }
     }
@@ -242,6 +261,7 @@ impl MemoryRepo {
             ScopeKind::Project => format!("Memory: project {}", self.label),
             ScopeKind::Agent => format!("Memory: agent {}", self.label),
             ScopeKind::Session => "Memory: session".to_string(),
+            ScopeKind::Task => format!("Memory: task {}", self.label),
         }
     }
 
@@ -547,6 +567,7 @@ pub fn render_prompt(repos: &[MemoryRepo]) -> String {
             ScopeKind::Project => format!("Project ({})", repo.label),
             ScopeKind::Agent => format!("Agent ({})", repo.label),
             ScopeKind::Session => "Session".to_string(),
+            ScopeKind::Task => format!("Task ({})", repo.label),
         };
         out.push_str(&format!(
             "\n### {scope} memory — {}\nHolds {}.\n\n{}\n",
@@ -724,4 +745,19 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     ));
     fs::write(&tmp, content).map_err(|e| e.to_string())?;
     fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod task_scope_tests {
+    use super::*;
+
+    #[test]
+    fn a_task_scope_has_a_key_and_is_never_listed_among_the_persons_scopes() {
+        let repo = MemoryRepo::task("abc-123").unwrap();
+        assert_eq!((repo.kind, repo.key.as_str()), (ScopeKind::Task, "task:abc-123"));
+        assert_eq!(MemoryRepo::from_key("task:abc-123").unwrap().root, repo.root);
+        assert!(MemoryRepo::task("../etc").is_none());
+        assert!(MemoryRepo::all().iter().all(|r| r.kind != ScopeKind::Task));
+        assert!(render_prompt(&[repo]).contains("### Task (abc-123) memory"));
+    }
 }

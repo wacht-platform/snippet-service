@@ -159,19 +159,13 @@ pub(crate) fn task_awareness(ctx: &ToolContext) -> String {
                 .find(|m| m.status == "active")
                 .map(|m| m.agent_id.clone());
         }
-        let briefing = task
-            .handoff
-            .as_ref()
-            .map(|h| h.description.as_str())
-            .filter(|d| !d.trim().is_empty())
-            .unwrap_or(task.description.as_str());
         let mut text = format!(
-            "Task you're on: \"{}\" (task {}, {}), from {}.\nBriefing: {}",
+            "Task you're on: \"{}\" (task {}, {}), from {}.\n{}",
             sanitize_line(&task.title),
             task.id,
             label(&task.status),
             task.created_by_id,
-            clip_chars(&sanitize_line(briefing), 400)
+            crate::task_state_tools::ledger_block(&db, task, false)
         );
         if !roster.is_empty() {
             let team: Vec<String> = roster
@@ -246,14 +240,6 @@ pub(crate) fn task_awareness(ctx: &ToolContext) -> String {
 
 fn sanitize_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn clip_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        format!("{}…", text.chars().take(max).collect::<String>())
-    }
 }
 
 fn lease_holder(ctx: &ToolContext, session_id: &str) -> Option<String> {

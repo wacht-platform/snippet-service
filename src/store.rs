@@ -28,6 +28,8 @@ pub enum StoreError {
     NotTerminal(String),
     #[error("could not encode session state: {0}")]
     ScalarEncode(String),
+    #[error("task {task_id} ledger is at version {actual}, not {expected}; read it again and resend your patch")]
+    StaleTaskState { task_id: String, expected: u64, actual: u64 },
     #[error("stored record is malformed: {0}")]
     AppDecode(String),
 }

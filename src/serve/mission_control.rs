@@ -510,8 +510,10 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         format!("inputs (tasks this one waited on, with their reports):\n{}\n", inputs.join("\n"))
     };
     let identity = super::coordination::identity_overlay(d, active_worker, &session_id);
+    let scope = if handoff.is_empty() { task.description.as_str() } else { handoff };
+    let ledger = crate::task_state_tools::dispatch_ledger(&d.store, &task, &workspace, scope, &now);
     let text = format!(
-        "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}{inputs_line}scope:\n{}\n\nThis is yours now: deliver it end to end, verified, in this session. If the scope looks wrong, unclear or there's a better way, say so to Mission Control (send_agent_message to mission-control) before you build. When something long-running is in flight, put a monitor watch on it rather than ending the task. When it's done, blocked or failed, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
+        "{identity}[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: {} {}\n{}active_agent: {}\n{plan_line}{roster_line}{owned_line}workspace: {}\n{revision_line}{inputs_line}scope:\n{}\n{ledger}\n\nThis is yours now: deliver it end to end, verified, in this session. If the scope looks wrong, unclear or there's a better way, say so to Mission Control (send_agent_message to mission-control) before you build. When something long-running is in flight, put a monitor watch on it rather than ending the task. When it's done, blocked or failed, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
         task.id,
         task.title,
         task.created_by_kind,
@@ -519,11 +521,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         mode_line,
         active_worker,
         workspace.display(),
-        if handoff.is_empty() {
-            task.description.as_str()
-        } else {
-            handoff
-        },
+        scope,
         task.id,
     );
     let task_profile = d.task_profile(&task);

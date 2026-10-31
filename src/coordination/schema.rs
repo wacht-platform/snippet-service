@@ -138,6 +138,15 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
          CREATE INDEX IF NOT EXISTS tasks_thread
              ON tasks(thread_id);
 
+         -- The task ledger: one versioned record per task. The body is JSON so a
+         -- new ledger field is additive; `version` is the optimistic-lock token.
+         CREATE TABLE IF NOT EXISTS task_state (
+             task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             version INTEGER NOT NULL,
+             state_json TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+         );
+
          -- Directed edges between tasks. `kind` distinguishes a blocks edge (an
          -- ordering constraint) from a relates_to edge (context), so the board
          -- can draw both without inferring intent.

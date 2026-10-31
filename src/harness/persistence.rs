@@ -201,7 +201,14 @@ impl CodingHarness {
         });
         let workspace = self.context.workspace_root();
         let project = !workspace.starts_with(crate::config::snippet_home());
-        crate::memory::scopes_for(project.then_some(workspace), agent.as_deref())
+        let mut repos = crate::memory::scopes_for(project.then_some(workspace), agent.as_deref());
+        let task = self
+            .session_id()
+            .and_then(|session| crate::coordination_tools::session_task(&self.context, &session));
+        if let Some(repo) = task.and_then(|(id, _)| crate::memory::MemoryRepo::task(&id)).filter(|r| r.exists()) {
+            repos.push(repo);
+        }
+        repos
     }
 
     /// Index and commit what the agent wrote to memory this turn.

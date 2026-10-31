@@ -478,6 +478,7 @@ fn scope_name(kind: &crate::memory::ScopeKind) -> &'static str {
         crate::memory::ScopeKind::Project => "project",
         crate::memory::ScopeKind::Agent => "agent",
         crate::memory::ScopeKind::Session => "session",
+        crate::memory::ScopeKind::Task => "task",
     }
 }
 

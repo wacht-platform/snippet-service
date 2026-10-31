@@ -686,13 +686,14 @@ pub fn board_message_envelope(
     event: &CoordinationEvent,
     history: &[CoordinationEvent],
 ) -> String {
-    board_message_envelope_with_task(event, history, None)
+    board_message_envelope_with_task(event, history, None, None)
 }
 
 pub fn board_message_envelope_with_task(
     event: &CoordinationEvent,
     history: &[CoordinationEvent],
     task: Option<&Task>,
+    ledger: Option<&str>,
 ) -> String {
     let body = event
         .payload
@@ -730,6 +731,10 @@ pub fn board_message_envelope_with_task(
         if !t.plan.trim().is_empty() {
             task_meta.push_str(&format!("task_plan:\n{}\n", t.plan.trim()));
         }
+        // A ledger update's body already is the delta; the full ledger would bury it.
+        if let Some(ledger) = ledger.filter(|l| !l.is_empty() && event.event_type != "task.state_updated") {
+            task_meta.push_str(&format!("{ledger}\n"));
+        }
     }
     format!(
         "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n{task_meta}\
@@ -761,7 +766,7 @@ const QUIET_EVENTS: &[&str] = &["task.agent_assigned", "task.dispatched"];
 
 /// Events Mission Control already receives as a task notification; waking it
 /// for the room post as well would deliver the same news twice.
-const NOTIFIED_EVENTS: &[&str] = &["task.reported", "task.message"];
+const NOTIFIED_EVENTS: &[&str] = &["task.reported", "task.message", "task.state_updated"];
 
 /// One session a board event should wake. `inbox_agent` is set when the
 /// session is that agent's inbox, which may need creating first.
@@ -947,7 +952,8 @@ pub async fn wake_coordination_thread_participants(
     if targets.is_empty() {
         return;
     }
-    let envelope = board_message_envelope_with_task(saved, &history, task.as_ref());
+    let ledger = task.as_ref().map(|t| crate::task_state_tools::ledger_block(&d.store, t, false));
+    let envelope = board_message_envelope_with_task(saved, &history, task.as_ref(), ledger.as_deref());
     let incoming = (saved.event_type == "task.lease_transferred")
         .then(|| saved.payload.get("to_agent_id").and_then(|v| v.as_str()))
         .flatten();

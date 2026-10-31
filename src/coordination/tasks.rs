@@ -447,7 +447,7 @@ fn decode_json_vec<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
+pub(super) fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
     Ok(Task {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -475,7 +475,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
     })
 }
 
-const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
+pub(super) const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
      created_by_id, created_at, updated_at, completed_at, thread_id, session_id,
      handoff_json, handoff_mode, reporting_session, dispatch_failures, result_json,
      notifications_json, owned_paths_json, profile, plan, work_plan_json, superseded_by";

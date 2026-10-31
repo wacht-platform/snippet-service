@@ -185,7 +185,7 @@ fn sessions_feeding(target: &MemoryRepo, sessions: &[(MemoryRepo, Option<String>
             ScopeKind::Project => project.as_deref() == Some(target.key.as_str()),
             ScopeKind::Agent => agent.as_deref() == Some(target.key.as_str()),
             ScopeKind::Global => true,
-            ScopeKind::Session => false,
+            ScopeKind::Session | ScopeKind::Task => false,
         })
         .filter(|(repo, _, _)| {
             let (count, newest) = repo.activity_since_consolidation();
@@ -356,6 +356,7 @@ async fn consolidation(d: &Shared, repo: &MemoryRepo) -> Result<(), String> {
             ScopeKind::Project => "project",
             ScopeKind::Agent => "agent",
             ScopeKind::Session => "session",
+            ScopeKind::Task => "task",
         },
         repo.root.display(),
         repo.label,

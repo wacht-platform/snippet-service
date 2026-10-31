@@ -254,6 +254,32 @@ use super::*;
     /// The wake must read as a group room: recent messages are included, and the
     /// digest can't be confused with the new message or the field layout.
     #[test]
+    fn room_wake_carries_the_ledger_but_a_ledger_update_carries_only_its_delta() {
+        let mut event = crate::coordination::types::CoordinationEvent {
+            event_id: "e1".into(),
+            thread_id: "task:t1".into(),
+            partition_key: "thread:task:t1".into(),
+            sequence: 3,
+            event_type: "message.posted".into(),
+            actor_kind: "agent".into(),
+            actor_id: "reviewer".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "looks odd"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: "k".into(),
+            created_at: "2020-01-01T00:00:00Z".into(),
+        };
+        let task = crate::coordination::Task::filed_by_human("t1".into(), "T".into(), "d".into(), "s".into(), 0, "2020-01-01T00:00:00Z".into());
+        let ledger = "[task_ledger v4]\ncurrent step: tests\n[/task_ledger]";
+        let wake = coordination::board_message_envelope_with_task(&event, &[], Some(&task), Some(ledger));
+        assert!(wake.contains("[task_ledger v4]"), "{wake}");
+        event.event_type = "task.state_updated".into();
+        let delta = coordination::board_message_envelope_with_task(&event, &[], Some(&task), Some(ledger));
+        assert!(!delta.contains("[task_ledger"), "{delta}");
+    }
+
+    #[test]
     fn board_message_envelope_includes_bounded_history() {
         let prior =
             |seq: u64, who: &str, body: &str| crate::coordination::types::CoordinationEvent {

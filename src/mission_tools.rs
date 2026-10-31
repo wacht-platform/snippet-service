@@ -76,6 +76,8 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(SessionState);
     registry.insert(RegisterAgent);
     registry.insert(ReportMissionTask);
+    registry.insert(crate::task_state_tools::UpdateTaskState);
+    registry.insert(crate::task_state_tools::TaskLedger);
     registry.insert(Speak);
     registry.insert(AmbientMode);
     registry.insert(AmbientExpect);
@@ -637,6 +639,8 @@ impl Tool for PingUser {
 
 pub fn add_worker_report_tool(registry: &mut ToolRegistry) {
     registry.insert(ReportMissionTask);
+    registry.insert(crate::task_state_tools::UpdateTaskState);
+    registry.insert(crate::task_state_tools::TaskLedger);
     registry.insert(InviteTaskAgent);
     registry.insert(ViewTaskBoard);
     registry.insert(FileFollowUpTask);
@@ -1541,7 +1545,8 @@ impl Tool for DeliverToSession {
             brief,
             &now,
         )?;
-        let envelope = direct_brief_envelope(&task, brief, &state.workspace);
+        let ledger = crate::task_state_tools::dispatch_ledger(&store, &task, std::path::Path::new(&state.workspace), brief, &now);
+        let envelope = direct_brief_envelope(&task, brief, &state.workspace, &ledger);
         store
             .send_task_notice(("agent", mission_control::SESSION_ID), &session_id, &task.id, "task_brief", &envelope, &now)
             .map_err(|e| ToolError::msg(format!("queue delivery: {e}")))?;
@@ -1637,9 +1642,9 @@ fn bind_direct_delivery(
     Ok(task)
 }
 
-fn direct_brief_envelope(task: &Task, brief: &str, workspace: &str) -> String {
+fn direct_brief_envelope(task: &Task, brief: &str, workspace: &str, ledger: &str) -> String {
     format!(
-        "[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: agent mission-control (delivered directly)\nworkspace: {workspace}\nscope:\n{brief}\n\nThis is yours now: deliver it end to end, verified, in this session. If the scope looks wrong or unclear, say so to Mission Control (send_agent_message to mission-control) before you build. When it's done, blocked or failed, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
+        "[mission_control_task]\ntask_id: {}\ntitle: {}\nrequested_by: agent mission-control (delivered directly)\nworkspace: {workspace}\nscope:\n{brief}\n{ledger}\n\nThis is yours now: deliver it end to end, verified, in this session. If the scope looks wrong or unclear, say so to Mission Control (send_agent_message to mission-control) before you build. When it's done, blocked or failed, report with report_mission_task (task_id {}): what was done, files changed, how it was verified, anything left open.\n[/mission_control_task]",
         task.id, task.title, task.id
     )
 }
@@ -3326,7 +3331,7 @@ mod tests {
         assert_eq!(filed.title, "Fix the header");
         assert_eq!(filed.reporting_session.as_deref(), Some("s-new"));
         assert_eq!(db.list_task_agents(&filed.id).unwrap()[0].status, "active");
-        assert!(direct_brief_envelope(&filed, "Fix the header", "/w").contains(&format!("report_mission_task (task_id {})", filed.id)));
+        assert!(direct_brief_envelope(&filed, "Fix the header", "/w", "").contains(&format!("report_mission_task (task_id {})", filed.id)));
 
         let mut blocked = queued.clone();
         blocked.id = "t-b".into();

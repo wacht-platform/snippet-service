@@ -37,6 +37,7 @@ pub mod meta;
 pub mod mission_control;
 pub mod mission_autonomy;
 pub mod mission_tools;
+pub mod task_state_tools;
 pub mod openai;
 pub mod prompts;
 pub mod reasoning;

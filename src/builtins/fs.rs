@@ -285,6 +285,7 @@ impl Tool for ChangeFilesTool {
             }
         }
         commit(ctx, &staged, &order).await?;
+        crate::task_state_tools::note_changed_files(ctx, &applied.iter().map(|a| a.path.clone()).collect::<Vec<_>>());
 
         let notes: Vec<String> = applied
             .iter()
