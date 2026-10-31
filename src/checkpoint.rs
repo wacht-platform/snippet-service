@@ -171,9 +171,44 @@ fn snapshot_unlocked(workspace: &Path, label: &str) -> Result<String, String> {
     Ok(commit)
 }
 
+/// `git add -A` aborts on a nested repository that has no commit yet, which would otherwise stop
+/// every checkpoint in that workspace. Such directories are excluded from the shadow and the add retried.
+fn add_all(workspace: &Path) -> Result<String, String> {
+    let mut last = String::new();
+    for _ in 0..8 {
+        match git(workspace, &["add", "-A"]) {
+            Ok(out) => return Ok(out),
+            Err(error) => {
+                let skipped = unborn_repos(&error);
+                if skipped.is_empty() {
+                    return Err(error);
+                }
+                let exclude = shadow_dir(workspace).join("info").join("exclude");
+                let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+                for dir in skipped {
+                    text.push_str(&format!("/{dir}\n"));
+                }
+                std::fs::write(&exclude, text).map_err(|e| e.to_string())?;
+                last = error;
+            }
+        }
+    }
+    Err(last)
+}
+
+fn unborn_repos(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter(|line| line.contains("does not have a commit checked out"))
+        .filter_map(|line| line.split('\'').nth(1))
+        .map(|dir| dir.trim_end_matches('/').to_string())
+        .filter(|dir| !dir.is_empty())
+        .collect()
+}
+
 /// Stage the whole work-tree in the shadow index and write it as a tree object.
 fn write_tree_unlocked(workspace: &Path) -> Result<String, String> {
-    git(workspace, &["add", "-A"]).map_err(|e| format!("git add: {e}"))?;
+    add_all(workspace).map_err(|e| format!("git add: {e}"))?;
     match git(workspace, &["write-tree"]) {
         Ok(tree) => Ok(tree),
         Err(first_error) => {
@@ -183,7 +218,7 @@ fn write_tree_unlocked(workspace: &Path) -> Result<String, String> {
             let index_path = shadow_dir(workspace).join("index");
             std::fs::remove_file(&index_path)
                 .map_err(|e| format!("remove corrupt shadow index: {e}"))
-                .and_then(|_| git(workspace, &["add", "-A"]))
+                .and_then(|_| add_all(workspace))
                 .and_then(|_| git(workspace, &["write-tree"]))
                 .map_err(|recovery_error| {
                     format!("git write-tree: {first_error}; shadow-index recovery failed: {recovery_error}")
@@ -322,6 +357,26 @@ mod numstat_tests {
         got.sort();
         assert_eq!(got, vec![("a.txt".to_string(), 2, 0), ("new.txt".to_string(), 1, 0)]);
         assert!(numstat(dir.path(), &end, &end).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(shadow_dir(dir.path()));
+    }
+
+    #[test]
+    fn a_nested_repo_without_commits_does_not_stop_snapshots() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let nested = dir.path().join("fresh-repo");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("x.txt"), "x\n").unwrap();
+        assert!(Command::new("git").arg("init").arg("-q").current_dir(&nested).status().unwrap().success());
+        let first = snapshot_diagnostic(dir.path(), "first").expect("snapshot survives an unborn nested repo");
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let second = snapshot_diagnostic(dir.path(), "second").unwrap();
+        let got = numstat(dir.path(), &first, &second).unwrap();
+        assert_eq!(got, vec![("a.txt".to_string(), 1, 0)]);
+        assert_eq!(unborn_repos("error: 'llm-rust/' does not have a commit checked out"), vec!["llm-rust"]);
         let _ = std::fs::remove_dir_all(shadow_dir(dir.path()));
     }
 
