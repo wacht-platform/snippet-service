@@ -65,6 +65,7 @@ mod mission_control;
 pub use mission_control::{mission_error, validated_owned_paths};
 mod recurring;
 mod review;
+mod goals;
 mod agent_wakes;
 mod keep_warm;
 mod routing_routes;
@@ -919,6 +920,7 @@ pub async fn run_serve(
         .merge(artifact_routes::router())
         .merge(github_routes::router())
         .merge(mission_control::router())
+        .merge(goals::router())
         .route("/fs", get(browse_fs))
         .route("/fs/file", get(read_fs_file))
         .route("/fs/files", get(list_fs_files))

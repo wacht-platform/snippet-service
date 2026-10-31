@@ -109,6 +109,9 @@ pub fn api_fields(store: &Store, task: &Task) -> serde_json::Map<String, Value> 
             "evidence": s.evidence,
         }))),
     );
+    out.insert("goal_id".into(), json!(task.goal_id));
+    let goal_title = task.goal_id.as_deref().and_then(|id| store.get_goal(id).ok().flatten()).map(|g| g.title);
+    out.insert("goal_title".into(), json!(goal_title));
     out.insert("ledger".into(), json!(state));
     out
 }

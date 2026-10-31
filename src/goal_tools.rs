@@ -55,11 +55,10 @@ fn pairs(items: &[EvidenceArg]) -> Vec<(String, String)> {
 
 /// Goal row for listings: progress without the plan or the full text.
 pub fn goal_row(goal: &Goal, tasks: &[crate::coordination::Task]) -> Value {
-    let live: Vec<_> = tasks.iter().filter(|t| t.status != crate::coordination::TaskStatus::Cancelled).collect();
-    let done = live.iter().filter(|t| t.status == crate::coordination::TaskStatus::Done).count();
+    let (done, total) = crate::coordination::goals::progress(tasks);
     json!({
         "id": goal.id, "title": goal.title, "status": goal.status,
-        "tasks": format!("{done}/{}", live.len()),
+        "tasks": format!("{done}/{total}"),
         "evidence": format!("{}/{}", goal.acceptance.len() - goal.unevidenced().len(), goal.acceptance.len()),
     })
 }

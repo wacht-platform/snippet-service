@@ -112,7 +112,8 @@ pub async fn autonomy_loop(daemon: Shared) {
         }
         let offers = pending_offers(&daemon, &tasks);
         let waiting = waiting_on(&daemon, &tasks);
-        let envelope = round_envelope(&tasks, &state, &due, &offers, &waiting, now);
+        let goal_lines = goal_attention_lines(&daemon.store);
+        let envelope = round_envelope(&tasks, &state, &due, &offers, &waiting, &goal_lines, now);
         let summary = round_summary(&tasks, &state, &due);
         let _ = mission_autonomy::update(|s| {
             s.last_round_at = now;
@@ -395,6 +396,28 @@ fn waiting_on(daemon: &Shared, tasks: &[crate::coordination::Task]) -> std::coll
         .collect()
 }
 
+/// Open goals with nothing moving them, and goals whose checks all have evidence.
+fn goal_attention_lines(store: &crate::store::Store) -> Vec<String> {
+    let goals = store.list_goals(Some(crate::coordination::GoalStatus::Open)).unwrap_or_default();
+    goals
+        .iter()
+        .filter_map(|g| goal_attention_line(g, &store.goal_tasks(&g.id).unwrap_or_default()))
+        .collect()
+}
+
+fn goal_attention_line(goal: &crate::coordination::Goal, tasks: &[crate::coordination::Task]) -> Option<String> {
+    use crate::coordination::goals::{Attention, attention, progress};
+    let (done, total) = progress(tasks);
+    Some(match attention(goal, tasks)? {
+        Attention::ReadyToClose => format!("- ready to close · {} · {} · every check has evidence, {done}/{total} slices done", goal.title, goal.id),
+        Attention::Stalled => {
+            let stuck: Vec<&str> = tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Blocked)).map(|t| t.title.as_str()).collect();
+            let why = if tasks.is_empty() { "no tasks filed".to_string() } else if stuck.is_empty() { format!("{done}/{total} slices done, none running") } else { format!("{done}/{total} done, stuck: {}", stuck.join(", ")) };
+            format!("- stalled · {} · {} · {why}", goal.title, goal.id)
+        }
+    })
+}
+
 /// " · plan 3/5, now: <step>" for a task whose worker has laid out a plan.
 fn plan_progress(task: &crate::coordination::Task) -> String {
     if task.work_plan.is_empty() {
@@ -416,6 +439,7 @@ fn round_envelope(
     due: &[mission_autonomy::Followup],
     offers: &std::collections::HashMap<String, String>,
     waiting: &std::collections::HashMap<String, Vec<String>>,
+    goal_lines: &[String],
     now: i64,
 ) -> String {
     let since = state.last_round_at;
@@ -471,6 +495,11 @@ fn round_envelope(
     out.push_str("\n\n## Open work\n");
     out.push_str(if open.is_empty() { "none" } else { "" });
     out.push_str(&open.join("\n"));
+
+    if !goal_lines.is_empty() {
+        out.push_str("\n\n## Goals needing you\nStalled: file or replan the next step, or ask the user. Ready to close: confirm with the user, then close_goal.\n");
+        out.push_str(&goal_lines.join("\n"));
+    }
 
     if !due.is_empty() {
         out.push_str("\n\n## Wake-ups due now\n");
@@ -565,5 +594,22 @@ mod tests {
         let quiet_followup = RoundInputs { quiet: true, followups_due: true, ..RoundInputs::default() };
         assert_eq!(round_decision(quiet_followup), Round::Fire);
         assert_eq!(round_decision(RoundInputs { board_changed: true, ..RoundInputs::default() }), Round::NotDue);
+    }
+
+    #[test]
+    fn goal_lines_name_stalled_and_ready_goals() {
+        use crate::coordination::{Goal, GoalCriterion, Task, VerifyMethod};
+        let mut goal = Goal::new("g".into(), "Launch".into(), "Live".into(), vec![GoalCriterion { criterion: "ok".into(), method: VerifyMethod::Command, evidence: String::new() }], "u".into(), "2026-01-01T00:00:00Z".into());
+        let task = |id: &str, status| {
+            let mut t = Task::filed_by_human(id.into(), format!("T{id}"), "d".into(), "s".into(), 0, "2026-01-01T00:00:00Z".into());
+            t.status = status;
+            t
+        };
+        assert_eq!(goal_attention_line(&goal, &[]).unwrap(), "- stalled · Launch · g · no tasks filed");
+        let line = goal_attention_line(&goal, &[task("a", TaskStatus::Done), task("b", TaskStatus::Failed)]).unwrap();
+        assert!(line.contains("1/2 done, stuck: Tb"), "{line}");
+        assert!(goal_attention_line(&goal, &[task("a", TaskStatus::InProgress)]).is_none());
+        goal.attach_evidence(&[("1".into(), "ran".into())]);
+        assert!(goal_attention_line(&goal, &[task("a", TaskStatus::Done)]).unwrap().starts_with("- ready to close · Launch"));
     }
 }

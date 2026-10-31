@@ -123,6 +123,41 @@ impl Goal {
     }
 }
 
+/// What stops a goal on the board needing its owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// Open, and no task is running, ready or in review.
+    Stalled,
+    /// Every criterion has evidence and no task is open, yet the goal is open.
+    ReadyToClose,
+}
+
+impl Attention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stalled => "stalled",
+            Self::ReadyToClose => "ready_to_close",
+        }
+    }
+}
+
+/// `(done, total)` slices, a dropped (cancelled) slice not counting.
+pub fn progress(tasks: &[Task]) -> (usize, usize) {
+    let live = tasks.iter().filter(|t| t.status != TaskStatus::Cancelled);
+    (live.clone().filter(|t| t.status == TaskStatus::Done).count(), live.count())
+}
+
+pub fn attention(goal: &Goal, tasks: &[Task]) -> Option<Attention> {
+    if goal.status != GoalStatus::Open {
+        return None;
+    }
+    if goal.fully_evidenced() && !tasks.iter().any(is_open) {
+        return Some(Attention::ReadyToClose);
+    }
+    let moving = tasks.iter().any(|t| matches!(t.status, TaskStatus::InProgress | TaskStatus::Todo | TaskStatus::InReview));
+    (!moving).then_some(Attention::Stalled)
+}
+
 /// Failed counts as open: it needs a retry or a cancel, not silence.
 pub fn is_open(task: &Task) -> bool {
     !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
@@ -365,5 +400,23 @@ mod tests {
         })
         .unwrap();
         assert_eq!(db.get_task("old").unwrap().unwrap().goal_id, None);
+    }
+
+    #[test]
+    fn attention_flags_stalled_and_ready_goals_only() {
+        let mut g = goal();
+        let t = |id: &str, st| task(id, Some("g1"), st);
+        assert_eq!(attention(&g, &[]), Some(Attention::Stalled));
+        assert_eq!(attention(&g, &[t("a", TaskStatus::Blocked), t("b", TaskStatus::Failed)]), Some(Attention::Stalled));
+        for moving in [TaskStatus::InProgress, TaskStatus::Todo, TaskStatus::InReview] {
+            assert_eq!(attention(&g, &[t("a", moving), t("b", TaskStatus::Blocked)]), None);
+        }
+        assert_eq!(attention(&g, &[t("a", TaskStatus::Done)]), Some(Attention::Stalled));
+        g.attach_evidence(&[("1".into(), "ok".into()), ("2".into(), "ok".into())]);
+        assert_eq!(attention(&g, &[t("a", TaskStatus::Done), t("b", TaskStatus::Cancelled)]), Some(Attention::ReadyToClose));
+        assert_eq!(attention(&g, &[t("a", TaskStatus::InProgress)]), None);
+        g.status = GoalStatus::Closed;
+        assert_eq!(attention(&g, &[]), None);
+        assert_eq!(progress(&[t("a", TaskStatus::Done), t("b", TaskStatus::Cancelled), t("c", TaskStatus::Todo)]), (1, 2));
     }
 }
