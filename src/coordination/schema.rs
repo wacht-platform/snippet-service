@@ -132,7 +132,9 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              plan TEXT NOT NULL DEFAULT '',
              work_plan_json TEXT NOT NULL DEFAULT '[]',
              superseded_by TEXT,
-             goal_id TEXT
+             goal_id TEXT,
+             last_progress_at TEXT,
+             expected_minutes INTEGER
          );
          CREATE INDEX IF NOT EXISTS tasks_status_priority
              ON tasks(status, priority DESC, created_at);
@@ -276,6 +278,12 @@ fn add_missing_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
     }
     if !existing.iter().any(|column| column == "goal_id") {
         connection.execute("ALTER TABLE tasks ADD COLUMN goal_id TEXT", [])?;
+    }
+    if !existing.iter().any(|column| column == "last_progress_at") {
+        connection.execute("ALTER TABLE tasks ADD COLUMN last_progress_at TEXT", [])?;
+    }
+    if !existing.iter().any(|column| column == "expected_minutes") {
+        connection.execute("ALTER TABLE tasks ADD COLUMN expected_minutes INTEGER", [])?;
     }
     connection.execute("CREATE INDEX IF NOT EXISTS tasks_goal ON tasks(goal_id)", [])?;
     let task_agent_columns: Vec<String> = {

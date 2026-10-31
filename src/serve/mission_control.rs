@@ -152,6 +152,9 @@ fn mission_task_view(store: &crate::store::Store, task: &Task) -> serde_json::Va
         "waiting_on": sub.waiting_on,
         "current_step": sub.current_step,
         "superseded_by": task.superseded_by,
+        "last_progress_at": task.last_progress_at,
+        "expected_minutes": task.expected_minutes,
+        "stalled_minutes": sub.stalled_minutes,
     });
     if let Some(map) = view.as_object_mut() {
         map.extend(crate::task_state_tools::api_fields(store, task));
@@ -1204,7 +1207,7 @@ async fn open(
 
 pub(super) const WORKFLOW_PLAN: &str = "Workflow W7 · first plan: the worker has laid out how it will deliver the task. Check it against the requirements; when it misses or misreads something, say so in the task room (post_task_coordination) so the worker adjusts before going far; when it shows what comes next, line up that work. A plan that's right needs no reply. Then stop.";
 
-pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: check its evidence against the acceptance criteria (spot-check only if thin); done → tell the user unless you already have; short of the criteria → update_mission_task revise; in_review or review_escalated → submit_review is yours; blocked → unblock it; failed → retry once or re-route. Then stop.";
+pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: check its evidence against the acceptance criteria (spot-check only if thin); done → tell the user unless you already have; short of the criteria → update_mission_task revise; in_review or review_escalated → submit_review is yours; stalled → inspect_session, then answer, retry or cancel; blocked → unblock it; failed → retry once or re-route. Then stop.";
 
 pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<String>) -> Result<(String, std::path::PathBuf), String> {
     let home = mission_control::ensure_home()?;
@@ -1334,6 +1337,7 @@ pub async fn dispatch_loop(daemon: Shared) {
             }
         }
         super::review::drive_reviews(&daemon).await;
+        super::stall::sweep(&daemon.store, chrono::Utc::now(), super::stall::probe_session);
         deliver_mission_control_reports(&daemon).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1371,38 +1375,53 @@ fn task_artifacts_block(session_id: &str, created_at: &str) -> String {
     }
 }
 
-async fn deliver_mission_control_reports(daemon: &Daemon) {
-    if mission_control::awaiting_user() {
-        return;
+fn report_text(task: &Task, marker: &crate::coordination::NotificationMarker) -> String {
+    if marker.kind == "plan" {
+        format!(
+            "[task_plan]\ntask_id: {}\ntitle: {}\nsession_id: {}\nplan:\n{}\n[/task_plan]\n{}",
+            task.id, task.title, task.session_id, marker.message, WORKFLOW_PLAN
+        )
+    } else {
+        format!(
+            "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n{}[/mission_task_report]\n{}",
+            task.id,
+            task.title,
+            marker.kind,
+            marker.message,
+            task_artifacts_block(&task.session_id, &task.created_at),
+            WORKFLOW_REPORT
+        )
     }
+}
+
+/// Outcomes that must not wait behind a question to the user.
+fn is_outcome_report(kind: &str) -> bool {
+    matches!(kind, "done" | "failed" | "stalled" | "blocked" | "review_escalated")
+}
+
+async fn deliver_mission_control_reports(daemon: &Daemon) {
+    let awaiting = mission_control::awaiting_user();
     let Ok(tasks) = daemon.store.list_tasks(None, None) else {
         return;
     };
     let mut delivered_any = false;
+    let mut digest: Vec<String> = Vec::new();
     for task in tasks {
         for marker in &task.notifications {
             if marker.delivered || marker.target != "mission_control" {
                 continue;
             }
-            let text = if marker.kind == "plan" {
-                format!(
-                    "[task_plan]\ntask_id: {}\ntitle: {}\nsession_id: {}\nplan:\n{}\n[/task_plan]\n{}",
-                    task.id, task.title, task.session_id, marker.message, WORKFLOW_PLAN
-                )
+            if awaiting && !is_outcome_report(&marker.kind) {
+                continue;
+            }
+            let text = report_text(&task, marker);
+            if awaiting {
+                digest.push(text);
             } else {
-                format!(
-                    "[mission_task_report]\ntask_id: {}\ntitle: {}\nstatus: {}\nsummary: {}\n{}[/mission_task_report]\n{}",
-                    task.id,
-                    task.title,
-                    marker.kind,
-                    marker.message,
-                    task_artifacts_block(&task.session_id, &task.created_at),
-                    WORKFLOW_REPORT
-                )
-            };
-            daemon
-                .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))
-                .await;
+                daemon
+                    .deliver(mission_control::SESSION_ID, LoopInput::UserMessage(text))
+                    .await;
+            }
             delivered_any = true;
             let _ = daemon
                 .store
@@ -1414,6 +1433,14 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
                     }
                 });
         }
+    }
+    if !digest.is_empty() {
+        let text = format!(
+            "[report_digest]\nOutcomes that arrived while you waited on the user; handle them after their answer.\n[/report_digest]\n{}",
+            digest.join("\n")
+        );
+        let item = crate::harness::QueuedInput { id: uuid::Uuid::new_v4().to_string(), text };
+        daemon.deliver(mission_control::SESSION_ID, LoopInput::Queue(item)).await;
     }
     if delivered_any {
         if let Ok(tasks) = daemon.store.list_tasks(None, None) {

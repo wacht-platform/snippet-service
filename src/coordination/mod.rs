@@ -28,7 +28,7 @@ pub use agents::AgentRemoval;
 pub use goals::{Goal, GoalCriterion, GoalStatus};
 pub use task_state::{Criterion, Decision, Evidence, PendingReport, StatePatch, TaskState, VerifyMethod, VerifyMode};
 pub use identity::{AgentHome, IdentityError};
-pub use tasks::{offer_marker, 
+pub use tasks::{offer_marker, progress_stamp, stall_marker_for_current_spell, stall_threshold_minutes, stalled_minutes,
     HandoffMode, NotificationMarker, Task, TaskAgent, TaskFilter, TaskHandoff, TaskLink,
     TaskLinkKind, TaskResult, TaskStatus, TaskSubStatus, WorkStep,
 };

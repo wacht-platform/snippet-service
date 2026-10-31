@@ -306,6 +306,7 @@ impl Tool for UpdateTaskState {
         if changes.is_empty() {
             return Ok(ToolResult::success(json!({"version": state.version, "changed": [], "note": "nothing differed; version unchanged"})));
         }
+        let _ = store.touch_task_progress(&task.id, &now);
         remember_decisions(&task.id, &author, &changes);
         post_state_event(&store, ctx, &task, &author, &state, &changes);
         Ok(ToolResult::success(json!({"version": state.version, "changed": changes})))

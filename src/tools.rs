@@ -415,6 +415,7 @@ impl ToolRegistry {
         name: &str,
         arguments: Value,
     ) -> Result<ToolResult, ToolError> {
+        note_session_activity(ctx);
         let tool = match self.tools.get(name) {
             Some(tool) => tool,
             None => return self.execute_custom(ctx, name, arguments).await,
@@ -445,6 +446,28 @@ impl ToolRegistry {
             data.insert("custom_tool".into(), Value::String(name.to_string()));
         }
         Ok(result)
+    }
+}
+
+/// Tool activity in a worker session (or its lane) is progress on the task it
+/// reports for. Written at most every 30 seconds per session.
+fn note_session_activity(ctx: &ToolContext) {
+    static LAST: std::sync::LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::LazyLock::new(Default::default);
+    if ctx.is_mission_control() {
+        return;
+    }
+    let Some(session) = ctx.durable_session_id().or(ctx.lane_origin().map(|(s, _)| s)) else { return };
+    let Some(path) = ctx.store_path() else { return };
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.get(session).is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(30)) {
+            return;
+        }
+        last.insert(session.to_string(), std::time::Instant::now());
+    }
+    if let Ok(store) = crate::store::Store::open_cached(path) {
+        let _ = store.touch_session_progress(session, &chrono::Utc::now().to_rfc3339());
     }
 }
 

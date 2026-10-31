@@ -118,6 +118,13 @@ pub struct Task {
     /// The goal this task is a step toward.
     #[serde(default)]
     pub goal_id: Option<String>,
+    /// When the task last moved: a plan change, a room post, a ledger update or
+    /// tool activity in its session. The stall check reads this, not `updated_at`.
+    #[serde(default)]
+    pub last_progress_at: Option<String>,
+    /// How long the work should take, in minutes; the stall threshold scales with it.
+    #[serde(default)]
+    pub expected_minutes: Option<u32>,
 }
 
 /// One step of a task's working plan.
@@ -195,6 +202,49 @@ pub struct TaskSubStatus {
     pub waiting_on: Vec<String>,
     /// The step the worker's plan is on.
     pub current_step: Option<String>,
+    /// Minutes without progress, while the task is stalled.
+    pub stalled_minutes: Option<i64>,
+}
+
+pub const STALL_FLOOR_MINUTES: i64 = 20;
+/// A worker waiting on a question is escalated sooner than a silent one.
+pub const WAITING_ESCALATE_MINUTES: i64 = 10;
+
+fn now_stamp() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// The timestamp the stall clock runs from.
+pub fn progress_stamp(task: &Task) -> &str {
+    task.last_progress_at.as_deref().unwrap_or(&task.updated_at)
+}
+
+pub fn stall_threshold_minutes(task: &Task) -> i64 {
+    STALL_FLOOR_MINUTES.max(2 * i64::from(task.expected_minutes.unwrap_or(0)))
+}
+
+fn minutes_since(stamp: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .map(|t| (now - t.with_timezone(&chrono::Utc)).num_minutes())
+        .unwrap_or(0)
+}
+
+/// How long an in-progress task has gone without progress, once that passes
+/// the threshold (`waiting` lowers it for a worker paused on a question).
+pub fn stalled_minutes(task: &Task, now: chrono::DateTime<chrono::Utc>, waiting: bool) -> Option<i64> {
+    if task.status != TaskStatus::InProgress {
+        return None;
+    }
+    let limit = if waiting { WAITING_ESCALATE_MINUTES } else { stall_threshold_minutes(task) };
+    let age = minutes_since(progress_stamp(task), now);
+    (age >= limit).then_some(age)
+}
+
+/// The stall notice raised for the current quiet spell, if any. Its text carries
+/// the progress stamp, so new progress retires it without clearing anything.
+pub fn stall_marker_for_current_spell(task: &Task) -> Option<&NotificationMarker> {
+    let stamp = progress_stamp(task);
+    task.notifications.iter().find(|n| n.kind == "stalled" && n.message.contains(stamp))
 }
 
 /// Pure, so the rules are testable. `path_owners` are other in-progress tasks
@@ -210,7 +260,12 @@ pub fn board_reason(task: &Task, roster: &[TaskAgent], waiting_on: &[String], pa
     let current: Vec<&TaskAgent> = roster.iter().filter(|m| m.removed_at.is_none()).collect();
     let reason = match task.status {
         TaskStatus::InReview => "in_review",
-        TaskStatus::InProgress if noted("stalled") => "stalled",
+        TaskStatus::InProgress
+            if stall_marker_for_current_spell(task).is_some()
+                || stalled_minutes(task, chrono::Utc::now(), false).is_some() =>
+        {
+            "stalled"
+        }
         TaskStatus::InProgress => "working",
         TaskStatus::Blocked if task.dispatch_failures > 0 => "dispatch_failed",
         TaskStatus::Blocked => "blocked",
@@ -305,6 +360,8 @@ impl Task {
             profile: None,
             superseded_by: None,
             goal_id: None,
+            last_progress_at: None,
+            expected_minutes: None,
         }
     }
 
@@ -348,6 +405,8 @@ impl Task {
             profile: None,
             superseded_by: None,
             goal_id: None,
+            last_progress_at: None,
+            expected_minutes: None,
         }
     }
 }
@@ -482,13 +541,16 @@ pub(super) fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::E
         work_plan: decode_json_vec(row.get(21)?, 21)?,
         superseded_by: row.get(22)?,
         goal_id: row.get(23)?,
+        last_progress_at: row.get(24)?,
+        expected_minutes: row.get::<_, Option<i64>>(25)?.map(|m| m.max(0) as u32),
     })
 }
 
 pub(super) const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
      created_by_id, created_at, updated_at, completed_at, thread_id, session_id,
      handoff_json, handoff_mode, reporting_session, dispatch_failures, result_json,
-     notifications_json, owned_paths_json, profile, plan, work_plan_json, superseded_by, goal_id";
+     notifications_json, owned_paths_json, profile, plan, work_plan_json, superseded_by, goal_id,
+     last_progress_at, expected_minutes";
 
 /// Persist every mutable column of a task. Takes the connection so it composes
 /// into the read-modify-write transaction in `update_task_in` — a separate
@@ -516,7 +578,9 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             profile = ?16,
             plan = ?17,
             superseded_by = ?18,
-            goal_id = ?19
+            goal_id = ?19,
+            last_progress_at = ?20,
+            expected_minutes = ?21
          WHERE id = ?1",
         params![
             task.id,
@@ -538,6 +602,8 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             task.plan,
             task.superseded_by,
             task.goal_id,
+            task.last_progress_at,
+            task.expected_minutes,
         ],
     )?;
     Ok(())
@@ -566,8 +632,9 @@ impl Store {
                     created_by_kind, created_by_id, created_at, updated_at,
                     completed_at, thread_id, session_id, handoff_json, handoff_mode,
                     reporting_session, dispatch_failures, result_json,
-                    notifications_json, owned_paths_json, profile, plan, superseded_by, goal_id)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                    notifications_json, owned_paths_json, profile, plan, superseded_by, goal_id,
+                    last_progress_at, expected_minutes)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
                 params![
                     task.id,
                     task.title,
@@ -592,6 +659,8 @@ impl Store {
                     task.plan,
                     task.superseded_by,
                     task.goal_id,
+                    task.last_progress_at,
+                    task.expected_minutes,
                 ],
             )?;
             tx.execute(
@@ -706,7 +775,11 @@ impl Store {
                 )
                 .optional()?
                 .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            let was_running = task.status == TaskStatus::InProgress;
             f(&mut task);
+            if !was_running && task.status == TaskStatus::InProgress {
+                task.last_progress_at = Some(now.to_string());
+            }
             task.updated_at = now.to_string();
             write_task(&tx, &task)?;
             tx.commit()?;
@@ -956,11 +1029,14 @@ impl Store {
                     delivered: false,
                 });
                 tx.execute(
-                    "UPDATE tasks SET work_plan_json = ?2, notifications_json = ?3 WHERE id = ?1",
-                    params![task_id, plan, serde_json::to_string(&markers).unwrap_or_else(|_| "[]".into())],
+                    "UPDATE tasks SET work_plan_json = ?2, notifications_json = ?3, last_progress_at = ?4 WHERE id = ?1",
+                    params![task_id, plan, serde_json::to_string(&markers).unwrap_or_else(|_| "[]".into()), now_stamp()],
                 )?;
-            } else {
-                tx.execute("UPDATE tasks SET work_plan_json = ?2 WHERE id = ?1", params![task_id, plan])?;
+            } else if existing != plan {
+                tx.execute(
+                    "UPDATE tasks SET work_plan_json = ?2, last_progress_at = ?3 WHERE id = ?1",
+                    params![task_id, plan, now_stamp()],
+                )?;
             }
             tx.commit()?;
             Ok(first && !steps.is_empty())
@@ -1268,6 +1344,8 @@ impl Store {
             status_reason: board_reason(task, &roster, &waiting_on, &path_owners),
             waiting_on,
             current_step: current_step(task),
+            stalled_minutes: stalled_minutes(task, chrono::Utc::now(), false)
+                .or_else(|| stall_marker_for_current_spell(task).map(|_| minutes_since(progress_stamp(task), chrono::Utc::now()))),
         }
     }
 
@@ -1501,26 +1579,39 @@ impl Store {
         })
     }
 
-    /// Tell Mission Control, once, that a worker session stopped with tasks it
-    /// never reported. Left in progress: the worker may yet be woken to finish,
-    /// and `retry_task` re-delivers it if not. Returns how many were flagged.
-    pub fn flag_unreported_tasks(&self, session_id: &str, now: &str) -> Result<usize, StoreError> {
-        let mut flagged = 0;
-        for task in self.list_tasks(Some(session_id), Some(&TaskStatus::InProgress))? {
-            if task.reporting_session.as_deref() != Some(session_id)
-                || task.notifications.iter().any(|n| n.kind == "stalled")
-            {
-                continue;
-            }
-            self.update_task_in(&task.id, now, |t| {
-                t.notify_once(
-                    "stalled",
-                    "the worker session stopped without reporting; retry_mission_task re-delivers it, or cancel it",
-                );
-            })?;
-            flagged += 1;
-        }
-        Ok(flagged)
+    /// Record that a task moved. Leaves `updated_at` alone: progress is not a
+    /// change on the board and must not start a round.
+    pub fn touch_task_progress(&self, task_id: &str, now: &str) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE tasks SET last_progress_at = ?2 WHERE id = ?1 AND status = 'in_progress'",
+                params![task_id, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record activity in a worker session against the task it is reporting for.
+    pub fn touch_session_progress(&self, session_id: &str, now: &str) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE tasks SET last_progress_at = ?2
+                 WHERE session_id = ?1 AND reporting_session = ?1 AND status = 'in_progress'",
+                params![session_id, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record activity in a task's room, by the thread that is its room.
+    pub fn touch_thread_progress(&self, thread_id: &str, now: &str) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE tasks SET last_progress_at = ?2 WHERE thread_id = ?1 AND status = 'in_progress'",
+                params![thread_id, now],
+            )?;
+            Ok(())
+        })
     }
 
     /// Park the work a failed session was doing, so it can be retried or
@@ -1785,12 +1876,51 @@ mod tests {
     }
 
     #[test]
+    fn progress_signals_stamp_the_stall_clock_without_touching_updated_at() {
+        let db = db();
+        db.create_task(&task("t1")).unwrap();
+        assert_eq!(db.get_task("t1").unwrap().unwrap().last_progress_at, None);
+        db.claim_task_for_dispatch("t1", "2026-01-01T00:00:01Z").unwrap();
+        let get = || db.get_task("t1").unwrap().unwrap();
+        assert_eq!(get().last_progress_at.as_deref(), Some("2026-01-01T00:00:01Z"), "claiming starts the clock");
+
+        db.set_task_work_plan("t1", &[WorkStep { step: "a".into(), status: "pending".into() }]).unwrap();
+        let after_plan = get().last_progress_at.unwrap();
+        assert_ne!(after_plan, "2026-01-01T00:00:01Z");
+        db.touch_session_progress("s1", "2030-01-01T00:00:00Z").unwrap();
+        assert_eq!(get().last_progress_at.as_deref(), Some("2030-01-01T00:00:00Z"));
+        db.set_task_work_plan("t1", &[WorkStep { step: "a".into(), status: "pending".into() }]).unwrap();
+        assert_eq!(get().last_progress_at.as_deref(), Some("2030-01-01T00:00:00Z"), "an unchanged plan is not progress");
+        db.touch_session_progress("other", "2031-01-01T00:00:00Z").unwrap();
+        assert_eq!(get().last_progress_at.as_deref(), Some("2030-01-01T00:00:00Z"));
+        assert_eq!(get().updated_at, "2026-01-01T00:00:01Z");
+
+        let post = |actor: &str, key: &str| crate::coordination::types::CoordinationEvent {
+            event_id: key.into(),
+            thread_id: Task::thread_for("t1"),
+            partition_key: format!("thread:{}", Task::thread_for("t1")),
+            sequence: 0,
+            event_type: "message.posted".into(),
+            actor_kind: actor.into(),
+            actor_id: "a".into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "x"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: key.into(),
+            created_at: "2032-01-01T00:00:00Z".into(),
+        };
+        db.append_event(&post("human", "k1")).unwrap();
+        assert_eq!(get().last_progress_at.as_deref(), Some("2030-01-01T00:00:00Z"), "a human post is not worker progress");
+        db.append_event(&post("agent", "k2")).unwrap();
+        assert_eq!(get().last_progress_at.as_deref(), Some("2032-01-01T00:00:00Z"));
+    }
+
+    #[test]
     fn retry_takes_back_stuck_work_but_not_finished_work() {
         let db = db();
         db.create_task(&task("t1")).unwrap();
         db.claim_task_for_dispatch("t1", "2026-01-01T00:00:01Z").unwrap();
-        db.flag_unreported_tasks("s1", "2026-01-01T00:00:02Z").unwrap();
-        assert_eq!(db.flag_unreported_tasks("s1", "2026-01-01T00:00:03Z").unwrap(), 0, "flagged once");
 
         let retried = db.retry_task("t1", "2026-01-01T00:00:04Z").unwrap();
         assert_eq!(retried.status, TaskStatus::Todo);
@@ -1912,8 +2042,11 @@ mod tests {
         t.notify_once("blocked", "agent a1 is not taking work; activate it or move the lease");
         assert_eq!(board_reason(&t, &[member("active")], &[], &[]).as_deref(), Some("awaiting_agent"));
         t.status = TaskStatus::InProgress;
+        t.last_progress_at = Some(chrono::Utc::now().to_rfc3339());
         assert_eq!(board_reason(&t, &[member("active")], &[], &[]).as_deref(), Some("working"));
-        t.notify_once("stalled", "quiet");
+        t.last_progress_at = Some(chrono::Utc::now().to_rfc3339());
+        assert_eq!(board_reason(&t, &[], &[], &[]).as_deref(), Some("working"));
+        t.last_progress_at = Some((chrono::Utc::now() - chrono::Duration::minutes(25)).to_rfc3339());
         assert_eq!(board_reason(&t, &[], &[], &[]).as_deref(), Some("stalled"));
         t.status = TaskStatus::Blocked;
         t.dispatch_failures = 3;

@@ -79,6 +79,12 @@ impl Store {
                 "INSERT INTO outbox (event_id, available_at) VALUES (?1, ?2)",
                 params![event.event_id, event.created_at],
             )?;
+            if event.actor_kind == "agent" {
+                tx.execute(
+                    "UPDATE tasks SET last_progress_at = ?2 WHERE thread_id = ?1 AND status = 'in_progress'",
+                    params![event.thread_id, event.created_at],
+                )?;
+            }
             tx.commit()?;
             let mut saved = event.clone();
             saved.sequence = sequence;

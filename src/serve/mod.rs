@@ -65,6 +65,7 @@ mod mission_control;
 pub use mission_control::{mission_error, validated_owned_paths};
 mod recurring;
 mod review;
+mod stall;
 mod goals;
 mod agent_wakes;
 mod keep_warm;
