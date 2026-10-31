@@ -521,7 +521,7 @@ impl Tool for WaitForUser {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "wait_for_user".into(),
-            description: "In a live spoken conversation, wait briefly for the user to carry on before you answer, when their line trails off or sounds unfinished. Returns their next turn as soon as they speak, or reports that they did not continue.".into(),
+            description: "In a live spoken conversation, pause for a beat when the user's line trails off or sounds unfinished. It returns by itself: with their next turn as soon as they speak (the wait stretches while they are still talking, up to 4 seconds, and you get the whole turn), or, if they stay silent, reporting that they did not continue, which hands the turn back to you to answer now. Call it once per line, before you speak.".into(),
             input_schema: schema(json!({
                 "max_seconds": {"type": "number", "description": "How long to wait, 0.3 to 4. Default 1.5."},
                 "reason": {"type": "string", "description": "Why you are waiting, in a short phrase, for example 'trailed off after and also'."}
