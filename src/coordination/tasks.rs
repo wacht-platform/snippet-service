@@ -204,6 +204,10 @@ pub struct TaskSubStatus {
     pub current_step: Option<String>,
     /// Minutes without progress, while the task is stalled.
     pub stalled_minutes: Option<i64>,
+    /// Who holds the session lease, with the fencing token.
+    pub lease: Option<super::leases::Lease>,
+    /// The latest handover: `{id, from, to, state: pending|acked, ...}`.
+    pub handover: Option<serde_json::Value>,
 }
 
 pub const STALL_FLOOR_MINUTES: i64 = 20;
@@ -1346,6 +1350,8 @@ impl Store {
             current_step: current_step(task),
             stalled_minutes: stalled_minutes(task, chrono::Utc::now(), false)
                 .or_else(|| stall_marker_for_current_spell(task).map(|_| minutes_since(progress_stamp(task), chrono::Utc::now()))),
+            lease: self.lease_of(&task.id).ok().flatten(),
+            handover: self.latest_handoff(&task.id).ok().flatten().map(|h| h.view()),
         }
     }
 

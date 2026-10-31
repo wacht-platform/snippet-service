@@ -328,6 +328,7 @@ impl AgentRuntime {
             "message_mission_control",
             "claim_and_dispatch_task",
             "transfer_task_session_lease",
+            "ack_handoff",
             "post_coordination_message",
             "read_coordination_board",
             "record_coordination_note",
@@ -522,6 +523,7 @@ pub(crate) fn coordination_tool_registry() -> ToolRegistry {
     for name in [
         "message_mission_control",
         "transfer_task_session_lease",
+        "ack_handoff",
         "post_coordination_message",
     ] {
         tools.remove(name);

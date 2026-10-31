@@ -30,6 +30,7 @@ pub fn add_coordination_tools(registry: &mut ToolRegistry) {
     registry.insert(MessageMissionControl);
     registry.insert(PostTaskCoordination);
     registry.insert(TransferTaskSessionLease);
+    registry.insert(AckHandoff);
     registry.insert(InspectTask);
     registry.insert(ClaimAndDispatchTask);
     registry.insert(crate::agent_wakes::WakeScheduleTool);
@@ -1071,12 +1072,12 @@ impl Tool for PostTaskCoordination {
 struct TransferTaskSessionLeaseArgs {
     task_id: String,
     to_agent_id: String,
+    done: String,
+    next: String,
     #[serde(default)]
-    reason: Option<String>,
+    risks: String,
     #[serde(default)]
-    handoff_context: Option<String>,
-    #[serde(default)]
-    artifacts: Vec<String>,
+    files: Vec<String>,
 }
 
 pub struct TransferTaskSessionLease;
@@ -1085,16 +1086,17 @@ impl Tool for TransferTaskSessionLease {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "transfer_task_session_lease".into(),
-            description: "Transfer the active workspace session lease for a task to another assigned agent (or back to snippet). Only ONE agent can work in the project session at a time; the others are waiting. Provide reason, handoff_context, and artifacts to give the next agent complete context of what you did and what they should do.".into(),
+            description: "Hand a task's session lease to another assigned agent. You must hold it. The handover (done, next, risks, files) is recorded; you keep the lease until the other agent calls ack_handoff, and Mission Control is told if that takes over 10 minutes.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string"},
-                    "to_agent_id": {"type": "string", "description": "Agent to hand lease to, e.g. an assigned agent or 'snippet'"},
-                    "reason": {"type": "string", "description": "High-level reason for the handoff / phase transition"},
-                    "handoff_context": {"type": "string", "description": "Detailed briefing and guidance for the incoming agent"},
-                    "artifacts": {"type": "array", "items": {"type": "string"}, "description": "List of files or paths modified or created in this phase"}
+                    "to_agent_id": {"type": "string", "description": "An assigned agent, or 'snippet'"},
+                    "done": {"type": "string", "description": "What is finished"},
+                    "next": {"type": "string", "description": "What the next agent should do"},
+                    "risks": {"type": "string", "description": "What could go wrong; open doubts"},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Files changed or to look at"}
                 }),
-                &["task_id", "to_agent_id"],
+                &["task_id", "to_agent_id", "done", "next"],
             ),
         }
     }
@@ -1106,6 +1108,9 @@ impl Tool for TransferTaskSessionLease {
         if task_id.is_empty() || to_agent.is_empty() {
             return Err(ToolError::msg("task_id and to_agent_id must not be empty"));
         }
+        if args.done.trim().is_empty() || args.next.trim().is_empty() {
+            return Err(ToolError::msg("a handover needs `done` and `next`"));
+        }
         let db = db(ctx)?;
         let task = db
             .get_task(task_id)
@@ -1116,67 +1121,127 @@ impl Tool for TransferTaskSessionLease {
         let now = now_rfc3339();
 
         let roster = db.list_task_agents(task_id).unwrap_or_default();
-        let current_active = roster
+        let holder = roster
             .iter()
             .find(|m| m.status == "active" && m.removed_at.is_none())
-            .map(|m| m.agent_id.as_str())
-            .unwrap_or(&actor_id);
-
+            .map(|m| m.agent_id.clone());
+        if holder.as_deref().is_some_and(|h| h != actor_id) {
+            return Err(ToolError::msg(format!("only the lease holder `{}` can hand the task over", holder.unwrap_or_default())));
+        }
+        if to_agent == actor_id {
+            return Err(ToolError::msg("you already hold the lease"));
+        }
         if !roster.iter().any(|m| m.agent_id == to_agent && m.removed_at.is_none()) {
             db.add_task_agent_full(task_id, to_agent, "collaborator", None, "", "waiting", &now)
                 .map_err(|e| ToolError::msg(format!("add agent to roster: {e}")))?;
         }
-
-        db.transfer_task_session_lease(task_id, current_active, to_agent)
-            .map_err(|e| ToolError::msg(format!("transfer lease: {e}")))?;
-
-        let reason_str = args.reason.as_deref().unwrap_or("Handoff to next agent");
-        let mut body = format!("Session lease transferred from {current_active} to {to_agent}: {reason_str}");
-        if let Some(ref h_ctx) = args.handoff_context {
-            if !h_ctx.trim().is_empty() {
-                body.push_str(&format!("\nHandoff Briefing:\n{}", h_ctx.trim()));
-            }
-        }
-        if !args.artifacts.is_empty() {
-            body.push_str(&format!("\nArtifacts / Modified Files:\n{}", args.artifacts.join(", ")));
-        }
-
-        let event = CoordinationEvent {
-            event_id: Uuid::new_v4().to_string(),
-            thread_id: task.thread_id.clone(),
-            partition_key: format!("thread:{}", task.thread_id),
-            sequence: 0,
-            event_type: "task.lease_transferred".into(),
-            actor_kind: "agent".into(),
-            actor_id: actor_id.clone(),
-            payload_version: 1,
-            payload: stamp_origin(ctx, json!({
-                "body": body,
-                "task_id": task_id,
-                "from_agent_id": current_active,
-                "to_agent_id": to_agent,
-                "reason": reason_str,
-                "handoff_context": args.handoff_context,
-                "artifacts": args.artifacts,
-            })),
-            causation_id: None,
-            correlation_id: Some(task_id.to_string()),
-            idempotency_key: Uuid::new_v4().to_string(),
-            created_at: now,
+        let handover = crate::coordination::handoffs::Handover {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            from_agent: actor_id.clone(),
+            to_agent: to_agent.to_string(),
+            done: args.done.trim().to_string(),
+            next: args.next.trim().to_string(),
+            risks: args.risks.trim().to_string(),
+            files: args.files.clone(),
+            created_at: now.clone(),
+            acked_at: None,
+            escalated_at: None,
         };
-        let saved = db
-            .append_event(&event)
-            .map_err(|e| ToolError::msg(format!("record event: {e}")))?;
-        crate::session::emit_device_event(json!({
-            "kind": "coordination_event",
-            "event": saved.clone(),
-        }));
-        crate::serve::queue_coordination_wake(&db, saved.clone());
+        db.create_handoff(&handover).map_err(|e| ToolError::msg(e.to_string()))?;
+
+        let body = format!(
+            "Handover from {actor_id} to {to_agent}, waiting for ack_handoff (id {}):\nDone: {}\nNext: {}\nRisks: {}\nFiles: {}",
+            handover.id, handover.done, handover.next,
+            if handover.risks.is_empty() { "none stated" } else { &handover.risks },
+            handover.files.join(", ")
+        );
+        let saved = post_handover_event(&db, ctx, &task.thread_id, "task.handoff_requested", &actor_id, &body, json!({
+            "task_id": task_id, "handoff_id": handover.id, "from_agent_id": actor_id, "to_agent_id": to_agent,
+        }))?;
         Ok(ToolResult::success(json!({
-            "transferred": true,
+            "pending": true,
             "task_id": task_id,
-            "active_agent": to_agent,
+            "handoff_id": handover.id,
+            "lease_holder": actor_id,
+            "note": format!("`{to_agent}` holds the lease once it calls ack_handoff; until then you keep it."),
             "event": saved,
+        })))
+    }
+}
+
+fn post_handover_event(
+    db: &Store,
+    ctx: &ToolContext,
+    thread_id: &str,
+    event_type: &str,
+    actor_id: &str,
+    body: &str,
+    mut payload: Value,
+) -> Result<CoordinationEvent, ToolError> {
+    payload["body"] = json!(body);
+    let event = CoordinationEvent {
+        event_id: Uuid::new_v4().to_string(),
+        thread_id: thread_id.to_string(),
+        partition_key: format!("thread:{thread_id}"),
+        sequence: 0,
+        event_type: event_type.into(),
+        actor_kind: "agent".into(),
+        actor_id: actor_id.to_string(),
+        payload_version: 1,
+        payload: stamp_origin(ctx, payload),
+        causation_id: None,
+        correlation_id: None,
+        idempotency_key: Uuid::new_v4().to_string(),
+        created_at: now_rfc3339(),
+    };
+    let saved = db.append_event(&event).map_err(|e| ToolError::msg(format!("record event: {e}")))?;
+    crate::session::emit_device_event(json!({"kind": "coordination_event", "event": saved.clone()}));
+    crate::serve::queue_coordination_wake(db, saved.clone());
+    Ok(saved)
+}
+
+#[derive(Deserialize)]
+struct AckHandoffArgs {
+    #[serde(default)]
+    task_id: Option<String>,
+}
+
+pub struct AckHandoff;
+#[async_trait]
+impl Tool for AckHandoff {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "ack_handoff".into(),
+            description: "Accept the handover addressed to you. Your first action on a handed-over task: it moves the session lease to you. Read the handover (done, next, risks, files) first.".into(),
+            input_schema: schema(json!({"task_id": {"type": "string", "description": "Defaults to the task in progress in this session"}}), &[]),
+        }
+    }
+    async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: AckHandoffArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let db = db(ctx)?;
+        let (_, actor_id) = actor(ctx)?;
+        let task = match args.task_id.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            Some(id) => db.get_task(id).map_err(|e| ToolError::msg(e.to_string()))?,
+            None => ctx
+                .durable_session_id()
+                .or(ctx.lane_origin().map(|(s, _)| s))
+                .and_then(|s| db.list_tasks(Some(s), None).ok())
+                .and_then(|tasks| tasks.into_iter().find(|t| !t.status.is_terminal() && db.pending_handoff(&t.id).ok().flatten().is_some())),
+        }
+        .ok_or_else(|| ToolError::msg("no task with a handover waiting; pass task_id"))?;
+        let now = now_rfc3339();
+        let h = db.ack_handoff(&task.id, &actor_id, &now).map_err(|e| ToolError::msg(e.to_string()))?;
+        let lease = db.current_lease(&task.id).ok().flatten();
+        let body = format!("{actor_id} acknowledged the handover from {} and holds the lease.", h.from_agent);
+        post_handover_event(&db, ctx, &task.thread_id, "task.lease_transferred", &actor_id, &body, json!({
+            "task_id": task.id, "handoff_id": h.id, "from_agent_id": h.from_agent, "to_agent_id": h.to_agent,
+        }))?;
+        Ok(ToolResult::success(json!({
+            "acknowledged": true,
+            "task_id": task.id,
+            "fencing_token": lease.map(|l| l.fencing_token),
+            "done": h.done, "next": h.next, "risks": h.risks, "files": h.files,
         })))
     }
 }
@@ -1950,19 +2015,30 @@ mod tests {
             .execute(&ctx_a, json!({
                 "task_id": "t1",
                 "to_agent_id": "agent-b",
-                "reason": "Ready for PR review",
-                "handoff_context": "Implemented OAuth2 token refresh in src/auth.rs",
-                "artifacts": ["src/auth.rs", "tests/auth_test.rs"]
+                "done": "Implemented OAuth2 token refresh in src/auth.rs",
+                "next": "Review the PR",
+                "risks": "token expiry edge",
+                "files": ["src/auth.rs", "tests/auth_test.rs"]
             }))
             .await
             .unwrap();
         assert_eq!(res.value["status"], "success");
 
-        let agents = db.list_task_agents("t1").unwrap();
-        let a = agents.iter().find(|m| m.agent_id == "agent-a").unwrap();
-        let b = agents.iter().find(|m| m.agent_id == "agent-b").unwrap();
-        assert_eq!(a.status, "waiting");
-        assert_eq!(b.status, "active");
+        let holder = |db: &Store| db.list_task_agents("t1").unwrap().into_iter().find(|m| m.status == "active").unwrap().agent_id;
+        assert_eq!(holder(&db), "agent-a", "the old holder keeps the lease until the ack");
+        let ctx_b0 = ToolContext::new(dir.path())
+            .unwrap()
+            .with_store_path(dir.path().join("snippet.db"))
+            .with_durable_session_id("sess-1")
+            .with_agent_id("agent-b");
+        assert!(TransferTaskSessionLease
+            .execute(&ctx_b0, json!({"task_id": "t1", "to_agent_id": "agent-a", "done": "x", "next": "y"}))
+            .await
+            .is_err(), "only the holder hands over");
+        assert!(AckHandoff.execute(&ctx_a, json!({"task_id": "t1"})).await.is_err(), "the sender cannot ack its own handover");
+        let acked = AckHandoff.execute(&ctx_b0, json!({"task_id": "t1"})).await.unwrap();
+        assert_eq!(acked.value["data"]["acknowledged"], true);
+        assert_eq!(holder(&db), "agent-b");
 
         // Verify InspectTask provides maximum visibility
         let ctx_b = ToolContext::new(dir.path())

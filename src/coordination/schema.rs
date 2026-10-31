@@ -187,6 +187,21 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
          );
          CREATE UNIQUE INDEX IF NOT EXISTS session_leases_open
              ON session_leases(task_id) WHERE released_at IS NULL;
+         -- A handover is acknowledged by the incoming agent before the lease moves.
+         CREATE TABLE IF NOT EXISTS handoffs (
+             id TEXT PRIMARY KEY NOT NULL,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             from_agent TEXT NOT NULL,
+             to_agent TEXT NOT NULL,
+             done TEXT NOT NULL,
+             next TEXT NOT NULL,
+             risks TEXT NOT NULL DEFAULT '',
+             files_json TEXT NOT NULL DEFAULT '[]',
+             created_at TEXT NOT NULL,
+             acked_at TEXT,
+             escalated_at TEXT
+         );
+         CREATE INDEX IF NOT EXISTS handoffs_task ON handoffs(task_id, created_at);
          CREATE TABLE IF NOT EXISTS task_requesters (
              task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
              reply_to TEXT NOT NULL

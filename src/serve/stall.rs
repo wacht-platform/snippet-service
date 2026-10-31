@@ -54,6 +54,23 @@ pub(super) fn sweep(store: &Store, now: DateTime<Utc>, probe: impl Fn(&str) -> O
     flagged
 }
 
+/// Tell Mission Control once about a handover nobody has acknowledged in time.
+pub(super) fn escalate_handoffs(store: &Store, now: DateTime<Utc>) -> usize {
+    let mut escalated = 0;
+    for h in store.overdue_handoffs(now).unwrap_or_default() {
+        let message = format!(
+            "handover {} from `{}` to `{}` was not acknowledged within {} min; the sender still holds the lease. Wake `{}` or take the work back.",
+            h.id, h.from_agent, h.to_agent, crate::coordination::handoffs::ESCALATE_AFTER_MINUTES, h.to_agent
+        );
+        let stamp = now.to_rfc3339();
+        if store.update_task_in(&h.task_id, &stamp, |t| t.notify_once("handover_unacked", &message)).is_ok() {
+            escalated += 1;
+        }
+        let _ = store.mark_handoff_escalated(&h.id, &stamp);
+    }
+    escalated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +126,42 @@ mod tests {
         store.complete_task("first", TaskStatus::Done, crate::coordination::TaskResult { summary: "ok".into(), ..Default::default() }, &Utc::now().to_rfc3339()).unwrap();
         assert!(sweep(&store, Utc::now(), idle).is_empty());
         assert!(store.get_task("second").unwrap().unwrap().notifications.iter().all(|n| n.kind != "stalled"));
+    }
+
+    #[test]
+    fn an_unacknowledged_handover_escalates_once_and_shows_in_the_board_view() {
+        use crate::coordination::handoffs::Handover;
+        let store = Store::open_in_memory().unwrap();
+        running_task(&store, "t", 1, None);
+        for id in ["a", "b"] {
+            store
+                .create_agent(&crate::coordination::types::Agent {
+                    id: id.into(), display_name: id.into(), handle: id.into(),
+                    kind: crate::coordination::types::AgentKind::Worker,
+                    status: crate::coordination::types::AgentStatus::Active,
+                    role: crate::coordination::types::AgentRole::Implementer, capabilities: vec![],
+                })
+                .unwrap();
+        }
+        store.add_task_agent_full("t", "a", "implementer", None, "", "active", "2026-01-01T00:00:00Z").unwrap();
+        store.add_task_agent_full("t", "b", "reviewer", None, "", "waiting", "2026-01-01T00:00:00Z").unwrap();
+        let created = (Utc::now() - chrono::Duration::minutes(11)).to_rfc3339();
+        store
+            .create_handoff(&Handover {
+                id: "h1".into(), task_id: "t".into(), from_agent: "a".into(), to_agent: "b".into(),
+                done: "d".into(), next: "n".into(), risks: String::new(), files: vec![],
+                created_at: created, acked_at: None, escalated_at: None,
+            })
+            .unwrap();
+        let task = store.get_task("t").unwrap().unwrap();
+        let sub = store.board_sub_status(&task);
+        assert_eq!(sub.handover.as_ref().unwrap()["state"], "pending");
+        assert_eq!(escalate_handoffs(&store, Utc::now()), 1);
+        assert_eq!(escalate_handoffs(&store, Utc::now()), 0, "once");
+        let task = store.get_task("t").unwrap().unwrap();
+        assert!(task.notifications.iter().any(|n| n.kind == "handover_unacked"));
+        store.current_lease("t").unwrap();
+        assert_eq!(store.board_sub_status(&task).lease.unwrap().agent_id, "a");
     }
 
     #[test]

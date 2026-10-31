@@ -34,6 +34,8 @@ pub enum StoreError {
     StaleTaskState { task_id: String, expected: u64, actual: u64 },
     #[error("stored record is malformed: {0}")]
     AppDecode(String),
+    #[error("{0}")]
+    InvalidInput(String),
 }
 
 /// Canonical location of the snippet database.

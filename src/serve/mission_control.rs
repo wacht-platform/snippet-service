@@ -155,6 +155,8 @@ fn mission_task_view(store: &crate::store::Store, task: &Task) -> serde_json::Va
         "last_progress_at": task.last_progress_at,
         "expected_minutes": task.expected_minutes,
         "stalled_minutes": sub.stalled_minutes,
+        "lease": sub.lease,
+        "handover": sub.handover,
     });
     if let Some(map) = view.as_object_mut() {
         map.extend(crate::task_state_tools::api_fields(store, task));
@@ -1338,6 +1340,7 @@ pub async fn dispatch_loop(daemon: Shared) {
         }
         super::review::drive_reviews(&daemon).await;
         super::stall::sweep(&daemon.store, chrono::Utc::now(), super::stall::probe_session);
+        super::stall::escalate_handoffs(&daemon.store, chrono::Utc::now());
         deliver_mission_control_reports(&daemon).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1396,7 +1399,7 @@ fn report_text(task: &Task, marker: &crate::coordination::NotificationMarker) ->
 
 /// Outcomes that must not wait behind a question to the user.
 fn is_outcome_report(kind: &str) -> bool {
-    matches!(kind, "done" | "failed" | "stalled" | "blocked" | "review_escalated")
+    matches!(kind, "done" | "failed" | "stalled" | "blocked" | "review_escalated" | "handover_unacked")
 }
 
 async fn deliver_mission_control_reports(daemon: &Daemon) {

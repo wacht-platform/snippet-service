@@ -11,6 +11,7 @@ pub mod board;
 pub mod direct;
 mod events;
 pub mod goals;
+pub mod handoffs;
 mod identity;
 pub mod leases;
 pub mod schema;

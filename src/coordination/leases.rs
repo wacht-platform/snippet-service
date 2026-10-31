@@ -72,6 +72,11 @@ impl Store {
         })
     }
 
+    /// The recorded lease, without syncing it; for read-only views.
+    pub fn lease_of(&self, task_id: &str) -> Result<Option<Lease>, StoreError> {
+        self.with_connection(|conn| open_lease(conn, task_id))
+    }
+
     /// The task's current lease, after syncing it with the roster.
     pub fn current_lease(&self, task_id: &str) -> Result<Option<Lease>, StoreError> {
         self.sync_task_lease(task_id, &chrono::Utc::now().to_rfc3339())
