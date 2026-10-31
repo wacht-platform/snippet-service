@@ -7,6 +7,7 @@
 pub const CODING_AGENT_LAYER: &str = include_str!("../prompts/coding_agent_layer.md");
 pub const CONVERSATION_AGENT_LAYER: &str = include_str!("../prompts/conversation_agent_layer.md");
 pub const MISSION_CONTROL_LAYER: &str = include_str!("../prompts/mission_control_layer.md");
+pub const ECOSYSTEM_LAYER: &str = include_str!("../prompts/ecosystem_layer.md");
 pub const COORDINATION_LAYER: &str = include_str!("../prompts/coordination_layer.md");
 pub const DELEGATION_LAYER: &str = include_str!("../prompts/delegation_layer.md");
 pub const TASK_LAYER: &str = include_str!("../prompts/task_layer.md");
@@ -89,13 +90,13 @@ impl PromptContext {
 }
 
 pub fn coding_prompt(context: &PromptContext) -> String {
-    let mut parts = vec![CODING_AGENT_LAYER.trim()];
+    let mut parts = vec![CODING_AGENT_LAYER.trim(), ECOSYSTEM_LAYER.trim()];
     parts.extend(context.conditional_layers());
     parts.join("\n\n")
 }
 
 pub fn conversation_prompt(context: &PromptContext) -> String {
-    let mut parts = vec![CODING_AGENT_LAYER.trim()];
+    let mut parts = vec![CODING_AGENT_LAYER.trim(), ECOSYSTEM_LAYER.trim()];
     parts.extend(context.conditional_layers());
     parts.push(CONVERSATION_AGENT_LAYER.trim());
     parts.push(DELEGATION_LAYER.trim());
@@ -121,7 +122,7 @@ pub fn coordination_prompt(_context: &PromptContext) -> String {
     // No vault layer: it is about commands this session has no
     // shell to run. COORDINATION_LAYER is last so its statements about what
     // this session can and cannot do are the final word.
-    [CONVERSATION_AGENT_LAYER.trim(), COORDINATION_LAYER.trim()].join("\n\n")
+    [CONVERSATION_AGENT_LAYER.trim(), ECOSYSTEM_LAYER.trim(), COORDINATION_LAYER.trim()].join("\n\n")
 }
 
 pub fn mission_control_system_prompt() -> String {
