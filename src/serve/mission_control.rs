@@ -1189,9 +1189,9 @@ async fn open(
     }
 }
 
-pub(super) const WORKFLOW_PLAN: &str = "Workflow W7 · first plan: the worker has laid out how it will deliver the task. Check it against the requirements; when it misses or misreads something, say so in the task room (post_task_coordination) so the worker adjusts before going far; when it shows what comes next, line up that work. A plan that's right needs nothing from you. Then stop.";
+pub(super) const WORKFLOW_PLAN: &str = "Workflow W7 · first plan: the worker has laid out how it will deliver the task. Check it against the requirements; when it misses or misreads something, say so in the task room (post_task_coordination) so the worker adjusts before going far; when it shows what comes next, line up that work. A plan that's right needs no reply. Then stop.";
 
-pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: read it and trust the worker's verification (check a claim only if the report is vague or the stakes are high, with a command or two); done → give the user the outcome, steps waiting on this one start by themselves; blocked → unblock it; failed → retry once or re-route. Then stop.";
+pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: read it and trust the worker's verification (check a claim only if the report is vague or the stakes are high, with a command or two); done → give the user the outcome unless you already have, steps waiting on this one start by themselves; blocked → unblock it; failed → retry once or re-route. Then stop.";
 
 pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<String>) -> Result<(String, std::path::PathBuf), String> {
     let home = mission_control::ensure_home()?;

@@ -189,3 +189,32 @@ pub fn specialized_coordination_prompt(context: SpecializedAgentPromptContext<'_
         overlay = identity_overlay(context.agent_id, context.identity),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MISSION_CONTROL_LAYER;
+
+    #[test]
+    fn mission_control_layer_stays_within_budget() {
+        // Mission Control re-reads this on every wake; grow it only by cutting elsewhere.
+        assert!(MISSION_CONTROL_LAYER.len() <= 39_000, "layer is {} bytes", MISSION_CONTROL_LAYER.len());
+    }
+
+    #[test]
+    fn mission_control_layer_keeps_orchestration_guards() {
+        for guard in [
+            "When the user names the session, agent or model, the work goes there",
+            "A session works one task at a time",
+            "Carry over everything specific the user named",
+            "A picture the user sends is a file path to put in the briefing",
+            "never a version you remember",
+            "Board notices (a claim, a progress note, a plan that matches) get no reply",
+            "A plan that's right gets no reply at all",
+            "not even one saying you're staying quiet",
+            "when the user asks you to confirm something, check before you answer",
+            "A `stalled` notice can also fire",
+        ] {
+            assert!(MISSION_CONTROL_LAYER.contains(guard), "missing: {guard}");
+        }
+    }
+}
