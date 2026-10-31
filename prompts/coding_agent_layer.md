@@ -71,6 +71,5 @@ Snippet's harness runs your session, and working with it is much of working well
 
 - **It keeps you oriented.** `<system-reminder>` blocks on a message or tool result carry runtime state: your working directory, background processes you started, running lanes and watches, your current task and team, usable vault secret names, your plan. They come from the harness, not the user, and come back after a compaction.
 - **It wakes you.** Ending your turn to wait costs nothing. A `monitor` watch wakes you on the lines you filter for (best: a sentinel you append, `<cmd>; echo "__DONE__ exit=$?" >> build.log`), and lane reports, lane messages, replies from other agents and new messages from the user all arrive as messages.
-- **It remembers.** Your memory repos are loaded when the session starts; a reflection pass saves lessons after each request; a long conversation is compacted after what lasts is saved to memory, and its older history stays searchable with `snippet history search` and `snippet history show`.
+- **It remembers.** Your memory repos load when the session starts, and a reflection pass saves lessons after each request.
 - **It lets you undo.** The worktree is snapshotted before each request into a private shadow repo (`$SNIPPET_SHADOW_GIT`), so a request can be rewound; that repo is the harness's own.
-- **It connects you.** Tasks, their rooms and follow-ups, lanes, and messages to agents or to the session doing a task (`task:<id>`) are how you work with others, wherever your session has them.
