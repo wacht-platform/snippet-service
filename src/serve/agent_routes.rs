@@ -436,7 +436,7 @@ pub(crate) struct AgentShapeReq {
     pub(crate) shape: Option<String>,
 }
 
-pub(crate) const AGENT_SHAPES: [&str; 7] = ["mochi", "bunny", "cat", "bear", "ghost", "cloud", "frog"];
+pub(crate) const AGENT_SHAPES: [&str; 7] = ["mochi", "bunny", "cat", "bear", "ghost", "cloud", "onigiri"];
 
 /// POST /agents/{id}/shape — the agent's mascot shape (one of `AGENT_SHAPES`), or null to
 /// go back to the default.

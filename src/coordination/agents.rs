@@ -421,8 +421,8 @@ mod tests {
         db.create_agent(&agent("a1", "A")).unwrap();
         assert!(!db.set_agent_shape("ghost-agent", Some("cat")).unwrap(), "unknown agent");
         assert!(db.set_agent_shape("a1", Some("cat")).unwrap());
-        assert!(db.set_agent_shape("a1", Some("frog")).unwrap());
-        assert_eq!(db.agent_shapes().unwrap().get("a1").map(String::as_str), Some("frog"));
+        assert!(db.set_agent_shape("a1", Some("onigiri")).unwrap());
+        assert_eq!(db.agent_shapes().unwrap().get("a1").map(String::as_str), Some("onigiri"));
         assert!(db.set_agent_shape("a1", None).unwrap());
         assert!(db.agent_shapes().unwrap().is_empty());
         db.set_agent_shape("a1", Some("bear")).unwrap();
