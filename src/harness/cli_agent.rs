@@ -1080,10 +1080,27 @@ impl CodingHarness {
         profile: InferenceProfileConfig,
         brief: String,
     ) -> Result<HarnessOutcome, ToolError> {
-        let (_keep, input_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let forward = self.config.lane_mailbox.clone().map(|mailbox| {
+            let input_tx = input_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    for text in mailbox.wait(std::time::Duration::from_secs(3600)).await {
+                        if input_tx.send(LoopInput::UserMessage(text)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+        });
         let state = self
             .drive_cli(profile, Some(brief), input_rx, None, None, true)
-            .await?;
+            .await;
+        drop(input_tx);
+        if let Some(forward) = forward {
+            forward.abort();
+        }
+        let state = state?;
         if state.final_text.is_none() {
             let message = state
                 .events

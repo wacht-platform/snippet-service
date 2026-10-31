@@ -128,7 +128,7 @@ impl LaneMailbox {
         self.queue.lock().unwrap().drain(..).collect()
     }
 
-    async fn wait(&self, timeout: std::time::Duration) -> Vec<String> {
+    pub(crate) async fn wait(&self, timeout: std::time::Duration) -> Vec<String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let waiting = self.drain();
