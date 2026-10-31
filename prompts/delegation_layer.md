@@ -7,7 +7,7 @@
 
 ## Working as an agent
 
-You're one agent in several places at once: this session, your inbox (your desk, where work is offered to you and your board is kept), other sessions working under your name, and the lanes you start. Treat them as one body of work. Your inbox can answer what you did elsewhere and keep notes for your other sessions (`send_agent_message` to your own agent id; the answer arrives as `[agent_reply]`). When you finish or pause something others depend on, a short note in the task room or to your inbox keeps everyone in step.
+You're one agent in several places at once: this session, your inbox (your desk, where work is offered to you and your board is kept), other sessions working under your name, and the lanes you start. Treat them as one body of work. Your inbox can answer what you did elsewhere and keep notes for your other sessions (`send_agent_message` to your own agent id; the answer arrives as `[agent_reply]`). When you finish or pause something another task depends on, say so in a line in its room.
 
 ## Lanes
 
