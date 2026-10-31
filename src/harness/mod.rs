@@ -114,9 +114,24 @@ impl Default for HarnessConfig {
     }
 }
 
+/// One file in a [`HarnessEvent::TurnChanges`]: path relative to the workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileChange {
+    pub path: String,
+    pub add: u64,
+    pub del: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HarnessEvent {
+    /// What the turn that just ended changed in the workspace. UI-only: never sent to the model.
+    TurnChanges {
+        files: Vec<FileChange>,
+        total_files: usize,
+        add: u64,
+        del: u64,
+    },
     UserInput {
         text: String,
     },
@@ -837,10 +852,16 @@ struct LoopVars {
     /// runtime. Finished before any tool runs so a rewind restores the files
     /// exactly as they were when the request arrived.
     pending_checkpoint: Option<PendingCheckpoint>,
+    /// A user request began a turn that has not yet reported its changes.
+    turn_open: bool,
+    /// Snapshot id the open turn started from, once known.
+    turn_start: Option<String>,
 }
 
 struct PendingCheckpoint {
     snapshot: tokio::task::JoinHandle<Result<String, String>>,
+    /// The snapshot's result once awaited, so it can be awaited only once.
+    resolved: Option<Result<String, String>>,
     label: String,
     created_at: String,
     event_index: usize,

@@ -433,6 +433,9 @@ impl CodingHarness {
                             TurnEndKind::Ask => HarnessStatus::WaitingForInput,
                             TurnEndKind::Complete => HarnessStatus::Idle,
                         };
+                        if matches!(kind, TurnEndKind::Complete) {
+                            self.emit_turn_changes(&mut state, &mut vars).await;
+                        }
                         self.persist(&mut state, &lanes).await?;
                         if self.config.memory_enabled && self.context.lane_origin().is_none() {
                             self.tidy_memory();

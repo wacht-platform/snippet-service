@@ -2735,6 +2735,7 @@ mod tests {
                 kind: "conversation".into(),
                 settled_at: None,
                 keep_awake: false,
+                last_changes: None,
             },
             &[],
             "[]",

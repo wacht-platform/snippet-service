@@ -934,7 +934,7 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                 settled: row.settled_at.is_some(),
                 settled_at: row.settled_at,
                 keep_awake: row.keep_awake,
-                changes: None,
+                changes: row.last_changes.as_deref().and_then(|j| serde_json::from_str(j).ok()),
                 running_since: None,
                 idle_secs: crate::settle::idle_secs(now, row.last_active.unwrap_or(0)),
                 cache: crate::settle::cache_state(crate::settle::idle_secs(now, row.last_active.unwrap_or(0))),

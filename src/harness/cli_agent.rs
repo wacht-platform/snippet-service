@@ -1760,6 +1760,9 @@ impl CodingHarness {
                                         }
                                     }
                                     CliCompaction::Idle => {
+                                        if !memory_saving && state.pending_question.is_none() {
+                                            self.emit_turn_changes(&mut state, &mut vars).await;
+                                        }
                                         if self.config.memory_enabled && self.context.lane_origin().is_none() {
                                             self.tidy_memory();
                                         }

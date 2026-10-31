@@ -63,7 +63,9 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
              -- deleted 15 days later), or NULL while it is awake.
              settled_at INTEGER,
              -- 1 opts the session out of AUTOMATIC settling (manual settle still works).
-             keep_awake INTEGER NOT NULL DEFAULT 0
+             keep_awake INTEGER NOT NULL DEFAULT 0,
+             -- JSON {files, added, removed} of the last turn that changed files, or NULL.
+             last_changes TEXT
          );
          CREATE INDEX IF NOT EXISTS sessions_workspace
              ON sessions(workspace_key, updated_at DESC);
@@ -134,6 +136,9 @@ fn ensure_session_id_columns(connection: &rusqlite::Connection) -> Result<(), ru
     }
     if !existing.iter().any(|c| c == "settled_at") {
         connection.execute("ALTER TABLE sessions ADD COLUMN settled_at INTEGER", [])?;
+    }
+    if !existing.iter().any(|c| c == "last_changes") {
+        connection.execute("ALTER TABLE sessions ADD COLUMN last_changes TEXT", [])?;
     }
     if !existing.iter().any(|c| c == "keep_awake") {
         connection.execute(
@@ -463,6 +468,8 @@ pub struct SessionRow {
     pub settled_at: Option<i64>,
     /// Opted out of automatic settling.
     pub keep_awake: bool,
+    /// JSON totals of the last turn that changed files.
+    pub last_changes: Option<String>,
 }
 
 /// Session metadata that used to live in sidecar files.
@@ -770,6 +777,17 @@ impl Store {
         })
     }
 
+    /// Record the totals of the session's most recent turn that changed files.
+    pub fn set_session_last_changes(&self, id: &str, json: &str) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE sessions SET last_changes = ?2 WHERE id = ?1 OR legacy_id = ?1",
+                params![id, json],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Opt a session in or out of automatic settling. Returns whether it exists.
     pub fn set_session_keep_awake(&self, id: &str, on: bool) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
@@ -898,7 +916,7 @@ impl Store {
 }
 
 const SESSION_COLUMNS: &str = "id, workspace_key, workspace, title, status, created_at, \
-     updated_at, last_active, profile, role, agent_id, legacy_id, kind, settled_at, keep_awake";
+     updated_at, last_active, profile, role, agent_id, legacy_id, kind, settled_at, keep_awake, last_changes";
 
 impl Store {
     /// Save a session's scalar state, creating the row on first write.
@@ -1291,6 +1309,7 @@ fn session_row_from(row: &rusqlite::Row<'_>) -> Result<SessionRow, rusqlite::Err
         kind: row.get(12)?,
         settled_at: row.get(13)?,
         keep_awake: row.get::<_, i64>(14)? != 0,
+        last_changes: row.get(15)?,
     })
 }
 
@@ -1349,6 +1368,7 @@ mod tests {
             kind: "conversation".into(),
             settled_at: None,
             keep_awake: false,
+            last_changes: None,
         }
     }
 

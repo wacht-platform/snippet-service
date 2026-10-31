@@ -161,6 +161,7 @@ mod tests {
             kind: "conversation".into(),
             settled_at: None,
             keep_awake: false,
+            last_changes: None,
         }
     }
 
@@ -180,6 +181,18 @@ mod tests {
         db.set_session_last_active("old", now).unwrap();
         assert!(db.get_session_row("old").unwrap().unwrap().settled_at.is_none());
         assert!(expired_settled(&db, now).is_empty());
+    }
+
+    #[test]
+    fn last_changes_is_stored_on_the_row_and_survives_settling() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_conversation(&row("c1"), &[], "[]").unwrap();
+        assert_eq!(db.get_session_row("c1").unwrap().unwrap().last_changes, None);
+        db.set_session_last_changes("c1", r#"{"files":2,"added":5,"removed":1}"#).unwrap();
+        db.set_session_settled("c1", Some(9)).unwrap();
+        let stored = db.get_session_row("c1").unwrap().unwrap().last_changes.unwrap();
+        let c: crate::session_stats::Changes = serde_json::from_str(&stored).unwrap();
+        assert_eq!((c.files, c.added, c.removed), (2, 5, 1));
     }
 
     #[test]

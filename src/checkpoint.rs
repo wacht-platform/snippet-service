@@ -155,28 +155,7 @@ fn snapshot_unlocked(workspace: &Path, label: &str) -> Result<String, String> {
         return Err("git is not available".to_string());
     }
     ensure_init(workspace).map_err(|e| format!("initialize shadow repo: {e}"))?;
-    git(workspace, &["add", "-A"]).map_err(|e| format!("git add: {e}"))?;
-    let tree = match git(workspace, &["write-tree"]) {
-        Ok(tree) => tree,
-        Err(first_error) => {
-            // The shadow index can outlive workspace rewrites and retain an object
-            // that was garbage-collected or replaced. Rebuild only this private
-            // index; never touch the user's real `.git/index`.
-            let index_path = shadow_dir(workspace).join("index");
-            let recovery = std::fs::remove_file(&index_path)
-                .map_err(|e| format!("remove corrupt shadow index: {e}"))
-                .and_then(|_| git(workspace, &["add", "-A"]))
-                .and_then(|_| git(workspace, &["write-tree"]));
-            match recovery {
-                Ok(tree) => tree,
-                Err(recovery_error) => {
-                    return Err(format!(
-                        "git write-tree: {first_error}; shadow-index recovery failed: {recovery_error}"
-                    ));
-                }
-            }
-        }
-    };
+    let tree = write_tree_unlocked(workspace)?;
     // Standalone commit (no parent chain) so a dropped snapshot becomes
     // unreachable and is freed by gc. Each snapshot is kept alive only by its own
     // `refs/snapshots/<id>` ref until `prune` removes it.
@@ -190,6 +169,77 @@ fn snapshot_unlocked(workspace: &Path, label: &str) -> Result<String, String> {
     // --work-tree=. diff checkpoint`. Kept across prunes (it points into `keep`).
     let _ = git(workspace, &["update-ref", "refs/heads/checkpoint", &commit]);
     Ok(commit)
+}
+
+/// Stage the whole work-tree in the shadow index and write it as a tree object.
+fn write_tree_unlocked(workspace: &Path) -> Result<String, String> {
+    git(workspace, &["add", "-A"]).map_err(|e| format!("git add: {e}"))?;
+    match git(workspace, &["write-tree"]) {
+        Ok(tree) => Ok(tree),
+        Err(first_error) => {
+            // The shadow index can outlive workspace rewrites and retain an object
+            // that was garbage-collected or replaced. Rebuild only this private
+            // index; never touch the user's real `.git/index`.
+            let index_path = shadow_dir(workspace).join("index");
+            std::fs::remove_file(&index_path)
+                .map_err(|e| format!("remove corrupt shadow index: {e}"))
+                .and_then(|_| git(workspace, &["add", "-A"]))
+                .and_then(|_| git(workspace, &["write-tree"]))
+                .map_err(|recovery_error| {
+                    format!("git write-tree: {first_error}; shadow-index recovery failed: {recovery_error}")
+                })
+        }
+    }
+}
+
+/// A tree object of the current work-tree, with no commit and no ref, so nothing is left to prune.
+pub fn tree_snapshot(workspace: &Path) -> Result<String, String> {
+    if !git_available() {
+        return Err("git is not available".to_string());
+    }
+    let lock = shadow_lock(workspace);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    ensure_init(workspace).map_err(|e| format!("initialize shadow repo: {e}"))?;
+    write_tree_unlocked(workspace)
+}
+
+/// Per-file `(path, added, removed)` between two snapshots (commits or trees).
+pub fn numstat(workspace: &Path, from: &str, to: &str) -> Option<Vec<(String, u64, u64)>> {
+    let out = git(
+        workspace,
+        &["-c", "core.quotepath=off", "diff", "--numstat", "--no-renames", from, to],
+    )
+    .ok()?;
+    Some(parse_numstat(&out))
+}
+
+/// Parse `git diff --numstat` lines; binary files (`-`) count as a changed file with 0/0.
+pub fn parse_numstat(text: &str) -> Vec<(String, u64, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\t');
+            let add = parts.next()?;
+            let del = parts.next()?;
+            let path = parts.next()?.trim();
+            (!path.is_empty()).then(|| (path.to_string(), add.parse().unwrap_or(0), del.parse().unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// At most `max` files, biggest change first, plus the totals over all files. `None` when empty.
+pub fn summarize_numstat(
+    mut entries: Vec<(String, u64, u64)>,
+    max: usize,
+) -> Option<(Vec<(String, u64, u64)>, usize, u64, u64)> {
+    if entries.is_empty() {
+        return None;
+    }
+    let total = entries.len();
+    let add = entries.iter().map(|e| e.1).sum();
+    let del = entries.iter().map(|e| e.2).sum();
+    entries.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(max);
+    Some((entries, total, add, del))
 }
 
 /// Drop the snapshots in `dropped` and garbage-collect the shadow repo so disk
@@ -237,4 +287,50 @@ pub fn restore(workspace: &Path, commit: &str) -> Result<(), String> {
     let _ = snapshot_unlocked(workspace, "pre-restore safety snapshot");
     git(workspace, &["read-tree", "-u", "--reset", commit])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod numstat_tests {
+    use super::*;
+
+    #[test]
+    fn parses_numstat_including_binary_and_spaces() {
+        let out = "3\t1\tsrc/a.rs\n-\t-\timg/logo.png\n0\t7\tdir/with space.txt";
+        assert_eq!(
+            parse_numstat(out),
+            vec![
+                ("src/a.rs".to_string(), 3, 1),
+                ("img/logo.png".to_string(), 0, 0),
+                ("dir/with space.txt".to_string(), 0, 7),
+            ]
+        );
+        assert!(parse_numstat("").is_empty());
+    }
+
+    #[test]
+    fn tree_snapshots_diff_real_changes() {
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let start = tree_snapshot(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "x\n").unwrap();
+        let end = tree_snapshot(dir.path()).unwrap();
+        let mut got = numstat(dir.path(), &start, &end).unwrap();
+        got.sort();
+        assert_eq!(got, vec![("a.txt".to_string(), 2, 0), ("new.txt".to_string(), 1, 0)]);
+        assert!(numstat(dir.path(), &end, &end).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(shadow_dir(dir.path()));
+    }
+
+    #[test]
+    fn summary_totals_cover_every_file() {
+        let (top, total, add, del) =
+            summarize_numstat(vec![("a".into(), 1, 1), ("b".into(), 5, 0), ("c".into(), 0, 3)], 2).unwrap();
+        assert_eq!(top.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(), ["b", "c"]);
+        assert_eq!((total, add, del), (3, 6, 4));
+        assert!(summarize_numstat(vec![], 2).is_none());
+    }
 }

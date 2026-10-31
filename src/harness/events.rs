@@ -283,8 +283,11 @@ impl CodingHarness {
         let snapshot = tokio::task::spawn_blocking(move || {
             crate::checkpoint::snapshot_diagnostic(&workspace, &snap_label)
         });
+        vars.turn_open = true;
+        vars.turn_start = None;
         vars.pending_checkpoint = Some(PendingCheckpoint {
             snapshot,
+            resolved: None,
             label,
             created_at: chrono::Utc::now().to_rfc3339(),
             event_index: state.events.len(),
@@ -293,12 +296,56 @@ impl CodingHarness {
         });
     }
 
+    /// At the end of a turn, record what it changed in the workspace as a `turn_changes` event and
+    /// on the session row. Best-effort: any failure, or no change, records nothing.
+    pub(super) async fn emit_turn_changes(&self, state: &mut HarnessState, vars: &mut LoopVars) {
+        if !std::mem::take(&mut vars.turn_open) {
+            return;
+        }
+        let start = match vars.turn_start.take() {
+            Some(id) => Some(id),
+            None => match vars.pending_checkpoint.as_mut() {
+                Some(p) => {
+                    if p.resolved.is_none() {
+                        p.resolved = Some(match (&mut p.snapshot).await {
+                            Ok(result) => result,
+                            Err(error) => Err(error.to_string()),
+                        });
+                    }
+                    p.resolved.as_ref().and_then(|r| r.as_ref().ok().cloned())
+                }
+                None => None,
+            },
+        };
+        let Some(start) = start else { return };
+        let workspace = self.context.workspace_root().to_path_buf();
+        let work = tokio::task::spawn_blocking(move || {
+            let end = crate::checkpoint::tree_snapshot(&workspace).ok()?;
+            crate::checkpoint::numstat(&workspace, &start, &end)
+        });
+        let Ok(Ok(Some(entries))) = tokio::time::timeout(std::time::Duration::from_secs(15), work).await else {
+            return;
+        };
+        let Some(event) = turn_changes_event(entries) else { return };
+        if let (HarnessEvent::TurnChanges { total_files, add, del, .. }, Some(store), Some(id)) =
+            (&event, self.store(), self.session_id())
+        {
+            let totals = serde_json::json!({"files": total_files, "added": add, "removed": del});
+            let _ = store.set_session_last_changes(&id, &totals.to_string());
+        }
+        state.events.push(event);
+    }
+
     pub(super) async fn finish_checkpoint(&self, state: &mut HarnessState, vars: &mut LoopVars) {
         let Some(pending) = vars.pending_checkpoint.take() else {
             return;
         };
         let workspace = self.context.workspace_root().to_path_buf();
-        let id = match pending.snapshot.await {
+        let result = match pending.resolved {
+            Some(result) => Ok(result),
+            None => pending.snapshot.await,
+        };
+        let id = match result {
             Ok(Ok(id)) => id,
             Ok(Err(error)) => {
                 self.debug_log(&format!(
@@ -317,6 +364,7 @@ impl CodingHarness {
                 return;
             }
         };
+        vars.turn_start = Some(id.clone());
         state.checkpoints.push(CheckpointRecord {
             id,
             label: pending.label,
@@ -812,4 +860,46 @@ fn idle_goal_turns(messages: &[HarnessMessage]) -> usize {
         }
     }
     idle
+}
+
+/// The `turn_changes` event for a turn's per-file numstat, or `None` when nothing changed.
+pub(super) fn turn_changes_event(entries: Vec<(String, u64, u64)>) -> Option<HarnessEvent> {
+    const MAX_FILES: usize = 12;
+    let (files, total_files, add, del) = crate::checkpoint::summarize_numstat(entries, MAX_FILES)?;
+    Some(HarnessEvent::TurnChanges {
+        files: files.into_iter().map(|(path, add, del)| FileChange { path, add, del }).collect(),
+        total_files,
+        add,
+        del,
+    })
+}
+
+#[cfg(test)]
+mod turn_changes_tests {
+    use super::*;
+
+    #[test]
+    fn event_only_when_something_changed_biggest_first_capped() {
+        assert!(turn_changes_event(Vec::new()).is_none());
+        let mut entries: Vec<(String, u64, u64)> =
+            (0..15).map(|i| (format!("f{i:02}.rs"), i, 0)).collect();
+        entries.push(("big.rs".into(), 100, 40));
+        let Some(HarnessEvent::TurnChanges { files, total_files, add, del }) = turn_changes_event(entries) else {
+            panic!("expected an event");
+        };
+        assert_eq!(files.len(), 12);
+        assert_eq!(files[0], FileChange { path: "big.rs".into(), add: 100, del: 40 });
+        assert_eq!(total_files, 16);
+        assert_eq!((add, del), (100 + (0..15).sum::<u64>(), 40));
+    }
+
+    #[test]
+    fn event_serialises_as_turn_changes() {
+        let e = turn_changes_event(vec![("a.rs".into(), 1, 2)]).unwrap();
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"kind":"turn_changes","files":[{"path":"a.rs","add":1,"del":2}],"total_files":1,"add":1,"del":2})
+        );
+    }
 }

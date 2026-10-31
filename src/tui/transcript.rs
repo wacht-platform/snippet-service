@@ -417,7 +417,7 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
         HarnessEvent::AssistantText { text } => {
             indent_block(render_prose(text, width.saturating_sub(SPINE)), SPINE)
         }
-        HarnessEvent::Retired => Vec::new(),
+        HarnessEvent::Retired | HarnessEvent::TurnChanges { .. } => Vec::new(),
         HarnessEvent::PlanUpdated { steps, explanation } => {
             let mut lines = Vec::new();
             if let Some(why) = explanation {
