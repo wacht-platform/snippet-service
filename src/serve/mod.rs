@@ -217,6 +217,19 @@ fn token_matches(provided: &str, expected: &str) -> bool {
     diff == 0
 }
 
+/// Inputs that put a settled session back to work: a message, an answer, or a goal (recurring runs set one).
+pub(crate) fn wakes_settled(input: &LoopInput) -> bool {
+    matches!(
+        input,
+        LoopInput::UserMessage(_)
+            | LoopInput::Answer(_)
+            | LoopInput::Queue(_)
+            | LoopInput::SteerQueued(_)
+            | LoopInput::SetGoal(_)
+            | LoopInput::ResumeGoal
+    )
+}
+
 impl Daemon {
     fn authed(&self, token: &Option<String>) -> bool {
         token
@@ -654,10 +667,7 @@ impl Daemon {
             }
             _ => {}
         }
-        if matches!(
-            input,
-            LoopInput::UserMessage(_) | LoopInput::Answer(_) | LoopInput::Queue(_) | LoopInput::SteerQueued(_)
-        ) {
+        if wakes_settled(&input) {
             crate::session::wake_settled(id);
         }
         let input = match input {
@@ -1391,3 +1401,16 @@ async fn get_config(State(d): State<Shared>, Query(a): Query<Auth>) -> Response 
 mod tests;
 
 
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn goals_wake_a_settled_session() {
+        assert!(wakes_settled(&LoopInput::SetGoal("run".into())));
+        assert!(wakes_settled(&LoopInput::UserMessage("hi".into())));
+        assert!(!wakes_settled(&LoopInput::Compact));
+        assert!(!wakes_settled(&LoopInput::CancelGoal));
+    }
+}
