@@ -16,6 +16,8 @@ pub enum TaskStatus {
     Todo,
     InProgress,
     Blocked,
+    /// Reported done, waiting on a reviewer's verdict.
+    InReview,
     Done,
     Failed,
     Cancelled,
@@ -39,6 +41,7 @@ impl TaskStatus {
             Self::Todo => "todo",
             Self::InProgress => "in_progress",
             Self::Blocked => "blocked",
+            Self::InReview => "in_review",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -181,7 +184,7 @@ pub struct NotificationMarker {
 /// have to piece it together from notifications.
 #[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
 pub struct TaskSubStatus {
-    /// `working`, `queued`, `offered`, `offer_stuck`, `awaiting_paths`,
+    /// `working`, `in_review`, `queued`, `offered`, `offer_stuck`, `awaiting_paths`,
     /// `awaiting_dependency(<id>)`, `awaiting_agent`, `stalled`, `dispatch_failed`
     /// or `blocked`; `None` once the task is finished.
     pub status_reason: Option<String>,
@@ -203,6 +206,7 @@ pub fn board_reason(task: &Task, roster: &[TaskAgent], waiting_on: &[String], pa
     let noted = |kind: &str| task.notifications.iter().any(|n| n.kind == kind);
     let current: Vec<&TaskAgent> = roster.iter().filter(|m| m.removed_at.is_none()).collect();
     let reason = match task.status {
+        TaskStatus::InReview => "in_review",
         TaskStatus::InProgress if noted("stalled") => "stalled",
         TaskStatus::InProgress => "working",
         TaskStatus::Blocked if task.dispatch_failures > 0 => "dispatch_failed",

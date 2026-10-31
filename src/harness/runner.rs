@@ -674,6 +674,10 @@ impl CodingHarness {
                             let outcome = self.keep_warm(model, &state).await;
                             crate::keep_warm::complete(&id, outcome);
                         }
+                        Some(LoopInput::SpawnLane(spec)) => {
+                            self.spawn_requested_lane(&mut state, &mut lanes, spec);
+                            self.persist(&mut state, &lanes).await?;
+                        }
                         None => {
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;

@@ -29,6 +29,50 @@ impl VerifyMethod {
     }
 }
 
+/// Who confirms a task is done before it completes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyMode {
+    #[serde(rename = "self")]
+    SelfCheck,
+    Reviewer,
+    MissionControl,
+    User,
+}
+
+impl VerifyMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(raw.trim().to_string())).ok()
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfCheck => "self",
+            Self::Reviewer => "reviewer",
+            Self::MissionControl => "mission_control",
+            Self::User => "user",
+        }
+    }
+}
+
+/// What the worker offers for one criterion when it reports done.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Evidence {
+    /// The criterion's number (`1`) or its text.
+    pub criterion: String,
+    /// The command and its result, or what was seen.
+    pub evidence: String,
+    /// An artifact or screenshot; required for `artifact` and `visual` criteria.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// The worker's report, held while the task is in review.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingReport {
+    pub summary: String,
+    pub artifacts: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Criterion {
     pub criterion: String,
@@ -72,6 +116,27 @@ pub struct TaskState {
     /// files and the review diff are measured from it. Daemon-set only.
     #[serde(default)]
     pub dispatch_rev: String,
+    /// Unset means: reviewer when the task has criteria, otherwise self.
+    #[serde(default)]
+    pub verify_mode: Option<VerifyMode>,
+    #[serde(default)]
+    pub revises_task_id: String,
+    #[serde(default)]
+    pub evidence: Vec<Evidence>,
+    #[serde(default)]
+    pub pending_report: Option<PendingReport>,
+    /// Reviews that sent the work back.
+    #[serde(default)]
+    pub review_rounds: u32,
+    #[serde(default)]
+    pub review_findings: Vec<String>,
+    #[serde(default)]
+    pub review_started_at: String,
+    #[serde(default)]
+    pub review_escalated: bool,
+    /// Why verification was waived (set by Mission Control on the user's word).
+    #[serde(default)]
+    pub waiver: String,
 }
 
 /// A partial update. Scalars and lists replace; `add_*` append without duplicates.
@@ -90,6 +155,7 @@ pub struct StatePatch {
     pub current_step: Option<String>,
     pub audience: Option<String>,
     pub definition_of_good: Option<String>,
+    pub verify_mode: Option<VerifyMode>,
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -177,7 +243,52 @@ impl TaskState {
             }
             changes.push(format!("changed files +{}: {}", added.len(), added.join(", ")));
         }
+        if let Some(mode) = patch.verify_mode.filter(|m| Some(*m) != self.verify_mode) {
+            self.verify_mode = Some(mode);
+            changes.push(format!("verification is now: {}", mode.as_str()));
+        }
         changes
+    }
+
+    /// The mode in force: the one set, else a reviewer when there is something
+    /// to check against, else the worker's own word. A waiver always wins.
+    pub fn effective_mode(&self) -> VerifyMode {
+        if !self.waiver.is_empty() {
+            return VerifyMode::SelfCheck;
+        }
+        self.verify_mode.unwrap_or(if self.criteria.is_empty() { VerifyMode::SelfCheck } else { VerifyMode::Reviewer })
+    }
+
+    /// Criteria the evidence does not cover, as `n. text (why)`. Artifact and
+    /// visual criteria need a `path` that exists (relative to `workspace`).
+    pub fn uncovered(&self, evidence: &[Evidence], workspace: &std::path::Path) -> Vec<String> {
+        let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        self.criteria
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let number = (i + 1).to_string();
+                let hits: Vec<&Evidence> = evidence
+                    .iter()
+                    .filter(|e| {
+                        let key = e.criterion.trim().trim_start_matches('#');
+                        key == number || norm(key) == norm(&c.criterion)
+                    })
+                    .collect();
+                let why = if hits.is_empty() {
+                    "no evidence"
+                } else if hits.iter().all(|e| e.evidence.trim().is_empty()) {
+                    "evidence is empty"
+                } else if matches!(c.method, VerifyMethod::Artifact | VerifyMethod::Visual)
+                    && !hits.iter().any(|e| e.path.as_deref().is_some_and(|p| !p.trim().is_empty() && workspace.join(p.trim()).exists()))
+                {
+                    "needs a path to an existing artifact or screenshot"
+                } else {
+                    return None;
+                };
+                Some(format!("{number}. [{}] {} ({why})", c.method.as_str(), clip(&c.criterion, 160)))
+            })
+            .collect()
     }
 
     /// The ledger as an envelope block. `full` lists everything; otherwise it is
@@ -220,6 +331,18 @@ impl TaskState {
         }
         if !self.open_questions.is_empty() {
             line("open questions", &self.open_questions.join("; "), &mut out);
+        }
+        if let Some(mode) = self.verify_mode {
+            line("verification", mode.as_str(), &mut out);
+        }
+        if !self.waiver.is_empty() {
+            line("verification waived", &self.waiver, &mut out);
+        }
+        if !self.review_findings.is_empty() {
+            out.push_str(&format!("review findings to fix (round {}):\n", self.review_rounds));
+            for f in &self.review_findings {
+                out.push_str(&format!("  - {}\n", clip(f, 400)));
+            }
         }
         line("current step", &self.current_step, &mut out);
         if !self.changed_files.is_empty() {

@@ -766,7 +766,7 @@ const QUIET_EVENTS: &[&str] = &["task.agent_assigned", "task.dispatched"];
 
 /// Events Mission Control already receives as a task notification; waking it
 /// for the room post as well would deliver the same news twice.
-const NOTIFIED_EVENTS: &[&str] = &["task.reported", "task.message", "task.state_updated"];
+const NOTIFIED_EVENTS: &[&str] = &["task.reported", "task.message", "task.state_updated", "task.in_review"];
 
 /// One session a board event should wake. `inbox_agent` is set when the
 /// session is that agent's inbox, which may need creating first.

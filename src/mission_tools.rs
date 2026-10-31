@@ -78,6 +78,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(ReportMissionTask);
     registry.insert(crate::task_state_tools::UpdateTaskState);
     registry.insert(crate::task_state_tools::TaskLedger);
+    registry.insert(crate::review_tools::SubmitReview);
     registry.insert(Speak);
     registry.insert(AmbientMode);
     registry.insert(AmbientExpect);
@@ -1173,6 +1174,19 @@ struct CreateTaskArgs {
     crew: Vec<CrewArg>,
     #[serde(default)]
     supersedes: Option<String>,
+    /// How the work is judged done; required unless `read_only`.
+    #[serde(default, alias = "acceptance_criteria")]
+    acceptance: Vec<crate::coordination::Criterion>,
+    #[serde(default)]
+    verify_mode: Option<String>,
+    #[serde(default)]
+    revises_task_id: Option<String>,
+    #[serde(default)]
+    read_only: bool,
+    #[serde(default)]
+    audience: Option<String>,
+    #[serde(default)]
+    definition_of_good: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1185,13 +1199,18 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}}), &["title","description","session"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "acceptance":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string"},"method":{"type":"string","enum":["command","artifact","visual","human"]}},"required":["criterion","method"]},"description":"how the work is judged done, each with how it is checked. Required unless read_only. The worker must report evidence for every one."}, "read_only":{"type":"boolean","description":"investigation that changes nothing; acceptance is then optional"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done. Default: a reviewer lane (self when read_only). self skips review."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}}), &["title","description","session"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "create_mission_task".into(),
             })?;
+        if !args.read_only && args.acceptance.is_empty() {
+            return Err(ToolError::msg(
+                "acceptance criteria are required: pass acceptance [{criterion, method: command|artifact|visual|human}], one per way the work is judged done, or read_only: true for an investigation that changes nothing",
+            ));
+        }
         create_task(ctx, args, ("agent", crate::mission_control::SESSION_ID)).await
     }
 }
@@ -1321,6 +1340,26 @@ async fn create_task(
                 "note": "This task was already filed a moment ago and is on its way; nothing new was created.",
             })));
         }
+        let verify_mode = match args.verify_mode.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            Some(raw) => crate::coordination::VerifyMode::parse(raw)
+                .ok_or_else(|| ToolError::msg(format!("verify_mode must be self, reviewer, mission_control or user, got `{raw}`")))?,
+            None if args.read_only => crate::coordination::VerifyMode::SelfCheck,
+            None => crate::coordination::VerifyMode::Reviewer,
+        };
+        let revises = args.revises_task_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(old) = revises {
+            store
+                .get_task(old)
+                .map_err(|e| ToolError::msg(format!("look up revised task: {e}")))?
+                .ok_or_else(|| ToolError::msg(format!("revises_task_id names no task `{old}`")))?;
+        }
+        let warnings = crate::task_state_tools::content_warnings(
+            &args.title,
+            &args.description,
+            args.audience.as_deref().unwrap_or(""),
+            args.definition_of_good.as_deref().unwrap_or(""),
+            &args.acceptance,
+        );
         let id = uuid::Uuid::new_v4().to_string();
         let handoff_mode = match args.handoff_mode.as_deref() {
             None | Some("resume") => HandoffMode::Resume,
@@ -1417,6 +1456,25 @@ async fn create_task(
                 .update_task_in(old, &task.created_at, |t| t.superseded_by = Some(task.id.clone()))
                 .map_err(|e| ToolError::msg(format!("record supersedes: {e}")))?;
         }
+        let ledger = crate::coordination::StatePatch {
+            criteria: Some(args.acceptance.clone()).filter(|c| !c.is_empty()),
+            audience: args.audience.clone(),
+            definition_of_good: args.definition_of_good.clone(),
+            verify_mode: Some(verify_mode),
+            ..Default::default()
+        };
+        store
+            .patch_task_state(&task.id, &ledger, None, created_by.1, &task.created_at)
+            .map_err(|e| ToolError::msg(format!("record ledger: {e}")))?;
+        if let Some(old) = revises {
+            let _ = store.modify_task_state(&task.id, &task.created_at, |s| s.revises_task_id = old.to_string());
+            let _ = store.link_tasks(&crate::coordination::TaskLink {
+                from_task_id: old.to_string(),
+                to_task_id: task.id.clone(),
+                kind: crate::coordination::TaskLinkKind::RelatesTo,
+                created_at: task.created_at.clone(),
+            });
+        }
         for blocker in &blockers {
             store
                 .link_tasks(&crate::coordination::TaskLink {
@@ -1465,8 +1523,12 @@ async fn create_task(
             "profile": profile,
             "waiting_on": blockers.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
             "crew": roster.iter().skip(1).map(|m| format!("{} ({})", m.agent_id, m.role)).collect::<Vec<_>>(),
+            "verify_mode": verify_mode.as_str(),
             "note": note
         });
+        if !warnings.is_empty() {
+            result["warnings"] = json!(warnings);
+        }
         if created_by.1 == crate::mission_control::SESSION_ID
             && agent_id == crate::coordination::SNIPPET_AGENT_ID
             && roster.len() == 1
@@ -1695,6 +1757,12 @@ impl Tool for FileFollowUpTask {
             blocked_by,
             crew: Vec::new(),
             supersedes: None,
+            acceptance: Vec::new(),
+            verify_mode: None,
+            revises_task_id: None,
+            read_only: true,
+            audience: None,
+            definition_of_good: None,
         };
         create_task(ctx, args, (kind, &who)).await
     }
@@ -1715,6 +1783,8 @@ struct UpdateMissionTaskArgs {
     profile: Option<String>,
     #[serde(default)]
     context_note: Option<String>,
+    #[serde(default)]
+    waive_verification: Option<String>,
 }
 
 /// Refuse to hand work to an agent that is unknown or not active.
@@ -1784,7 +1854,8 @@ impl Tool for UpdateMissionTask {
                     "plan": {"type": "string"},
                     "status": {"type": "string", "enum": ["todo", "blocked"]},
                     "profile": {"type": "string"},
-                    "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"}
+                    "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"},
+                    "waive_verification": {"type": "string", "description": "Only when the user said to skip checking this task: their words. Drops review; a task waiting in review completes."}
                 }),
                 &["task_id"],
             ),
@@ -1811,6 +1882,17 @@ impl Tool for UpdateMissionTask {
         }
         let store = db(ctx)?;
         let now = now_rfc3339();
+        if let Some(reason) = args.waive_verification.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+            let state = store
+                .modify_task_state(task_id, &now, |s| s.waiver = reason.to_string())
+                .map_err(|e| ToolError::msg(format!("record waiver: {e}")))?;
+            let patch = crate::coordination::StatePatch { add_decisions: vec![format!("verification waived: {reason}")], ..Default::default() };
+            let _ = store.patch_task_state(task_id, &patch, None, "user", &now);
+            let held = store.get_task(task_id).map_err(|e| ToolError::msg(e.to_string()))?;
+            if let Some(held) = held.filter(|t| t.status == TaskStatus::InReview) {
+                crate::review_tools::approve_pending(ctx, &store, &held, &state, "user", "accepted without review at the user's word", now.clone())?;
+            }
+        }
         let mut updated_task = store
             .update_task_in(task_id, &now, |t| {
                 if let Some(ref title) = args.title {
@@ -2625,6 +2707,94 @@ impl Tool for RegisterAgent {
     }
 }
 
+/// Tell the board, the requester and the task room how a task ended.
+pub(crate) fn announce_report(
+    ctx: &ToolContext,
+    store: &Store,
+    task: &Task,
+    status_for_board: TaskStatus,
+    summary_for_board: &str,
+    now: String,
+) {
+    // The WORKER whose board this reports to. Taken from the task ROSTER, not
+    // from this session's context: the target session is not always
+    // agent-bound, so `ctx.agent_id()` is usually None here and the report
+    // would be silently skipped. The roster was written when Mission Control
+    // created the task, so it is the one record that knows who did the work.
+    let roster = store.list_task_agents(&task.id).unwrap_or_default();
+    let current = roster.iter().filter(|member| member.removed_at.is_none());
+    let reporter = current
+        .clone()
+        .find(|member| member.status == "active")
+        .or_else(|| current.clone().next())
+        .map(|member| member.agent_id.clone())
+        .or_else(|| ctx.agent_id().map(str::to_string));
+    if let Some(agent_id) = reporter.as_deref() {
+        let verb = match status_for_board {
+            TaskStatus::Done => "finished",
+            TaskStatus::Blocked => "blocked",
+            _ => "failed",
+        };
+        let _ = store.record_board_entry(
+            agent_id,
+            crate::coordination::BoardEntryKind::Reported,
+            &crate::coordination::NewBoardEntry {
+                session_id: Some(&task.session_id),
+                workspace: None,
+                summary: &format!("{} — {verb}: {summary_for_board}", task.id),
+                correlation_id: Some(&task.id),
+                created_at: &now,
+            },
+        );
+    }
+
+    if status_for_board.is_terminal()
+        && let Ok(Some(reply_to)) = store.task_requester(&task.id)
+        && let Some((kind, id)) = reply_to.split_once(':')
+    {
+        let verb = match status_for_board {
+            TaskStatus::Done => "is done",
+            TaskStatus::Failed => "failed",
+            _ => "was stopped",
+        };
+        let body = format!("“{}” {verb}.\n\n{summary_for_board}", task.title);
+        let _ = store.send_direct_message(
+            ("agent", crate::mission_control::SESSION_ID),
+            (kind, id),
+            &body,
+            &format!("task-outcome:{}", task.id),
+            &now,
+        );
+    }
+    let report_event = CoordinationEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        thread_id: task.thread_id.clone(),
+        partition_key: format!("thread:{}", task.thread_id),
+        sequence: 0,
+        event_type: "task.reported".into(),
+        actor_kind: "agent".into(),
+        actor_id: reporter.unwrap_or_else(|| "worker".into()),
+        payload_version: 1,
+        payload: crate::coordination_tools::stamp_origin(ctx, json!({
+            "body": format!("Task reported {status_for_board}: {summary_for_board}"),
+            "task_id": task.id,
+            "status": status_for_board.to_string(),
+            "summary": summary_for_board,
+        })),
+        causation_id: None,
+        correlation_id: Some(task.id.clone()),
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
+        created_at: now,
+    };
+    if let Ok(saved) = store.append_event(&report_event) {
+        crate::session::emit_device_event(json!({
+            "kind": "coordination_event",
+            "event": saved.clone(),
+        }));
+        crate::serve::queue_coordination_wake(&store, saved);
+    }
+}
+
 #[derive(Deserialize)]
 struct ReportArgs {
     task_id: String,
@@ -2632,12 +2802,14 @@ struct ReportArgs {
     summary: String,
     #[serde(default)]
     artifacts: Vec<String>,
+    #[serde(default)]
+    evidence: Vec<crate::coordination::Evidence>,
 }
 pub struct ReportMissionTask;
 #[async_trait]
 impl Tool for ReportMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "report_mission_task".into(), description: "Report a Mission Control task's completion, failure, or blocker. Use only for the [mission_control_task] envelope delivered to this session.".into(), input_schema: schema(json!({"task_id":{"type":"string"}, "status":{"type":"string","enum":["done","blocked","failed"]}, "summary":{"type":"string"}, "artifacts":{"type":"array","items":{"type":"string"}}}), &["task_id","status","summary"]) }
+        NativeToolDefinition { name: "report_mission_task".into(), description: "Report a Mission Control task's completion, failure, or blocker. Use only for the [mission_control_task] envelope delivered to this session. A done report must carry evidence for every acceptance criterion in the ledger; a task with a reviewer goes to review before it completes.".into(), input_schema: schema(json!({"task_id":{"type":"string"}, "status":{"type":"string","enum":["done","blocked","failed"]}, "summary":{"type":"string"}, "artifacts":{"type":"array","items":{"type":"string"}}, "evidence":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string","description":"the criterion's number or text"},"evidence":{"type":"string","description":"command and result, or what you saw"},"path":{"type":"string","description":"artifact or screenshot; required for artifact and visual criteria"}},"required":["criterion","evidence"]}}}), &["task_id","status","summary"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ReportArgs =
@@ -2665,6 +2837,12 @@ impl Tool for ReportMissionTask {
                 .get_task(&args.task_id)
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
+            if bound.status == TaskStatus::InReview {
+                return Err(ToolError::msg(format!(
+                    "task `{}` is in review; its verdict will reach this session. Nothing to report meanwhile.",
+                    args.task_id
+                )));
+            }
             if bound.status.is_terminal() {
                 return Err(ToolError::msg(format!(
                     "task `{}` is already {}; there is nothing to report. Work the user asks for directly in this chat is not a task: answer them here instead.",
@@ -2682,6 +2860,24 @@ impl Tool for ReportMissionTask {
             }
         }
         let now = now_rfc3339();
+        if status == TaskStatus::Done {
+            let current = store
+                .get_task(&args.task_id)
+                .map_err(|e| ToolError::msg(format!("load task: {e}")))?
+                .ok_or_else(|| ToolError::msg("unknown task"))?;
+            let workspace = state_path_for_id(&current.session_id)
+                .and_then(|p| read_session_state(&p))
+                .map(|s| PathBuf::from(s.workspace))
+                .unwrap_or_else(|| ctx.workspace_root().to_path_buf());
+            if let Some(mode) = crate::review_tools::gate_done(&store, &current, &args.evidence, &workspace, &now)? {
+                let held = crate::review_tools::submit_for_review(ctx, &store, &current, mode, args.summary.trim(), &args.artifacts, &now)?;
+                return Ok(ToolResult::success(json!({
+                    "task": task_view(&held),
+                    "in_review": mode.as_str(),
+                    "note": "Held for verification. You will get the verdict in this session; if changes are asked for, fix them and report again.",
+                })));
+            }
+        }
         let summary_for_board = args.summary.trim().to_string();
         let status_for_board = status.clone();
         let task = if status.is_terminal() {
@@ -2710,83 +2906,7 @@ impl Tool for ReportMissionTask {
                 })
                 .map_err(|e| ToolError::msg(format!("update task: {e}")))?
         };
-        // The WORKER whose board this reports to. Taken from the task ROSTER, not
-        // from this session's context: the target session is not always
-        // agent-bound, so `ctx.agent_id()` is usually None here and the report
-        // would be silently skipped. The roster was written when Mission Control
-        // created the task, so it is the one record that knows who did the work.
-        let roster = store.list_task_agents(&task.id).unwrap_or_default();
-        let current = roster.iter().filter(|member| member.removed_at.is_none());
-        let reporter = current
-            .clone()
-            .find(|member| member.status == "active")
-            .or_else(|| current.clone().next())
-            .map(|member| member.agent_id.clone())
-            .or_else(|| ctx.agent_id().map(str::to_string));
-        if let Some(agent_id) = reporter.as_deref() {
-            let verb = match status_for_board {
-                TaskStatus::Done => "finished",
-                TaskStatus::Blocked => "blocked",
-                _ => "failed",
-            };
-            let _ = store.record_board_entry(
-                agent_id,
-                crate::coordination::BoardEntryKind::Reported,
-                &crate::coordination::NewBoardEntry {
-                    session_id: Some(&task.session_id),
-                    workspace: None,
-                    summary: &format!("{} — {verb}: {summary_for_board}", task.id),
-                    correlation_id: Some(&task.id),
-                    created_at: &now,
-                },
-            );
-        }
-
-        if status_for_board.is_terminal()
-            && let Ok(Some(reply_to)) = store.task_requester(&task.id)
-            && let Some((kind, id)) = reply_to.split_once(':')
-        {
-            let verb = match status_for_board {
-                TaskStatus::Done => "is done",
-                TaskStatus::Failed => "failed",
-                _ => "was stopped",
-            };
-            let body = format!("“{}” {verb}.\n\n{summary_for_board}", task.title);
-            let _ = store.send_direct_message(
-                ("agent", crate::mission_control::SESSION_ID),
-                (kind, id),
-                &body,
-                &format!("task-outcome:{}", task.id),
-                &now,
-            );
-        }
-        let report_event = CoordinationEvent {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            thread_id: task.thread_id.clone(),
-            partition_key: format!("thread:{}", task.thread_id),
-            sequence: 0,
-            event_type: "task.reported".into(),
-            actor_kind: "agent".into(),
-            actor_id: reporter.unwrap_or_else(|| "worker".into()),
-            payload_version: 1,
-            payload: crate::coordination_tools::stamp_origin(ctx, json!({
-                "body": format!("Task reported {status_for_board}: {summary_for_board}"),
-                "task_id": task.id,
-                "status": status_for_board.to_string(),
-                "summary": summary_for_board,
-            })),
-            causation_id: None,
-            correlation_id: Some(task.id.clone()),
-            idempotency_key: uuid::Uuid::new_v4().to_string(),
-            created_at: now,
-        };
-        if let Ok(saved) = store.append_event(&report_event) {
-            crate::session::emit_device_event(json!({
-                "kind": "coordination_event",
-                "event": saved.clone(),
-            }));
-            crate::serve::queue_coordination_wake(&store, saved);
-        }
+        announce_report(ctx, &store, &task, status_for_board, &summary_for_board, now);
 
         Ok(ToolResult::success(json!({"task": task_view(&task)})))
     }

@@ -51,6 +51,39 @@ pub fn dispatch_ledger(store: &Store, task: &Task, workspace: &Path, scope: &str
     format!("{}{}", state.render(true), memory_line(task))
 }
 
+/// Gaps in a content brief worth fixing before the work starts.
+pub fn content_warnings(
+    title: &str,
+    description: &str,
+    audience: &str,
+    definition_of_good: &str,
+    criteria: &[crate::coordination::Criterion],
+) -> Vec<String> {
+    let text = format!("{title} {description}").to_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+    const CONTENT: &[&str] = &["deck", "slides", "presentation", "video", "blog", "article", "essay", "newsletter", "email", "readme", "copy", "script", "landing page", "documentation", "report", "mockup", "design"];
+    const VISUAL: &[&str] = &["deck", "slides", "presentation", "video", "landing page", "mockup", "design", "ui ", "screen"];
+    if !has(CONTENT) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let both = format!("{text} {} {}", audience.to_lowercase(), definition_of_good.to_lowercase());
+    let said = |words: &[&str]| words.iter().any(|w| both.contains(w));
+    if audience.trim().is_empty() && !said(&["audience", "readers", "for the team", "for customers", "for users"]) {
+        out.push("content work with no audience: say who it is for".to_string());
+    }
+    if !said(&["words", "pages", "slides", "minutes", "seconds", "length", "long", "short", "brief"]) {
+        out.push("content work with no length: say how long it should be".to_string());
+    }
+    if !said(&["tone", "voice", "formal", "casual", "friendly", "plain", "technical", "style"]) {
+        out.push("content work with no tone: say how it should sound".to_string());
+    }
+    if has(VISUAL) && !criteria.iter().any(|c| c.method == crate::coordination::VerifyMethod::Visual) {
+        out.push("visual work with no visual criterion: add an acceptance criterion with method visual (a screenshot or render someone looks at)".to_string());
+    }
+    out
+}
+
 fn workspace_of(task: &Task) -> Option<std::path::PathBuf> {
     let path = crate::session::state_path_for_id(&task.session_id)?;
     crate::session::read_session_state(&path).map(|s| s.workspace.into())
@@ -323,6 +356,16 @@ mod tests {
             .execute(&other, json!({"task_id": "tl1", "expected_version": 1, "patch": {"audience": "x"}}))
             .await;
         assert!(result.unwrap_err().to_string().contains("not yours"));
+    }
+
+    #[test]
+    fn content_briefs_are_checked_for_audience_length_tone_and_a_visual_criterion() {
+        let w = content_warnings("Write the launch blog post", "Announce the feature", "", "", &[]);
+        assert_eq!(w.len(), 3, "{w:?}");
+        let ok = content_warnings("Build the sales deck", "for customers, 10 slides, plain tone", "buyers", "crisp", &[crate::coordination::Criterion { criterion: "slides render".into(), method: crate::coordination::VerifyMethod::Visual }]);
+        assert!(ok.is_empty(), "{ok:?}");
+        assert!(content_warnings("Fix the parser bug", "off by one", "", "", &[]).is_empty());
+        assert!(content_warnings("Build the sales deck", "for customers, 10 slides, plain tone", "", "", &[]).iter().any(|w| w.contains("visual criterion")));
     }
 
     #[test]

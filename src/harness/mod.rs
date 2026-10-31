@@ -766,6 +766,17 @@ pub enum LoopInput {
     /// Re-read the provider's cached prefix with a minimal request, adding
     /// nothing to the transcript; answered through `keep_warm::complete(id)`.
     KeepWarm(String),
+    /// Start a lane on the session's behalf (the daemon starting a task review).
+    SpawnLane(LaneSpawn),
+}
+
+/// What the daemon asks the session to delegate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneSpawn {
+    pub title: String,
+    pub brief: String,
+    pub read_only: bool,
+    pub agent: Option<String>,
 }
 
 // --- Runtime corrections ---

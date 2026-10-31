@@ -1329,6 +1329,7 @@ pub async fn dispatch_loop(daemon: Shared) {
                 tracing_log_dispatch_failure(&task.id, &error);
             }
         }
+        super::review::drive_reviews(&daemon).await;
         deliver_mission_control_reports(&daemon).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
