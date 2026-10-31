@@ -78,6 +78,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(Speak);
     registry.insert(AmbientMode);
     registry.insert(AmbientExpect);
+    registry.insert(WaitForUser);
     registry.insert(AmbientSearch);
     registry.insert(Recordings);
     registry.insert(RecordingPolicyTool);
@@ -493,6 +494,68 @@ impl Tool for AmbientMode {
         let out = crate::ambient::set_mode(&args.mode, args.reason.as_deref().unwrap_or("")).await.map_err(ToolError::msg)?;
         Ok(ToolResult::success(out))
     }
+}
+
+#[derive(Deserialize)]
+struct WaitForUserArgs {
+    #[serde(default)]
+    max_seconds: Option<f64>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+pub struct WaitForUser;
+#[async_trait]
+impl Tool for WaitForUser {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "wait_for_user".into(),
+            description: "In a live spoken conversation, wait briefly for the user to carry on before you answer, when their line trails off or sounds unfinished. Returns their next turn as soon as they speak, or reports that they did not continue.".into(),
+            input_schema: schema(json!({
+                "max_seconds": {"type": "number", "description": "How long to wait, 0.3 to 4. Default 1.5."},
+                "reason": {"type": "string", "description": "Why you are waiting, in a short phrase, for example 'trailed off after and also'."}
+            }), &[]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: WaitForUserArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let max = args
+            .max_seconds
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(|s| std::time::Duration::from_secs_f64(s.min(crate::ambient::WAIT_CAP.as_secs_f64())))
+            .unwrap_or(crate::ambient::WAIT_DEFAULT);
+        let started = std::time::Instant::now();
+        let outcome = crate::ambient::wait_for_user(max).await;
+        Ok(ToolResult::success(wait_result(outcome, started.elapsed().as_millis() as u64, args.reason.as_deref())))
+    }
+}
+
+fn wait_result(outcome: crate::ambient::WaitOutcome, waited_ms: u64, reason: Option<&str>) -> Value {
+    use crate::ambient::WaitOutcome;
+    let mut out = match outcome {
+        WaitOutcome::Speech(turn) => json!({
+            "continued": true,
+            "turn": turn,
+            "next": "They kept talking: answer this turn together with their previous line.",
+        }),
+        WaitOutcome::TimedOut => {
+            let mut v = json!({
+                "continued": false,
+                "result": "user did not continue",
+                "next": "Answer what they said.",
+            });
+            if let Some(heard) = crate::speech::take_interruption() {
+                v["interrupted_reply"] = Value::String(heard);
+            }
+            v
+        }
+        WaitOutcome::Cancelled(why) => json!({"continued": false, "result": format!("wait cancelled: {why}")}),
+    };
+    out["waited_ms"] = json!(waited_ms);
+    if let Some(r) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        out["reason"] = Value::String(r.to_string());
+    }
+    out
 }
 
 pub struct AmbientExpect;

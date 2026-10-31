@@ -631,11 +631,17 @@ async fn deliver(
     }
     let ctx = context(d, device, &ids);
     let envelope = format!("<ambient_turn{attrs}>{ctx}{}</ambient_turn>", ambient_watch::escape(&text));
-    if mode == "active" {
-        super::autonomy::interrupt_mission_control(d).await;
+    if mode == "active" && crate::ambient::offer_to_wait(&envelope) {
+        if let Some(last) = ids.last() {
+            super::ambient_routes::mark(last, "wait_handoff");
+        }
+    } else {
+        if mode == "active" {
+            super::autonomy::interrupt_mission_control(d).await;
+        }
+        crate::tts::prewarm();
+        super::autonomy::deliver_to_mission_control(d, envelope).await;
     }
-    crate::tts::prewarm();
-    super::autonomy::deliver_to_mission_control(d, envelope).await;
     for id in &ids {
         d.store.write(|c| {
             c.execute("UPDATE ambient_events SET delivered = 1 WHERE id = ?1", [id])?;

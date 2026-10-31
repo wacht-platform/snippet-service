@@ -141,6 +141,153 @@ pub fn take_quick_wakes() -> Vec<QuickWake> {
     std::mem::take(&mut *QUICK_WAKES.lock().unwrap())
 }
 
+pub const WAIT_DEFAULT: Duration = Duration::from_millis(1500);
+pub const WAIT_CAP: Duration = Duration::from_secs(4);
+const WAIT_EXTEND: Duration = Duration::from_millis(250);
+const STILL_TALKING: Duration = Duration::from_millis(600);
+
+static HEARD_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Any live transcript update from the listening device, including mid-turn ones.
+pub fn note_hearing() {
+    *HEARD_AT.lock().unwrap() = Some(Instant::now());
+}
+
+fn still_talking() -> bool {
+    HEARD_AT.lock().unwrap().is_some_and(|t| t.elapsed() < STILL_TALKING)
+}
+
+#[derive(Debug, PartialEq)]
+pub enum WaitOutcome {
+    Speech(String),
+    TimedOut,
+    Cancelled(&'static str),
+}
+
+enum WaitEnd {
+    Speech(String),
+    Cancelled(&'static str),
+}
+
+pub struct WaitSlot {
+    inner: Mutex<Option<(u64, tokio::sync::oneshot::Sender<WaitEnd>)>>,
+    next: AtomicU64,
+}
+
+impl Default for WaitSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WaitSlot {
+    pub const fn new() -> Self {
+        Self { inner: Mutex::new(None), next: AtomicU64::new(0) }
+    }
+
+    pub fn begin(&self) -> Waiter<'_> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some((_, old)) = self.inner.lock().unwrap().replace((id, tx)) {
+            let _ = old.send(WaitEnd::Cancelled("a newer wait started"));
+        }
+        Waiter { slot: self, id, rx }
+    }
+
+    /// Hands a new user turn to the pending wait; false means nobody was waiting and the caller delivers it.
+    pub fn offer(&self, turn: &str) -> bool {
+        let taken = self.inner.lock().unwrap().take();
+        taken.is_some_and(|(_, tx)| tx.send(WaitEnd::Speech(turn.to_string())).is_ok())
+    }
+
+    pub fn cancel(&self, reason: &'static str) {
+        if let Some((_, tx)) = self.inner.lock().unwrap().take() {
+            let _ = tx.send(WaitEnd::Cancelled(reason));
+        }
+    }
+
+    pub fn pending(&self) -> bool {
+        self.inner.lock().unwrap().is_some()
+    }
+
+    fn release(&self, id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.as_ref().is_some_and(|(held, _)| *held == id) {
+            *inner = None;
+            return true;
+        }
+        false
+    }
+}
+
+/// Dropping it (an interrupted tool call, a stopped session) frees the slot.
+pub struct Waiter<'a> {
+    slot: &'a WaitSlot,
+    id: u64,
+    rx: tokio::sync::oneshot::Receiver<WaitEnd>,
+}
+
+impl Waiter<'_> {
+    pub async fn wait(mut self, max: Duration, cap: Duration, still_talking: impl Fn() -> bool) -> WaitOutcome {
+        let start = tokio::time::Instant::now();
+        let cap_at = start + cap.max(max);
+        let mut deadline = start + max;
+        loop {
+            tokio::select! {
+                end = &mut self.rx => return Self::outcome(end),
+                _ = tokio::time::sleep_until(deadline) => {
+                    if deadline < cap_at && still_talking() {
+                        deadline = (tokio::time::Instant::now() + WAIT_EXTEND).min(cap_at);
+                        continue;
+                    }
+                    if self.slot.release(self.id) {
+                        return WaitOutcome::TimedOut;
+                    }
+                    // An offer or cancel took the slot first; its message is already sent.
+                    return Self::outcome((&mut self.rx).await);
+                }
+            }
+        }
+    }
+
+    fn outcome(end: Result<WaitEnd, tokio::sync::oneshot::error::RecvError>) -> WaitOutcome {
+        match end {
+            Ok(WaitEnd::Speech(s)) => WaitOutcome::Speech(s),
+            Ok(WaitEnd::Cancelled(r)) => WaitOutcome::Cancelled(r),
+            Err(_) => WaitOutcome::Cancelled("wait dropped"),
+        }
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.slot.release(self.id);
+    }
+}
+
+static WAIT: WaitSlot = WaitSlot::new();
+
+/// Waits for the user to carry on speaking; returns their next turn's envelope, or times out.
+pub async fn wait_for_user(max: Duration) -> WaitOutcome {
+    if conversation().is_none() || lease_holder().is_none() {
+        return WaitOutcome::Cancelled("no live conversation");
+    }
+    let max = max.clamp(Duration::from_millis(300), WAIT_CAP);
+    WAIT.begin().wait(max, WAIT_CAP, still_talking).await
+}
+
+pub fn offer_to_wait(turn: &str) -> bool {
+    WAIT.offer(turn)
+}
+
+pub fn cancel_wait(reason: &'static str) {
+    WAIT.cancel(reason);
+}
+
+pub fn waiting_for_user() -> bool {
+    WAIT.pending()
+}
+
 pub fn release_hold() {
     *WORKING.lock().unwrap() = None;
 }
@@ -255,6 +402,7 @@ pub fn lease_touch(device: &str, label: Option<&str>, claim: bool) -> bool {
     }
     if other {
         crate::speech::cancel_all("device changed");
+        cancel_wait("device changed");
     }
     let kept = lease
         .as_ref()
@@ -291,6 +439,7 @@ pub fn conversation() -> Option<Conversation> {
     if conversation.as_ref().is_some_and(|c| c.expires <= now && c.hold_until.is_none_or(|h| h <= now)) && !is_working(now) {
         *conversation = None;
         drop(conversation);
+        cancel_wait("conversation ended");
         emit_state("conversation ended");
         return None;
     }
@@ -320,6 +469,7 @@ pub fn open_conversation(by: &str, ttl_secs: u32) -> Conversation {
 }
 
 pub fn end_conversation() {
+    cancel_wait("conversation ended");
     let had = CONVERSATION.lock().unwrap().take().is_some();
     if had {
         emit_state("conversation ended");
@@ -398,6 +548,7 @@ pub fn prompt_line() -> String {
         Some(_) => format!(
             " Ambient mode is ACTIVE: a live spoken conversation is open with the user on {label}. Nearly everything they say arrives as <ambient_turn mode=\"active\"> messages; answer by calling speak, or stay silent when a line is not for you.\n\
 Reading a turn: answer only the latest line; earlier lines are context. revises=\"id\" means they kept talking after a line you may have started on: the text is their whole line now, so answer it as one, don't repeat what you already said, and use speak mode replace if your earlier answer no longer fits. continuation_of means the line carries on their previous one. interrupted_reply holds exactly what they heard of your last reply before they cut in; everything after the cut was never said. user_voice is how likely the speaker is the user (below 0.5 is probably someone else or media). When a turn carries out_of_context or prior_out_of_context_streak, sounds like a fragment or side chatter, or <ambient_context_alert> arrives, don't ask aloud whether they meant you: stay silent and either call schedule_wake with in_seconds: 10 (unless_user_speaks: true) or, after several such turns, call ambient_mode with passive.\n\
+When their line trails off or sounds unfinished (\"and also...\"), call wait_for_user before speaking; if it returns their next turn, answer both lines as one.\n\
 Speaking: the user hears silence until your first speak, so speak before any tool: the answer if you know it, otherwise a short acknowledgement like \"Checking.\", then run the tools and speak the result. Lead with the point. Put one or two sentences, each under about fifteen words, in each speak call; for a longer answer make several speak calls in order rather than one long one, so they can cut in between and nothing has to wait for the whole reply. Say two or three sentences, then stop and let them talk; offer more (\"Want the details?\") instead of going on. Each later speak picks up where the last left off, like the next sentence of one reply: never restate or start over. Acknowledge once per line they say, then work quietly and speak only with something new.\n\
 Interruptions are normal: when they cut you off, respond to what they just said; don't apologise, don't mention it, and don't restart the cut reply from the top. If the unsaid part still matters, give only that part, briefly, after you answer them. \"Stop\", \"wait\" or \"hold on\" means stop: say nothing, or at most \"Sure.\", and wait for them.\n\
 How to sound: like a person on a call, not an assistant. Contractions, plain words, \"it\" or \"that\" for what was just discussed; no markdown, lists, ids or paths; no preamble, no stock openers, never read back what they said. Use their name at most once, when greeting. Don't repeat anything from your last few replies. After speaking, write no chat line that restates it. When you ask them something, set expecting and stop: their reply comes as the next ambient_turn, so never answer your own question. The conversation stays open while you work; if speaking is no longer needed, call ambient_mode with passive.{expecting}"
@@ -519,5 +670,77 @@ mod room_tests {
         assert!(!room_busy_at(1000, 950, 960), "a direct address clears it");
         assert!(room_busy_at(1069, 950, 0));
         assert!(!room_busy_at(1070, 950, 0), "expires after 120 s");
+    }
+}
+
+#[cfg(test)]
+mod wait_tests {
+    use super::{WaitOutcome, WaitSlot};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[tokio::test]
+    async fn times_out_when_the_user_does_not_continue() {
+        let slot = WaitSlot::new();
+        let started = std::time::Instant::now();
+        let out = slot.begin().wait(MS(60), MS(500), || false).await;
+        assert_eq!(out, WaitOutcome::TimedOut);
+        assert!(started.elapsed() < MS(400));
+        assert!(!slot.pending());
+        assert!(!slot.offer("late"), "a turn after the timeout goes the normal way");
+    }
+
+    #[tokio::test]
+    async fn returns_early_with_the_new_turn() {
+        let slot: &'static WaitSlot = Box::leak(Box::new(WaitSlot::new()));
+        let started = std::time::Instant::now();
+        let waiter = slot.begin();
+        let offer = tokio::spawn(async move {
+            tokio::time::sleep(MS(30)).await;
+            slot.offer("<ambient_turn mode=\"active\">and also the logs</ambient_turn>")
+        });
+        let out = waiter.wait(MS(3000), MS(4000), || false).await;
+        assert!(offer.await.unwrap());
+        assert_eq!(out, WaitOutcome::Speech("<ambient_turn mode=\"active\">and also the logs</ambient_turn>".into()));
+        assert!(started.elapsed() < MS(1000));
+        assert!(!slot.pending());
+    }
+
+    #[tokio::test]
+    async fn extends_while_still_talking_but_never_past_the_cap() {
+        let slot = WaitSlot::new();
+        let started = std::time::Instant::now();
+        assert_eq!(slot.begin().wait(MS(50), MS(300), || true).await, WaitOutcome::TimedOut);
+        let took = started.elapsed();
+        assert!(took >= MS(300) && took < MS(700), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn no_leak_after_cancel_or_drop() {
+        let slot: &'static WaitSlot = Box::leak(Box::new(WaitSlot::new()));
+        let waiter = slot.begin();
+        slot.cancel("conversation ended");
+        assert!(!slot.pending());
+        assert_eq!(waiter.wait(MS(2000), MS(4000), || false).await, WaitOutcome::Cancelled("conversation ended"));
+        assert!(!slot.offer("next"), "nothing holds the slot after a cancel");
+
+        let calls = AtomicUsize::new(0);
+        let fut = slot.begin().wait(MS(2000), MS(4000), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+        assert!(slot.pending());
+        assert!(tokio::time::timeout(MS(30), fut).await.is_err(), "an interrupted tool call drops the future");
+        assert!(!slot.pending(), "dropping the waiter frees the slot");
+        assert!(!slot.offer("next"));
+
+        let first = slot.begin();
+        let second = slot.begin();
+        assert_eq!(first.wait(MS(2000), MS(4000), || false).await, WaitOutcome::Cancelled("a newer wait started"));
+        assert!(slot.pending(), "the older waiter's drop must not free the newer one");
+        drop(second);
+        assert!(!slot.pending());
     }
 }

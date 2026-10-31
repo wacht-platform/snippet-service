@@ -138,6 +138,7 @@ pub(super) fn note_input() {
 
 pub(super) fn note_heard() {
     *HEARD_AT.lock().unwrap() = Some(std::time::Instant::now());
+    crate::ambient::note_hearing();
 }
 
 pub(super) fn resume_unless_heard(daemon: Shared) {
