@@ -1415,7 +1415,11 @@ impl Store {
             )?;
             tx.commit()?;
             Ok(())
-        })
+        })?;
+        if status == "active" {
+            self.sync_task_lease(task_id, now)?;
+        }
+        Ok(())
     }
 
     pub fn set_task_agent_status(
@@ -1464,7 +1468,9 @@ impl Store {
             }
             tx.commit()?;
             Ok(())
-        })
+        })?;
+        self.sync_task_lease(task_id, &chrono::Utc::now().to_rfc3339())?;
+        Ok(())
     }
 
     pub fn get_task_by_thread(&self, thread_id: &str) -> Result<Option<Task>, StoreError> {
@@ -1587,6 +1593,31 @@ impl Store {
                 "UPDATE tasks SET last_progress_at = ?2 WHERE id = ?1 AND status = 'in_progress'",
                 params![task_id, now],
             )?;
+            Ok(())
+        })
+    }
+
+    /// Add paths a task has written to its owned set, so path conflicts see them.
+    /// Leaves `updated_at` alone.
+    pub fn add_owned_paths(&self, task_id: &str, paths: &[std::path::PathBuf]) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            let raw: Option<String> = conn
+                .query_row("SELECT owned_paths_json FROM tasks WHERE id = ?1 AND status = 'in_progress'", params![task_id], |r| r.get(0))
+                .optional()?;
+            let Some(raw) = raw else { return Ok(()) };
+            let mut owned: Vec<std::path::PathBuf> = serde_json::from_str(&raw).unwrap_or_default();
+            let before = owned.len();
+            for path in paths {
+                if !owned.iter().any(|o| path.starts_with(o)) {
+                    owned.push(path.clone());
+                }
+            }
+            if owned.len() != before {
+                conn.execute(
+                    "UPDATE tasks SET owned_paths_json = ?2 WHERE id = ?1",
+                    params![task_id, serde_json::to_string(&owned).unwrap_or_else(|_| "[]".into())],
+                )?;
+            }
             Ok(())
         })
     }
@@ -1914,6 +1945,22 @@ mod tests {
         assert_eq!(get().last_progress_at.as_deref(), Some("2030-01-01T00:00:00Z"), "a human post is not worker progress");
         db.append_event(&post("agent", "k2")).unwrap();
         assert_eq!(get().last_progress_at.as_deref(), Some("2032-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn written_files_become_owned_paths_without_widening_what_is_covered() {
+        let db = db();
+        db.create_task(&task("t1")).unwrap();
+        db.add_owned_paths("t1", &["/w/a.rs".into()]).unwrap();
+        assert!(db.get_task("t1").unwrap().unwrap().owned_paths.is_empty(), "only in-progress work owns paths");
+        db.claim_task_for_dispatch("t1", "2026-01-01T00:00:01Z").unwrap();
+        db.add_owned_paths("t1", &["/w/src".into(), "/w/src/b.rs".into(), "/w/a.rs".into()]).unwrap();
+        let owned = db.get_task("t1").unwrap().unwrap().owned_paths;
+        assert_eq!(owned, vec![std::path::PathBuf::from("/w/src"), "/w/a.rs".into()]);
+        let mut other = task("t2");
+        other.session_id = "s2".into();
+        db.create_task(&other).unwrap();
+        assert_eq!(db.task_path_conflicts("t2", &["/w/src/c.rs".into()]).unwrap().len(), 1);
     }
 
     #[test]

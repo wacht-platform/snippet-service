@@ -319,6 +319,11 @@ fn delegate_task_tool() -> NativeToolDefinition {
                     "enum": ["full", "read_only"],
                     "description": "read_only removes the lane's file-editing tools (investigation/review lanes). Default full."
                 },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Full-access lanes: the files or directories the lane may change. Edits elsewhere are refused; overlapping a running lane's paths is refused."
+                },
                 "agent": {
                     "type": "string",
                     "description": "Optional specialized agent identity or role name for this lane (e.g. 'reviewer', 'researcher', 'security')."
@@ -349,6 +354,8 @@ pub struct DelegateBrief {
     pub agent: Option<String>,
     /// Optional inference profile name.
     pub profile: Option<String>,
+    /// Paths a writing lane will change; edits outside them are refused.
+    pub paths: Vec<String>,
 }
 
 /// Validate a `delegate_task` payload: the brief must state both a scope
@@ -432,6 +439,13 @@ pub fn parse_delegate_brief(arguments: &Value) -> Result<DelegateBrief, String> 
         read_only,
         agent,
         profile,
+        paths: arguments
+            .get("paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string))
+            .collect(),
     })
 }
 

@@ -12,6 +12,7 @@ pub mod direct;
 mod events;
 pub mod goals;
 mod identity;
+pub mod leases;
 pub mod schema;
 mod task_state;
 mod tasks;

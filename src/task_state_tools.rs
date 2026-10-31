@@ -178,6 +178,8 @@ pub fn note_changed_files(ctx: &ToolContext, paths: &[String]) {
         .collect();
     let patch = StatePatch { add_changed_files: rel, ..StatePatch::default() };
     let _ = store.patch_task_state(&task.id, &patch, None, "change_files", &chrono::Utc::now().to_rfc3339());
+    let owned: Vec<std::path::PathBuf> = paths.iter().map(|p| root.join(p)).filter(|p| p.starts_with(root)).collect();
+    let _ = store.add_owned_paths(&task.id, &owned);
 }
 
 fn remember_decisions(task_id: &str, author: &str, changes: &[String]) {

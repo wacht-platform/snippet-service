@@ -91,6 +91,12 @@ pub struct ToolContext {
     /// For a lane: the session that delegated it and the lane's id, so its
     /// messages are answerable and replies find their way back into the lane.
     lane_origin: Option<(String, String)>,
+    /// A writing lane's declared paths; `change_files` outside them is refused.
+    write_scope: Vec<PathBuf>,
+    /// Investigation lane: shell commands that modify files are refused.
+    read_only_shell: bool,
+    /// Fencing token of the task lease this lane was started under.
+    lease_token: Option<u64>,
     /// The shell's working directory, carried across `bash` calls. Relative
     /// paths in the file tools resolve against it too, so there is one "here".
     current_dir: Arc<Mutex<PathBuf>>,
@@ -133,6 +139,9 @@ impl ToolContext {
             store_path: None,
             agent_id: None,
             lane_origin: None,
+            write_scope: Vec::new(),
+            read_only_shell: false,
+            lease_token: None,
         })
     }
 
@@ -220,6 +229,33 @@ impl ToolContext {
     pub fn with_lane_origin(mut self, session_id: impl Into<String>, lane_id: impl Into<String>) -> Self {
         self.lane_origin = Some((session_id.into(), lane_id.into()));
         self
+    }
+
+    pub fn with_write_scope(mut self, paths: Vec<PathBuf>) -> Self {
+        self.write_scope = paths;
+        self
+    }
+
+    pub fn write_scope(&self) -> &[PathBuf] {
+        &self.write_scope
+    }
+
+    pub fn with_read_only_shell(mut self, on: bool) -> Self {
+        self.read_only_shell = on;
+        self
+    }
+
+    pub fn read_only_shell(&self) -> bool {
+        self.read_only_shell
+    }
+
+    pub fn with_lease_token(mut self, token: Option<u64>) -> Self {
+        self.lease_token = token;
+        self
+    }
+
+    pub fn lease_token(&self) -> Option<u64> {
+        self.lease_token
     }
 
     pub fn lane_origin(&self) -> Option<(&str, &str)> {
@@ -416,11 +452,18 @@ impl ToolRegistry {
         arguments: Value,
     ) -> Result<ToolResult, ToolError> {
         note_session_activity(ctx);
+        let gate = crate::ownership::gate(ctx, name, &arguments);
+        if let crate::ownership::Gate::Refuse(reason) = &gate {
+            return Err(ToolError::msg(reason.clone()));
+        }
         let tool = match self.tools.get(name) {
             Some(tool) => tool,
             None => return self.execute_custom(ctx, name, arguments).await,
         };
         let mut result = tool.execute(ctx, arguments).await?;
+        if let (crate::ownership::Gate::Warn(note), Some(map)) = (&gate, result.value.as_object_mut()) {
+            map.insert("ownership_warning".into(), Value::String(note.clone()));
+        }
         result.value = bound_tool_output(ctx, name, result.value);
         Ok(result)
     }

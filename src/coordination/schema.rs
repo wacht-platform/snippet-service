@@ -174,6 +174,19 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              PRIMARY KEY (from_task_id, to_task_id, kind)
          );
          CREATE INDEX IF NOT EXISTS task_links_to ON task_links(to_task_id, kind);
+         -- One row per holder of a task's session lease; the token only grows.
+         CREATE TABLE IF NOT EXISTS session_leases (
+             lease_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             session_id TEXT NOT NULL,
+             agent_id TEXT NOT NULL,
+             fencing_token INTEGER NOT NULL,
+             acquired_at TEXT NOT NULL,
+             released_at TEXT,
+             release_reason TEXT
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS session_leases_open
+             ON session_leases(task_id) WHERE released_at IS NULL;
          CREATE TABLE IF NOT EXISTS task_requesters (
              task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
              reply_to TEXT NOT NULL

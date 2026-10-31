@@ -211,3 +211,71 @@ pub fn classify_shell_command(command: &str) -> ShellVerdict {
 
     ShellVerdict::Allow
 }
+
+const WRITE_VERBS: &[&str] = &[
+    "rm", "rmdir", "mv", "cp", "mkdir", "touch", "truncate", "install", "ln", "chmod", "chown", "patch", "dd",
+];
+const WRITE_GIT: &[&str] = &[
+    "add", "commit", "checkout", "switch", "reset", "restore", "apply", "am", "stash", "merge", "rebase", "clean",
+    "rm", "mv", "cherry-pick", "revert", "pull",
+];
+
+/// Whether a `bash` command modifies workspace files, and which paths it names
+/// as targets (possibly none: `git commit` writes without naming a file).
+/// `None` for a read. Writes only to throwaway sinks (`/tmp`, `/dev/null`) are reads.
+pub fn shell_writes(command: &str) -> Option<Vec<String>> {
+    let mut targets: Vec<String> = Vec::new();
+    let mut writes = false;
+    for seg in segments(command) {
+        let toks = tokens(&seg);
+        let Some(verb) = toks.first().map(String::as_str) else { continue };
+        let git_write = verb == "git"
+            && toks.iter().skip(1).find(|t| !t.starts_with('-')).is_some_and(|sub| WRITE_GIT.contains(&sub.as_str()));
+        if git_write {
+            writes = true;
+        } else if is_sed_inplace(&toks) {
+            targets.extend(toks.last().filter(|t| is_tracked_write_target(t)).cloned());
+            writes |= !targets.is_empty();
+        } else if WRITE_VERBS.contains(&verb) || is_tee_to_tracked(&toks) {
+            let named = toks.iter().skip(1).filter(|t| !t.starts_with('-') && !t.contains('='));
+            let named: Vec<String> = named.filter(|t| is_tracked_write_target(t)).cloned().collect();
+            writes |= !named.is_empty();
+            targets.extend(named);
+        }
+        let mut it = toks.iter();
+        while let Some(t) = it.next() {
+            let Some(rest) = t.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&').strip_prefix('>') else {
+                continue;
+            };
+            let rest = rest.trim_start_matches('>');
+            if rest.starts_with('&') {
+                continue;
+            }
+            let target = if rest.is_empty() { it.next().cloned() } else { Some(rest.to_string()) };
+            if let Some(target) = target.filter(|t| is_tracked_write_target(t)) {
+                writes = true;
+                targets.push(target);
+            }
+        }
+    }
+    writes.then_some(targets)
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    #[test]
+    fn finds_writes_and_their_targets() {
+        assert_eq!(shell_writes("ls -la && rg foo src"), None);
+        assert_eq!(shell_writes("echo hi > src/a.rs"), Some(vec!["src/a.rs".into()]));
+        assert_eq!(shell_writes("echo hi > /tmp/x"), None);
+        assert_eq!(shell_writes("sed -i 's/a/b/' src/a.rs"), Some(vec!["src/a.rs".into()]));
+        assert_eq!(shell_writes("git commit -m x"), Some(vec![]));
+        assert_eq!(shell_writes("git log --oneline"), None);
+        assert_eq!(shell_writes("cargo build 2>&1 | tail"), None);
+        assert_eq!(shell_writes("rm -rf build"), Some(vec!["build".into()]));
+        assert_eq!(shell_writes("mv a.rs b.rs"), Some(vec!["a.rs".into(), "b.rs".into()]));
+        assert_eq!(shell_writes("rm /tmp/scratch"), None);
+    }
+}

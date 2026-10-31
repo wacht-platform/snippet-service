@@ -328,12 +328,13 @@ impl CodingHarness {
                             Err(error) => (tool_error(error), MetaControl::Continue),
                         };
                     }
-                    match lanes.spawn(
+                    match lanes.spawn_scoped(
                         &brief.title,
                         &brief.description,
                         brief.read_only,
                         brief.agent.clone(),
                         brief.profile.clone(),
+                        brief.paths.clone(),
                     ) {
                         Ok(id) => {
                             state.events.push(HarnessEvent::LaneSpawned {

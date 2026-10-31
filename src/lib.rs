@@ -53,6 +53,7 @@ pub mod settle;
 pub mod session;
 pub mod session_resolve;
 pub mod voiceprint;
+pub mod ownership;
 pub mod shell_guard;
 pub mod signals;
 pub mod skills;

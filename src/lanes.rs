@@ -6,7 +6,7 @@
 //! a channel. Multiple lanes run in parallel.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use chrono::Utc;
@@ -91,6 +91,9 @@ pub struct LaneRecord {
     /// The id the lane's own transcript is stored under, for a read-only view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
+    /// Paths a writing lane declared; `change_files` outside them is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 /// Terminal report delivered back to the parent loop when a lane finishes.
@@ -254,6 +257,8 @@ struct LaneLink {
     context: String,
     mailbox: Arc<LaneMailbox>,
     title: String,
+    write_scope: Vec<PathBuf>,
+    lease_token: Option<u64>,
 }
 
 /// Max lanes running at once — a runaway/cost guard so "spawn several" can't
@@ -443,6 +448,17 @@ impl LaneManager {
                 .find(|r| r.id == id)
                 .map(|r| r.title.clone())
                 .unwrap_or_default(),
+            write_scope: self
+                .records
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.paths.iter().map(|p| self.workspace_root.join(p)).collect())
+                .unwrap_or_default(),
+            lease_token: parent
+                .filter(|p| p.store_path().is_some())
+                .zip(task.as_ref())
+                .and_then(|(p, (task_id, _))| p.store().ok()?.current_lease(task_id).ok().flatten())
+                .map(|lease| lease.fencing_token),
         }
     }
 
@@ -492,6 +508,20 @@ impl LaneManager {
         agent: Option<String>,
         profile: Option<String>,
     ) -> Result<String, String> {
+        self.spawn_scoped(title, brief, read_only, agent, profile, Vec::new())
+    }
+
+    /// Spawn a lane; a writing lane may declare the paths it will change, and is
+    /// refused while another running writing lane declared an overlapping path.
+    pub fn spawn_scoped(
+        &mut self,
+        title: &str,
+        brief: &str,
+        read_only: bool,
+        agent: Option<String>,
+        profile: Option<String>,
+        paths: Vec<String>,
+    ) -> Result<String, String> {
         if self.factory.is_none() {
             return Err(
                 "delegate_task is unavailable in this run (no model factory; interactive mode only)."
@@ -504,6 +534,9 @@ impl LaneManager {
             ));
         }
 
+        if let Some(clash) = self.scope_clash(read_only, &paths) {
+            return Err(clash);
+        }
         self.counter += 1;
         let id = format!("lane-{}", self.counter);
         self.records.push(LaneRecord {
@@ -524,9 +557,27 @@ impl LaneManager {
             agent: agent.clone(),
             profile: profile.clone(),
             transcript: self.transcript_id(&id),
+            paths,
         });
         self.launch(&id, title, brief, false, read_only, agent, profile);
         Ok(id)
+    }
+
+    fn scope_clash(&self, read_only: bool, paths: &[String]) -> Option<String> {
+        if read_only {
+            return None;
+        }
+        let overlaps = |a: &str, b: &str| {
+            let (a, b) = (Path::new(a), Path::new(b));
+            a.starts_with(b) || b.starts_with(a)
+        };
+        self.records
+            .iter()
+            .filter(|r| r.status == LaneStatus::Running && !r.read_only)
+            .find_map(|r| {
+                let (mine, theirs) = paths.iter().find_map(|p| r.paths.iter().find(|q| overlaps(p, q)).map(|q| (p, q)))?;
+                Some(format!("`{mine}` overlaps `{theirs}`, which running lane {} (\"{}\") is writing. Wait for it, split the paths, or make this lane read-only.", r.id, r.title))
+            })
     }
 
     /// Continue a FINISHED lane with a follow-up brief: its harness state is
@@ -1019,6 +1070,9 @@ async fn run_lane_once(
     let context = match ToolContext::with_owner(workspace_root, &owner) {
         Ok(context) => {
             let context = context
+                .with_write_scope(link.write_scope.clone())
+                .with_read_only_shell(read_only)
+                .with_lease_token(link.lease_token)
                 .with_agent_id_opt(link.agent_id.clone())
                 .with_store_path(link.store_path.clone().unwrap_or_else(crate::store::default_db_path));
             match link.origin_session.as_deref() {
@@ -1298,6 +1352,7 @@ mod tests {
             agent: None,
             profile: None,
             transcript: None,
+            paths: Vec::new(),
         }
     }
 
@@ -1381,6 +1436,20 @@ mod tests {
             progress_tx,
             None,
         )
+    }
+
+    #[test]
+    fn overlapping_writing_lanes_are_refused_but_readers_and_disjoint_paths_are_not() {
+        let dir = std::env::temp_dir().join(format!("snippet-lane-scope-{}", std::process::id()));
+        let mut running = test_record();
+        running.status = LaneStatus::Running;
+        running.read_only = false;
+        running.paths = vec!["src/serve".into()];
+        let mgr = empty_manager(dir).with_records(vec![running]);
+        let clash = mgr.scope_clash(false, &["src/serve/mod.rs".into()]).unwrap();
+        assert!(clash.contains("overlaps"), "{clash}");
+        assert!(mgr.scope_clash(false, &["src/lanes.rs".into()]).is_none());
+        assert!(mgr.scope_clash(true, &["src/serve".into()]).is_none());
     }
 
     #[test]
