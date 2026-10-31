@@ -383,7 +383,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
                 return Err(message);
             }
         };
-        if other.status != TaskStatus::Done {
+        if !other.status.releases_dependants() {
             let reason = if other.status.is_terminal() {
                 format!(
                     "dependency {blocker_id} is {}; retry it, or cancel or unlink this task",
@@ -497,10 +497,7 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         .unwrap_or_default()
         .iter()
         .filter_map(|id| d.store.get_task(id).ok().flatten())
-        .map(|blocker| {
-            let summary = blocker.result.as_ref().map(|r| r.summary.trim().to_string()).unwrap_or_default();
-            format!("- {} ({}, {}): {}", blocker.title, blocker.id, blocker.status, if summary.is_empty() { "no report".to_string() } else { summary })
-        })
+        .map(|blocker| input_line(&blocker))
         .collect();
     let inputs_line = if inputs.is_empty() {
         String::new()
@@ -554,6 +551,15 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         .update_task_in(task_id, &now, |t| t.dispatch_failures = 0)
         .map_err(|error| error.to_string())?;
     Ok(task)
+}
+
+pub(super) fn input_line(blocker: &Task) -> String {
+    let summary = blocker.result.as_ref().map(|r| r.summary.trim().to_string()).unwrap_or_default();
+    let summary = if summary.is_empty() { "no report".to_string() } else { summary };
+    if blocker.status == TaskStatus::Cancelled {
+        return format!("- {} ({}): blocker {} cancelled, so its output is not available: {summary}", blocker.title, blocker.id, blocker.id);
+    }
+    format!("- {} ({}, {}): {summary}", blocker.title, blocker.id, blocker.status)
 }
 
 /// If other in-progress tasks own any of this task's paths, leave it queued

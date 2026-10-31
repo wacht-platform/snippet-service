@@ -1224,10 +1224,9 @@ async fn create_task(
                 .get_task(blocker)
                 .map_err(|e| ToolError::msg(format!("look up blocker: {e}")))?
                 .ok_or_else(|| ToolError::msg(format!("blocked_by names no task `{blocker}`")))?;
-            if matches!(found.status, TaskStatus::Failed | TaskStatus::Cancelled) {
+            if found.status == TaskStatus::Failed {
                 return Err(ToolError::msg(format!(
-                    "blocker `{blocker}` is {}; it will never finish, so this task would never start",
-                    found.status
+                    "blocker `{blocker}` failed; retry it first, or this task would wait forever"
                 )));
             }
             if found.status != TaskStatus::Done {
@@ -1909,6 +1908,10 @@ impl Tool for RetryMissionTask {
 #[derive(Deserialize)]
 struct CancelTaskArgs {
     task_id: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    superseded_by: Option<String>,
 }
 pub struct CancelMissionTask;
 #[async_trait]
@@ -1916,8 +1919,8 @@ impl Tool for CancelMissionTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "cancel_mission_task".into(),
-            description: "Cancel a queued, blocked, failed, or in-progress Mission Control task. Use when the user drops the work or two tasks are deadlocked. Does not delete history. Refuses already-done work.".into(),
-            input_schema: schema(json!({"task_id":{"type":"string"}}), &["task_id"]),
+            description: "Cancel an open or failed Mission Control task with a reason. A session working it is stopped and told why; tasks waiting on it start, told it was cancelled. When refiling, pass the new task's id as superseded_by. Refuses done work.".into(),
+            input_schema: schema(json!({"task_id":{"type":"string"}, "reason":{"type":"string","description":"why; stored as the task's result"}, "superseded_by":{"type":"string","description":"optional; id of the task that replaces this one"}}), &["task_id", "reason"]),
         }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
@@ -1925,26 +1928,119 @@ impl Tool for CancelMissionTask {
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "cancel_mission_task".into(),
             })?;
-        if args.task_id.trim().is_empty() {
-            return Err(ToolError::msg("task_id must be non-empty"));
+        let (task_id, reason) = (args.task_id.trim(), args.reason.trim());
+        if task_id.is_empty() || reason.is_empty() {
+            return Err(ToolError::msg("cancel_mission_task needs task_id and reason"));
         }
-        let task = db(ctx)?
+        let store = db(ctx)?;
+        let superseded_by = args.superseded_by.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(next) = superseded_by {
+            if next == task_id || store.get_task(next).ok().flatten().is_none() {
+                return Err(ToolError::msg(format!("superseded_by names no other task `{next}`")));
+            }
+        }
+        let before = store
+            .get_task(task_id)
+            .map_err(|e| ToolError::msg(format!("look up task: {e}")))?
+            .ok_or_else(|| ToolError::msg(format!("no task `{task_id}`")))?;
+        let now = now_rfc3339();
+        let mut task = store
             .complete_task(
-                args.task_id.trim(),
+                task_id,
                 TaskStatus::Cancelled,
-                TaskResult {
-                    summary: "Cancelled by Mission Control.".into(),
-                    artifacts: Vec::new(),
-                    authoritative: true,
-                },
-                &now_rfc3339(),
+                TaskResult { summary: reason.to_string(), artifacts: Vec::new(), authoritative: true },
+                &now,
             )
             .map_err(|e| ToolError::msg(format!("cancel task: {e}")))?;
+        if let Some(next) = superseded_by {
+            task = store
+                .update_task_in(task_id, &now, |t| t.superseded_by = Some(next.to_string()))
+                .map_err(|e| ToolError::msg(format!("record superseded_by: {e}")))?;
+        }
+        let worker = cancelled_worker(&before);
+        let mut stopped = Value::Null;
+        if let Some(session) = worker.as_deref() {
+            let body = cancelled_envelope(&before, reason, superseded_by);
+            store
+                .send_task_notice(("agent", crate::mission_control::SESSION_ID), session, task_id, "task_cancelled", &body, &now)
+                .map_err(|e| ToolError::msg(format!("notify worker: {e}")))?;
+            if session_is_running(&store, session) {
+                stopped = match interrupt_session(session, &format!("task {task_id} cancelled: {reason}")).await {
+                    Ok(_) => json!(session),
+                    Err(e) => json!({"session": session, "error": e.to_string()}),
+                };
+            }
+        }
+        let released: Vec<String> = store
+            .task_links(task_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.kind == crate::coordination::TaskLinkKind::Blocks && l.from_task_id == task_id)
+            .map(|l| l.to_task_id)
+            .filter(|id| store.get_task(id).ok().flatten().is_some_and(|t| !t.status.is_terminal()))
+            .filter(|id| {
+                store.blockers_of(id).unwrap_or_default().iter().all(|b| {
+                    store.get_task(b).ok().flatten().is_some_and(|t| t.status.releases_dependants())
+                })
+            })
+            .collect();
+        let note = if released.is_empty() {
+            "Cancelled.".to_string()
+        } else {
+            format!("Cancelled. {} waiting task(s) now start, told this blocker was cancelled.", released.len())
+        };
         Ok(ToolResult::success(json!({
             "task": task_view(&task),
-            "note": "Cancelled. Waiters on this task can now dispatch."
+            "worker_notified": worker,
+            "stopped": stopped,
+            "released": released,
+            "note": note,
         })))
     }
+}
+
+/// The session a cancelled task was bound to, if it had one to tell.
+fn cancelled_worker(task: &Task) -> Option<String> {
+    let session = task.reporting_session.clone().or_else(|| {
+        (task.status == TaskStatus::InProgress && !task.session_id.is_empty()).then(|| task.session_id.clone())
+    })?;
+    (!crate::mission_control::is_session_id(&session)).then_some(session)
+}
+
+fn cancelled_envelope(task: &Task, reason: &str, superseded_by: Option<&str>) -> String {
+    let next = superseded_by.map(|id| format!("superseded_by: {id}\n")).unwrap_or_default();
+    format!(
+        "[task_cancelled]\ntask_id: {}\ntitle: {}\nreason: {reason}\n{next}note: Mission Control cancelled this task. Stop work on it and don't report it; keep what's done. Ask Mission Control if anything is unclear.\n[/task_cancelled]",
+        task.id, task.title
+    )
+}
+
+fn session_is_running(store: &Store, session: &str) -> bool {
+    store
+        .get_session_row(session)
+        .ok()
+        .flatten()
+        .is_some_and(|row| matches!(row.status.as_str(), "running" | "waiting_for_input"))
+}
+
+/// End a session's current run the way the stop button does.
+async fn interrupt_session(id: &str, reason: &str) -> Result<Value, ToolError> {
+    let info = crate::serve::sidecar::read_daemon_info()
+        .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
+    let url = format!("{}/session/interrupt?token={}", info.api_url.trim_end_matches('/'), info.token);
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(&json!({"session": id, "reason": reason}))
+        .send()
+        .await
+        .map_err(|e| ToolError::msg(format!("stop failed: {e}")))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(ToolError::msg(format!("no session `{id}`")));
+    }
+    if !response.status().is_success() {
+        return Err(ToolError::msg(format!("stop failed: HTTP {}", response.status())));
+    }
+    Ok(response.json().await.unwrap_or_default())
 }
 
 /// Sessions that have gone quiet: not running, idle for a while, and with no
@@ -2062,23 +2158,7 @@ impl Tool for StopSession {
         if id == crate::mission_control::SESSION_ID {
             return Err(ToolError::msg("that's your own session; end your turn instead"));
         }
-        let info = crate::serve::sidecar::read_daemon_info()
-            .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
-        let url = format!("{}/session/interrupt?token={}", info.api_url.trim_end_matches('/'), info.token);
-        let response = reqwest::Client::new()
-            .post(&url)
-            .json(&json!({"session": id, "reason": reason}))
-            .send()
-            .await
-            .map_err(|e| ToolError::msg(format!("stop failed: {e}")))?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(ToolError::msg(format!("no session `{id}`")));
-        }
-        if !response.status().is_success() {
-            return Err(ToolError::msg(format!("stop failed: HTTP {}", response.status())));
-        }
-        let body: Value = response.json().await.unwrap_or_default();
-        Ok(ToolResult::success(body))
+        Ok(ToolResult::success(interrupt_session(id, reason).await?))
     }
 }
 
@@ -2863,6 +2943,57 @@ mod tests {
         // Verify thread event was emitted
         let events = db.events_for_thread(&task.thread_id, 0, 10).unwrap();
         assert!(events.iter().any(|e| e.event_type == "task.reported"));
+    }
+
+    #[tokio::test]
+    async fn cancel_needs_a_reason_tells_the_worker_and_releases_waiters() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("snippet.db")).unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        let mk = |id: &str| Task::dispatched_to(
+            id.into(), "s-w".into(), id.into(), "do it".into(), vec![], HandoffMode::Resume,
+            "agent", crate::mission_control::SESSION_ID, "2026-01-01T00:00:00Z".into(),
+        );
+        db.create_task(&mk("t-old")).unwrap();
+        db.create_task(&mk("t-new")).unwrap();
+        let mut waiter = mk("t-wait");
+        waiter.status = TaskStatus::Blocked;
+        db.create_task(&waiter).unwrap();
+        db.link_tasks(&crate::coordination::TaskLink {
+            from_task_id: "t-old".into(), to_task_id: "t-wait".into(),
+            kind: crate::coordination::TaskLinkKind::Blocks, created_at: "2026-01-01T00:00:00Z".into(),
+        }).unwrap();
+        db.add_task_agent_full("t-old", "snippet", "implementer", None, "", "offered", "2026-01-01T00:00:00Z").unwrap();
+        db.update_task_in("t-old", "2026-01-01T00:00:01Z", |t| {
+            t.status = TaskStatus::InProgress;
+            t.reporting_session = Some("s-w".into());
+        }).unwrap();
+        let ctx = ToolContext::mission_control(dir.path())
+            .unwrap()
+            .with_durable_session_id("mc")
+            .with_store_path(dir.path().join("snippet.db"));
+
+        assert!(CancelMissionTask.execute(&ctx, json!({"task_id": "t-old"})).await.is_err());
+        let res = CancelMissionTask
+            .execute(&ctx, json!({"task_id": "t-old", "reason": "user changed plan", "superseded_by": "t-new"}))
+            .await
+            .unwrap();
+        assert_eq!(res.value["data"]["released"], json!(["t-wait"]));
+        assert_eq!(res.value["data"]["worker_notified"], "s-w");
+
+        let old = db.get_task("t-old").unwrap().unwrap();
+        assert_eq!(old.status, TaskStatus::Cancelled);
+        assert_eq!(old.result.unwrap().summary, "user changed plan");
+        assert_eq!(old.superseded_by.as_deref(), Some("t-new"));
+        assert_eq!(db.list_task_agents("t-old").unwrap()[0].status, "withdrawn");
+
+        let pending = db.list_pending_direct_deliveries(10, "2026-12-01T00:00:00Z").unwrap();
+        let notice = pending
+            .iter()
+            .find(|m| m.recipient_kind == "session" && m.recipient_id == "s-w")
+            .expect("worker notice queued");
+        assert_eq!(notice.event.payload["notice"], "task_cancelled");
+        assert!(notice.event.payload["body"].as_str().unwrap().contains("[task_cancelled]"));
     }
 }
 

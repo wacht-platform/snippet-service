@@ -207,6 +207,17 @@ async fn deliver_direct(
             .get("body")
             .and_then(|value| value.as_str())
             .unwrap_or_default();
+        match event.payload.get("notice").and_then(|v| v.as_str()) {
+            Some("task_brief") => {
+                d.deliver(&session_id, LoopInput::UserMessage(body.to_string())).await;
+                return Ok(());
+            }
+            Some(_) => {
+                super::record_agent_message(d, &session_id, &event.actor_id, body, false).await;
+                return Ok(());
+            }
+            None => {}
+        }
         if event.payload.get("about_task").and_then(|v| v.as_str()).is_some() {
             let Some((tx, _path, _stream)) = d.ensure_live(&session_id).await else {
                 return Err(format!("could not start session `{session_id}`"));

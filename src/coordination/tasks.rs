@@ -28,6 +28,12 @@ impl TaskStatus {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
     }
 
+    /// Whether a blocker in this state lets its dependants start. A cancelled
+    /// blocker is gone, so waiting on it is pointless; a failed one may be retried.
+    pub fn releases_dependants(&self) -> bool {
+        matches!(self, Self::Done | Self::Cancelled)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Todo => "todo",
@@ -103,6 +109,9 @@ pub struct Task {
     /// mirrored here so the board shows how far along it is.
     #[serde(default)]
     pub work_plan: Vec<WorkStep>,
+    /// The task filed to replace this one when it was cancelled and refiled.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 /// One step of a task's working plan.
@@ -238,6 +247,7 @@ impl Task {
             notifications: Vec::new(),
             owned_paths: Vec::new(),
             profile: None,
+            superseded_by: None,
         }
     }
 
@@ -279,6 +289,7 @@ impl Task {
             notifications: Vec::new(),
             owned_paths,
             profile: None,
+            superseded_by: None,
         }
     }
 }
@@ -411,13 +422,14 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
         profile: row.get(19)?,
         plan: row.get(20)?,
         work_plan: decode_json_vec(row.get(21)?, 21)?,
+        superseded_by: row.get(22)?,
     })
 }
 
 const TASK_COLUMNS: &str = "id, title, description, status, priority, created_by_kind,
      created_by_id, created_at, updated_at, completed_at, thread_id, session_id,
      handoff_json, handoff_mode, reporting_session, dispatch_failures, result_json,
-     notifications_json, owned_paths_json, profile, plan, work_plan_json";
+     notifications_json, owned_paths_json, profile, plan, work_plan_json, superseded_by";
 
 /// Persist every mutable column of a task. Takes the connection so it composes
 /// into the read-modify-write transaction in `update_task_in` — a separate
@@ -443,7 +455,8 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             notifications_json = ?14,
             owned_paths_json = ?15,
             profile = ?16,
-            plan = ?17
+            plan = ?17,
+            superseded_by = ?18
          WHERE id = ?1",
         params![
             task.id,
@@ -463,6 +476,7 @@ fn write_task(conn: &rusqlite::Connection, task: &Task) -> Result<(), rusqlite::
             serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
             task.profile,
             task.plan,
+            task.superseded_by,
         ],
     )?;
     Ok(())
@@ -491,8 +505,8 @@ impl Store {
                     created_by_kind, created_by_id, created_at, updated_at,
                     completed_at, thread_id, session_id, handoff_json, handoff_mode,
                     reporting_session, dispatch_failures, result_json,
-                    notifications_json, owned_paths_json, profile, plan)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                    notifications_json, owned_paths_json, profile, plan, superseded_by)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
                 params![
                     task.id,
                     task.title,
@@ -515,6 +529,7 @@ impl Store {
                     serde_json::to_string(&task.owned_paths).unwrap_or_else(|_| "[]".into()),
                     task.profile,
                     task.plan,
+                    task.superseded_by,
                 ],
             )?;
             tx.execute(
@@ -703,6 +718,16 @@ impl Store {
                 status: format!("{existing:?}"),
             });
         }
+        // An offer nobody claimed must not read as pending on a finished task.
+        let settled = if task.status == TaskStatus::Done { "done" } else { "withdrawn" };
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE task_agents SET status = ?2
+                 WHERE task_id = ?1 AND status = 'offered' AND removed_at IS NULL",
+                params![id, settled],
+            )?;
+            Ok(())
+        })?;
         Ok(task)
     }
 
@@ -750,6 +775,19 @@ impl Store {
                 status: status.to_string(),
             });
         }
+        self.with_connection(|conn| {
+            conn.execute(
+                "DELETE FROM task_links WHERE to_task_id = ?1 AND kind = 'blocks'
+                   AND from_task_id IN (SELECT id FROM tasks WHERE status = 'cancelled')",
+                params![id],
+            )?;
+            conn.execute(
+                "UPDATE task_agents SET status = 'offered'
+                 WHERE task_id = ?1 AND status = 'withdrawn' AND removed_at IS NULL",
+                params![id],
+            )?;
+            Ok(())
+        })?;
         Ok(task)
     }
 
@@ -801,15 +839,6 @@ impl Store {
         }
     }
 
-    /// Return every `Blocked` task whose dependencies are all `Done` back to
-    /// `Todo`, so the dispatch loop can pick them up. Returns the ids re-queued.
-    ///
-    /// A failed or cancelled dependency does not release its dependents: dispatch
-    /// would only block them again, every tick. They wait for a retry or cancel.
-    ///
-    /// Tasks parked by the dispatch retry ceiling are excluded: they are blocked
-    /// with no dependencies, and re-queuing them would spin the loop forever.
-    /// A user resets those explicitly.
     /// Record the working plan of the session doing a task. Written apart
     /// from `update_task_in` so it leaves `updated_at` alone: a plan update is
     /// progress, not a change on the board, and must not start a round. The
@@ -856,6 +885,12 @@ impl Store {
         })
     }
 
+    /// Return every `Blocked` task whose dependencies are all done or cancelled
+    /// back to `Todo`, so the dispatch loop can pick them up. Returns the ids
+    /// re-queued. A failed dependency still holds its dependants until retried.
+    ///
+    /// Tasks parked by the dispatch retry ceiling are excluded: they are blocked
+    /// with no dependencies, and re-queuing them would spin the loop forever.
     pub fn unblock_ready_tasks(
         &self,
         now: &str,
@@ -870,13 +905,13 @@ impl Store {
             if blockers.is_empty() {
                 continue;
             }
-            let all_done = blockers.iter().all(|id| {
+            let all_released = blockers.iter().all(|id| {
                 self.get_task(id)
                     .ok()
                     .flatten()
-                    .is_some_and(|other| other.status == TaskStatus::Done)
+                    .is_some_and(|other| other.status.releases_dependants())
             });
-            if !all_done {
+            if !all_released {
                 continue;
             }
             let updated = self.update_task_in(&task.id, now, |t| {
@@ -1655,6 +1690,93 @@ mod tests {
             db.retry_task("t1", "2026-01-01T00:00:06Z"),
             Err(StoreError::NotRetryable { .. })
         ));
+    }
+
+    fn blocks(db: &Store, from: &str, to: &str) {
+        db.link_tasks(&TaskLink {
+            from_task_id: from.into(),
+            to_task_id: to.into(),
+            kind: TaskLinkKind::Blocks,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        })
+        .unwrap();
+    }
+
+    fn agent(db: &Store, id: &str) {
+        db.create_agent(&crate::coordination::types::Agent {
+            id: id.into(),
+            display_name: id.into(),
+            handle: id.into(),
+            kind: crate::coordination::types::AgentKind::Worker,
+            status: crate::coordination::types::AgentStatus::Active,
+            role: crate::coordination::types::AgentRole::Implementer,
+            capabilities: vec![],
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_blocker_releases_its_waiter_but_a_failed_one_holds() {
+        let db = db();
+        for id in ["cancelled", "failed", "after-cancel", "after-fail"] {
+            let mut t = task(id);
+            if id.starts_with("after") {
+                t.status = TaskStatus::Blocked;
+            }
+            db.create_task(&t).unwrap();
+        }
+        blocks(&db, "cancelled", "after-cancel");
+        blocks(&db, "failed", "after-fail");
+        db.move_task("cancelled", TaskStatus::Cancelled, "dropped", "2026-01-01T00:00:01Z").unwrap();
+        db.move_task("failed", TaskStatus::Failed, "broke", "2026-01-01T00:00:01Z").unwrap();
+
+        assert_eq!(db.unblock_ready_tasks("2026-01-01T00:00:02Z").unwrap(), vec!["after-cancel".to_string()]);
+        assert_eq!(db.get_task("after-fail").unwrap().unwrap().status, TaskStatus::Blocked);
+    }
+
+    #[test]
+    fn retry_drops_cancelled_blockers_and_reoffers_a_withdrawn_worker() {
+        let db = db();
+        agent(&db, "a1");
+        db.create_task(&task("gone")).unwrap();
+        db.create_task(&task("kept")).unwrap();
+        db.create_task(&task("waiter")).unwrap();
+        db.add_task_agent_full("waiter", "a1", "implementer", None, "", "offered", "2026-01-01T00:00:00Z").unwrap();
+        blocks(&db, "gone", "waiter");
+        blocks(&db, "kept", "waiter");
+        db.move_task("gone", TaskStatus::Cancelled, "dropped", "2026-01-01T00:00:01Z").unwrap();
+        db.move_task("waiter", TaskStatus::Failed, "broke", "2026-01-01T00:00:02Z").unwrap();
+        assert_eq!(db.list_task_agents("waiter").unwrap()[0].status, "withdrawn");
+
+        db.retry_task("waiter", "2026-01-01T00:00:03Z").unwrap();
+        assert_eq!(db.blockers_of("waiter").unwrap(), vec!["kept".to_string()]);
+        assert_eq!(db.list_task_agents("waiter").unwrap()[0].status, "offered");
+    }
+
+    #[test]
+    fn finishing_settles_an_unclaimed_offer() {
+        let db = db();
+        agent(&db, "a1");
+        agent(&db, "a2");
+        db.create_task(&task("t1")).unwrap();
+        db.add_task_agent_full("t1", "a1", "implementer", None, "", "offered", "2026-01-01T00:00:00Z").unwrap();
+        db.add_task_agent_full("t1", "a2", "reviewer", None, "", "waiting", "2026-01-01T00:00:00Z").unwrap();
+        db.move_task("t1", TaskStatus::Done, "shipped", "2026-01-01T00:00:01Z").unwrap();
+        let roster = db.list_task_agents("t1").unwrap();
+        let status = |id: &str| roster.iter().find(|m| m.agent_id == id).unwrap().status.clone();
+        assert_eq!(status("a1"), "done");
+        assert_eq!(status("a2"), "waiting");
+    }
+
+    #[test]
+    fn superseded_by_survives_create_and_update() {
+        let db = db();
+        let mut t = task("old");
+        t.superseded_by = Some("seed".into());
+        db.create_task(&t).unwrap();
+        assert_eq!(db.get_task("old").unwrap().unwrap().superseded_by.as_deref(), Some("seed"));
+        db.update_task_in("old", "2026-01-01T00:00:01Z", |t| t.superseded_by = Some("new".into())).unwrap();
+        assert_eq!(db.get_task("old").unwrap().unwrap().superseded_by.as_deref(), Some("new"));
     }
 
     /// The cursor carries every sort key; without the priority, the page after

@@ -563,6 +563,34 @@ use super::*;
         assert!(d.store.unblock_ready_tasks("2026-01-01T00:00:02Z").unwrap().is_empty());
     }
 
+    /// A cancelled dependency no longer parks its dependent; the dependent is
+    /// told the blocker was cancelled instead of waiting forever.
+    #[tokio::test]
+    async fn a_cancelled_dependency_releases_its_dependent() {
+        let d = test_daemon();
+        d.store.create_task(&queued_task("first", &["/w/a"])).unwrap();
+        d.store.create_task(&queued_task("second", &["/w/b"])).unwrap();
+        d.store
+            .link_tasks(&crate::coordination::TaskLink {
+                from_task_id: "first".into(),
+                to_task_id: "second".into(),
+                kind: crate::coordination::TaskLinkKind::Blocks,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        d.store
+            .move_task("first", crate::coordination::TaskStatus::Cancelled, "user dropped it", "2026-01-01T00:00:01Z")
+            .unwrap();
+
+        // Past the dependency check, it fails only on the unknown test session.
+        let _ = mission_control::dispatch_mission_task(&d, "second").await;
+        let second = d.store.get_task("second").unwrap().unwrap();
+        assert!(second.notifications.iter().all(|n| !n.message.contains("dependency")));
+        let line = mission_control::input_line(&d.store.get_task("first").unwrap().unwrap());
+        assert!(line.contains("blocker first cancelled"), "{line}");
+        assert!(line.contains("user dropped it"));
+    }
+
     /// An agent taking the lease on a session it does not own carries its
     /// identity in the handoff; the session's own agent needs none.
     #[test]

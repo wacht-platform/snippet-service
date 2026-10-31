@@ -127,6 +127,24 @@ impl Store {
         self.send_direct_message_with_origin(sender, recipient, body, idempotency_key, created_at, origin_session, None, None)
     }
 
+    /// A durable notice to a session about a task (`notice` names its kind, e.g.
+    /// `task_cancelled`). Delivered by the direct loop, so it survives a restart.
+    pub fn send_task_notice(
+        &self,
+        sender: (&str, &str),
+        session_id: &str,
+        task_id: &str,
+        notice: &str,
+        body: &str,
+        created_at: &str,
+    ) -> Result<CoordinationEvent, StoreError> {
+        let mut extra = serde_json::Map::new();
+        extra.insert("notice".into(), serde_json::json!(notice));
+        extra.insert("notice_task".into(), serde_json::json!(task_id));
+        let key = format!("{notice}:{task_id}:{session_id}");
+        self.send_direct_with_payload(sender, ("session", session_id), body, &key, created_at, None, None, None, extra)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn send_direct_message_with_origin(
         &self,
@@ -138,6 +156,32 @@ impl Store {
         origin_session: Option<&str>,
         origin_lane: Option<&str>,
         about_task: Option<&str>,
+    ) -> Result<CoordinationEvent, StoreError> {
+        self.send_direct_with_payload(
+            sender,
+            recipient,
+            body,
+            idempotency_key,
+            created_at,
+            origin_session,
+            origin_lane,
+            about_task,
+            serde_json::Map::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_direct_with_payload(
+        &self,
+        sender: (&str, &str),
+        recipient: (&str, &str),
+        body: &str,
+        idempotency_key: &str,
+        created_at: &str,
+        origin_session: Option<&str>,
+        origin_lane: Option<&str>,
+        about_task: Option<&str>,
+        extra: serde_json::Map<String, serde_json::Value>,
     ) -> Result<CoordinationEvent, StoreError> {
         let thread_id = direct_thread_id(sender, recipient);
         let title = format!(
@@ -186,6 +230,9 @@ impl Store {
                 }
                 if let Some(task) = about_task.filter(|t| !t.trim().is_empty()) {
                     payload["about_task"] = serde_json::json!(task);
+                }
+                for (key, value) in extra {
+                    payload[key] = value;
                 }
                 payload
             },
