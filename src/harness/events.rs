@@ -330,8 +330,7 @@ impl CodingHarness {
         if let (HarnessEvent::TurnChanges { total_files, add, del, .. }, Some(store), Some(id)) =
             (&event, self.store(), self.session_id())
         {
-            let totals = serde_json::json!({"files": total_files, "added": add, "removed": del});
-            let _ = store.set_session_last_changes(&id, &totals.to_string());
+            let _ = store.record_turn_changes(&id, *total_files as u64, *add, *del);
         }
         state.events.push(event);
     }
@@ -891,6 +890,54 @@ mod turn_changes_tests {
         assert_eq!(files[0], FileChange { path: "big.rs".into(), add: 100, del: 40 });
         assert_eq!(total_files, 16);
         assert_eq!((add, del), (100 + (0..15).sum::<u64>(), 40));
+    }
+
+    fn harness_in(dir: &std::path::Path) -> CodingHarness {
+        CodingHarness::new(
+            HarnessConfig::default(),
+            ToolRegistry::new(),
+            ToolContext::new(dir.to_path_buf()).expect("ctx"),
+        )
+    }
+
+    #[tokio::test]
+    async fn emitting_touches_events_only_never_the_model_context() {
+        if !crate::checkpoint::git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let harness = harness_in(dir.path());
+        let mut state = HarnessState::blank(&dir.path().display().to_string(), None);
+        let mut vars = LoopVars::default();
+        vars.turn_open = true;
+        vars.turn_start = Some(crate::checkpoint::tree_snapshot(dir.path()).unwrap());
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+
+        harness.emit_turn_changes(&mut state, &mut vars).await;
+        assert!(matches!(state.events.last(), Some(HarnessEvent::TurnChanges { .. })));
+        assert!(state.messages.is_empty(), "context is built from messages only");
+
+        // The turn is closed: a second call with nothing open emits nothing.
+        let before = state.events.len();
+        harness.emit_turn_changes(&mut state, &mut vars).await;
+        assert_eq!(state.events.len(), before);
+
+        // Nothing changed in a new turn: no event.
+        vars.turn_open = true;
+        vars.turn_start = Some(crate::checkpoint::tree_snapshot(dir.path()).unwrap());
+        harness.emit_turn_changes(&mut state, &mut vars).await;
+        assert_eq!(state.events.len(), before);
+        let _ = std::fs::remove_dir_all(crate::checkpoint::shadow_dir(dir.path()));
+    }
+
+    #[test]
+    fn model_request_builders_do_not_read_events() {
+        let step = include_str!("step.rs");
+        let body = &step[step.find("async fn build_request").unwrap()..];
+        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
+        assert!(!body.contains("TurnChanges"));
+        assert!(!body.contains("state.events.iter"), "request is built from state.messages");
     }
 
     #[test]

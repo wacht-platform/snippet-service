@@ -2491,6 +2491,17 @@ impl Tool for CreateRecurringJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_changes_is_not_shown_to_mission_control() {
+        let event = crate::harness::HarnessEvent::TurnChanges {
+            files: vec![crate::harness::FileChange { path: "a.rs".into(), add: 1, del: 0 }],
+            total_files: 1,
+            add: 1,
+            del: 0,
+        };
+        assert!(inspect_event_row(&event).is_none());
+    }
     use crate::coordination::types::{Agent, AgentKind, AgentRole, AgentStatus};
 
     fn worker(id: &str) -> Agent {
@@ -2736,6 +2747,7 @@ mod tests {
                 settled_at: None,
                 keep_awake: false,
                 last_changes: None,
+                total_changes: None,
             },
             &[],
             "[]",

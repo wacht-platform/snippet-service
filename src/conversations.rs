@@ -65,7 +65,9 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> Result<(), rusqlite::
              -- 1 opts the session out of AUTOMATIC settling (manual settle still works).
              keep_awake INTEGER NOT NULL DEFAULT 0,
              -- JSON {files, added, removed} of the last turn that changed files, or NULL.
-             last_changes TEXT
+             last_changes TEXT,
+             -- JSON {files, added, removed} summed over every turn since the session began.
+             total_changes TEXT
          );
          CREATE INDEX IF NOT EXISTS sessions_workspace
              ON sessions(workspace_key, updated_at DESC);
@@ -136,6 +138,9 @@ fn ensure_session_id_columns(connection: &rusqlite::Connection) -> Result<(), ru
     }
     if !existing.iter().any(|c| c == "settled_at") {
         connection.execute("ALTER TABLE sessions ADD COLUMN settled_at INTEGER", [])?;
+    }
+    if !existing.iter().any(|c| c == "total_changes") {
+        connection.execute("ALTER TABLE sessions ADD COLUMN total_changes TEXT", [])?;
     }
     if !existing.iter().any(|c| c == "last_changes") {
         connection.execute("ALTER TABLE sessions ADD COLUMN last_changes TEXT", [])?;
@@ -470,6 +475,8 @@ pub struct SessionRow {
     pub keep_awake: bool,
     /// JSON totals of the last turn that changed files.
     pub last_changes: Option<String>,
+    /// JSON lifetime totals over all turns that changed files.
+    pub total_changes: Option<String>,
 }
 
 /// Session metadata that used to live in sidecar files.
@@ -777,12 +784,34 @@ impl Store {
         })
     }
 
-    /// Record the totals of the session's most recent turn that changed files.
-    pub fn set_session_last_changes(&self, id: &str, json: &str) -> Result<(), StoreError> {
+    /// Record a turn that changed files: it becomes the session's last-turn totals and is added
+    /// to its lifetime totals. Read-modify-write on the one store connection.
+    pub fn record_turn_changes(&self, id: &str, files: u64, added: u64, removed: u64) -> Result<(), StoreError> {
         self.with_connection(|conn| {
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT total_changes FROM sessions WHERE id = ?1 OR legacy_id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let sum = |key: &str| {
+                current
+                    .as_deref()
+                    .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                    .and_then(|v| v.get(key).and_then(serde_json::Value::as_u64))
+                    .unwrap_or(0)
+            };
+            let last = serde_json::json!({"files": files, "added": added, "removed": removed});
+            let total = serde_json::json!({
+                "files": sum("files") + files,
+                "added": sum("added") + added,
+                "removed": sum("removed") + removed,
+            });
             conn.execute(
-                "UPDATE sessions SET last_changes = ?2 WHERE id = ?1 OR legacy_id = ?1",
-                params![id, json],
+                "UPDATE sessions SET last_changes = ?2, total_changes = ?3 WHERE id = ?1 OR legacy_id = ?1",
+                params![id, last.to_string(), total.to_string()],
             )?;
             Ok(())
         })
@@ -916,7 +945,7 @@ impl Store {
 }
 
 const SESSION_COLUMNS: &str = "id, workspace_key, workspace, title, status, created_at, \
-     updated_at, last_active, profile, role, agent_id, legacy_id, kind, settled_at, keep_awake, last_changes";
+     updated_at, last_active, profile, role, agent_id, legacy_id, kind, settled_at, keep_awake, last_changes, total_changes";
 
 impl Store {
     /// Save a session's scalar state, creating the row on first write.
@@ -1310,6 +1339,7 @@ fn session_row_from(row: &rusqlite::Row<'_>) -> Result<SessionRow, rusqlite::Err
         settled_at: row.get(13)?,
         keep_awake: row.get::<_, i64>(14)? != 0,
         last_changes: row.get(15)?,
+        total_changes: row.get(16)?,
     })
 }
 
@@ -1369,6 +1399,7 @@ mod tests {
             settled_at: None,
             keep_awake: false,
             last_changes: None,
+            total_changes: None,
         }
     }
 

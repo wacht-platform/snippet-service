@@ -164,6 +164,7 @@ mod tests {
             settled_at: None,
             keep_awake: false,
             last_changes: None,
+            total_changes: None,
         }
     }
 
@@ -190,11 +191,16 @@ mod tests {
         let db = Store::open_in_memory().unwrap();
         db.create_conversation(&row("c1"), &[], "[]").unwrap();
         assert_eq!(db.get_session_row("c1").unwrap().unwrap().last_changes, None);
-        db.set_session_last_changes("c1", r#"{"files":2,"added":5,"removed":1}"#).unwrap();
+        db.record_turn_changes("c1", 2, 5, 1).unwrap();
+        db.record_turn_changes("c1", 1, 10, 4).unwrap();
         db.set_session_settled("c1", Some(9)).unwrap();
+        db.set_session_last_active("c1", 99).unwrap();
+        let total: crate::session_stats::Changes =
+            serde_json::from_str(&db.get_session_row("c1").unwrap().unwrap().total_changes.unwrap()).unwrap();
+        assert_eq!((total.files, total.added, total.removed), (3, 15, 5));
         let stored = db.get_session_row("c1").unwrap().unwrap().last_changes.unwrap();
         let c: crate::session_stats::Changes = serde_json::from_str(&stored).unwrap();
-        assert_eq!((c.files, c.added, c.removed), (2, 5, 1));
+        assert_eq!((c.files, c.added, c.removed), (1, 10, 4), "last turn only");
     }
 
     #[test]
