@@ -141,7 +141,7 @@ impl Store {
         let mut extra = serde_json::Map::new();
         extra.insert("notice".into(), serde_json::json!(notice));
         extra.insert("notice_task".into(), serde_json::json!(task_id));
-        let key = format!("{notice}:{task_id}:{session_id}");
+        let key = format!("{notice}:{task_id}:{session_id}:{created_at}");
         self.send_direct_with_payload(sender, ("session", session_id), body, &key, created_at, None, None, None, extra)
     }
 

@@ -47,6 +47,7 @@ pub mod serve;
 pub mod session_stats;
 pub mod settle;
 pub mod session;
+pub mod session_resolve;
 pub mod voiceprint;
 pub mod shell_guard;
 pub mod signals;
