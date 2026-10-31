@@ -540,7 +540,15 @@ fn start_session_with_role(
         .and_then(|name| config.setups.as_ref()?.get(name).cloned());
     let exa_api_key = config.exa_api_key.clone();
     let manual_approval = config.manual_approval;
-    let context_window_tokens = model_config.context_window;
+    let context_limit = crate::agent_context::limit_for(
+        crate::agent_context::agent_for_session(
+            session.agent.as_ref().map(|a| a.agent_id.as_str()),
+            matches!(session.role, SessionRole::MissionControl),
+        )
+        .as_deref(),
+    );
+    let context_window_tokens =
+        crate::agent_context::effective_context_window(model_config.context_window, context_limit);
     let compact_at_pct = model_config.compact_at_pct;
     let memory_enabled = config.memory_enabled;
     let memory_reflect = config.memory_reflect;
@@ -597,7 +605,9 @@ fn start_session_with_role(
             runtime.tools,
             runtime.context,
         );
-        if let Some(profile) = cli_profile {
+        if let Some(mut profile) = cli_profile {
+            profile.context_window =
+                crate::agent_context::effective_context_window(profile.context_window, context_limit);
             let result = harness
                 .run_cli_agent(profile, initial, rx, runtime.factory, stream)
                 .await

@@ -4,6 +4,7 @@
 unsafe extern "C" {}
 
 pub mod accounts;
+pub mod agent_context;
 pub mod agent_wakes;
 pub mod ambient;
 pub mod agent_tools;

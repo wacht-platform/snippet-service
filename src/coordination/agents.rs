@@ -157,6 +157,7 @@ impl Store {
             tx.execute("DELETE FROM agent_shapes WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agent_nicknames WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agent_profiles WHERE agent_id = ?1", params![id])?;
+            tx.execute("DELETE FROM agent_context_limits WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
             tx.commit()?;
             Ok(AgentRemoval::Removed)
@@ -250,6 +251,58 @@ impl Store {
                     params![id, profile],
                 )?,
                 None => conn.execute("DELETE FROM agent_profiles WHERE agent_id = ?1", params![id])?,
+            };
+            Ok(true)
+        })
+    }
+
+    pub fn agent_context_limits(&self) -> Result<std::collections::HashMap<String, u64>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt =
+                conn.prepare("SELECT agent_id, max_context_tokens FROM agent_context_limits")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    /// The agent's own context ceiling, if one is set.
+    pub fn agent_context_limit(&self, id: &str) -> Result<Option<u64>, StoreError> {
+        self.with_connection(|conn| {
+            match conn.query_row(
+                "SELECT max_context_tokens FROM agent_context_limits WHERE agent_id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            ) {
+                Ok(tokens) => Ok(Some(tokens.max(0) as u64).filter(|t| *t > 0)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
+    /// Set or clear (`None`) the agent's context ceiling. Returns whether the agent exists.
+    pub fn set_agent_context_limit(&self, id: &str, tokens: Option<u64>) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            match tokens.filter(|t| *t > 0) {
+                Some(tokens) => conn.execute(
+                    "INSERT INTO agent_context_limits (agent_id, max_context_tokens) VALUES (?1, ?2)
+                     ON CONFLICT(agent_id) DO UPDATE SET max_context_tokens = excluded.max_context_tokens",
+                    params![id, tokens as i64],
+                )?,
+                None => conn.execute(
+                    "DELETE FROM agent_context_limits WHERE agent_id = ?1",
+                    params![id],
+                )?,
             };
             Ok(true)
         })

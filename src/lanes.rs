@@ -1067,6 +1067,10 @@ async fn run_lane_once(
         Some(cli) => (cli.context_window, cli.compact_at_pct),
         None => (defaults.context_window_tokens, defaults.compact_at_pct),
     };
+    let context_window_tokens = crate::agent_context::effective_context_window(
+        context_window_tokens,
+        crate::agent_context::limit_for(agent.as_deref()),
+    );
     let harness = CodingHarness::new(
         HarnessConfig {
             system_prompt: lane_prompt(
@@ -1106,7 +1110,10 @@ async fn run_lane_once(
         link.context
     );
     let run = match cli_profile {
-        Some(cli) => harness.run_cli_lane(cli, brief).await,
+        Some(mut cli) => {
+            cli.context_window = context_window_tokens;
+            harness.run_cli_lane(cli, brief).await
+        }
         None => harness.run(&mut *model, brief).await,
     };
     if let Some(message) = crate::routing::limit_in(&run) {

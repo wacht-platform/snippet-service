@@ -46,6 +46,7 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
             let shapes = d.store.agent_shapes().unwrap_or_default();
             let nicknames = d.store.agent_nicknames().unwrap_or_default();
             let profiles = d.store.agent_profiles().unwrap_or_default();
+            let context_limits = d.store.agent_context_limits().unwrap_or_default();
             let mut grouped: HashMap<String, serde_json::Map<String, serde_json::Value>> =
                 HashMap::new();
             for (agent_id, status, count) in counts {
@@ -73,6 +74,10 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                         if let Some(profile) = profiles.get(&agent.id) {
                             object.insert("profile".into(), profile.clone().into());
                         }
+                        object.insert(
+                            "max_context_tokens".into(),
+                            context_limits.get(&agent.id).copied().into(),
+                        );
                     }
                     value
                 })
@@ -521,6 +526,35 @@ pub(crate) async fn set_agent_profile(
         Ok(true) => Json(serde_json::json!({ "id": agent_id, "profile": profile })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent profile: {error}"))
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentContextReq {
+    pub(crate) max_context_tokens: Option<u64>,
+}
+
+/// POST /agents/{id}/context — the agent's context ceiling before compaction,
+/// clamped to the model's window at session start; null or 0 clears it.
+pub(crate) async fn set_agent_context(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(req): Json<AgentContextReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let tokens = match crate::agent_context::validate(req.max_context_tokens) {
+        Ok(tokens) => tokens,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    match d.store.set_agent_context_limit(&agent_id, tokens) {
+        Ok(true) => Json(serde_json::json!({ "id": agent_id, "max_context_tokens": tokens }))
+            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent context: {error}"))
             .into_response(),
     }
 }

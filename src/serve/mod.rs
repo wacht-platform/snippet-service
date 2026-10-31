@@ -895,6 +895,7 @@ pub async fn run_serve(
         .route("/agents/{agent_id}/shape", post(set_agent_shape))
         .route("/agents/{agent_id}/nickname", post(set_agent_nickname))
         .route("/agents/{agent_id}/profile", post(set_agent_profile))
+        .route("/agents/{agent_id}/context", post(agent_routes::set_agent_context))
         .route("/agents/{agent_id}", axum::routing::delete(delete_agent))
         .merge(coordination::router())
         .route(
