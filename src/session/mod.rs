@@ -722,6 +722,9 @@ pub struct SessionInfo {
     /// Uncommitted change size of the workspace; filled for the session list only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changes: Option<crate::session_stats::Changes>,
+    /// The workspace is inside a git repo; `branch` then names its branch. Filled for the list.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub git: bool,
     /// Lifetime totals over every turn that changed files (files is the sum of per-turn counts).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_changes: Option<crate::session_stats::Changes>,
@@ -937,6 +940,7 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                 settled: row.settled_at.is_some(),
                 settled_at: row.settled_at,
                 keep_awake: row.keep_awake,
+                git: false,
                 changes: row.last_changes.as_deref().and_then(|j| serde_json::from_str(j).ok()),
                 total_changes: row.total_changes.as_deref().and_then(|j| serde_json::from_str(j).ok()),
                 running_since: None,
@@ -1716,6 +1720,7 @@ pub fn create_blank_session_in(
         settled: false,
         settled_at: None,
         keep_awake: false,
+        git: false,
         changes: None,
         total_changes: None,
         running_since: None,

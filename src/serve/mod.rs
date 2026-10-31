@@ -1070,6 +1070,7 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
     if let Some(n) = q.limit {
         sessions.truncate(n);
     }
+    crate::session_stats::attach_git(&mut sessions);
     let live = d.sessions.lock().await;
     let out: Vec<serde_json::Value> = sessions
         .into_iter()
