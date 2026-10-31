@@ -421,7 +421,7 @@ impl Store {
     /// The ledger if it exists; unlike [`Self::task_state`] it writes nothing,
     /// so a list endpoint can call it for every task.
     pub fn peek_task_state(&self, task_id: &str) -> Result<Option<TaskState>, StoreError> {
-        Ok(self.with_connection(|conn| read_state(conn, task_id))?)
+        self.with_connection(|conn| read_state(conn, task_id))
     }
 
     /// Change daemon-owned fields (no version bump, no wake): the dispatch
