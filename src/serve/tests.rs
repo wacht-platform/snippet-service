@@ -591,6 +591,29 @@ use super::*;
         assert!(line.contains("user dropped it"));
     }
 
+    /// The HTTP task shape carries the board's derived fields additively.
+    #[test]
+    fn the_task_api_adds_the_derived_board_fields() {
+        let d = test_daemon();
+        d.store.create_task(&queued_task("first", &["/w/a"])).unwrap();
+        let mut second = queued_task("second", &["/w/b"]);
+        second.status = crate::coordination::TaskStatus::Blocked;
+        d.store.create_task(&second).unwrap();
+        d.store
+            .link_tasks(&crate::coordination::TaskLink {
+                from_task_id: "first".into(),
+                to_task_id: "second".into(),
+                kind: crate::coordination::TaskLinkKind::Blocks,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            })
+            .unwrap();
+        let view = coordination::task_with_sub_status(&d.store, &d.store.get_task("second").unwrap().unwrap());
+        assert_eq!(view["status_reason"], "awaiting_dependency(first)");
+        assert_eq!(view["waiting_on"], serde_json::json!(["first"]));
+        assert_eq!(view["status"], "blocked");
+        assert!(view.get("current_step").is_some());
+    }
+
     /// An agent taking the lease on a session it does not own carries its
     /// identity in the handoff; the session's own agent needs none.
     #[test]

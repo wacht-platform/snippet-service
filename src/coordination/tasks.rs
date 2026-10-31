@@ -177,6 +177,55 @@ pub struct NotificationMarker {
     pub delivered: bool,
 }
 
+/// Why an open task is where it is, derived for the board so a reader does not
+/// have to piece it together from notifications.
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct TaskSubStatus {
+    /// `working`, `queued`, `offered`, `offer_stuck`, `awaiting_paths`,
+    /// `awaiting_dependency(<id>)`, `awaiting_agent`, `stalled`, `dispatch_failed`
+    /// or `blocked`; `None` once the task is finished.
+    pub status_reason: Option<String>,
+    /// Blockers that have not released this task yet.
+    pub waiting_on: Vec<String>,
+    /// The step the worker's plan is on.
+    pub current_step: Option<String>,
+}
+
+/// Pure, so the rules are testable. `path_owners` are other in-progress tasks
+/// holding this one's paths.
+pub fn board_reason(task: &Task, roster: &[TaskAgent], waiting_on: &[String], path_owners: &[String]) -> Option<String> {
+    if task.status.is_terminal() {
+        return None;
+    }
+    if let Some(first) = waiting_on.first() {
+        return Some(format!("awaiting_dependency({first})"));
+    }
+    let noted = |kind: &str| task.notifications.iter().any(|n| n.kind == kind);
+    let current: Vec<&TaskAgent> = roster.iter().filter(|m| m.removed_at.is_none()).collect();
+    let reason = match task.status {
+        TaskStatus::InProgress if noted("stalled") => "stalled",
+        TaskStatus::InProgress => "working",
+        TaskStatus::Blocked if task.dispatch_failures > 0 => "dispatch_failed",
+        TaskStatus::Blocked => "blocked",
+        _ if !path_owners.is_empty() => "awaiting_paths",
+        _ if task.notifications.iter().any(|n| n.message.contains("is not taking work")) => "awaiting_agent",
+        _ if current.iter().any(|m| m.status == "active") => "queued",
+        _ if noted("offer_stuck") || noted("offer_unclaimed") => "offer_stuck",
+        _ if current.iter().any(|m| m.status == "offered") => "offered",
+        _ => "queued",
+    };
+    Some(reason.to_string())
+}
+
+/// The first unfinished step of a worker's plan.
+pub fn current_step(task: &Task) -> Option<String> {
+    task.work_plan
+        .iter()
+        .find(|s| s.status == "in_progress")
+        .or_else(|| task.work_plan.iter().find(|s| s.status != "done" && s.status != "completed"))
+        .map(|s| s.step.clone())
+}
+
 pub fn offer_marker(agent_id: &str) -> String {
     format!("offer:{agent_id}")
 }
@@ -1160,6 +1209,35 @@ impl Store {
         })
     }
 
+    /// The derived board fields for one task: why it waits, on what, and the
+    /// step its worker is on.
+    pub fn board_sub_status(&self, task: &Task) -> TaskSubStatus {
+        if task.status.is_terminal() {
+            return TaskSubStatus { current_step: current_step(task), ..Default::default() };
+        }
+        let waiting_on: Vec<String> = self
+            .blockers_of(&task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !self.get_task(id).ok().flatten().is_some_and(|t| t.status.releases_dependants()))
+            .collect();
+        let path_owners: Vec<String> = if task.status == TaskStatus::Todo && !task.owned_paths.is_empty() {
+            self.task_path_conflicts(&task.id, &task.owned_paths)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(owner, _)| owner)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let roster = self.list_task_agents(&task.id).unwrap_or_default();
+        TaskSubStatus {
+            status_reason: board_reason(task, &roster, &waiting_on, &path_owners),
+            waiting_on,
+            current_step: current_step(task),
+        }
+    }
+
     /// Add an agent to the task and its message room.
     ///
     /// Re-adding an agent who was removed REVIVES the row rather than inserting a
@@ -1777,6 +1855,44 @@ mod tests {
         assert_eq!(db.get_task("old").unwrap().unwrap().superseded_by.as_deref(), Some("seed"));
         db.update_task_in("old", "2026-01-01T00:00:01Z", |t| t.superseded_by = Some("new".into())).unwrap();
         assert_eq!(db.get_task("old").unwrap().unwrap().superseded_by.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn board_reason_names_why_a_task_waits() {
+        let member = |status: &str| TaskAgent {
+            task_id: "t".into(),
+            agent_id: "a1".into(),
+            work_session_id: None,
+            scope: String::new(),
+            status: status.into(),
+            role: "implementer".into(),
+            added_at: String::new(),
+            removed_at: None,
+        };
+        let mut t = task("t");
+        assert_eq!(board_reason(&t, &[member("offered")], &[], &[]).as_deref(), Some("offered"));
+        assert_eq!(board_reason(&t, &[member("active")], &[], &["owner".into()]).as_deref(), Some("awaiting_paths"));
+        assert_eq!(board_reason(&t, &[], &["dep".into()], &[]).as_deref(), Some("awaiting_dependency(dep)"));
+        t.notify_once("offer_unclaimed", "no answer");
+        assert_eq!(board_reason(&t, &[member("offered")], &[], &[]).as_deref(), Some("offer_stuck"));
+        t.notifications.clear();
+        t.notify_once("blocked", "agent a1 is not taking work; activate it or move the lease");
+        assert_eq!(board_reason(&t, &[member("active")], &[], &[]).as_deref(), Some("awaiting_agent"));
+        t.status = TaskStatus::InProgress;
+        assert_eq!(board_reason(&t, &[member("active")], &[], &[]).as_deref(), Some("working"));
+        t.notify_once("stalled", "quiet");
+        assert_eq!(board_reason(&t, &[], &[], &[]).as_deref(), Some("stalled"));
+        t.status = TaskStatus::Blocked;
+        t.dispatch_failures = 3;
+        assert_eq!(board_reason(&t, &[], &[], &[]).as_deref(), Some("dispatch_failed"));
+        t.status = TaskStatus::Done;
+        assert_eq!(board_reason(&t, &[], &[], &[]), None);
+
+        t.work_plan = vec![
+            WorkStep { step: "read".into(), status: "done".into() },
+            WorkStep { step: "build".into(), status: "pending".into() },
+        ];
+        assert_eq!(current_step(&t).as_deref(), Some("build"));
     }
 
     /// The cursor carries every sort key; without the priority, the page after

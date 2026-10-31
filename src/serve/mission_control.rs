@@ -131,7 +131,8 @@ struct MissionSessionUpdate {
     title: Option<String>,
 }
 
-fn mission_task_view(task: &Task) -> serde_json::Value {
+fn mission_task_view(store: &crate::store::Store, task: &Task) -> serde_json::Value {
+    let sub = store.board_sub_status(task);
     serde_json::json!({
         "id": task.id,
         "title": task.title,
@@ -147,6 +148,10 @@ fn mission_task_view(task: &Task) -> serde_json::Value {
         "result": task.result,
         "notifications": task.notifications,
         "dispatch_failures": task.dispatch_failures,
+        "status_reason": sub.status_reason,
+        "waiting_on": sub.waiting_on,
+        "current_step": sub.current_step,
+        "superseded_by": task.superseded_by,
     })
 }
 
@@ -266,7 +271,7 @@ async fn overview(
         .iter()
         .rev()
         .take(12)
-        .map(mission_task_view)
+        .map(|task| mission_task_view(&d.store, task))
         .map(task_summary)
         .collect::<Vec<_>>();
     let recent_sessions = sessions
@@ -313,7 +318,7 @@ async fn tasks(
                 })
                 .skip(q.offset.unwrap_or(0))
                 .take(q.limit.unwrap_or(usize::MAX))
-                .map(mission_task_view)
+                .map(|task| mission_task_view(&d.store, task))
                 .map(|view| if summary { task_summary(view) } else { view })
                 .collect::<Vec<_>>(),
         )
@@ -331,7 +336,7 @@ async fn task(
         return unauthorized();
     }
     match d.store.get_task(&id) {
-        Ok(Some(task)) => Json(mission_task_view(&task)).into_response(),
+        Ok(Some(task)) => Json(mission_task_view(&d.store, &task)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such task").into_response(),
         Err(error) => mission_error(error.to_string()),
     }
@@ -917,7 +922,7 @@ async fn create_task(
             Err(error) => return mission_error(error.to_string()),
         }
     };
-    Json(mission_task_view(&task)).into_response()
+    Json(mission_task_view(&d.store, &task)).into_response()
 }
 
 async fn update_task(
@@ -1005,10 +1010,10 @@ async fn update_task(
     };
     match updated {
         Ok(task) if task.status == TaskStatus::Todo => match dispatch_mission_task(&d, &id).await {
-            Ok(task) => Json(mission_task_view(&task)).into_response(),
+            Ok(task) => Json(mission_task_view(&d.store, &task)).into_response(),
             Err(error) => mission_error(error),
         },
-        Ok(task) => Json(mission_task_view(&task)).into_response(),
+        Ok(task) => Json(mission_task_view(&d.store, &task)).into_response(),
         Err(error) => mission_error(error.to_string()),
     }
 }
@@ -1030,7 +1035,7 @@ async fn archive_task(
         },
         &chrono::Utc::now().to_rfc3339(),
     ) {
-        Ok(task) => Json(mission_task_view(&task)).into_response(),
+        Ok(task) => Json(mission_task_view(&d.store, &task)).into_response(),
         Err(error) => mission_error(error.to_string()),
     }
 }

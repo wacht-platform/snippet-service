@@ -834,14 +834,28 @@ pub struct ListMissionTasks;
 #[async_trait]
 impl Tool for ListMissionTasks {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "list_mission_tasks".into(), description: "List Mission Control's task board: open work (queued, active, blocked) and work finished in the last day. Read status, result, notifications, and dispatch_failures — those are how you see errors and temporary failures to resume. Pass include_finished to see older finished and cancelled tasks too.".into(), input_schema: schema(json!({"include_finished": {"type": "boolean", "description": "Also list tasks that finished or were cancelled more than a day ago."}}), &[]) }
+        NativeToolDefinition { name: "list_mission_tasks".into(), description: "Mission Control's board, one compact row per task: status, why it waits (reason), age, the worker's current plan step, blockers and the latest unread note. Open work plus work finished in the last day. Pass task_id for one task in full (description, result, notifications, roster, links).".into(), input_schema: schema(json!({"include_finished": {"type": "boolean", "description": "Also list tasks finished more than a day ago."}, "task_id": {"type": "string", "description": "Show this one task in full."}}), &[]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let store = db(ctx)?;
+        if let Some(id) = arguments.get("task_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+            let task = store
+                .get_task(id)
+                .map_err(|e| ToolError::msg(format!("look up task: {e}")))?
+                .ok_or_else(|| ToolError::msg(format!("no task `{id}`")))?;
+            let mut view = task_view(&task);
+            let sub = store.board_sub_status(&task);
+            view["reason"] = json!(sub.status_reason);
+            view["waiting_on"] = json!(sub.waiting_on);
+            view["superseded_by"] = json!(task.superseded_by);
+            view["roster"] = json!(store.list_task_agents(id).unwrap_or_default().into_iter().filter(|m| m.removed_at.is_none()).map(|m| format!("{} ({}, {})", m.agent_id, m.role, m.status)).collect::<Vec<_>>());
+            view["links"] = json!(store.task_links(id).unwrap_or_default());
+            return Ok(ToolResult::success(json!({"task": view})));
+        }
         let include_finished = arguments.get("include_finished").and_then(Value::as_bool).unwrap_or(false);
-        let tasks = db(ctx)?
-            .list_tasks(None, None)
-            .map_err(|e| ToolError::msg(format!("list tasks: {e}")))?;
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(1);
+        let tasks = store.list_tasks(None, None).map_err(|e| ToolError::msg(format!("list tasks: {e}")))?;
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::days(1);
         let recent = |task: &&Task| {
             let finished = task.completed_at.as_deref().unwrap_or(&task.updated_at);
             chrono::DateTime::parse_from_rfc3339(finished).map_or(true, |at| at >= cutoff)
@@ -849,11 +863,56 @@ impl Tool for ListMissionTasks {
         let shown: Vec<Value> = tasks
             .iter()
             .filter(|task| include_finished || !task.status.is_terminal() || recent(task))
-            .map(task_view)
+            .map(|task| board_row(&store, task, now))
             .collect();
         let hidden = tasks.len() - shown.len();
         Ok(ToolResult::success(json!({"tasks": shown, "older_finished_hidden": hidden})))
     }
+}
+
+fn compact_age(since: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = chrono::DateTime::parse_from_rfc3339(since).map_or(0, |at| (now - at.with_timezone(&chrono::Utc)).num_seconds().max(0));
+    match secs {
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// One slim board row: enough to route on, with the detail behind task_id.
+fn board_row(store: &Store, task: &Task, now: chrono::DateTime<chrono::Utc>) -> Value {
+    let sub = store.board_sub_status(task);
+    let mut row = json!({
+        "id": task.id,
+        "title": clip(&task.title, 64),
+        "status": task.status,
+        "age": compact_age(&task.created_at, now),
+    });
+    if let Some(reason) = sub.status_reason {
+        row["reason"] = json!(reason);
+    }
+    if let Some(step) = sub.current_step.filter(|_| !task.status.is_terminal()) {
+        row["step"] = json!(clip(&step, 56));
+    }
+    if !sub.waiting_on.is_empty() {
+        row["blockers"] = json!(sub.waiting_on);
+    }
+    let roster = store.list_task_agents(&task.id).unwrap_or_default();
+    if let Some(m) = roster.iter().filter(|m| m.removed_at.is_none()).find(|m| m.status == "active").or_else(|| roster.iter().find(|m| m.status == "offered")) {
+        row["agent"] = json!(m.agent_id);
+    }
+    if let Some(note) = task.notifications.iter().rev().find(|n| !n.delivered) {
+        row["note"] = json!(clip(&format!("{}: {}", note.kind, note.message), 80));
+    }
+    if task.status.is_terminal() {
+        if let Some(result) = task.result.as_ref() {
+            row["result"] = json!(clip(&result.summary, 100));
+        }
+        if let Some(next) = task.superseded_by.as_deref() {
+            row["superseded_by"] = json!(next);
+        }
+    }
+    row
 }
 
 pub struct ViewTaskBoard;
@@ -3278,6 +3337,44 @@ mod tests {
             kind: crate::coordination::TaskLinkKind::Blocks, created_at: "2026-01-01T00:00:00Z".into(),
         }).unwrap();
         assert!(bind_direct_delivery(&db, Some("t-b"), "s-new", "snippet", None, "go", "2026-01-01T00:00:03Z").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_board_view_is_compact_and_detail_is_behind_task_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Store::open(dir.path().join("snippet.db")).unwrap();
+        db.create_agent(&worker("snippet")).unwrap();
+        let long = "x".repeat(4000);
+        for i in 0..20 {
+            let mut t = Task::dispatched_to(
+                format!("00000000-0000-0000-0000-{i:012}"), "research-beb1adba29b2f946/conversations/275420ba-17b3-427c-8a47-bda2be9b6933".into(),
+                format!("Task {i}: {}", "a fairly long descriptive title ".repeat(4)), long.clone(), vec![], HandoffMode::Fresh,
+                "agent", crate::mission_control::SESSION_ID, now_rfc3339(),
+            );
+            t.notify_once("blocked", &long);
+            db.create_task(&t).unwrap();
+            db.set_task_work_plan(&t.id, &[crate::coordination::WorkStep { step: "step ".repeat(40), status: "in_progress".into() }]).unwrap();
+            db.add_task_agent_full(&t.id, "snippet", "implementer", None, "", "offered", &now_rfc3339()).unwrap();
+        }
+        let ctx = ToolContext::mission_control(dir.path())
+            .unwrap()
+            .with_durable_session_id("mc")
+            .with_store_path(dir.path().join("snippet.db"));
+        let res = ListMissionTasks.execute(&ctx, json!({})).await.unwrap();
+        let size = serde_json::to_string(&res.value).unwrap().len();
+        assert!(size < 8 * 1024, "board is {size} bytes");
+        let rows = res.value["data"]["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 20);
+        assert_eq!(rows[0]["reason"], "offered");
+        assert!(rows[0].get("description").is_none());
+        assert!(rows[0]["step"].as_str().unwrap().starts_with("step"));
+
+        let one = ListMissionTasks
+            .execute(&ctx, json!({"task_id": "00000000-0000-0000-0000-000000000003"}))
+            .await
+            .unwrap();
+        assert_eq!(one.value["data"]["task"]["description"].as_str().unwrap().len(), 4000);
+        assert_eq!(one.value["data"]["task"]["reason"], "offered");
     }
 }
 

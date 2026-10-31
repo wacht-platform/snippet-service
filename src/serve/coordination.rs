@@ -184,11 +184,11 @@ async fn list_tasks(
         Ok(tasks) if summary => Json(
             tasks
                 .iter()
-                .map(|task| task_summary(serde_json::to_value(task).unwrap_or_default()))
+                .map(|task| task_summary(task_with_sub_status(&d.store, task)))
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Ok(tasks) => Json(tasks).into_response(),
+        Ok(tasks) => Json(tasks.iter().map(|task| task_with_sub_status(&d.store, task)).collect::<Vec<_>>()).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("list tasks: {error}"),
@@ -264,6 +264,18 @@ async fn create_task(
     }
 }
 
+/// The task as stored, plus the derived board fields (`status_reason`,
+/// `waiting_on`, `current_step`). Additive, so older clients ignore them.
+pub(super) fn task_with_sub_status(store: &crate::store::Store, task: &Task) -> serde_json::Value {
+    let mut value = serde_json::to_value(task).unwrap_or_default();
+    if let (Some(map), Ok(serde_json::Value::Object(extra))) =
+        (value.as_object_mut(), serde_json::to_value(store.board_sub_status(task)))
+    {
+        map.extend(extra);
+    }
+    value
+}
+
 async fn get_task(
     State(d): State<Shared>,
     Query(q): Query<Auth>,
@@ -273,7 +285,7 @@ async fn get_task(
         return unauthorized();
     }
     match d.store.get_task(&task_id) {
-        Ok(Some(task)) => Json(task).into_response(),
+        Ok(Some(task)) => Json(task_with_sub_status(&d.store, &task)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such task").into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
