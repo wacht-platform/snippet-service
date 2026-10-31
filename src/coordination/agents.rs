@@ -263,7 +263,7 @@ impl Store {
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.max(0) as u64))
             })?;
-            Ok(rows.collect::<Result<_, _>>()?)
+            rows.collect::<Result<_, _>>()
         })
     }
 
@@ -277,7 +277,7 @@ impl Store {
             ) {
                 Ok(tokens) => Ok(Some(tokens.max(0) as u64).filter(|t| *t > 0)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(error) => Err(error.into()),
+                Err(error) => Err(error),
             }
         })
     }

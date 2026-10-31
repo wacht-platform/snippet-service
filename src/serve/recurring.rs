@@ -21,7 +21,7 @@ pub fn router() -> Router<Shared> {
         )
 }
 
-fn session_busy_for_recurring(id: &str) -> bool {
+pub(super) fn session_busy_for_recurring(id: &str) -> bool {
     let Some(sp) = state_path_for_id(id) else {
         return false;
     };

@@ -65,6 +65,7 @@ mod mission_control;
 pub use mission_control::{mission_error, validated_owned_paths};
 mod recurring;
 mod agent_wakes;
+mod keep_warm;
 mod routing_routes;
 mod settle_routes;
 pub mod session_routes;
@@ -866,6 +867,10 @@ pub async fn run_serve(
     }
     {
         let d = daemon.clone();
+        tokio::spawn(async move { keep_warm::tick_loop(d).await });
+    }
+    {
+        let d = daemon.clone();
         tokio::spawn(async move { coordination::coordination_wake_loop(d).await });
     }
     {
@@ -910,6 +915,7 @@ pub async fn run_serve(
         .route("/notifications", get(notification_replay))
         .merge(recurring::router())
         .merge(agent_wakes::router())
+        .merge(keep_warm::router())
         .merge(memory_routes::router())
         .merge(artifact_routes::router())
         .merge(github_routes::router())

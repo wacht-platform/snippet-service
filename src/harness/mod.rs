@@ -763,6 +763,9 @@ pub enum LoopInput {
     Rewind {
         checkpoint: String,
     },
+    /// Re-read the provider's cached prefix with a minimal request, adding
+    /// nothing to the transcript; answered through `keep_warm::complete(id)`.
+    KeepWarm(String),
 }
 
 // --- Runtime corrections ---

@@ -23,6 +23,7 @@ pub struct AnthropicConfig {
     pub initial_retry_ms: u64,
     pub max_retry_ms: u64,
     pub cache_prompt: bool,
+    pub cache_ttl_1h: bool,
     pub supports_images: bool,
     pub reasoning_effort: Option<String>,
 }
@@ -53,6 +54,29 @@ impl AgentModel for AnthropicModel {
 
     fn supports_images(&self) -> bool {
         self.config.supports_images
+    }
+
+    fn keep_warm_support(&self) -> Result<(), String> {
+        if !self.config.cache_prompt {
+            Err("prompt caching is off on this profile".into())
+        } else if !self.config.cache_ttl_1h {
+            Err("this Anthropic profile caches for 5 minutes; set cache_ttl = \"1h\" on it to allow keep-warm".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn keep_warm(
+        &mut self,
+        messages: &[HarnessMessage],
+        tools: &[NativeToolDefinition],
+    ) -> Result<TokenUsage, ToolError> {
+        self.keep_warm_support().map_err(ToolError::msg)?;
+        let url = anthropic_messages_url(&self.config.base_url);
+        let body = self.keep_warm_request(messages, tools);
+        let bytes = self.send_with_retries(&url, &body).await?;
+        let response: AnthropicResponse = serde_json::from_slice(&bytes)?;
+        Ok(response.usage.map(token_usage).unwrap_or_default())
     }
 
     async fn generate(
@@ -103,19 +127,7 @@ impl AgentModel for AnthropicModel {
         Ok(ModelOutput {
             calls,
             content_text,
-            usage: response.usage.map(|u| {
-                let full_input = u
-                    .input_tokens
-                    .saturating_add(u.cache_read_input_tokens)
-                    .saturating_add(u.cache_creation_input_tokens);
-                crate::llm::TokenUsage {
-                    prompt_tokens: full_input,
-                    completion_tokens: u.output_tokens,
-                    total_tokens: full_input.saturating_add(u.output_tokens),
-                    cache_read_tokens: u.cache_read_input_tokens,
-                    cache_creation_tokens: u.cache_creation_input_tokens,
-                }
-            }),
+            usage: response.usage.map(token_usage),
             // Anthropic signals a token-cap cut-off as `max_tokens`; normalize so
             // `ModelOutput::is_truncated` catches it like the OpenAI `length`.
             finish_reason: response.stop_reason,
@@ -126,6 +138,47 @@ impl AgentModel for AnthropicModel {
 }
 
 impl AnthropicModel {
+    fn post(&self, url: &str) -> reqwest::RequestBuilder {
+        let request = self
+            .client
+            .post(url)
+            .header("x-api-key", &self.config.api_key)
+            .header("anthropic-version", "2023-06-01");
+        if self.config.cache_ttl_1h {
+            request.header("anthropic-beta", "extended-cache-ttl-2025-04-11")
+        } else {
+            request
+        }
+    }
+
+    /// The turn's own request plus a one-line ping, with the smallest reply the
+    /// API accepts. Thinking and tool_choice stay as a real turn sends them,
+    /// since changing either invalidates the cached message prefix.
+    fn keep_warm_request(
+        &self,
+        messages: &[HarnessMessage],
+        tools: &[NativeToolDefinition],
+    ) -> AnthropicRequest {
+        let mut messages = messages.to_vec();
+        messages.push(HarnessMessage::User {
+            content: crate::keep_warm::PING.into(),
+        });
+        let mut body = self.build_anthropic_request(&messages, tools, false, false);
+        body.max_tokens = match &body.thinking {
+            Some(thinking) => thinking["budget_tokens"].as_u64().unwrap_or(1024) as u32 + 1,
+            None => 1,
+        };
+        body
+    }
+
+    fn cache_mark(&self) -> Value {
+        if self.config.cache_ttl_1h {
+            json!({"type": "ephemeral", "ttl": "1h"})
+        } else {
+            json!({"type": "ephemeral"})
+        }
+    }
+
     fn build_anthropic_request(
         &self,
         messages: &[HarnessMessage],
@@ -145,7 +198,7 @@ impl AnthropicModel {
                 content_type: "text",
                 text: prompt,
                 cache_control: if self.config.cache_prompt {
-                    Some(json!({"type": "ephemeral"}))
+                    Some(self.cache_mark())
                 } else {
                     None
                 },
@@ -159,7 +212,7 @@ impl AnthropicModel {
         }
         if self.config.cache_prompt {
             if let Some(last_tool) = anthropic_tools.last_mut() {
-                last_tool.cache_control = Some(json!({"type": "ephemeral"}));
+                last_tool.cache_control = Some(self.cache_mark());
             }
         }
 
@@ -174,7 +227,7 @@ impl AnthropicModel {
             let stamp = |block: &mut AnthropicContent| match block {
                 AnthropicContent::Text { cache_control, .. }
                 | AnthropicContent::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(json!({"type": "ephemeral"}));
+                    *cache_control = Some(self.cache_mark());
                     true
                 }
                 // A bare tool_use block is never the last durable block (its
@@ -270,10 +323,7 @@ impl AnthropicModel {
             attempts = attempt;
             StreamBuffer::clear(sink);
             let response = self
-                .client
                 .post(url)
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", "2023-06-01")
                 .header(CONTENT_TYPE, "application/json")
                 .json(&body)
                 .send()
@@ -343,10 +393,7 @@ impl AnthropicModel {
         for attempt in 1..=max_attempts {
             attempts = attempt;
             let response = self
-                .client
                 .post(url)
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", "2023-06-01")
                 .header(CONTENT_TYPE, "application/json")
                 .json(body)
                 .send()
@@ -861,6 +908,20 @@ struct AnthropicUsage {
     cache_read_input_tokens: u64,
 }
 
+fn token_usage(u: AnthropicUsage) -> TokenUsage {
+    let full_input = u
+        .input_tokens
+        .saturating_add(u.cache_read_input_tokens)
+        .saturating_add(u.cache_creation_input_tokens);
+    TokenUsage {
+        prompt_tokens: full_input,
+        completion_tokens: u.output_tokens,
+        total_tokens: full_input.saturating_add(u.output_tokens),
+        cache_read_tokens: u.cache_read_input_tokens,
+        cache_creation_tokens: u.cache_creation_input_tokens,
+    }
+}
+
 fn prepare_messages(
     harness_msgs: &[HarnessMessage],
     replay_model: Option<&str>,
@@ -975,4 +1036,78 @@ fn push_block(prepared: &mut Vec<AnthropicMessage>, role: &str, block: Anthropic
         role: role.to_string(),
         content: vec![block],
     });
+}
+
+#[cfg(test)]
+mod keep_warm_tests {
+    use super::*;
+
+    fn model(ttl_1h: bool, effort: Option<&str>) -> AnthropicModel {
+        AnthropicModel::new(AnthropicConfig {
+            api_key: "test".into(),
+            model: "claude-sonnet-4-5".into(),
+            base_url: String::new(),
+            temperature: None,
+            max_retries: 0,
+            initial_retry_ms: 0,
+            max_retry_ms: 0,
+            cache_prompt: true,
+            cache_ttl_1h: ttl_1h,
+            supports_images: false,
+            reasoning_effort: effort.map(str::to_string),
+        })
+    }
+
+    fn history() -> Vec<HarnessMessage> {
+        vec![
+            HarnessMessage::System { content: "You are a researcher.".into() },
+            HarnessMessage::User { content: "Summarise the thread.".into() },
+            HarnessMessage::Assistant { content: "Done: three points.".into(), tool_calls: vec![] },
+        ]
+    }
+
+    fn tools() -> Vec<NativeToolDefinition> {
+        vec![NativeToolDefinition {
+            name: "bash".into(),
+            description: "Run a command".into(),
+            input_schema: json!({"type": "object"}),
+        }]
+    }
+
+    #[test]
+    fn keep_warm_reuses_the_turn_prefix_with_the_smallest_reply() {
+        let m = model(true, None);
+        assert!(m.keep_warm_support().is_ok());
+        let turn = serde_json::to_value(m.build_anthropic_request(&history(), &tools(), false, false)).unwrap();
+        let warm = serde_json::to_value(m.keep_warm_request(&history(), &tools())).unwrap();
+        assert_eq!(warm["system"], turn["system"]);
+        assert_eq!(warm["tools"], turn["tools"]);
+        assert_eq!(warm["system"][0]["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(warm["max_tokens"], 1);
+        let messages = warm["messages"].as_array().unwrap();
+        let ping = messages.last().unwrap();
+        assert!(ping["content"][0]["text"].as_str().unwrap().contains("keep-warm"));
+        assert!(ping["content"][0].get("cache_control").is_none());
+        let before = &messages[messages.len() - 2];
+        assert_eq!(before["content"].as_array().unwrap().last().unwrap()["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn keep_warm_keeps_thinking_so_the_message_cache_survives() {
+        let m = model(true, Some("low"));
+        let turn = serde_json::to_value(m.build_anthropic_request(&history(), &tools(), false, false)).unwrap();
+        let warm = serde_json::to_value(m.keep_warm_request(&history(), &tools())).unwrap();
+        assert_eq!(warm["thinking"], turn["thinking"]);
+        assert_eq!(warm["max_tokens"], 2049);
+    }
+
+    #[test]
+    fn five_minute_and_uncached_profiles_are_not_warmed() {
+        assert!(model(false, None).keep_warm_support().unwrap_err().contains("5 minutes"));
+        let mut m = model(true, None);
+        m.config.cache_prompt = false;
+        assert!(m.keep_warm_support().is_err());
+        let plain = serde_json::to_value(model(false, None).build_anthropic_request(&history(), &tools(), false, false)).unwrap();
+        assert_eq!(plain["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+    }
 }

@@ -670,6 +670,10 @@ impl CodingHarness {
                             self.persist(&mut state, &lanes).await?;
                             state.status = HarnessStatus::Idle;
                         }
+                        Some(LoopInput::KeepWarm(id)) => {
+                            let outcome = self.keep_warm(model, &state).await;
+                            crate::keep_warm::complete(&id, outcome);
+                        }
                         None => {
                             state.status = HarnessStatus::Interrupted;
                             self.persist(&mut state, &lanes).await?;

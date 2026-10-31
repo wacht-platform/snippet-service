@@ -176,6 +176,29 @@ impl CodingHarness {
         request_messages
     }
 
+    /// Re-read the cached prefix an idle conversation's next turn will send:
+    /// the same history and tools, nothing persisted.
+    pub(super) async fn keep_warm(
+        &self,
+        model: &mut dyn AgentModel,
+        state: &HarnessState,
+    ) -> crate::keep_warm::Outcome {
+        use crate::keep_warm::Outcome;
+        if let Err(reason) = model.keep_warm_support() {
+            return Outcome::Unsupported(reason);
+        }
+        if state.messages.len() < 2 {
+            return Outcome::Skipped("nothing cached yet".into());
+        }
+        let definitions = self.definitions_for(true, false);
+        let mut messages = state.messages.clone();
+        self.inline_images(&mut messages, model.supports_images());
+        match model.keep_warm(&messages, &definitions).await {
+            Ok(usage) => Outcome::Warmed(usage),
+            Err(error) => Outcome::Failed(error.to_string()),
+        }
+    }
+
     /// Call the model. An unsupported reasoning tier is degraded one step and
     /// retried (pinned on the model for the rest of the session); any other
     /// failure becomes a `ModelError` with a concise message.

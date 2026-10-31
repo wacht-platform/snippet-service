@@ -245,6 +245,10 @@ pub struct InferenceProfileConfig {
     pub compact_at_pct: u8,
     #[serde(default = "default_cache_prompt")]
     pub cache_prompt: bool,
+    /// Anthropic only: `"1h"` writes prompt-cache entries with the one-hour TTL
+    /// (dearer writes, and what makes keep-warm possible). Default is 5 minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<String>,
     /// Force the streaming wire protocol (`stream: true`) even on the buffered
     /// serve/app/lanes path. Off by default. Some OpenAI-compatible models only
     /// return output when streamed — e.g. NVIDIA NIM's MiniMax, which sends an
@@ -786,6 +790,8 @@ impl InferenceProfileConfig {
                     initial_retry_ms: self.initial_retry_ms,
                     max_retry_ms: self.max_retry_ms,
                     cache_prompt: self.cache_prompt,
+                    cache_ttl_1h: self.cache_prompt
+                        && self.cache_ttl.as_deref().map(str::trim) == Some("1h"),
                     supports_images: self.supports_images,
                     reasoning_effort: self.reasoning_effort.clone(),
                 };
@@ -990,6 +996,7 @@ impl Default for InferenceProfileConfig {
             context_window: default_context_window(),
             compact_at_pct: default_compact_at_pct(),
             cache_prompt: default_cache_prompt(),
+            cache_ttl: None,
             stream: false,
             x_search: false,
         }

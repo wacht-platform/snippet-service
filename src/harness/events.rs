@@ -598,6 +598,10 @@ impl CodingHarness {
                 let _ = state.apply_checkpoint_rewind(&checkpoint);
                 false
             }
+            LoopInput::KeepWarm(id) => {
+                crate::keep_warm::complete(&id, crate::keep_warm::Outcome::Skipped("session was mid-turn".into()));
+                false
+            }
             LoopInput::Interrupt => true,
         }
     }

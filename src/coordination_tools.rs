@@ -34,6 +34,7 @@ pub fn add_coordination_tools(registry: &mut ToolRegistry) {
     registry.insert(ClaimAndDispatchTask);
     registry.insert(crate::agent_wakes::WakeScheduleTool);
     registry.insert(crate::agent_context::ContextLimitTool);
+    registry.insert(crate::keep_warm::KeepWarmTool);
 }
 
 

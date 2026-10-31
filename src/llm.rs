@@ -592,6 +592,22 @@ pub trait AgentModel: Send + Sync {
     fn cli_agent_profile(&self) -> Option<crate::config::InferenceProfileConfig> {
         None
     }
+
+    /// Whether a keep-warm request can hold this model's prompt cache for an
+    /// hour; the error says why not.
+    fn keep_warm_support(&self) -> Result<(), String> {
+        Err(crate::keep_warm::NO_HOUR_CACHE.into())
+    }
+
+    /// Re-read the cached prefix of `messages` with the smallest reply, adding
+    /// nothing to the conversation. Returns the call's usage.
+    async fn keep_warm(
+        &mut self,
+        _messages: &[HarnessMessage],
+        _tools: &[NativeToolDefinition],
+    ) -> Result<TokenUsage, ToolError> {
+        Err(ToolError::msg(crate::keep_warm::NO_HOUR_CACHE))
+    }
 }
 
 #[async_trait]
@@ -620,6 +636,18 @@ impl<T: ?Sized + AgentModel + Send> AgentModel for Box<T> {
 
     fn cli_agent_profile(&self) -> Option<crate::config::InferenceProfileConfig> {
         (**self).cli_agent_profile()
+    }
+
+    fn keep_warm_support(&self) -> Result<(), String> {
+        (**self).keep_warm_support()
+    }
+
+    async fn keep_warm(
+        &mut self,
+        messages: &[HarnessMessage],
+        tools: &[NativeToolDefinition],
+    ) -> Result<TokenUsage, ToolError> {
+        (**self).keep_warm(messages, tools).await
     }
 }
 

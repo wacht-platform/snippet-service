@@ -297,6 +297,32 @@ impl Store {
         })
     }
 
+    pub fn keep_warm_entries(&self) -> Result<Vec<String>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare("SELECT entry_json FROM keep_warm ORDER BY owner")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect()
+        })
+    }
+
+    pub fn put_keep_warm(&self, owner: &str, entry_json: &str, updated_at: i64) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO keep_warm (owner, entry_json, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(owner) DO UPDATE SET entry_json = excluded.entry_json,
+                     updated_at = excluded.updated_at",
+                params![owner, entry_json, updated_at],
+            )
+            .map(|_| ())
+        })
+    }
+
+    pub fn delete_keep_warm(&self, owner: &str) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            conn.execute("DELETE FROM keep_warm WHERE owner = ?1", params![owner]).map(|n| n > 0)
+        })
+    }
+
     pub fn count_recurring_runs_since(&self, job_id: &str, since: i64) -> Result<u32, StoreError> {
         self.with_connection(|conn| {
             conn.query_row(

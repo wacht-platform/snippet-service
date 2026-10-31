@@ -201,7 +201,12 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              reported_to TEXT
          );
          CREATE INDEX IF NOT EXISTS recurring_runs_job ON recurring_runs(job_id, fired_at);
-         CREATE INDEX IF NOT EXISTS recurring_runs_owner ON recurring_runs(owner, fired_at);",
+         CREATE INDEX IF NOT EXISTS recurring_runs_owner ON recurring_runs(owner, fired_at);
+         CREATE TABLE IF NOT EXISTS keep_warm (
+             owner TEXT PRIMARY KEY NOT NULL,
+             entry_json TEXT NOT NULL,
+             updated_at INTEGER NOT NULL
+         );",
     )?;
     let have_turns: Vec<String> = {
         let mut stmt = connection.prepare("PRAGMA table_info(ambient_turns)")?;
