@@ -9,26 +9,53 @@ use crate::coordination::{Task, TaskFilter, TaskLink, TaskLinkKind, TaskStatus};
 use crate::coordination::types::CoordinationEvent;
 use crate::mission_control;
 use crate::serve::task_summary;
-use std::sync::OnceLock;
-use tokio::sync::mpsc;
 
 use super::{Auth, LoopInput, Shared, unauthorized, direct};
 
 pub const COORDINATION_THREAD: &str = "system";
 
-static COORDINATION_WAKE_TX: OnceLock<mpsc::UnboundedSender<CoordinationEvent>> = OnceLock::new();
+static ROOM_WAKE_NUDGE: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
-pub fn queue_coordination_wake(event: CoordinationEvent) {
-    if let Some(tx) = COORDINATION_WAKE_TX.get() {
-        let _ = tx.send(event);
+/// A wake older than this when the loop reaches it (the daemon was down) is
+/// dropped: the room has moved on, and a late turn would answer stale news.
+const ROOM_WAKE_MAX_AGE_SECS: i64 = 30 * 60;
+
+/// Persist a room wake and nudge the loop. The row, not the nudge, is the wake.
+pub fn queue_coordination_wake(store: &crate::store::Store, event: CoordinationEvent) {
+    if let Err(error) = store.queue_room_wake(&event.event_id, &event.thread_id, &event.created_at) {
+        eprintln!("[coordination] room wake not queued for {}: {error}", event.event_id);
     }
+    ROOM_WAKE_NUDGE.notify_one();
 }
 
 pub async fn coordination_wake_loop(d: Shared) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let _ = COORDINATION_WAKE_TX.set(tx);
-    while let Some(event) = rx.recv().await {
-        wake_coordination_thread_participants(&d, &event).await;
+    loop {
+        drain_room_wakes(&d).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), ROOM_WAKE_NUDGE.notified()).await;
+    }
+}
+
+async fn drain_room_wakes(d: &Shared) {
+    let now = chrono::Utc::now();
+    let pending = match d.store.list_pending_room_wakes(50, &now.to_rfc3339()) {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!("[coordination] room wakes unreadable: {error}");
+            return;
+        }
+    };
+    for event in pending {
+        let stale = chrono::DateTime::parse_from_rfc3339(&event.created_at)
+            .is_ok_and(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() > ROOM_WAKE_MAX_AGE_SECS);
+        if !stale {
+            wake_coordination_thread_participants(d, &event).await;
+        }
+        let _ = d.store.mark_direct_delivered(
+            &event.event_id,
+            "room",
+            &event.thread_id,
+            &chrono::Utc::now().to_rfc3339(),
+        );
     }
 }
 
@@ -565,7 +592,7 @@ async fn transfer_task_lease(
                         "kind": "coordination_event",
                         "event": saved.clone(),
                     }));
-                    queue_coordination_wake(saved);
+                    queue_coordination_wake(&d.store, saved);
                 }
             }
             StatusCode::NO_CONTENT.into_response()
@@ -639,7 +666,7 @@ pub(super) async fn post_message(
                 "kind": "coordination_event",
                 "event": saved.clone(),
             }));
-            queue_coordination_wake(saved.clone());
+            queue_coordination_wake(&d.store, saved.clone());
             Json(saved).into_response()
         }
         Err(error) => (
@@ -747,12 +774,18 @@ pub(super) struct WakeTarget {
 const CHATTER_EVENTS: &[&str] = &["message.posted", "task.message"];
 
 /// Whether the room's tail is an agent-only exchange long enough to stop.
-fn agent_chain_exhausted(history: &[CoordinationEvent], event: &CoordinationEvent) -> bool {
+/// `human_at` is the room's own last human post, so a human speaking in one
+/// room never re-arms another.
+fn agent_chain_exhausted(
+    history: &[CoordinationEvent],
+    event: &CoordinationEvent,
+    human_at: Option<&str>,
+) -> bool {
     let chatter = |e: &&CoordinationEvent| CHATTER_EVENTS.contains(&e.event_type.as_str());
     if !chatter(&event) {
         return false;
     }
-    let human = super::autonomy::human_at();
+    let human = human_at.and_then(|h| chrono::DateTime::parse_from_rfc3339(h).ok());
     let after_human = |e: &&CoordinationEvent| {
         human.is_none_or(|h| chrono::DateTime::parse_from_rfc3339(&e.created_at).is_ok_and(|t| t > h))
     };
@@ -780,9 +813,10 @@ pub(super) fn wake_targets(
     roster: &[crate::coordination::TaskAgent],
     task_session: Option<&str>,
     idle_agents: &[String],
+    human_at: Option<&str>,
 ) -> Vec<WakeTarget> {
     let mc = crate::mission_control::SESSION_ID;
-    if QUIET_EVENTS.contains(&event.event_type.as_str()) || agent_chain_exhausted(history, event) {
+    if QUIET_EVENTS.contains(&event.event_type.as_str()) || agent_chain_exhausted(history, event, human_at) {
         return Vec::new();
     }
     let mut targets: Vec<WakeTarget> = Vec::new();
@@ -900,6 +934,7 @@ pub async fn wake_coordination_thread_participants(
         .filter(|agent| agent.status != crate::coordination::types::AgentStatus::Active)
         .map(|agent| agent.id)
         .collect();
+    let human_at = d.store.last_human_event_at(&saved.thread_id).ok().flatten();
     let targets = wake_targets(
         saved,
         &history,
@@ -907,6 +942,7 @@ pub async fn wake_coordination_thread_participants(
         &roster,
         task.as_ref().map(|t| t.session_id.as_str()),
         &idle_agents,
+        human_at.as_deref(),
     );
     if targets.is_empty() {
         return;

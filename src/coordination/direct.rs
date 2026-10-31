@@ -325,6 +325,55 @@ impl Store {
         })
     }
 
+    /// Record that a room event owes its participants a wake. The row is the
+    /// wake: it outlives a restart, and the room loop marks it delivered.
+    pub fn queue_room_wake(&self, event_id: &str, thread_id: &str, at: &str) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_deliveries
+                 (event_id, recipient_kind, recipient_id, recipient, queued_at)
+                 VALUES (?1, 'room', ?2, ?3, ?4)",
+                params![event_id, thread_id, actor_ref("room", thread_id), at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Room wakes not yet delivered, oldest first.
+    pub fn list_pending_room_wakes(
+        &self,
+        limit: u32,
+        now: &str,
+    ) -> Result<Vec<CoordinationEvent>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {EVENT_COLUMNS_QUALIFIED}
+                 FROM message_deliveries d
+                 JOIN board_events e ON e.event_id = d.event_id
+                 WHERE d.recipient_kind = 'room'
+                   AND d.delivered_at IS NULL
+                   AND d.attempts < ?2
+                   AND (d.retry_at IS NULL OR d.retry_at <= ?3)
+                 ORDER BY e.created_at, e.sequence
+                 LIMIT ?1"
+            ))?;
+            let rows = stmt.query_map(params![limit, MAX_DELIVERY_ATTEMPTS, now], event_from_row)?;
+            rows.collect()
+        })
+    }
+
+    /// The newest human post in a room, which resets its agent-chain guard.
+    pub fn last_human_event_at(&self, thread_id: &str) -> Result<Option<String>, StoreError> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT MAX(created_at) FROM board_events
+                 WHERE thread_id = ?1 AND actor_kind = 'human'",
+                params![thread_id],
+                |row| row.get(0),
+            )
+        })
+    }
+
     /// Mark a message delivered to one recipient. Idempotent.
     pub fn mark_direct_delivered(
         &self,
@@ -766,5 +815,45 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].payload["body"], "m3");
         assert_eq!(recent[1].payload["body"], "m4");
+    }
+
+    fn room_event(actor: (&str, &str), at: &str) -> CoordinationEvent {
+        CoordinationEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            thread_id: "task:t1".into(),
+            partition_key: "thread:task:t1".into(),
+            sequence: 0,
+            event_type: "message.posted".into(),
+            actor_kind: actor.0.into(),
+            actor_id: actor.1.into(),
+            payload_version: 1,
+            payload: serde_json::json!({"body": "hi"}),
+            causation_id: None,
+            correlation_id: None,
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            created_at: at.into(),
+        }
+    }
+
+    /// A room wake is a row: it survives until marked, and never reads as a
+    /// direct delivery.
+    #[test]
+    fn a_room_wake_is_durable_until_delivered() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&worker("a")).unwrap();
+        let human = db.append_event(&room_event(("human", "local"), "2026-01-01T00:00:00Z")).unwrap();
+        let post = db.append_event(&room_event(("agent", "a"), "2026-01-01T00:00:05Z")).unwrap();
+        db.queue_room_wake(&post.event_id, &post.thread_id, &post.created_at).unwrap();
+        db.queue_room_wake(&post.event_id, &post.thread_id, &post.created_at).unwrap();
+
+        let pending = db.list_pending_room_wakes(50, "9999").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_id, post.event_id);
+        assert!(db.list_pending_direct_deliveries(50, "9999").unwrap().is_empty());
+        assert_eq!(db.last_human_event_at("task:t1").unwrap().as_deref(), Some(human.created_at.as_str()));
+
+        db.mark_direct_delivered(&post.event_id, "room", "task:t1", "2026-01-01T00:00:06Z").unwrap();
+        assert!(db.list_pending_room_wakes(50, "9999").unwrap().is_empty());
+        assert_eq!(db.last_human_event_at("task:other").unwrap(), None);
     }
 }

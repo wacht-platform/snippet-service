@@ -253,7 +253,7 @@ fn post_to_task_room(daemon: &Shared, wake: &crate::agent_wakes::WakePolicy, tas
     };
     let saved = daemon.store.append_event(&event).map_err(|e| e.to_string())?;
     crate::session::emit_device_event(serde_json::json!({"kind": "coordination_event", "event": saved.clone()}));
-    super::queue_coordination_wake(saved);
+    super::queue_coordination_wake(&daemon.store, saved);
     Ok(())
 }
 

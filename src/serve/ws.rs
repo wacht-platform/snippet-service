@@ -461,14 +461,6 @@ async fn handle_ws(
                     ) {
                         crate::speech::cancel_all("interrupted");
                     }
-                    if crate::mission_control::is_session_id(&session)
-                        && matches!(
-                            input,
-                            LoopInput::UserMessage(_) | LoopInput::Queue(_) | LoopInput::Answer(_) | LoopInput::SteerQueued(_)
-                        )
-                    {
-                        super::autonomy::note_human();
-                    }
                     daemon.deliver(&session, input).await;
                 }
             }

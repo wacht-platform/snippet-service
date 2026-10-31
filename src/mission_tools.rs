@@ -1522,7 +1522,7 @@ impl Tool for DeliverToSession {
             .and_then(|sidecar| sidecar.agent_id)
             .unwrap_or_else(|| crate::coordination::SNIPPET_AGENT_ID.to_string());
         let store = db(ctx)?;
-        let mc_root = ctx.mission_control_root().map(PathBuf::from).unwrap_or_else(mission_control::workspace_path);
+        let mc_root = ctx.mission_control_root().unwrap_or_else(mission_control::workspace_path);
         if mission_control::get_session(&mc_root, &session_id).is_err() {
             let _ = mission_control::create_session(
                 &mc_root,
@@ -1856,7 +1856,7 @@ impl Tool for UpdateMissionTask {
                     "kind": "coordination_event",
                     "event": saved.clone(),
                 }));
-                crate::serve::queue_coordination_wake(saved);
+                crate::serve::queue_coordination_wake(&store, saved);
             }
         }
 
@@ -1954,7 +1954,7 @@ impl Tool for AssignTaskAgent {
                 "kind": "coordination_event",
                 "event": saved.clone(),
             }));
-            crate::serve::queue_coordination_wake(saved);
+            crate::serve::queue_coordination_wake(&store, saved);
         }
 
         Ok(ToolResult::success(json!({
@@ -2060,7 +2060,7 @@ impl Tool for InviteTaskAgent {
             .append_event(&event)
             .map_err(|e| ToolError::msg(format!("post invitation: {e}")))?;
         crate::session::emit_device_event(json!({"kind": "coordination_event", "event": saved.clone()}));
-        crate::serve::queue_coordination_wake(saved);
+        crate::serve::queue_coordination_wake(&store, saved);
         Ok(ToolResult::success(json!({
             "invited": agent_id,
             "task_id": task_id,
@@ -2146,7 +2146,7 @@ impl Tool for TransferMissionTaskLease {
                 "kind": "coordination_event",
                 "event": saved.clone(),
             }));
-            crate::serve::queue_coordination_wake(saved);
+            crate::serve::queue_coordination_wake(&store, saved);
         }
 
         Ok(ToolResult::success(json!({
@@ -2236,10 +2236,10 @@ impl Tool for CancelMissionTask {
         }
         let store = db(ctx)?;
         let superseded_by = args.superseded_by.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        if let Some(next) = superseded_by {
-            if next == task_id || store.get_task(next).ok().flatten().is_none() {
-                return Err(ToolError::msg(format!("superseded_by names no other task `{next}`")));
-            }
+        if let Some(next) = superseded_by
+            && (next == task_id || store.get_task(next).ok().flatten().is_none())
+        {
+            return Err(ToolError::msg(format!("superseded_by names no other task `{next}`")));
         }
         let before = store
             .get_task(task_id)
@@ -2780,7 +2780,7 @@ impl Tool for ReportMissionTask {
                 "kind": "coordination_event",
                 "event": saved.clone(),
             }));
-            crate::serve::queue_coordination_wake(saved);
+            crate::serve::queue_coordination_wake(&store, saved);
         }
 
         Ok(ToolResult::success(json!({"task": task_view(&task)})))

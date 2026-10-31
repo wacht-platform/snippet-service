@@ -394,7 +394,7 @@ impl Tool for PostCoordinationMessage {
             "kind": "coordination_event",
             "event": saved.clone(),
         }));
-        crate::serve::queue_coordination_wake(saved.clone());
+        crate::serve::queue_coordination_wake(&db, saved.clone());
         Ok(ToolResult::success(json!({"event": saved})))
     }
 }
@@ -1007,7 +1007,7 @@ impl Tool for MessageMissionControl {
             "kind": "coordination_event",
             "event": saved.clone(),
         }));
-        crate::serve::queue_coordination_wake(saved.clone());
+        crate::serve::queue_coordination_wake(&db, saved.clone());
         Ok(ToolResult::success(json!({
             "sent": true,
             "task_id": task_id,
@@ -1076,7 +1076,7 @@ impl Tool for PostTaskCoordination {
             "kind": "coordination_event",
             "event": saved.clone(),
         }));
-        crate::serve::queue_coordination_wake(saved.clone());
+        crate::serve::queue_coordination_wake(&db, saved.clone());
         Ok(ToolResult::success(json!({"event": saved})))
     }
 }
@@ -1185,7 +1185,7 @@ impl Tool for TransferTaskSessionLease {
             "kind": "coordination_event",
             "event": saved.clone(),
         }));
-        crate::serve::queue_coordination_wake(saved.clone());
+        crate::serve::queue_coordination_wake(&db, saved.clone());
         Ok(ToolResult::success(json!({
             "transferred": true,
             "task_id": task_id,

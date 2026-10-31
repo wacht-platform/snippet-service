@@ -425,7 +425,7 @@ use super::*;
             serde_json::json!({"body": "progress", "origin_session": "work-1"}),
         );
         let roster = [member("snippet", "active"), member("reviewer", "waiting")];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[], None);
         assert_eq!(sessions(&targets), ["mission-control", "inbox-reviewer"]);
     }
 
@@ -443,14 +443,32 @@ use super::*;
             ("agent", "reviewer"),
             serde_json::json!({"body": "ok"}),
         );
-        assert!(coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[]).is_empty());
+        assert!(coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[], None).is_empty());
 
         history.push(board_event(
             "message.posted",
             ("human", "local"),
             serde_json::json!({"body": "go on"}),
         ));
-        assert!(!coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[]).is_empty());
+        assert!(!coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[], None).is_empty());
+    }
+
+    /// The guard re-arms on the room's own last human post, not on a human
+    /// speaking anywhere else.
+    #[test]
+    fn only_this_rooms_human_post_rearms_the_chain_guard() {
+        let roster = [member("snippet", "active"), member("reviewer", "waiting")];
+        let history: Vec<_> = (0..coordination::MAX_AGENT_CHAIN)
+            .map(|i| {
+                let who = if i % 2 == 0 { "reviewer" } else { "snippet" };
+                board_event("message.posted", ("agent", who), serde_json::json!({"body": "ok"}))
+            })
+            .collect();
+        let event = board_event("message.posted", ("agent", "reviewer"), serde_json::json!({"body": "ok"}));
+        let wakes = |human_at| coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[], human_at);
+        assert!(wakes(None).is_empty());
+        assert!(wakes(Some("2025-12-31T23:59:59Z")).is_empty(), "a post before the chain doesn't re-arm it");
+        assert!(!wakes(Some("2026-01-01T00:00:00Z")).is_empty(), "a post at the chain's start does");
     }
 
     #[test]
@@ -461,7 +479,7 @@ use super::*;
             serde_json::json!({"body": "yours", "to_agent_id": "reviewer"}),
         );
         let roster = [member("snippet", "waiting"), member("reviewer", "active")];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[], None);
         assert_eq!(sessions(&targets), ["work-1"]);
     }
 
@@ -475,7 +493,7 @@ use super::*;
             serde_json::json!({"body": "done"}),
         );
         let roster = [member("snippet", "active"), member("reviewer", "waiting")];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[], None);
         assert_eq!(sessions(&targets), ["inbox-reviewer"]);
     }
 
@@ -489,7 +507,7 @@ use super::*;
         let mut gone = member("reviewer", "waiting");
         gone.removed_at = Some("2026-01-02T00:00:00Z".into());
         let roster = [member("snippet", "active"), gone];
-        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[]);
+        let targets = coordination::wake_targets(&event, &[], &room(), &roster, Some("work-1"), &[], None);
         assert_eq!(sessions(&targets), ["mission-control"]);
 
         let assigned = board_event(
@@ -497,7 +515,7 @@ use super::*;
             ("agent", "mission-control"),
             serde_json::json!({}),
         );
-        assert!(coordination::wake_targets(&assigned, &[], &room(), &roster, Some("work-1"), &[]).is_empty());
+        assert!(coordination::wake_targets(&assigned, &[], &room(), &roster, Some("work-1"), &[], None).is_empty());
     }
 
     fn queued_task(id: &str, paths: &[&str]) -> crate::coordination::Task {
