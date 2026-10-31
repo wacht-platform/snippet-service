@@ -84,6 +84,30 @@ pub fn content_warnings(
     out
 }
 
+/// Ledger fields for the task HTTP API. Additive: a client that predates the
+/// ledger ignores them. Reads without creating a ledger.
+pub fn api_fields(store: &Store, task: &Task) -> serde_json::Map<String, Value> {
+    let state = store.peek_task_state(&task.id).ok().flatten();
+    let mut out = serde_json::Map::new();
+    let mode = state.as_ref().map(|s| s.effective_mode().as_str());
+    out.insert("in_review".into(), json!(task.status == crate::coordination::TaskStatus::InReview));
+    out.insert("verify_mode".into(), json!(mode));
+    out.insert("acceptance".into(), json!(state.as_ref().map(|s| s.criteria.clone()).unwrap_or_default()));
+    out.insert("revision".into(), json!(state.as_ref().map_or(0, |s| s.revision)));
+    out.insert(
+        "review".into(),
+        json!(state.as_ref().map(|s| json!({
+            "rounds": s.review_rounds,
+            "findings": s.review_findings,
+            "escalated": s.review_escalated,
+            "waived": (!s.waiver.is_empty()).then(|| s.waiver.clone()),
+            "evidence": s.evidence,
+        }))),
+    );
+    out.insert("ledger".into(), json!(state));
+    out
+}
+
 fn workspace_of(task: &Task) -> Option<std::path::PathBuf> {
     let path = crate::session::state_path_for_id(&task.session_id)?;
     crate::session::read_session_state(&path).map(|s| s.workspace.into())

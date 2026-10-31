@@ -1785,6 +1785,13 @@ struct UpdateMissionTaskArgs {
     context_note: Option<String>,
     #[serde(default)]
     waive_verification: Option<String>,
+    #[serde(default)]
+    revise: Option<ReviseArg>,
+}
+
+#[derive(Deserialize)]
+struct ReviseArg {
+    feedback: String,
 }
 
 /// Refuse to hand work to an agent that is unknown or not active.
@@ -1855,6 +1862,7 @@ impl Tool for UpdateMissionTask {
                     "status": {"type": "string", "enum": ["todo", "blocked"]},
                     "profile": {"type": "string"},
                     "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"},
+"revise": {"type": "object", "properties": {"feedback": {"type": "string"}}, "required": ["feedback"], "description": "On a done task: reopen it in the same session with this feedback and its previous result, instead of filing a new task."},
                     "waive_verification": {"type": "string", "description": "Only when the user said to skip checking this task: their words. Drops review; a task waiting in review completes."}
                 }),
                 &["task_id"],
@@ -1882,6 +1890,10 @@ impl Tool for UpdateMissionTask {
         }
         let store = db(ctx)?;
         let now = now_rfc3339();
+        if let Some(revise) = args.revise.as_ref() {
+            let reopened = crate::review_tools::revise_task(&store, task_id, &revise.feedback, crate::mission_control::SESSION_ID, &now)?;
+            return Ok(ToolResult::success(json!({"task": task_view(&reopened), "revised": true, "note": "Reopened in the same session; it was sent the feedback and its previous result."})));
+        }
         if let Some(reason) = args.waive_verification.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
             let state = store
                 .modify_task_state(task_id, &now, |s| s.waiver = reason.to_string())

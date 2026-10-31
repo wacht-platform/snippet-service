@@ -133,7 +133,7 @@ struct MissionSessionUpdate {
 
 fn mission_task_view(store: &crate::store::Store, task: &Task) -> serde_json::Value {
     let sub = store.board_sub_status(task);
-    serde_json::json!({
+    let mut view = serde_json::json!({
         "id": task.id,
         "title": task.title,
         "description": task.description,
@@ -152,7 +152,11 @@ fn mission_task_view(store: &crate::store::Store, task: &Task) -> serde_json::Va
         "waiting_on": sub.waiting_on,
         "current_step": sub.current_step,
         "superseded_by": task.superseded_by,
-    })
+    });
+    if let Some(map) = view.as_object_mut() {
+        map.extend(crate::task_state_tools::api_fields(store, task));
+    }
+    view
 }
 
 fn mission_session_view(session: &ManagedSession, task_count: usize) -> serde_json::Value {
@@ -1200,7 +1204,7 @@ async fn open(
 
 pub(super) const WORKFLOW_PLAN: &str = "Workflow W7 · first plan: the worker has laid out how it will deliver the task. Check it against the requirements; when it misses or misreads something, say so in the task room (post_task_coordination) so the worker adjusts before going far; when it shows what comes next, line up that work. A plan that's right needs no reply. Then stop.";
 
-pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: read it and trust the worker's verification (check a claim only if the report is vague or the stakes are high, with a command or two); done → give the user the outcome unless you already have, steps waiting on this one start by themselves; blocked → unblock it; failed → retry once or re-route. Then stop.";
+pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: check its evidence against the acceptance criteria (spot-check only if thin); done → tell the user unless you already have; short of the criteria → update_mission_task revise; in_review or review_escalated → submit_review is yours; blocked → unblock it; failed → retry once or re-route. Then stop.";
 
 pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<String>) -> Result<(String, std::path::PathBuf), String> {
     let home = mission_control::ensure_home()?;

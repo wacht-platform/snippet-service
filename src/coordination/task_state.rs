@@ -137,6 +137,12 @@ pub struct TaskState {
     /// Why verification was waived (set by Mission Control on the user's word).
     #[serde(default)]
     pub waiver: String,
+    /// How many times finished work was reopened with feedback.
+    #[serde(default)]
+    pub revision: u32,
+    /// The report the last revision started from.
+    #[serde(default)]
+    pub previous_result: Option<PendingReport>,
 }
 
 /// A partial update. Scalars and lists replace; `add_*` append without duplicates.
@@ -332,6 +338,9 @@ impl TaskState {
         if !self.open_questions.is_empty() {
             line("open questions", &self.open_questions.join("; "), &mut out);
         }
+        if self.revision > 0 {
+            line("revision", &self.revision.to_string(), &mut out);
+        }
         if let Some(mode) = self.verify_mode {
             line("verification", mode.as_str(), &mut out);
         }
@@ -407,6 +416,12 @@ impl Store {
             write_state(conn, &state)?;
             Ok(Some(state))
         })
+    }
+
+    /// The ledger if it exists; unlike [`Self::task_state`] it writes nothing,
+    /// so a list endpoint can call it for every task.
+    pub fn peek_task_state(&self, task_id: &str) -> Result<Option<TaskState>, StoreError> {
+        Ok(self.with_connection(|conn| read_state(conn, task_id))?)
     }
 
     /// Change daemon-owned fields (no version bump, no wake): the dispatch

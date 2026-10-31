@@ -96,7 +96,7 @@ pub(crate) fn task_summary(mut task: serde_json::Value) -> serde_json::Value {
         return task;
     };
     let mut clipped = false;
-    for key in ["description", "plan", "result", "handoff"] {
+    for key in ["description", "plan", "result", "handoff", "ledger"] {
         if let Some(field) = o.get_mut(key) {
             clipped |= clip_json(field, TASK_SUMMARY_TEXT_LIMIT, 8);
         }

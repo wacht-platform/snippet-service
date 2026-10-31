@@ -299,6 +299,7 @@ pub(super) fn task_with_sub_status(store: &crate::store::Store, task: &Task) -> 
         (value.as_object_mut(), serde_json::to_value(store.board_sub_status(task)))
     {
         map.extend(extra);
+        map.extend(crate::task_state_tools::api_fields(store, task));
     }
     value
 }
@@ -378,6 +379,8 @@ pub(super) fn store_error(error: crate::store::StoreError) -> Response {
         StoreError::AlreadyTerminal { .. }
         | StoreError::NotRetryable { .. }
         | StoreError::InvalidTransition { .. }
+        | StoreError::NotRevisable { .. }
+        | StoreError::StaleTaskState { .. }
         | StoreError::WorkerBusy { .. }
         | StoreError::DependencyCycle { .. } => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

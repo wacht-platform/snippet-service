@@ -280,6 +280,26 @@ use super::*;
     }
 
     #[test]
+    fn the_task_api_exposes_ledger_acceptance_verify_mode_review_and_revision_additively() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut task = crate::coordination::Task::filed_by_human("api1".into(), "T".into(), "d".into(), "s".into(), 0, "2020-01-01T00:00:00Z".into());
+        store.create_task(&task).unwrap();
+        let plain = coordination::task_with_sub_status(&store, &task);
+        assert_eq!((plain["in_review"].clone(), plain["acceptance"].clone(), plain["revision"].clone(), plain["ledger"].clone()), (false.into(), serde_json::json!([]), 0.into(), serde_json::Value::Null));
+        assert_eq!(plain["status"], "todo", "existing fields stay");
+        let patch: crate::coordination::StatePatch = serde_json::from_value(serde_json::json!({"criteria": [{"criterion": "tests pass", "method": "command"}]})).unwrap();
+        store.patch_task_state("api1", &patch, None, "mission-control", "2020-01-02T00:00:00Z").unwrap();
+        task = store.update_task_in("api1", "2020-01-03T00:00:00Z", |t| t.status = crate::coordination::TaskStatus::InReview).unwrap();
+        let view = coordination::task_with_sub_status(&store, &task);
+        assert_eq!(view["status"], "in_review");
+        assert_eq!(view["status_reason"], "in_review");
+        assert_eq!((view["in_review"].clone(), view["verify_mode"].clone()), (true.into(), "reviewer".into()));
+        assert_eq!(view["acceptance"][0]["method"], "command");
+        assert_eq!(view["review"]["rounds"], 0);
+        assert_eq!(view["ledger"]["version"], 2);
+    }
+
+    #[test]
     fn board_message_envelope_includes_bounded_history() {
         let prior =
             |seq: u64, who: &str, body: &str| crate::coordination::types::CoordinationEvent {

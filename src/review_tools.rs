@@ -170,6 +170,49 @@ pub fn approve_pending(
     Ok(done)
 }
 
+pub fn revision_envelope(task: &Task, state: &crate::coordination::TaskState, feedback: &str, by: &str) -> String {
+    format!(
+        "[mission_control_task]\ntask_id: {id}\ntitle: {title}\nrevision: {n}\nrequested_by: agent {by} (your finished work reopened, same session)\nprevious result:\n{prev}\nfeedback:\n{feedback}\n{ledger}\n\nChange what the feedback names, in this session, then report again with report_mission_task (task_id {id}) and evidence for each acceptance criterion.\n[/mission_control_task]",
+        id = task.id,
+        title = task.title,
+        n = state.revision,
+        prev = state.previous_result.as_ref().map(|p| p.summary.as_str()).unwrap_or(""),
+        ledger = state.render(false),
+    )
+}
+
+/// Reopen a done task in its own session with the reviewer's or Mission
+/// Control's feedback, and the previous result in the envelope.
+pub fn revise_task(store: &Store, task_id: &str, feedback: &str, by: &str, now: &str) -> Result<Task, ToolError> {
+    let feedback = feedback.trim();
+    if feedback.is_empty() {
+        return Err(ToolError::msg("revise needs feedback: say what to change"));
+    }
+    let before = store.get_task(task_id).map_err(|e| ToolError::msg(e.to_string()))?.ok_or_else(|| ToolError::msg(format!("no task `{task_id}`")))?;
+    let reopened = store.reopen_for_revision(task_id, now).map_err(|e| ToolError::msg(e.to_string()))?;
+    let previous = before.result.as_ref().map(|r| PendingReport { summary: r.summary.clone(), artifacts: r.artifacts.iter().map(|p| p.display().to_string()).collect() });
+    let state = store
+        .modify_task_state(task_id, now, |s| {
+            s.revision += 1;
+            s.previous_result = previous.clone();
+            s.review_rounds = 0;
+            s.review_findings.clear();
+            s.review_started_at.clear();
+            s.review_escalated = false;
+            s.pending_report = None;
+            s.evidence.clear();
+        })
+        .map_err(|e| ToolError::msg(e.to_string()))?;
+    let patch = crate::coordination::StatePatch { add_decisions: vec![format!("revision {} requested: {}", state.revision, clip(feedback, 300))], ..Default::default() };
+    let _ = store.patch_task_state(task_id, &patch, None, by, now);
+    let state = store.task_state(task_id).ok().flatten().unwrap_or(state);
+    let envelope = revision_envelope(&reopened, &state, feedback, by);
+    store
+        .send_task_notice(("agent", by), &reopened.session_id, &reopened.id, "task_brief", &envelope, now)
+        .map_err(|e| ToolError::msg(format!("send revision: {e}")))?;
+    Ok(reopened)
+}
+
 #[derive(Deserialize)]
 struct SubmitReviewArgs {
     #[serde(default)]
@@ -341,6 +384,28 @@ mod tests {
         assert!(again.contains("is in review"), "{again}");
         let state = store.task_state("rv1").unwrap().unwrap();
         assert_eq!((state.evidence.len(), state.pending_report.unwrap().summary.as_str()), (2, "all done"));
+    }
+
+    #[test]
+    fn revising_a_done_task_reopens_it_in_the_same_session_with_the_previous_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, task) = seed(dir.path(), "s1");
+        assert!(revise_task(&store, "rv1", "tighten it", "mission-control", "2026-01-02T00:00:00Z").unwrap_err().to_string().contains("only a done task"));
+        store
+            .complete_task("rv1", TaskStatus::Done, TaskResult { summary: "first cut".into(), artifacts: vec![], authoritative: true }, "2026-01-02T00:00:00Z")
+            .unwrap();
+        assert!(revise_task(&store, "rv1", " ", "mission-control", "t").is_err());
+        let back = revise_task(&store, "rv1", "tighten the intro", "mission-control", "2026-01-03T00:00:00Z").unwrap();
+        assert_eq!((&back.status, back.session_id.as_str(), back.reporting_session.as_deref()), (&TaskStatus::InProgress, "s1", Some("s1")));
+        let state = store.task_state("rv1").unwrap().unwrap();
+        assert_eq!((state.revision, state.previous_result.as_ref().unwrap().summary.as_str()), (1, "first cut"));
+        assert!(state.decisions.iter().any(|d| d.text.contains("revision 1 requested: tighten the intro")));
+        let envelope = revision_envelope(&back, &state, "tighten the intro", "mission-control");
+        for needle in ["revision: 1", "previous result:\nfirst cut", "feedback:\ntighten the intro", "report_mission_task (task_id rv1)"] {
+            assert!(envelope.contains(needle), "{needle}: {envelope}");
+        }
+        let _ = task;
+        assert!(revise_task(&store, "rv1", "again", "mission-control", "t").is_err());
     }
 
     #[tokio::test]

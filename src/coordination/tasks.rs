@@ -784,6 +784,26 @@ impl Store {
         Ok(task)
     }
 
+    /// Reopen a done task in the session that did it: back to in progress with
+    /// that session bound to report again. The caller records the revision.
+    pub fn reopen_for_revision(&self, id: &str, now: &str) -> Result<Task, StoreError> {
+        let mut refused = None;
+        let task = self.update_task_in(id, now, |task| {
+            if task.status != TaskStatus::Done {
+                refused = Some(task.status.clone());
+                return;
+            }
+            task.status = TaskStatus::InProgress;
+            task.completed_at = None;
+            task.result = None;
+            task.reporting_session = Some(task.session_id.clone());
+        })?;
+        match refused {
+            Some(status) => Err(StoreError::NotRevisable { id: id.to_string(), status: status.to_string() }),
+            None => Ok(task),
+        }
+    }
+
     /// Re-queue unfinished work so dispatch delivers it again: blocked, failed,
     /// or in progress with a worker that went quiet. Refuses done and cancelled
     /// work, which only a person reopens ([`Self::move_task`]), and work whose
@@ -857,7 +877,7 @@ impl Store {
     ) -> Result<Task, StoreError> {
         match status {
             TaskStatus::Todo => self.requeue(id, now, true),
-            TaskStatus::InProgress => Err(StoreError::InvalidTransition {
+            TaskStatus::InProgress | TaskStatus::InReview => Err(StoreError::InvalidTransition {
                 id: id.to_string(),
                 status: status.to_string(),
             }),
