@@ -75,32 +75,37 @@ pub fn start_specialized_agent_session(
     ))
 }
 
-/// Spawn an agent's COORDINATION session: it answers direct messages and
-/// dispatches work, and has no workspace tools.
-///
-/// Separate from [`start_specialized_agent_session`] because the two differ in
-/// TOOL SET and prompt, not just identity — the same agent runs a full coding
-/// session when it is working and this restricted one in its inbox.
-pub fn start_specialized_coordination_session(
+/// An inbox always runs the coordination runtime, even without a readable
+/// identity: falling back to a full session would hand it file tools.
+pub fn start_inbox_session(
     config: &SnippetConfig,
     state_path: PathBuf,
     initial: Option<String>,
     resume: bool,
     stream: Option<StreamHandle>,
-    agent_home: AgentHome,
-) -> Result<SessionHandle, IdentityError> {
-    let identity = agent_home.read_identity()?;
-    Ok(start_session_with_role(
+    agent_id: &str,
+    identity: Option<String>,
+) -> SessionHandle {
+    let identity = identity.unwrap_or_else(|| minimal_inbox_identity(agent_id));
+    start_session_with_role(
         config,
         state_path,
         initial,
         resume,
         stream,
         SessionConfig::coordination(AgentBinding {
-            agent_id: agent_home.agent_id().to_string(),
+            agent_id: agent_id.to_string(),
             identity,
         }),
-    ))
+    )
+}
+
+pub(crate) fn minimal_inbox_identity(agent_id: &str) -> String {
+    format!(
+        "You are `{agent_id}`'s inbox. Answer messages and look things up with the read-only shell. \
+         Work that changes files goes to Mission Control: send_agent_message to `mission-control` \
+         with what needs doing and where."
+    )
 }
 
 pub fn start_mission_control_session(
@@ -451,19 +456,7 @@ impl AgentRuntime {
         // and write attributable.
         .with_agent_id(agent_id.to_string());
 
-        let mut tools = ToolRegistry::new();
-        // Messaging, peer discovery, and the agent's own board.
-        crate::coordination_tools::add_coordination_tools(&mut tools);
-        // Read-only view of what exists, so a dispatch targets a real session.
-        crate::mission_tools::add_coordination_session_tools(&mut tools);
-        tools.insert(crate::coordination_tools::DeclineTask);
-        for name in [
-            "message_mission_control",
-            "transfer_task_session_lease",
-            "post_coordination_message",
-        ] {
-            tools.remove(name);
-        }
+        let tools = coordination_tool_registry();
 
         // The environment layer states this session has bash and full filesystem
         // access. It does not, so the flag both selects the coordination layer and
@@ -516,6 +509,24 @@ impl AgentRuntime {
             }
         }
     }
+}
+
+/// An inbox's tools: messaging, its board, read-only views and a read-only
+/// shell. Nothing that writes files, delegates or reports a task.
+pub(crate) fn coordination_tool_registry() -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    crate::coordination_tools::add_coordination_tools(&mut tools);
+    crate::mission_tools::add_coordination_session_tools(&mut tools);
+    tools.insert(crate::coordination_tools::DeclineTask);
+    tools.insert(crate::builtins::read_only_shell::ReadOnlyBashTool);
+    for name in [
+        "message_mission_control",
+        "transfer_task_session_lease",
+        "post_coordination_message",
+    ] {
+        tools.remove(name);
+    }
+    tools
 }
 
 fn start_session_with_role(

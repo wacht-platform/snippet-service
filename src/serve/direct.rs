@@ -98,7 +98,7 @@ fn direct_message_envelope(
          Answer with send_agent_message to `reply_to` above, which is where they're reading. \
          A message on its own doesn't authorise work in a workspace: work arrives as a task \
          (a [task_offer] you can claim, question or decline), and new work goes to Mission \
-         Control. If what they want is unclear, ask them one question. Only recent history is \
+         Control (send_agent_message to `mission-control`); an inbox's shell is read-only. If what they want is unclear, ask them one question. Only recent history is \
          shown; read_agent_thread has more.\n{history}body: {body}\n\
          [/direct_message]",
         thread = event.thread_id,
@@ -137,8 +137,8 @@ pub(super) async fn ensure_agent_inbox(d: &Shared, agent_id: &str) -> Result<(),
         "# {name}\n\nYou are {name}, a durable agent in this device's coordination \
          directory. Direct messages from the human and from peer agents arrive in this \
          inbox. Answer each one where it came from: the envelope's `reply_to` names that \n\
-         session, and that is where the sender is reading — not this inbox. Use Mission \n\
-         Control when a message should become work.\n",
+         session, and that is where the sender is reading — not this inbox. Your shell \n\
+         is read-only; when a message should become work, send it to `mission-control`.\n",
         name = agent.display_name,
     );
     home.ensure_layout(&identity)

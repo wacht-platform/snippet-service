@@ -652,3 +652,17 @@ mod working_agents_tests {
         assert!(working_agents_in(&db).is_empty());
     }
 }
+
+#[cfg(test)]
+mod inbox_tool_tests {
+    /// An inbox files work through Mission Control; it never writes or delegates.
+    #[test]
+    fn an_inbox_cannot_write_delegate_or_report() {
+        let tools = crate::session::coordination_tool_registry();
+        for name in ["change_files", "write_file", "edit_file", "delegate_task", "report_mission_task"] {
+            assert!(!tools.contains(name), "{name} must not reach an inbox");
+        }
+        assert!(tools.contains("bash"));
+        assert!(tools.contains("send_agent_message"));
+    }
+}

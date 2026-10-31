@@ -3,6 +3,7 @@ pub mod shell_search;
 pub mod web;
 pub mod skills;
 pub mod process;
+pub mod read_only_shell;
 
 pub use fs::*;
 pub use shell_search::*;

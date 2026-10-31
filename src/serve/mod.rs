@@ -369,6 +369,28 @@ impl Daemon {
                 Some(crate::speech::mission_control_stream()),
             );
         }
+        let session_id = session_id_for_state_path(&sp);
+        if crate::session::is_inbox_session_id(&session_id) {
+            let agent_id = sidecar
+                .as_ref()
+                .and_then(|s| s.agent_id.clone())
+                .unwrap_or_else(|| session_id.trim_start_matches("inbox-").to_string());
+            let identity = crate::coordination::AgentHome::new(
+                crate::coordination::agents_root(&self.mission_control_root),
+                &agent_id,
+            )
+            .ok()
+            .and_then(|home| match home.read_identity() {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    eprintln!("[coordination] inbox `{agent_id}` has no identity ({error}); using the minimal one");
+                    None
+                }
+            });
+            return crate::session::start_inbox_session(
+                cfg, sp, initial, true, stream(), &agent_id, identity,
+            );
+        }
         if let Some(agent_id) = sidecar.as_ref().and_then(|s| s.agent_id.as_deref()) {
             // Identity revision is re-read on every resume, so an agent whose
             // identity was updated comes back with the new guidance.
@@ -376,30 +398,6 @@ impl Daemon {
                 crate::coordination::agents_root(&self.mission_control_root),
                 agent_id,
             ) {
-                // An agent's INBOX is its coordination session: it answers direct
-                // messages and dispatches work, with no workspace tools. The same
-                // agent runs the full coding runtime in a work session, so the
-                // choice is made on the session, not on the agent.
-                Ok(home)
-                    if crate::session::is_inbox_session_id(&session_id_for_state_path(&sp)) =>
-                {
-                    match crate::session::start_specialized_coordination_session(
-                        cfg,
-                        sp.clone(),
-                        initial.clone(),
-                        true,
-                        stream(),
-                        home,
-                    ) {
-                        Ok(handle) => return handle,
-                        Err(error) => {
-                            eprintln!(
-                                "[coordination] agent `{agent_id}` coordination identity \
-                                 unavailable ({error}); running as an ordinary session"
-                            );
-                        }
-                    }
-                }
                 Ok(home) => match crate::session::start_specialized_agent_session(
                     cfg,
                     sp.clone(),
