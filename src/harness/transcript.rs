@@ -184,6 +184,71 @@ pub(super) fn replied_since_last_user(events: &[HarnessEvent]) -> bool {
     false
 }
 
+/// Like [`replied_since_last_user`], but a successful `speak` also counts: the
+/// user heard the answer, so an empty chat line after it is not a missed reply.
+pub(super) fn answered_since_last_user(events: &[HarnessEvent]) -> bool {
+    for e in events.iter().rev() {
+        match e {
+            HarnessEvent::UserInput { .. } | HarnessEvent::Steer { .. } => return false,
+            HarnessEvent::AssistantText { .. } => return true,
+            HarnessEvent::ToolResult { tool_name, result }
+                if tool_name == "speak"
+                    && result.get("status").and_then(Value::as_str) == Some("success") =>
+            {
+                return true
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+const SILENT_OK_INPUTS: &[&str] = &[
+    "<ambient_",
+    "<call_ended",
+    "[ambient mode]",
+    "[heard, voice classifier]",
+    "[recording]",
+    "[dispatched by",
+    "[coordination_board_message]",
+    "[task_plan]",
+    "[task_offer]",
+    "[mission_task_report]",
+    "[automated_wake]",
+    "[worker_question]",
+    "[recurring_run_report]",
+    "[direct_message]",
+    "[agent_reply]",
+];
+
+/// Whether the latest input is an ambient line or a daemon envelope, where
+/// Mission Control ending its turn without text is often the right answer.
+pub(super) fn last_input_allows_silence(events: &[HarnessEvent]) -> bool {
+    let Some(text) = events.iter().rev().find_map(|e| match e {
+        HarnessEvent::UserInput { text } | HarnessEvent::Steer { text } => Some(text.as_str()),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let text = text.trim_start();
+    let text = text
+        .strip_prefix(steer_message("").trim_end())
+        .map(str::trim_start)
+        .unwrap_or(text);
+    SILENT_OK_INPUTS.iter().any(|tag| text.starts_with(tag))
+}
+
+/// Whether an empty final turn should be re-prompted for a reply. Mission
+/// Control may legitimately stay silent after speaking or on an ambient line or
+/// envelope; every other conversation still owes the user visible text.
+pub(super) fn empty_turn_needs_reply(events: &[HarnessEvent], mission_control: bool) -> bool {
+    if replied_since_last_user(events) {
+        return false;
+    }
+    !(mission_control
+        && (answered_since_last_user(events) || last_input_allows_silence(events)))
+}
+
 /// Record an assistant turn. Near-duplicate *narration* (text accompanying
 /// tool calls) is dropped before it enters `events` or `messages` so clients
 /// and the on-disk session never see repeated working-aloud status. Turn-final

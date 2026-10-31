@@ -461,3 +461,54 @@ mod dedup_and_stuck_edit_tests {
         assert!(ctx.is_file_unchanged(&file_path));
     }
 }
+
+#[cfg(test)]
+mod empty_reply_tests {
+    use super::*;
+
+    fn input(text: &str) -> HarnessEvent {
+        HarnessEvent::UserInput { text: text.into() }
+    }
+
+    fn speak(status: &str) -> HarnessEvent {
+        HarnessEvent::ToolResult {
+            tool_name: "speak".into(),
+            result: serde_json::json!({"schema_version": 1, "status": status}),
+        }
+    }
+
+    #[test]
+    fn silent_mission_control_ambient_turn_is_not_reprompted() {
+        let events = [input(
+            "<ambient_turn mode=\"active\" ids=\"x\" parts=\"1\">Okay.</ambient_turn>",
+        )];
+        assert!(!empty_turn_needs_reply(&events, true));
+        let board = [input("[coordination_board_message]\nthread_id: task:1\nbody: claimed")];
+        assert!(!empty_turn_needs_reply(&board, true));
+        let steered = [HarnessEvent::Steer {
+            text: steer_message("[mission_task_report]\ntask_id: 1"),
+        }];
+        assert!(!empty_turn_needs_reply(&steered, true));
+    }
+
+    #[test]
+    fn a_successful_speak_counts_as_a_reply() {
+        let events = [input("can you check the build?"), speak("success")];
+        assert!(!empty_turn_needs_reply(&events, true));
+        let failed = [input("can you check the build?"), speak("error")];
+        assert!(empty_turn_needs_reply(&failed, true));
+        let stale = [speak("success"), input("and the tests?")];
+        assert!(empty_turn_needs_reply(&stale, true));
+    }
+
+    #[test]
+    fn a_normal_chat_empty_turn_still_reprompts() {
+        let typed = [input("what changed?")];
+        assert!(empty_turn_needs_reply(&typed, false));
+        assert!(empty_turn_needs_reply(&typed, true));
+        let ambient_elsewhere = [input("<ambient_turn mode=\"active\">Okay.</ambient_turn>"), speak("success")];
+        assert!(empty_turn_needs_reply(&ambient_elsewhere, false));
+        let replied = [input("what changed?"), HarnessEvent::AssistantText { text: "Nothing.".into() }];
+        assert!(!empty_turn_needs_reply(&replied, false));
+    }
+}
