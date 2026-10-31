@@ -311,7 +311,9 @@ async fn deliver_direct(
                     event.thread_id, event.actor_kind, event.actor_id,
                     tags = crate::coordination::typed::envelope_lines(&event.payload)
                 );
-                if crate::lanes::deliver_to_lane(parent, lane, envelope) {
+                let reached = crate::lanes::deliver_to_lane(parent, lane, envelope);
+                eprintln!("[coordination] message to lane {lane} of {parent}: live mailbox reached = {reached}");
+                if reached {
                     return Ok(());
                 }
             }
