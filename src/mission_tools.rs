@@ -2617,6 +2617,10 @@ async fn settle_call(path: &str, id: &str, on: Option<bool>) -> Result<Value, To
     if let Some(on) = on {
         body_in["on"] = json!(on);
     }
+    session_post(path, id, body_in).await
+}
+
+async fn session_post(path: &str, id: &str, body_in: Value) -> Result<Value, ToolError> {
     let info = crate::serve::sidecar::read_daemon_info()
         .ok_or_else(|| ToolError::msg("the daemon's address isn't available"))?;
     let url = format!("{}{path}?token={}", info.api_url.trim_end_matches('/'), info.token);
@@ -2645,11 +2649,12 @@ impl Tool for SessionState {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "session_state".into(),
-            description: "Settle or unsettle a session, or exempt it from automatic settling. Settling parks a finished session (memory saved first, deleted 15 days later) and is refused with a reason for a busy session; any message to a settled session wakes it. Omitted fields stay unchanged.".into(),
+            description: "Settle or unsettle a session, exempt it from automatic settling, or rename it (title). Settling parks a finished session (memory saved first, deleted 15 days later) and is refused with a reason for a busy session; any message to a settled session wakes it. Omitted fields stay unchanged.".into(),
             input_schema: schema(json!({
                 "session_id": {"type": "string", "description": "Exactly as list_sessions shows it."},
                 "settled": {"type": "boolean", "description": "true parks the session, false wakes it."},
-                "keep_awake": {"type": "boolean", "description": "true stops automatic settling after 12 hours idle."}
+                "keep_awake": {"type": "boolean", "description": "true stops automatic settling after 12 hours idle."},
+                "title": {"type": "string", "description": "renames the session; say what it is for now, so later routing can trust it."}
             }), &["session_id"]),
         }
     }
@@ -2663,10 +2668,15 @@ impl Tool for SessionState {
         }
         let settled = arguments.get("settled").and_then(Value::as_bool);
         let keep = arguments.get("keep_awake").and_then(Value::as_bool);
-        if settled.is_none() && keep.is_none() {
-            return Err(ToolError::msg("give settled or keep_awake"));
+        let title = arguments.get("title").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+        if settled.is_none() && keep.is_none() && title.is_none() {
+            return Err(ToolError::msg("give settled, keep_awake or title"));
         }
         let mut out = json!({});
+        if let Some(title) = title {
+            let title: String = title.chars().take(80).collect();
+            out["title"] = session_post("/session/rename", id, json!({"session": id, "title": title})).await?;
+        }
         if let Some(on) = keep {
             out["keep_awake"] = settle_call("/session/keep_awake", id, Some(on)).await?;
         }
