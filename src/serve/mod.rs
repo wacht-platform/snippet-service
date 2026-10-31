@@ -64,6 +64,7 @@ pub(crate) use maintenance::*;
 mod mission_control;
 pub use mission_control::{mission_error, validated_owned_paths};
 mod recurring;
+mod agent_wakes;
 mod routing_routes;
 mod settle_routes;
 pub mod session_routes;
@@ -907,6 +908,7 @@ pub async fn run_serve(
         .route("/usage", get(usage_summary))
         .route("/notifications", get(notification_replay))
         .merge(recurring::router())
+        .merge(agent_wakes::router())
         .merge(memory_routes::router())
         .merge(artifact_routes::router())
         .merge(github_routes::router())

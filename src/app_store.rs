@@ -15,7 +15,7 @@ use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use crate::mission_control::{ControlSettings, ManagedSession, SessionStatus};
-use crate::recurring::{Delivery, RecurringJob, Schedule};
+use crate::recurring::{Delivery, RecurringJob, RecurringRun, Schedule};
 use crate::store::{Store, StoreError};
 
 /// Where the app-level rows live for `root`.
@@ -192,13 +192,14 @@ impl Store {
 
     pub fn upsert_recurring_job(&self, job: &RecurringJob) -> Result<(), StoreError> {
         let schedule = encode("job schedule", &job.schedule)?;
+        let wake = job.wake.as_ref().map(|w| encode("wake policy", w)).transpose()?;
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO recurring_jobs
                    (id, title, session_id, prompt, plan_path, schedule_json, delivery,
                     enabled, next_run_at, last_run_at, last_error, queued,
-                    created_at, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                    created_at, updated_at, wake_json, last_result)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
                  ON CONFLICT(id) DO UPDATE SET
                    title = excluded.title,
                    session_id = excluded.session_id,
@@ -211,7 +212,9 @@ impl Store {
                    last_run_at = excluded.last_run_at,
                    last_error = excluded.last_error,
                    queued = excluded.queued,
-                   updated_at = excluded.updated_at",
+                   updated_at = excluded.updated_at,
+                   wake_json = excluded.wake_json,
+                   last_result = excluded.last_result",
                 params![
                     job.id,
                     job.title,
@@ -227,6 +230,8 @@ impl Store {
                     job.queued as i64,
                     job.created_at as i64,
                     job.updated_at as i64,
+                    wake,
+                    job.last_result,
                 ],
             )?;
             Ok(())
@@ -259,6 +264,71 @@ impl Store {
     pub fn delete_recurring_job(&self, id: &str) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
             Ok(conn.execute("DELETE FROM recurring_jobs WHERE id = ?1", params![id])? == 1)
+        })
+    }
+
+    pub fn insert_recurring_run(&self, job_id: &str, owner: Option<&str>, session_id: &str, fired_at: i64) -> Result<i64, StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO recurring_runs (job_id, owner, session_id, fired_at, status) VALUES (?1, ?2, ?3, ?4, 'running')",
+                params![job_id, owner, session_id, fired_at],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+    }
+
+    pub fn finish_recurring_run(&self, run_id: i64, status: &str, summary: Option<&str>, reported_to: Option<&str>, finished_at: i64) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE recurring_runs SET status = ?2, summary = ?3, reported_to = ?4, finished_at = ?5 WHERE id = ?1",
+                params![run_id, status, summary, reported_to, finished_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Runs left `running` by a daemon that stopped mid-run.
+    pub fn interrupt_running_recurring_runs(&self, now: i64) -> Result<usize, StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE recurring_runs SET status = 'interrupted', finished_at = ?1 WHERE status = 'running'",
+                params![now],
+            )
+        })
+    }
+
+    pub fn count_recurring_runs_since(&self, job_id: &str, since: i64) -> Result<u32, StoreError> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM recurring_runs WHERE job_id = ?1 AND fired_at >= ?2",
+                params![job_id, since],
+                |row| row.get::<_, u32>(0),
+            )
+        })
+    }
+
+    pub fn list_recurring_runs(&self, job_id: Option<&str>, owner: Option<&str>, limit: u32) -> Result<Vec<RecurringRun>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, job_id, owner, session_id, fired_at, finished_at, status, summary, reported_to
+                 FROM recurring_runs
+                 WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR owner = ?2)
+                 ORDER BY fired_at DESC, id DESC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![job_id, owner, limit], |row| {
+                Ok(RecurringRun {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    owner: row.get(2)?,
+                    session_id: row.get(3)?,
+                    fired_at: row.get(4)?,
+                    finished_at: row.get(5)?,
+                    status: row.get(6)?,
+                    summary: row.get(7)?,
+                    reported_to: row.get(8)?,
+                })
+            })?;
+            rows.collect()
         })
     }
 
@@ -430,7 +500,7 @@ impl OptionalPresent for Result<(), rusqlite::Error> {
 
 const JOB_COLUMNS: &str = "id, title, session_id, prompt, plan_path, schedule_json, delivery, \
                            enabled, next_run_at, last_run_at, last_error, queued, \
-                           created_at, updated_at";
+                           created_at, updated_at, wake_json, last_result";
 
 fn delivery_str(delivery: &Delivery) -> &'static str {
     match delivery {
@@ -481,5 +551,9 @@ fn recurring_job_from_row(row: &rusqlite::Row<'_>) -> Result<RecurringJob, rusql
         queued: row.get::<_, i64>(11)? != 0,
         created_at: row.get::<_, i64>(12)? as u64,
         updated_at: row.get::<_, i64>(13)? as u64,
+        wake: row
+            .get::<_, Option<String>>(14)?
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
+        last_result: row.get(15)?,
     })
 }

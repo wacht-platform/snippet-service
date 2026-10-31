@@ -32,6 +32,7 @@ pub fn add_coordination_tools(registry: &mut ToolRegistry) {
     registry.insert(TransferTaskSessionLease);
     registry.insert(InspectTask);
     registry.insert(ClaimAndDispatchTask);
+    registry.insert(crate::agent_wakes::WakeScheduleTool);
 }
 
 

@@ -46,8 +46,10 @@ pub const MIN_INTERVAL_SECS: u64 = 300;
 pub enum Schedule {
     /// Fire every `every_secs` seconds (minimum [`MIN_INTERVAL_SECS`]).
     Interval { every_secs: u64 },
-    /// Fire once a day at `hour`:`minute` in local time (0–23, 0–59).
+    /// Fire once a day at `hour`:`minute` in the user's time (0–23, 0–59).
     Daily { hour: u8, minute: u8 },
+    /// Fire at `hour`:`minute` on the weekdays in `days` (bit 0 = Monday).
+    Weekly { days: u8, hour: u8, minute: u8 },
     /// One-off fire at unix second `at`. After it fires the job is disabled
     /// (kept so the UI can show it as done).
     Once { at: u64 },
@@ -74,8 +76,14 @@ impl Schedule {
             let (hour, minute) = parse_hhmm(rest.trim())?;
             let now = epoch_secs();
             return Ok(Self::Once {
-                at: next_daily_after(now, hour, minute),
+                at: next_time_after(now, hour, minute, ALL_DAYS, user_offset()),
             });
+        }
+        if let Some((days, time)) = lower.split_once(' ')
+            && let Some(days) = parse_days(days)
+        {
+            let (hour, minute) = parse_hhmm(time.trim())?;
+            return Ok(Self::Weekly { days, hour, minute });
         }
         if let Some(rest) = lower.strip_prefix("in ") {
             let secs = parse_duration(rest.trim())?;
@@ -83,7 +91,7 @@ impl Schedule {
                 at: epoch_secs().saturating_add(secs),
             });
         }
-        Err("schedule must be `every 5m|1h|1d`, `daily HH:MM`, `at HH:MM`, or `in 30m`".into())
+        Err("schedule must be `every 5m|1h|1d`, `daily HH:MM`, `weekdays HH:MM`, `mon,wed HH:MM`, `at HH:MM`, or `in 30m`".into())
     }
 
     pub fn display(&self) -> String {
@@ -100,7 +108,15 @@ impl Schedule {
                 }
             }
             Self::Daily { hour, minute } => format!("daily {hour:02}:{minute:02}"),
+            Self::Weekly { days, hour, minute } => format!("{} {hour:02}:{minute:02}", display_days(*days)),
             Self::Once { at } => format!("once {}", fmt_hhmm(*at)),
+        }
+    }
+
+    pub fn interval_secs(&self) -> Option<u64> {
+        match self {
+            Self::Interval { every_secs } => Some(*every_secs),
+            _ => None,
         }
     }
 
@@ -108,20 +124,62 @@ impl Schedule {
     /// its moment passes it stays due-until-fired (the tick disables it right
     /// after delivering), so return `at` unchanged.
     pub fn next_after(&self, from: u64) -> u64 {
+        self.next_after_in(from, user_offset())
+    }
+
+    /// Wall-clock schedules are read in `offset` (the user's, not the server's).
+    pub fn next_after_in(&self, from: u64, offset: chrono::FixedOffset) -> u64 {
         match self {
             Self::Interval { every_secs } => from.saturating_add(*every_secs),
-            Self::Daily { hour, minute } => next_daily_after(from, *hour, *minute),
+            Self::Daily { hour, minute } => next_time_after(from, *hour, *minute, ALL_DAYS, offset),
+            Self::Weekly { days, hour, minute } => next_time_after(from, *hour, *minute, *days, offset),
             Self::Once { at } => *at,
         }
     }
 }
 
-/// Local HH:MM for a unix timestamp (used in the `once` display).
+const ALL_DAYS: u8 = 0x7f;
+const DAY_NAMES: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+fn parse_days(raw: &str) -> Option<u8> {
+    match raw {
+        "weekdays" => return Some(0x1f),
+        "weekends" => return Some(0x60),
+        _ => {}
+    }
+    let mut mask = 0u8;
+    for part in raw.split(',') {
+        let i = DAY_NAMES.iter().position(|d| part.trim().starts_with(d) && part.trim().len() >= 3)?;
+        mask |= 1 << i;
+    }
+    (mask != 0).then_some(mask)
+}
+
+fn display_days(mask: u8) -> String {
+    match mask {
+        0x1f => "weekdays".into(),
+        0x60 => "weekends".into(),
+        ALL_DAYS => "daily".into(),
+        _ => DAY_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, d)| *d)
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+/// The user's offset from Mission Control's settings, else the server's.
+pub fn user_offset() -> chrono::FixedOffset {
+    crate::mission_autonomy::offset_or_local(crate::mission_autonomy::user_offset_minutes())
+}
+
+/// HH:MM for a unix timestamp in the user's time (used in the `once` display).
 fn fmt_hhmm(at: u64) -> String {
-    use chrono::{Local, TimeZone, Timelike};
+    use chrono::{TimeZone, Timelike};
     let at_i = i64::try_from(at).unwrap_or(i64::MAX);
-    let dt = Local.timestamp_opt(at_i, 0).single();
-    match dt {
+    match user_offset().timestamp_opt(at_i, 0).single() {
         Some(dt) => format!("{:02}:{:02}", dt.hour(), dt.minute()),
         None => "??".into(),
     }
@@ -172,36 +230,27 @@ fn parse_hhmm(raw: &str) -> Result<(u8, u8), String> {
     Ok((hour, minute))
 }
 
-/// Local-time next daily fire. Uses chrono so DST is handled by the wall clock.
-fn next_daily_after(from: u64, hour: u8, minute: u8) -> u64 {
-    use chrono::{Local, NaiveTime, TimeZone};
+/// Next `hour`:`minute` after `from` on a day in `days`, read in `offset`.
+fn next_time_after(from: u64, hour: u8, minute: u8, days: u8, offset: chrono::FixedOffset) -> u64 {
+    use chrono::{Datelike, NaiveTime, TimeZone};
     let from_i = i64::try_from(from).unwrap_or(i64::MAX);
-    let now = Local
-        .timestamp_opt(from_i, 0)
-        .single()
-        .unwrap_or_else(Local::now);
-    let Some(tod) = NaiveTime::from_hms_opt(hour as u32, minute as u32, 0) else {
+    let (Some(now), Some(tod)) = (
+        offset.timestamp_opt(from_i, 0).single(),
+        NaiveTime::from_hms_opt(hour as u32, minute as u32, 0),
+    ) else {
         return from.saturating_add(86400);
     };
-    let today = now.date_naive().and_time(tod);
-    let candidate = now
-        .timezone()
-        .from_local_datetime(&today)
-        .single()
-        .or_else(|| now.timezone().from_local_datetime(&today).earliest());
-    if let Some(dt) = candidate {
-        if dt.timestamp() > from_i {
+    let mut day = now.date_naive();
+    for _ in 0..8 {
+        if days & (1 << day.weekday().num_days_from_monday()) != 0
+            && let Some(dt) = offset.from_local_datetime(&day.and_time(tod)).single()
+            && dt.timestamp() > from_i
+        {
             return dt.timestamp() as u64;
         }
+        day = day.succ_opt().unwrap_or(day);
     }
-    let tomorrow = now.date_naive().succ_opt().unwrap_or(now.date_naive());
-    let next = tomorrow.and_time(tod);
-    now.timezone()
-        .from_local_datetime(&next)
-        .single()
-        .or_else(|| now.timezone().from_local_datetime(&next).earliest())
-        .map(|dt| dt.timestamp() as u64)
-        .unwrap_or_else(|| from.saturating_add(86400))
+    from.saturating_add(86400)
 }
 
 /// A durable recurring poke.
@@ -234,6 +283,29 @@ pub struct RecurringJob {
     pub queued: bool,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Set when this job is an agent's wake schedule.
+    #[serde(default)]
+    pub wake: Option<crate::agent_wakes::WakePolicy>,
+    #[serde(default)]
+    pub last_result: Option<String>,
+}
+
+/// One fire of a job, kept for audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecurringRun {
+    pub id: i64,
+    pub job_id: String,
+    pub owner: Option<String>,
+    pub session_id: String,
+    pub fired_at: i64,
+    pub finished_at: Option<i64>,
+    pub status: String,
+    pub summary: Option<String>,
+    pub reported_to: Option<String>,
+}
+
+pub fn store_at(root: &Path) -> Result<Store, String> {
+    store_for(root)
 }
 
 /// How a fire reaches the session.
@@ -321,6 +393,9 @@ impl RecurringJob {
         out.push_str(&format!("- Fired: {}\n", fmt_local_time(epoch_secs())));
         out.push_str("\n---\n\n");
         out.push_str(&body);
+        if let Some(wake) = &self.wake {
+            out.push_str(&crate::agent_wakes::goal_addendum(wake, self.last_result.as_deref(), self.last_run_at));
+        }
         let playbook = self.playbook_topic();
         out.push_str(&format!("\n\n---\n\nThis job runs again, and each run should go better than the last. Before you start, read its playbook in project memory (`playbooks/{playbook}`) if it exists, and follow it. Before you finish, update that playbook: what worked and should stay the approach, what went wrong and what to do instead next time (situation → approach → why), and any entry this run proved wrong. Keep it short: a proven rule replaces the run notes that led to it."));
         out.push_str("\n\nWhen the work is done (or blocked), call `complete_goal` with a short summary saying **what this run was**, **what you did**, **how it went**, and **what the next run will do better** — that summary is surfaced to the user as the run's outcome.");
@@ -342,11 +417,11 @@ impl RecurringJob {
 
 }
 
-/// Local "YYYY-MM-DD HH:MM" for a unix timestamp (fire header).
-fn fmt_local_time(at: u64) -> String {
+/// "YYYY-MM-DD HH:MM" in the user's time for a unix timestamp (fire header).
+pub fn fmt_local_time(at: u64) -> String {
     use chrono::TimeZone;
     let at_i = i64::try_from(at).unwrap_or(i64::MAX);
-    match chrono::Local.timestamp_opt(at_i, 0).single() {
+    match user_offset().timestamp_opt(at_i, 0).single() {
         Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
         None => "unknown time".into(),
     }
@@ -475,6 +550,8 @@ pub fn create_job_with(
         queued: false,
         created_at: now,
         updated_at: now,
+        wake: None,
+        last_result: None,
     };
     store_for(root)?
         .upsert_recurring_job(&job)
@@ -719,6 +796,8 @@ mod tests {
             queued: false,
             created_at: 0,
             updated_at: 0,
+            wake: None,
+            last_result: None,
         })
         .unwrap();
         // Old on-disk jobs (no delivery field) must parse as Goal.
@@ -816,6 +895,8 @@ mod tests {
             queued: false,
             created_at: 0,
             updated_at: 0,
+            wake: None,
+            last_result: None,
         };
         let msg = job.render_goal(None).unwrap();
         // Formatted header, then the instruction, then the outcome directive.
@@ -848,6 +929,8 @@ mod tests {
             queued: false,
             created_at: 0,
             updated_at: 0,
+            wake: None,
+            last_result: None,
         };
         let msg = job.render_goal(None).unwrap();
         assert!(msg.contains("follow the plan"));
@@ -878,4 +961,31 @@ mod tests {
         assert!(!session_is_busy("idle"));
         assert!(!session_is_busy("completed"));
     }
+
+    #[test]
+    fn weekly_schedules_parse_and_display() {
+        assert_eq!(Schedule::parse("weekdays 09:00").unwrap(), Schedule::Weekly { days: 0x1f, hour: 9, minute: 0 });
+        assert_eq!(Schedule::parse("Mon,Thu 18:30").unwrap(), Schedule::Weekly { days: 0b1001, hour: 18, minute: 30 });
+        assert_eq!(Schedule::parse("weekends 10:00").unwrap().display(), "weekends 10:00");
+        assert_eq!(Schedule::parse("mon,wed 07:05").unwrap().display(), "mon,wed 07:05");
+        assert!(Schedule::parse("mon,xyz 09:00").is_err());
+        assert!(Schedule::parse("weekdays 25:00").is_err());
+    }
+
+    #[test]
+    fn wall_clock_schedules_follow_the_given_offset() {
+        let ist = chrono::FixedOffset::east_opt(330 * 60).unwrap();
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        // Sat 31 Oct 2026 13:00 UTC = 18:30 IST.
+        let from = 1_793_451_600;
+        let daily = Schedule::Daily { hour: 9, minute: 0 };
+        assert_eq!(daily.next_after_in(from, ist), 1_793_503_800);
+        assert_eq!(daily.next_after_in(from, utc), 1_793_523_600);
+        let weekdays = Schedule::Weekly { days: 0x1f, hour: 9, minute: 0 };
+        assert_eq!(weekdays.next_after_in(from, ist), 1_793_503_800 + 86_400);
+        let sat = Schedule::Weekly { days: 1 << 5, hour: 20, minute: 0 };
+        assert_eq!(sat.next_after_in(from, ist), from + 5400);
+        assert_eq!(sat.next_after_in(from + 5400, ist), from + 5400 + 7 * 86_400);
+    }
+
 }

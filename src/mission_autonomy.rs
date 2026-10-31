@@ -154,22 +154,40 @@ pub fn valid_clock(value: &str) -> bool {
     parse_clock(Some(value)).is_some()
 }
 
-pub fn user_now(settings: &AutonomySettings) -> chrono::DateTime<chrono::FixedOffset> {
-    let offset = settings
-        .utc_offset_minutes
+pub fn offset_or_local(minutes: Option<i32>) -> chrono::FixedOffset {
+    minutes
         .and_then(|m| chrono::FixedOffset::east_opt(m * 60))
-        .unwrap_or_else(|| *Local::now().offset());
-    chrono::Utc::now().with_timezone(&offset)
+        .unwrap_or_else(|| *Local::now().offset())
+}
+
+pub fn user_now(settings: &AutonomySettings) -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::Utc::now().with_timezone(&offset_or_local(settings.utc_offset_minutes))
+}
+
+/// The user's UTC offset as set in Mission Control's settings, if any.
+pub fn user_offset_minutes() -> Option<i32> {
+    load().settings.utc_offset_minutes
 }
 
 pub fn in_quiet_hours(settings: &AutonomySettings) -> bool {
-    let (Some(start), Some(end)) = (
-        parse_clock(settings.quiet_start.as_deref()),
-        parse_clock(settings.quiet_end.as_deref()),
-    ) else {
+    quiet_at(
+        settings.quiet_start.as_deref(),
+        settings.quiet_end.as_deref(),
+        offset_or_local(settings.utc_offset_minutes),
+        chrono::Utc::now(),
+    )
+}
+
+pub fn quiet_at(
+    start: Option<&str>,
+    end: Option<&str>,
+    offset: chrono::FixedOffset,
+    at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let (Some(start), Some(end)) = (parse_clock(start), parse_clock(end)) else {
         return false;
     };
-    let now = user_now(settings).time();
+    let now = at.with_timezone(&offset).time();
     let now = NaiveTime::from_hms_opt(now.hour(), now.minute(), 0).unwrap_or(now);
     if start == end {
         false
@@ -177,6 +195,28 @@ pub fn in_quiet_hours(settings: &AutonomySettings) -> bool {
         now >= start && now < end
     } else {
         now >= start || now < end
+    }
+}
+
+/// When the quiet window holding `at` ends; None when `at` is not in one.
+pub fn quiet_ends_after(
+    start: Option<&str>,
+    end: Option<&str>,
+    offset: chrono::FixedOffset,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if !quiet_at(start, end, offset, at) {
+        return None;
+    }
+    let end = parse_clock(end)?;
+    let local = at.with_timezone(&offset);
+    let mut day = local.date_naive();
+    loop {
+        let candidate = day.and_time(end).and_local_timezone(offset).single()?;
+        if candidate > local {
+            return Some(candidate.with_timezone(&chrono::Utc));
+        }
+        day = day.succ_opt()?;
     }
 }
 
@@ -316,7 +356,7 @@ fn mode_status() -> String {
         _ => String::new(),
     };
     format!(
-        "Automated wakes are on: you're woken every {} minutes{quiet}.{} The user may be away and doesn't watch this chat: reach them with ping_user to keep working while they think, or ask_user when nothing worthwhile can move without their answer (it blocks you and your wakes until they reply). When they message you directly they are here, so answer in your reply as usual.",
+        "Automated wakes are on: you're woken every {} minutes{quiet} (in quiet hours only when something changed).{} The user may be away and doesn't watch this chat: reach them with ping_user to keep working while they think, or ask_user when nothing worthwhile can move without their answer (it blocks you and your wakes until they reply). When they message you directly they are here, so answer in your reply as usual.",
         settings.round_minutes,
         next_wake_status(&state)
     )
@@ -327,4 +367,41 @@ pub fn next_round_at(state: &AutonomyState) -> Option<i64> {
         .settings
         .on
         .then(|| state.last_round_at + i64::from(state.settings.round_minutes.max(MIN_ROUND_MINUTES)) * 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn utc(h: u32, m: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 10, 31, h, m, 0).unwrap()
+    }
+
+    fn ist() -> chrono::FixedOffset {
+        chrono::FixedOffset::east_opt(330 * 60).unwrap()
+    }
+
+    #[test]
+    fn quiet_hours_are_read_in_the_users_offset() {
+        let (s, e) = (Some("22:00"), Some("08:00"));
+        assert!(quiet_at(s, e, ist(), utc(16, 30)), "22:00 IST");
+        assert!(!quiet_at(s, e, ist(), utc(16, 29)), "21:59 IST");
+        assert!(quiet_at(s, e, ist(), utc(2, 29)), "07:59 IST");
+        assert!(!quiet_at(s, e, ist(), utc(2, 30)), "08:00 IST");
+        assert!(!quiet_at(s, e, chrono::FixedOffset::east_opt(0).unwrap(), utc(16, 30)));
+        assert!(!quiet_at(Some("09:00"), Some("09:00"), ist(), utc(3, 30)));
+        assert!(!quiet_at(None, e, ist(), utc(20, 0)));
+    }
+
+    #[test]
+    fn quiet_window_end_rolls_to_the_next_morning() {
+        let (s, e) = (Some("22:00"), Some("08:00"));
+        let next_morning = chrono::Utc.with_ymd_and_hms(2026, 11, 1, 2, 30, 0).unwrap();
+        assert_eq!(quiet_ends_after(s, e, ist(), utc(17, 0)), Some(next_morning));
+        assert_eq!(quiet_ends_after(s, e, ist(), utc(20, 0)), Some(next_morning));
+        assert_eq!(quiet_ends_after(s, e, ist(), utc(13, 0)), None);
+        let same_day = chrono::Utc.with_ymd_and_hms(2026, 10, 31, 9, 0, 0).unwrap();
+        assert_eq!(quiet_ends_after(Some("13:00"), Some("14:30"), ist(), utc(8, 0)), Some(same_day));
+    }
 }

@@ -217,6 +217,7 @@ const SILENT_OK_INPUTS: &[&str] = &[
     "[automated_wake]",
     "[worker_question]",
     "[recurring_run_report]",
+    "[agent_wake_report]",
     "[direct_message]",
     "[agent_reply]",
 ];

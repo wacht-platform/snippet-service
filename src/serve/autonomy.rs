@@ -93,13 +93,22 @@ pub async fn autonomy_loop(daemon: Shared) {
         let tasks = daemon.store.list_tasks(None, None).unwrap_or_default();
         let digest = board_digest(&tasks);
         let due = mission_autonomy::take_due_followups(now);
-        let interval_due = mission_autonomy::next_round_at(&state).is_some_and(|at| now >= at);
-        let changed = digest != state.last_digest;
-        if due.is_empty() && !(interval_due && (changed || state.last_round_at == 0)) {
-            if interval_due {
+        let decision = round_decision(RoundInputs {
+            interval_due: mission_autonomy::next_round_at(&state).is_some_and(|at| now >= at),
+            followups_due: !due.is_empty(),
+            quiet: mission_autonomy::in_quiet_hours(&state.settings),
+            board_changed: digest != state.last_digest,
+            run_notes: !state.run_notes.is_empty(),
+            first: state.last_round_at == 0,
+        });
+        match decision {
+            Round::NotDue => continue,
+            Round::Skip(reason) => {
+                eprintln!("[autonomy] interval round skipped: {reason}");
                 let _ = mission_autonomy::update(|s| s.last_round_at = now);
+                continue;
             }
-            continue;
+            Round::Fire => {}
         }
         let offers = pending_offers(&daemon, &tasks);
         let waiting = waiting_on(&daemon, &tasks);
@@ -111,7 +120,41 @@ pub async fn autonomy_loop(daemon: Shared) {
             s.last_round_summary = Some(summary);
             s.run_notes.clear();
         });
+        eprintln!("[autonomy] round fired");
         deliver_to_mission_control(&daemon, envelope).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Round {
+    Fire,
+    NotDue,
+    Skip(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RoundInputs {
+    interval_due: bool,
+    followups_due: bool,
+    quiet: bool,
+    board_changed: bool,
+    run_notes: bool,
+    first: bool,
+}
+
+// Outside quiet hours the interval is honoured as set; task reports mark the
+// board seen, so gating on a board change there left a still board with no wakes.
+fn round_decision(i: RoundInputs) -> Round {
+    if i.followups_due {
+        return Round::Fire;
+    }
+    if !i.interval_due {
+        return Round::NotDue;
+    }
+    if i.first || !i.quiet || i.board_changed || i.run_notes {
+        Round::Fire
+    } else {
+        Round::Skip("quiet hours and nothing changed")
     }
 }
 
@@ -503,4 +546,34 @@ fn round_summary(
         parts.insert(0, "automated wakes switched on".to_string());
     }
     parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn due() -> RoundInputs {
+        RoundInputs { interval_due: true, ..RoundInputs::default() }
+    }
+
+    #[test]
+    fn interval_rounds_fire_on_a_still_board_outside_quiet_hours() {
+        assert_eq!(round_decision(due()), Round::Fire);
+    }
+
+    #[test]
+    fn quiet_hours_need_a_change_or_completed_runs() {
+        let quiet = RoundInputs { quiet: true, ..due() };
+        assert_eq!(round_decision(quiet), Round::Skip("quiet hours and nothing changed"));
+        assert_eq!(round_decision(RoundInputs { board_changed: true, ..quiet }), Round::Fire);
+        assert_eq!(round_decision(RoundInputs { run_notes: true, ..quiet }), Round::Fire);
+        assert_eq!(round_decision(RoundInputs { first: true, ..quiet }), Round::Fire);
+    }
+
+    #[test]
+    fn followups_fire_any_time_and_nothing_fires_before_the_interval() {
+        let quiet_followup = RoundInputs { quiet: true, followups_due: true, ..RoundInputs::default() };
+        assert_eq!(round_decision(quiet_followup), Round::Fire);
+        assert_eq!(round_decision(RoundInputs { board_changed: true, ..RoundInputs::default() }), Round::NotDue);
+    }
 }

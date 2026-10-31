@@ -175,6 +175,34 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
             connection.execute(&format!("ALTER TABLE ambient_events DROP COLUMN {column}"), [])?;
         }
     }
+    let have_jobs: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(recurring_jobs)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (name, ddl) in [
+        ("wake_json", "ALTER TABLE recurring_jobs ADD COLUMN wake_json TEXT"),
+        ("last_result", "ALTER TABLE recurring_jobs ADD COLUMN last_result TEXT"),
+    ] {
+        if !have_jobs.iter().any(|c| c == name) {
+            connection.execute(ddl, [])?;
+        }
+    }
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS recurring_runs (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             job_id TEXT NOT NULL,
+             owner TEXT,
+             session_id TEXT NOT NULL,
+             fired_at INTEGER NOT NULL,
+             finished_at INTEGER,
+             status TEXT NOT NULL,
+             summary TEXT,
+             reported_to TEXT
+         );
+         CREATE INDEX IF NOT EXISTS recurring_runs_job ON recurring_runs(job_id, fired_at);
+         CREATE INDEX IF NOT EXISTS recurring_runs_owner ON recurring_runs(owner, fired_at);",
+    )?;
     let have_turns: Vec<String> = {
         let mut stmt = connection.prepare("PRAGMA table_info(ambient_turns)")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;

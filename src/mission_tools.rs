@@ -2462,6 +2462,13 @@ impl Tool for CancelRecurringJob {
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CancelRecurringArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        let user_wake = crate::recurring::list_jobs(&crate::recurring::default_root())
+            .unwrap_or_default()
+            .into_iter()
+            .any(|j| j.id == args.id.trim() && j.wake.is_some_and(|w| w.set_by == crate::agent_wakes::Setter::User));
+        if user_wake {
+            return Err(ToolError::msg("the user set this wake schedule; ask them to change it"));
+        }
         crate::recurring::delete_job(&crate::recurring::default_root(), args.id.trim()).map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({"cancelled": true, "id": args.id.trim()})))
     }
