@@ -131,12 +131,26 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              profile TEXT,
              plan TEXT NOT NULL DEFAULT '',
              work_plan_json TEXT NOT NULL DEFAULT '[]',
-             superseded_by TEXT
+             superseded_by TEXT,
+             goal_id TEXT
          );
          CREATE INDEX IF NOT EXISTS tasks_status_priority
              ON tasks(status, priority DESC, created_at);
          CREATE INDEX IF NOT EXISTS tasks_thread
              ON tasks(thread_id);
+
+         -- A goal is the user's whole outcome; tasks link to it by goal_id.
+         CREATE TABLE IF NOT EXISTS goals (
+             id TEXT PRIMARY KEY NOT NULL,
+             title TEXT NOT NULL,
+             outcome TEXT NOT NULL,
+             acceptance_json TEXT NOT NULL DEFAULT '[]',
+             status TEXT NOT NULL DEFAULT 'open',
+             requester TEXT NOT NULL DEFAULT '',
+             created_at TEXT NOT NULL,
+             closed_at TEXT,
+             plan_json TEXT NOT NULL DEFAULT '{}'
+         );
 
          -- The task ledger: one versioned record per task. The body is JSON so a
          -- new ledger field is additive; `version` is the optimistic-lock token.
@@ -260,6 +274,10 @@ fn add_missing_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
     if !existing.iter().any(|column| column == "superseded_by") {
         connection.execute("ALTER TABLE tasks ADD COLUMN superseded_by TEXT", [])?;
     }
+    if !existing.iter().any(|column| column == "goal_id") {
+        connection.execute("ALTER TABLE tasks ADD COLUMN goal_id TEXT", [])?;
+    }
+    connection.execute("CREATE INDEX IF NOT EXISTS tasks_goal ON tasks(goal_id)", [])?;
     let task_agent_columns: Vec<String> = {
         let mut stmt = connection.prepare("PRAGMA table_info(task_agents)")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;

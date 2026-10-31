@@ -79,6 +79,10 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(crate::task_state_tools::UpdateTaskState);
     registry.insert(crate::task_state_tools::TaskLedger);
     registry.insert(crate::review_tools::SubmitReview);
+    registry.insert(crate::goal_tools::CreateGoal);
+    registry.insert(crate::goal_tools::UpdateGoal);
+    registry.insert(crate::goal_tools::CloseGoal);
+    registry.insert(crate::goal_tools::ListGoals);
     registry.insert(Speak);
     registry.insert(AmbientMode);
     registry.insert(AmbientExpect);
@@ -1187,6 +1191,8 @@ struct CreateTaskArgs {
     audience: Option<String>,
     #[serde(default)]
     definition_of_good: Option<String>,
+    #[serde(default)]
+    goal: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1199,7 +1205,7 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "acceptance":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string"},"method":{"type":"string","enum":["command","artifact","visual","human"]}},"required":["criterion","method"]},"description":"how the work is judged done, each with how it is checked. Required unless read_only. The worker must report evidence for every one."}, "read_only":{"type":"boolean","description":"investigation that changes nothing; acceptance is then optional"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done. Default: a reviewer lane (self when read_only). self skips review."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}}), &["title","description","session"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "acceptance":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string"},"method":{"type":"string","enum":["command","artifact","visual","human"]}},"required":["criterion","method"]},"description":"how the work is judged done, each with how it is checked. Required unless read_only. The worker must report evidence for every one."}, "read_only":{"type":"boolean","description":"investigation that changes nothing; acceptance is then optional"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done. Default: a reviewer lane (self when read_only). self skips review."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}, "goal":{"type":"string","description":"optional; id of the open goal this task serves"}}), &["title","description","session"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: CreateTaskArgs =
@@ -1248,6 +1254,18 @@ fn candidate_list(candidates: &[crate::session_resolve::Candidate]) -> String {
         .map(|c| format!("`{}` \"{}\" in {} (idle {}h)", c.id, c.title, c.folder, (now - c.last_active).max(0) / 3600))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+pub(crate) fn open_goal_id(store: &Store, goal: Option<&str>) -> Result<Option<String>, ToolError> {
+    let Some(id) = goal.map(str::trim).filter(|g| !g.is_empty()) else { return Ok(None) };
+    let found = store
+        .get_goal(id)
+        .map_err(|e| ToolError::msg(format!("look up goal: {e}")))?
+        .ok_or_else(|| ToolError::msg(format!("goal names no goal `{id}`; list_goals shows them")))?;
+    if found.status != crate::coordination::GoalStatus::Open {
+        return Err(ToolError::msg(format!("goal `{id}` is {}; reopen it with update_goal first", found.status.as_str())));
+    }
+    Ok(Some(found.id))
 }
 
 /// File a task: validate the target, record the worker on the roster, link
@@ -1391,6 +1409,7 @@ async fn create_task(
                 blockers.push(found);
             }
         }
+        let goal_id = open_goal_id(&store, args.goal.as_deref())?;
         let supersedes = args.supersedes.as_deref().map(str::trim).filter(|s| !s.is_empty());
         if let Some(old) = supersedes {
             let found = store
@@ -1413,6 +1432,7 @@ async fn create_task(
             now_rfc3339(),
         );
         task.profile = profile.clone();
+        task.goal_id = goal_id;
         if !blockers.is_empty() {
             task.status = TaskStatus::Blocked;
         }
@@ -1763,6 +1783,7 @@ impl Tool for FileFollowUpTask {
             read_only: true,
             audience: None,
             definition_of_good: None,
+            goal: None,
         };
         create_task(ctx, args, (kind, &who)).await
     }

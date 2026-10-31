@@ -10,6 +10,7 @@ mod agents;
 pub mod board;
 pub mod direct;
 mod events;
+pub mod goals;
 mod identity;
 pub mod schema;
 mod task_state;
@@ -24,6 +25,7 @@ pub use direct::{
     DirectThreadSummary, LOCAL_HUMAN_ID, PendingDirectMessage, actor_ref, direct_thread_id,
 };
 pub use agents::AgentRemoval;
+pub use goals::{Goal, GoalCriterion, GoalStatus};
 pub use task_state::{Criterion, Decision, Evidence, PendingReport, StatePatch, TaskState, VerifyMethod, VerifyMode};
 pub use identity::{AgentHome, IdentityError};
 pub use tasks::{offer_marker, 

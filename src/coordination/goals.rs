@@ -1,0 +1,305 @@
+//! Goals: the user's whole outcome as data. Tasks link to a goal by `goal_id`;
+//! a goal closes only when none of its tasks is open and every acceptance
+//! criterion carries evidence.
+
+use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+
+use super::tasks::{TASK_COLUMNS, task_from_row};
+use super::{Store, StoreError, Task, TaskStatus, VerifyMethod};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Open,
+    Closed,
+    Cancelled,
+}
+
+impl GoalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+    pub fn parse(raw: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(raw.trim().to_string())).ok()
+    }
+}
+
+fn human() -> VerifyMethod {
+    VerifyMethod::Human
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoalCriterion {
+    pub criterion: String,
+    #[serde(default = "human")]
+    pub method: VerifyMethod,
+    /// What was seen or run to show the criterion holds; empty until then.
+    #[serde(default)]
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Goal {
+    pub id: String,
+    pub title: String,
+    pub outcome: String,
+    pub acceptance: Vec<GoalCriterion>,
+    pub status: GoalStatus,
+    pub requester: String,
+    pub created_at: String,
+    pub closed_at: Option<String>,
+    pub plan: serde_json::Value,
+}
+
+fn clip(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max { flat } else { format!("{}…", flat.chars().take(max).collect::<String>()) }
+}
+
+impl Goal {
+    pub fn new(id: String, title: String, outcome: String, criteria: Vec<GoalCriterion>, requester: String, now: String) -> Self {
+        Self {
+            id,
+            title,
+            outcome,
+            acceptance: criteria,
+            status: GoalStatus::Open,
+            requester,
+            created_at: now,
+            closed_at: None,
+            plan: serde_json::json!({}),
+        }
+    }
+
+    /// Record evidence for criteria named by number or by text. Names that match
+    /// nothing come back, so a typo is not silently dropped.
+    pub fn attach_evidence(&mut self, items: &[(String, String)]) -> Vec<String> {
+        let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+        let mut unknown = Vec::new();
+        for (key, text) in items {
+            let k = key.trim().trim_start_matches('#');
+            let number = k.parse::<usize>().ok();
+            let hit = self.acceptance.iter().enumerate().position(|(i, c)| number == Some(i + 1) || norm(k) == norm(&c.criterion));
+            match hit {
+                Some(i) => self.acceptance[i].evidence = text.trim().to_string(),
+                None => unknown.push(key.clone()),
+            }
+        }
+        unknown
+    }
+
+    /// Criteria with no evidence, as `n. text`.
+    pub fn unevidenced(&self) -> Vec<String> {
+        self.acceptance
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.evidence.trim().is_empty())
+            .map(|(i, c)| format!("{}. [{}] {}", i + 1, c.method.as_str(), clip(&c.criterion, 160)))
+            .collect()
+    }
+
+    /// What stops the goal closing: open tasks and unevidenced criteria.
+    /// A goal with no acceptance criteria cannot be closed either.
+    pub fn close_gaps(&self, tasks: &[Task]) -> Vec<String> {
+        let mut gaps: Vec<String> = tasks
+            .iter()
+            .filter(|t| is_open(t))
+            .map(|t| format!("task {} \"{}\" is {}", t.id, clip(&t.title, 80), t.status))
+            .collect();
+        if self.acceptance.is_empty() {
+            gaps.push("the goal has no acceptance criteria; add some with update_goal".into());
+        }
+        gaps.extend(self.unevidenced().into_iter().map(|c| format!("no evidence for criterion {c}")));
+        gaps
+    }
+
+    pub fn fully_evidenced(&self) -> bool {
+        !self.acceptance.is_empty() && self.unevidenced().is_empty()
+    }
+}
+
+/// Failed counts as open: it needs a retry or a cancel, not silence.
+pub fn is_open(task: &Task) -> bool {
+    !matches!(task.status, TaskStatus::Done | TaskStatus::Cancelled)
+}
+
+const GOAL_COLUMNS: &str = "id, title, outcome, acceptance_json, status, requester, created_at, closed_at, plan_json";
+
+fn goal_from_row(row: &rusqlite::Row<'_>) -> Result<Goal, rusqlite::Error> {
+    let bad = |i: usize, e: serde_json::Error| {
+        rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
+    };
+    let acceptance: String = row.get(3)?;
+    let status: String = row.get(4)?;
+    let plan: String = row.get(8)?;
+    Ok(Goal {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        outcome: row.get(2)?,
+        acceptance: serde_json::from_str(&acceptance).map_err(|e| bad(3, e))?,
+        status: GoalStatus::parse(&status).unwrap_or(GoalStatus::Open),
+        requester: row.get(5)?,
+        created_at: row.get(6)?,
+        closed_at: row.get(7)?,
+        plan: serde_json::from_str(&plan).map_err(|e| bad(8, e))?,
+    })
+}
+
+impl Store {
+    pub fn create_goal(&self, goal: &Goal) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                &format!("INSERT INTO goals ({GOAL_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"),
+                params![
+                    goal.id,
+                    goal.title,
+                    goal.outcome,
+                    serde_json::to_string(&goal.acceptance).unwrap_or_else(|_| "[]".into()),
+                    goal.status.as_str(),
+                    goal.requester,
+                    goal.created_at,
+                    goal.closed_at,
+                    goal.plan.to_string(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_goal(&self, id: &str) -> Result<Option<Goal>, StoreError> {
+        self.with_connection(|conn| {
+            conn.query_row(&format!("SELECT {GOAL_COLUMNS} FROM goals WHERE id = ?1"), params![id], goal_from_row).optional()
+        })
+    }
+
+    /// Every mutable column; the origin (`created_at`, `requester`) stays.
+    pub fn save_goal(&self, goal: &Goal) -> Result<(), StoreError> {
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE goals SET title = ?2, outcome = ?3, acceptance_json = ?4, status = ?5,
+                    closed_at = ?6, plan_json = ?7 WHERE id = ?1",
+                params![
+                    goal.id,
+                    goal.title,
+                    goal.outcome,
+                    serde_json::to_string(&goal.acceptance).unwrap_or_else(|_| "[]".into()),
+                    goal.status.as_str(),
+                    goal.closed_at,
+                    goal.plan.to_string(),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Goals newest first; `None` lists every status.
+    pub fn list_goals(&self, status: Option<GoalStatus>) -> Result<Vec<Goal>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {GOAL_COLUMNS} FROM goals WHERE (?1 IS NULL OR status = ?1) ORDER BY created_at DESC"
+            ))?;
+            let rows = stmt.query_map(params![status.map(GoalStatus::as_str)], goal_from_row)?;
+            rows.collect()
+        })
+    }
+
+    /// The tasks linked to a goal, oldest first.
+    pub fn goal_tasks(&self, goal_id: &str) -> Result<Vec<Task>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {TASK_COLUMNS} FROM tasks WHERE goal_id = ?1 ORDER BY created_at, rowid"
+            ))?;
+            let rows = stmt.query_map(params![goal_id], task_from_row)?;
+            rows.collect()
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn goal() -> Goal {
+        Goal::new(
+            "g1".into(),
+            "Ship it".into(),
+            "Users can sign in".into(),
+            vec![
+                GoalCriterion { criterion: "tests pass".into(), method: VerifyMethod::Command, evidence: String::new() },
+                GoalCriterion { criterion: "login screen looks right".into(), method: VerifyMethod::Visual, evidence: String::new() },
+            ],
+            "user".into(),
+            "2026-01-01T00:00:00Z".into(),
+        )
+    }
+
+    fn task(id: &str, goal: Option<&str>, status: TaskStatus) -> Task {
+        let mut t = Task::filed_by_human(id.into(), format!("T {id}"), "do".into(), "s".into(), 0, "2026-01-01T00:00:00Z".into());
+        t.goal_id = goal.map(str::to_string);
+        t.status = status;
+        t
+    }
+
+    #[test]
+    fn goals_round_trip_and_list_by_status() {
+        let db = Store::open_in_memory().unwrap();
+        let mut g = goal();
+        db.create_goal(&g).unwrap();
+        assert_eq!(db.get_goal("g1").unwrap().unwrap(), g);
+        g.status = GoalStatus::Closed;
+        g.closed_at = Some("2026-01-02T00:00:00Z".into());
+        db.save_goal(&g).unwrap();
+        assert_eq!(db.list_goals(Some(GoalStatus::Open)).unwrap().len(), 0);
+        assert_eq!(db.list_goals(None).unwrap().len(), 1);
+        assert!(db.get_goal("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn linked_tasks_come_back_by_goal() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_goal(&goal()).unwrap();
+        db.create_task(&task("a", Some("g1"), TaskStatus::Todo)).unwrap();
+        db.create_task(&task("b", None, TaskStatus::Todo)).unwrap();
+        let linked = db.goal_tasks("g1").unwrap();
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, "a");
+        assert_eq!(linked[0].goal_id.as_deref(), Some("g1"));
+    }
+
+    #[test]
+    fn closing_is_refused_for_open_tasks_and_missing_evidence() {
+        let mut g = goal();
+        let tasks = [task("a", Some("g1"), TaskStatus::InProgress), task("b", Some("g1"), TaskStatus::Done), task("c", Some("g1"), TaskStatus::Failed)];
+        let gaps = g.close_gaps(&tasks);
+        assert_eq!(gaps.len(), 4, "{gaps:?}");
+        assert!(gaps[0].contains("task a") && gaps[1].contains("task c"));
+        let unknown = g.attach_evidence(&[("1".into(), "cargo test: ok".into()), ("Login Screen looks right".into(), "shot.png".into()), ("9".into(), "x".into())]);
+        assert_eq!(unknown, ["9"]);
+        assert!(g.fully_evidenced());
+        assert_eq!(g.close_gaps(&tasks[1..2]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_goal_without_criteria_cannot_close() {
+        let mut g = goal();
+        g.acceptance.clear();
+        assert!(g.close_gaps(&[]).iter().any(|g| g.contains("no acceptance criteria")));
+    }
+
+    #[test]
+    fn an_older_database_gains_goal_id_without_losing_tasks() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_task(&task("old", None, TaskStatus::Todo)).unwrap();
+        db.with_connection(|c| {
+            c.execute_batch("DROP INDEX tasks_goal; ALTER TABLE tasks DROP COLUMN goal_id;")?;
+            crate::coordination::schema::ensure(c)
+        })
+        .unwrap();
+        assert_eq!(db.get_task("old").unwrap().unwrap().goal_id, None);
+    }
+}
