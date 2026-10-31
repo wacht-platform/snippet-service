@@ -480,6 +480,10 @@ struct SendAgentMessageArgs {
     body: String,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    urgency: Option<String>,
 }
 
 /// The session id named by the most recent human message in a direct thread.
@@ -527,12 +531,14 @@ impl Tool for SendAgentMessage {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "send_agent_message".into(),
-            description: "Send a direct message to another agent, or reply where you were asked. When the message you are answering came from a session, reply to `session:<id>` — the exact `reply_to` value from its envelope, copied as written — so the answer lands in the conversation where it was asked. Use `human` only when the message did not name a session. Otherwise address an agent by its agent id (list_coordination_agents shows the directory), or `task:<id>` to reach the session working on that task. It is a conversation, not a command: it never creates a task, transfers ownership, or authorises a workspace change. Task and status messages belong on a task room instead.".into(),
+            description: "Send a direct message to another agent, or reply where you were asked. When the message you are answering came from a session, reply to `session:<id>` — the exact `reply_to` value from its envelope, copied as written — so the answer lands in the conversation where it was asked. Use `human` only when the message did not name a session. Otherwise address an agent by its agent id (list_coordination_agents shows the directory), or `task:<id>` to reach the session working on that task. It is a conversation, not a command: it never creates a task, transfers ownership, or authorises a workspace change. Task and status messages belong on a task room instead (post_task_coordination). Optional `kind` and `urgency` type the message; urgent interrupts the recipient's run, so use it sparingly.".into(),
             input_schema: schema(
                 json!({
                     "recipient_agent_id":{"type":"string","description":"agent id from list_coordination_agents, `task:<id>`, `session:<id>` or `human`"},
                     "body":{"type":"string"},
-                    "idempotency_key":{"type":"string","description":"optional; a retry with the same key does not duplicate"}
+                    "idempotency_key":{"type":"string","description":"optional; a retry with the same key does not duplicate"},
+                    "kind":{"type":"string","enum":["note","question","status","handoff_note","blocker","result","interrupt"],"description":"optional; what the message is, shown to the recipient"},
+                    "urgency":{"type":"string","enum":["normal","urgent"],"description":"optional, default normal. Normal waits until the recipient's current run ends. Urgent stops its run and wakes it now: only for a blocker, a wrong direction or something that makes its work pointless. kind `interrupt` is always urgent."}
                 }),
                 &["recipient_agent_id", "body"],
             ),
@@ -643,6 +649,8 @@ impl Tool for SendAgentMessage {
             }
         }
         let (sender_kind, sender_id) = actor(ctx)?;
+        let (kind, urgency) = crate::coordination::typed::parse(args.kind.as_deref(), args.urgency.as_deref())
+            .map_err(ToolError::msg)?;
         let key = args
             .idempotency_key
             .filter(|k| !k.trim().is_empty())
@@ -655,7 +663,7 @@ impl Tool for SendAgentMessage {
             .or(ctx.lane_origin().map(|(session, _)| session))
             .map(str::to_string);
         let saved = db
-            .send_direct_message_with_origin(
+            .send_direct_message_typed(
                 (&sender_kind, &sender_id),
                 (to_kind, to_id),
                 &body,
@@ -664,6 +672,7 @@ impl Tool for SendAgentMessage {
                 origin.as_deref(),
                 ctx.lane_origin().map(|(_, lane)| lane),
                 about_task.as_deref(),
+                crate::coordination::typed::payload_fields(kind, urgency, about_task.as_deref()),
             )
             .map_err(|e| ToolError::msg(format!("send message: {e}")))?;
         crate::session::emit_device_event(json!({
@@ -1007,6 +1016,10 @@ impl Tool for MessageMissionControl {
 struct PostTaskCoordinationArgs {
     task_id: String,
     body: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    urgency: Option<String>,
 }
 
 pub struct PostTaskCoordination;
@@ -1015,11 +1028,13 @@ impl Tool for PostTaskCoordination {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "post_task_coordination".into(),
-            description: "Coordinate with fellow agents assigned to this task board item. Posts context, plan proposals, or status to the task thread. Everyone on the task and Mission Control see it; a post that needs nothing from them can simply be read.".into(),
+            description: "Coordinate with fellow agents assigned to this task board item. Posts context, plan proposals, or status to the task thread. Everyone on the task and Mission Control see it; a post that needs nothing from them can simply be read. The task room is the task's one channel, in task order. Optional `kind` types the post; `urgency: urgent` stops the other sessions' runs and wakes them now (a blocker or wrong direction only), while normal posts wait for their next turn.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string", "description": "The task ID on the task board"},
-                    "body": {"type": "string", "description": "The coordination message or update"}
+                    "body": {"type": "string", "description": "The coordination message or update"},
+                    "kind": {"type": "string", "enum": ["note","question","status","handoff_note","blocker","result","interrupt"], "description": "optional"},
+                    "urgency": {"type": "string", "enum": ["normal","urgent"], "description": "optional, default normal"}
                 }),
                 &["task_id", "body"],
             ),
@@ -1040,6 +1055,12 @@ impl Tool for PostTaskCoordination {
             .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
         let (actor_kind, actor_id) = actor(ctx)?;
         require_thread_access(&db, ctx, &actor_id, &task.thread_id)?;
+        let (kind, urgency) = crate::coordination::typed::parse(args.kind.as_deref(), args.urgency.as_deref())
+            .map_err(ToolError::msg)?;
+        let mut payload = json!({"body": body, "task_id": task_id});
+        for (key, value) in crate::coordination::typed::payload_fields(kind, urgency, None) {
+            payload[key] = value;
+        }
         let now = now_rfc3339();
         let event = CoordinationEvent {
             event_id: Uuid::new_v4().to_string(),
@@ -1050,7 +1071,7 @@ impl Tool for PostTaskCoordination {
             actor_kind: actor_kind.to_string(),
             actor_id,
             payload_version: 1,
-            payload: stamp_origin(ctx, json!({"body": body, "task_id": task_id})),
+            payload: stamp_origin(ctx, payload),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
             idempotency_key: Uuid::new_v4().to_string(),
