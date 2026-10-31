@@ -881,6 +881,7 @@ pub async fn run_serve(
         .route("/agents/{agent_id}/board", get(agent_board))
         .route("/agents/{agent_id}/status", post(set_agent_status))
         .route("/agents/{agent_id}/color", post(set_agent_color))
+        .route("/agents/{agent_id}/shape", post(set_agent_shape))
         .route("/agents/{agent_id}/nickname", post(set_agent_nickname))
         .route("/agents/{agent_id}/profile", post(set_agent_profile))
         .route("/agents/{agent_id}", axum::routing::delete(delete_agent))

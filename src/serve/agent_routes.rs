@@ -43,6 +43,7 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                 }
             };
             let colors = d.store.agent_colors().unwrap_or_default();
+            let shapes = d.store.agent_shapes().unwrap_or_default();
             let nicknames = d.store.agent_nicknames().unwrap_or_default();
             let profiles = d.store.agent_profiles().unwrap_or_default();
             let mut grouped: HashMap<String, serde_json::Map<String, serde_json::Value>> =
@@ -62,6 +63,9 @@ pub(crate) async fn list_agents(State(d): State<Shared>, Query(q): Query<AgentsQ
                         object.insert("task_counts_since".into(), since.clone().into());
                         if let Some(color) = colors.get(&agent.id) {
                             object.insert("color".into(), color.clone().into());
+                        }
+                        if let Some(shape) = shapes.get(&agent.id) {
+                            object.insert("shape".into(), shape.clone().into());
                         }
                         if let Some(nickname) = nicknames.get(&agent.id) {
                             object.insert("nickname".into(), nickname.clone().into());
@@ -423,6 +427,42 @@ pub(crate) async fn set_agent_color(
         Ok(true) => Json(serde_json::json!({ "id": agent_id, "color": color })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent color: {error}"))
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentShapeReq {
+    pub(crate) shape: Option<String>,
+}
+
+pub(crate) const AGENT_SHAPES: [&str; 7] = ["mochi", "bunny", "cat", "bear", "ghost", "cloud", "frog"];
+
+/// POST /agents/{id}/shape — the agent's mascot shape (one of `AGENT_SHAPES`), or null to
+/// go back to the default.
+pub(crate) async fn set_agent_shape(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(req): Json<AgentShapeReq>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let shape = req.shape.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+    if let Some(s) = &shape {
+        if !AGENT_SHAPES.contains(&s.as_str()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("shape must be one of: {}", AGENT_SHAPES.join(", ")),
+            )
+                .into_response();
+        }
+    }
+    match d.store.set_agent_shape(&agent_id, shape.as_deref()) {
+        Ok(true) => Json(serde_json::json!({ "id": agent_id, "shape": shape })).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("set agent shape: {error}"))
             .into_response(),
     }
 }

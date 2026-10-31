@@ -28,6 +28,11 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
              color TEXT NOT NULL
          );
 
+         CREATE TABLE IF NOT EXISTS agent_shapes (
+             agent_id TEXT PRIMARY KEY NOT NULL,
+             shape TEXT NOT NULL
+         );
+
          CREATE TABLE IF NOT EXISTS agents (
              id TEXT PRIMARY KEY NOT NULL,
              display_name TEXT NOT NULL,

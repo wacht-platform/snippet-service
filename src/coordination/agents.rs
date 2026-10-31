@@ -154,6 +154,7 @@ impl Store {
                 params![id],
             )?;
             tx.execute("DELETE FROM agent_colors WHERE agent_id = ?1", params![id])?;
+            tx.execute("DELETE FROM agent_shapes WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agent_nicknames WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agent_profiles WHERE agent_id = ?1", params![id])?;
             tx.execute("DELETE FROM agents WHERE id = ?1", params![id])?;
@@ -195,6 +196,14 @@ impl Store {
     pub fn agent_colors(&self) -> Result<std::collections::HashMap<String, String>, StoreError> {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare("SELECT agent_id, color FROM agent_colors")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+    }
+
+    pub fn agent_shapes(&self) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare("SELECT agent_id, shape FROM agent_shapes")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
@@ -263,6 +272,28 @@ impl Store {
                     params![id, color],
                 )?,
                 None => conn.execute("DELETE FROM agent_colors WHERE agent_id = ?1", params![id])?,
+            };
+            Ok(true)
+        })
+    }
+
+    pub fn set_agent_shape(&self, id: &str, shape: Option<&str>) -> Result<bool, StoreError> {
+        self.with_connection(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            match shape {
+                Some(shape) => conn.execute(
+                    "INSERT INTO agent_shapes (agent_id, shape) VALUES (?1, ?2)
+                     ON CONFLICT(agent_id) DO UPDATE SET shape = excluded.shape",
+                    params![id, shape],
+                )?,
+                None => conn.execute("DELETE FROM agent_shapes WHERE agent_id = ?1", params![id])?,
             };
             Ok(true)
         })
@@ -382,6 +413,21 @@ mod tests {
             role: AgentRole::Implementer,
             capabilities: vec![],
         }
+    }
+
+    #[test]
+    fn agent_shape_is_set_cleared_and_removed_with_the_agent() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&agent("a1", "A")).unwrap();
+        assert!(!db.set_agent_shape("ghost-agent", Some("cat")).unwrap(), "unknown agent");
+        assert!(db.set_agent_shape("a1", Some("cat")).unwrap());
+        assert!(db.set_agent_shape("a1", Some("frog")).unwrap());
+        assert_eq!(db.agent_shapes().unwrap().get("a1").map(String::as_str), Some("frog"));
+        assert!(db.set_agent_shape("a1", None).unwrap());
+        assert!(db.agent_shapes().unwrap().is_empty());
+        db.set_agent_shape("a1", Some("bear")).unwrap();
+        db.delete_agent("a1").unwrap();
+        assert!(db.agent_shapes().unwrap().is_empty());
     }
 
     #[test]
