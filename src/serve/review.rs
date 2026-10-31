@@ -96,6 +96,7 @@ async fn start_review(d: &Daemon, task: &Task, state: &TaskState, now: &str) {
         brief: review_brief(task, state, &workspace),
         read_only: true,
         agent: seated,
+        profile: Some(state.reviewer_profile.clone()).filter(|p| !p.is_empty()),
     };
     let _ = d.store.modify_task_state(&task.id, now, |s| s.review_started_at = now.to_string());
     d.deliver(&task.session_id, LoopInput::SpawnLane(spec)).await;

@@ -777,6 +777,7 @@ pub struct LaneSpawn {
     pub brief: String,
     pub read_only: bool,
     pub agent: Option<String>,
+    pub profile: Option<String>,
 }
 
 // --- Runtime corrections ---

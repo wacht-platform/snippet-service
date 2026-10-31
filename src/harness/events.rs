@@ -493,7 +493,7 @@ impl CodingHarness {
     /// Start a lane the daemon asked for. No turn is started; the lane's report
     /// arrives like any other.
     pub(super) fn spawn_requested_lane(&self, state: &mut HarnessState, lanes: &mut LaneManager, spec: super::LaneSpawn) {
-        match lanes.spawn(&spec.title, &spec.brief, spec.read_only, spec.agent, None) {
+        match lanes.spawn(&spec.title, &spec.brief, spec.read_only, spec.agent, spec.profile) {
             Ok(id) => state.events.push(HarnessEvent::LaneSpawned { id, title: spec.title }),
             Err(error) => eprintln!("[lanes] requested lane `{}` not started: {error}", spec.title),
         }
