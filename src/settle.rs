@@ -76,6 +76,10 @@ pub fn refusal(f: &SettleFacts) -> Option<String> {
 }
 
 /// Whether the auto-sweep should try to settle this session now.
+pub fn sweep_eligible(settled: bool, keep_awake: bool, idle: i64, status: &str) -> bool {
+    !settled && !keep_awake && idle >= AUTO_SETTLE_AFTER_SECS && status != "running"
+}
+
 pub fn due_for_auto_settle(f: &SettleFacts, idle: i64) -> bool {
     !f.settled && !f.keep_awake && idle >= AUTO_SETTLE_AFTER_SECS && refusal(f).is_none()
 }
@@ -230,5 +234,14 @@ mod tests {
         assert!(!db.set_session_keep_awake("missing", true).unwrap());
         db.set_session_last_active("legacy", 9).unwrap();
         assert!(db.get_session_row("legacy").unwrap().unwrap().keep_awake, "waking keeps the flag");
+    }
+
+    #[test]
+    fn sweep_waits_twelve_hours_not_one() {
+        assert!(!sweep_eligible(false, false, COLD_AFTER_SECS + 60, "idle"));
+        assert!(!sweep_eligible(false, false, AUTO_SETTLE_AFTER_SECS - 1, "idle"));
+        assert!(sweep_eligible(false, false, AUTO_SETTLE_AFTER_SECS, "idle"));
+        assert!(!sweep_eligible(false, true, AUTO_SETTLE_AFTER_SECS * 2, "idle"));
+        assert!(!sweep_eligible(false, false, AUTO_SETTLE_AFTER_SECS * 2, "running"));
     }
 }

@@ -258,7 +258,7 @@ pub(crate) async fn sweep_once(d: &Shared) -> (usize, usize) {
 
     let mut candidates: Vec<_> = crate::session::list_routable_sessions()
         .into_iter()
-        .filter(|s| !s.settled && !s.keep_awake && s.idle_secs >= COLD_AFTER_SECS && s.status != "running")
+        .filter(|s| sweep_eligible(s.settled, s.keep_awake, s.idle_secs, &s.status))
         .collect();
     candidates.sort_by(|a, b| b.idle_secs.cmp(&a.idle_secs));
     let mut spent = 0;
