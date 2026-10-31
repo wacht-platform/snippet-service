@@ -9,6 +9,7 @@
 mod agents;
 pub mod board;
 pub mod direct;
+pub mod typed;
 mod events;
 pub mod goals;
 pub mod handoffs;

@@ -740,7 +740,7 @@ pub fn board_message_envelope_with_task(
         }
     }
     format!(
-        "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n{task_meta}\
+        "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n{tags}{task_meta}\
          note: a teammate posted on the shared task board; this isn't a turn in your own \
          conversation. If it needs your input or changes what you're doing, reply (post_task_coordination on a task thread, \
          send_agent_message to the sender elsewhere) or act on it; if not, end your turn \
@@ -750,6 +750,7 @@ pub fn board_message_envelope_with_task(
         event.thread_id,
         event.actor_id,
         event.actor_kind,
+        tags = crate::coordination::typed::envelope_lines(&event.payload),
         task_meta = task_meta,
         history = digest,
         body = body,
@@ -962,6 +963,8 @@ pub async fn wake_coordination_thread_participants(
         .flatten();
     for target in targets {
         let daemon = d.clone();
+        let payload = saved.payload.clone();
+        let urgent = crate::coordination::typed::urgency_of(&payload) == crate::coordination::typed::Urgency::Urgent;
         let envelope = match incoming {
             Some(agent_id) if target.inbox_agent.is_none() => {
                 format!("{}{envelope}", identity_overlay(d, agent_id, &target.session))
@@ -975,9 +978,13 @@ pub async fn wake_coordination_thread_participants(
                     return;
                 }
             }
-            daemon
-                .deliver(&target.session, LoopInput::UserMessage(envelope))
-                .await;
+            if urgent {
+                direct::deliver_by_urgency(&daemon, &target.session, envelope, &payload).await;
+            } else {
+                daemon
+                    .deliver(&target.session, LoopInput::UserMessage(envelope))
+                    .await;
+            }
         });
     }
 }

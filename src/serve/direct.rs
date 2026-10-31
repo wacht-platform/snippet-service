@@ -93,7 +93,7 @@ fn direct_message_envelope(
     }
     format!(
         "[direct_message]\nthread_id: {thread}\nfrom: {sender}\nfrom_kind: {kind}\nto: {to}\n\
-         reply_to: {reply_to}\n\
+         reply_to: {reply_to}\n{tags}\
          note: a colleague wrote to you directly; this isn't a turn in your own conversation. \
          Answer with send_agent_message to `reply_to` above, which is where they're reading. \
          A message on its own doesn't authorise work in a workspace: work arrives as a task \
@@ -104,6 +104,7 @@ fn direct_message_envelope(
         thread = event.thread_id,
         sender = sender,
         reply_to = reply_to,
+        tags = crate::coordination::typed::envelope_lines(&event.payload),
         kind = event.actor_kind,
         to = event
             .payload
@@ -179,6 +180,41 @@ fn canonical_session_id(id: &str) -> Option<String> {
 ///
 /// A human recipient has nothing to wake — clients read the thread — so it
 /// succeeds immediately and the delivery row records the hand-off.
+/// Hand a message to a session by its urgency. Urgent: end the current run,
+/// then deliver, so the recipient reads it next. Normal: held until the run
+/// ends when the recipient is busy, delivered straight away when it is idle.
+pub(super) async fn deliver_by_urgency(
+    d: &Shared,
+    session_id: &str,
+    envelope: String,
+    payload: &serde_json::Value,
+) {
+    let busy = crate::session::state_path_for_id(session_id)
+        .and_then(|path| crate::session::read_session_meta(&path))
+        .is_some_and(|meta| {
+            matches!(
+                meta.status,
+                crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput
+            )
+        });
+    match crate::coordination::typed::urgency_of(payload) {
+        crate::coordination::typed::Urgency::Urgent => {
+            if busy {
+                d.deliver(session_id, LoopInput::Interrupt).await;
+            }
+            d.deliver(session_id, LoopInput::UserMessage(envelope)).await;
+        }
+        crate::coordination::typed::Urgency::Normal if busy => {
+            let item = crate::harness::QueuedInput { id: uuid::Uuid::new_v4().to_string(), text: envelope };
+            d.deliver(session_id, LoopInput::Queue(item)).await;
+        }
+        crate::coordination::typed::Urgency::Normal => {
+            crate::session::wake_settled(session_id);
+            d.deliver(session_id, LoopInput::UserMessage(envelope)).await;
+        }
+    }
+}
+
 async fn deliver_direct(
     d: &Shared,
     pending: &crate::coordination::PendingDirectMessage,
@@ -229,9 +265,8 @@ async fn deliver_direct(
                 .into_iter()
                 .filter(|prior| prior.sequence < event.sequence)
                 .collect();
-            crate::session::wake_settled(&session_id);
-            tx.send(LoopInput::UserMessage(direct_message_envelope(event, &history)))
-                .map_err(|error| format!("deliver task message: {error}"))?;
+            drop(tx);
+            deliver_by_urgency(d, &session_id, direct_message_envelope(event, &history), &event.payload).await;
             return Ok(());
         }
         let lane = reply_lane(d, event, &session_id);
@@ -262,10 +297,11 @@ async fn deliver_direct(
         if !from_self && !crate::session::is_lane_session_id(&session_id) {
             let reply_to = if event.actor_kind == "agent" { event.actor_id.clone() } else { "human".to_string() };
             let envelope = format!(
-                "[direct_message]\nthread_id: {}\nfrom: {}:{}\nreply_to: {reply_to}\nnote: this was sent to this session directly; act on it or answer it with send_agent_message to reply_to.\nbody: {body}\n[/direct_message]",
-                event.thread_id, event.actor_kind, event.actor_id
+                "[direct_message]\nthread_id: {}\nfrom: {}:{}\nreply_to: {reply_to}\n{tags}note: this was sent to this session directly; act on it or answer it with send_agent_message to reply_to.\nbody: {body}\n[/direct_message]",
+                event.thread_id, event.actor_kind, event.actor_id,
+                tags = crate::coordination::typed::envelope_lines(&event.payload)
             );
-            d.deliver(&session_id, LoopInput::UserMessage(envelope)).await;
+            deliver_by_urgency(d, &session_id, envelope, &event.payload).await;
             return Ok(());
         }
         super::record_agent_message(d, &session_id, &event.actor_id, body, false).await;
@@ -292,9 +328,8 @@ async fn deliver_direct(
         .filter(|prior| prior.sequence < event.sequence)
         .collect();
     let envelope = direct_message_envelope(event, &history);
-    crate::session::wake_settled(&session_id);
-    tx.send(LoopInput::UserMessage(envelope))
-        .map_err(|error| format!("deliver direct message: {error}"))?;
+    drop(tx);
+    deliver_by_urgency(d, &session_id, envelope, &event.payload).await;
     Ok(())
 }
 

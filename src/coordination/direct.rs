@@ -170,6 +170,25 @@ impl Store {
         )
     }
 
+    /// A direct message carrying a kind, an urgency and optionally its task.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_direct_message_typed(
+        &self,
+        sender: (&str, &str),
+        recipient: (&str, &str),
+        body: &str,
+        idempotency_key: &str,
+        created_at: &str,
+        origin_session: Option<&str>,
+        origin_lane: Option<&str>,
+        about_task: Option<&str>,
+        extra: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<CoordinationEvent, StoreError> {
+        self.send_direct_with_payload(
+            sender, recipient, body, idempotency_key, created_at, origin_session, origin_lane, about_task, extra,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn send_direct_with_payload(
         &self,
@@ -630,6 +649,30 @@ mod tests {
         assert_eq!(pending.len(), 1, "exactly one undelivered recipient");
         assert_eq!(pending[0].recipient_id, "b");
         assert_eq!(pending[0].event.payload["body"], "hello");
+    }
+
+    #[test]
+    fn a_typed_urgent_message_keeps_its_kind_urgency_and_task() {
+        let db = Store::open_in_memory().unwrap();
+        db.create_agent(&worker("a")).unwrap();
+        db.create_agent(&worker("b")).unwrap();
+        let extra = crate::coordination::typed::payload_fields(
+            Some("blocker"),
+            crate::coordination::typed::Urgency::Urgent,
+            Some("t1"),
+        );
+        db.send_direct_message_typed(
+            ("agent", "a"), ("agent", "b"), "stuck", "key-t", "2026-01-01T00:00:00Z", None, None, Some("t1"), extra,
+        )
+        .unwrap();
+        let pending = db.list_pending_direct_deliveries(50, "9999").unwrap();
+        let payload = &pending[0].event.payload;
+        assert_eq!(payload["kind"], "blocker");
+        assert_eq!(payload["task_id"], "t1");
+        assert_eq!(
+            crate::coordination::typed::urgency_of(payload),
+            crate::coordination::typed::Urgency::Urgent
+        );
     }
 
     /// A failing delivery backs off and is eventually given up on, so it can
