@@ -1,13 +1,15 @@
 //! Settled sessions: parked conversations that routing skips and that are deleted later.
 //!
 //! A session idle for `COLD_AFTER_SECS` is assumed to have lost its provider prompt cache.
-//! The daemon settles such a session once its memory is saved, and deletes it
+//! One idle for `AUTO_SETTLE_AFTER_SECS` is settled once its memory is saved, and deleted
 //! `DELETE_AFTER_SECS` after it was settled. Any message sent into it wakes it.
 
 use crate::store::Store;
 
-/// Idle time after which the prompt cache is assumed purged and a session is auto-settled.
+/// Idle time after which the prompt cache is assumed purged.
 pub const COLD_AFTER_SECS: i64 = 3600;
+/// Inactivity before a session is settled automatically.
+pub const AUTO_SETTLE_AFTER_SECS: i64 = 12 * 3600;
 /// How long a session stays settled before the daemon deletes it (its memory repo is kept).
 pub const DELETE_AFTER_SECS: i64 = 15 * 24 * 3600;
 /// Interval between settle sweeps.
@@ -75,7 +77,7 @@ pub fn refusal(f: &SettleFacts) -> Option<String> {
 
 /// Whether the auto-sweep should try to settle this session now.
 pub fn due_for_auto_settle(f: &SettleFacts, idle: i64) -> bool {
-    !f.settled && !f.keep_awake && idle >= COLD_AFTER_SECS && refusal(f).is_none()
+    !f.settled && !f.keep_awake && idle >= AUTO_SETTLE_AFTER_SECS && refusal(f).is_none()
 }
 
 /// Sessions whose settled time is more than `DELETE_AFTER_SECS` ago.
@@ -135,12 +137,12 @@ mod tests {
     #[test]
     fn auto_settle_needs_cold_unsettled_eligible() {
         let f = facts();
-        assert!(!due_for_auto_settle(&f, COLD_AFTER_SECS - 1));
-        assert!(due_for_auto_settle(&f, COLD_AFTER_SECS));
+        assert!(!due_for_auto_settle(&f, AUTO_SETTLE_AFTER_SECS - 1));
+        assert!(due_for_auto_settle(&f, AUTO_SETTLE_AFTER_SECS));
         let settled = SettleFacts { settled: true, ..facts() };
-        assert!(!due_for_auto_settle(&settled, COLD_AFTER_SECS * 5));
+        assert!(!due_for_auto_settle(&settled, AUTO_SETTLE_AFTER_SECS * 5));
         let kept = SettleFacts { keep_awake: true, ..facts() };
-        assert!(!due_for_auto_settle(&kept, COLD_AFTER_SECS * 5));
+        assert!(!due_for_auto_settle(&kept, AUTO_SETTLE_AFTER_SECS * 5));
         assert!(refusal(&kept).is_none(), "manual settle stays allowed");
     }
 

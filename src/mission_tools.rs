@@ -2056,7 +2056,7 @@ impl Tool for SessionState {
             input_schema: schema(json!({
                 "session_id": {"type": "string", "description": "Exactly as list_sessions shows it."},
                 "settled": {"type": "boolean", "description": "true parks the session, false wakes it."},
-                "keep_awake": {"type": "boolean", "description": "true stops automatic settling after an hour idle."}
+                "keep_awake": {"type": "boolean", "description": "true stops automatic settling after 12 hours idle."}
             }), &["session_id"]),
         }
     }
