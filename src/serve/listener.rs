@@ -264,6 +264,9 @@ pub(super) fn audio(device: &str, h: u32, pcm: &[u8]) -> bool {
         if !crate::voiceprint::neural_ready() {
             s.vp_acc.feed_pcm(pcm);
         }
+        if !at(&s.playing, s.g) && crate::ambient::pcm_rms(pcm) >= crate::ambient::FLOOR_RMS {
+            crate::ambient::hold_floor();
+        }
         s.ring.extend(pcm);
         s.g += pcm.len() as u64;
         if s.ring.len() > RING {
@@ -454,6 +457,9 @@ impl Listener {
         let Some(order) = v.get("turn_order").and_then(|x| x.as_i64()) else { return };
         super::autonomy::note_heard();
         let ended = v.get("end_of_turn").and_then(|x| x.as_bool()).unwrap_or(false);
+        if !ended {
+            crate::ambient::hold_floor();
+        }
         let transcript = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
         let mut s = self.inner.lock().unwrap();
         let Some(base) = s.conn.as_ref().filter(|c| c.id == conn).map(|c| c.base) else { return };

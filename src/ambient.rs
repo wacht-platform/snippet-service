@@ -153,6 +153,48 @@ pub fn note_hearing() {
     *HEARD_AT.lock().unwrap() = Some(Instant::now());
 }
 
+/// Mic level (16-bit RMS) above which a chunk counts as the user speaking. Deliberately
+/// high: it also reacts to loud media or noise, so it is tuned on a device.
+pub const FLOOR_RMS: f64 = 1800.0;
+const FLOOR_HOLD: Duration = Duration::from_millis(900);
+/// A floor held this long without a break is treated as noise, not a person.
+const FLOOR_MAX: Duration = Duration::from_secs(8);
+
+struct Floor {
+    last: Instant,
+    since: Instant,
+}
+
+static FLOOR: Mutex<Option<Floor>> = Mutex::new(None);
+
+/// The user is audibly speaking, known before any transcript arrives.
+pub fn hold_floor() {
+    let now = Instant::now();
+    let mut floor = FLOOR.lock().unwrap();
+    match floor.as_mut() {
+        Some(f) if now.duration_since(f.last) < FLOOR_HOLD => f.last = now,
+        _ => *floor = Some(Floor { last: now, since: now }),
+    }
+}
+
+/// True while the user holds the floor: nothing the agent says should start now.
+pub fn floor_held() -> bool {
+    FLOOR
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|f| f.last.elapsed() < FLOOR_HOLD && f.last.duration_since(f.since) < FLOOR_MAX)
+}
+
+pub fn pcm_rms(pcm: &[u8]) -> f64 {
+    let n = pcm.len() / 2;
+    if n == 0 {
+        return 0.0;
+    }
+    let sum: f64 = pcm.chunks_exact(2).map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])).powi(2)).sum();
+    (sum / n as f64).sqrt()
+}
+
 fn still_talking() -> bool {
     HEARD_AT.lock().unwrap().is_some_and(|t| t.elapsed() < STILL_TALKING)
 }
@@ -675,7 +717,7 @@ mod room_tests {
 
 #[cfg(test)]
 mod wait_tests {
-    use super::{WaitOutcome, WaitSlot};
+    use super::{floor_held, hold_floor, pcm_rms, WaitOutcome, WaitSlot, FLOOR_RMS};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -715,6 +757,17 @@ mod wait_tests {
         assert_eq!(slot.begin().wait(MS(50), MS(300), || true).await, WaitOutcome::TimedOut);
         let took = started.elapsed();
         assert!(took >= MS(300) && took < MS(700), "{took:?}");
+    }
+
+    #[test]
+    fn mic_level_and_the_floor_lock() {
+        let quiet: Vec<u8> = (0..160).flat_map(|_| 120i16.to_le_bytes()).collect();
+        let loud: Vec<u8> = (0..160).flat_map(|i| (if i % 2 == 0 { 5000i16 } else { -5000i16 }).to_le_bytes()).collect();
+        assert!(pcm_rms(&quiet) < FLOOR_RMS);
+        assert!(pcm_rms(&loud) >= FLOOR_RMS);
+        assert_eq!(pcm_rms(&[]), 0.0);
+        hold_floor();
+        assert!(floor_held());
     }
 
     #[tokio::test]

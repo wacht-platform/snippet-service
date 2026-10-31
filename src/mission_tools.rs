@@ -608,6 +608,14 @@ impl Tool for Speak {
     }
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: SpeakArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        if crate::ambient::conversation().is_some() && crate::ambient::floor_held() {
+            return Ok(ToolResult::success(json!({
+                "held": true,
+                "spoken": false,
+                "result": "Not spoken: the user is speaking and has the floor.",
+                "next": "Stay silent. Their turn arrives next; answer it together with what you meant to say.",
+            })));
+        }
         let asking = crate::speech::asks_aloud(&args.text, args.expecting.as_deref());
         let expecting = args.expecting.as_deref().filter(|_| asking);
         let mut out = crate::speech::speak(&args.text, expecting, args.about.as_deref(), args.mode.as_deref() == Some("replace")).await.map_err(ToolError::msg)?;
