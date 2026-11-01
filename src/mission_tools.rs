@@ -556,7 +556,9 @@ fn wait_result(outcome: crate::ambient::WaitOutcome, waited_ms: u64, reason: Opt
                 "next": "Answer what they said.",
             });
             if let Some(heard) = crate::speech::take_interruption() {
-                v["interrupted_reply"] = Value::String(heard);
+                v["interrupted_reply"] = Value::String(heard.heard);
+                v["unsaid"] = Value::String(heard.unsaid);
+                v["heard_none"] = Value::Bool(v["interrupted_reply"].as_str().is_some_and(|h| h.trim().is_empty()));
             }
             v
         }

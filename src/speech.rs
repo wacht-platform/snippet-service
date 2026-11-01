@@ -9,7 +9,12 @@ struct FluxProvisional {
 }
 
 static FLUX_STREAMING: Mutex<Option<FluxProvisional>> = Mutex::new(None);
-static STREAM_INTERRUPTED: Mutex<Option<String>> = Mutex::new(None);
+static STREAM_INTERRUPTED: Mutex<Option<Interruption>> = Mutex::new(None);
+
+pub struct Interruption {
+    pub heard: String,
+    pub unsaid: String,
+}
 static DIRECT: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
 static TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -69,12 +74,12 @@ pub fn has_interruption() -> bool {
     STREAM_INTERRUPTED.lock().unwrap().is_some() || crate::tts_stream::is_reconciling()
 }
 
-pub fn take_interruption() -> Option<String> {
+pub fn take_interruption() -> Option<Interruption> {
     STREAM_INTERRUPTED.lock().unwrap().take()
 }
 
-pub(crate) fn note_stream_interruption(text: String) {
-    *STREAM_INTERRUPTED.lock().unwrap() = Some(text);
+pub(crate) fn note_stream_interruption(cut: Interruption) {
+    *STREAM_INTERRUPTED.lock().unwrap() = Some(cut);
     crate::ambient::emit_state("interrupted");
 }
 

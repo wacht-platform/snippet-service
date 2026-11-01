@@ -626,7 +626,7 @@ async fn deliver(
     let _ = crate::speech::interrupt(device);
     crate::tts_stream::settle(Duration::from_millis(120)).await;
     if let Some(heard) = crate::speech::take_interruption() {
-        attrs.push_str(&format!(" interrupted_reply=\"{}\"", ambient_watch::escape(&heard)));
+        attrs.push_str(&ambient_watch::interruption_attrs(&heard));
     }
     let ctx = context(d, device, &ids);
     let envelope = format!("<ambient_turn{attrs}>{ctx}{}</ambient_turn>", ambient_watch::escape(&text));

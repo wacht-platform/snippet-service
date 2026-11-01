@@ -1019,7 +1019,8 @@ async fn reconcile(
         }
         let _ = s.cmd.send(Cmd::Close);
     }
-    let mut last = String::new();
+    let mut heard_all: Vec<String> = Vec::new();
+    let mut unsaid_all: Vec<String> = Vec::new();
     for t in &turns {
         let heard = match (spoken.remove(&t.turn), heard_by_turn.get(&t.turn)) {
             (Some(text), _) => text,
@@ -1028,12 +1029,20 @@ async fn reconcile(
             (None, None) => String::new(),
         };
         write_heard(t.turn, status, &heard);
+        let skip = heard.split_whitespace().count();
+        let rest = t.text().split_whitespace().skip(skip).collect::<Vec<_>>().join(" ");
         if !heard.is_empty() {
-            last = heard;
+            heard_all.push(heard);
+        }
+        if !rest.is_empty() {
+            unsaid_all.push(rest);
         }
     }
     if interrupted {
-        crate::speech::note_stream_interruption(last);
+        crate::speech::note_stream_interruption(crate::speech::Interruption {
+            heard: heard_all.join(" "),
+            unsaid: unsaid_all.join(" "),
+        });
     }
 }
 

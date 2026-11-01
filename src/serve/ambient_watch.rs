@@ -147,6 +147,17 @@ fn ended_ago(secs: i64) -> &'static str {
     }
 }
 
+pub(super) fn interruption_attrs(cut: &crate::speech::Interruption) -> String {
+    let mut attrs = format!(" interrupted_reply=\"{}\"", escape(&cut.heard));
+    if cut.heard.trim().is_empty() {
+        attrs.push_str(" heard_none=\"true\"");
+    }
+    if !cut.unsaid.trim().is_empty() {
+        attrs.push_str(&format!(" unsaid=\"{}\"", escape(&cut.unsaid)));
+    }
+    attrs
+}
+
 pub(super) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -315,7 +326,7 @@ pub(super) struct Heard {
 pub(super) struct Said {
     pub text: String,
     pub ago: i64,
-    pub heard: Option<String>,
+    pub cut: bool,
 }
 
 pub(super) struct Moment {
@@ -381,7 +392,7 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
         "speaking_when_utterance_was_heard": m.during_playback,
         "last_said": last_text,
         "last_said_ended": last.map(|a| ended_ago(a.ago)).unwrap_or("not in the last few minutes"),
-        "last_said_was_cut_off": last.is_some_and(|a| a.heard.is_some()),
+        "last_said_was_cut_off": last.is_some_and(|a| a.cut),
         "last_said_was_question": last.is_some_and(|a| a.ago < 120 && a.text.trim_end().ends_with('?')),
         "words_shared_with_utterance": shared,
     });
@@ -573,7 +584,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
             let mut assistant = Vec::new();
             let mut stmt = c.prepare(
                 "SELECT t.text, t.created_at + COALESCE((SELECT SUM(ms) FROM ambient_chunks WHERE turn_id = t.id), 0) / 1000,
-                        t.status, COALESCE(t.heard_text, '')
+                        t.status
                  FROM ambient_turns t
                  WHERE t.role = 'assistant' AND t.created_at >= ?1 AND t.text != '' AND t.status != 'cancelled'
                    AND t.device = (SELECT device FROM ambient_events WHERE id = ?2)
@@ -581,11 +592,10 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
             )?;
             for row in stmt.query_map(rusqlite::params![now - 300, id], |r| {
                 let status: String = r.get(2)?;
-                let heard: String = r.get(3)?;
                 Ok(Said {
                     text: r.get(0)?,
                     ago: now - r.get::<_, i64>(1)?,
-                    heard: (status == "interrupted" && !heard.trim().is_empty()).then_some(heard),
+                    cut: status == "interrupted",
                 })
             })? {
                 assistant.push(row?);
@@ -690,7 +700,7 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
             let mut assistant = Vec::new();
             let mut stmt = c.prepare(
                 "SELECT t.text, t.created_at + COALESCE((SELECT SUM(ms) FROM ambient_chunks WHERE turn_id = t.id), 0) / 1000,
-                        t.status, COALESCE(t.heard_text, '')
+                        t.status
                  FROM ambient_turns t
                  WHERE t.role = 'assistant' AND t.created_at >= ?1 AND t.text != '' AND t.status != 'cancelled'
                    AND t.device = ?2
@@ -698,11 +708,10 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
             )?;
             for row in stmt.query_map(rusqlite::params![now - 300, device], |r| {
                 let status: String = r.get(2)?;
-                let heard: String = r.get(3)?;
                 Ok(Said {
                     text: r.get(0)?,
                     ago: (now - r.get::<_, i64>(1)?).max(0),
-                    heard: (status == "interrupted" && !heard.trim().is_empty()).then_some(heard),
+                    cut: status == "interrupted",
                 })
             })? {
                 assistant.push(row?);
@@ -712,7 +721,7 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         .unwrap_or_default();
     for live_txt in crate::tts_stream::live_texts(device) {
         if !assistant.iter().any(|a| a.text.trim() == live_txt.trim()) {
-            assistant.insert(0, Said { text: live_txt, ago: 0, heard: None });
+            assistant.insert(0, Said { text: live_txt, ago: 0, cut: false });
         }
     }
     let (pending, mc_chat, mc_tools) = if chat_context {
@@ -872,5 +881,14 @@ mod voice_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn interruption_attrs_mark_nothing_heard_and_unsaid() {
+        use crate::speech::Interruption;
+        let none = interruption_attrs(&Interruption { heard: String::new(), unsaid: "All of it.".into() });
+        assert!(none.contains("heard_none=\"true\"") && none.contains("unsaid=\"All of it.\""));
+        let part = interruption_attrs(&Interruption { heard: "The build passed".into(), unsaid: "two tests skipped".into() });
+        assert!(!part.contains("heard_none") && part.contains("interrupted_reply=\"The build passed\""));
     }
 }
