@@ -398,7 +398,7 @@ impl RecurringJob {
         }
         let playbook = self.playbook_topic();
         out.push_str(&format!("\n\n---\n\nThis job runs again, and each run should go better than the last. Before you start, read its playbook in project memory (`playbooks/{playbook}`) if it exists, and follow it. Before you finish, update that playbook: what worked and should stay the approach, what went wrong and what to do instead next time (situation → approach → why), and any entry this run proved wrong. Keep it short: a proven rule replaces the run notes that led to it."));
-        out.push_str("\n\nWhen the work is done (or blocked), call `complete_goal` with a short summary saying **what this run was**, **what you did**, **how it went**, and **what the next run will do better** — that summary is surfaced to the user as the run's outcome.");
+        out.push_str("\n\nWhen the work is done, or genuinely blocked after you tried it (a failed tool call alone is not a blocker), call `complete_goal` with a short summary saying **what this run was**, **what you did**, **how it went**, and **what the next run will do better** — that summary is surfaced to the user as the run's outcome.");
         Ok(out)
     }
 

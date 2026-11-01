@@ -1234,7 +1234,7 @@ impl Tool for AckHandoff {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "ack_handoff".into(),
-            description: "Accept the handover addressed to you. Your first action on a handed-over task: it moves the session lease to you. Read the handover (done, next, risks, files) first.".into(),
+            description: "Accept a handover addressed to you, when a message or envelope says one is waiting for you. It moves the session lease to you. Read the handover (done, next, risks, files) first. Never call it at the start of a scheduled run, goal wake or ordinary task: with nothing waiting it only errors.".into(),
             input_schema: schema(json!({"task_id": {"type": "string", "description": "Defaults to the task in progress in this session"}}), &[]),
         }
     }
@@ -1250,7 +1250,7 @@ impl Tool for AckHandoff {
                 .and_then(|s| db.list_tasks(Some(s), None).ok())
                 .and_then(|tasks| tasks.into_iter().find(|t| !t.status.is_terminal() && db.pending_handoff(&t.id).ok().flatten().is_some())),
         }
-        .ok_or_else(|| ToolError::msg("no task with a handover waiting; pass task_id"))?;
+        .ok_or_else(|| ToolError::msg("no handover is waiting for you, so there is nothing to accept. This is not a problem with your task: carry on with the work you were given."))?;
         let now = now_rfc3339();
         let h = db.ack_handoff(&task.id, &actor_id, &now).map_err(|e| ToolError::msg(e.to_string()))?;
         let lease = db.current_lease(&task.id).ok().flatten();
