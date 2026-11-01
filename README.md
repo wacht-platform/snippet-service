@@ -28,7 +28,7 @@ A code-first agent for your terminal, with a phone and desktop app to steer it f
 ## Install
 
 ```sh
-curl -fsSL https://snippet.wacht.dev/install.sh | sh
+curl -fsSL https://snippet.fyi/install.sh | sh
 ```
 
 Or download a package from the [releases](https://github.com/wacht-platform/snippet-service/releases), or build from source with [Rust](https://rustup.rs):
