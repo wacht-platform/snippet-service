@@ -394,6 +394,7 @@ fn ask_user_choice_question_takes_a_typed_answer() {
     assert!(!handle_question_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)));
     app.answer_current_question();
     assert!(app.q_answers.is_empty() && app.input.is_empty(), "sent and reset");
+}
 
     /// Render one frame of a given app.
     fn snapshot_of(app: &mut App, width: u16, height: u16) -> Vec<String> {
@@ -443,10 +444,10 @@ fn ask_user_choice_question_takes_a_typed_answer() {
         assert_eq!(app.active_conversation, "default");
     }
 
-    /// In a git repository a new session asks where it works, offering a new
-    /// worktree, the folder, and the worktrees that already exist.
+    /// In a git repository a new session offers a new worktree, the folder, and the
+    /// sessions that already exist there; picking one opens it, never a blank one.
     #[test]
-    fn a_new_session_in_a_repo_asks_where_it_works() {
+    fn a_new_session_offers_existing_sessions_not_worktrees() {
         use crate::tui::commands::NewChoice;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -459,22 +460,57 @@ fn ask_user_choice_question_takes_a_typed_answer() {
         let side = dir.path().join("side");
         git(&["worktree", "add", "-q", "-b", "side", side.to_str().unwrap()]);
         let repo = repo.canonicalize().unwrap();
+        let home = repo.display().to_string();
 
         let mut app = tui_app();
         app.options.config = app.options.config.for_workspace(repo.clone());
+        app.daemon_sessions = Some(vec![
+            row("a", &home, None, "c1", "Root work", 10),
+            row("b", "/wt/repo/ab12", Some(&home), "default", "Isolated work", 20),
+        ]);
         app.begin_new_session("fresh".into());
         assert!(app.screen == Screen::NewSession);
         assert_eq!(app.new_choices[0], NewChoice::Worktree(repo.clone()));
         assert_eq!(app.new_choices[1], NewChoice::Folder(repo.clone()));
-        assert!(matches!(&app.new_choices[2], NewChoice::Existing { branch: Some(b), .. } if b == "side"));
+        assert!(matches!(&app.new_choices[2], NewChoice::Session(c) if c.title == "Isolated work"));
+        assert!(matches!(&app.new_choices[3], NewChoice::Session(c) if c.title == "Root work"));
+        assert_eq!(app.new_choices.len(), 4, "the empty worktree is not a choice");
 
-        let text = snapshot_of(&mut app, 100, 20).join("\n");
-        assert!(text.contains("New worktree") && text.contains("Existing worktrees"), "{text}");
+        let text = snapshot_of(&mut app, 100, 24).join("\n");
+        assert!(text.contains("New worktree") && text.contains("Existing sessions"), "{text}");
+        assert!(text.contains("Isolated work") && !text.contains("Existing worktrees"), "{text}");
 
+        app.start_new_session(app.new_choices[2].clone(), "ignored".into());
+        assert!(app.screen == Screen::Main);
+        assert_eq!(app.options.config.workspace, PathBuf::from("/wt/repo/ab12"));
+        assert_ne!(app.new_workspace, Some(crate::session::WorkspaceMode::Worktree));
+
+        app.options.config = app.options.config.for_workspace(repo.clone());
+        app.begin_new_session("fresh".into());
         app.start_new_session(app.new_choices[0].clone(), "fresh".into());
         assert!(app.screen == Screen::Main);
         assert_eq!(app.new_workspace, Some(crate::session::WorkspaceMode::Worktree));
         assert_eq!(app.active_conversation, "fresh");
     }
-}
 
+    /// Outside a repository there is nothing to choose between unless the folder
+    /// already has sessions, which are then offered beside "This folder".
+    #[test]
+    fn a_plain_folder_offers_its_sessions_and_skips_the_screen_when_it_has_none() {
+        use crate::tui::commands::NewChoice;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().canonicalize().unwrap();
+        let mut app = tui_app();
+        app.options.config = app.options.config.for_workspace(plain.clone());
+        app.daemon_sessions = Some(Vec::new());
+        app.begin_new_session("fresh".into());
+        assert!(app.screen == Screen::Main, "no sessions: straight to a new one");
+
+        let home = plain.display().to_string();
+        app.daemon_sessions = Some(vec![row("a", &home, None, "c1", "Earlier work", 10)]);
+        app.begin_new_session("fresh2".into());
+        assert!(app.screen == Screen::NewSession);
+        assert_eq!(app.new_choices[0], NewChoice::Folder(plain));
+        assert!(matches!(&app.new_choices[1], NewChoice::Session(c) if c.title == "Earlier work"));
+        assert_eq!(app.new_choices.len(), 2);
+    }

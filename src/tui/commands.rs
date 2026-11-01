@@ -464,16 +464,18 @@ impl App {
     /// where it works first; elsewhere it works in the folder.
     pub(crate) fn begin_new_session(&mut self, name: String) {
         let home = self.home_folder();
-        let Some((_, worktrees)) = crate::session::repo_worktrees(&home) else {
+        let in_repo = crate::session::repo_worktrees(&home).is_some();
+        let existing = self.conversations(true);
+        if !in_repo && existing.is_empty() {
             self.start_new_session(NewChoice::Folder(home), name);
             return;
-        };
-        let mut choices = vec![NewChoice::Worktree(home.clone()), NewChoice::Folder(home)];
-        choices.extend(
-            worktrees
-                .into_iter()
-                .map(|w| NewChoice::Existing { path: w.path, branch: w.branch }),
-        );
+        }
+        let mut choices = Vec::new();
+        if in_repo {
+            choices.push(NewChoice::Worktree(home.clone()));
+        }
+        choices.push(NewChoice::Folder(home));
+        choices.extend(existing.into_iter().map(NewChoice::Session));
         self.new_choices = choices;
         self.new_choice_index = 0;
         self.new_session_name = name;
@@ -482,19 +484,13 @@ impl App {
     }
 
     pub(crate) fn start_new_session(&mut self, choice: NewChoice, name: String) {
-        if let NewChoice::Existing { ref path, .. } = choice
-            && let Some(existing) = self
-                .conversations(false)
-                .into_iter()
-                .find(|c| &c.folder == path || crate::session::linked_worktree_root(&c.folder).as_deref() == Some(path.as_path()))
-        {
-            self.open_conversation(&existing);
-            return;
-        }
         let (folder, mode) = match choice {
             NewChoice::Worktree(folder) => (folder, crate::session::WorkspaceMode::Worktree),
             NewChoice::Folder(folder) => (folder, crate::session::WorkspaceMode::Folder),
-            NewChoice::Existing { path, .. } => (path, crate::session::WorkspaceMode::Folder),
+            NewChoice::Session(c) => {
+                self.open_conversation(&c);
+                return;
+            }
         };
         if folder != self.options.config.workspace {
             self.options.config = self.options.config.for_workspace(folder);
@@ -1308,6 +1304,6 @@ pub(crate) enum NewChoice {
     Worktree(PathBuf),
     /// The folder itself.
     Folder(PathBuf),
-    /// A worktree that already exists.
-    Existing { path: PathBuf, branch: Option<String> },
+    /// A session that already exists, in this folder or one of its worktrees.
+    Session(Conversation),
 }

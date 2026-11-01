@@ -435,9 +435,9 @@ pub(crate) fn render_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
     }
 }
 
-/// Where a new session works, chosen before it starts in a git repository.
+/// Start a new session, or pick up an existing one in this folder or its worktrees.
 pub(crate) fn render_new_session(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    use super::chrome::{Row, section, screen_frame, sub_line};
+    use super::chrome::{Row, compact_secs, section, screen_frame, sub_line};
     use crate::tui::commands::NewChoice;
     let folder = app
         .home_folder()
@@ -448,38 +448,57 @@ pub(crate) fn render_new_session(frame: &mut ratatui::Frame<'_>, area: Rect, app
     let body = screen_frame(
         frame,
         area,
-        "New session",
-        &format!("in {folder} — where should it work?"),
-        &[("↑↓", "choose"), ("Enter", "start"), ("Esc", "cancel")],
+        "Sessions",
+        &format!("in {folder} — start something new or pick up where you left off"),
+        &[("↑↓", "choose"), ("Enter", "start or open"), ("Esc", "cancel")],
     );
     let width = body.width as usize;
     let name_of = |path: &std::path::Path| path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+    let now = chrono::Utc::now().timestamp();
     let mut lines = Vec::new();
-    let mut existing_header = false;
+    let mut selected_line = 0;
+    let mut sessions_header = false;
     for (i, choice) in app.new_choices.iter().enumerate() {
-        let (title, detail) = match choice {
-            NewChoice::Worktree(_) => (
-                "New worktree".to_string(),
-                "Its own branch and checkout; other sessions' edits stay apart.".to_string(),
-            ),
-            NewChoice::Folder(path) => (
-                format!("This folder ({})", name_of(path)),
-                "Work directly in the checkout.".to_string(),
-            ),
-            NewChoice::Existing { path, branch } => {
-                if !existing_header {
-                    existing_header = true;
-                    lines.push(section("Existing worktrees"));
-                }
-                (format!("⎇ {}", branch.clone().unwrap_or_else(|| name_of(path))), path.display().to_string())
-            }
-        };
         let selected = i == app.new_choice_index;
-        lines.push(Row { selected, dot: None, title: &title, emphasis: true, meta: "", right: None }.line(width));
-        lines.push(sub_line(&detail, selected, 2, width));
-        lines.push(Line::from(""));
+        if selected {
+            selected_line = lines.len();
+        }
+        match choice {
+            NewChoice::Worktree(_) => {
+                lines.push(
+                    Row { selected, dot: None, title: "New worktree", emphasis: true, meta: "", right: None }.line(width),
+                );
+                lines.push(sub_line("Its own branch and checkout; other sessions' edits stay apart.", selected, 2, width));
+                lines.push(Line::from(""));
+            }
+            NewChoice::Folder(path) => {
+                let title = format!("This folder ({})", name_of(path));
+                lines.push(Row { selected, dot: None, title: &title, emphasis: true, meta: "", right: None }.line(width));
+                lines.push(sub_line("Work directly in the checkout.", selected, 2, width));
+                lines.push(Line::from(""));
+            }
+            NewChoice::Session(c) => {
+                if !sessions_header {
+                    sessions_header = true;
+                    lines.push(section("Existing sessions"));
+                }
+                let meta = c.branch.as_ref().map(|b| format!("⎇ {b}")).unwrap_or_default();
+                lines.push(
+                    Row {
+                        selected,
+                        dot: Some(super::boards::status_color(&c.status)),
+                        title: &c.title,
+                        emphasis: false,
+                        meta: &meta,
+                        right: Some((compact_secs(now - c.last_active), faint())),
+                    }
+                    .line(width),
+                );
+            }
+        }
     }
-    frame.render_widget(Paragraph::new(lines), body);
+    let scroll = (selected_line + 2).saturating_sub(body.height as usize);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body);
 }
 
 pub(crate) fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {

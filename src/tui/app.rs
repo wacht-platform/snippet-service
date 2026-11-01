@@ -45,8 +45,8 @@ pub(crate) enum Screen {
     Term,
     RewindCheckpointSelection,
     ForkCheckpointSelection,
-    /// Where a new session works: a new worktree, the folder, or an existing
-    /// worktree. Shown before a new session starts in a git repository.
+    /// Start fresh in a new worktree or the folder, or pick up an existing
+    /// session. Shown when a launch or `/new` finds a repository or sessions.
     NewSession,
 }
 
