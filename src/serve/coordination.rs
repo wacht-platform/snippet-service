@@ -250,8 +250,8 @@ async fn create_task(
         return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
     };
     let session_id = crate::session::session_id_for_state_path(&target_path);
-    if mission_control::get_session(&d.mission_control_root, &session_id).is_err() {
-        if let Err(error) = mission_control::create_session(
+    if mission_control::get_session(&d.mission_control_root, &session_id).is_err()
+        && let Err(error) = mission_control::create_session(
             &d.mission_control_root,
             &session_id,
             state.title.as_deref().unwrap_or("Managed session"),
@@ -263,7 +263,6 @@ async fn create_task(
             )
                 .into_response();
         }
-    }
     let now = chrono::Utc::now().to_rfc3339();
     let id = req
         .id
@@ -972,12 +971,11 @@ pub async fn wake_coordination_thread_participants(
             _ => envelope.clone(),
         };
         tokio::spawn(async move {
-            if let Some(agent_id) = target.inbox_agent.as_deref() {
-                if let Err(error) = direct::ensure_agent_inbox(&daemon, agent_id).await {
+            if let Some(agent_id) = target.inbox_agent.as_deref()
+                && let Err(error) = direct::ensure_agent_inbox(&daemon, agent_id).await {
                     eprintln!("[coordination] no inbox for `{agent_id}`: {error}");
                     return;
                 }
-            }
             if urgent {
                 direct::deliver_by_urgency(&daemon, &target.session, envelope, &payload).await;
             } else {

@@ -69,11 +69,10 @@ pub(crate) async fn add_account(
                 let url = device.verification_url.clone();
                 let target = id.clone();
                 tokio::spawn(async move {
-                    if let Ok(tokens) = crate::chatgpt_auth::complete_device_code_login(device).await {
-                        if crate::chatgpt_auth::save_account(&target, &tokens).is_ok() {
+                    if let Ok(tokens) = crate::chatgpt_auth::complete_device_code_login(device).await
+                        && crate::chatgpt_auth::save_account(&target, &tokens).is_ok() {
                             crate::accounts::set_label("chatgpt", &target, &label);
                         }
-                    }
                 });
                 Json(serde_json::json!({ "id": id, "user_code": user_code, "verification_uri": url })).into_response()
             }
@@ -84,11 +83,10 @@ pub(crate) async fn add_account(
                 let poll = device.clone();
                 let target = id.clone();
                 tokio::spawn(async move {
-                    if let Ok(tokens) = crate::xai_auth::poll_for_tokens(poll).await {
-                        if crate::xai_auth::save_account(&target, &tokens).is_ok() {
+                    if let Ok(tokens) = crate::xai_auth::poll_for_tokens(poll).await
+                        && crate::xai_auth::save_account(&target, &tokens).is_ok() {
                             crate::accounts::set_label("xai", &target, &label);
                         }
-                    }
                 });
                 Json(serde_json::json!({
                     "id": id,

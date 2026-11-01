@@ -739,11 +739,10 @@ pub(crate) async fn enroll_voiceprint(
         };
         let mut latest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
         while let Ok(Some(entry)) = dir.next_entry().await {
-            if let Ok(modified) = entry.metadata().await.and_then(|m| m.modified()) {
-                if latest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            if let Ok(modified) = entry.metadata().await.and_then(|m| m.modified())
+                && latest.as_ref().is_none_or(|(t, _)| modified > *t) {
                     latest = Some((modified, entry.path()));
                 }
-            }
         }
         let Some((_, path)) = latest else {
             return (StatusCode::BAD_REQUEST, "No recent ambient voice recordings found").into_response();

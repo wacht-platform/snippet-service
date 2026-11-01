@@ -181,13 +181,11 @@ impl StreamBuffer {
     }
 
     pub fn tool_event<'a>(handle: impl Into<Option<&'a StreamHandle>>, ev: ToolArgEvent) {
-        if let Some(handle) = handle.into() {
-            if let Ok(buf) = handle.lock() {
-                if let Some(tap) = &buf.tool_tap {
+        if let Some(handle) = handle.into()
+            && let Ok(buf) = handle.lock()
+                && let Some(tap) = &buf.tool_tap {
                     let _ = tap.send(ev);
                 }
-            }
-        }
     }
 
     pub fn append(handle: &StreamHandle, delta: &str) {

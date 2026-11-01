@@ -74,15 +74,12 @@ pub(crate) fn wire_events(events: &[crate::harness::HarnessEvent], compact: bool
             .iter()
             .map(|event| {
                 let mut v = serde_json::to_value(event).unwrap_or_default();
-                if let crate::harness::HarnessEvent::ToolResult { .. } = event {
-                    if let Some(o) = v.as_object_mut() {
-                        if let Some(result) = o.get_mut("result") {
-                            if clip_json(result, WIRE_STRING_LIMIT, WIRE_ARRAY_LIMIT) {
+                if let crate::harness::HarnessEvent::ToolResult { .. } = event
+                    && let Some(o) = v.as_object_mut()
+                        && let Some(result) = o.get_mut("result")
+                            && clip_json(result, WIRE_STRING_LIMIT, WIRE_ARRAY_LIMIT) {
                                 o.insert("result_clipped".into(), serde_json::json!(true));
                             }
-                        }
-                    }
-                }
                 v
             })
             .collect(),
@@ -165,13 +162,12 @@ pub(crate) async fn rewind_session(
     // Keep a live loop in sync (it may overwrite disk on its next persist otherwise).
     {
         let sessions = d.sessions.lock().await;
-        if let Some(s) = sessions.get(&req.session) {
-            if !s.join.is_finished() {
+        if let Some(s) = sessions.get(&req.session)
+            && !s.join.is_finished() {
                 let _ = s.input_tx.send(LoopInput::Rewind {
                     checkpoint: checkpoint_id.clone(),
                 });
             }
-        }
     }
 
     // Restore workspace files to the shadow commit.
@@ -336,14 +332,13 @@ pub(crate) fn session_state_fingerprint(store: &crate::store::Store, state_path:
 }
 
 pub(crate) fn resolve_session_dir(session: &str) -> Result<PathBuf, Response> {
-    if let Some(sp) = state_path_for_id(session) {
-        if let Some(state) = read_session_meta(&sp) {
+    if let Some(sp) = state_path_for_id(session)
+        && let Some(state) = read_session_meta(&sp) {
             let dir = PathBuf::from(&state.workspace);
             if !state.workspace.is_empty() && dir.is_dir() {
                 return Ok(dir);
             }
         }
-    }
     // Not a session id → treat it as a folder path (no-session git).
     let dir = PathBuf::from(session);
     if dir.is_dir() {
@@ -429,15 +424,14 @@ pub(crate) async fn interrupt_session(
         status,
         Some(crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)
     );
-    if !live && working {
-        if let Some(mut state) = crate::session::read_session_state(&sp) {
+    if !live && working
+        && let Some(mut state) = crate::session::read_session_state(&sp) {
             state.status = crate::harness::HarnessStatus::Idle;
             if crate::session::write_session_state(&sp, &state).is_ok() {
                 return Json(serde_json::json!({"stopped": true, "was": status, "note": "cleared a run left over from a restart"}))
                     .into_response();
             }
         }
-    }
     if !live || !working {
         return Json(serde_json::json!({"stopped": false, "status": status, "note": "the session isn't running"}))
             .into_response();
@@ -478,12 +472,11 @@ pub(crate) async fn rename_session(
     };
     {
         let sessions = d.sessions.lock().await;
-        if let Some(s) = sessions.get(&req.session) {
-            if !s.join.is_finished() {
+        if let Some(s) = sessions.get(&req.session)
+            && !s.join.is_finished() {
                 let _ = s.input_tx.send(LoopInput::SetTitle(req.title.clone()));
                 return Json(serde_json::json!({"renamed": true})).into_response();
             }
-        }
     }
     match crate::session::set_session_title(&sp, &req.title) {
         Ok(()) => Json(serde_json::json!({"renamed": true})).into_response(),

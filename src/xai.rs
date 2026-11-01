@@ -470,8 +470,8 @@ fn build_responses_request(
                         "call_id": tool_call_id,
                         "output": output,
                     }));
-                    if let Some((mime, base64)) = image {
-                        if config.inner.supports_images {
+                    if let Some((mime, base64)) = image
+                        && config.inner.supports_images {
                             input.push(json!({
                                 "type": "message",
                                 "role": "user",
@@ -481,7 +481,6 @@ fn build_responses_request(
                                 }],
                             }));
                         }
-                    }
                 }
             }
             HarnessMessage::Summary { kind, content } => {
@@ -714,11 +713,9 @@ fn append_citations(text: &mut String, value: &Value) {
             if let Some(url) = item
                 .as_str()
                 .or_else(|| item.get("url").and_then(Value::as_str))
-            {
-                if !url.is_empty() && !urls.iter().any(|u| u == url) {
+                && !url.is_empty() && !urls.iter().any(|u| u == url) {
                     urls.push(url.to_string());
                 }
-            }
         }
     }
     if urls.is_empty() {
@@ -826,8 +823,8 @@ fn parse_responses_value(
         }
     }
     // Fallback: standard OpenAI chat completions format if output was empty
-    if calls.is_empty() && text.is_empty() {
-        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+    if calls.is_empty() && text.is_empty()
+        && let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for choice in choices {
                 if let Some(msg) = choice.get("message") {
                     if let Some(content) = msg.get("content").and_then(Value::as_str) {
@@ -841,9 +838,8 @@ fn parse_responses_value(
                 }
             }
         }
-    }
-    if text.is_empty() {
-        if let Some(chunk) = value
+    if text.is_empty()
+        && let Some(chunk) = value
             .get("output_text")
             .or_else(|| value.pointer("/response/output_text"))
             .and_then(Value::as_str)
@@ -851,13 +847,11 @@ fn parse_responses_value(
         {
             text.push_str(chunk);
         }
-    }
     append_citations(&mut text, value);
-    if let Some(sink) = sink {
-        if !text.is_empty() {
+    if let Some(sink) = sink
+        && !text.is_empty() {
             StreamBuffer::append(sink, &text);
         }
-    }
     let usage = value
         .get("usage")
         .or_else(|| value.pointer("/response/usage"))
@@ -1036,27 +1030,24 @@ async fn parse_responses_sse(
                                 .get("arguments")
                                 .map(|v| v.is_object())
                                 .unwrap_or(false);
-                        if !has_args && !inflight.arguments_buf.is_empty() {
-                            if let Some(obj) = item_clone.as_object_mut() {
+                        if !has_args && !inflight.arguments_buf.is_empty()
+                            && let Some(obj) = item_clone.as_object_mut() {
                                 obj.insert(
                                     "arguments".into(),
                                     Value::String(inflight.arguments_buf),
                                 );
                             }
-                        }
-                        if item_clone.get("name").is_none() && !inflight.name.is_empty() {
-                            if let Some(obj) = item_clone.as_object_mut() {
+                        if item_clone.get("name").is_none() && !inflight.name.is_empty()
+                            && let Some(obj) = item_clone.as_object_mut() {
                                 obj.insert("name".into(), Value::String(inflight.name));
                             }
-                        }
-                        if item_clone.get("call_id").is_none() && inflight.call_id.is_some() {
-                            if let Some(obj) = item_clone.as_object_mut() {
+                        if item_clone.get("call_id").is_none() && inflight.call_id.is_some()
+                            && let Some(obj) = item_clone.as_object_mut() {
                                 obj.insert(
                                     "call_id".into(),
                                     Value::String(inflight.call_id.unwrap()),
                                 );
                             }
-                        }
                     }
                     collect_client_call(&item_clone, &mut calls);
                 }
@@ -1065,11 +1056,9 @@ async fn parse_responses_sse(
                 if let Some(status) = chunk
                     .pointer("/response/status")
                     .and_then(Value::as_str)
-                {
-                    if status == "incomplete" {
+                    && status == "incomplete" {
                         incomplete = true;
                     }
-                }
                 if chunk
                     .pointer("/response/incomplete_details/reason")
                     .is_some()
@@ -1162,11 +1151,9 @@ async fn parse_responses_sse(
                         }
                         if let Some(finish) =
                             choice.get("finish_reason").and_then(Value::as_str)
-                        {
-                            if finish == "length" {
+                            && finish == "length" {
                                 incomplete = true;
                             }
-                        }
                     }
                 }
             }
@@ -1184,7 +1171,7 @@ async fn parse_responses_sse(
             });
             if !already_collected {
                 let args = serde_json::from_str::<Value>(&inflight.arguments_buf)
-                    .unwrap_or_else(|_| Value::String(inflight.arguments_buf));
+                    .unwrap_or(Value::String(inflight.arguments_buf));
                 calls.push(GeneratedToolCall {
                     tool_name: inflight.name,
                     arguments: args,
@@ -1203,11 +1190,10 @@ async fn parse_responses_sse(
         append_citations(&mut text, &wrapper);
     }
 
-    if let Some(err) = failure {
-        if text.is_empty() && calls.is_empty() {
+    if let Some(err) = failure
+        && text.is_empty() && calls.is_empty() {
             return Err(ToolError::model_request(format!("xAI: {err}"), false));
         }
-    }
 
     Ok(ModelOutput {
         calls,

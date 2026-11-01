@@ -98,8 +98,8 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let content_w = width.saturating_sub(TAG_W).max(20);
     let mut tag_pending = false;
 
-    if !has_user_events {
-        if let Some(request) = state
+    if !has_user_events
+        && let Some(request) = state
             .initial_request()
             .filter(|text| !text.trim().is_empty())
         {
@@ -112,7 +112,6 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 &mut tag_pending,
             );
         }
-    }
 
     // After a compaction, clear the screen above it: render only from the last
     // compaction boundary down (a "✦ context compacted" divider, then any newer
@@ -154,12 +153,11 @@ pub(super) fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             let mut cur = Some(event);
             while let Some(HarnessEvent::ToolCall { tool_name, arguments }) = cur {
                 let mut result = None;
-                if let Some(HarnessEvent::ToolResult { tool_name: rn, result: r }) = events.peek() {
-                    if rn == tool_name {
+                if let Some(HarnessEvent::ToolResult { tool_name: rn, result: r }) = events.peek()
+                    && rn == tool_name {
                         result = Some(r.clone());
                         events.next();
                     }
-                }
                 if !HIDDEN_TOOL_ROWS.contains(&tool_name.as_str()) {
                     run.push(RunStep { tool: tool_name.clone(), args: arguments.clone(), result });
                 }

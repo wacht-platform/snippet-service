@@ -100,11 +100,10 @@ pub struct ChangeFilesTool;
 /// `path`. A well-formed call passes through unchanged.
 fn normalize_changes(arguments: Value) -> Value {
     let Value::Object(mut top) = arguments else { return arguments };
-    if let Some(Value::String(raw)) = top.get("changes") {
-        if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+    if let Some(Value::String(raw)) = top.get("changes")
+        && let Ok(parsed) = serde_json::from_str::<Value>(raw) {
             top.insert("changes".into(), parsed);
         }
-    }
     if !top.contains_key("changes") && top.contains_key("path") {
         let single: serde_json::Map<String, Value> = top.clone();
         top = serde_json::Map::new();
@@ -115,11 +114,10 @@ fn normalize_changes(arguments: Value) -> Value {
         changes.retain(|c| c.is_object());
         for change in changes.iter_mut() {
             let Value::Object(fields) = change else { continue };
-            if !fields.contains_key("path") {
-                if let Some(path) = shared_path.clone() {
+            if !fields.contains_key("path")
+                && let Some(path) = shared_path.clone() {
                     fields.insert("path".into(), path);
                 }
-            }
             if !fields.contains_key("action") {
                 let has = |keys: &[&str]| keys.iter().any(|k| fields.contains_key(*k));
                 let action = if has(&["find", "old_string", "old", "search"]) {
@@ -792,11 +790,10 @@ fn normalize_source(source: &str) -> NormalizedSource {
             continue;
         }
 
-        if let Some((ws_start, ws_end)) = pending_ws.take() {
-            if previous_word && current_word {
+        if let Some((ws_start, ws_end)) = pending_ws.take()
+            && previous_word && current_word {
                 emit(' ', ws_start, ws_end);
             }
-        }
         emit(ch, start, end);
         previous_word = current_word;
     }

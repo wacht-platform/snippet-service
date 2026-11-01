@@ -477,8 +477,8 @@ impl CodingHarness {
                         // the session — the drive stops until the window resets. Record
                         // when that is (from the last rate-limit snapshot) so the UI can
                         // show it. The user can re-issue /goal to resume.
-                        if is_rate_limit_error(&message) {
-                            if let Some(goal) = state
+                        if is_rate_limit_error(&message)
+                            && let Some(goal) = state
                                 .goal
                                 .as_mut()
                                 .filter(|g| g.status == GoalStatus::Active)
@@ -498,7 +498,6 @@ impl CodingHarness {
                                 self.persist(&mut state, &lanes).await?;
                                 continue;
                             }
-                        }
                         if crate::routing::is_limit_error(&message) {
                             state.status = HarnessStatus::Idle;
                             self.persist(&mut state, &lanes).await?;
@@ -853,13 +852,11 @@ fn trim_spoken_calls(state: &mut HarnessState, evt_mark: usize) {
     }
     let from = evt_mark.min(state.events.len());
     for event in state.events[from..].iter_mut() {
-        if let HarnessEvent::ToolCall { tool_name, arguments } = event {
-            if is_speak_tool(tool_name) {
-                if let Some((heard, note)) = arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
+        if let HarnessEvent::ToolCall { tool_name, arguments } = event
+            && is_speak_tool(tool_name)
+                && let Some((heard, note)) = arguments.get("text").and_then(|t| t.as_str()).and_then(crate::speech::cut_view) {
                     arguments["text"] = serde_json::Value::String(heard);
                     arguments["cut_off_by_user"] = serde_json::Value::String(note.into());
                 }
-            }
-        }
     }
 }

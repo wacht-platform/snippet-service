@@ -146,8 +146,8 @@ impl ChatGptModel {
             .as_ref()
             .map(ChatGptTokens::is_stale)
             .unwrap_or(false);
-        if stale {
-            if let Some(prior) = self.tokens.clone() {
+        if stale
+            && let Some(prior) = self.tokens.clone() {
                 match chatgpt_auth::refresh(&prior).await {
                     Ok(fresh) => {
                         self.tokens = Some(fresh);
@@ -158,7 +158,6 @@ impl ChatGptModel {
                     Err(_) => {}
                 }
             }
-        }
         self.tokens.as_ref().ok_or_else(|| {
             ToolError::model_request(
                 "not signed in to ChatGPT — open the model picker and choose “Sign in with ChatGPT”."
@@ -500,8 +499,8 @@ fn build_responses_request(
                         "call_id": tool_call_id,
                         "output": output,
                     }));
-                    if let Some((mime, base64)) = image {
-                        if config.supports_images {
+                    if let Some((mime, base64)) = image
+                        && config.supports_images {
                             input.push(json!({
                                 "type": "message",
                                 "role": "user",
@@ -511,7 +510,6 @@ fn build_responses_request(
                                 }],
                             }));
                         }
-                    }
                 }
             }
             HarnessMessage::Summary { kind, content } => {
@@ -675,12 +673,11 @@ async fn parse_responses_sse(
             }
             "response.function_call_arguments.done" => {
                 let id = chunk.get("item_id").or_else(|| chunk.get("call_id")).and_then(Value::as_str).unwrap_or("");
-                if let Some(ended) = streamed.get_mut(id) {
-                    if !*ended {
+                if let Some(ended) = streamed.get_mut(id)
+                    && !*ended {
                         *ended = true;
                         StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::End { call_id: id.to_string() });
                     }
-                }
             }
             "response.output_item.done" => {
                 let item = chunk.get("item");
@@ -755,14 +752,13 @@ async fn parse_responses_sse(
     // instead of aborting (this silently killed memory reflection mid-compaction).
     .map_err(|e| ToolError::model_request(format!("chatgpt stream error: {e}"), true))?;
 
-    if let Some(err) = failure {
-        if text.is_empty() && calls.is_empty() {
+    if let Some(err) = failure
+        && text.is_empty() && calls.is_empty() {
             let fatal = err.contains("context_length")
                 || err.contains("insufficient_quota")
                 || err.contains("usage_not_included");
             return Err(ToolError::model_request(format!("chatgpt: {err}"), !fatal));
         }
-    }
 
     Ok(ModelOutput {
         calls,

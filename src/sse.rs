@@ -14,11 +14,10 @@ where
     let mut buf: Vec<u8> = Vec::new();
     let emit = |line: &[u8], on_data: &mut F| {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if let Ok(text) = std::str::from_utf8(line) {
-            if let Some(data) = text.strip_prefix("data:") {
+        if let Ok(text) = std::str::from_utf8(line)
+            && let Some(data) = text.strip_prefix("data:") {
                 on_data(data.trim_start());
             }
-        }
     };
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;

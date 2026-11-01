@@ -18,9 +18,9 @@ pub(crate) async fn config_watch_loop(daemon: Shared) {
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            if let Ok(mtime) = meta.modified() {
-                if Some(mtime) != last_mtime {
+        if let Ok(meta) = tokio::fs::metadata(&path).await
+            && let Ok(mtime) = meta.modified()
+                && Some(mtime) != last_mtime {
                     last_mtime = Some(mtime);
                     daemon.reload_config().await;
                     let ids: Vec<String> = daemon.sessions.lock().await.keys().cloned().collect();
@@ -30,8 +30,6 @@ pub(crate) async fn config_watch_loop(daemon: Shared) {
                     );
                     pending.extend(ids);
                 }
-            }
-        }
 
         if pending.is_empty() {
             continue;

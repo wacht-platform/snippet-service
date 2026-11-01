@@ -1138,17 +1138,15 @@ pub use fork::*;
 /// parks the task here; a silent idle stop is the stall check's to notice.
 pub fn park_failed_session_work(id: &str, prev_status: &str, state: &HarnessState) {
     let status = status_str(state.status);
-    if prev_status == "running" && matches!(status.as_str(), "idle" | "failed") {
-        if let Some(crate::harness::HarnessEvent::ModelError { message }) = state.events.last() {
-            if crate::routing::is_limit_error(message) {
+    if prev_status == "running" && matches!(status.as_str(), "idle" | "failed")
+        && let Some(crate::harness::HarnessEvent::ModelError { message }) = state.events.last()
+            && crate::routing::is_limit_error(message) {
                 crate::routing::report(crate::routing::LimitHit {
                     session_id: id.to_string(),
                     message: message.clone(),
                     resets_at: crate::routing::reset_from(state.rate_limit.as_ref()),
                 });
             }
-        }
-    }
     if status != "failed" || prev_status == "failed" {
         return;
     }
@@ -1209,12 +1207,11 @@ fn read_session_state_from_store(state_path: &Path) -> Option<HarnessState> {
 /// message and event logs — for callers that only need metadata.
 pub fn read_session_meta(state_path: &Path) -> Option<HarnessState> {
     let id = session_id_for_state_path(state_path);
-    if let Some(store) = store_for_sessions() {
-        if store.has_conversation(&id).ok()? {
+    if let Some(store) = store_for_sessions()
+        && store.has_conversation(&id).ok()? {
             let scalar = store.load_session_scalar(&id).ok()??;
             return crate::harness::state_from_scalar(&scalar, Vec::new(), Vec::new()).ok();
         }
-    }
     read_session_state(state_path)
 }
 
@@ -1354,8 +1351,8 @@ fn emit_device_event_with_store(
     store: Option<&crate::store::Store>,
     events: &broadcast::Sender<serde_json::Value>,
 ) {
-    if let Some(store) = store {
-        if let Some(mut notification) = notification_candidate(&event) {
+    if let Some(store) = store
+        && let Some(mut notification) = notification_candidate(&event) {
             if notification["kind"] == "waiting" {
                 let attention = notification["session"].as_str()
                     .and_then(|id| store.current_attention(id).ok().flatten());
@@ -1379,8 +1376,8 @@ fn emit_device_event_with_store(
                 };
                 notification["stop_identity"] = identity.into();
             }
-            if let Ok(settings) = store.load_control_settings() {
-                if notification_allowed(&settings, &notification) {
+            if let Ok(settings) = store.load_control_settings()
+                && notification_allowed(&settings, &notification) {
                     match store.append_notification_event(notification, NOTIFICATION_RETENTION_SECS) {
                         Ok(saved) => { let _ = events.send(serde_json::json!({
                             "kind": "notification", "notification": saved
@@ -1388,9 +1385,7 @@ fn emit_device_event_with_store(
                         Err(error) => eprintln!("persist notification: {error}"),
                     }
                 }
-            }
         }
-    }
     let _ = events.send(event);
 }
 

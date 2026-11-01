@@ -349,14 +349,13 @@ impl CodingHarness {
             let tail_has_user = recent_tail
                 .iter()
                 .any(|m| matches!(m, HarnessMessage::User { .. }));
-            if !tail_has_user {
-                if let Some(last_user) = state.messages.iter().rev().find_map(|m| match m {
+            if !tail_has_user
+                && let Some(last_user) = state.messages.iter().rev().find_map(|m| match m {
                     HarnessMessage::User { content } => Some(content.clone()),
                     _ => None,
                 }) {
                     next.push(HarnessMessage::User { content: last_user });
                 }
-            }
 
             if next.len() >= working.len() {
                 break;

@@ -304,8 +304,8 @@ impl GeminiModel {
         // (creation and fresh sends are both billed at the input rate). With no
         // reusable cache, should_refresh stays true → create fresh.
         let mut should_refresh = true;
-        if let Some(prior) = self.cache.as_ref() {
-            if self.can_reuse(prior, &prefix_signature, &cacheable) {
+        if let Some(prior) = self.cache.as_ref()
+            && self.can_reuse(prior, &prefix_signature, &cacheable) {
                 let delta_contents = cacheable[prior.cached_content_count..].to_vec();
                 let delta_tokens = estimate_tokens(&Value::Array(delta_contents.clone()));
                 let m = (prior.reuse_turns as usize).saturating_add(1);
@@ -320,7 +320,6 @@ impl GeminiModel {
                 obj.insert("cachedContent".to_string(), json!(prior.cache_name));
                 obj.insert("contents".to_string(), Value::Array(delta));
             }
-        }
 
         Some(CachePlan {
             full_cache_payload,
@@ -398,11 +397,10 @@ impl GeminiModel {
             expire_at,
             reuse_turns: 0,
         });
-        if let Some(old) = superseded {
-            if old != parsed.name {
+        if let Some(old) = superseded
+            && old != parsed.name {
                 self.delete_cache(&old).await;
             }
-        }
     }
 
     async fn delete_cache(&self, cache_name: &str) {
@@ -656,14 +654,12 @@ fn build_contents(messages: &[HarnessMessage], model: &str) -> (String, Vec<Valu
 /// Append parts, merging into the previous content when it shares the role (so
 /// parallel tool calls / results land in one turn, as Gemini expects).
 fn push_content(contents: &mut Vec<Value>, role: &str, mut parts: Vec<Value>) {
-    if let Some(last) = contents.last_mut() {
-        if last.get("role").and_then(Value::as_str) == Some(role) {
-            if let Some(existing) = last.get_mut("parts").and_then(Value::as_array_mut) {
+    if let Some(last) = contents.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some(role)
+            && let Some(existing) = last.get_mut("parts").and_then(Value::as_array_mut) {
                 existing.append(&mut parts);
                 return;
             }
-        }
-    }
     contents.push(json!({ "role": role, "parts": parts }));
 }
 

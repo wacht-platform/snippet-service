@@ -126,12 +126,11 @@ fn parse_status(z: &str) -> serde_json::Value {
             let path = &tok[3..];
             // Rename/copy entries carry the original path in the NEXT NUL field.
             let mut orig: Option<String> = None;
-            if x == 'R' || x == 'C' {
-                if let Some(o) = parts.get(i + 1) {
+            if (x == 'R' || x == 'C')
+                && let Some(o) = parts.get(i + 1) {
                     orig = Some((*o).to_string());
                     i += 1;
                 }
-            }
             files.push(serde_json::json!({
                 "path": path,
                 "orig": orig,

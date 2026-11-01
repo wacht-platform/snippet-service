@@ -711,7 +711,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt =
                 conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))?;
-            Ok(stmt.query_row(params![id], task_from_row).optional()?)
+            stmt.query_row(params![id], task_from_row).optional()
         })
     }
 
@@ -1484,7 +1484,7 @@ impl Store {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {TASK_COLUMNS} FROM tasks WHERE thread_id = ?1"
             ))?;
-            Ok(stmt.query_row(params![thread_id], task_from_row).optional()?)
+            stmt.query_row(params![thread_id], task_from_row).optional()
         })
     }
 

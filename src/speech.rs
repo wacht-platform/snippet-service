@@ -453,11 +453,10 @@ async fn open_flux(text: &str, done: bool) -> Route {
 
 fn drop_flux_provisional(token: u64) {
     let mut guard = FLUX_STREAMING.lock().unwrap();
-    if guard.as_ref().is_some_and(|p| p.token == token) {
-        if let Some(p) = guard.take() {
+    if guard.as_ref().is_some_and(|p| p.token == token)
+        && let Some(p) = guard.take() {
             p.turn.flush();
         }
-    }
 }
 
 fn push_suffix(turn: &Arc<crate::tts_stream::StreamTurn>, text: &str, pushed: &mut usize) {

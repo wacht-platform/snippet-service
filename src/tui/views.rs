@@ -626,8 +626,8 @@ pub(crate) fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     if need_open {
         // Spawn at the measured pane size — never 80×24 then resize.
         app.send_term_open();
-    } else if need_resize {
-        if let Some(a) = app.sidecar_attach.as_ref() {
+    } else if need_resize
+        && let Some(a) = app.sidecar_attach.as_ref() {
             let _ = a.send_term(serde_json::json!({
                 "wire": "term",
                 "op": "resize",
@@ -636,7 +636,6 @@ pub(crate) fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 "rows": rows,
             }));
         }
-    }
     let pane = &app.term_panes[focus];
     let mut lines: Vec<Line> = Vec::with_capacity(rows);
     let (raw_cx, raw_cy) = pane.vt.cursor();
@@ -838,15 +837,14 @@ pub(crate) fn ensure_q_init(app: &mut App) {
 pub(crate) fn prepare_question(app: &mut App, qs: &[Value]) {
     app.q_sel = 0;
     app.q_multi.clear();
-    if let Some(q) = qs.get(app.q_index) {
-        if q_kind(q) == "multi_choice" {
+    if let Some(q) = qs.get(app.q_index)
+        && q_kind(q) == "multi_choice" {
             for (i, o) in q_options(q).iter().enumerate() {
                 if o.recommended {
                     app.q_multi.insert(i);
                 }
             }
         }
-    }
 }
 
 /// Intercept navigation/selection keys while an ask_user question is pending.

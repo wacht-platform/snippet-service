@@ -59,13 +59,12 @@ pub fn deserialize_state(bytes: &[u8]) -> Result<HarnessState, String> {
     // Try parsing as compressed MessagePack first
     let mut decoder = GzDecoder::new(bytes);
     let mut decompressed_bytes = Vec::new();
-    if decoder.read_to_end(&mut decompressed_bytes).is_ok() {
-        if let Ok(state) = rmp_serde::from_slice::<HarnessState>(&decompressed_bytes) {
+    if decoder.read_to_end(&mut decompressed_bytes).is_ok()
+        && let Ok(state) = rmp_serde::from_slice::<HarnessState>(&decompressed_bytes) {
             let mut state = state;
             normalize_state_title(&mut state);
             return Ok(state);
         }
-    }
 
     // Fallback: try parsing as legacy JSON
     if let Ok(mut state) = serde_json::from_slice::<HarnessState>(bytes) {

@@ -261,11 +261,10 @@ impl Vault {
             key.extend_from_slice(b);
         }
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached, vault)) = cache.as_ref() {
-            if *cached == key {
+        if let Some((cached, vault)) = cache.as_ref()
+            && *cached == key {
                 return vault.clone();
             }
-        }
         let secrets = serde_json::from_slice(&bytes).unwrap_or_default();
         let vault = Self { secrets, harness: harness_secrets(&files) };
         *cache = Some((key, vault.clone()));

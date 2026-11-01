@@ -422,8 +422,8 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
     ];
 
     // Compact lane indicator in the header bar.
-    if let Some(state) = &app.state {
-        if !state.lanes.is_empty() {
+    if let Some(state) = &app.state
+        && !state.lanes.is_empty() {
             let running = state
                 .lanes
                 .iter()
@@ -437,7 +437,6 @@ pub(crate) fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Ap
             };
             right.insert(0, Span::styled(label, Style::default().fg(faint())));
         }
-    }
 
     let update = app.update_notice.lock().ok().and_then(|g| g.clone());
     if let Some(v) = update {

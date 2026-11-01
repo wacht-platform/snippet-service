@@ -152,11 +152,10 @@ pub(crate) fn mission_control(d: &Shared) -> Value {
                                 chat.push(json!({"who": "assistant", "via": "spoken", "when": when, "text": text}));
                             }
                         }
-                    } else if tools.len() < 5 {
-                        if let Some(summary) = summarize_tool(tc) {
+                    } else if tools.len() < 5
+                        && let Some(summary) = summarize_tool(tc) {
                             tools.push(json!({"when": when, "action": summary}));
                         }
-                    }
                 }
                 if !content.trim().is_empty() && !has_speak && chat.len() < 8 && budget >= 80 {
                     let text = redact(&clip(&plain_text(content), 280, true));

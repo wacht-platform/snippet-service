@@ -363,16 +363,14 @@ pub(crate) async fn provider_models(
     if let Some(p) = req.provider {
         cfg.provider = p;
     }
-    if let Some(b) = req.base_url {
-        if !b.trim().is_empty() {
+    if let Some(b) = req.base_url
+        && !b.trim().is_empty() {
             cfg.base_url = b;
         }
-    }
-    if let Some(k) = req.api_key {
-        if !k.trim().is_empty() {
+    if let Some(k) = req.api_key
+        && !k.trim().is_empty() {
             cfg.api_key = k;
         }
-    }
     match crate::catalog::fetch_models(&cfg).await {
         Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e).into_response(),

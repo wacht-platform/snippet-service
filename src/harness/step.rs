@@ -229,8 +229,8 @@ impl CodingHarness {
                 Err(error) => error,
             };
             let raw = error.to_string();
-            if crate::llm::is_effort_rejection(&raw) {
-                if let Some(current) = model.swap_reasoning_effort(None) {
+            if crate::llm::is_effort_rejection(&raw)
+                && let Some(current) = model.swap_reasoning_effort(None) {
                     let next = crate::llm::degrade_effort(&current);
                     model.swap_reasoning_effort(next.map(str::to_string));
                     state.events.push(HarnessEvent::SystemDecision {
@@ -250,7 +250,6 @@ impl CodingHarness {
                     continue;
                 }
                 // No effort was set — not degradable (the swap restored None).
-            }
             // Adapters embed the full HTTP body; show only a concise first line.
             let line = raw.lines().next().unwrap_or(&raw);
             let message = if line.chars().count() > 240 {

@@ -126,12 +126,11 @@ pub(crate) fn live_from_handle(handle: crate::session::SessionHandle, profile: O
 /// Apply a named profile's model to a workspace config (no-op if the name isn't a
 /// known setup). Shared by the session open / resume / attach paths.
 pub(crate) fn apply_profile(cfg: &mut SnippetConfig, profile: &Option<String>) {
-    if let Some(name) = profile.as_ref() {
-        if let Some(m) = cfg.setups.as_ref().and_then(|s| s.get(name)).cloned() {
+    if let Some(name) = profile.as_ref()
+        && let Some(m) = cfg.setups.as_ref().and_then(|s| s.get(name)).cloned() {
             cfg.model = m;
             cfg.active_setup = Some(name.clone());
         }
-    }
 }
 
 /// Resolve a session id to its (state_path, workspace_dir), reading and validating
@@ -493,11 +492,10 @@ impl Daemon {
     }
 
     pub(crate) fn routed_profile(&self, id: &str) -> Option<String> {
-        if let Some(agent_id) = id.strip_prefix("inbox-") {
-            if let Some(profile) = self.agent_profile(agent_id) {
+        if let Some(agent_id) = id.strip_prefix("inbox-")
+            && let Some(profile) = self.agent_profile(agent_id) {
                 return Some(profile);
             }
-        }
         let route = if id == crate::mission_control::SESSION_ID {
             crate::routing::Route::Mission
         } else if crate::session::is_inbox_session_id(id) {
@@ -562,11 +560,10 @@ impl Daemon {
             .get(id)
             .and_then(|s| s.profile.clone());
         let c = self.config.lock().unwrap();
-        if let Some(name) = profile {
-            if let Some(m) = c.setups.as_ref().and_then(|s| s.get(&name)) {
+        if let Some(name) = profile
+            && let Some(m) = c.setups.as_ref().and_then(|s| s.get(&name)) {
                 return m.provider.clone();
             }
-        }
         c.model.provider.clone()
     }
 
@@ -666,7 +663,7 @@ impl Daemon {
     pub(crate) async fn deliver(&self, id: &str, input: LoopInput) {
         match &input {
             LoopInput::Unqueue(queue_id) | LoopInput::SteerQueued(queue_id) => {
-                self.hide_queued(id, &queue_id).await
+                self.hide_queued(id, queue_id).await
             }
             _ => {}
         }
@@ -684,12 +681,11 @@ impl Daemon {
             other => other,
         };
         let mut sessions = self.sessions.lock().await;
-        if let Some(s) = sessions.get(id) {
-            if !s.join.is_finished() {
+        if let Some(s) = sessions.get(id)
+            && !s.join.is_finished() {
                 let _ = s.input_tx.send(input);
                 return;
             }
-        }
         // The resident loop isn't alive — e.g. after a daemon restart, before this
         // session has been activated this run. Revive it, then deliver the input.
         // A text message starts the loop WITH that message as the first turn; any
@@ -1105,12 +1101,11 @@ async fn list_sessions(State(d): State<Shared>, Query(q): Query<ListQuery>) -> R
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             if s.status == "running" && !alive && now - s.last_active > 600 {
-                if let Some(sp) = state_path_for_id(&s.id) {
-                    if let Some(mut st) = crate::session::read_session_state(&sp) {
+                if let Some(sp) = state_path_for_id(&s.id)
+                    && let Some(mut st) = crate::session::read_session_state(&sp) {
                         st.status = crate::harness::HarnessStatus::Idle;
                         let _ = crate::session::write_session_state(&sp, &st);
                     }
-                }
                 s.status = "idle".to_string();
             }
             let running = s.status == "running";

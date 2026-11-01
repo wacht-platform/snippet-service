@@ -283,14 +283,13 @@ async fn fetch_gemini(cfg: &InferenceProfileConfig) -> Result<Vec<CatalogModel>,
                 .to_string();
             // Only generateContent-capable models are usable as a chat model.
             let methods = m["supportedGenerationMethods"].as_array();
-            if let Some(methods) = methods {
-                if !methods
+            if let Some(methods) = methods
+                && !methods
                     .iter()
                     .any(|x| x.as_str() == Some("generateContent"))
                 {
                     return None;
                 }
-            }
             Some(CatalogModel {
                 id,
                 display_name: m["displayName"].as_str().map(str::to_string),

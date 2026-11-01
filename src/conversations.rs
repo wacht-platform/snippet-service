@@ -639,7 +639,7 @@ impl Store {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1 OR legacy_id = ?1"
             ))?;
-            Ok(stmt.query_row(params![id], session_row_from).optional()?)
+            stmt.query_row(params![id], session_row_from).optional()
         })
     }
 
@@ -701,11 +701,11 @@ impl Store {
     /// How many messages a session holds, without reading any of them.
     pub fn conversation_message_count(&self, session_id: &str) -> Result<i64, StoreError> {
         self.with_connection(|conn| {
-            Ok(conn.query_row(
+            conn.query_row(
                 "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
                 params![session_id],
                 |row| row.get(0),
-            )?)
+            )
         })
     }
 
@@ -1061,13 +1061,13 @@ impl Store {
     /// Read a session's stored scalar state, if this store has the session.
     pub fn load_session_scalar(&self, id: &str) -> Result<Option<String>, StoreError> {
         self.with_connection(|conn| {
-            Ok(conn
+            conn
                 .query_row(
                     "SELECT state_json FROM sessions WHERE id = ?1",
                     params![id],
                     |row| row.get(0),
                 )
-                .optional()?)
+                .optional()
         })
     }
 
@@ -1094,7 +1094,7 @@ impl Store {
     /// moving it into the database.
     pub fn conversation_fingerprint(&self, id: &str) -> Result<Option<String>, StoreError> {
         self.with_connection(|conn| {
-            Ok(conn
+            conn
                 .query_row(
                     "SELECT s.updated_at,
                             (SELECT COUNT(*) FROM session_messages WHERE session_id = s.id),
@@ -1108,7 +1108,7 @@ impl Store {
                         Ok(format!("{updated}|{messages}|{events}"))
                     },
                 )
-                .optional()?)
+                .optional()
         })
     }
 

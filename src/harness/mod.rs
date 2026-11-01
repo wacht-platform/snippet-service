@@ -675,8 +675,8 @@ fn normalize_state_title(state: &mut HarnessState) {
         .as_deref()
         .map(str::trim)
         .is_none_or(|t| t.is_empty() || (t.starts_with('[') && t.contains("]\n")));
-    if title_is_empty {
-        if let Some(request) = state
+    if title_is_empty
+        && let Some(request) = state
             .initial_request()
             .filter(|text| !text.trim().is_empty())
         {
@@ -685,7 +685,6 @@ fn normalize_state_title(state: &mut HarnessState) {
                 state.title = Some(label);
             }
         }
-    }
     // The legacy field is an input-only migration bridge. Once its value has
     // seeded the title/context, drop it so every subsequent persist emits the
     // clean schema.

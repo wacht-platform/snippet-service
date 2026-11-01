@@ -245,11 +245,10 @@ pub fn parse_when(text: &str) -> Result<i64, String> {
         return Ok(dt.timestamp_millis());
     }
     for fmt in ["%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"] {
-        if let Ok(n) = NaiveDateTime::parse_from_str(t, fmt) {
-            if let Some(dt) = chrono::Local.from_local_datetime(&n).single() {
+        if let Ok(n) = NaiveDateTime::parse_from_str(t, fmt)
+            && let Some(dt) = chrono::Local.from_local_datetime(&n).single() {
                 return Ok(dt.timestamp_millis());
             }
-        }
     }
     Err(format!("could not read the time \"{t}\": use RFC 3339 or YYYY-MM-DD HH:MM"))
 }

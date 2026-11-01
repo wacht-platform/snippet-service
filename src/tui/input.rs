@@ -214,14 +214,13 @@ impl App {
                     vec!["-selection", "clipboard", "-t", "image/png", "-o"],
                 ),
             ] {
-                if let Ok(out) = std::process::Command::new(cmd).args(&args).output() {
-                    if out.status.success() && !out.stdout.is_empty() {
+                if let Ok(out) = std::process::Command::new(cmd).args(&args).output()
+                    && out.status.success() && !out.stdout.is_empty() {
                         wrote = std::fs::write(&dest, &out.stdout).is_ok();
                         if wrote {
                             break;
                         }
                     }
-                }
             }
             wrote
         };

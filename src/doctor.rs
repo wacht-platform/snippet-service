@@ -189,11 +189,10 @@ fn libstdcxx_paths() -> Vec<PathBuf> {
     for bin in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
         if let Ok(o) = std::process::Command::new(bin).arg("-p").output() {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
-                if line.trim_start().starts_with("libstdc++.so.6 ") && (line.contains("x86-64") || line.contains("AArch64")) {
-                    if let Some((_, p)) = line.rsplit_once("=> ") {
+                if line.trim_start().starts_with("libstdc++.so.6 ") && (line.contains("x86-64") || line.contains("AArch64"))
+                    && let Some((_, p)) = line.rsplit_once("=> ") {
                         out.push(PathBuf::from(p.trim()));
                     }
-                }
             }
             break;
         }

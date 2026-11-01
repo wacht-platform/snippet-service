@@ -241,8 +241,8 @@ fn score(st: &mut State, pcm: &[f32], refs: &[Arc<[f32]>], legacy: &[VoiceprintS
     if voiced < MIN_VOICED {
         return none;
     }
-    if !refs.is_empty() {
-        if let Some(m) = st.model() {
+    if !refs.is_empty()
+        && let Some(m) = st.model() {
             return match m.embed(&clip) {
                 Ok(emb) => {
                     let sim = similarity(&emb, refs);
@@ -254,7 +254,6 @@ fn score(st: &mut State, pcm: &[f32], refs: &[Arc<[f32]>], legacy: &[VoiceprintS
                 }
             };
         }
-    }
     if legacy.is_empty() || st.model.is_some() || st.failed.is_none() {
         return none;
     }

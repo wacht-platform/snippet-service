@@ -75,12 +75,11 @@ impl App {
     /// Same precedence as the serve daemon, so TUI and app agree.
     pub(crate) fn effective_config(&self) -> SnippetConfig {
         let mut cfg = self.options.config.clone();
-        if let Some(name) = crate::session::read_session_profile(&self.active_state_path) {
-            if let Some(m) = cfg.setups.as_ref().and_then(|s| s.get(&name)).cloned() {
+        if let Some(name) = crate::session::read_session_profile(&self.active_state_path)
+            && let Some(m) = cfg.setups.as_ref().and_then(|s| s.get(&name)).cloned() {
                 cfg.model = m;
                 cfg.active_setup = Some(name);
             }
-        }
         cfg
     }
 
@@ -855,11 +854,10 @@ impl App {
                             self.status = "Agent is already running.".to_string();
                             return;
                         }
-                        if !self.session_known() {
-                            if let Some(last_active) = self.find_last_active_conversation() {
+                        if !self.session_known()
+                            && let Some(last_active) = self.find_last_active_conversation() {
                                 self.switch_conversation(&last_active);
                             }
-                        }
                     }
                 }
 

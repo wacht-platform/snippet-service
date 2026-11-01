@@ -545,17 +545,15 @@ pub(super) async fn dispatch_mission_task(d: &Daemon, task_id: &str) -> Result<T
         None => None,
     };
     let keep = d.config.lock().map(|c| c.keep_task_profile).unwrap_or(true);
-    if let Some(profile) = task_profile.as_deref().filter(|_| keep) {
-        if let Some(sp) = crate::session::state_path_for_id(&session_id) {
+    if let Some(profile) = task_profile.as_deref().filter(|_| keep)
+        && let Some(sp) = crate::session::state_path_for_id(&session_id) {
             crate::session::write_session_profile(&sp, profile);
         }
-    }
-    if let Some(profile) = switch_to {
-        if let Err(error) = d.run_session_on_profile(&session_id, profile, keep).await {
+    if let Some(profile) = switch_to
+        && let Err(error) = d.run_session_on_profile(&session_id, profile, keep).await {
             release_failed_claim(d, &task, &error)?;
             return Err(error);
         }
-    }
     d.deliver(&session_id, LoopInput::UserMessage(text)).await;
     record_dispatch_notice(d, &task).await;
     let task = d
@@ -1244,13 +1242,12 @@ pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<S
             Some(crate::speech::mission_control_stream()),
         );
         sessions.insert(id.clone(), live_from_handle(handle, profile));
-        if !resume {
-            if let Some(live) = sessions.get(&id) {
+        if !resume
+            && let Some(live) = sessions.get(&id) {
                 let _ = live
                     .input_tx
                     .send(LoopInput::SetTitle("Mission Control".into()));
             }
-        }
     }
     drop(sessions);
     if let Err(error) = mission_control::set_mission_control_session(&d.mission_control_root, &id) {
@@ -1445,11 +1442,10 @@ async fn deliver_mission_control_reports(daemon: &Daemon) {
         let item = crate::harness::QueuedInput { id: uuid::Uuid::new_v4().to_string(), text };
         daemon.deliver(mission_control::SESSION_ID, LoopInput::Queue(item)).await;
     }
-    if delivered_any {
-        if let Ok(tasks) = daemon.store.list_tasks(None, None) {
+    if delivered_any
+        && let Ok(tasks) = daemon.store.list_tasks(None, None) {
             super::autonomy::mark_board_seen(&tasks);
         }
-    }
 }
 
 fn tracing_log_dispatch_failure(task_id: &str, error: &str) {

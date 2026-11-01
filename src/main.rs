@@ -659,6 +659,12 @@ fn serve_route_url(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // glibc keeps a retained arena per thread; unbounded they sat at ~600 MB resident.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 8 << 20);
+    }
     let cli = Cli::parse();
     let config_path = config_path(&cli);
 

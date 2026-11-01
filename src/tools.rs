@@ -270,15 +270,14 @@ impl ToolContext {
         if let Some(stored) = stored {
             // Compare against the file's CURRENT on-disk bytes. A missing/unreadable
             // file isn't "stale" — let the write itself surface any real error.
-            if let Ok(current) = std::fs::read(path) {
-                if content_hash(&current) != stored {
+            if let Ok(current) = std::fs::read(path)
+                && content_hash(&current) != stored {
                     return Err(ToolError::msg(format!(
                         "`{}` changed on disk since you last read it. Re-read it before writing \
                          so your change is based on its current contents.",
                         path.display()
                     )));
                 }
-            }
         }
         Ok(())
     }
@@ -291,11 +290,10 @@ impl ToolContext {
     /// Whether `path` is tracked in `seen` and matches its current bytes on disk.
     pub fn is_file_unchanged(&self, path: &Path) -> bool {
         let stored = self.seen.lock().unwrap().get(path).copied();
-        if let Some(stored) = stored {
-            if let Ok(current) = std::fs::read(path) {
+        if let Some(stored) = stored
+            && let Ok(current) = std::fs::read(path) {
                 return content_hash(&current) == stored;
             }
-        }
         false
     }
 

@@ -41,11 +41,10 @@ async fn handle_shells_ws(socket: WebSocket, terms: Arc<crate::term::SessionTerm
         .map(|(id, alive)| serde_json::json!({ "id": id, "alive": alive }))
         .collect();
     let hello = serde_json::json!({ "wire": "term", "op": "list", "shells": existing });
-    if let Ok(json) = serde_json::to_string(&hello) {
-        if sender.send(Message::Text(json.into())).await.is_err() {
+    if let Ok(json) = serde_json::to_string(&hello)
+        && sender.send(Message::Text(json.into())).await.is_err() {
             return;
         }
-    }
 
     let push = tokio::spawn(async move {
         loop {
@@ -64,11 +63,10 @@ async fn handle_shells_ws(socket: WebSocket, terms: Arc<crate::term::SessionTerm
                     "rows": rows,
                     "alive": alive,
                 });
-                if let Ok(json) = serde_json::to_string(&frame) {
-                    if sender.send(Message::Text(json.into())).await.is_err() {
+                if let Ok(json) = serde_json::to_string(&frame)
+                    && sender.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -77,11 +75,10 @@ async fn handle_shells_ws(socket: WebSocket, terms: Arc<crate::term::SessionTerm
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(t) => {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(t.as_str()) {
-                    if val.get("wire").and_then(|w| w.as_str()) == Some("term") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(t.as_str())
+                    && val.get("wire").and_then(|w| w.as_str()) == Some("term") {
                         apply_term_client(&terms, &val);
                     }
-                }
             }
             Message::Close(_) => break,
             _ => {}
@@ -180,9 +177,9 @@ async fn handle_ws(
         let mut term_seq: u64 = 0;
         loop {
             let queue_revision = daemon.queue_revision.load(Ordering::Acquire);
-            if let Some(fingerprint) = session_state_fingerprint(&daemon.store, &state_path) {
-                if Some(fingerprint) != last_state_fingerprint
-                    || queue_revision != last_queue_revision
+            if let Some(fingerprint) = session_state_fingerprint(&daemon.store, &state_path)
+                && (Some(fingerprint) != last_state_fingerprint
+                    || queue_revision != last_queue_revision)
                 {
                     let resume = !last_events.is_empty();
                     let from = if resume { last_event_offset } else { 0 };
@@ -219,11 +216,10 @@ async fn handle_ws(
                                 // before a model switch (it showed ChatGPT's monthly limits
                                 // on an anthropic-compatible chat).
                                 if daemon.session_provider(&session).await == "chatgpt" {
-                                    if let Some(g) = crate::chatgpt::read_global_usage() {
-                                        if let Ok(gv) = serde_json::to_value(&g) {
+                                    if let Some(g) = crate::chatgpt::read_global_usage()
+                                        && let Ok(gv) = serde_json::to_value(&g) {
                                             o.insert("rate_limit".into(), gv);
                                         }
-                                    }
                                 } else {
                                     o.remove("rate_limit");
                                 }
@@ -266,7 +262,6 @@ async fn handle_ws(
                         }
                     }
                 }
-            }
             {
                 use std::hash::{Hash, Hasher};
                 let snap = crate::llm::StreamBuffer::snapshot(&stream);
@@ -302,11 +297,10 @@ async fn handle_ws(
                     sent_once = true;
                     sent_text = snap;
                     sent_thinking = think;
-                    if let Ok(json) = serde_json::to_string(&frame) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
+                    if let Ok(json) = serde_json::to_string(&frame)
+                        && sender.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
-                    }
                 }
             }
             if let Some(terms) = terms.as_ref() {
@@ -334,15 +328,14 @@ async fn handle_ws(
                         "rows": rows,
                         "alive": alive,
                     });
-                    if let Ok(json) = serde_json::to_string(&frame) {
-                        if sender.send(Message::Text(json.into())).await.is_err() {
+                    if let Ok(json) = serde_json::to_string(&frame)
+                        && sender.send(Message::Text(json.into())).await.is_err() {
                             break;
                         }
-                    }
                 }
             }
-            if let Ok(index) = event_rx.try_recv() {
-                if let Some((state, _)) = read_session_state_tail(&state_path, index) {
+            if let Ok(index) = event_rx.try_recv()
+                && let Some((state, _)) = read_session_state_tail(&state_path, index) {
                     let frame = serde_json::json!({
                         "wire": "event",
                         "index": index,
@@ -356,7 +349,6 @@ async fn handle_ws(
                         break;
                     }
                 }
-            }
             if let Ok((before, limit)) = history_rx.try_recv() {
                 let paged = match limit {
                     Some(size) => {
@@ -425,8 +417,8 @@ async fn handle_ws(
                         }
                         continue;
                     }
-                    if let Some(nonce) = val.get("nonce").and_then(|n| n.as_str()) {
-                        if let Some(kind) = val.get("kind").and_then(|k| k.as_str()) {
+                    if let Some(nonce) = val.get("nonce").and_then(|n| n.as_str())
+                        && let Some(kind) = val.get("kind").and_then(|k| k.as_str()) {
                             // User messages and approval/question answers are both
                             // retried across reconnects and must be idempotent.
                             let idempotent = matches!(
@@ -445,7 +437,6 @@ async fn handle_ws(
                                 continue; // duplicate — drop silently
                             }
                         }
-                    }
                 }
                 if read_only {
                     continue;
@@ -509,11 +500,10 @@ fn apply_term_client(terms: &crate::term::SessionTerms, val: &serde_json::Value)
             // keys look captured but never paint.
             if let Some(term) = terms.get_or_create(&id) {
                 let _ = term.ensure(cols, rows);
-                if let Some(data) = val.get("data").and_then(|v| v.as_str()) {
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
+                if let Some(data) = val.get("data").and_then(|v| v.as_str())
+                    && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
                         term.write(&bytes);
                     }
-                }
             }
         }
         "close" => terms.close(&id),

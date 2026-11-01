@@ -153,8 +153,7 @@ impl CodingHarness {
                 .get("user_requests")
                 .map(|s| s.trim().is_empty())
                 .unwrap_or(true)
-            {
-                if let Some(pos) = window_text.find("CHRONOLOGICAL USER REQUESTS TO PRESERVE") {
+                && let Some(pos) = window_text.find("CHRONOLOGICAL USER REQUESTS TO PRESERVE") {
                     let rest = &window_text[pos..];
                     if let Some(start) = rest.find('\n') {
                         let candidate = &rest[start + 1..];
@@ -165,7 +164,6 @@ impl CodingHarness {
                         }
                     }
                 }
-            }
 
             let missing = required_missing(&sections);
             if !missing.is_empty() {

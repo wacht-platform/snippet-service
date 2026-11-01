@@ -664,7 +664,7 @@ impl Tool for SendAgentMessage {
             .map(str::to_string);
         let saved = db
             .send_direct_message_typed(
-                (&sender_kind, &sender_id),
+                (sender_kind, &sender_id),
                 (to_kind, to_id),
                 &body,
                 &key,
@@ -725,7 +725,7 @@ impl Tool for ReadAgentThread {
         }
         let (kind, id) = actor(ctx)?;
         let thread_id =
-            crate::coordination::direct_thread_id((&kind, &id), ("agent", peer));
+            crate::coordination::direct_thread_id((kind, &id), ("agent", peer));
         let limit = args.limit.unwrap_or(20).clamp(1, 100);
         let db = db(ctx)?;
         let events = match args.after_sequence {
@@ -761,7 +761,7 @@ impl Tool for ReadAgentInbox {
     async fn execute(&self, ctx: &ToolContext, _: Value) -> Result<ToolResult, ToolError> {
         let (kind, id) = actor(ctx)?;
         let threads = db(ctx)?
-            .list_direct_threads(&kind, &id)
+            .list_direct_threads(kind, &id)
             .map_err(|e| ToolError::msg(format!("list inbox: {e}")))?;
         Ok(ToolResult::success(json!({
             "actor": format!("{kind}:{id}"),
@@ -920,11 +920,10 @@ impl Tool for RecordCoordinationNote {
 /// this is the same rule the turn lease uses, and for the same reason: a session
 /// is not an agent.
 fn board_agent_id(ctx: &ToolContext) -> Result<String, ToolError> {
-    if let Ok((kind, id)) = actor(ctx) {
-        if kind == "agent" {
+    if let Ok((kind, id)) = actor(ctx)
+        && kind == "agent" {
             return Ok(id);
         }
-    }
     ctx.agent_id().map(str::to_string).ok_or_else(|| {
         ToolError::msg(
             "this session is not working as an agent — coordination memory requires an agent identity",

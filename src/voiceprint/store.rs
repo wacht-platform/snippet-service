@@ -36,11 +36,10 @@ fn save(map: &Adaptive) {
     let path = index();
     let _ = std::fs::create_dir_all(dir());
     let tmp = path.with_extension("json.tmp");
-    if let Ok(bytes) = serde_json::to_vec(map) {
-        if std::fs::write(&tmp, bytes).is_ok() {
+    if let Ok(bytes) = serde_json::to_vec(map)
+        && std::fs::write(&tmp, bytes).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
-    }
 }
 
 pub(super) fn adaptive(device: &str) -> Vec<Arc<[f32]>> {

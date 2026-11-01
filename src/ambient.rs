@@ -416,11 +416,10 @@ pub fn emit_state(reason: &str) {
         *last = mode.to_string();
         changed
     };
-    if changed && !reason.starts_with("mission_control:") {
-        if let Some(hook) = MODE_HOOK.get() {
+    if changed && !reason.starts_with("mission_control:")
+        && let Some(hook) = MODE_HOOK.get() {
             hook(mode, reason);
         }
-    }
 }
 
 pub fn effective_mode_name(pinned_active: bool) -> &'static str {

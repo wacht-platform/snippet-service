@@ -210,11 +210,10 @@ impl AnthropicModel {
         if let Some(speak) = anthropic_tools.iter_mut().find(|tool| tool.name == "speak") {
             speak.eager_input_streaming = Some(true);
         }
-        if self.config.cache_prompt {
-            if let Some(last_tool) = anthropic_tools.last_mut() {
+        if self.config.cache_prompt
+            && let Some(last_tool) = anthropic_tools.last_mut() {
                 last_tool.cache_control = Some(self.cache_mark());
             }
-        }
 
         if self.config.cache_prompt {
             // Stamp the breakpoint on the last DURABLE content block, not the
@@ -247,11 +246,10 @@ impl AnthropicModel {
             }
             if !placed {
                 let m = anthropic_messages.len();
-                if m >= 2 {
-                    if let Some(block) = anthropic_messages[m - 2].content.last_mut() {
+                if m >= 2
+                    && let Some(block) = anthropic_messages[m - 2].content.last_mut() {
                         placed = stamp(block);
                     }
-                }
             }
             if !placed {
                 // Single-message requests (summarizer / reflection workers): the
@@ -570,12 +568,11 @@ async fn parse_anthropic_sse(
                         }
                     }
                     Some("input_json_delta") => {
-                        if let Some(chunk) = delta.and_then(|d| d.get("partial_json")).and_then(Value::as_str) {
-                            if let Some(tool) = tools.get_mut(&index) {
+                        if let Some(chunk) = delta.and_then(|d| d.get("partial_json")).and_then(Value::as_str)
+                            && let Some(tool) = tools.get_mut(&index) {
                                 tool.partial.push_str(chunk);
                                 StreamBuffer::tool_event(sink, crate::llm::ToolArgEvent::Delta { call_id: if tool.id.is_empty() { index.to_string() } else { tool.id.clone() }, chunk: chunk.to_string() });
                             }
-                        }
                     }
                     Some("signature_delta") => {
                         if let (Some(block), Some(sig)) = (
@@ -1026,12 +1023,11 @@ fn text_block(text: String) -> AnthropicContent {
 /// role so tool_use / tool_result blocks pair correctly across one assistant /
 /// user turn.
 fn push_block(prepared: &mut Vec<AnthropicMessage>, role: &str, block: AnthropicContent) {
-    if let Some(last) = prepared.last_mut() {
-        if last.role == role {
+    if let Some(last) = prepared.last_mut()
+        && last.role == role {
             last.content.push(block);
             return;
         }
-    }
     prepared.push(AnthropicMessage {
         role: role.to_string(),
         content: vec![block],

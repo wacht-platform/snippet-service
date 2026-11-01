@@ -56,12 +56,11 @@ pub fn model_ok() -> bool {
 
 pub fn fetch_model() -> Result<PathBuf, String> {
     let path = model_path();
-    if path.exists() {
-        if let Err(e) = verify(&path) {
+    if path.exists()
+        && let Err(e) = verify(&path) {
             eprintln!("[voiceprint] {e}; re-downloading");
             let _ = std::fs::remove_file(&path);
         }
-    }
     if !path.exists() {
         eprintln!("[voiceprint] downloading {MODEL}");
         download(&path)?;

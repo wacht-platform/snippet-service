@@ -178,11 +178,10 @@ impl SessionTerms {
     }
 
     pub fn close(&self, id: &str) {
-        if let Ok(mut g) = self.terms.lock() {
-            if let Some(t) = g.remove(id) {
+        if let Ok(mut g) = self.terms.lock()
+            && let Some(t) = g.remove(id) {
                 t.kill();
             }
-        }
     }
 
     /// Drain the PTY once and copy the same bytes to every subscriber.
@@ -372,12 +371,11 @@ impl SessionTerm {
                 }
             }
         }
-        if let Some(pid) = g.child_pid {
-            if reap_if_exited(pid) {
+        if let Some(pid) = g.child_pid
+            && reap_if_exited(pid) {
                 g.alive = false;
                 g.child_pid = None;
             }
-        }
         if !out.is_empty() {
             for b in &out {
                 if g.scrollback.len() >= SCROLLBACK_CAP {
@@ -391,12 +389,11 @@ impl SessionTerm {
             let col = 1u16;
             let mut replies = Vec::new();
             g.dsr.feed(&out, &mut replies, row, col);
-            if !replies.is_empty() {
-                if let Some(m) = g.master.as_mut() {
+            if !replies.is_empty()
+                && let Some(m) = g.master.as_mut() {
                     let _ = m.write_all(&replies);
                     let _ = m.flush();
                 }
-            }
         }
         out
     }

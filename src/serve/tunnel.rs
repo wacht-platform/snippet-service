@@ -53,14 +53,13 @@ pub(super) async fn open(tunnel: Tunnel, port: u16) -> Result<(String, Running),
             start_tailscale(&bin, &dns, port, funnel).await
         }
         Tunnel::Auto => {
-            if let Some(bin) = find_tailscale() {
-                if let Some(dns) = tailscale_dns_name(&bin).await {
+            if let Some(bin) = find_tailscale()
+                && let Some(dns) = tailscale_dns_name(&bin).await {
                     match start_tailscale(&bin, &dns, port, false).await {
                         Ok(up) => return Ok(up),
                         Err(e) => println!("tailscale serve did not start: {e}"),
                     }
                 }
-            }
             if let Some(bin) = find_cloudflared() {
                 return start_cloudflared_quick(&bin, port).await;
             }
@@ -207,11 +206,10 @@ async fn start_cloudflared_quick(
         .map_err(|e| format!("launch cloudflared: {e}"))?;
 
     for _ in 0..100 {
-        if let Ok(content) = std::fs::read_to_string(&log) {
-            if let Some(url) = extract_trycloudflare_url(&content) {
+        if let Ok(content) = std::fs::read_to_string(&log)
+            && let Some(url) = extract_trycloudflare_url(&content) {
                 return Ok((url, Running::Process(child)));
             }
-        }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     let _ = child.start_kill();

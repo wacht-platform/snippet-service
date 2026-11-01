@@ -227,12 +227,11 @@ pub async fn attach(info: &DaemonInfo, state_path: &Path) -> Result<SidecarAttac
                 }
                 continue;
             };
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if v.get("wire").and_then(|w| w.as_str()) == Some("term") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                && v.get("wire").and_then(|w| w.as_str()) == Some("term") {
                     let _ = term_in_tx.send(v);
                     continue;
                 }
-            }
             apply_wire_frame(&text, &mut accumulated, &state_tx, &stream_in);
         }
         connected_in.store(false, std::sync::atomic::Ordering::Relaxed);

@@ -532,13 +532,11 @@ impl App {
                 }
                 if self.options.config.model.provider == "chatgpt" {
                     let name = self.options.config.active_setup.clone();
-                    if let Some(name) = name {
-                        if let Some(setups) = self.options.config.setups.as_mut() {
-                            if let Some(cfg) = setups.get_mut(&name) {
+                    if let Some(name) = name
+                        && let Some(setups) = self.options.config.setups.as_mut()
+                            && let Some(cfg) = setups.get_mut(&name) {
                                 cfg.api_key.clear();
                             }
-                        }
-                    }
                     let _ = self.save_config_file();
                 }
                 self.status = "Signed out of ChatGPT.".to_string();

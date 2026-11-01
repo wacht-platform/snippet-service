@@ -118,13 +118,13 @@ impl Store {
 
     pub fn managed_session_exists(&self, id: &str) -> Result<bool, StoreError> {
         self.with_connection(|conn| {
-            Ok(conn
+            conn
                 .query_row(
                     "SELECT 1 FROM managed_sessions WHERE id = ?1",
                     params![id],
                     |_| Ok(()),
                 )
-                .optional_present()?)
+                .optional_present()
         })
     }
 
@@ -173,7 +173,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare("SELECT state_json FROM mission_autonomy WHERE id = 1")?;
             let mut rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            Ok(rows.next().transpose()?)
+            rows.next().transpose()
         })
     }
 

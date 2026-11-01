@@ -520,7 +520,7 @@ impl CodingHarness {
         }
         let Some(session) = self.context.durable_session_id() else { return };
         let Some((task_id, _)) = crate::coordination_tools::session_task(&self.context, session) else { return };
-        let path = self.context.store_path().map(std::path::PathBuf::from).unwrap_or_else(crate::store::default_db_path);
+        let path = self.context.store_path().unwrap_or_else(crate::store::default_db_path);
         let Ok(store) = crate::store::Store::open_cached(path) else { return };
         let work: Vec<crate::coordination::WorkStep> = steps
             .iter()

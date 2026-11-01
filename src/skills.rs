@@ -49,11 +49,10 @@ pub fn discover() -> Vec<Skill> {
     static CACHE: std::sync::Mutex<Option<(Stamp, Vec<Skill>)>> = std::sync::Mutex::new(None);
     let stamp = skills_stamp();
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((cached, skills)) = cache.as_ref() {
-        if *cached == stamp {
+    if let Some((cached, skills)) = cache.as_ref()
+        && *cached == stamp {
             return skills.clone();
         }
-    }
     let skills = discover_uncached();
     *cache = Some((stamp, skills.clone()));
     skills
@@ -239,11 +238,10 @@ fn load_skill(sk: Skill) -> Option<(Skill, String, Vec<String>)> {
 }
 
 fn strip_frontmatter(text: &str) -> String {
-    if let Some(rest) = text.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
+    if let Some(rest) = text.strip_prefix("---")
+        && let Some(end) = rest.find("\n---") {
             return rest[end + 4..].trim_start().to_string();
         }
-    }
     text.trim_start().to_string()
 }
 

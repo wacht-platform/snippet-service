@@ -332,11 +332,10 @@ impl Listener {
         }
         drop(s);
         self.pump(true);
-        if force {
-            if let Some(tx) = self.inner.lock().unwrap().conn.as_ref().and_then(|c| c.tx.clone()) {
+        if force
+            && let Some(tx) = self.inner.lock().unwrap().conn.as_ref().and_then(|c| c.tx.clone()) {
                 let _ = tx.send(Cmd::Force);
             }
-        }
     }
 
     fn sample(&self) {
@@ -530,8 +529,8 @@ impl Listener {
             if fresh || resumed {
                 super::ambient_routes::announce(&self.d, &self.device, seq, false);
             }
-            if let Some(clean_text) = probe_text {
-                if !clean_text.trim().is_empty() {
+            if let Some(clean_text) = probe_text
+                && !clean_text.trim().is_empty() {
                     let me = get(&self.d, &self.device);
                     let d = self.d.clone();
                     let device = self.device.clone();
@@ -562,7 +561,6 @@ impl Listener {
                         }
                     });
                 }
-            }
             return;
         }
         if let Some(last) = words.last() {

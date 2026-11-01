@@ -224,8 +224,8 @@ async fn accept(
             supersede(d, &l.latest(&revised));
         }
     }
-    if turn.is_empty() {
-        if let Some(l) = last.as_mut() {
+    if turn.is_empty()
+        && let Some(l) = last.as_mut() {
             let gap = part.started - l.ended;
             let routable = crate::ambient::lease_holder().is_some_and(|(h, _)| h == device);
             if l.delivered
@@ -244,7 +244,6 @@ async fn accept(
                 return;
             }
         }
-    }
     let mergeable = turn.last().is_some_and(|prev| {
         let gap = part.started - prev.ended;
         let allowed = if part.continued || deadline.is_some_and(|t| t > Instant::now() + HOLD) { CONTINUED_GAP } else { MERGE_GAP };

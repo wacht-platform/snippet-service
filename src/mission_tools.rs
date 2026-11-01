@@ -20,9 +20,7 @@ fn schema(properties: Value, required: &[&str]) -> Value {
 }
 
 fn root(ctx: &ToolContext) -> Result<PathBuf, ToolError> {
-    ctx.mission_control_root()
-        .map(PathBuf::from)
-        .ok_or_else(|| {
+    ctx.mission_control_root().ok_or_else(|| {
             ToolError::msg(
                 "Mission Control tools are only available in the Mission Control session.",
             )
@@ -1307,9 +1305,7 @@ async fn create_task(
         }
         let store = db(ctx)?;
         let root = ctx
-            .mission_control_root()
-            .map(PathBuf::from)
-            .unwrap_or_else(mission_control::workspace_path);
+            .mission_control_root().unwrap_or_else(mission_control::workspace_path);
         // An agent's INBOX is a mailbox, not a workspace. It runs the
         // coordination runtime — no file or shell tools, and no
         // `report_mission_task` — so work routed there cannot be done and cannot
@@ -1966,16 +1962,14 @@ impl Tool for UpdateMissionTask {
         }
         let mut updated_task = store
             .update_task_in(task_id, &now, |t| {
-                if let Some(ref title) = args.title {
-                    if !title.trim().is_empty() {
+                if let Some(ref title) = args.title
+                    && !title.trim().is_empty() {
                         t.title = title.trim().to_string();
                     }
-                }
-                if let Some(ref desc) = args.description {
-                    if !desc.trim().is_empty() {
+                if let Some(ref desc) = args.description
+                    && !desc.trim().is_empty() {
                         t.description = desc.trim().to_string();
                     }
-                }
                 if let Some(ref plan) = args.plan {
                     t.plan = plan.trim().to_string();
                 }
@@ -2872,7 +2866,7 @@ pub(crate) fn announce_report(
             "kind": "coordination_event",
             "event": saved.clone(),
         }));
-        crate::serve::queue_coordination_wake(&store, saved);
+        crate::serve::queue_coordination_wake(store, saved);
     }
 }
 

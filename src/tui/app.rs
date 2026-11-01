@@ -726,13 +726,12 @@ impl App {
             self.status_shown = self.status.clone();
             self.status_since = (!self.status.is_empty()).then(std::time::Instant::now);
         }
-        if let Some(since) = self.status_since {
-            if since.elapsed() > Duration::from_secs(4) {
+        if let Some(since) = self.status_since
+            && since.elapsed() > Duration::from_secs(4) {
                 self.status.clear();
                 self.status_shown.clear();
                 self.status_since = None;
             }
-        }
 
         // Refresh the account-wide ChatGPT usage a few times a second (tiny file,
         // signed-in users only) so the footer figure is global, not per-chat.
@@ -780,11 +779,10 @@ impl App {
                     let count = models.len();
                     // Seed a model only if none is chosen yet (e.g. a custom
                     // endpoint with no default); never override a real choice.
-                    if self.form_model.trim().is_empty() {
-                        if let Some(first) = models.first() {
+                    if self.form_model.trim().is_empty()
+                        && let Some(first) = models.first() {
                             self.form_model = first.clone();
                         }
-                    }
                     self.form_fetched_models = Some(models);
                     self.models_fetch_status = format!("Loaded {count} models from provider.");
                 }
@@ -1064,11 +1062,10 @@ impl App {
                     // workspaces root directly.
                     let sp = crate::config::workspaces_root().join(&session_id);
                     self.active_state_path = sp.clone();
-                    if let Some(stem) = sp.file_stem().and_then(|s| s.to_str()) {
-                        if stem != "state" {
+                    if let Some(stem) = sp.file_stem().and_then(|s| s.to_str())
+                        && stem != "state" {
                             self.active_conversation = stem.to_string();
                         }
-                    }
                 }
                 Err(error) => {
                     self.status = format!("sidecar open: {error}");
@@ -1167,11 +1164,10 @@ pub(crate) async fn run_app(
         let slot = app.update_notice.clone();
         tokio::spawn(async move {
             let client = reqwest::Client::new();
-            if let Some(version) = crate::update::check_and_update(&client).await {
-                if let Ok(mut guard) = slot.lock() {
+            if let Some(version) = crate::update::check_and_update(&client).await
+                && let Ok(mut guard) = slot.lock() {
                     *guard = Some(version);
                 }
-            }
         });
     }
 

@@ -168,7 +168,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare("SELECT agent_id, nickname FROM agent_nicknames")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
+            rows.collect::<Result<_, _>>()
         })
     }
 
@@ -198,7 +198,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare("SELECT agent_id, color FROM agent_colors")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
+            rows.collect::<Result<_, _>>()
         })
     }
 
@@ -206,7 +206,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare("SELECT agent_id, shape FROM agent_shapes")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
+            rows.collect::<Result<_, _>>()
         })
     }
 
@@ -214,7 +214,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare("SELECT agent_id, profile FROM agent_profiles")?;
             let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
+            rows.collect::<Result<_, _>>()
         })
     }
 
@@ -228,7 +228,7 @@ impl Store {
             ) {
                 Ok(profile) => Ok(Some(profile).filter(|p| !p.trim().is_empty())),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(error) => Err(error.into()),
+                Err(error) => Err(error),
             }
         })
     }

@@ -432,13 +432,11 @@ impl CodingHarness {
 
         stats.real_work += 1;
 
-        if tool_name == "bash" {
-            if let Some(command) = call.arguments.get("command").and_then(Value::as_str) {
-                if note_shell_command(vars, command) {
+        if tool_name == "bash"
+            && let Some(command) = call.arguments.get("command").and_then(Value::as_str)
+                && note_shell_command(vars, command) {
                     stats.shell_nudged = true;
                 }
-            }
-        }
 
         // A bash command that references a vault secret ($NAME) ALWAYS requires
         // explicit user confirmation, regardless of approval mode or a prior

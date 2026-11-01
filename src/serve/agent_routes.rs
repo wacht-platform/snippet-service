@@ -306,11 +306,10 @@ pub(crate) async fn create_agent(
         return (StatusCode::BAD_REQUEST, "id and handle are required").into_response();
     }
     let profile = req.profile.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
-    if let Some(name) = profile.as_deref() {
-        if let Err(error) = crate::mission_tools::check_profile(name).await {
+    if let Some(name) = profile.as_deref()
+        && let Err(error) = crate::mission_tools::check_profile(name).await {
             return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
         }
-    }
     let req_nickname = req.nickname.as_deref().map(|n| n.trim().to_string());
     let agent = crate::coordination::types::Agent {
         id: req.id,
@@ -455,15 +454,14 @@ pub(crate) async fn set_agent_shape(
         return unauthorized();
     }
     let shape = req.shape.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
-    if let Some(s) = &shape {
-        if !AGENT_SHAPES.contains(&s.as_str()) {
+    if let Some(s) = &shape
+        && !AGENT_SHAPES.contains(&s.as_str()) {
             return (
                 StatusCode::BAD_REQUEST,
                 format!("shape must be one of: {}", AGENT_SHAPES.join(", ")),
             )
                 .into_response();
         }
-    }
     match d.store.set_agent_shape(&agent_id, shape.as_deref()) {
         Ok(true) => Json(serde_json::json!({ "id": agent_id, "shape": shape })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "no such agent").into_response(),

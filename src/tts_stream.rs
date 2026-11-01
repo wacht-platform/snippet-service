@@ -1009,11 +1009,10 @@ async fn reconcile(
         s.send(json!({"type": "Interrupt", "playback_offset": {"type": "time_ms", "value": at}}));
         match tokio::time::timeout(INTERRUPT_WAIT, rx).await {
             Ok(Ok(v)) => {
-                if heard_by_turn.contains_key(&current.turn) {
-                    if let Some(text) = v.get("text_spoken").and_then(|x| x.as_str()) {
+                if heard_by_turn.contains_key(&current.turn)
+                    && let Some(text) = v.get("text_spoken").and_then(|x| x.as_str()) {
                         spoken.insert(current.turn, text.trim().to_string());
                     }
-                }
             }
             _ => {}
         }
