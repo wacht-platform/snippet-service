@@ -445,6 +445,75 @@ struct WakeToolArgs {
     only_on_change: Option<bool>,
 }
 
+fn own_view(state: &crate::mission_autonomy::AutonomyState) -> Value {
+    json!({
+        "enabled": state.settings.on,
+        "every_minutes": state.settings.round_minutes,
+        "quiet_start": state.settings.quiet_start,
+        "quiet_end": state.settings.quiet_end,
+    })
+}
+
+fn own_minutes(schedule: &str) -> Option<u32> {
+    let t = schedule.trim().to_ascii_lowercase();
+    let t = t.strip_prefix("every").map(str::trim).unwrap_or(&t);
+    if t == "hourly" || t == "hour" {
+        return Some(60);
+    }
+    let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
+    let n: u32 = digits.parse().ok().filter(|n| *n > 0)?;
+    match t[digits.len()..].trim() {
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(n),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(n.saturating_mul(60)),
+        _ => None,
+    }
+}
+
+/// Mission Control's own automated wakes: the heartbeat the user also sets in the app.
+fn own_wakes(args: &WakeToolArgs) -> Result<ToolResult, ToolError> {
+    use crate::mission_autonomy as auto;
+    match args.action.as_str() {
+        "show" => Ok(ToolResult::success(json!({"automated_wakes": own_view(&auto::load())}))),
+        "set" | "clear" => {
+            let clear = args.action == "clear";
+            let minutes = match args.schedule.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                Some(raw) => Some(own_minutes(raw).ok_or_else(|| ToolError::msg("schedule must look like `every 30m`, `every 2h` or `hourly`"))?),
+                None => None,
+            };
+            for clock in [&args.quiet_start, &args.quiet_end].into_iter().flatten() {
+                if !clock.is_empty() && !auto::valid_clock(clock) {
+                    return Err(ToolError::msg(format!("quiet hours must be HH:MM, got `{clock}`")));
+                }
+            }
+            let state = auto::update(|state| {
+                if clear {
+                    state.settings.on = false;
+                }
+                if let Some(on) = args.enabled.filter(|_| !clear) {
+                    if on && !state.settings.on {
+                        state.last_round_at = 0;
+                        state.last_digest.clear();
+                    }
+                    state.settings.on = on;
+                }
+                if let Some(m) = minutes {
+                    state.settings.round_minutes = m.clamp(auto::MIN_ROUND_MINUTES, 24 * 60);
+                }
+                if let Some(start) = args.quiet_start.clone() {
+                    state.settings.quiet_start = Some(start).filter(|v| !v.is_empty());
+                }
+                if let Some(end) = args.quiet_end.clone() {
+                    state.settings.quiet_end = Some(end).filter(|v| !v.is_empty());
+                }
+                state.clone()
+            })
+            .map_err(ToolError::msg)?;
+            Ok(ToolResult::success(json!({"automated_wakes": own_view(&state), "note": "Your own heartbeat; the app's Wakes settings show the same values."})))
+        }
+        other => Err(ToolError::msg(format!("unknown action `{other}`; use show, set or clear"))),
+    }
+}
+
 pub struct WakeScheduleTool;
 
 #[async_trait]
@@ -457,7 +526,7 @@ impl Tool for WakeScheduleTool {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["show", "set", "clear"]},
-                    "agent_id": {"type": "string", "description": "Mission Control only: the agent or session to manage."},
+                    "agent_id": {"type": "string", "description": "Mission Control: the agent or session to manage. Omitted, Mission Control manages its own automated wakes: schedule `every 60m` or `hourly` sets the interval (10m minimum), quiet_start and quiet_end set quiet hours, enabled turns them on or off, clear turns them off."},
                     "schedule": {"type": "string"},
                     "brief": {"type": "string", "description": "What to do on each wake."},
                     "enabled": {"type": "boolean"},
@@ -478,7 +547,7 @@ impl Tool for WakeScheduleTool {
         let named = args.agent_id.as_deref().map(str::trim).filter(|a| !a.is_empty());
         let (owner, setter) = match (ctx.is_mission_control(), named) {
             (true, Some(other)) => (other.to_string(), Setter::MissionControl),
-            (true, None) => return Err(ToolError::msg("pass agent_id; your own wakes are automated wakes and schedule_wake")),
+            (true, None) => return own_wakes(&args),
             (false, Some(_)) => return Err(ToolError::msg("only Mission Control can set another agent's wake")),
             (false, None) => {
                 let own = ctx
@@ -785,5 +854,19 @@ mod tests {
         let jobs = store.list_recurring_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(jobs[0].wake.is_none() && jobs[0].last_result.is_none());
+    }
+}
+
+#[cfg(test)]
+mod own_wake_tests {
+    use super::own_minutes;
+
+    #[test]
+    fn reads_the_intervals_mission_control_may_ask_for() {
+        assert_eq!(own_minutes("every 30m"), Some(30));
+        assert_eq!(own_minutes("every 2h"), Some(120));
+        assert_eq!(own_minutes("Hourly"), Some(60));
+        assert_eq!(own_minutes("90 minutes"), Some(90));
+        assert_eq!(own_minutes("daily 09:00"), None);
     }
 }
