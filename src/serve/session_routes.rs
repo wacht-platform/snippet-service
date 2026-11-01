@@ -419,7 +419,7 @@ pub(crate) async fn interrupt_session(
         .await
         .get(&req.session)
         .is_some_and(|s| !s.join.is_finished());
-    let status = crate::session::read_session_state(&sp).map(|s| s.status);
+    let status = crate::session::read_session_meta(&sp).map(|s| s.status);
     let working = matches!(
         status,
         Some(crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)

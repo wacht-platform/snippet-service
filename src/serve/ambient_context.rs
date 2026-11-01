@@ -171,7 +171,7 @@ pub(crate) fn mission_control(d: &Shared) -> Value {
     chat.reverse();
     tools.reverse();
     let pending = crate::session::state_path_for_id(crate::mission_control::SESSION_ID)
-        .and_then(|p| crate::session::read_session_state(&p))
+        .and_then(|p| crate::session::read_session_meta(&p))
         .and_then(|s| s.pending_question)
         .map(|q| redact(&clip(&super::autonomy::question_text(&q), 300, false)));
     json!({

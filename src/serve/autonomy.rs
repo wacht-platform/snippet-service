@@ -223,7 +223,7 @@ pub(super) async fn interrupt_mission_control(daemon: &Shared) -> bool {
 }
 
 pub(super) fn mission_control_busy() -> bool {
-    crate::session::read_session_state(&crate::mission_control::session_state_path())
+    crate::session::read_session_meta(&crate::mission_control::session_state_path())
         .is_some_and(|s| matches!(s.status, HarnessStatus::Running | HarnessStatus::WaitingForInput))
 }
 
@@ -258,6 +258,13 @@ fn ago(secs: i64) -> String {
 }
 
 fn session_status(id: &str) -> Option<crate::harness::HarnessState> {
+    if id.trim().is_empty() {
+        return None;
+    }
+    crate::session::state_path_for_id(id).and_then(|p| crate::session::read_session_meta(&p))
+}
+
+fn session_full_state(id: &str) -> Option<crate::harness::HarnessState> {
     if id.trim().is_empty() {
         return None;
     }
@@ -347,10 +354,6 @@ fn waiting_and_dormant(tasks: &[crate::coordination::Task], now: i64) -> (Vec<St
             continue;
         }
         let Some(state) = session_status(&session.id) else { continue };
-        let last_said = state.events.iter().rev().find_map(|event| match event {
-            crate::harness::HarnessEvent::AssistantText { text } => Some(one_line(text, 220)),
-            _ => None,
-        });
         if state.status == HarnessStatus::WaitingForInput {
             let question = state.pending_question.as_ref().map(question_text).unwrap_or_default();
             waiting.push(format!(
@@ -363,6 +366,12 @@ fn waiting_and_dormant(tasks: &[crate::coordination::Task], now: i64) -> (Vec<St
             continue;
         }
         if dormant.len() < 8 {
+            let last_said = session_full_state(&session.id).and_then(|full| {
+                full.events.iter().rev().find_map(|event| match event {
+                    crate::harness::HarnessEvent::AssistantText { text } => Some(one_line(text, 220)),
+                    _ => None,
+                })
+            });
             dormant.push(format!(
                 "- {} · {} · quiet {} · last said: {}",
                 session.title,

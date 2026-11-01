@@ -753,7 +753,7 @@ fn secs_between(from: &str, to: &str) -> i64 {
 
 fn inbox_busy(agent: &str) -> bool {
     crate::session::state_path_for_id(&crate::session::inbox_session_id(agent))
-        .and_then(|path| crate::session::read_session_state(&path))
+        .and_then(|path| crate::session::read_session_meta(&path))
         .is_some_and(|state| {
             matches!(state.status, crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)
         })
@@ -837,7 +837,7 @@ async fn wait_for_idle_switch(d: &Daemon, task_id: &str) -> Result<Option<Task>,
         return Ok(None);
     }
     let busy = crate::session::state_path_for_id(&task.session_id)
-        .and_then(|path| crate::session::read_session_state(&path))
+        .and_then(|path| crate::session::read_session_meta(&path))
         .is_some_and(|state| {
             matches!(state.status, crate::harness::HarnessStatus::Running | crate::harness::HarnessStatus::WaitingForInput)
         });

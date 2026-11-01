@@ -90,7 +90,7 @@ pub fn workspace_path() -> PathBuf {
 /// The one conversation file. Open always resumes this; it is never minted
 /// under a project `conversations/` directory.
 pub fn awaiting_user() -> bool {
-    crate::session::read_session_state(&session_state_path()).is_some_and(|state| {
+    crate::session::read_session_meta(&session_state_path()).is_some_and(|state| {
         state.status == crate::harness::HarnessStatus::WaitingForInput && state.pending_question.is_some()
     })
 }

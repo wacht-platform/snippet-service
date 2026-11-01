@@ -78,7 +78,7 @@ pub(super) async fn drive_reviews(d: &Daemon) {
 
 async fn start_review(d: &Daemon, task: &Task, state: &TaskState, now: &str) {
     let workspace = crate::session::state_path_for_id(&task.session_id)
-        .and_then(|p| crate::session::read_session_state(&p))
+        .and_then(|p| crate::session::read_session_meta(&p))
         .map(|s| std::path::PathBuf::from(s.workspace));
     let Some(workspace) = workspace else {
         crate::review_tools::escalate(&d.store, &task.id, "no reviewer could start: the work session's workspace is gone", now);

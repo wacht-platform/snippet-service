@@ -199,7 +199,7 @@ impl Tool for AnswerWorker {
         let args: AnswerWorkerArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         let session = args.session_id.trim().trim_start_matches("session:").to_string();
         let waiting = crate::session::state_path_for_id(&session)
-            .and_then(|path| crate::session::read_session_state(&path))
+            .and_then(|path| crate::session::read_session_meta(&path))
             .is_some_and(|state| state.status == crate::harness::HarnessStatus::WaitingForInput && state.pending_question.is_some());
         if !waiting {
             return Err(ToolError::msg(format!("session `{session}` isn't waiting on a question right now")));
@@ -1246,7 +1246,7 @@ pub(crate) fn resolve_target_session(query: &str) -> Result<String, ToolError> {
     }
     if !q.contains(char::is_whitespace)
         && let Some(path) = state_path_for_id(q)
-        && read_session_state(&path).is_some()
+        && crate::session::read_session_meta(&path).is_some()
     {
         return Ok(crate::session::session_id_for_state_path(&path));
     }
@@ -2941,7 +2941,7 @@ impl Tool for ReportMissionTask {
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
             let workspace = state_path_for_id(&current.session_id)
-                .and_then(|p| read_session_state(&p))
+                .and_then(|p| crate::session::read_session_meta(&p))
                 .map(|s| PathBuf::from(s.workspace))
                 .unwrap_or_else(|| ctx.workspace_root().to_path_buf());
             if let Some(mode) = crate::review_tools::gate_done(&store, &current, &args.evidence, &workspace, &now)? {

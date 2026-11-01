@@ -118,7 +118,7 @@ pub fn api_fields(store: &Store, task: &Task) -> serde_json::Map<String, Value> 
 
 fn workspace_of(task: &Task) -> Option<std::path::PathBuf> {
     let path = crate::session::state_path_for_id(&task.session_id)?;
-    crate::session::read_session_state(&path).map(|s| s.workspace.into())
+    crate::session::read_session_meta(&path).map(|s| s.workspace.into())
 }
 
 fn git_lines(workspace: &Path, args: &[&str]) -> Vec<String> {

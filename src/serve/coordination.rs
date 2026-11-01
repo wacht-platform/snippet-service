@@ -246,7 +246,7 @@ async fn create_task(
     let Some(target_path) = crate::session::state_path_for_id(req.session_id.trim()) else {
         return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
     };
-    let Some(state) = crate::session::read_session_state(&target_path) else {
+    let Some(state) = crate::session::read_session_meta(&target_path) else {
         return (StatusCode::BAD_REQUEST, "session_id must name a real session").into_response();
     };
     let session_id = crate::session::session_id_for_state_path(&target_path);

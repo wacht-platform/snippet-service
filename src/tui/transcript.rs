@@ -408,10 +408,22 @@ pub(super) fn event_lines(event: &HarnessEvent, width: usize) -> Vec<Line<'stati
         return card_lines(&card, width);
     }
     match event {
-        HarnessEvent::UserInput { text } => user_lines(text, width),
+        HarnessEvent::UserInput { text } => {
+            if text.trim_start().starts_with("[routing]") {
+                Vec::new()
+            } else {
+                user_lines(text, width)
+            }
+        }
         // Steers are still your words mid-run — same column as user messages, no
         // extra ↳ gutter (that stacked with the speaker tag and broke indent).
-        HarnessEvent::Steer { text } => steer_lines(text, width),
+        HarnessEvent::Steer { text } => {
+            if text.trim_start().starts_with("[routing]") {
+                Vec::new()
+            } else {
+                steer_lines(text, width)
+            }
+        }
         HarnessEvent::AssistantText { text } => {
             indent_block(render_prose(text, width.saturating_sub(SPINE)), SPINE)
         }

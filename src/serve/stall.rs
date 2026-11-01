@@ -18,7 +18,7 @@ pub(super) fn probe_session(session_id: &str) -> Option<SessionProbe> {
     if session_id.trim().is_empty() {
         return None;
     }
-    let state = crate::session::state_path_for_id(session_id).and_then(|p| crate::session::read_session_state(&p))?;
+    let state = crate::session::state_path_for_id(session_id).and_then(|p| crate::session::read_session_meta(&p))?;
     let question = (state.status == crate::harness::HarnessStatus::WaitingForInput)
         .then(|| state.pending_question.as_ref().map(super::autonomy::question_text))
         .flatten();

@@ -80,7 +80,7 @@ fn parallel_conflicts(nodes: &[Node], workspace: &str, ancestors: &HashSet<usize
 
 fn workspace_of_session(id: &str) -> String {
     crate::session::state_path_for_id(id)
-        .and_then(|p| crate::session::read_session_state(&p))
+        .and_then(|p| crate::session::read_session_meta(&p))
         .map(|s| s.workspace)
         .unwrap_or_default()
 }
