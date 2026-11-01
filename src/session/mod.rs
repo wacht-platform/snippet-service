@@ -1404,7 +1404,7 @@ fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value
         return None;
     }
     if matches!(kind, "done" | "idle")
-        && event.get("session").and_then(|s| s.as_str()).is_some_and(is_inbox_session_id)
+        && event.get("session").and_then(|s| s.as_str()).is_some_and(|id| is_inbox_session_id(id.split('/').next().unwrap_or(id)))
     {
         return None;
     }

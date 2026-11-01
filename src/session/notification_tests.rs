@@ -64,3 +64,13 @@ fn actionable_candidates_do_not_include_ui_only_events() {
     let task = notification_candidate(&json!({"kind":"coordination_event","event":{"event_type":"task.message","event_id":"source","correlation_id":"task","payload":{"body":"help"}}})).unwrap();
     assert_eq!(task["destination"]["type"], "task");
 }
+
+#[test]
+fn finished_notifications_skip_inbox_sessions_and_their_lanes() {
+    for session in ["inbox-growth-advisor", "inbox-growth-advisor/lanes/lane-3"] {
+        for kind in ["done", "idle"] {
+            assert!(notification_candidate(&json!({"kind": kind, "session": session})).is_none(), "{session} {kind}");
+        }
+    }
+    assert!(notification_candidate(&json!({"kind": "idle", "session": "project-1/conversations/abc"})).is_some());
+}
