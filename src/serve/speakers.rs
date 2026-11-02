@@ -48,6 +48,7 @@ pub(crate) struct Speakers {
 }
 
 impl Speakers {
+    #[cfg(test)]
     pub fn assign(&mut self, key: &str, at_ms: i64, voice: Option<&VoiceScore>, played: bool) -> Speaker {
         self.assign_with_tag(key, at_ms, voice, None, played)
     }
