@@ -38,7 +38,6 @@ mod account_routes;
 mod ambient_routes;
 mod ambient_context;
 mod ambient_router;
-mod req_stats;
 mod ambient_stream;
 mod assembly;
 mod listener;
@@ -1008,7 +1007,6 @@ pub async fn run_serve(
         .route("/git/discard", post(git_discard))
         .route("/session/checkpoint-stats", post(checkpoint_stats))
         .route("/git/init", post(git_init))
-        .route_layer(axum::middleware::from_fn(req_stats::track))
         .with_state(daemon);
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
