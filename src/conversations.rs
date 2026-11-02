@@ -702,7 +702,7 @@ impl Store {
     pub fn conversation_message_count(&self, session_id: &str) -> Result<i64, StoreError> {
         self.with_connection(|conn| {
             conn.query_row(
-                "SELECT COUNT(*) FROM session_messages WHERE session_id = ?1",
+                "SELECT COALESCE((SELECT ordinal + 1 FROM session_messages WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT 1), 0)",
                 params![session_id],
                 |row| row.get(0),
             )
@@ -1097,8 +1097,8 @@ impl Store {
             conn
                 .query_row(
                     "SELECT s.updated_at,
-                            (SELECT COUNT(*) FROM session_messages WHERE session_id = s.id),
-                            (SELECT COUNT(*) FROM session_events WHERE session_id = s.id)
+                            COALESCE((SELECT ordinal + 1 FROM session_messages WHERE session_id = s.id ORDER BY ordinal DESC LIMIT 1), 0),
+                            COALESCE((SELECT ordinal + 1 FROM session_events WHERE session_id = s.id ORDER BY ordinal DESC LIMIT 1), 0)
                      FROM sessions s WHERE s.id = ?1",
                     params![id],
                     |row| {
@@ -1250,7 +1250,7 @@ impl Store {
     ) -> Result<(Vec<HarnessEvent>, usize), StoreError> {
         self.with_connection(|conn| {
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+                "SELECT COALESCE((SELECT ordinal + 1 FROM session_events WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT 1), 0)",
                 params![session_id],
                 |row| row.get(0),
             )?;
@@ -1282,7 +1282,7 @@ impl Store {
     ) -> Result<(Vec<HarnessEvent>, usize, usize), StoreError> {
         self.with_connection(|conn| {
             let count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1",
+                "SELECT COALESCE((SELECT ordinal + 1 FROM session_events WHERE session_id = ?1 ORDER BY ordinal DESC LIMIT 1), 0)",
                 params![session_id],
                 |row| row.get(0),
             )?;
