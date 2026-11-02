@@ -527,7 +527,9 @@ fn ready_voice(voices: &[VoiceHandle]) -> Option<std::sync::Arc<VoiceScore>> {
 }
 
 fn best_voice(scores: impl Iterator<Item = std::sync::Arc<VoiceScore>>) -> Option<std::sync::Arc<VoiceScore>> {
-    scores.filter(|s| s.likelihood.is_some()).max_by(|a, b| a.voiced_secs.total_cmp(&b.voiced_secs))
+    scores
+        .filter(|s| s.likelihood.is_some() || s.embedding.is_some())
+        .max_by(|a, b| a.voiced_secs.total_cmp(&b.voiced_secs))
 }
 
 async fn wait_voice(id: &str, voices: &[VoiceHandle]) -> Option<std::sync::Arc<VoiceScore>> {

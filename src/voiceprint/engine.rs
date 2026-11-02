@@ -116,8 +116,11 @@ pub fn warm() {
     submit(Job::Warm);
 }
 
-/// Scores a finalised utterance in the background. `None` when there is nothing to compare against.
+/// Scores a finalised utterance in the background. Skips short clips (< 1.0s) before allocating.
 pub fn start(id: &str, device: &str, pcm: &[u8], manual: &[VoiceprintSample]) -> Option<VoiceHandle> {
+    if (pcm.len() / 2) < (MIN_VOICED * 16_000.0) as usize {
+        return None;
+    }
     let mut refs: Vec<Arc<[f32]>> = manual
         .iter()
         .filter(|s| s.model == neural::MODEL && s.vector.len() == neural::DIM)
@@ -125,7 +128,7 @@ pub fn start(id: &str, device: &str, pcm: &[u8], manual: &[VoiceprintSample]) ->
         .collect();
     refs.extend(super::store::adaptive(device));
     let legacy: Vec<VoiceprintSample> = manual.iter().filter(|s| s.model.is_empty() && s.vector.len() == super::DIM).cloned().collect();
-    if refs.is_empty() && legacy.is_empty() {
+    if refs.is_empty() && legacy.is_empty() && !neural_ready() {
         return None;
     }
     let (tx, rx) = watch::channel(None);
@@ -241,19 +244,25 @@ fn score(st: &mut State, pcm: &[f32], refs: &[Arc<[f32]>], legacy: &[VoiceprintS
     if voiced < MIN_VOICED {
         return none;
     }
-    if !refs.is_empty()
-        && let Some(m) = st.model() {
-            return match m.embed(&clip) {
-                Ok(emb) => {
-                    let sim = similarity(&emb, refs);
-                    VoiceScore { neural: true, similarity: Some(sim), likelihood: Some(likelihood(sim)), embedding: Some(emb.into()), ..none }
-                }
-                Err(e) => {
-                    eprintln!("[voiceprint] embed failed: {e}");
-                    none
-                }
-            };
-        }
+    if (!refs.is_empty() || legacy.is_empty())
+        && let Some(m) = st.model()
+    {
+        return match m.embed(&clip) {
+            Ok(emb) => {
+                let (sim, lh) = if refs.is_empty() {
+                    (None, None)
+                } else {
+                    let s = similarity(&emb, refs);
+                    (Some(s), Some(likelihood(s)))
+                };
+                VoiceScore { neural: true, similarity: sim, likelihood: lh, embedding: Some(emb.into()), ..none }
+            }
+            Err(e) => {
+                eprintln!("[voiceprint] embed failed: {e}");
+                none
+            }
+        };
+    }
     if legacy.is_empty() || st.model.is_some() || st.failed.is_none() {
         return none;
     }

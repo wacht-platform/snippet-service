@@ -53,6 +53,7 @@ pub(crate) struct Part {
     pub continued: bool,
     pub voice: Option<crate::voiceprint::VoiceHandle>,
     pub revises: Option<String>,
+    pub stt_speaker: Option<String>,
 }
 
 pub(crate) enum Msg {
@@ -247,7 +248,11 @@ async fn accept(
     let mergeable = turn.last().is_some_and(|prev| {
         let gap = part.started - prev.ended;
         let allowed = if part.continued || deadline.is_some_and(|t| t > Instant::now() + HOLD) { CONTINUED_GAP } else { MERGE_GAP };
-        let same_speaker = match (
+        let same_stt_speaker = match (prev.stt_speaker.as_deref(), part.stt_speaker.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        let same_voice = match (
             prev.voice.as_ref().and_then(|v| v.ready()),
             part.voice.as_ref().and_then(|v| v.ready()),
         ) {
@@ -265,7 +270,8 @@ async fn accept(
             _ => true,
         };
         gap <= allowed
-            && same_speaker
+            && same_stt_speaker
+            && same_voice
             && turn.len() < MAX_PARTS
             && part.ended - turn[0].started <= MAX_SPAN
     });
@@ -642,7 +648,15 @@ async fn deliver(
     }
     if let Some(first) = parts.first() {
         let voice = v.voice.clone().or_else(|| parts.iter().find_map(|p| p.voice.as_ref()?.ready()));
-        let speaker = super::speakers::assign(device, &first.id, (first.started * 1000.0) as i64, voice.as_deref(), v.played >= 0.8);
+        let stt_sp = parts.iter().find_map(|p| p.stt_speaker.as_deref());
+        let speaker = super::speakers::assign_with_tag(
+            device,
+            &first.id,
+            (first.started * 1000.0) as i64,
+            voice.as_deref(),
+            stt_sp,
+            v.played >= 0.8,
+        );
         if speaker != super::speakers::Speaker::Unknown {
             attrs.push_str(&format!(" speaker=\"{}\"", ambient_watch::escape(&speaker.label())));
         }

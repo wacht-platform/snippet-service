@@ -322,7 +322,14 @@ pub(super) async fn observe(d: &Shared, device: &str, parts: &[Part], v: &Verdic
     let mut part_speakers = Vec::with_capacity(parts.len());
     for p in parts {
         let pv = p.voice.as_ref().and_then(|h| h.ready()).or_else(|| v.voice.clone());
-        let sp = super::speakers::assign(device, &p.id, (p.started * 1000.0) as i64, pv.as_deref(), played);
+        let sp = super::speakers::assign_with_tag(
+            device,
+            &p.id,
+            (p.started * 1000.0) as i64,
+            pv.as_deref(),
+            p.stt_speaker.as_deref(),
+            played,
+        );
         part_speakers.push((p, sp, speaker_label(sp), pv.and_then(|s| s.likelihood)));
     }
     d.store.write(|c| {

@@ -241,9 +241,7 @@ pub(super) async fn open(d: &Shared, device: &str, h: u32, started_at: Option<&s
     s.stream = Some(h);
     drop(s);
     l.ensure();
-    if d.config.lock().unwrap().ambient.voiceprints.iter().any(|v| v.model == crate::voiceprint::NEURAL_MODEL) {
-        crate::voiceprint::warm();
-    }
+    crate::voiceprint::warm();
     Ok(())
 }
 
@@ -462,6 +460,12 @@ impl Listener {
         let transcript = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
         let mut s = self.inner.lock().unwrap();
         let Some(base) = s.conn.as_ref().filter(|c| c.id == conn).map(|c| c.base) else { return };
+        let turn_speaker = v
+            .get("speaker_label")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|sp| !sp.is_empty() && !sp.eq_ignore_ascii_case("PENDING") && !sp.eq_ignore_ascii_case("UNKNOWN"))
+            .map(str::to_string);
         let words: Vec<Heard> = v
             .get("words")
             .and_then(|x| x.as_array())
@@ -471,8 +475,14 @@ impl Listener {
                         let start = (base + (w.get("start")?.as_f64()? / 1000.0 * BPS) as u64) & !1;
                         let end = (base + (w.get("end")?.as_f64()? / 1000.0 * BPS) as u64) & !1;
                         let text = w.get("text")?.as_str()?.to_string();
+                        let speaker = w
+                            .get("speaker")
+                            .and_then(|x| x.as_str())
+                            .map(str::trim)
+                            .filter(|sp| !sp.is_empty() && !sp.eq_ignore_ascii_case("PENDING") && !sp.eq_ignore_ascii_case("UNKNOWN"))
+                            .map(str::to_string);
                         let mid = (start + end) / 2;
-                        Some(Heard { key: norm(&text), text, start, end, playing: at(&s.playing, mid), media: at(&s.media, mid) })
+                        Some(Heard { key: norm(&text), text, start, end, playing: at(&s.playing, mid), media: at(&s.media, mid), speaker })
                     })
                     .collect()
             })
@@ -566,77 +576,160 @@ impl Listener {
         if let Some(last) = words.last() {
             s.last_final = s.last_final.max(last.end);
         }
-        let (first_g, last_g) = match (words.first(), words.last()) {
-            (Some(f), Some(l)) => (f.start, l.end),
-            _ => (s.g, s.g),
-        };
-        let opened = s.anchors.iter().rev().find(|(a, _)| *a <= last_g).map(|(a, _)| *a).unwrap_or(0);
-        let first_g = first_g.max(opened).min(last_g);
-        let wall = s.anchors.iter().rev().find(|(a, _)| *a <= first_g).or(s.anchors.front()).map(|(a, w)| w + (first_g as f64 - *a as f64) / BPS);
-        let from = first_g.saturating_sub(PAD).max(s.ring_start);
-        let to = (last_g + PAD).min(s.g);
-        let pcm: Vec<u8> = if to > from {
-            s.ring.range((from - s.ring_start) as usize..(to - s.ring_start) as usize).copied().collect()
+        let clean_words: Vec<&Heard> = words.iter().zip(&mask).filter(|(_, e)| !**e).map(|(w, _)| w).collect();
+        let segments = if echo_all || clean_words.is_empty() {
+            let (first_g, last_g) = match (words.first(), words.last()) {
+                (Some(f), Some(l)) => (f.start, l.end),
+                _ => (s.g, s.g),
+            };
+            vec![(first_g, last_g, transcript.clone(), turn_speaker.clone())]
         } else {
-            Vec::new()
+            split_segments(&clean_words, &transcript, real == words.len(), turn_speaker.as_deref())
         };
+        let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
+        let mut events = Vec::with_capacity(segments.len());
+        let previous = s
+            .live
+            .as_mut()
+            .filter(|live| live.conn == conn && live.turn == order)
+            .and_then(|live| {
+                live.done = true;
+                live.event_id.clone()
+            });
+        for (idx, (raw_first, last_g, raw_text, stt_speaker)) in segments.into_iter().enumerate() {
+            let opened = s.anchors.iter().rev().find(|(a, _)| *a <= last_g).map(|(a, _)| *a).unwrap_or(0);
+            let first_g = raw_first.max(opened).min(last_g);
+            let wall = s
+                .anchors
+                .iter()
+                .rev()
+                .find(|(a, _)| *a <= first_g)
+                .or(s.anchors.front())
+                .map(|(a, w)| w + (first_g as f64 - *a as f64) / BPS);
+            let from = first_g.saturating_sub(PAD).max(s.ring_start);
+            let to = (last_g + PAD).min(s.g);
+            let pcm: Vec<u8> = if to > from {
+                s.ring.range((from - s.ring_start) as usize..(to - s.ring_start) as usize).copied().collect()
+            } else {
+                Vec::new()
+            };
+            let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
+            let (status, text) = if echo_all {
+                ("echo", raw_text)
+            } else if media {
+                ("media", raw_text)
+            } else {
+                let spoken = super::transcribe::finish_text(&raw_text).text;
+                if spoken.is_empty() { ("empty", String::new()) } else { ("done", spoken) }
+            };
+            let started = wall.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+            let duration_ms = ((last_g.saturating_sub(first_g)) as f64 / BPS * 1000.0) as i64;
+            let id = uuid::Uuid::new_v4().to_string();
+            let revises = if idx == 0 { previous.clone() } else { None };
+            if idx == 0
+                && previous.is_none()
+                && let Some(live) = s.live.as_mut().filter(|live| live.conn == conn && live.turn == order)
+            {
+                live.event_id = Some(id.clone());
+            }
+            let part_seq = if idx == 0 { seq } else { next_seq() };
+            if idx > 0 {
+                super::ambient_routes::announce(&self.d, &self.device, part_seq, false);
+            }
+            crate::ambient::mark(&id, if revises.is_some() { "revision" } else { "end" });
+            let voice = if status == "done" {
+                crate::voiceprint::start(&id, &self.device, &pcm, &vps)
+            } else {
+                None
+            };
+            events.push(Event {
+                id,
+                seq: part_seq,
+                status,
+                text,
+                started,
+                duration_ms,
+                during_playback,
+                media,
+                pcm,
+                voice,
+                revises,
+                stt_speaker,
+            });
+        }
         s.vp_acc.reset();
         drop(s);
-        let media = !words.is_empty() && words.iter().filter(|w| w.media).count() * 2 > words.len();
-        let text = if words.is_empty() || real == words.len() {
-            if transcript.is_empty() { words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ") } else { transcript.clone() }
-        } else {
-            words.iter().zip(&mask).filter(|(_, e)| !**e).map(|(w, _)| w.text.as_str()).collect::<Vec<_>>().join(" ")
-        };
-        let (status, text) = if echo_all {
-            ("echo", transcript.clone())
-        } else if media {
-            ("media", text)
-        } else {
-            let spoken = super::transcribe::finish_text(&text).text;
-            if spoken.is_empty() { ("empty", String::new()) } else { ("done", spoken) }
-        };
-        let started = wall.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
-        let duration_ms = ((last_g.saturating_sub(first_g)) as f64 / BPS * 1000.0) as i64;
-        let (id, revises) = {
-            let mut s = self.inner.lock().unwrap();
-            let live = s.live.as_mut().filter(|live| live.conn == conn && live.turn == order);
-            if let Some(live) = live {
-                live.done = true;
-                if let Some(previous) = live.event_id.clone() {
-                    (uuid::Uuid::new_v4().to_string(), Some(previous))
-                } else {
-                    let id = uuid::Uuid::new_v4().to_string();
-                    live.event_id = Some(id.clone());
-                    (id, None)
-                }
-            } else {
-                (uuid::Uuid::new_v4().to_string(), None)
-            }
-        };
-        crate::ambient::mark(&id, if revises.is_some() { "revision" } else { "end" });
-        let voice = if status == "done" {
-            let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
-            crate::voiceprint::start(&id, &self.device, &pcm, &vps)
-        } else {
-            None
-        };
-        let event = Event {
-            id,
-            seq,
-            status,
-            text,
-            started,
-            duration_ms,
-            during_playback,
-            media,
-            pcm,
-            voice,
-            revises,
-        };
         let (d, device) = (self.d.clone(), self.device.clone());
-        tokio::spawn(async move { super::ambient_routes::record_heard(&d, &device, event).await });
+        tokio::spawn(async move {
+            for event in events {
+                super::ambient_routes::record_heard(&d, &device, event).await;
+            }
+        });
     }
+}
+
+const PAUSE_SPLIT_BYTES: u64 = (0.85 * BPS) as u64;
+const MIN_SEG_WORDS: usize = 3;
+
+fn split_segments(
+    words: &[&Heard],
+    transcript: &str,
+    unfiltered: bool,
+    turn_speaker: Option<&str>,
+) -> Vec<(u64, u64, String, Option<String>)> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut groups: Vec<Vec<&Heard>> = Vec::new();
+    let mut cur: Vec<&Heard> = Vec::new();
+    let mut cur_sp: Option<&str> = None;
+    for &w in words {
+        let wsp = w.speaker.as_deref();
+        let speaker_changed = match (cur_sp, wsp) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        };
+        let pause_split = cur_sp.is_none()
+            && wsp.is_none()
+            && cur.len() >= MIN_SEG_WORDS
+            && cur.last().is_some_and(|prev| {
+                w.start.saturating_sub(prev.end) >= PAUSE_SPLIT_BYTES
+                    && prev.text.trim_end().ends_with(['.', '?', '!'])
+            });
+        if !cur.is_empty() && (speaker_changed || pause_split) {
+            groups.push(std::mem::take(&mut cur));
+            cur_sp = None;
+        }
+        if wsp.is_some() {
+            cur_sp = wsp;
+        }
+        cur.push(w);
+    }
+    if !cur.is_empty() {
+        if groups.len() >= 1 && cur.len() < MIN_SEG_WORDS && cur.iter().all(|w| w.speaker.is_none()) {
+            groups.last_mut().unwrap().extend(cur);
+        } else {
+            groups.push(cur);
+        }
+    }
+    if groups.len() == 1 {
+        let g = &groups[0];
+        let text = if unfiltered && !transcript.is_empty() {
+            transcript.to_string()
+        } else {
+            g.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
+        };
+        let sp = g.iter().find_map(|w| w.speaker.clone()).or_else(|| turn_speaker.map(str::to_string));
+        return vec![(g.first().unwrap().start, g.last().unwrap().end, text, sp)];
+    }
+    groups
+        .into_iter()
+        .map(|g| {
+            let text = g.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ");
+            let sp = g.iter().find_map(|w| w.speaker.clone()).or_else(|| turn_speaker.map(str::to_string));
+            (g.first().unwrap().start, g.last().unwrap().end, text, sp)
+        })
+        .collect()
 }
 
 pub(super) struct Event {
@@ -651,6 +744,7 @@ pub(super) struct Event {
     pub pcm: Vec<u8>,
     pub voice: Option<crate::voiceprint::VoiceHandle>,
     pub revises: Option<String>,
+    pub stt_speaker: Option<String>,
 }
 
 struct Heard {
@@ -660,6 +754,7 @@ struct Heard {
     end: u64,
     playing: bool,
     media: bool,
+    speaker: Option<String>,
 }
 
 fn norm(w: &str) -> String {
@@ -794,7 +889,7 @@ async fn connect(creds: &Creds, active: bool) -> Result<Ws, String> {
     let keyterms = serde_json::to_string(terms).map_err(|e| e.to_string())?;
     let (min, max) = silences(active);
     let url = format!(
-        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&mode=min_latency&min_turn_silence={min}&max_turn_silence={max}&interruption_delay=80&language_codes={}&keyterms_prompt={}",
+        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&encoding=pcm_s16le&speech_model=universal-3-6-pro&speaker_labels=true&mode=min_latency&min_turn_silence={min}&max_turn_silence={max}&interruption_delay=80&language_codes={}&keyterms_prompt={}",
         urlencoding::encode("[\"en\"]"),
         urlencoding::encode(&keyterms)
     );
