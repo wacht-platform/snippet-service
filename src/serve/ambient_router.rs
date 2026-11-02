@@ -514,27 +514,33 @@ fn attached() -> &'static Mutex<std::collections::HashSet<String>> {
 fn context(d: &Shared, device: &str, ids: &[String]) -> String {
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
     let since = chrono::Utc::now().timestamp() - 60;
-    let rows: Vec<(String, String)> = d
+    let rows: Vec<(String, String, String)> = d
         .store
         .with_connection(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, text FROM ambient_events
+                "SELECT id, text, COALESCE(speaker, '') FROM ambient_events
                  WHERE device = ?1 AND status = 'done' AND kept = 1 AND delivered = 0 AND routed = 1
                    AND created_at >= ?2 AND text != '' AND id NOT IN (SELECT value FROM json_each(?3))
                  ORDER BY started_at DESC LIMIT 6",
             )?;
             let rows = stmt
-                .query_map(rusqlite::params![device, since, excluded], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .query_map(rusqlite::params![device, since, excluded], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .unwrap_or_default();
-    let lines: Vec<String> = {
+    let lines: Vec<(String, String)> = {
         let mut seen = attached().lock().unwrap();
         if seen.len() > 500 {
             seen.clear();
         }
-        rows.into_iter().filter(|(id, _)| seen.insert(id.clone())).map(|(_, t)| t).take(3).collect()
+        rows.into_iter()
+            .filter(|(id, _, _)| seen.insert(id.clone()))
+            .map(|(_, t, s)| (t, s))
+            .take(3)
+            .collect()
     };
     if lines.is_empty() {
         return String::new();
@@ -542,7 +548,14 @@ fn context(d: &Shared, device: &str, ids: &[String]) -> String {
     let body: Vec<String> = lines
         .into_iter()
         .rev()
-        .map(|t| format!("[earlier, not sent] {}", ambient_watch::escape(&t.chars().take(200).collect::<String>())))
+        .map(|(t, s)| {
+            let tag = if s.is_empty() {
+                "[earlier, not sent]".to_string()
+            } else {
+                format!("[earlier, not sent, speaker={}]", ambient_watch::escape(&s))
+            };
+            format!("{tag} {}", ambient_watch::escape(&t.chars().take(200).collect::<String>()))
+        })
         .collect();
     format!("<context>{}</context>", body.join("\n"))
 }
@@ -612,10 +625,13 @@ async fn deliver(
     if let Some(first) = parts.first() {
         let voice = v.voice.clone().or_else(|| parts.iter().find_map(|p| p.voice.as_ref()?.ready()));
         let speaker = super::speakers::assign(device, &first.id, (first.started * 1000.0) as i64, voice.as_deref(), v.played >= 0.8);
-        let _ = speaker;
+        if speaker != super::speakers::Speaker::Unknown {
+            attrs.push_str(&format!(" speaker=\"{}\"", ambient_watch::escape(&speaker.label())));
+        }
         let present = super::speakers::peek(device, (first.started * 1000.0) as i64, None).1;
         if present.len() > 1 {
             attrs.push_str(&format!(" voices_present=\"{}\"", present.len()));
+            attrs.push_str(&format!(" speakers_in_room=\"{}\"", ambient_watch::escape(&present.join(", "))));
         }
     }
     let ready = || parts.iter().filter_map(|p| p.voice.as_ref()?.ready()?.likelihood).reduce(f64::max);

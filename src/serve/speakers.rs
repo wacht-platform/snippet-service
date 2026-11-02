@@ -84,11 +84,14 @@ impl Speakers {
         }
         let Some(v) = voice.filter(|v| v.neural) else { return Speaker::Unknown };
         let Some(emb) = v.embedding.as_deref() else { return Speaker::Unknown };
-        if v.likelihood.is_some_and(|l| l >= YOU) {
+        if v.likelihood.is_some_and(|l| l >= 0.65) {
             if learn {
                 self.you_ms = Some(at_ms);
             }
             return Speaker::You;
+        }
+        if v.likelihood.is_some_and(|l| l >= 0.5) {
+            return Speaker::Unknown;
         }
         let best = self
             .clusters
@@ -109,7 +112,7 @@ impl Speakers {
             }
             return Speaker::Voice(c.n);
         }
-        if !learn || played || v.voiced_secs < FOUND_SECS || v.likelihood.is_some_and(|l| l >= 0.5) {
+        if !learn || played || v.voiced_secs < FOUND_SECS {
             return Speaker::Unknown;
         }
         self.next += 1;

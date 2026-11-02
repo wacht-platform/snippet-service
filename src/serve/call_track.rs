@@ -159,7 +159,11 @@ impl CallBook {
         let busy = self.active.as_ref().map(|c| c.device.clone());
         while let Some(i) = self.held.iter().position(|(d, at, _)| now - at >= WINDOW_MS && busy.as_deref() != Some(d)) {
             let (_, _, h) = self.held.remove(i).unwrap();
-            fx.push(Effect::Note(h.text));
+            let note = match h.speaker.as_deref() {
+                Some(s) if !s.is_empty() => format!("[{s}] {}", h.text),
+                _ => h.text,
+            };
+            fx.push(Effect::Note(note));
         }
         let Some(call) = &self.active else { return fx };
         match call.phase {
@@ -319,6 +323,14 @@ pub(super) async fn observe(d: &Shared, device: &str, parts: &[Part], v: &Verdic
     let label = speaker_label(speaker);
     let signal = Signal { speaker: Some(speaker), ..signal };
     let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
+    if let Some(lbl) = label.as_deref() {
+        for id in &ids {
+            d.store.write(|c| {
+                c.execute("UPDATE ambient_events SET speaker = ?2 WHERE id = ?1", rusqlite::params![id, lbl])?;
+                Ok(())
+            });
+        }
+    }
     let heard = Heard { at_ms: signal.at_ms, ids, text, memorable: !delivered && v.kept() && v.memorable >= MEMORABLE, speaker: label };
     let policy = d.config.lock().unwrap().recording.clone();
     let fx = {
@@ -503,7 +515,8 @@ fn transcript_to(lines: &[Heard], cap: Option<usize>) -> String {
 
 async fn summarise(d: &Shared, call: Call, ended_at: i64) {
     for line in call.lines.iter().filter(|l| l.memorable) {
-        let body = format!("Said on a call: {}", line.text.trim());
+        let who = line.speaker.as_deref().filter(|s| !s.is_empty()).unwrap_or("Unknown speaker");
+        let body = format!("Said on a call ({who}): {}", line.text.trim());
         super::agent_routes::record_agent_message(d, crate::mission_control::SESSION_ID, "voice classifier", &body, false).await;
     }
     deliver_ended(d, &call.id, &call.device, call.started_at, ended_at, &call.lines).await;

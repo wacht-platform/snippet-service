@@ -627,8 +627,10 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
     if media_playing && !wake_word(text, &phrases) {
         return Verdict { kind: "media".into(), intent: "ignore".into(), judge: "rule", voice: ready_voice(&voices), ..Verdict::inherited() };
     }
+    let voice = wait_voice(id, &voices).await;
     let expectation = crate::ambient::expectation();
     let expecting = expectation.is_some();
+    let (_, present) = super::speakers::peek(&device, now * 1000, voice.as_deref());
     let moment = Moment {
         text: text.to_string(),
         duration_ms,
@@ -642,17 +644,10 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         mc_tools,
         media_playing,
         during_playback,
-        user_voice: ready_voice(&voices).filter(|v| v.neural).and_then(|v| v.likelihood),
-        speakers_present: Vec::new(),
-    };
-    let (_, present) = super::speakers::peek(&device, now * 1000, ready_voice(&voices).as_deref());
-    let moment = Moment {
+        user_voice: voice.as_ref().filter(|v| v.neural).and_then(|v| v.likelihood),
         speakers_present: present,
-        ..moment
     };
-    let classifier = ask_classifier(&key, classifier_state(&moment), with_pending, expecting);
-    let (classified, voice) = tokio::join!(classifier, wait_voice(id, &voices));
-    match classified {
+    match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
         Ok(verdict) => settle(verdict, text, &phrases, voice),
         Err(e) => {
             eprintln!("[ambient] voice classifier failed: {e}");
