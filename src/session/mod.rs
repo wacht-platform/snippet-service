@@ -1426,9 +1426,14 @@ fn notification_candidate(event: &serde_json::Value) -> Option<serde_json::Value
             }
             _ => return None,
         };
+        let body = source["payload"]["body"].as_str().unwrap_or_default();
         value = serde_json::json!({
-            "kind": event_type, "destination": destination,
-            "source_key": source["event_id"], "payload": source["payload"]
+            "kind": event_type,
+            "title": "Message",
+            "body": body,
+            "destination": destination,
+            "source_key": source["event_id"],
+            "payload": source["payload"]
         });
         if event_type == "direct_message.sent" {
             value["thread_id"] = source["thread_id"].clone();
