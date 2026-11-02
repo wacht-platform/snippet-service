@@ -1907,14 +1907,14 @@ impl Tool for UpdateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "update_mission_task".into(),
-            description: "Update an existing task on the board (title, description, plan, status, or inference profile). Use this to add context, update scope, or reuse an existing task instead of creating duplicate tasks. status `todo` re-queues the task for dispatch; `blocked` parks it. Work starts only through dispatch. An empty profile clears it.".into(),
+            description: "Update an existing task on the board (title, description, plan, status, or inference profile). Use this to add context, update scope, close a finished task (`done`), or reuse an existing task instead of creating duplicate tasks. status `todo` re-queues the task for dispatch; `blocked` parks it; `done` completes it. Work starts only through dispatch. An empty profile clears it.".into(),
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string"},
                     "title": {"type": "string"},
                     "description": {"type": "string"},
                     "plan": {"type": "string"},
-                    "status": {"type": "string", "enum": ["todo", "blocked"]},
+                    "status": {"type": "string", "enum": ["todo", "blocked", "done"]},
                     "profile": {"type": "string"},
                     "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"},
 "revise": {"type": "object", "properties": {"feedback": {"type": "string"}}, "required": ["feedback"], "description": "On a done task: reopen it in the same session with this feedback and its previous result, instead of filing a new task."},
@@ -1935,8 +1935,9 @@ impl Tool for UpdateMissionTask {
             None => None,
             Some("todo") => Some(TaskStatus::Todo),
             Some("blocked") => Some(TaskStatus::Blocked),
+            Some("done") => Some(TaskStatus::Done),
             Some(other) => {
-                return Err(ToolError::msg(format!("status must be todo or blocked, got `{other}`")));
+                return Err(ToolError::msg(format!("status must be todo, blocked, or done, got `{other}`")));
             }
         };
         let profile = args.profile.as_deref().map(str::trim);
@@ -1979,9 +1980,35 @@ impl Tool for UpdateMissionTask {
             })
             .map_err(|e| ToolError::msg(format!("update task: {e}")))?;
         if let Some(status) = status {
-            updated_task = store
-                .move_task(task_id, status, "", &now)
-                .map_err(|e| ToolError::msg(format!("update task: {e}")))?;
+            if status == TaskStatus::Done {
+                let summary = args
+                    .context_note
+                    .as_deref()
+                    .or(args.description.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| updated_task.result.as_ref().map(|r| r.summary.clone()))
+                    .unwrap_or_else(|| "Completed by Mission Control.".to_string());
+                let artifacts = updated_task
+                    .result
+                    .as_ref()
+                    .map(|r| r.artifacts.clone())
+                    .unwrap_or_default();
+                updated_task = store
+                    .complete_task(
+                        task_id,
+                        TaskStatus::Done,
+                        TaskResult { summary: summary.clone(), artifacts, authoritative: true },
+                        &now,
+                    )
+                    .map_err(|e| ToolError::msg(format!("complete task: {e}")))?;
+                announce_report(ctx, &store, &updated_task, TaskStatus::Done, &summary, now.clone());
+            } else {
+                updated_task = store
+                    .move_task(task_id, status, "", &now)
+                    .map_err(|e| ToolError::msg(format!("update task: {e}")))?;
+            }
         }
         let note = args.context_note.or(args.description);
         if let Some(body) = note.filter(|b| !b.trim().is_empty()) {
@@ -2907,12 +2934,16 @@ impl Tool for ReportMissionTask {
             _ => return Err(ToolError::msg("status must be done, blocked, or failed")),
         };
         let store = db(ctx)?;
+        let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
+        let caller_canonical = canonical(caller);
+        let is_mc = caller_canonical == crate::mission_control::SESSION_ID
+            || ctx.agent_id() == Some(crate::mission_control::SESSION_ID);
         {
             let bound = store
                 .get_task(&args.task_id)
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
-            if bound.status == TaskStatus::InReview {
+            if bound.status == TaskStatus::InReview && !is_mc {
                 return Err(ToolError::msg(format!(
                     "task `{}` is in review; its verdict will reach this session. Nothing to report meanwhile.",
                     args.task_id
@@ -2924,18 +2955,18 @@ impl Tool for ReportMissionTask {
                     args.task_id, bound.status
                 )));
             }
-            let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
-            let caller = canonical(caller);
-            let bound_to = bound.reporting_session.as_deref().map(canonical);
-            let own_unbound = bound_to.is_none()
-                && !bound.status.is_terminal()
-                && canonical(&bound.session_id) == caller;
-            if bound_to.as_deref() != Some(caller.as_str()) && !own_unbound {
-                return Err(ToolError::msg("task was not dispatched to this session"));
+            if !is_mc {
+                let bound_to = bound.reporting_session.as_deref().map(canonical);
+                let own_unbound = bound_to.is_none()
+                    && !bound.status.is_terminal()
+                    && canonical(&bound.session_id) == caller_canonical;
+                if bound_to.as_deref() != Some(caller_canonical.as_str()) && !own_unbound {
+                    return Err(ToolError::msg("task was not dispatched to this session"));
+                }
             }
         }
         let now = now_rfc3339();
-        if status == TaskStatus::Done {
+        if status == TaskStatus::Done && !is_mc {
             let current = store
                 .get_task(&args.task_id)
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?

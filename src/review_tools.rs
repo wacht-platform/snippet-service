@@ -274,8 +274,9 @@ impl Tool for SubmitReview {
             return Err(ToolError::msg("changes needs findings: say what to fix"));
         }
         let store = ctx.store().map_err(|e| ToolError::msg(format!("open store: {e}")))?;
-        let is_mc = ctx.agent_id() == Some(crate::mission_control::SESSION_ID);
         let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
+        let is_mc = ctx.agent_id() == Some(crate::mission_control::SESSION_ID)
+            || ctx.durable_session_id().is_some_and(|s| canonical(s) == crate::mission_control::SESSION_ID);
         let task = match args.task_id.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(id) => store.get_task(id).map_err(|e| ToolError::msg(e.to_string()))?.ok_or_else(|| ToolError::msg(format!("no task `{id}`")))?,
             None => {
@@ -288,10 +289,19 @@ impl Tool for SubmitReview {
                     .ok_or_else(|| ToolError::msg("no task is in review for this session"))?
             }
         };
+        if task.status.is_terminal() {
+            return Ok(ToolResult::success(json!({"task_id": task.id, "status": task.status.as_str()})));
+        }
+        let state = store.task_state(&task.id).map_err(|e| ToolError::msg(e.to_string()))?.unwrap_or_default();
         if task.status != TaskStatus::InReview {
+            if is_mc && approve {
+                let now = chrono::Utc::now().to_rfc3339();
+                let note = if findings.is_empty() { String::new() } else { format!(" Notes: {}", findings.join("; ")) };
+                let done = approve_pending(ctx, &store, &task, &state, crate::mission_control::SESSION_ID, &format!("approved by Mission Control.{note}"), now)?;
+                return Ok(ToolResult::success(json!({"task_id": done.id, "status": "done"})));
+            }
             return Err(ToolError::msg(format!("task `{}` is {}, not in review", task.id, task.status)));
         }
-        let state = store.task_state(&task.id).map_err(|e| ToolError::msg(e.to_string()))?.ok_or_else(|| ToolError::msg("no ledger"))?;
         let reviewer = if is_mc {
             crate::mission_control::SESSION_ID.to_string()
         } else {
