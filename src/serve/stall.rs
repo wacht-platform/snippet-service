@@ -12,6 +12,7 @@ use crate::store::Store;
 pub(super) struct SessionProbe {
     pub status: String,
     pub question: Option<String>,
+    pub last_said: Option<String>,
 }
 
 pub(super) fn probe_session(session_id: &str) -> Option<SessionProbe> {
@@ -22,7 +23,25 @@ pub(super) fn probe_session(session_id: &str) -> Option<SessionProbe> {
     let question = (state.status == crate::harness::HarnessStatus::WaitingForInput)
         .then(|| state.pending_question.as_ref().map(super::autonomy::question_text))
         .flatten();
-    Some(SessionProbe { status: crate::session::status_str(state.status), question })
+    let last_said = (state.status == crate::harness::HarnessStatus::Idle)
+        .then(|| last_assistant_text(session_id))
+        .flatten();
+    Some(SessionProbe { status: crate::session::status_str(state.status), question, last_said })
+}
+
+fn last_assistant_text(session_id: &str) -> Option<String> {
+    let path = crate::session::state_path_for_id(session_id)?;
+    let (events, _, _) = crate::session::read_session_event_page(&path, None, 12)?;
+    events.into_iter().rev().find_map(|e| match e {
+        crate::harness::HarnessEvent::AssistantText { text } if !text.trim().is_empty() => {
+            let text = text.trim();
+            Some(match text.char_indices().nth(600) {
+                Some((cut, _)) => format!("{}…", &text[..cut]),
+                None => text.to_string(),
+            })
+        }
+        _ => None,
+    })
 }
 
 /// Raise one `stalled` notice per quiet spell for every in-progress task with no
@@ -36,15 +55,18 @@ pub(super) fn sweep(store: &Store, now: DateTime<Utc>, probe: impl Fn(&str) -> O
         }
         let session = probe(&task.session_id);
         let question = session.as_ref().and_then(|s| s.question.clone());
-        let Some(age) = stalled_minutes(&task, now, question.is_some()) else { continue };
+        let idle = session.as_ref().is_some_and(|s| s.status == "idle");
+        let Some(age) = stalled_minutes(&task, now, question.is_some() || idle) else { continue };
         if stall_marker_for_current_spell(&task).is_some() {
             continue;
         }
         let stamp = progress_stamp(&task).to_string();
+        let last_said = session.as_ref().and_then(|s| s.last_said.clone());
         let state = session.map(|s| s.status).unwrap_or_else(|| "missing".into());
-        let detail = match question {
-            Some(q) => format!("the worker is waiting on an answer:\n{q}\nanswer_worker (session_id {}) if you can settle it, otherwise ask the user.", task.session_id),
-            None => format!("its session is {state}; check it with inspect_session, then retry_mission_task, answer it or cancel."),
+        let detail = match (question, last_said) {
+            (Some(q), _) => format!("the worker is waiting on an answer:\n{q}\nanswer_worker (session_id {}) if you can settle it, otherwise ask the user.", task.session_id),
+            (None, Some(said)) => format!("its session went idle without reporting; its last message was:\n{said}\nIf that asks for something, answer_worker (session_id {}) if you can settle it, otherwise ask the user; if it just stopped, retry_mission_task.", task.session_id),
+            (None, None) => format!("its session is {state}; check it with inspect_session, then retry_mission_task, answer it or cancel."),
         };
         let message = format!("stalled {age} min: no progress since {stamp}; {detail}");
         if store.update_task_in(&task.id, &now.to_rfc3339(), |t| t.notify_once("stalled", &message)).is_ok() {
@@ -87,7 +109,22 @@ mod tests {
     }
 
     fn idle(_: &str) -> Option<SessionProbe> {
-        Some(SessionProbe { status: "idle".into(), question: None })
+        Some(SessionProbe { status: "idle".into(), question: None, last_said: None })
+    }
+
+    fn running(_: &str) -> Option<SessionProbe> {
+        Some(SessionProbe { status: "running".into(), question: None, last_said: None })
+    }
+
+    #[test]
+    fn an_idle_session_escalates_after_ten_minutes_with_its_last_message() {
+        let store = Store::open_in_memory().unwrap();
+        running_task(&store, "soon", 5, Some(90));
+        running_task(&store, "parked", 12, Some(90));
+        let said = |_: &str| Some(SessionProbe { status: "idle".into(), question: None, last_said: Some("please log in".into()) });
+        assert_eq!(sweep(&store, Utc::now(), said), vec!["parked".to_string()]);
+        let task = store.get_task("parked").unwrap().unwrap();
+        assert!(task.notifications.iter().any(|n| n.kind == "stalled" && n.message.contains("please log in")));
     }
 
     #[test]
@@ -96,8 +133,8 @@ mod tests {
         running_task(&store, "fresh", 5, None);
         running_task(&store, "quiet", 25, None);
         running_task(&store, "long", 25, Some(30));
-        assert_eq!(sweep(&store, Utc::now(), idle), vec!["quiet".to_string()]);
-        assert!(sweep(&store, Utc::now(), idle).is_empty(), "once per spell");
+        assert_eq!(sweep(&store, Utc::now(), running), vec!["quiet".to_string()]);
+        assert!(sweep(&store, Utc::now(), running).is_empty(), "once per spell");
         let task = store.get_task("quiet").unwrap().unwrap();
         assert!(task.notifications.iter().any(|n| n.kind == "stalled" && n.message.contains("no progress since")));
         assert_eq!(store.board_sub_status(&task).status_reason.as_deref(), Some("stalled"));
@@ -112,7 +149,7 @@ mod tests {
     fn a_waiting_worker_escalates_early_with_its_question() {
         let store = Store::open_in_memory().unwrap();
         running_task(&store, "ask", 12, None);
-        let waiting = |_: &str| Some(SessionProbe { status: "waiting_for_input".into(), question: Some("- which db?".into()) });
+        let waiting = |_: &str| Some(SessionProbe { status: "waiting_for_input".into(), question: Some("- which db?".into()), last_said: None });
         assert_eq!(sweep(&store, Utc::now(), waiting), vec!["ask".to_string()]);
         let task = store.get_task("ask").unwrap().unwrap();
         assert!(task.notifications.iter().any(|n| n.message.contains("which db?")));
