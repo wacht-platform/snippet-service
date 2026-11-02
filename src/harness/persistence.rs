@@ -173,8 +173,8 @@ impl CodingHarness {
         self.persist_to_store(state).await
     }
 
-    /// List sort uses the store's `last_active` — bump only when the user
-    /// actually sent a message (or a mid-run steer).
+    /// List sort uses the store's `last_active` — bump when a human or agent
+    /// message is recorded.
     pub(super) fn bump_activity(&self) {
         if let Some(path) = &self.config.state_path {
             crate::session::bump_session_activity(path);
@@ -307,6 +307,7 @@ impl CodingHarness {
                     .written_events
                     .load(std::sync::atomic::Ordering::Acquire)
                     > state.events.len();
+            let mut active = false;
             if messages_rewritten {
                 on_busy(|| store.replace_conversation_messages(&id, &state.messages, &now)).await?;
             } else {
@@ -314,6 +315,12 @@ impl CodingHarness {
                     .written_messages
                     .load(std::sync::atomic::Ordering::Acquire);
                 if from < state.messages.len() {
+                    active |= state.messages[from..].iter().any(|m| {
+                        matches!(
+                            m,
+                            HarnessMessage::User { .. } | HarnessMessage::Assistant { .. }
+                        )
+                    });
                     on_busy(|| {
                         store.append_conversation_messages(&id, &state.messages[from..], &now)
                     })
@@ -327,9 +334,21 @@ impl CodingHarness {
                     .written_events
                     .load(std::sync::atomic::Ordering::Acquire);
                 if from < state.events.len() {
+                    active |= state.events[from..].iter().any(|e| {
+                        matches!(
+                            e,
+                            HarnessEvent::UserInput { .. }
+                                | HarnessEvent::Steer { .. }
+                                | HarnessEvent::AssistantText { .. }
+                        )
+                    });
                     on_busy(|| store.append_conversation_events(&id, &state.events[from..], &now))
                         .await?;
                 }
+            }
+            if active {
+                let ts = Utc::now().timestamp();
+                let _ = on_busy(|| store.set_session_last_active(&id, ts)).await;
             }
             Ok::<(), String>(())
         }
