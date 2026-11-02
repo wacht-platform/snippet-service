@@ -319,24 +319,59 @@ pub(super) async fn observe(d: &Shared, device: &str, parts: &[Part], v: &Verdic
         speaker: None,
     };
     let played = v.kind == "media" || v.played >= 0.8;
-    let speaker = super::speakers::assign(device, &first.id, signal.at_ms, v.voice.as_deref(), played);
-    let label = speaker_label(speaker);
-    let signal = Signal { speaker: Some(speaker), ..signal };
-    let ids: Vec<String> = parts.iter().map(|p| p.id.clone()).collect();
-    if let Some(lbl) = label.as_deref() {
-        for id in &ids {
-            d.store.write(|c| {
-                c.execute("UPDATE ambient_events SET speaker = ?2 WHERE id = ?1", rusqlite::params![id, lbl])?;
-                Ok(())
-            });
+    let mut part_speakers = Vec::with_capacity(parts.len());
+    for p in parts {
+        let pv = p.voice.as_ref().and_then(|h| h.ready()).or_else(|| v.voice.clone());
+        let sp = super::speakers::assign(device, &p.id, (p.started * 1000.0) as i64, pv.as_deref(), played);
+        part_speakers.push((p, sp, speaker_label(sp), pv.and_then(|s| s.likelihood)));
+    }
+    d.store.write(|c| {
+        for (p, _, lbl, uv) in &part_speakers {
+            if let Some(lbl) = lbl.as_deref() {
+                c.execute(
+                    "UPDATE ambient_events SET speaker = ?2, user_voice = COALESCE(?3, user_voice) WHERE id = ?1",
+                    rusqlite::params![p.id, lbl, uv],
+                )?;
+            }
+        }
+        Ok(())
+    });
+    let mut groups: Vec<(i64, super::speakers::Speaker, Option<String>, Vec<String>, Vec<&str>)> = Vec::new();
+    for (p, sp, lbl, _) in &part_speakers {
+        let can_merge = groups.last().is_some_and(|(_, prev_sp, _, _, _)| {
+            *prev_sp == *sp || *sp == super::speakers::Speaker::Unknown || *prev_sp == super::speakers::Speaker::Unknown
+        });
+        if can_merge {
+            let last = groups.last_mut().unwrap();
+            if last.1 == super::speakers::Speaker::Unknown && *sp != super::speakers::Speaker::Unknown {
+                last.1 = *sp;
+                last.2 = lbl.clone();
+            }
+            last.3.push(p.id.clone());
+            last.4.push(p.text.trim());
+        } else {
+            groups.push(((p.started * 1000.0) as i64, *sp, lbl.clone(), vec![p.id.clone()], vec![p.text.trim()]));
         }
     }
-    let heard = Heard { at_ms: signal.at_ms, ids, text, memorable: !delivered && v.kept() && v.memorable >= MEMORABLE, speaker: label };
     let policy = d.config.lock().unwrap().recording.clone();
+    let memorable = !delivered && v.kept() && v.memorable >= MEMORABLE;
     let fx = {
         let mut book = book();
         book.set_policy(policy);
-        book.observe(device, &signal, heard, now_ms())
+        let now = now_ms();
+        let mut all_fx = Vec::new();
+        for (at_ms, sp, lbl, g_ids, g_texts) in groups {
+            let g_text = g_texts.join(" ");
+            let g_sig = Signal {
+                at_ms,
+                words: super::call_detect::meaningful_words(&g_text),
+                speaker: Some(sp),
+                ..signal.clone()
+            };
+            let heard = Heard { at_ms, ids: g_ids, text: g_text, memorable, speaker: lbl };
+            all_fx.extend(book.observe(device, &g_sig, heard, now));
+        }
+        all_fx
     };
     if !fx.is_empty() {
         ensure_ticker(d);

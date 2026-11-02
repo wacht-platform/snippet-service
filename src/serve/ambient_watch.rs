@@ -627,10 +627,16 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
     if media_playing && !wake_word(text, &phrases) {
         return Verdict { kind: "media".into(), intent: "ignore".into(), judge: "rule", voice: ready_voice(&voices), ..Verdict::inherited() };
     }
-    let voice = wait_voice(id, &voices).await;
+    let early_voice = match ready_voice(&voices) {
+        Some(v) => Some(v),
+        None => tokio::time::timeout(Duration::from_millis(80), wait_voice(id, &voices))
+            .await
+            .ok()
+            .flatten(),
+    };
     let expectation = crate::ambient::expectation();
     let expecting = expectation.is_some();
-    let (_, present) = super::speakers::peek(&device, now * 1000, voice.as_deref());
+    let (_, present) = super::speakers::peek(&device, now * 1000, early_voice.as_deref());
     let moment = Moment {
         text: text.to_string(),
         duration_ms,
@@ -644,14 +650,21 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         mc_tools,
         media_playing,
         during_playback,
-        user_voice: voice.as_ref().filter(|v| v.neural).and_then(|v| v.likelihood),
+        user_voice: early_voice.as_ref().filter(|v| v.neural).and_then(|v| v.likelihood),
         speakers_present: present,
     };
-    match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
-        Ok(verdict) => settle(verdict, text, &phrases, voice),
+    let classifier = ask_classifier(&key, classifier_state(&moment), with_pending, expecting);
+    let (classified, late_voice) = tokio::join!(classifier, async {
+        match early_voice {
+            Some(v) => Some(v),
+            None => wait_voice(id, &voices).await,
+        }
+    });
+    match classified {
+        Ok(verdict) => settle(verdict, text, &phrases, late_voice),
         Err(e) => {
             eprintln!("[ambient] voice classifier failed: {e}");
-            Verdict { voice, ..rule(text, &phrases) }
+            Verdict { voice: late_voice, ..rule(text, &phrases) }
         }
     }
 }

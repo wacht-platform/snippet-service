@@ -10,7 +10,7 @@ pub(crate) const JOIN: f32 = 0.55;
 /// A short clip only joins a voice it matches closely; it never founds one.
 pub(crate) const JOIN_SHORT: f32 = 0.65;
 pub(crate) const FOUND_SECS: f32 = 2.0;
-pub(crate) const YOU: f64 = 0.8;
+pub(crate) const YOU: f64 = 0.65;
 const CACHE: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,7 +84,7 @@ impl Speakers {
         }
         let Some(v) = voice.filter(|v| v.neural) else { return Speaker::Unknown };
         let Some(emb) = v.embedding.as_deref() else { return Speaker::Unknown };
-        if v.likelihood.is_some_and(|l| l >= 0.65) {
+        if v.likelihood.is_some_and(|l| l >= YOU) {
             if learn {
                 self.you_ms = Some(at_ms);
             }

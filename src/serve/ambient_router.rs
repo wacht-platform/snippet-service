@@ -247,7 +247,25 @@ async fn accept(
     let mergeable = turn.last().is_some_and(|prev| {
         let gap = part.started - prev.ended;
         let allowed = if part.continued || deadline.is_some_and(|t| t > Instant::now() + HOLD) { CONTINUED_GAP } else { MERGE_GAP };
+        let same_speaker = match (
+            prev.voice.as_ref().and_then(|v| v.ready()),
+            part.voice.as_ref().and_then(|v| v.ready()),
+        ) {
+            (Some(a), Some(b)) if a.neural && b.neural => {
+                let l_diff = match (a.likelihood, b.likelihood) {
+                    (Some(la), Some(lb)) => (la >= super::speakers::YOU && lb <= 0.35) || (lb >= super::speakers::YOU && la <= 0.35),
+                    _ => false,
+                };
+                let emb_diff = match (a.embedding.as_deref(), b.embedding.as_deref()) {
+                    (Some(ea), Some(eb)) => crate::voiceprint::neural::cosine(ea, eb) < 0.45,
+                    _ => false,
+                };
+                !l_diff && !emb_diff
+            }
+            _ => true,
+        };
         gap <= allowed
+            && same_speaker
             && turn.len() < MAX_PARTS
             && part.ended - turn[0].started <= MAX_SPAN
     });
@@ -277,8 +295,8 @@ fn supersede(d: &Shared, id: &str) {
 
 fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
     let kept = v.kept();
-    for id in ids {
-        d.store.write(|c| {
+    d.store.write(|c| {
+        for id in ids {
             c.execute(
                 "UPDATE ambient_events SET verdict = ?2, addressed = ?3, judge = ?4, kept = ?5, intent = ?6, delivered = ?7,
                         user_voice = COALESCE(?8, user_voice), other_party = ?9, played = ?10
@@ -291,9 +309,9 @@ fn mark_verdict(d: &Shared, ids: &[String], v: &Verdict, delivered: bool) {
                     [id],
                 )?;
             }
-            Ok(())
-        });
-    }
+        }
+        Ok(())
+    });
 }
 
 fn decide(live: bool, pinned: bool, v: &Verdict, wake: bool, expecting: bool) -> (bool, bool) {
