@@ -1276,6 +1276,36 @@ impl CodingHarness {
                 lane_prompt_shown = true;
                 self.persist(&mut state, &lanes).await?;
             }
+            if state.status == HarnessStatus::Idle
+                && compaction == CliCompaction::Idle
+                && !compact_wanted
+                && pending_approval.is_none()
+                && state.pending_question.is_none()
+                && outbox.is_empty()
+                && !state.queued_inputs.is_empty()
+            {
+                let held: Vec<QueuedInput> = std::mem::take(&mut state.queued_inputs);
+                for (i, item) in held.into_iter().enumerate() {
+                    let text = item.text;
+                    if i == 0 {
+                        self.accept_user_message(&mut state, &mut vars, text.clone()).await;
+                        let message = match state.messages.last() {
+                            Some(HarnessMessage::User { content }) => content.clone(),
+                            _ => text,
+                        };
+                        outbox.push(message);
+                    } else {
+                        let steered = super::steer_message(&text);
+                        state.messages.push(HarnessMessage::User {
+                            content: steered.clone(),
+                        });
+                        state.events.push(HarnessEvent::Steer { text });
+                        self.bump_activity();
+                        outbox.push(steered);
+                    }
+                }
+                self.persist(&mut state, &lanes).await?;
+            }
             if cli_goal_due(
                 &state,
                 compaction == CliCompaction::Idle && !compact_wanted && pending_approval.is_none(),
