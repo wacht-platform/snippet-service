@@ -179,7 +179,7 @@ async fn handle_ws(
         let mut last_frame_sent = tokio::time::Instant::now();
         let load_initial = |path: &Path| -> Option<(crate::harness::HarnessState, usize)> {
             if let Some(mut meta) = crate::session::read_session_meta(path)
-                && let Some((events, win_start, _)) = crate::session::read_session_event_page(path, None, 1000)
+                && let Some((events, win_start, _)) = crate::session::read_session_event_page(path, None, 200)
             {
                 meta.events = events;
                 return Some((meta, win_start));

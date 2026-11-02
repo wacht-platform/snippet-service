@@ -131,6 +131,7 @@ impl CodingHarness {
         let (lane_tx, mut lane_rx) = mpsc::unbounded_channel::<LaneResult>();
         let (progress_tx, mut progress_rx) =
             mpsc::unbounded_channel::<crate::lanes::LaneProgress>();
+        let had_initial_request = initial_request.is_some();
         let mut state = self.load_or_initialize_state(initial_request).await?;
         self.compact_history_if_needed(model, &mut state).await?;
         // A reopened terminal state (completed / failed / interrupted) starts idle
@@ -139,10 +140,11 @@ impl CodingHarness {
         // the user switches away or hits Esc, and without this reset, resuming it
         // would break out of the loop immediately — the agent would die on load and
         // the user's next message would start a fresh session over it.
-        if matches!(
+        let status_reset = matches!(
             state.status,
             HarnessStatus::Completed | HarnessStatus::Failed | HarnessStatus::Interrupted
-        ) {
+        );
+        if status_reset {
             state.status = HarnessStatus::Idle;
         }
         let had_interrupted_lanes = state
@@ -174,7 +176,9 @@ impl CodingHarness {
         // Inputs that arrived while a step was running (the interrupt race consumes
         // input_rx, so non-interrupt messages are parked here until the next turn).
         let mut pending_inputs: Vec<LoopInput> = Vec::new();
-        self.persist(&mut state, &lanes).await?;
+        if had_initial_request || status_reset || had_interrupted_lanes || state.history_rewritten {
+            self.persist(&mut state, &lanes).await?;
+        }
 
         loop {
             // Apply any input buffered during a step. A message that arrived mid- or

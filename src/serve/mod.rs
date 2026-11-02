@@ -312,7 +312,6 @@ impl Daemon {
             return None;
         }
         let profile = self.resume_profile(id, &sp);
-        self.reload_config().await; // pick up profiles added from the TUI
         let cfg = {
             let c = self.config.lock().unwrap();
             let mut w = c.for_workspace(folder);

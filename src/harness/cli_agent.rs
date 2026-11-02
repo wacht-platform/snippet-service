@@ -1129,11 +1129,13 @@ impl CodingHarness {
         sink: Option<StreamHandle>,
         once: bool,
     ) -> Result<HarnessState, ToolError> {
+        let had_initial_request = initial_request.is_some();
         let mut state = self.load_or_initialize_state(initial_request).await?;
-        if matches!(
+        let status_reset = matches!(
             state.status,
             HarnessStatus::Completed | HarnessStatus::Failed | HarnessStatus::Interrupted
-        ) {
+        );
+        if status_reset {
             state.status = if once { HarnessStatus::Running } else { HarnessStatus::Idle };
         }
         let (lane_tx, mut lane_rx) = mpsc::unbounded_channel::<LaneResult>();
@@ -1219,7 +1221,9 @@ impl CodingHarness {
         {
             outbox.push(text);
         }
-        self.persist(&mut state, &lanes).await?;
+        if had_initial_request || status_reset || had_interrupted_lanes {
+            self.persist(&mut state, &lanes).await?;
+        }
 
         loop {
             if state.status == HarnessStatus::Running {

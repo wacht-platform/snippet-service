@@ -14,9 +14,9 @@ pub(crate) fn session_event_page(
 }
 
 fn turn_page_start(events: &[crate::harness::HarnessEvent]) -> usize {
-    const MAX_EVENTS: usize = 1000;
-    const MIN_EVENTS: usize = 120;
-    const TURNS: usize = 6;
+    const MAX_EVENTS: usize = 160;
+    const MIN_EVENTS: usize = 40;
+    const TURNS: usize = 3;
     let len = events.len();
     let floor = len.saturating_sub(MAX_EVENTS);
     let mut seen = 0;
@@ -74,12 +74,25 @@ pub(crate) fn wire_events(events: &[crate::harness::HarnessEvent], compact: bool
             .iter()
             .map(|event| {
                 let mut v = serde_json::to_value(event).unwrap_or_default();
-                if let crate::harness::HarnessEvent::ToolResult { .. } = event
-                    && let Some(o) = v.as_object_mut()
-                        && let Some(result) = o.get_mut("result")
-                            && clip_json(result, WIRE_STRING_LIMIT, WIRE_ARRAY_LIMIT) {
-                                o.insert("result_clipped".into(), serde_json::json!(true));
-                            }
+                match event {
+                    crate::harness::HarnessEvent::ToolResult { .. } => {
+                        if let Some(o) = v.as_object_mut()
+                            && let Some(result) = o.get_mut("result")
+                            && clip_json(result, WIRE_STRING_LIMIT, WIRE_ARRAY_LIMIT)
+                        {
+                            o.insert("result_clipped".into(), serde_json::json!(true));
+                        }
+                    }
+                    crate::harness::HarnessEvent::ToolCall { .. } => {
+                        if let Some(o) = v.as_object_mut()
+                            && let Some(args) = o.get_mut("arguments")
+                            && clip_json(args, WIRE_STRING_LIMIT, WIRE_ARRAY_LIMIT)
+                        {
+                            o.insert("result_clipped".into(), serde_json::json!(true));
+                        }
+                    }
+                    _ => {}
+                }
                 v
             })
             .collect(),
