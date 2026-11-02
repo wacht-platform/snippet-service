@@ -150,6 +150,7 @@ async fn handle_ws(
     let (history_tx, history_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Option<usize>)>();
     let history_request_tx = history_tx.clone();
     let (event_request_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     let push_daemon = daemon.clone();
     let push_session = session.clone();
@@ -175,6 +176,16 @@ async fn handle_ws(
         let mut last_queue_revision = 0;
         let mut attach_revision: u64 = 0;
         let mut term_seq: u64 = 0;
+        let mut last_frame_sent = tokio::time::Instant::now();
+        let load_initial = |path: &Path| -> Option<(crate::harness::HarnessState, usize)> {
+            if let Some(mut meta) = crate::session::read_session_meta(path)
+                && let Some((events, win_start, _)) = crate::session::read_session_event_page(path, None, 1000)
+            {
+                meta.events = events;
+                return Some((meta, win_start));
+            }
+            read_session_state_tail(path, 0).map(|(s, _)| (s, 0))
+        };
         loop {
             let queue_revision = daemon.queue_revision.load(Ordering::Acquire);
             if let Some(fingerprint) = session_state_fingerprint(&daemon.store, &state_path)
@@ -182,18 +193,20 @@ async fn handle_ws(
                     || queue_revision != last_queue_revision)
                 {
                     let resume = !last_events.is_empty();
-                    let from = if resume { last_event_offset } else { 0 };
-                    let loaded = read_session_state_tail(&state_path, from).and_then(|(state, _)| {
-                        let continuous = resume
-                            && state.events.len() >= last_events.len()
-                            && state.events[..last_events.len()] == last_events[..];
-                        if resume && !continuous {
-                            read_session_state_tail(&state_path, 0).map(|(s, _)| (s, false))
-                        } else {
-                            Some((state, continuous))
-                        }
-                    });
-                    if let Some((mut state, continuous)) = loaded {
+                    let loaded = if resume {
+                        read_session_state_tail(&state_path, last_event_offset).and_then(|(state, _)| {
+                            let continuous = state.events.len() >= last_events.len()
+                                && state.events[..last_events.len()] == last_events[..];
+                            if continuous {
+                                Some((state, true, last_event_offset))
+                            } else {
+                                load_initial(&state_path).map(|(s, off)| (s, false, off))
+                            }
+                        })
+                    } else {
+                        load_initial(&state_path).map(|(s, off)| (s, false, off))
+                    };
+                    if let Some((mut state, continuous, base_offset)) = loaded {
                         let hidden = {
                             let mut overlays = daemon.queue_hidden.lock().unwrap();
                             let entries = overlays.entry(session.clone()).or_default();
@@ -233,9 +246,11 @@ async fn handle_ws(
                                 o.insert("revision".into(), serde_json::json!(attach_revision));
                                 if continuous {
                                     let tail = &events[last_events.len()..];
+                                    let total_events = last_event_offset + events.len();
                                     o.insert("wire".into(), serde_json::json!("delta"));
                                     o.insert("new_events".into(), wire_events(tail, compact));
                                     o.insert("event_count".into(), serde_json::json!(events.len()));
+                                    o.insert("total_events".into(), serde_json::json!(total_events));
                                     if last_lanes_json.as_deref() == Some(lanes_json.as_str()) {
                                         o.remove("lanes");
                                     } else if !o.contains_key("lanes") {
@@ -243,12 +258,13 @@ async fn handle_ws(
                                     }
                                     last_events = events;
                                 } else {
-                                    let (start, _, _) = session_event_page(&events, None, None);
+                                    let (rel_start, _, _) = session_event_page(&events, None, None);
+                                    let start = base_offset + rel_start;
                                     last_event_offset = start;
                                     o.insert("wire".into(), serde_json::json!("snapshot"));
-                                    o.insert("events".into(), wire_events(&events[start..], compact));
+                                    o.insert("events".into(), wire_events(&events[rel_start..], compact));
                                     o.insert("event_offset".into(), serde_json::json!(start));
-                                    last_events = events[start..].to_vec();
+                                    last_events = events[rel_start..].to_vec();
                                 }
                             }
                             last_lanes_json = Some(lanes_json);
@@ -257,6 +273,7 @@ async fn handle_ws(
                                 if sender.send(Message::Text(json.into())).await.is_err() {
                                     break;
                                 }
+                                last_frame_sent = tokio::time::Instant::now();
                                 last_state_fingerprint = Some(fingerprint);
                             }
                         }
@@ -383,7 +400,22 @@ async fn handle_ws(
                     {
                         break;
                     }
+                    last_frame_sent = tokio::time::Instant::now();
                 }
+            }
+            let mut pinged = false;
+            while ping_rx.try_recv().is_ok() {
+                pinged = true;
+            }
+            if pinged || last_frame_sent.elapsed() >= Duration::from_secs(5) {
+                if sender
+                    .send(Message::Text("{\"wire\":\"hb\"}".into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                last_frame_sent = tokio::time::Instant::now();
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -398,6 +430,10 @@ async fn handle_ws(
                 // changing the LoopInput serde format.
                 let dominated = serde_json::from_str::<serde_json::Value>(t.as_str());
                 if let Ok(val) = dominated {
+                    if val.get("kind").and_then(|k| k.as_str()) == Some("ping") {
+                        let _ = ping_tx.send(());
+                        continue;
+                    }
                     if val.get("wire").and_then(|w| w.as_str()) == Some("term") {
                         if let Some(terms) = terms.as_ref() {
                             apply_term_client(terms, &val);
