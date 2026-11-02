@@ -214,6 +214,8 @@ mod tests {
             "not even one saying you're staying quiet",
             "when the user asks you to confirm something, check before you answer",
             "A `stalled` notice can also fire",
+            "Work only starts through a task",
+            "never to a `session:<id>` to hand over, start or revise work",
         ] {
             assert!(MISSION_CONTROL_LAYER.contains(guard), "missing: {guard}");
         }
