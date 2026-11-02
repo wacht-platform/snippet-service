@@ -660,6 +660,24 @@ impl Tool for SendAgentMessage {
                     "unknown session `{to_id}`. Copy the `reply_to` value from the envelope as written, in full: it names the session the sender is reading."
                 )));
             }
+            if ctx.agent_id() == Some(crate::mission_control::SESSION_ID) {
+                let target_canon = crate::conversations::canonical_session_id(to_id).0;
+                if let Ok(in_review) = db.list_tasks(None, Some(&TaskStatus::InReview)) {
+                    let now = now_rfc3339();
+                    for t in in_review {
+                        if crate::conversations::canonical_session_id(&t.session_id).0 == target_canon {
+                            let _ = db.update_task_in(&t.id, &now, |task| {
+                                task.status = TaskStatus::InProgress;
+                                task.reporting_session = Some(task.session_id.clone());
+                            });
+                            let _ = db.modify_task_state(&t.id, &now, |s| {
+                                s.pending_report = None;
+                                s.review_started_at.clear();
+                            });
+                        }
+                    }
+                }
+            }
         }
         let (sender_kind, sender_id) = actor(ctx)?;
         let (kind, urgency) = crate::coordination::typed::parse(args.kind.as_deref(), args.urgency.as_deref())
@@ -1114,6 +1132,23 @@ impl Tool for PostTaskCoordination {
                     == crate::conversations::canonical_session_id(&task.session_id).0
             })
         {
+            let step_line = body
+                .lines()
+                .map(|l| l.trim().trim_start_matches(['#', '-', '*', ' ']))
+                .find(|l| !l.is_empty())
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            let now_step = now_rfc3339();
+            let _ = db.touch_task_progress(&task.id, &now_step);
+            if !step_line.is_empty() {
+                let _ = db.update_task_in(&task.id, &now_step, |t| {
+                    if let Some(active) = t.work_plan.iter_mut().find(|s| s.status == "in_progress") {
+                        active.step = step_line.clone();
+                    }
+                });
+            }
             out["note"] = json!(
                 "Posted to the task room. Note: a room post does not complete the task; call report_mission_task when the work is finished."
             );
