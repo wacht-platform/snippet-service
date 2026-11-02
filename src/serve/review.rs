@@ -67,10 +67,14 @@ pub(super) async fn drive_reviews(d: &Daemon) {
             start_review(d, &task, &state, &stamp).await;
             continue;
         }
-        let silent = chrono::DateTime::parse_from_rfc3339(&state.review_started_at)
-            .map(|at| (now - at.with_timezone(&chrono::Utc)).num_seconds() > crate::review_tools::REVIEW_TIMEOUT_SECS)
-            .unwrap_or(true);
-        if silent {
+        let elapsed_secs = chrono::DateTime::parse_from_rfc3339(&state.review_started_at)
+            .map(|at| (now - at.with_timezone(&chrono::Utc)).num_seconds())
+            .unwrap_or(crate::review_tools::REVIEW_TIMEOUT_SECS + 1);
+        let lane_alive = elapsed_secs < 20
+            || crate::session::state_path_for_id(&task.session_id)
+                .and_then(|p| crate::session::read_session_meta(&p))
+                .is_some_and(|meta| meta.lanes.iter().any(|l| l.status == crate::lanes::LaneStatus::Running));
+        if elapsed_secs > crate::review_tools::REVIEW_TIMEOUT_SECS || !lane_alive {
             crate::review_tools::escalate(&d.store, &task.id, "the reviewer gave no verdict in time; check the work and submit_review yourself", &stamp);
         }
     }

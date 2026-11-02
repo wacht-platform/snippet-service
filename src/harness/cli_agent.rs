@@ -1616,6 +1616,10 @@ impl CodingHarness {
                         LoopInput::Compact => {
                             compact_wanted = true;
                         }
+                        LoopInput::SpawnLane(spec) => {
+                            self.spawn_requested_lane(&mut state, &mut lanes, spec);
+                            self.persist(&mut state, &lanes).await?;
+                        }
                         other => {
                             if self.apply_input(&mut state, other) {
                                 break;

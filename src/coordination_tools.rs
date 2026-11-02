@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::coordination::{NotificationMarker, Store, StoreError, types::CoordinationEvent};
+use crate::coordination::{NotificationMarker, Store, StoreError, TaskStatus, types::CoordinationEvent};
 use crate::llm::NativeToolDefinition;
 use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry, ToolResult};
 
@@ -588,6 +588,19 @@ impl Tool for SendAgentMessage {
                         task.id
                     )));
                 }
+                if task.status == TaskStatus::InReview
+                    && ctx.agent_id() == Some(crate::mission_control::SESSION_ID)
+                {
+                    let now = now_rfc3339();
+                    let _ = db.update_task_in(&task.id, &now, |t| {
+                        t.status = TaskStatus::InProgress;
+                        t.reporting_session = Some(t.session_id.clone());
+                    });
+                    let _ = db.modify_task_state(&task.id, &now, |s| {
+                        s.pending_report = None;
+                        s.review_started_at.clear();
+                    });
+                }
                 body = format!("[about task {}: {}]\n{body}", task.id, task.title);
                 about_task = Some(task.id.clone());
                 task_session = task.session_id;
@@ -1061,6 +1074,16 @@ impl Tool for PostTaskCoordination {
             payload[key] = value;
         }
         let now = now_rfc3339();
+        if task.status == TaskStatus::InReview && actor_id == crate::mission_control::SESSION_ID {
+            let _ = db.update_task_in(&task.id, &now, |t| {
+                t.status = TaskStatus::InProgress;
+                t.reporting_session = Some(t.session_id.clone());
+            });
+            let _ = db.modify_task_state(&task.id, &now, |s| {
+                s.pending_report = None;
+                s.review_started_at.clear();
+            });
+        }
         let event = CoordinationEvent {
             event_id: Uuid::new_v4().to_string(),
             thread_id: task.thread_id.clone(),
@@ -1084,7 +1107,18 @@ impl Tool for PostTaskCoordination {
             "event": saved.clone(),
         }));
         crate::serve::queue_coordination_wake(&db, saved.clone());
-        Ok(ToolResult::success(json!({"event": saved})))
+        let mut out = json!({"event": saved});
+        if !task.status.is_terminal()
+            && ctx.durable_session_id().is_some_and(|s| {
+                crate::conversations::canonical_session_id(s).0
+                    == crate::conversations::canonical_session_id(&task.session_id).0
+            })
+        {
+            out["note"] = json!(
+                "Posted to the task room. Note: a room post does not complete the task; call report_mission_task when the work is finished."
+            );
+        }
+        Ok(ToolResult::success(out))
     }
 }
 

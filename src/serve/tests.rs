@@ -491,12 +491,25 @@ use super::*;
         );
         assert!(coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[], None).is_empty());
 
+        let result_event = board_event(
+            "message.posted",
+            ("session", "work-1"),
+            serde_json::json!({"body": "delivered", "kind": "result", "origin_session": "work-1"}),
+        );
+        assert!(
+            !coordination::wake_targets(&result_event, &history, &room(), &roster, Some("work-1"), &[], None).is_empty(),
+            "result posts always wake Mission Control even after a long exchange"
+        );
+
         history.push(board_event(
             "message.posted",
-            ("human", "local"),
-            serde_json::json!({"body": "go on"}),
+            ("agent", "mission-control"),
+            serde_json::json!({"body": "next revision"}),
         ));
-        assert!(!coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[], None).is_empty());
+        assert!(
+            !coordination::wake_targets(&event, &history, &room(), &roster, Some("work-1"), &[], None).is_empty(),
+            "a post from Mission Control re-arms the room just like a human post"
+        );
     }
 
     /// The guard re-arms on the room's own last human post, not on a human

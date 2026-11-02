@@ -789,8 +789,14 @@ fn agent_chain_exhausted(
     event: &CoordinationEvent,
     human_at: Option<&str>,
 ) -> bool {
+    use crate::coordination::typed::{Urgency, urgency_of};
     let chatter = |e: &&CoordinationEvent| CHATTER_EVENTS.contains(&e.event_type.as_str());
-    if !chatter(&event) {
+    let kind = event.payload.get("kind").and_then(|v| v.as_str());
+    if !chatter(&event)
+        || event.actor_id == crate::mission_control::SESSION_ID
+        || urgency_of(&event.payload) == Urgency::Urgent
+        || matches!(kind, Some("result" | "blocker" | "interrupt"))
+    {
         return false;
     }
     let human = human_at.and_then(|h| chrono::DateTime::parse_from_rfc3339(h).ok());
@@ -801,7 +807,12 @@ fn agent_chain_exhausted(
         .iter()
         .chain(std::iter::once(event))
         .rev()
-        .take_while(|e| e.actor_kind != "human" && chatter(e) && after_human(e))
+        .take_while(|e| {
+            e.actor_kind != "human"
+                && e.actor_id != crate::mission_control::SESSION_ID
+                && chatter(e)
+                && after_human(e)
+        })
         .collect();
     let mut actors: Vec<&str> = tail.iter().map(|e| e.actor_id.as_str()).collect();
     actors.sort();
