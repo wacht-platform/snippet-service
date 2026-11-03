@@ -513,13 +513,13 @@ pub(super) fn filler(text: &str) -> bool {
     words_of(text).iter().all(|w| FILLERS.contains(&w.as_str()))
 }
 
-/// Strong cap only for a confident different speaker on enough neural audio; otherwise a bounded nudge.
-pub(super) fn apply_voice(verdict: &mut Verdict, voice: &VoiceScore, wake: bool) {
+/// Strong cap only for a confident different speaker on enough neural audio (when not mixed with speaker playback); otherwise a bounded nudge.
+pub(super) fn apply_voice(verdict: &mut Verdict, voice: &VoiceScore, wake: bool, during_playback: bool) {
     let Some(likelihood) = voice.likelihood else { return };
     if wake {
         return;
     }
-    if voice.confident_other() {
+    if !during_playback && voice.confident_other() {
         verdict.other = verdict.other.max(0.72);
         verdict.addressed = verdict.addressed.min(0.38);
         return;
@@ -533,8 +533,18 @@ pub(super) fn apply_voice(verdict: &mut Verdict, voice: &VoiceScore, wake: bool)
 }
 
 pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String], voice: Option<std::sync::Arc<VoiceScore>>) -> Verdict {
+    settle_with(verdict, text, phrases, voice, false)
+}
+
+pub(super) fn settle_with(
+    mut verdict: Verdict,
+    text: &str,
+    phrases: &[String],
+    voice: Option<std::sync::Arc<VoiceScore>>,
+    during_playback: bool,
+) -> Verdict {
     if let Some(v) = &voice {
-        apply_voice(&mut verdict, v, wake_word(text, phrases));
+        apply_voice(&mut verdict, v, wake_word(text, phrases), during_playback);
     }
     verdict.voice = voice;
     if filler(text) {
@@ -732,7 +742,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         }
     });
     let mut v = match classified {
-        Ok(verdict) => settle(verdict, text, &phrases, late_voice),
+        Ok(verdict) => settle_with(verdict, text, &phrases, late_voice, during_playback),
         Err(e) => {
             eprintln!("[ambient] voice classifier failed: {e}");
             Verdict { voice: late_voice, ..rule(text, &phrases) }
@@ -853,7 +863,7 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         std::sync::Arc::new(VoiceScore { neural: false, similarity: None, likelihood: Some(l), voiced_secs: 0.0, embedding: None, ms: 0 })
     });
     let mut v = match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
-        Ok(verdict) => settle(verdict, text, &phrases, legacy),
+        Ok(verdict) => settle_with(verdict, text, &phrases, legacy, during_playback),
         Err(_) => rule(text, &phrases),
     };
     apply_policy(&mut v, text, &phrases, &policy, now_ms);

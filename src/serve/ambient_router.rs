@@ -30,15 +30,29 @@ fn voices(turn: &[Part]) -> Vec<crate::voiceprint::VoiceHandle> {
     turn.iter().filter_map(|p| p.voice.clone()).collect()
 }
 
-fn classify_turn(d: &Shared, turn: &[Part], pending: &mut Option<Pending>) {
+fn classify_turn(d: &Shared, device: &str, turn: &[Part], pending: &mut Option<Pending>) {
     if let Some((_, _, h)) = pending.take() {
         h.abort();
     }
     let ids: Vec<String> = turn.iter().map(|p| p.id.clone()).collect();
     let text = turn.iter().map(|p| p.text.trim()).collect::<Vec<_>>().join(" ");
     let vs = voices(turn);
-    let (d2, ids2, text2) = (d.clone(), ids.clone(), text.clone());
-    let h = tokio::spawn(async move { ambient_watch::classify(&d2, &ids2, &text2, vs).await });
+    let (d2, dev2, ids2, text2) = (d.clone(), device.to_string(), ids.clone(), text.clone());
+    let sent = super::autonomy::mission_control_inputs();
+    let h = tokio::spawn(async move {
+        let v = ambient_watch::classify(&d2, &ids2, &text2, vs).await;
+        if (crate::tts_stream::busy_for(&dev2) || super::autonomy::mission_control_busy())
+            && should_interrupt(&d2, &v, &text2)
+        {
+            let spoke = crate::speech::interrupt(&dev2);
+            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+            if (spoke || busy) && super::autonomy::mission_control_inputs() == sent && !crate::ambient::waiting_for_user() {
+                super::autonomy::interrupt_mission_control(&d2).await;
+                super::autonomy::resume_unless_heard(d2);
+            }
+        }
+        v
+    });
     *pending = Some((ids, text, h));
 }
 
@@ -51,6 +65,7 @@ pub(crate) struct Part {
     pub ended: f64,
     pub started_at: String,
     pub continued: bool,
+    pub during_playback: bool,
     pub voice: Option<crate::voiceprint::VoiceHandle>,
     pub revises: Option<String>,
     pub stt_speaker: Option<String>,
@@ -215,7 +230,7 @@ async fn accept(
         if let Some(i) = turn.iter().position(|p| p.id == revised || p.revises.as_deref() == Some(revised.as_str())) {
             supersede(d, &turn[i].id);
             turn[i] = part;
-            classify_turn(d, turn, pending);
+            classify_turn(d, device, turn, pending);
             let live = crate::ambient::conversation().is_some() || crate::tts_stream::busy_for(device);
             *deadline = Some(Instant::now() + if live { FAST_HOLD } else { HOLD });
             return;
@@ -230,6 +245,7 @@ async fn accept(
             let gap = part.started - l.ended;
             let routable = crate::ambient::lease_holder().is_some_and(|(h, _)| h == device);
             if l.delivered
+                && !part.during_playback
                 && routable
                 && crate::ambient::conversation().is_some()
                 && l.at.elapsed() < LATE_WINDOW
@@ -286,7 +302,7 @@ async fn accept(
         *deadline = None;
         flush(d, device, parts, true, last, pending.take()).await;
     } else {
-        classify_turn(d, turn, pending);
+        classify_turn(d, device, turn, pending);
         let hold = if live { FAST_HOLD } else { HOLD };
         *deadline = Some(Instant::now() + hold);
     }

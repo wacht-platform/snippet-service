@@ -470,18 +470,18 @@ fn spawn_transcription(d: Shared, id: String) {
         if status != "failed" {
             prune_audio(40).await;
         }
-        let row: Option<(String, Option<i64>, String, i64, i64, i64)> = d
+        let row: Option<(String, Option<i64>, String, i64, i64, i64, i64)> = d
             .store
             .with_connection(|c| {
                 c.query_row(
-                    "SELECT device, seq, started_at, duration_ms, continued, routed
+                    "SELECT device, seq, started_at, duration_ms, continued, routed, COALESCE(during_playback, 0)
                      FROM ambient_events WHERE id = ?1",
                     [&id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
                 )
             })
             .ok();
-        let Some((device, seq, started_at, duration_ms, continued, routed)) = row else {
+        let Some((device, seq, started_at, duration_ms, continued, routed, during_playback)) = row else {
             return;
         };
         let seq = seq.unwrap_or(-1);
@@ -531,6 +531,7 @@ fn spawn_transcription(d: Shared, id: String) {
                 ended: started + duration_ms as f64 / 1000.0,
                 started_at,
                 continued: continued != 0,
+                during_playback: during_playback != 0,
                 voice,
                 revises: None,
                 stt_speaker: None,
@@ -601,7 +602,7 @@ pub(super) fn recent_replies(device: &str) -> Vec<String> {
             s.with_connection(|c| {
                 let mut stmt = c.prepare(
                     "SELECT text FROM ambient_turns WHERE role = 'assistant' AND device = ?1 AND created_at >= ?2 AND TRIM(text) != ''
-                     ORDER BY id DESC LIMIT 4",
+                     ORDER BY id DESC LIMIT 12",
                 )?;
                 let rows = stmt
                     .query_map(rusqlite::params![device, since], |r| r.get::<_, String>(0))?
@@ -685,6 +686,7 @@ pub(super) async fn record_heard(d: &Shared, device: &str, e: super::listener::E
                 ended: e.started + e.duration_ms as f64 / 1000.0,
                 started_at,
                 continued: false,
+                during_playback: e.during_playback,
                 voice: e.voice,
                 revises: e.revises,
                 stt_speaker: e.stt_speaker,

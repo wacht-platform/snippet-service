@@ -40,6 +40,7 @@ struct Live {
     conn: u64,
     turn: i64,
     seq: i64,
+    announced: bool,
     interrupted: bool,
     classifying: bool,
     classified_words: usize,
@@ -421,7 +422,7 @@ impl Listener {
             s.retry_at = Some(Instant::now() + wait);
             s.pending_from = s.last_final.max(c.base).max(s.g.saturating_sub(REPLAY));
         }
-        let stale = s.live.take().filter(|l| !l.done);
+        let stale = s.live.take().filter(|l| !l.done && l.announced);
         drop(s);
         if let Some(live) = stale {
             super::ambient_routes::announce(&self.d, &self.device, live.seq, true);
@@ -494,7 +495,7 @@ impl Listener {
             if ended && words.is_empty() && transcript.is_empty() {
                 return;
             }
-            s.live = Some(Live { conn, turn: order, seq: next_seq(), interrupted: false, classifying: false, classified_words: 0, event_id: None, done: false });
+            s.live = Some(Live { conn, turn: order, seq: next_seq(), announced: false, interrupted: false, classifying: false, classified_words: 0, event_id: None, done: false });
         }
         let audible = s.audible || s.play_flag || live_audible;
         let during_playback = words.iter().any(|w| w.playing) || audible;
@@ -503,6 +504,7 @@ impl Listener {
         let resumed = !ended && live.done;
         if resumed {
             live.done = false;
+            live.announced = false;
         }
         let replies = super::ambient_routes::recent_replies(&self.device);
         let mask = echo_mask(&words, &replies, during_playback);
@@ -513,75 +515,78 @@ impl Listener {
                 crate::ambient::hold_floor();
             }
         }
+        let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+        let barge_ready = if during_playback {
+            tail_real >= 2 || max_real_run >= 3 || (tail_real == 1 && words.last().is_some_and(|w| is_quick_barge(&w.key)))
+        } else {
+            real >= 1
+        };
+        let should_probe = !echo_all
+            && (audible || busy)
+            && !live.interrupted
+            && (!live.classifying || ended)
+            && barge_ready
+            && (ended || real >= live.classified_words.saturating_add(if live.classified_words == 0 { 0 } else { 2 }));
+        let probe_text = if should_probe {
+            live.classifying = true;
+            live.classified_words = real;
+            let clean = words
+                .iter()
+                .zip(&mask)
+                .filter(|(_, e)| !**e)
+                .map(|(w, _)| w.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(clean)
+        } else {
+            None
+        };
+        let live_vp = if probe_text.is_some() && !crate::voiceprint::neural_ready() {
+            let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
+            s.vp_acc.score(&vps)
+        } else {
+            None
+        };
+        if let Some(clean_text) = probe_text
+            && !clean_text.trim().is_empty()
+        {
+            let me = get(&self.d, &self.device);
+            let d = self.d.clone();
+            let device = self.device.clone();
+            let sent = super::autonomy::mission_control_inputs();
+            tokio::spawn(async move {
+                let verdict = super::ambient_watch::classify_live(&d, &device, &clean_text, during_playback, live_vp).await;
+                let go = super::ambient_router::should_interrupt(&d, &verdict, &clean_text);
+                let mut do_interrupt = false;
+                {
+                    let mut s = me.inner.lock().unwrap();
+                    if let Some(l) = s.live.as_mut().filter(|l| l.conn == conn && l.turn == order) {
+                        l.classifying = false;
+                        if go && !l.interrupted {
+                            l.interrupted = true;
+                            do_interrupt = true;
+                        }
+                    }
+                }
+                if do_interrupt {
+                    let spoke = crate::speech::interrupt(&device);
+                    let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+                    if (spoke || busy) && super::autonomy::mission_control_inputs() == sent && !crate::ambient::waiting_for_user() {
+                        super::autonomy::interrupt_mission_control(&d).await;
+                        super::autonomy::resume_unless_heard(d);
+                    }
+                }
+            });
+        }
         if !ended {
-            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
-            let barge_ready = if during_playback {
-                tail_real >= 2 || max_real_run >= 3 || (tail_real == 1 && words.last().is_some_and(|w| is_quick_barge(&w.key)))
-            } else {
-                real >= 1
-            };
-            let should_probe = !echo_all
-                && (audible || busy)
-                && !live.interrupted
-                && !live.classifying
-                && barge_ready
-                && real >= live.classified_words.saturating_add(if live.classified_words == 0 { 0 } else { 2 });
-            let probe_text = if should_probe {
-                live.classifying = true;
-                live.classified_words = real;
-                let clean = words
-                    .iter()
-                    .zip(&mask)
-                    .filter(|(_, e)| !**e)
-                    .map(|(w, _)| w.text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                Some(clean)
-            } else {
-                None
-            };
-            let live_vp = if probe_text.is_some() && !crate::voiceprint::neural_ready() {
-                let vps = self.d.config.lock().unwrap().ambient.voiceprints.clone();
-                s.vp_acc.score(&vps)
-            } else {
-                None
-            };
+            let need_announce = !echo_all && !s.live.as_ref().unwrap().announced;
+            if need_announce {
+                s.live.as_mut().unwrap().announced = true;
+            }
             drop(s);
-            if fresh || resumed {
+            if need_announce {
                 super::ambient_routes::announce(&self.d, &self.device, seq, false);
             }
-            if let Some(clean_text) = probe_text
-                && !clean_text.trim().is_empty() {
-                    let me = get(&self.d, &self.device);
-                    let d = self.d.clone();
-                    let device = self.device.clone();
-                    let sent = super::autonomy::mission_control_inputs();
-                    tokio::spawn(async move {
-                        let verdict = super::ambient_watch::classify_live(&d, &device, &clean_text, during_playback, live_vp).await;
-                        let go = super::ambient_router::should_interrupt(&d, &verdict, &clean_text);
-                        let mut do_interrupt = false;
-                        {
-                            let mut s = me.inner.lock().unwrap();
-                            if let Some(l) = s.live.as_mut().filter(|l| l.conn == conn && l.turn == order) {
-                                l.classifying = false;
-                                if go && !l.interrupted {
-                                    l.interrupted = true;
-                                    do_interrupt = true;
-                                }
-                            }
-                        }
-                        if do_interrupt {
-                            let spoke = crate::speech::interrupt(&device);
-                            let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
-                            // Resume even when the reply was fully generated: the audio usually outlives the run.
-                            // A pending wait_for_user receives the next turn itself; interrupting would drop it.
-                            if (spoke || busy) && super::autonomy::mission_control_inputs() == sent && !crate::ambient::waiting_for_user() {
-                                super::autonomy::interrupt_mission_control(&d).await;
-                                super::autonomy::resume_unless_heard(d);
-                            }
-                        }
-                    });
-                }
             return;
         }
         if let Some(last) = words.last() {
@@ -643,8 +648,14 @@ impl Listener {
             {
                 live.event_id = Some(id.clone());
             }
-            let part_seq = if idx == 0 { seq } else { next_seq() };
-            if idx > 0 {
+            let part_seq = if status != "done" && idx == 0 && !s.live.as_ref().is_some_and(|l| l.announced) {
+                0
+            } else if idx == 0 {
+                seq
+            } else {
+                next_seq()
+            };
+            if idx > 0 && status == "done" {
                 super::ambient_routes::announce(&self.d, &self.device, part_seq, false);
             }
             crate::ambient::mark(&id, if revises.is_some() { "revision" } else { "end" });
@@ -999,6 +1010,12 @@ fn on_message(l: &Arc<Listener>, id: u64, flux: bool, v: &serde_json::Value, raw
             let words = v.get("words").and_then(|x| x.as_array()).map_or(0, |w| w.len());
             let active = l.inner.lock().unwrap().conn.as_ref().is_some_and(|c| c.id == id && c.active);
             match event {
+                "TurnResumed" => {
+                    let mut s = l.inner.lock().unwrap();
+                    if s.delivered.is_some_and(|(c, t, _)| c == id && t == index) {
+                        s.delivered = None;
+                    }
+                }
                 "EagerEndOfTurn" if !active => return Ok(false),
                 "EagerEndOfTurn" | "EndOfTurn" => {
                     if event == "EagerEndOfTurn" {
