@@ -595,17 +595,22 @@ pub(super) fn echo_of_reply(text: &str, device: &str, ratio: f64) -> bool {
 
 pub(super) fn recent_replies(device: &str) -> Vec<String> {
     let mut out = crate::tts_stream::live_texts(device);
-    let since = chrono::Utc::now().timestamp() - 180;
+    let now = chrono::Utc::now().timestamp();
+    let speaking_since = now - 60;
+    let recent_since = now - 12;
     let db_replies: Vec<String> = crate::ambient::store()
         .ok()
         .and_then(|s| {
             s.with_connection(|c| {
                 let mut stmt = c.prepare(
-                    "SELECT text FROM ambient_turns WHERE role = 'assistant' AND device = ?1 AND created_at >= ?2 AND TRIM(text) != ''
-                     ORDER BY id DESC LIMIT 12",
+                    "SELECT text FROM ambient_turns
+                     WHERE role = 'assistant' AND device = ?1 AND TRIM(text) != ''
+                       AND ((status = 'speaking' AND created_at >= ?2)
+                            OR (created_at >= ?3 AND COALESCE(played_at, created_at) >= ?4))
+                     ORDER BY id DESC LIMIT 10",
                 )?;
                 let rows = stmt
-                    .query_map(rusqlite::params![device, since], |r| r.get::<_, String>(0))?
+                    .query_map(rusqlite::params![device, speaking_since, speaking_since, recent_since], |r| r.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })

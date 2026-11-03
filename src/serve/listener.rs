@@ -516,8 +516,23 @@ impl Listener {
             }
         }
         let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+        let instant_barge = !echo_all && (audible || busy) && !live.interrupted && has_barge_command(&words);
+        if instant_barge {
+            live.interrupted = true;
+            let d = self.d.clone();
+            let device = self.device.clone();
+            let sent = super::autonomy::mission_control_inputs();
+            tokio::spawn(async move {
+                let spoke = crate::speech::interrupt(&device);
+                let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+                if (spoke || busy) && super::autonomy::mission_control_inputs() == sent && !crate::ambient::waiting_for_user() {
+                    super::autonomy::interrupt_mission_control(&d).await;
+                    super::autonomy::resume_unless_heard(d);
+                }
+            });
+        }
         let barge_ready = if during_playback {
-            tail_real >= 2 || max_real_run >= 3 || (tail_real == 1 && words.last().is_some_and(|w| is_quick_barge(&w.key)))
+            tail_real >= 2 || max_real_run >= 3 || has_barge_command(&words)
         } else {
             real >= 1
         };
@@ -830,24 +845,70 @@ fn similar(a: &str, b: &str) -> bool {
         return true;
     }
     let (la, lb) = (a.chars().count(), b.chars().count());
-    if la.min(lb) < 2 {
-        return false;
-    }
-    let (pa, pb) = (phonetic(a), phonetic(b));
-    if !pa.is_empty() && (pa == pb || (pa.len().min(pb.len()) >= 3 && (pa.starts_with(&pb) || pb.starts_with(&pa)))) {
-        return true;
-    }
     if la.min(lb) < 3 {
         return false;
     }
-    if (a.starts_with(b) || b.starts_with(a)) && la.min(lb) >= 3 {
+    if la.max(lb) <= 4 {
+        return a.chars().next() == b.chars().next() && lev(a, b) <= 1;
+    }
+    let (pa, pb) = (phonetic(a), phonetic(b));
+    if pa.len().min(pb.len()) >= 3 && (pa == pb || pa.starts_with(&pb) || pb.starts_with(&pa)) {
+        return true;
+    }
+    if (a.starts_with(b) || b.starts_with(a)) && la.min(lb) >= 4 {
         return true;
     }
     lev(a, b) <= (la.max(lb) / 4).max(1)
 }
 
 fn is_quick_barge(key: &str) -> bool {
-    matches!(key, "snippet" | "snipit" | "snippit" | "stop" | "wait" | "hold" | "pause" | "cancel")
+    matches!(
+        key,
+        "snippet" | "snipit" | "snippit" | "stop" | "wait" | "hold" | "pause" | "cancel" | "quiet" | "enough" | "shutup" | "hush"
+    )
+}
+
+fn has_barge_command(words: &[Heard]) -> bool {
+    if words.iter().any(|w| is_quick_barge(&w.key)) {
+        return true;
+    }
+    words.windows(2).any(|w| {
+        matches!(
+            (w[0].key.as_str(), w[1].key.as_str()),
+            ("shut", "up")
+                | ("checked", "up")
+                | ("hold", "on")
+                | ("be", "quiet")
+                | ("stop", "it")
+                | ("stop", "talking")
+                | ("stop", "speaking")
+                | ("hey", "snippet")
+        )
+    })
+}
+
+fn unmutes_barge_pairs(words: &[Heard], mask: &mut [bool]) {
+    for i in 0..words.len() {
+        if is_quick_barge(&words[i].key) {
+            mask[i] = false;
+        }
+        if i + 1 < words.len()
+            && matches!(
+                (words[i].key.as_str(), words[i + 1].key.as_str()),
+                ("shut", "up")
+                    | ("checked", "up")
+                    | ("hold", "on")
+                    | ("be", "quiet")
+                    | ("stop", "it")
+                    | ("stop", "talking")
+                    | ("stop", "speaking")
+                    | ("hey", "snippet")
+            )
+        {
+            mask[i] = false;
+            mask[i + 1] = false;
+        }
+    }
 }
 
 fn echo_stats(words: &[Heard], mask: &[bool], during_playback: bool) -> (usize, usize, usize, usize, bool) {
@@ -866,7 +927,7 @@ fn echo_stats(words: &[Heard], mask: &[bool], during_playback: bool) -> (usize, 
     }
     let has_user_barge = tail_real >= 2
         || max_real_run >= 3
-        || (tail_real == 1 && words.last().is_some_and(|w| is_quick_barge(&w.key)));
+        || has_barge_command(words);
     let echo_all = !words.is_empty()
         && (real == 0 || (during_playback && filtered >= 2 && !has_user_barge && real * 3 <= words.len()));
     (real, filtered, tail_real, max_real_run, echo_all)
@@ -953,6 +1014,7 @@ fn echo_mask(words: &[Heard], replies: &[String], during_playback: bool) -> Vec<
             }
         }
     }
+    unmutes_barge_pairs(words, &mut mask);
     mask
 }
 
