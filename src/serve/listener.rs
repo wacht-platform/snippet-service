@@ -452,13 +452,15 @@ impl Listener {
 
     fn on_turn(&self, conn: u64, v: &serde_json::Value) {
         let Some(order) = v.get("turn_order").and_then(|x| x.as_i64()) else { return };
-        super::autonomy::note_heard();
         let ended = v.get("end_of_turn").and_then(|x| x.as_bool()).unwrap_or(false);
-        if !ended {
-            crate::ambient::hold_floor();
-        }
         let transcript = v.get("transcript").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+        let live_audible = crate::speech::is_audible(&self.device);
         let mut s = self.inner.lock().unwrap();
+        if live_audible && !s.audible {
+            s.audible = true;
+            let g = s.g;
+            set(&mut s.playing, g, true);
+        }
         let Some(base) = s.conn.as_ref().filter(|c| c.id == conn).map(|c| c.base) else { return };
         let turn_speaker = v
             .get("speaker_label")
@@ -494,7 +496,8 @@ impl Listener {
             }
             s.live = Some(Live { conn, turn: order, seq: next_seq(), interrupted: false, classifying: false, classified_words: 0, event_id: None, done: false });
         }
-        let audible = s.audible || s.play_flag;
+        let audible = s.audible || s.play_flag || live_audible;
+        let during_playback = words.iter().any(|w| w.playing) || audible;
         let live = s.live.as_mut().unwrap();
         let seq = live.seq;
         let resumed = !ended && live.done;
@@ -502,18 +505,26 @@ impl Listener {
             live.done = false;
         }
         let replies = super::ambient_routes::recent_replies(&self.device);
-        let mask = echo_mask(&words, &replies);
-        let real = words.iter().zip(&mask).filter(|(_, e)| !**e).count();
-        let filtered = words.len().saturating_sub(real);
-        let during_playback = words.iter().any(|w| w.playing) || audible;
-        let echo_all = !words.is_empty() && (real == 0 || (during_playback && filtered >= 2 && real * 3 <= words.len()));
+        let mask = echo_mask(&words, &replies, during_playback);
+        let (real, _filtered, tail_real, max_real_run, echo_all) = echo_stats(&words, &mask, during_playback);
+        if !echo_all {
+            super::autonomy::note_heard();
+            if !ended {
+                crate::ambient::hold_floor();
+            }
+        }
         if !ended {
             let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
+            let barge_ready = if during_playback {
+                tail_real >= 2 || max_real_run >= 3 || (tail_real == 1 && words.last().is_some_and(|w| is_quick_barge(&w.key)))
+            } else {
+                real >= 1
+            };
             let should_probe = !echo_all
                 && (audible || busy)
                 && !live.interrupted
                 && !live.classifying
-                && real >= 1
+                && barge_ready
                 && real >= live.classified_words.saturating_add(if live.classified_words == 0 { 0 } else { 2 });
             let probe_text = if should_probe {
                 live.classifying = true;
@@ -824,26 +835,54 @@ fn similar(a: &str, b: &str) -> bool {
     lev(a, b) <= (la.max(lb) / 4).max(1)
 }
 
-fn echo_mask(words: &[Heard], replies: &[String]) -> Vec<bool> {
+fn is_quick_barge(key: &str) -> bool {
+    matches!(key, "snippet" | "snipit" | "snippit" | "stop" | "wait" | "hold" | "pause" | "cancel")
+}
+
+fn echo_stats(words: &[Heard], mask: &[bool], during_playback: bool) -> (usize, usize, usize, usize, bool) {
+    let real = words.iter().zip(mask).filter(|(_, e)| !**e).count();
+    let filtered = words.len().saturating_sub(real);
+    let tail_real = words.iter().zip(mask).rev().take_while(|(_, e)| !**e).count();
+    let mut max_real_run = 0usize;
+    let mut cur = 0usize;
+    for &e in mask {
+        if !e {
+            cur += 1;
+            max_real_run = max_real_run.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    let has_user_barge = tail_real >= 2
+        || max_real_run >= 3
+        || (tail_real == 1 && words.last().is_some_and(|w| is_quick_barge(&w.key)));
+    let echo_all = !words.is_empty()
+        && (real == 0 || (during_playback && filtered >= 2 && !has_user_barge && real * 3 <= words.len()));
+    (real, filtered, tail_real, max_real_run, echo_all)
+}
+
+fn echo_mask(words: &[Heard], replies: &[String], during_playback: bool) -> Vec<bool> {
     let mut mask = vec![false; words.len()];
-    if !words.iter().any(|w| w.playing) {
+    if !during_playback && !words.iter().any(|w| w.playing) {
         return mask;
     }
     for reply in replies {
         let said: Vec<String> = reply.split_whitespace().map(norm).filter(|w| !w.is_empty()).collect();
         let mut i = 0;
+        let mut min_j = 0usize;
         while i < words.len() {
-            let mut best: Option<(usize, usize)> = None;
-            for j in 0..said.len() {
-                let (mut k, mut skipped, mut matched, mut last_match) = (0usize, 0usize, 0usize, 0usize);
+            let mut best: Option<(usize, usize, usize)> = None;
+            for j in min_j..said.len() {
+                let (mut k, mut skipped, mut matched, mut last_match, mut end_j) = (0usize, 0usize, 0usize, 0usize, j);
                 while i + k < words.len() && j + k + skipped < said.len() {
                     if similar(&words[i + k].key, &said[j + k + skipped]) {
                         matched += 1;
                         last_match = k + 1;
+                        end_j = j + k + skipped + 1;
                         k += 1;
                     } else if skipped < 2 && j + k + skipped + 1 < said.len() && similar(&words[i + k].key, &said[j + k + skipped + 1]) {
                         skipped += 1;
-                    } else if k + 1 < words.len() - i && matched >= 2 && words[i + k].playing {
+                    } else if k + 1 < words.len() - i && matched >= 2 && (words[i + k].playing || during_playback) {
                         k += 1;
                         if k - last_match > 1 {
                             break;
@@ -853,14 +892,20 @@ fn echo_mask(words: &[Heard], replies: &[String]) -> Vec<bool> {
                     }
                 }
                 if last_match > best.map(|b| b.1).unwrap_or(0) {
-                    best = Some((matched, last_match));
+                    best = Some((matched, last_match, end_j));
                 }
             }
             match best {
-                Some((matched, len)) if matched >= 2 || (matched == 1 && len == 1 && words.len() == 1 && words[i].playing) => {
-                    let playing = words[i..i + len].iter().filter(|w| w.playing).count();
+                Some((matched, len, end_j))
+                    if matched >= 2
+                        || (matched == 1 && len == 1 && words.len() == 1 && (words[i].playing || during_playback)) =>
+                {
+                    let playing = words[i..i + len].iter().filter(|w| w.playing || during_playback).count();
                     if playing * 2 >= len {
                         mask[i..i + len].iter_mut().for_each(|m| *m = true);
+                        if matched >= 3 {
+                            min_j = min_j.max(end_j.saturating_sub(2));
+                        }
                     }
                     i += len.max(1);
                 }
@@ -871,8 +916,29 @@ fn echo_mask(words: &[Heard], replies: &[String]) -> Vec<bool> {
     for gap in [1usize, 2] {
         for i in 1..words.len().saturating_sub(gap) {
             let end = i + gap;
-            if end < words.len() && mask[i - 1] && mask[end] && (i..end).all(|k| !mask[k] && words[k].playing) {
+            if end < words.len()
+                && mask[i - 1]
+                && mask[end]
+                && (i..end).all(|k| !mask[k] && (words[k].playing || during_playback) && !is_quick_barge(&words[k].key))
+            {
                 (i..end).for_each(|k| mask[k] = true);
+            }
+        }
+    }
+    let filtered = mask.iter().filter(|&&m| m).count();
+    if during_playback && filtered >= 2 {
+        let mut i = 0;
+        while i < words.len() {
+            if !mask[i] {
+                let start = i;
+                while i < words.len() && !mask[i] {
+                    i += 1;
+                }
+                if i - start == 1 && start > 0 && i < words.len() && !is_quick_barge(&words[start].key) {
+                    mask[start] = true;
+                }
+            } else {
+                i += 1;
             }
         }
     }
@@ -1031,4 +1097,68 @@ async fn run(l: &Arc<Listener>, id: u64, ws: Ws, mut cmd: mpsc::UnboundedReceive
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn heard_words(text: &str, playing: bool) -> Vec<Heard> {
+        text.split_whitespace()
+            .enumerate()
+            .map(|(i, w)| Heard {
+                key: norm(w),
+                text: w.to_string(),
+                start: (i as u64) * 3200,
+                end: ((i + 1) as u64) * 3200,
+                playing,
+                media: false,
+                speaker: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn opening_tts_words_before_play_flag_are_masked_when_audible() {
+        let replies = vec![
+            "I've got key control over the Mac, but screen capture is failing, so I can't see the display.".to_string(),
+            "Keyboard control works, but I still can't grab the screen.".to_string(),
+        ];
+        for partial in ["I've got key control over", "Screen capture is", "Keyboard control work."] {
+            let words = heard_words(partial, false);
+            let mask = echo_mask(&words, &replies, true);
+            let (real, _, tail_real, _, echo_all) = echo_stats(&words, &mask, true);
+            assert!(echo_all, "partial `{partial}` should be echo_all (real={real}, tail={tail_real})");
+            assert_eq!(real, 0, "partial `{partial}` should have 0 real words");
+        }
+    }
+
+    #[test]
+    fn user_barge_in_after_long_agent_echo_is_kept_and_triggers_barge() {
+        let replies = vec![
+            "Quick honest check, boss: I don't have a remote-control path to your Mac right now, I've only got the sandbox VMs. Setting up real control needs you there to grant permissions, and the Mac on the same network. I can't push a driver onto your Mac from here.".to_string(),
+        ];
+        let full = "Quick honest check, boss. I don't have a remote control pad to your Mac right now. I've only got the sandbox BMS. Setting up real control needs you there to grant permissions, and the Mac on the same network. I can't push a driver It is on the same tailscale network. Okay?";
+        let words = heard_words(full, true);
+        let mask = echo_mask(&words, &replies, true);
+        let (real, filtered, tail_real, max_real_run, echo_all) = echo_stats(&words, &mask, true);
+        assert!(!echo_all, "barge-in at tail must not be marked echo_all");
+        assert!(filtered >= 30 && tail_real >= 7 && max_real_run >= 7, "real={real} filtered={filtered} tail={tail_real}");
+        let clean: Vec<&str> = words.iter().zip(&mask).filter(|(_, e)| !**e).map(|(w, _)| w.text.as_str()).collect();
+        assert_eq!(clean.join(" "), "It is on the same tailscale network. Okay?");
+    }
+
+    #[test]
+    fn short_two_word_reply_at_tail_of_echo_is_kept() {
+        let replies = vec![
+            "It needs the Mac on the same network, me installing a small helper, and you granting screen and accessibility permissions. Want me to go ahead?".to_string(),
+        ];
+        let full = "It needs the Mac on the same network. Me installing a small helper and you granting screen and accessibility permissions. Want me to go ahead? Yes, please.";
+        let words = heard_words(full, true);
+        let mask = echo_mask(&words, &replies, true);
+        let (_, _, tail_real, _, echo_all) = echo_stats(&words, &mask, true);
+        assert!(!echo_all && tail_real == 2);
+        let clean: Vec<&str> = words.iter().zip(&mask).filter(|(_, e)| !**e).map(|(w, _)| w.text.as_str()).collect();
+        assert_eq!(clean.join(" "), "Yes, please.");
+    }
 }
