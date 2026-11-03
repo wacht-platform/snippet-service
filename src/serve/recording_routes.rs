@@ -23,7 +23,7 @@ pub(crate) fn view(policy: &RecordingPolicy, now_ms: i64, dir: &std::path::Path)
     json!({
         "retention_days": policy.retention_days,
         "snooze_until": policy.snooze_until_ms.filter(|t| *t > now_ms),
-        "rules": policy.rules,
+        "rules": policy.rules.iter().filter(|r| r.is_live(now_ms)).collect::<Vec<_>>(),
         "windows": policy.windows.iter().filter(|w| w.to_ms > now_ms).collect::<Vec<_>>(),
         "recordings": crate::recordings::list(dir, 100),
     })
@@ -73,6 +73,7 @@ pub(crate) async fn set(State(d): State<Shared>, Query(a): Query<Auth>, Json(req
             Err(e) => Err(e),
             Ok(()) => {
                 next.prune(now);
+                crate::recording_policy::sync(&next);
                 c.recording = next.clone();
                 crate::config::save_config(&c, &d.config_path).map(|_| next)
             }

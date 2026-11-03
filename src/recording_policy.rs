@@ -5,8 +5,22 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_WINDOW_MS: i64 = 12 * 3_600_000;
 pub const MAX_SNOOZE_MINUTES: i64 = 720;
+pub const MAX_RULE_MINUTES: i64 = 43_200;
 pub const MAX_RETENTION_DAYS: u32 = 3650;
 pub const REFUSAL_COOLDOWN_MS: i64 = 600_000;
+
+static LIVE: std::sync::OnceLock<std::sync::Mutex<Option<RecordingPolicy>>> = std::sync::OnceLock::new();
+
+pub fn sync(policy: &RecordingPolicy) {
+    *LIVE.get_or_init(Default::default).lock().unwrap() = Some(policy.clone());
+}
+
+pub fn live_or(fallback: &RecordingPolicy) -> RecordingPolicy {
+    let mut guard = LIVE.get_or_init(Default::default).lock().unwrap();
+    let p = guard.get_or_insert_with(|| fallback.clone());
+    p.prune(now_ms());
+    p.clone()
+}
 
 fn default_retention() -> u32 {
     60
@@ -53,12 +67,32 @@ pub struct Rule {
     pub id: String,
     pub label: String,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub about: String,
     #[serde(default)]
     pub when: When,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
     #[serde(default)]
     pub basis: String,
     #[serde(default)]
     pub created_at: i64,
+}
+
+impl Rule {
+    pub fn is_live(&self, now_ms: i64) -> bool {
+        self.expires_at_ms.is_none_or(|t| t > now_ms)
+    }
+
+    pub fn matches_deterministic(&self, text_lower: &str, local: NaiveDateTime, now_ms: i64) -> bool {
+        if !self.is_live(now_ms) || !self.when.matches_schedule(local) {
+            return false;
+        }
+        if !self.when.keywords.is_empty() {
+            return self.when.keywords.iter().any(|k| text_lower.contains(&k.to_lowercase()));
+        }
+        self.about.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -93,10 +127,7 @@ pub fn local_at(ms: i64) -> NaiveDateTime {
 }
 
 impl When {
-    pub fn matches(&self, text_lower: &str, local: NaiveDateTime) -> bool {
-        if !self.keywords.is_empty() && !self.keywords.iter().any(|k| text_lower.contains(&k.to_lowercase())) {
-            return false;
-        }
+    pub fn matches_schedule(&self, local: NaiveDateTime) -> bool {
         if !self.weekdays.is_empty() && !self.weekdays.contains(&(local.weekday().num_days_from_sunday() as u8)) {
             return false;
         }
@@ -109,37 +140,68 @@ impl When {
         }
         true
     }
+
+    pub fn matches(&self, text_lower: &str, local: NaiveDateTime) -> bool {
+        if !self.keywords.is_empty() && !self.keywords.iter().any(|k| text_lower.contains(&k.to_lowercase())) {
+            return false;
+        }
+        self.matches_schedule(local)
+    }
 }
 
 impl RecordingPolicy {
     pub fn prune(&mut self, now_ms: i64) -> bool {
-        let before = self.windows.len();
+        let (bw, br) = (self.windows.len(), self.rules.len());
         self.windows.retain(|w| w.to_ms > now_ms);
+        self.rules.retain(|r| r.is_live(now_ms));
         if self.snooze_until_ms.is_some_and(|t| t <= now_ms) {
             self.snooze_until_ms = None;
             return true;
         }
-        before != self.windows.len()
+        bw != self.windows.len() || br != self.rules.len()
     }
 
     pub fn snoozed(&self, now_ms: i64) -> bool {
         self.snooze_until_ms.is_some_and(|t| t > now_ms)
     }
 
-    /// Snooze or never beats auto beats ask. `cooled` suppresses auto after the user's own refusal.
-    pub fn decide(&self, now_ms: i64, local: NaiveDateTime, heard: &str, cooled: bool) -> Decision {
+    pub fn active_rules(&self, now_ms: i64, local: NaiveDateTime) -> Vec<&Rule> {
+        self.rules.iter().filter(|r| r.is_live(now_ms) && r.when.matches_schedule(local)).collect()
+    }
+
+    pub fn matches_never(&self, now_ms: i64, local: NaiveDateTime, heard: &str) -> bool {
         if self.snoozed(now_ms) {
-            return Decision::Drop;
+            return true;
         }
         let text = heard.to_lowercase();
         let live = |w: &&Window| w.from_ms <= now_ms && now_ms < w.to_ms;
-        let hit = |r: &&Rule| r.when.matches(&text, local);
-        if self.windows.iter().filter(live).any(|w| w.mode == "never") || self.rules.iter().filter(hit).any(|r| r.mode == "never") {
+        self.windows.iter().filter(live).any(|w| w.mode == "never")
+            || self.rules.iter().any(|r| r.mode == "never" && r.matches_deterministic(&text, local, now_ms))
+    }
+
+    pub fn matches_note_or_auto(&self, now_ms: i64, local: NaiveDateTime, heard: &str) -> bool {
+        if self.matches_never(now_ms, local, heard) {
+            return false;
+        }
+        let text = heard.to_lowercase();
+        self.rules.iter().any(|r| {
+            matches!(r.mode.as_str(), "note" | "auto")
+                && !r.when.keywords.is_empty()
+                && r.matches_deterministic(&text, local, now_ms)
+        })
+    }
+
+    /// Snooze or never beats auto beats ask. `cooled` suppresses auto after the user's own refusal.
+    pub fn decide(&self, now_ms: i64, local: NaiveDateTime, heard: &str, cooled: bool) -> Decision {
+        if self.matches_never(now_ms, local, heard) {
             return Decision::Drop;
         }
         if cooled {
             return Decision::Ask;
         }
+        let text = heard.to_lowercase();
+        let live = |w: &&Window| w.from_ms <= now_ms && now_ms < w.to_ms;
+        let hit = |r: &&Rule| r.matches_deterministic(&text, local, now_ms);
         if let Some(w) = self.windows.iter().filter(live).find(|w| w.mode == "auto") {
             return Decision::Auto { label: w.label.clone() };
         }
@@ -178,17 +240,54 @@ impl RecordingPolicy {
     }
 
     pub fn set_rule(&mut self, label: &str, mode: &str, when: When, basis: &str, now_ms: i64) -> Result<String, String> {
-        if !matches!(mode, "auto" | "ask" | "never") {
-            return Err("mode must be auto, ask or never".into());
+        self.set_rule_with(label, mode, "", when, None, basis, now_ms)
+    }
+
+    pub fn set_rule_with(
+        &mut self,
+        label: &str,
+        mode: &str,
+        about: &str,
+        when: When,
+        expires_at_ms: Option<i64>,
+        basis: &str,
+        now_ms: i64,
+    ) -> Result<String, String> {
+        let mode = match mode {
+            "ignore" => "never",
+            "include" => "note",
+            other => other,
+        };
+        if !matches!(mode, "auto" | "note" | "ask" | "never") {
+            return Err("mode must be auto, note (include), ask, or never (ignore)".into());
         }
         if mode != "ask" {
             need_basis(basis)?;
         }
+        if let Some(exp) = expires_at_ms {
+            if exp <= now_ms {
+                return Err("rule expiry must be in the future".into());
+            }
+            if exp - now_ms > MAX_RULE_MINUTES * 60_000 {
+                return Err("a short-term rule can span at most 30 days (43200 minutes); omit minutes/until for a standing rule".into());
+            }
+        }
         let label = need_label(label)?;
+        let about: String = about.trim().chars().take(240).collect();
         let when = clean_when(when)?;
+        self.prune(now_ms);
         self.rules.retain(|r| !r.label.eq_ignore_ascii_case(&label));
         let id = uuid::Uuid::new_v4().to_string();
-        self.rules.push(Rule { id: id.clone(), label, mode: mode.into(), when, basis: basis.trim().into(), created_at: now_ms });
+        self.rules.push(Rule {
+            id: id.clone(),
+            label,
+            mode: mode.into(),
+            about,
+            when,
+            expires_at_ms,
+            basis: basis.trim().into(),
+            created_at: now_ms,
+        });
         Ok(id)
     }
 
@@ -269,12 +368,14 @@ pub async fn update<T>(f: impl FnOnce(&mut RecordingPolicy, i64) -> Result<T, St
     config.recording.prune(now);
     let out = f(&mut config.recording, now)?;
     crate::config::save_config(&config, &path)?;
+    sync(&config.recording);
     Ok((out, config.recording))
 }
 
 pub async fn current() -> RecordingPolicy {
     let mut p = crate::config::SnippetConfig::load(crate::config::default_config_path()).await.map(|c| c.recording).unwrap_or_default();
     p.prune(now_ms());
+    sync(&p);
     p
 }
 
@@ -290,7 +391,7 @@ mod tests {
     }
 
     fn rule(mode: &str, when: When) -> Rule {
-        Rule { id: "r".into(), label: format!("{mode} rule"), mode: mode.into(), when, basis: "b".into(), created_at: 0 }
+        Rule { id: "r".into(), label: format!("{mode} rule"), mode: mode.into(), about: String::new(), when, expires_at_ms: None, basis: "b".into(), created_at: 0 }
     }
 
     fn kw(k: &str) -> When {
@@ -374,5 +475,38 @@ mod tests {
         assert!(!toml::to_string_pretty(&crate::config::SnippetConfig::default()).unwrap().contains("recording"));
         assert_eq!(clamp_retention(99_999), 3650);
         assert!(parse_when("2026-11-02 09:30").is_ok() && parse_when("2026-11-02T09:30:00+00:00").is_ok() && parse_when("tomorrow").is_err());
+    }
+
+    #[test]
+    fn short_term_and_classifier_rules_expire_and_match() {
+        let mut p = RecordingPolicy::default();
+        p.set_rule_with(
+            "YC pitch takes",
+            "ignore",
+            "Rehearsing YC founder video pitch takes",
+            kw("hey yc"),
+            Some(NOW + 60_000),
+            "user: stop recording this pitch rehearsal",
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(p.rules[0].mode, "never");
+        assert!(p.matches_never(NOW, at(2, 10, 0), "Hey YC, my name is Saurav"));
+        assert!(!p.matches_never(NOW + 60_000, at(2, 10, 0), "Hey YC, my name is Saurav"));
+        assert!(p.prune(NOW + 60_000));
+        assert!(p.rules.is_empty());
+
+        p.set_rule_with(
+            "Track Secure Access notes",
+            "include",
+            "Action items about Cisco Secure Access",
+            kw("secure access"),
+            None,
+            "user: keep notes on secure access",
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(p.rules[0].mode, "note");
+        assert!(p.matches_note_or_auto(NOW, at(2, 10, 0), "We need to update Secure Access rules"));
     }
 }

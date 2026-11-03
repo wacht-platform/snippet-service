@@ -281,6 +281,7 @@ impl Daemon {
     async fn reload_config(&self) {
         if let Ok(fresh) = SnippetConfig::load(&self.config_path).await {
             crate::tts::apply_config(&fresh);
+            crate::recording_policy::sync(&fresh.recording);
             *self.config.lock().unwrap() = fresh;
         }
     }

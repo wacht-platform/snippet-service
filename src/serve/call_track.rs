@@ -88,7 +88,8 @@ impl CallBook {
         let seen = self.detectors.entry(device.to_string()).or_default().observe(signal);
         let keep = !matches!(seen.class, Class::Assistant | Class::Played) && signal.words > 0;
         let on_call = self.holds(device);
-        if heard.memorable && !(on_call && keep) {
+        let suppressed = self.policy.matches_never(now, crate::recording_policy::local_at(now), &heard.text);
+        if heard.memorable && !suppressed && !(on_call && keep) {
             self.held.push_back((device.to_string(), now, heard.clone()));
         }
         if let Some(call) = self.active.as_mut().filter(|c| c.device == device) {
@@ -159,6 +160,9 @@ impl CallBook {
         let busy = self.active.as_ref().map(|c| c.device.clone());
         while let Some(i) = self.held.iter().position(|(d, at, _)| now - at >= WINDOW_MS && busy.as_deref() != Some(d)) {
             let (_, _, h) = self.held.remove(i).unwrap();
+            if self.policy.matches_never(now, crate::recording_policy::local_at(now), &h.text) {
+                continue;
+            }
             let note = match h.speaker.as_deref() {
                 Some(s) if !s.is_empty() => format!("[{s}] {}", h.text),
                 _ => h.text,
@@ -360,7 +364,7 @@ pub(super) async fn observe(d: &Shared, device: &str, parts: &[Part], v: &Verdic
             groups.push(((p.started * 1000.0) as i64, *sp, lbl.clone(), vec![p.id.clone()], vec![p.text.trim()]));
         }
     }
-    let policy = d.config.lock().unwrap().recording.clone();
+    let policy = crate::recording_policy::live_or(&d.config.lock().unwrap().recording);
     let memorable = !delivered && v.kept() && v.memorable >= MEMORABLE;
     let fx = {
         let mut book = book();
@@ -1293,5 +1297,19 @@ mod tests {
         let body = std::fs::read_to_string(crate::recordings::find(&rec, "blank").unwrap()).unwrap();
         assert!(body.contains("- id: blank") && body.contains("[redacted]") && !body.contains("secret"), "{body}");
         assert_eq!(crate::recordings::list(&rec, 10).len(), 1);
+    }
+
+    #[test]
+    fn ignore_rule_and_snooze_suppress_held_notes() {
+        let mut book = CallBook::default();
+        let mut p = RecordingPolicy::default();
+        let when = crate::recording_policy::When { keywords: vec!["solo founder".into()], ..Default::default() };
+        p.set_rule_with("YC pitch", "ignore", "YC pitch takes", when, Some(T0 + 300_000), "user: ignore pitch takes", T0).unwrap();
+        book.set_policy(p);
+
+        let sig = Signal { at_ms: T0, words: 8, speaker: Some(super::super::speakers::Speaker::You), ..Signal::default() };
+        let h = Heard { at_ms: T0, ids: vec!["1".into()], text: "My name is Saurav, I am a solo founder".into(), memorable: true, speaker: Some("You".into()) };
+        assert!(book.observe("mac", &sig, h, T0).is_empty());
+        assert!(book.tick(T0 + WINDOW_MS + 1000).is_empty(), "ignored rule must not emit Effect::Note");
     }
 }

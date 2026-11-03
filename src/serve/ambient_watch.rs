@@ -203,6 +203,8 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
                 ],
                 "false": [
                     "Played media, YouTube/TikTok/Reels videos, dramatic first-person storytelling ('I kissed my boyfriend...', 'last week a street interviewer asked me...', 'before I tell you the last one, drop a comment'), vlogs, or narration",
+                    "Rehearsing, practising or recording a pitch, script, presentation or video take (e.g. 'Hey YC, my name is...', repeating or restarting lines for a take)",
+                    "Matches a rule in `classifier_rules.ignore` when `name_in_utterance` is 'no'",
                     "Thinking aloud, an exclamation, a filler sound, or a remark about the speaker's own life/past that asks nothing of the assistant",
                     "A stray 1-2 word fragment ('Guess what?', 'Hello', 'I mean...') without a wake word when `conversation` is 'closed' or `assistant.speaking_when_utterance_was_heard` is true",
                     "Clearly part of an exchange with someone else shown in `recent`, or third-person chatter ('he asked...', 'she said...', 'they said...')",
@@ -247,12 +249,12 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
                 "for_assistant": "Said to the assistant: a call, request, question, answer or reaction to it",
                 "note": "The speaker's own remark, plan, idea or commitment, not said to the assistant",
                 "meeting": "People talking with each other in person or on a call",
-                "ignore": "Filler, noise, played media, or the assistant's own echoed words"
+                "ignore": "Filler, noise, played media, the assistant's own echoed words, rehearsing/recording a script or video take, or speech matching `classifier_rules.ignore`"
             }
         },
         "worth_remembering": {
             "type": "noul",
-            "instructions": "`utterance` holds information the assistant should still have in future: a commitment, plan, deadline, decision, fact about the user, their health, family, finances, preferences, or work, or anything they would expect to be remembered. Venting, reactions, filler, jokes, commentary on what is on screen, and small talk are false."
+            "instructions": "`utterance` holds information the assistant should still have in future: a commitment, plan, deadline, decision, fact about the user, their health, family, finances, preferences, or work, or anything they would expect to be remembered (including anything matching `classifier_rules.include`). Rehearsing or recording a pitch/script/video take (e.g. 'Hey YC, my name is...', repeating takes), speech matching `classifier_rules.ignore`, venting, reactions, filler, jokes, commentary on what is on screen, and small talk are false."
         },
         "suggest_conversation": {
             "type": "noul",
@@ -344,6 +346,54 @@ pub(super) struct Moment {
     pub during_playback: bool,
     pub user_voice: Option<f64>,
     pub speakers_present: Vec<String>,
+    pub classifier_rules: Option<Value>,
+}
+
+pub(super) fn policy_rules_json(policy: &crate::recording_policy::RecordingPolicy, now_ms: i64) -> Option<Value> {
+    let local = crate::recording_policy::local_at(now_ms);
+    let active = policy.active_rules(now_ms, local);
+    let mut include = Vec::new();
+    let mut ignore = Vec::new();
+    for r in active {
+        let entry = json!({
+            "label": r.label,
+            "about": r.about,
+            "keywords": r.when.keywords,
+        });
+        match r.mode.as_str() {
+            "never" => ignore.push(entry),
+            "note" | "auto" => include.push(entry),
+            _ => {}
+        }
+    }
+    if include.is_empty() && ignore.is_empty() {
+        None
+    } else {
+        Some(json!({ "include": include, "ignore": ignore }))
+    }
+}
+
+pub(super) fn apply_policy(
+    verdict: &mut Verdict,
+    text: &str,
+    phrases: &[String],
+    policy: &crate::recording_policy::RecordingPolicy,
+    now_ms: i64,
+) {
+    if wake_word(text, phrases) {
+        return;
+    }
+    let local = crate::recording_policy::local_at(now_ms);
+    if policy.matches_never(now_ms, local, text) {
+        verdict.intent = "ignore".into();
+        verdict.addressed = 0.0;
+        verdict.memorable = 0.0;
+    } else if policy.matches_note_or_auto(now_ms, local, text) {
+        verdict.memorable = verdict.memorable.max(0.85);
+        if verdict.intent == "ignore" {
+            verdict.intent = "note".into();
+        }
+    }
 }
 
 fn handled_as(h: &Heard) -> &'static str {
@@ -420,6 +470,9 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
     }
     if m.speakers_present.len() > 1 {
         state["voices_present"] = json!(m.speakers_present.len());
+    }
+    if let Some(rules) = &m.classifier_rules {
+        state["classifier_rules"] = rules.clone();
     }
     state
 }
@@ -546,19 +599,34 @@ async fn wait_voice(id: &str, voices: &[VoiceHandle]) -> Option<std::sync::Arc<V
 pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec<VoiceHandle>) -> Verdict {
     let id = ids.last().map(String::as_str).unwrap_or("");
     let excluded = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
-    let (key, watcher, phrases, chat_context) = {
+    let (key, watcher, phrases, chat_context, policy) = {
         let c = d.config.lock().unwrap();
         (
             c.typesafe_api_key.clone().filter(|k| !k.trim().is_empty()),
             c.ambient.watcher.clone(),
             c.ambient.wake_phrases.clone(),
             c.ambient.watcher_chat_context,
+            crate::recording_policy::live_or(&c.recording),
         )
     };
-    let Some(key) = key.filter(|_| watcher == "classifier" || watcher == "jev") else {
-        return Verdict { voice: ready_voice(&voices), ..rule(text, &phrases) };
-    };
     let now = chrono::Utc::now().timestamp();
+    let now_ms = now * 1000;
+    if !wake_word(text, &phrases) && policy.matches_never(now_ms, crate::recording_policy::local_at(now_ms), text) {
+        return Verdict {
+            kind: "conversation".into(),
+            intent: "ignore".into(),
+            addressed: 0.0,
+            memorable: 0.0,
+            judge: "rule",
+            voice: ready_voice(&voices),
+            ..Verdict::inherited()
+        };
+    }
+    let Some(key) = key.filter(|_| watcher == "classifier" || watcher == "jev") else {
+        let mut v = Verdict { voice: ready_voice(&voices), ..rule(text, &phrases) };
+        apply_policy(&mut v, text, &phrases, &policy, now_ms);
+        return v;
+    };
     let (duration_ms, device, users, assistant): (i64, String, Vec<Heard>, Vec<Said>) = d
         .store
         .with_connection(|c| {
@@ -654,6 +722,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         during_playback,
         user_voice: early_voice.as_ref().filter(|v| v.neural).and_then(|v| v.likelihood),
         speakers_present: present,
+        classifier_rules: policy_rules_json(&policy, now_ms),
     };
     let classifier = ask_classifier(&key, classifier_state(&moment), with_pending, expecting);
     let (classified, late_voice) = tokio::join!(classifier, async {
@@ -662,31 +731,47 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
             None => wait_voice(id, &voices).await,
         }
     });
-    match classified {
+    let mut v = match classified {
         Ok(verdict) => settle(verdict, text, &phrases, late_voice),
         Err(e) => {
             eprintln!("[ambient] voice classifier failed: {e}");
             Verdict { voice: late_voice, ..rule(text, &phrases) }
         }
-    }
+    };
+    apply_policy(&mut v, text, &phrases, &policy, now_ms);
+    v
 }
 
 /// Real-time parallel classification on partial streaming transcripts while the user
 /// is still speaking, enabling fast classifier-driven barge-in/interruption.
 pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_playback: bool, user_voice: Option<f64>) -> Verdict {
-    let (key, watcher, phrases, chat_context) = {
+    let (key, watcher, phrases, chat_context, policy) = {
         let c = d.config.lock().unwrap();
         (
             c.typesafe_api_key.clone().filter(|k| !k.trim().is_empty()),
             c.ambient.watcher.clone(),
             c.ambient.wake_phrases.clone(),
             c.ambient.watcher_chat_context,
+            crate::recording_policy::live_or(&c.recording),
         )
     };
-    let Some(key) = key.filter(|_| watcher == "classifier" || watcher == "jev") else {
-        return rule(text, &phrases);
-    };
     let now = chrono::Utc::now().timestamp();
+    let now_ms = now * 1000;
+    if !wake_word(text, &phrases) && policy.matches_never(now_ms, crate::recording_policy::local_at(now_ms), text) {
+        return Verdict {
+            kind: "conversation".into(),
+            intent: "ignore".into(),
+            addressed: 0.0,
+            memorable: 0.0,
+            judge: "rule",
+            ..Verdict::inherited()
+        };
+    }
+    let Some(key) = key.filter(|_| watcher == "classifier" || watcher == "jev") else {
+        let mut v = rule(text, &phrases);
+        apply_policy(&mut v, text, &phrases, &policy, now_ms);
+        return v;
+    };
     let (users, mut assistant): (Vec<Heard>, Vec<Said>) = d
         .store
         .with_connection(|c| {
@@ -761,15 +846,18 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         media_playing: false,
         during_playback,
         user_voice: None,
-        speakers_present: super::speakers::peek(device, now * 1000, None).1,
+        speakers_present: super::speakers::peek(device, now_ms, None).1,
+        classifier_rules: policy_rules_json(&policy, now_ms),
     };
     let legacy = user_voice.map(|l| {
         std::sync::Arc::new(VoiceScore { neural: false, similarity: None, likelihood: Some(l), voiced_secs: 0.0, embedding: None, ms: 0 })
     });
-    match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
+    let mut v = match ask_classifier(&key, classifier_state(&moment), with_pending, expecting).await {
         Ok(verdict) => settle(verdict, text, &phrases, legacy),
         Err(_) => rule(text, &phrases),
-    }
+    };
+    apply_policy(&mut v, text, &phrases, &policy, now_ms);
+    v
 }
 
 #[cfg(test)]
@@ -900,5 +988,49 @@ mod voice_tests {
         assert!(none.contains("heard_none=\"true\"") && none.contains("unsaid=\"All of it.\""));
         let part = interruption_attrs(&Interruption { heard: "The build passed".into(), unsaid: "two tests skipped".into() });
         assert!(!part.contains("heard_none") && part.contains("interrupted_reply=\"The build passed\""));
+    }
+
+    #[test]
+    fn policy_rules_tune_classifier_and_wake_word_still_wins() {
+        let now = 1_800_000_000_000;
+        let mut p = crate::recording_policy::RecordingPolicy::default();
+        p.set_rule_with(
+            "YC pitch takes",
+            "ignore",
+            "Rehearsing YC founder pitch video takes",
+            crate::recording_policy::When { keywords: vec!["hey yc".into(), "solo founder".into()], ..Default::default() },
+            Some(now + 60_000),
+            "user: stop recording pitch rehearsal",
+            now,
+        )
+        .unwrap();
+        p.set_rule_with(
+            "Architecture notes",
+            "include",
+            "Notes about Cisco Secure Access",
+            crate::recording_policy::When { keywords: vec!["secure access".into()], ..Default::default() },
+            None,
+            "user: keep notes on secure access",
+            now,
+        )
+        .unwrap();
+
+        let rules_json = policy_rules_json(&p, now).unwrap();
+        assert_eq!(rules_json["ignore"][0]["label"], "YC pitch takes");
+        assert_eq!(rules_json["include"][0]["label"], "Architecture notes");
+
+        let mut v = Verdict { memorable: 0.9, ..classified(0.8) };
+        apply_policy(&mut v, "Hey YC, my name is Saurav, solo founder", &phrases(), &p, now);
+        assert_eq!((v.intent.as_str(), v.addressed, v.memorable), ("ignore", 0.0, 0.0));
+
+        let mut v_wake = Verdict { memorable: 0.9, ..classified(0.95) };
+        apply_policy(&mut v_wake, "Snippet, how was my Hey YC take?", &phrases(), &p, now);
+        assert_eq!(v_wake.intent, "for_assistant");
+        assert!(v_wake.addressed >= 0.9);
+
+        let mut v_inc = Verdict { intent: "ignore".into(), memorable: 0.2, ..classified(0.1) };
+        apply_policy(&mut v_inc, "We should migrate Secure Access tomorrow", &phrases(), &p, now);
+        assert_eq!(v_inc.intent, "note");
+        assert!(v_inc.memorable >= 0.85);
     }
 }

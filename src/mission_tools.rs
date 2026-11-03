@@ -410,7 +410,11 @@ struct PolicyArgs {
     #[serde(default)]
     to: String,
     #[serde(default)]
+    until: String,
+    #[serde(default)]
     label: String,
+    #[serde(default)]
+    about: String,
     #[serde(default)]
     basis: String,
     #[serde(default)]
@@ -435,16 +439,19 @@ impl Tool for RecordingPolicyTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "recording_policy".into(),
-            description: "Read or edit what happens when a conversation is detected: recorded without asking (auto), asked about (ask) or dropped silently (never). `expect` and `block` set a window of at most 12 hours (RFC 3339 or local `YYYY-MM-DD HH:MM`), `snooze` pauses recording for 1 to 720 minutes, and `set_rule` creates or replaces by label a standing rule that matches on keywords in the first lines heard, weekdays (0 is Sunday) and a local from_hhmm to to_hhmm range (HH:MM, may wrap midnight). Auto and never entries require a `basis`.".into(),
+            description: "Tune the voice classifier and conversation recording policy for both short-term and long-term rules. `set_rule` creates or replaces by label a rule telling the classifier what speech to include (`note`/`include` to capture as context notes, `auto` to also auto-record conversations), ask about (`ask`), or ignore (`never`/`ignore` to suppress both classifier context notes and call recording unless a wake word is spoken). Pass `minutes` (e.g. 60) or `until` (RFC 3339 or `YYYY-MM-DD HH:MM`) for a short-term rule that expires automatically, or omit both for a long-term standing rule. Match by `keywords` (exact phrases), `about` (natural-language description passed to the classifier, e.g. 'rehearsing YC founder video pitch takes'), `weekdays` (0 is Sunday) and `from_hhmm`..`to_hhmm`. `expect` and `block` set a time window of at most 12 hours, and `snooze` pauses all recording and context notes for 1 to 720 minutes. Auto, note/include and never/ignore entries require a `basis`.".into(),
             input_schema: schema(json!({
                 "action": {"type": "string", "enum": ["get", "expect", "block", "snooze", "set_rule", "remove_rule", "remove_window"]},
-                "from": {"type": "string", "description": "expect, block"}, "to": {"type": "string", "description": "expect, block"},
+                "from": {"type": "string", "description": "expect, block"},
+                "to": {"type": "string", "description": "expect, block, or set_rule expiry time"},
+                "until": {"type": "string", "description": "set_rule: optional expiry time (RFC 3339 or local YYYY-MM-DD HH:MM) for a short-term rule."},
                 "label": {"type": "string", "description": "expect, block, set_rule: name shown to the user."},
+                "about": {"type": "string", "description": "set_rule: natural-language guidance for the voice classifier on what speech/topic this rule includes or ignores."},
                 "basis": {"type": "string", "description": "The user's words or the standing approval this rests on."},
-                "mode": {"type": "string", "enum": ["auto", "ask", "never"], "description": "set_rule, or expect (auto or never). Default for expect: auto."},
-                "minutes": {"type": "integer", "description": "snooze"},
-                "keywords": {"type": "array", "items": {"type": "string"}, "description": "set_rule"},
-                "weekdays": {"type": "array", "items": {"type": "integer"}, "description": "set_rule"},
+                "mode": {"type": "string", "enum": ["auto", "note", "include", "ask", "never", "ignore"], "description": "set_rule (`auto`, `note`/`include`, `ask`, `never`/`ignore`), or expect (`auto` or `never`). Default for expect: auto."},
+                "minutes": {"type": "integer", "description": "snooze (1..720), or set_rule duration in minutes for a short-term rule (1..43200; omit for a long-term standing rule)."},
+                "keywords": {"type": "array", "items": {"type": "string"}, "description": "set_rule: phrases or keywords to match."},
+                "weekdays": {"type": "array", "items": {"type": "integer"}, "description": "set_rule: 0 (Sunday) to 6 (Saturday)."},
                 "from_hhmm": {"type": "string", "description": "set_rule"}, "to_hhmm": {"type": "string", "description": "set_rule"},
                 "id": {"type": "string", "description": "remove_rule, remove_window"}
             }), &["action"]),
@@ -474,8 +481,22 @@ impl Tool for RecordingPolicyTool {
             "set_rule" => {
                 let mode = a.mode.clone().ok_or_else(|| err("mode is required"))?;
                 let when = rp::When { keywords: a.keywords.clone(), weekdays: a.weekdays.clone(), from_hhmm: a.from_hhmm.clone(), to_hhmm: a.to_hhmm.clone() };
-                let (id, _) = rp::update(|p, now| p.set_rule(&a.label, &mode, when, &a.basis, now)).await.map_err(err)?;
-                json!({"id": id, "label": a.label, "mode": mode})
+                let until_str = if !a.until.trim().is_empty() { Some(a.until.as_str()) } else if !a.to.trim().is_empty() { Some(a.to.as_str()) } else { None };
+                let parsed_until = match until_str {
+                    Some(s) => Some(rp::parse_when(s).map_err(err)?),
+                    None => None,
+                };
+                let ((id, expires_at_ms, norm_mode), _) = rp::update(|p, now| {
+                    let exp = match (parsed_until, a.minutes) {
+                        (Some(u), _) => Some(u),
+                        (None, m) if m > 0 => Some(now + m * 60_000),
+                        _ => None,
+                    };
+                    let id = p.set_rule_with(&a.label, &mode, &a.about, when, exp, &a.basis, now)?;
+                    let norm = p.rules.iter().find(|r| r.id == id).map(|r| r.mode.clone()).unwrap_or(mode.clone());
+                    Ok((id, exp, norm))
+                }).await.map_err(err)?;
+                json!({"id": id, "label": a.label, "mode": norm_mode, "about": a.about, "expires_at_ms": expires_at_ms})
             }
             "remove_rule" => json!({"removed": rp::update(|p, _| Ok(p.remove_rule(&a.id))).await.map_err(err)?.0}),
             "remove_window" => json!({"removed": rp::update(|p, _| Ok(p.remove_window(&a.id))).await.map_err(err)?.0}),
