@@ -42,21 +42,37 @@ fn save(map: &Adaptive) {
         }
 }
 
+fn platform_prefix(device: &str) -> Option<&str> {
+    let prefix = device.split('-').next()?.trim();
+    (!prefix.is_empty() && device.contains('-')).then_some(prefix)
+}
+
 pub(super) fn adaptive(device: &str) -> Vec<Arc<[f32]>> {
     with(|m| {
-        m.get(device)
-            .map(|v| {
-                v.iter()
-                    .filter(|s| s.model == neural::MODEL && s.vector.len() == neural::DIM)
-                    .map(|s| Arc::from(s.vector.as_slice()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let mut out: Vec<Arc<[f32]>> = m
+            .get(device)
+            .into_iter()
+            .flatten()
+            .filter(|s| s.model == neural::MODEL && s.vector.len() == neural::DIM)
+            .map(|s| Arc::from(s.vector.as_slice()))
+            .collect();
+        if let Some(prefix) = platform_prefix(device) {
+            for (k, v) in m.iter() {
+                if k != device && platform_prefix(k) == Some(prefix) {
+                    out.extend(
+                        v.iter()
+                            .filter(|s| s.model == neural::MODEL && s.vector.len() == neural::DIM)
+                            .map(|s| Arc::from(s.vector.as_slice())),
+                    );
+                }
+            }
+        }
+        out
     })
 }
 
 pub fn adaptive_count(device: &str) -> usize {
-    with(|m| m.get(device).map_or(0, |v| v.iter().filter(|s| s.model == neural::MODEL).count()))
+    adaptive(device).len()
 }
 
 /// Adds a confidently-matched utterance as a per-device sample (blocking file IO).

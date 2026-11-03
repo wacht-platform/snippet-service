@@ -272,16 +272,27 @@ fn score(st: &mut State, pcm: &[f32], refs: &[Arc<[f32]>], legacy: &[VoiceprintS
     VoiceScore { likelihood: acc.score(legacy), ..none }
 }
 
-/// Cosine to the centroid of the reference embeddings.
+/// Best match across the reference centroid and the top-3 closest reference samples
+/// (so samples recorded on different microphones—e.g. Mac vs phone vs earbuds—do not
+/// dilute each other).
 pub fn similarity(emb: &[f32], refs: &[Arc<[f32]>]) -> f32 {
+    if refs.is_empty() {
+        return 0.0;
+    }
     let mut c = vec![0f32; emb.len()];
+    let mut sims: Vec<f32> = Vec::with_capacity(refs.len());
     for r in refs {
+        sims.push(neural::cosine(emb, r));
         for (a, b) in c.iter_mut().zip(r.iter()) {
             *a += b;
         }
     }
     let n = c.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
-    neural::cosine(emb, &c) / n
+    let centroid_sim = neural::cosine(emb, &c) / n;
+    sims.sort_by(|a, b| b.total_cmp(a));
+    let k = sims.len().min(3);
+    let top_k_sim = sims[..k].iter().sum::<f32>() / k as f32;
+    centroid_sim.max(top_k_sim)
 }
 
 #[cfg(test)]
