@@ -532,7 +532,8 @@ pub(super) fn apply_voice(verdict: &mut Verdict, voice: &VoiceScore, wake: bool,
     }
 }
 
-pub(super) fn settle(mut verdict: Verdict, text: &str, phrases: &[String], voice: Option<std::sync::Arc<VoiceScore>>) -> Verdict {
+#[cfg(test)]
+pub(super) fn settle(verdict: Verdict, text: &str, phrases: &[String], voice: Option<std::sync::Arc<VoiceScore>>) -> Verdict {
     settle_with(verdict, text, phrases, voice, false)
 }
 

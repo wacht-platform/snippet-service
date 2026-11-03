@@ -511,27 +511,6 @@ impl CodingHarness {
         state.events.push(event);
     }
 
-    /// Fold notices buffered during a step into the transcript.
-    ///
-    /// The interrupt paths discard the in-flight turn with a truncate, and a
-    /// notice is not part of that turn — it is a record of something that already
-    /// happened and that the store has already accepted. Dropping one would lose
-    /// the message from the transcript entirely. Anything else stays buffered.
-    #[cfg(test)]
-    pub(super) fn record_pending_notices(
-        &self,
-        state: &mut HarnessState,
-        pending: &mut Vec<LoopInput>,
-    ) {
-        pending.retain(|input| match input {
-            LoopInput::Notice(event) => {
-                self.record_notice(state, event.clone());
-                false
-            }
-            _ => true,
-        });
-    }
-
     /// Apply one queued input while a run is active: a message/answer becomes a
     /// a mid-run user message, an interrupt returns `true`. Shared by the between-iteration
     /// drain and the buffered-input drain.
