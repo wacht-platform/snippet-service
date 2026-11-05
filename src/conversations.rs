@@ -835,6 +835,18 @@ impl Store {
         })
     }
 
+    /// Replace a session's lifetime totals with a figure measured from its worktree.
+    pub fn set_total_changes(&self, id: &str, total: &crate::session_stats::Changes) -> Result<(), StoreError> {
+        let json = serde_json::to_string(total).unwrap_or_default();
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE sessions SET total_changes = ?2 WHERE id = ?1 OR legacy_id = ?1",
+                params![id, json],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Opt a session in or out of automatic settling. Returns whether it exists.
     pub fn set_session_keep_awake(&self, id: &str, on: bool) -> Result<bool, StoreError> {
         self.with_connection(|conn| {

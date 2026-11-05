@@ -847,6 +847,10 @@ pub async fn run_serve(
     }
     {
         let d = daemon.clone();
+        tokio::spawn(async move { worktree_totals_loop(d).await });
+    }
+    {
+        let d = daemon.clone();
         tokio::spawn(async move { mission_control::dispatch_loop(d).await });
     }
     {

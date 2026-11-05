@@ -47,6 +47,23 @@ pub(crate) async fn config_watch_loop(daemon: Shared) {
     }
 }
 
+/// Keep worktree sessions' diff totals current: every row once at start, then whatever is running
+/// or was active in the last few minutes, so a turn's edits and a finished turn both show up.
+pub(crate) async fn worktree_totals_loop(daemon: Shared) {
+    use std::time::Duration;
+
+    let mut active_since = None;
+    loop {
+        let d = daemon.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::session_stats::refresh_worktree_totals(&d.store, active_since);
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        active_since = Some(chrono::Utc::now().timestamp() - 300);
+    }
+}
+
 /// Result of an attempt to rebuild a live session's model from the current config.
 pub(crate) enum RebuildOutcome {
     Rebuilt,

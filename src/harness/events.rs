@@ -283,8 +283,11 @@ impl CodingHarness {
         let snapshot = tokio::task::spawn_blocking(move || {
             crate::checkpoint::snapshot_diagnostic(&workspace, &snap_label)
         });
+        // A message landing mid-turn must not move the turn's start, or earlier edits go uncounted.
+        if !vars.turn_open {
+            vars.turn_start = None;
+        }
         vars.turn_open = true;
-        vars.turn_start = None;
         vars.pending_checkpoint = Some(PendingCheckpoint {
             snapshot,
             resolved: None,
@@ -363,7 +366,11 @@ impl CodingHarness {
                 return;
             }
         };
-        vars.turn_start = Some(id.clone());
+        if vars.turn_open {
+            vars.turn_start.get_or_insert_with(|| id.clone());
+        } else {
+            vars.turn_start = Some(id.clone());
+        }
         state.checkpoints.push(CheckpointRecord {
             id,
             label: pending.label,

@@ -1,6 +1,7 @@
 //! Extras for the session list: last-turn change size and when a run began.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Totals of the most recent turn that changed files (from its `turn_changes` event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,6 +9,100 @@ pub struct Changes {
     pub files: u32,
     pub added: u32,
     pub removed: u32,
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        // A background read must never take the index lock from an agent's own git.
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn default_branch(dir: &Path) -> Option<String> {
+    let remote_head = git_out(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]);
+    let named = remote_head.as_deref().and_then(|r| r.trim().strip_prefix("origin/")).map(str::to_string);
+    named.into_iter().chain(["main".to_string(), "master".to_string()]).find_map(|name| {
+        ["refs/heads", "refs/remotes/origin"].iter().find_map(|prefix| {
+            let reference = format!("{prefix}/{name}");
+            git_out(dir, &["rev-parse", "--verify", "-q", &reference]).map(|_| reference)
+        })
+    })
+}
+
+const UNTRACKED_FILE_LIMIT: usize = 5000;
+const UNTRACKED_BYTES_LIMIT: u64 = 1024 * 1024;
+
+fn text_lines(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return 0 };
+    if !meta.is_file() || meta.len() > UNTRACKED_BYTES_LIMIT {
+        return 0;
+    }
+    let Ok(bytes) = std::fs::read(path) else { return 0 };
+    if bytes.contains(&0) {
+        return 0;
+    }
+    let newlines = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+    newlines + u64::from(bytes.last().is_some_and(|b| *b != b'\n'))
+}
+
+/// What a linked worktree adds to the repository's default branch, counting uncommitted and
+/// untracked work. `None` leaves the stored total alone: not a linked worktree, git failed, or a
+/// clean branch with nothing ahead, which is also how a merged branch looks.
+pub fn worktree_changes(workspace: &Path) -> Option<Changes> {
+    crate::session::worktree::worktree_origin(workspace)?;
+    let root = git_out(workspace, &["rev-parse", "--show-toplevel"])?;
+    let root = Path::new(root.trim());
+    let base = default_branch(root)?;
+    let fork = git_out(root, &["merge-base", "HEAD", &base])?;
+    let fork = fork.trim();
+    let tracked = git_out(root, &["-c", "core.quotepath=off", "diff", "--numstat", "--no-renames", fork])?;
+    let tracked = crate::checkpoint::parse_numstat(&tracked);
+    let untracked = git_out(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
+    let untracked: Vec<&str> = untracked.split('\0').filter(|p| !p.is_empty()).take(UNTRACKED_FILE_LIMIT).collect();
+    let added = tracked.iter().map(|t| t.1).sum::<u64>()
+        + untracked.iter().map(|p| text_lines(&root.join(p))).sum::<u64>();
+    let removed = tracked.iter().map(|t| t.2).sum::<u64>();
+    let head = git_out(root, &["rev-parse", "HEAD"])?;
+    if tracked.is_empty() && added == 0 && head.trim() == fork {
+        return None;
+    }
+    Some(Changes {
+        files: (tracked.len() + untracked.len()) as u32,
+        added: added as u32,
+        removed: removed as u32,
+    })
+}
+
+/// Bring worktree sessions' totals up to date. `active_since` limits it to rows running or active
+/// after that time; `None` covers every row. A seat shares its parent's worktree, so only the
+/// session that owns the worktree carries the figure.
+pub fn refresh_worktree_totals(store: &crate::store::Store, active_since: Option<i64>) {
+    let Ok(rows) = store.list_all_sessions() else { return };
+    let mut measured: std::collections::HashMap<String, Option<Changes>> = std::collections::HashMap::new();
+    for row in rows {
+        if row.id.contains("/conversations/") {
+            continue;
+        }
+        if let Some(since) = active_since
+            && row.status != "running"
+            && row.last_active.unwrap_or(0) < since
+        {
+            continue;
+        }
+        let total = *measured
+            .entry(row.workspace.clone())
+            .or_insert_with(|| worktree_changes(Path::new(&row.workspace)));
+        let Some(total) = total else { continue };
+        let stored = row.total_changes.as_deref().and_then(|j| serde_json::from_str::<Changes>(j).ok());
+        if stored != Some(total) {
+            let _ = store.set_total_changes(&row.id, &total);
+        }
+    }
 }
 
 static RUN_STARTS: std::sync::Mutex<Option<std::collections::HashMap<String, i64>>> = std::sync::Mutex::new(None);
