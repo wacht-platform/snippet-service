@@ -138,6 +138,9 @@ pub fn open_first_turn(store: &Store, task: &Task, workspace: &Path, now: &str) 
         .find(|m| m.status == "active" && m.removed_at.is_none());
     let Some(holder) = holder else { return };
     let session = holder.work_session_id.as_deref().unwrap_or(&task.session_id);
+    if holder.work_session_id.is_none() {
+        let _ = store.set_member_session(&task.id, &holder.agent_id, session);
+    }
     let snap = serde_json::to_string(&snapshot(workspace)).unwrap_or_default();
     let _ = store.open_turn(&task.id, &holder.agent_id, session, &snap, now);
 }
@@ -177,7 +180,13 @@ pub fn seat(store: &Store, task: &Task, agent_id: &str, now: &str) -> Result<Str
     store
         .set_session_role(&info.id, crate::session::role_str(crate::session::SessionRole::Standard), Some(agent_id))
         .map_err(|e| e.to_string())?;
-    if let Some(profile) = store.agent_profile(agent_id).ok().flatten() {
+    // Without an inherited profile the seat falls to the global default, which may be the very quota the task was pinned away from.
+    let profile = task
+        .profile
+        .clone()
+        .or_else(|| store.agent_profile(agent_id).ok().flatten())
+        .or_else(|| store.get_session_row(&task.session_id).ok().flatten().and_then(|row| row.profile));
+    if let Some(profile) = profile {
         let _ = store.set_session_profile(&info.id, Some(&profile));
     }
     store.set_member_session(&task.id, agent_id, &info.id).map_err(|e| e.to_string())?;

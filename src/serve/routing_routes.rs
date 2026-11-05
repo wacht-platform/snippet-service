@@ -62,6 +62,14 @@ pub(crate) async fn routing_loop(d: Shared, mut rx: tokio::sync::mpsc::Unbounded
             }
         }
         let options = if route_for(id).is_some() { Vec::new() } else { routing::alternatives(&cfg, &profile) };
+        if let Ok(Some(member)) = d.store.member_by_session(id) {
+            let message = format!(
+                "`{}` can't run: its conversation {id} hit the limit on profile `{profile}`. It will miss anything sent to it until that session has a working profile.",
+                member.agent_id
+            );
+            let now = chrono::Utc::now().to_rfc3339();
+            let _ = d.store.update_task_in(&member.task_id, &now, |t| t.notify_once("member_stopped", &message));
+        }
         record_notice(&d, id, HarnessEvent::LimitReached { profile, resets_at, options }).await;
     }
 }

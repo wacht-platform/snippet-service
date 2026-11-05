@@ -1396,7 +1396,7 @@ fn report_text(task: &Task, marker: &crate::coordination::NotificationMarker) ->
 
 /// Outcomes that must not wait behind a question to the user.
 fn is_outcome_report(kind: &str) -> bool {
-    matches!(kind, "done" | "failed" | "stalled" | "blocked" | "review_escalated" | "handover_unacked" | "room_limit")
+    matches!(kind, "done" | "failed" | "stalled" | "blocked" | "review_escalated" | "member_stopped" | "handover_unacked" | "room_limit")
 }
 
 async fn deliver_mission_control_reports(daemon: &Daemon) {
