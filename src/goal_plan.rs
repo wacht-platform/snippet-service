@@ -123,7 +123,7 @@ fn plan_entries(goal: &Goal) -> Vec<Value> {
 }
 
 fn save_plan(store: &Store, goal: &mut Goal, entries: Vec<Value>) -> Result<(), ToolError> {
-    goal.plan = json!({"slices": entries});
+    goal.plan["slices"] = json!(entries);
     store.save_goal(goal).map_err(|e| ToolError::msg(format!("save plan: {e}")))
 }
 
@@ -208,7 +208,7 @@ async fn file_slices(ctx: &ToolContext, store: &Store, goal: &mut Goal, slices: 
         }
         blockers.dedup();
         let mut args = json!({
-            "title": slice.title, "description": slice.brief, "session": session, "handoff_mode": "fresh",
+            "title": slice.title, "description": format!("{}{}", slice.brief, crate::mission_autonomy::standing_rules_note()), "session": session, "handoff_mode": "fresh",
             "acceptance": slice.acceptance, "read_only": slice.read_only, "blocked_by": blockers,
             "owned_paths": slice.owned_paths, "goal": goal.id,
             "verify_mode": slice.verify_mode.as_deref().unwrap_or_else(|| default_verify(slice)),
@@ -235,6 +235,8 @@ async fn file_slices(ctx: &ToolContext, store: &Store, goal: &mut Goal, slices: 
 
 #[derive(Deserialize)]
 struct PlanGoalArgs {
+    #[serde(default)]
+    go_ahead: Option<String>,
     goal: String,
     slices: Vec<SliceArg>,
     #[serde(default)]
@@ -251,12 +253,14 @@ impl Tool for PlanGoal {
             input_schema: json!({"type":"object","properties":{
                 "goal":{"type":"string","description":"goal id"},
                 "session":{"type":"string","description":"default session for slices that name none"},
+                "go_ahead":{"type":"string","description":crate::routing_gate::GO_AHEAD_DESCRIPTION},
                 "slices":slice_schema("0-based indexes of earlier slices in this list this one needs finished first")
             },"required":["goal","slices"],"additionalProperties":false}),
         }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: PlanGoalArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(format!("plan_goal arguments: {e}")))?;
+        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         let store = store_of(ctx)?;
         let mut goal = open_goal(&store, &args.goal)?;
         if !plan_entries(&goal).is_empty() {
@@ -278,6 +282,8 @@ struct ReorderArg {
 
 #[derive(Deserialize)]
 struct ReplanArgs {
+    #[serde(default)]
+    go_ahead: Option<String>,
     goal: String,
     #[serde(default)]
     add: Vec<SliceArg>,
@@ -299,6 +305,7 @@ impl Tool for ReplanGoal {
             name: "replan_goal".into(),
             description: "Change a goal's plan and keep finished work: add slices (as in plan_goal; depends_on indexes this add list, blocked_by names existing tasks), drop slices by task id (cancelled with the reason; done ones are kept), or reorder unstarted slices by giving a task its new blocked_by.".into(),
             input_schema: json!({"type":"object","properties":{
+                "go_ahead":{"type":"string","description":crate::routing_gate::GO_AHEAD_DESCRIPTION},
                 "goal":{"type":"string"},
                 "add":slice_schema("0-based indexes of earlier slices in this add list"),
                 "drop":{"type":"array","items":{"type":"string"},"description":"task ids to drop"},
@@ -310,6 +317,7 @@ impl Tool for ReplanGoal {
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ReplanArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(format!("replan_goal arguments: {e}")))?;
+        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         let store = store_of(ctx)?;
         let mut goal = open_goal(&store, &args.goal)?;
         let linked: HashSet<String> = store.goal_tasks(&goal.id).map_err(|e| ToolError::msg(format!("goal tasks: {e}")))?.into_iter().map(|t| t.id).collect();

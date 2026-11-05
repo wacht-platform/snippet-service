@@ -275,11 +275,11 @@ fn now_ms() -> i64 {
 
 /// A call is pending or tracked on this device: hold everything that isn't clearly for the assistant.
 pub(super) fn holds(device: &str) -> bool {
-    book().holds(device)
+    book().holds(device) || crate::mission_autonomy::user_call().is_some()
 }
 
 pub(super) fn clearly_for_assistant(v: &Verdict, wake: bool) -> bool {
-    wake || (v.kind == "conversation" && v.addressed >= CLEAR_TO_ASSISTANT && v.veto() < 0.5 && v.out_of_context < 0.5)
+    wake || (crate::mission_autonomy::user_call().is_none() && v.kind == "conversation" && v.addressed >= CLEAR_TO_ASSISTANT && v.veto() < 0.5 && v.out_of_context < 0.5)
 }
 
 /// Human conversation that is not for the assistant: a meeting, other-party talk or out-of-context speech.

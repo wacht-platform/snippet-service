@@ -476,6 +476,8 @@ impl Tool for ReadCoordinationThread {
 
 #[derive(Deserialize)]
 struct SendAgentMessageArgs {
+    #[serde(default)]
+    go_ahead: Option<String>,
     recipient_agent_id: String,
     body: String,
     #[serde(default)]
@@ -538,6 +540,7 @@ impl Tool for SendAgentMessage {
                     "body":{"type":"string"},
                     "idempotency_key":{"type":"string","description":"optional; a retry with the same key does not duplicate"},
                     "kind":{"type":"string","enum":["note","question","status","handoff_note","blocker","result","interrupt"],"description":"optional; what the message is, shown to the recipient"},
+                    "go_ahead":{"type":"string","description":crate::routing_gate::GO_AHEAD_DESCRIPTION},
                     "urgency":{"type":"string","enum":["normal","urgent"],"description":"optional, default normal. Normal waits until the recipient's current run ends. Urgent stops its run and wakes it now: only for a blocker, a wrong direction or something that makes its work pointless. kind `interrupt` is always urgent."}
                 }),
                 &["recipient_agent_id", "body"],
@@ -554,6 +557,9 @@ impl Tool for SendAgentMessage {
         }
         if args.body.trim().is_empty() {
             return Err(ToolError::msg("body must not be empty"));
+        }
+        if !matches!(recipient, "human" | "local") {
+            crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         }
         // `human` (or `local`) addresses the operator who is talking to this
         // agent. `session:<id>` answers a message in the session it was asked
@@ -1044,6 +1050,8 @@ impl Tool for MessageMissionControl {
 
 #[derive(Deserialize)]
 struct PostTaskCoordinationArgs {
+    #[serde(default)]
+    go_ahead: Option<String>,
     task_id: String,
     body: String,
     #[serde(default)]
@@ -1064,7 +1072,8 @@ impl Tool for PostTaskCoordination {
                     "task_id": {"type": "string", "description": "The task ID on the task board"},
                     "body": {"type": "string", "description": "The coordination message or update"},
                     "kind": {"type": "string", "enum": ["note","question","status","handoff_note","blocker","result","interrupt"], "description": "optional"},
-                    "urgency": {"type": "string", "enum": ["normal","urgent"], "description": "optional, default normal"}
+                    "urgency": {"type": "string", "enum": ["normal","urgent"], "description": "optional, default normal"},
+                    "go_ahead": {"type": "string", "description": crate::routing_gate::GO_AHEAD_DESCRIPTION}
                 }),
                 &["task_id", "body"],
             ),
@@ -1073,6 +1082,7 @@ impl Tool for PostTaskCoordination {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: PostTaskCoordinationArgs =
             serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         let task_id = args.task_id.trim();
         let body = args.body.trim();
         if task_id.is_empty() || body.is_empty() {

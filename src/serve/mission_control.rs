@@ -1207,7 +1207,7 @@ async fn open(
 
 pub(super) const WORKFLOW_PLAN: &str = "Workflow W7 · first plan: the worker has laid out how it will deliver the task. Check it against the requirements; when it misses or misreads something, say so in the task room (post_task_coordination) so the worker adjusts before going far; when it shows what comes next, line up that work. A plan that's right needs no reply. Then stop.";
 
-pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: check its evidence against the acceptance criteria (spot-check only if thin); done → tell the user unless you already have; short of the criteria → update_mission_task revise; in_review or review_escalated → submit_review is yours; stalled → inspect_session, then answer, retry or cancel; blocked → unblock it; failed → retry once or re-route. Then stop.";
+pub(super) const WORKFLOW_REPORT: &str = "Workflow W3 · task report: check its evidence against the acceptance criteria (spot-check only if thin), then judge it as the user will: is it actually good, would the person it's for care, does it keep their standing rules? Meets the criteria but weak → update_mission_task revise with the bar you want, before they see it. Done and good → tell the user unless you already have, with your view, and set the goal's next step; short of the criteria → update_mission_task revise; in_review or review_escalated → submit_review is yours; stalled → inspect_session, then answer, retry or cancel; blocked → unblock it; failed → retry once or re-route. Then stop.";
 
 pub(super) async fn open_mission_control(d: &Shared, requested_profile: Option<String>) -> Result<(String, std::path::PathBuf), String> {
     let home = mission_control::ensure_home()?;

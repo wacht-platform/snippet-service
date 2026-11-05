@@ -60,7 +60,70 @@ pub fn goal_row(goal: &Goal, tasks: &[crate::coordination::Task]) -> Value {
         "id": goal.id, "title": goal.title, "status": goal.status,
         "tasks": format!("{done}/{total}"),
         "evidence": format!("{}/{}", goal.acceptance.len() - goal.unevidenced().len(), goal.acceptance.len()),
+        "drive": goal.drive(),
     })
+}
+
+fn drive_schema() -> Value {
+    json!({
+        "next_step":{"type":"string","description":"the very next thing that moves this goal"},
+        "waiting_on":{"type":"string","description":"what the user owes for it to move, e.g. sign off on the four targets. Empty clears it."},
+        "waiting_since":{"type":"string","description":"optional YYYY-MM-DD, when it has already been waiting; defaults to now"},
+        "due":{"type":"string","description":"YYYY-MM-DD; empty clears it"},
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct DriveArgs {
+    #[serde(default)]
+    next_step: Option<String>,
+    #[serde(default)]
+    waiting_on: Option<String>,
+    #[serde(default)]
+    waiting_since: Option<String>,
+    #[serde(default)]
+    due: Option<String>,
+    #[serde(default)]
+    nudged: bool,
+    #[serde(default)]
+    snooze_days: Option<i64>,
+}
+
+fn checked_date(field: &str, raw: &str) -> Result<String, ToolError> {
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map(|_| raw.to_string()).map_err(|_| ToolError::msg(format!("{field} must be YYYY-MM-DD, got `{raw}`")))
+}
+
+fn apply_drive(goal: &mut Goal, args: &DriveArgs) -> Result<(), ToolError> {
+    let mut drive = goal.drive();
+    if let Some(next) = &args.next_step {
+        drive.next_step = next.trim().to_string();
+    }
+    if let Some(waiting) = &args.waiting_on {
+        let waiting = waiting.trim();
+        if waiting != drive.waiting_on {
+            drive.waiting_on = waiting.to_string();
+            drive.waiting_since = if waiting.is_empty() { String::new() } else { now() };
+            drive.last_nudged_at = String::new();
+            drive.nudges = 0;
+            drive.snoozed_until = String::new();
+        }
+    }
+    if let Some(since) = args.waiting_since.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        drive.waiting_since = checked_date("waiting_since", since)?;
+    }
+    if let Some(due) = args.due.as_deref().map(str::trim) {
+        drive.due = if due.is_empty() { String::new() } else { checked_date("due", due)? };
+    }
+    if args.nudged {
+        drive.last_nudged_at = now();
+        drive.nudges += 1;
+    }
+    if let Some(days) = args.snooze_days {
+        let until = chrono::Utc::now() + chrono::Duration::days(days.clamp(1, 90));
+        drive.snoozed_until = until.to_rfc3339();
+    }
+    goal.set_drive(&drive);
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -71,6 +134,8 @@ struct CreateGoalArgs {
     acceptance: Vec<GoalCriterion>,
     #[serde(default)]
     requester: Option<String>,
+    #[serde(flatten)]
+    drive: DriveArgs,
 }
 
 pub struct CreateGoal;
@@ -80,7 +145,11 @@ impl Tool for CreateGoal {
         NativeToolDefinition {
             name: "create_goal".into(),
             description: "Record a long-horizon goal: the user's whole outcome and the checks that prove it. Link tasks to it with create_mission_task `goal`.".into(),
-            input_schema: json!({"type":"object","properties":{"title":{"type":"string"},"outcome":{"type":"string","description":"the finished thing, at the bar the user would be proud of"},"acceptance":criteria_schema(),"requester":{"type":"string","description":"who asked; default user"}},"required":["title","outcome","acceptance"],"additionalProperties":false}),
+            input_schema: {
+                let mut properties = json!({"title":{"type":"string"},"outcome":{"type":"string","description":"the finished thing, at the bar the user would be proud of"},"acceptance":criteria_schema(),"requester":{"type":"string","description":"who asked; default user"}});
+                properties.as_object_mut().unwrap().extend(drive_schema().as_object().unwrap().clone());
+                json!({"type":"object","properties":properties,"required":["title","outcome","acceptance"],"additionalProperties":false})
+            },
         }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
@@ -99,7 +168,8 @@ impl Tool for CreateGoal {
             .map(|c| GoalCriterion { evidence: String::new(), ..c })
             .collect();
         let requester = args.requester.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("user");
-        let goal = Goal::new(uuid::Uuid::new_v4().to_string(), args.title.trim().into(), args.outcome.trim().into(), acceptance, requester.into(), now());
+        let mut goal = Goal::new(uuid::Uuid::new_v4().to_string(), args.title.trim().into(), args.outcome.trim().into(), acceptance, requester.into(), now());
+        apply_drive(&mut goal, &args.drive)?;
         store.create_goal(&goal).map_err(|e| ToolError::msg(format!("create goal: {e}")))?;
         Ok(ToolResult::success(json!({"goal": goal})))
     }
@@ -118,6 +188,8 @@ struct UpdateGoalArgs {
     evidence: Vec<EvidenceArg>,
     #[serde(default)]
     status: Option<String>,
+    #[serde(flatten)]
+    drive: DriveArgs,
 }
 
 pub struct UpdateGoal;
@@ -126,8 +198,12 @@ impl Tool for UpdateGoal {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "update_goal".into(),
-            description: "Change a goal's title, outcome or acceptance (evidence on criteria whose text is unchanged is kept), record evidence for criteria, or cancel it (status cancelled; needs no open task) or reopen it. Closing is close_goal.".into(),
-            input_schema: json!({"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"outcome":{"type":"string"},"acceptance":criteria_schema(),"evidence":evidence_schema(),"status":{"type":"string","enum":["open","cancelled"]}},"required":["id"],"additionalProperties":false}),
+            description: "Change a goal's title, outcome or acceptance (evidence on criteria whose text is unchanged is kept), record evidence for criteria, set what drives it (next_step, waiting_on, due), record a nudge you just gave (nudged) or their 'not now' (snooze_days), or cancel it (status cancelled; needs no open task) or reopen it. Closing is close_goal.".into(),
+            input_schema: {
+                let mut properties = json!({"id":{"type":"string"},"title":{"type":"string"},"outcome":{"type":"string"},"acceptance":criteria_schema(),"evidence":evidence_schema(),"status":{"type":"string","enum":["open","cancelled"]},"nudged":{"type":"boolean","description":"you just nudged the user about what this waits on"},"snooze_days":{"type":"integer","description":"they said not now: no nudge for this many days"}});
+                properties.as_object_mut().unwrap().extend(drive_schema().as_object().unwrap().clone());
+                json!({"type":"object","properties":properties,"required":["id"],"additionalProperties":false})
+            },
         }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
@@ -151,6 +227,7 @@ impl Tool for UpdateGoal {
                 .collect();
         }
         let unknown = goal.attach_evidence(&pairs(&args.evidence));
+        apply_drive(&mut goal, &args.drive)?;
         match args.status.as_deref().map(str::trim) {
             None | Some("") => {}
             Some("open") => {

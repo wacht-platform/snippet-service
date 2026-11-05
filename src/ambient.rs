@@ -43,7 +43,12 @@ pub fn set_call_quiet(on: bool) {
 }
 
 pub fn call_quiet() -> bool {
-    CALL_QUIET.load(Ordering::Relaxed)
+    CALL_QUIET.load(Ordering::Relaxed) || crate::mission_autonomy::user_call().is_some()
+}
+
+pub fn seconds_since_user_turn() -> Option<i64> {
+    let last = LAST_USER_TURN.load(Ordering::Relaxed);
+    (last > 0).then(|| chrono::Utc::now().timestamp() - last)
 }
 
 static LEASE: Mutex<Option<(String, String, Instant)>> = Mutex::new(None);

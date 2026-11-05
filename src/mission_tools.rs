@@ -86,6 +86,7 @@ pub fn add_mission_control_tools(registry: &mut ToolRegistry) {
     registry.insert(crate::goal_plan::ReplanGoal);
     registry.insert(Speak);
     registry.insert(AmbientMode);
+    registry.insert(UserOnCall);
     registry.insert(AmbientExpect);
     registry.insert(WaitForUser);
     registry.insert(AmbientSearch);
@@ -506,6 +507,53 @@ impl Tool for RecordingPolicyTool {
     }
 }
 
+#[derive(Deserialize)]
+struct UserOnCallArgs {
+    state: String,
+    #[serde(default)]
+    about: Option<String>,
+    #[serde(default)]
+    minutes: Option<i64>,
+}
+
+pub struct UserOnCall;
+#[async_trait]
+impl Tool for UserOnCall {
+    fn definition(&self) -> NativeToolDefinition {
+        NativeToolDefinition {
+            name: "user_on_call".into(),
+            description: "Record that the user is on a call or in a meeting, the moment they say so, or that it ended. While it holds, what the microphone hears stays out of your turns unless they use the wake word, speak is off, pings wait unless urgent, and work going to a worker needs go_ahead. It survives across your turns, so you don't have to remember it.".into(),
+            input_schema: schema(json!({
+                "state": {"type": "string", "enum": ["on_call", "ended"]},
+                "about": {"type": "string", "description": "Optional; who or what the call is, if they said."},
+                "minutes": {"type": "integer", "description": "How long to hold it if they don't say it ended, 5 to 480. Default 60."}
+            }), &["state"]),
+        }
+    }
+    async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
+        let args: UserOnCallArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        match args.state.trim() {
+            "ended" => {
+                crate::mission_autonomy::set_user_call(None).map_err(ToolError::msg)?;
+                Ok(ToolResult::success(json!({"on_call": false})))
+            }
+            "on_call" => {
+                let now = chrono::Utc::now().timestamp();
+                let minutes = args.minutes.unwrap_or(60).clamp(5, 480);
+                crate::mission_autonomy::set_user_call(Some(crate::mission_autonomy::UserCall {
+                    about: args.about.unwrap_or_default().trim().to_string(),
+                    since: now,
+                    until: now + minutes * 60,
+                }))
+                .map_err(ToolError::msg)?;
+                crate::ambient::end_conversation();
+                Ok(ToolResult::success(json!({"on_call": true, "held_minutes": minutes, "note": "Say nothing more than a brief acknowledgement, in text."})))
+            }
+            other => Err(ToolError::msg(format!("state must be on_call or ended, got `{other}`"))),
+        }
+    }
+}
+
 pub struct AmbientMode;
 #[async_trait]
 impl Tool for AmbientMode {
@@ -669,7 +717,7 @@ impl Tool for PingUser {
         let outcome = crate::mission_autonomy::ping(args.title.trim(), args.message.trim(), kind).map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({
             "ping": outcome,
-            "note": if outcome == "held" { "Quiet hours: held until morning." } else { "Sent to the user's phone." },
+            "note": if outcome == "held" { "Held until quiet hours or their call end." } else { "Sent to the user's phone." },
         })))
     }
 }
@@ -1229,6 +1277,8 @@ struct CreateTaskArgs {
     goal: Option<String>,
     #[serde(default)]
     expected_minutes: Option<u32>,
+    #[serde(default)]
+    go_ahead: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1241,13 +1291,15 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "acceptance":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string"},"method":{"type":"string","enum":["command","artifact","visual","human"]}},"required":["criterion","method"]},"description":"how the work is judged done, each with how it is checked. Required unless read_only. The worker must report evidence for every one."}, "read_only":{"type":"boolean","description":"investigation that changes nothing; acceptance is then optional"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done; choose it per task. self skips review; reviewer starts a read-only reviewer lane in the worker's session (as the crew reviewer agent when one is seated); mission_control and user keep the verdict with you. Omitted: reviewer (self when read_only)."}, "reviewer_profile":{"type":"string","description":"optional; an inference profile named as list_profiles returns it, for the reviewer lane only. Omitted: the lane default, or the profile of a reviewer agent seated in crew. Use a stronger model for risky work, a cheaper one for routine checks."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}, "goal":{"type":"string","description":"optional; id of the open goal this task serves"}, "expected_minutes":{"type":"integer","description":"optional; how long the work should take. The task is flagged stalled after twice this without progress (minimum 20 min). Defaults by verify_mode."}}), &["title","description","session"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"go_ahead":{"type":"string","description":crate::routing_gate::GO_AHEAD_DESCRIPTION}, "title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "acceptance":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string"},"method":{"type":"string","enum":["command","artifact","visual","human"]}},"required":["criterion","method"]},"description":"how the work is judged done, each with how it is checked. Required unless read_only. The worker must report evidence for every one."}, "read_only":{"type":"boolean","description":"investigation that changes nothing; acceptance is then optional"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done; choose it per task. self skips review; reviewer starts a read-only reviewer lane in the worker's session (as the crew reviewer agent when one is seated); mission_control and user keep the verdict with you. Omitted: reviewer (self when read_only)."}, "reviewer_profile":{"type":"string","description":"optional; an inference profile named as list_profiles returns it, for the reviewer lane only. Omitted: the lane default, or the profile of a reviewer agent seated in crew. Use a stronger model for risky work, a cheaper one for routine checks."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}, "goal":{"type":"string","description":"optional; id of the open goal this task serves"}, "expected_minutes":{"type":"integer","description":"optional; how long the work should take. The task is flagged stalled after twice this without progress (minimum 20 min). Defaults by verify_mode."}}), &["title","description","session"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
-        let args: CreateTaskArgs =
+        let mut args: CreateTaskArgs =
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "create_mission_task".into(),
             })?;
+        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
+        args.description.push_str(&crate::mission_autonomy::standing_rules_note());
         if !args.read_only && args.acceptance.is_empty() {
             return Err(ToolError::msg(
                 "acceptance criteria are required: pass acceptance [{criterion, method: command|artifact|visual|human}], one per way the work is judged done, or read_only: true for an investigation that changes nothing",
@@ -1620,6 +1672,14 @@ struct DeliverArgs {
     task_id: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    go_ahead: Option<String>,
+    #[serde(default, alias = "acceptance_criteria")]
+    acceptance: Vec<crate::coordination::Criterion>,
+    #[serde(default)]
+    verify_mode: Option<String>,
+    #[serde(default)]
+    reviewer_profile: Option<String>,
 }
 
 pub struct DeliverToSession;
@@ -1628,13 +1688,17 @@ impl Tool for DeliverToSession {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "deliver_to_session".into(),
-            description: "Send a brief straight into an existing session: it starts a turn there now, with no offer step, and that session is bound to report the task. Pass task_id to hand over a queued task; otherwise a task is filed for the brief.".into(),
+            description: "Send a brief straight into an existing session: it starts a turn there now, with no offer step, and that session is bound to report the task. Pass task_id to hand over a queued task; otherwise a task is filed for the brief. With no acceptance and no verify_mode the session checks its own work, so pass both when judgement matters.".into(),
             input_schema: schema(
                 json!({
                     "session": {"type": "string", "description": "session id, or a title fragment or workspace path, optionally with `latest`"},
                     "brief": {"type": "string", "description": "the self-contained ask"},
                     "task_id": {"type": "string"},
-                    "title": {"type": "string", "description": "optional; board title for a new task"}
+                    "title": {"type": "string", "description": "optional; board title for a new task"},
+                    "go_ahead": {"type": "string", "description": crate::routing_gate::GO_AHEAD_DESCRIPTION},
+                    "acceptance": {"type": "array", "items": {"type": "object"}, "description": "[{criterion, method: command|artifact|visual|human}], one per way the work is judged done; required with verify_mode reviewer on a new task"},
+                    "verify_mode": {"type": "string", "description": "self, reviewer, mission_control or user"},
+                    "reviewer_profile": {"type": "string", "description": "inference profile for the reviewer lane"}
                 }),
                 &["session", "brief"],
             ),
@@ -1644,10 +1708,27 @@ impl Tool for DeliverToSession {
         let _ = root(ctx)?;
         let args: DeliverArgs = serde_json::from_value(arguments)
             .map_err(|_| ToolError::InvalidArguments { tool: "deliver_to_session".into() })?;
-        let brief = args.brief.trim();
-        if brief.is_empty() {
+        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
+        if args.brief.trim().is_empty() {
             return Err(ToolError::msg("brief must be non-empty"));
         }
+        let verify_mode = match args.verify_mode.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            Some(raw) => Some(
+                crate::coordination::VerifyMode::parse(raw)
+                    .ok_or_else(|| ToolError::msg(format!("verify_mode must be self, reviewer, mission_control or user, got `{raw}`")))?,
+            ),
+            None => None,
+        };
+        let new_task = args.task_id.as_deref().is_none_or(|t| t.trim().is_empty());
+        if verify_mode == Some(crate::coordination::VerifyMode::Reviewer) && new_task && args.acceptance.is_empty() {
+            return Err(ToolError::msg("verify_mode reviewer needs acceptance criteria: the reviewer judges against them"));
+        }
+        let reviewer_profile = args.reviewer_profile.as_deref().map(str::trim).filter(|p| !p.is_empty()).map(str::to_string);
+        if let Some(name) = reviewer_profile.as_deref() {
+            check_profile(name).await?;
+        }
+        let brief = format!("{}{}", args.brief.trim(), crate::mission_autonomy::standing_rules_note());
+        let brief = brief.as_str();
         let session_id = resolve_target_session(&args.session)?;
         if crate::session::is_inbox_session_id(&session_id)
             || crate::session::is_lane_session_id(&session_id)
@@ -1680,6 +1761,17 @@ impl Tool for DeliverToSession {
             brief,
             &now,
         )?;
+        let check = crate::coordination::StatePatch {
+            criteria: Some(args.acceptance.clone()).filter(|c| !c.is_empty()),
+            verify_mode,
+            ..Default::default()
+        };
+        store
+            .patch_task_state(&task.id, &check, None, mission_control::SESSION_ID, &now)
+            .map_err(|e| ToolError::msg(format!("record ledger: {e}")))?;
+        if let Some(name) = reviewer_profile.as_deref() {
+            let _ = store.modify_task_state(&task.id, &now, |s| s.reviewer_profile = name.to_string());
+        }
         let ledger = crate::task_state_tools::dispatch_ledger(&store, &task, std::path::Path::new(&state.workspace), brief, &now);
         let envelope = direct_brief_envelope(&task, brief, &state.workspace, &ledger);
         store
@@ -1819,6 +1911,7 @@ impl Tool for FileFollowUpTask {
         let speaker = crate::coordination_tools::speaks_as(ctx);
         let (kind, who) = speaker.unwrap_or(("session", own.clone()));
         let args = CreateTaskArgs {
+            go_ahead: None,
             title: text("title").unwrap_or_default(),
             description: text("description").unwrap_or_default(),
             session_id: text("session_id").unwrap_or(own),
@@ -1846,6 +1939,8 @@ impl Tool for FileFollowUpTask {
 
 #[derive(Deserialize)]
 struct UpdateMissionTaskArgs {
+    #[serde(default)]
+    go_ahead: Option<String>,
     task_id: String,
     #[serde(default)]
     title: Option<String>,
@@ -1939,7 +2034,8 @@ impl Tool for UpdateMissionTask {
                     "profile": {"type": "string"},
                     "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"},
 "revise": {"type": "object", "properties": {"feedback": {"type": "string"}}, "required": ["feedback"], "description": "On a done task: reopen it in the same session with this feedback and its previous result, instead of filing a new task."},
-                    "waive_verification": {"type": "string", "description": "Only when the user said to skip checking this task: their words. Drops review; a task waiting in review completes."}
+                    "waive_verification": {"type": "string", "description": "Only when the user said to skip checking this task: their words. Drops review; a task waiting in review completes."},
+                    "go_ahead": {"type": "string", "description": crate::routing_gate::GO_AHEAD_DESCRIPTION}
                 }),
                 &["task_id"],
             ),
@@ -1948,6 +2044,7 @@ impl Tool for UpdateMissionTask {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: UpdateMissionTaskArgs =
             serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
+        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(ToolError::msg("task_id must not be empty"));

@@ -120,6 +120,9 @@ pub async fn autonomy_loop(daemon: Shared) {
             s.last_digest = digest;
             s.last_round_summary = Some(summary);
             s.run_notes.clear();
+            if !mission_autonomy::in_quiet_hours(&s.settings) {
+                s.day_opened = mission_autonomy::user_now(&s.settings).format("%Y-%m-%d").to_string();
+            }
         });
         eprintln!("[autonomy] round fired");
         deliver_to_mission_control(&daemon, envelope).await;
@@ -408,6 +411,9 @@ fn waiting_on(daemon: &Shared, tasks: &[crate::coordination::Task]) -> std::coll
 /// Open goals with nothing moving them, and goals whose checks all have evidence.
 fn goal_attention_lines(store: &crate::store::Store) -> Vec<String> {
     let goals = store.list_goals(Some(crate::coordination::GoalStatus::Open)).unwrap_or_default();
+    if goals.is_empty() {
+        return vec!["- none recorded: every outcome the user is still pursuing belongs in create_goal, not as prose in your brief.".to_string()];
+    }
     goals
         .iter()
         .filter_map(|g| goal_attention_line(g, &store.goal_tasks(&g.id).unwrap_or_default()))
@@ -417,12 +423,32 @@ fn goal_attention_lines(store: &crate::store::Store) -> Vec<String> {
 fn goal_attention_line(goal: &crate::coordination::Goal, tasks: &[crate::coordination::Task]) -> Option<String> {
     use crate::coordination::goals::{Attention, attention, progress};
     let (done, total) = progress(tasks);
-    Some(match attention(goal, tasks)? {
+    let drive = goal.drive();
+    let now = chrono::Utc::now().timestamp();
+    let next = if drive.next_step.is_empty() { String::new() } else { format!(" · next: {}", drive.next_step) };
+    let due = if drive.due.is_empty() { String::new() } else { format!(" · due {}", drive.due) };
+    let Some(need) = attention(goal, tasks) else {
+        return drive.due_soon(now).then(|| format!("- due soon · {} · {} · {done}/{total} slices done{next}{due}", goal.title, goal.id));
+    };
+    Some(match need {
+        Attention::Waiting => {
+            let waited = drive.waiting_days(now).map(|d| format!(" · waiting {d}d")).unwrap_or_default();
+            let nudged = match drive.days_since_nudge(now) {
+                Some(d) => format!(" · nudged {} times, last {d}d ago", drive.nudges),
+                None => " · not nudged yet".to_string(),
+            };
+            let call = match (drive.nudge_due(now), drive.nudges >= 3) {
+                (true, true) => " · ASK WHETHER TO DROP OR PARK IT",
+                (true, false) => " · NUDGE DUE",
+                _ => "",
+            };
+            format!("- waiting on the user · {} · {} · {}{waited}{nudged}{due}{call}", goal.title, goal.id, drive.waiting_on)
+        }
         Attention::ReadyToClose => format!("- ready to close · {} · {} · every check has evidence, {done}/{total} slices done", goal.title, goal.id),
         Attention::Stalled => {
             let stuck: Vec<&str> = tasks.iter().filter(|t| matches!(t.status, TaskStatus::Failed | TaskStatus::Blocked)).map(|t| t.title.as_str()).collect();
             let why = if tasks.is_empty() { "no tasks filed".to_string() } else if stuck.is_empty() { format!("{done}/{total} slices done, none running") } else { format!("{done}/{total} done, stuck: {}", stuck.join(", ")) };
-            format!("- stalled · {} · {} · {why}", goal.title, goal.id)
+            format!("- stalled · {} · {} · {why}{next}{due}", goal.title, goal.id)
         }
     })
 }
@@ -460,6 +486,8 @@ fn round_envelope(
     ));
     if mission_autonomy::in_quiet_hours(&state.settings) {
         out.push_str("quiet hours: yes — non-urgent pings are held until morning\n");
+    } else if state.day_opened != mission_autonomy::user_now(&state.settings).format("%Y-%m-%d").to_string() {
+        out.push_str("\n## Start of the user's day\nYour first wake today. Open their day in a few lines, by speech or ping as well as here: what finished, what's stuck on them, what's out there worth their attention (deadlines, scout and recurring findings, an opening), and the two or three things you'd do today with your pick.\n");
     }
 
     let changed: Vec<String> = tasks
@@ -506,7 +534,7 @@ fn round_envelope(
     out.push_str(&open.join("\n"));
 
     if !goal_lines.is_empty() {
-        out.push_str("\n\n## Goals needing you\nStalled: file or replan the next step, or ask the user. Ready to close: confirm with the user, then close_goal.\n");
+        out.push_str("\n\n## Goals needing you\nStalled: file or replan the next step, or take it to the user. Waiting on the user, NUDGE DUE: nudge them (one is enough this wake, the most important), then update_goal nudged. ASK WHETHER TO DROP OR PARK IT: three nudges went unanswered, so ask that instead. Ready to close: confirm with the user, then close_goal.\n");
         out.push_str(&goal_lines.join("\n"));
     }
 
@@ -556,7 +584,7 @@ fn round_envelope(
     } else {
         brief.trim()
     });
-    out.push_str("\n[/automated_wake]\nWorkflow W4 · wake: act, wait or ask, then stop. Running and waiting tasks report on their own: don't inspect them, read their logs or schedule a check for them. A wake where you only waited needs no reply.");
+    out.push_str("\n[/automated_wake]\nWorkflow W4 · wake: move the work, nudge the user or propose the next thing, then stop. Just waiting is right only when every goal has something moving it and no nudge is due; it needs no reply. Running and waiting tasks report on their own: don't inspect them, read their logs or schedule a check for them.");
     out
 }
 

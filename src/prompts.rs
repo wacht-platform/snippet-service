@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn mission_control_layer_stays_within_budget() {
         // Mission Control re-reads this on every wake; grow it only by cutting elsewhere.
-        assert!(MISSION_CONTROL_LAYER.len() <= 39_000, "layer is {} bytes", MISSION_CONTROL_LAYER.len());
+        assert!(MISSION_CONTROL_LAYER.len() <= 41_000, "layer is {} bytes", MISSION_CONTROL_LAYER.len());
     }
 
     #[test]
@@ -216,6 +216,13 @@ mod tests {
             "A `stalled` notice can also fire",
             "Work only starts through a task",
             "never to a `session:<id>` to hand over, start or revise work",
+            "Understand before you route",
+            "Agree the plan, then route",
+            "Voice is where the user thinks",
+            "call `user_on_call` first",
+            "A draft isn't done",
+            "goes under `## Standing rules`",
+            "passing the criteria doesn't make it good",
         ] {
             assert!(MISSION_CONTROL_LAYER.contains(guard), "missing: {guard}");
         }

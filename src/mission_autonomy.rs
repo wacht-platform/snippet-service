@@ -78,6 +78,17 @@ pub struct AutonomyState {
     pub answers: Vec<QueuedAnswer>,
     #[serde(default)]
     pub run_notes: Vec<String>,
+    #[serde(default)]
+    pub user_call: Option<UserCall>,
+    #[serde(default)]
+    pub day_opened: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserCall {
+    pub about: String,
+    pub since: i64,
+    pub until: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -128,6 +139,48 @@ pub fn update<T>(f: impl FnOnce(&mut AutonomyState) -> T) -> Result<T, String> {
 
 pub fn is_on() -> bool {
     load().settings.on
+}
+
+pub fn user_call() -> Option<UserCall> {
+    let now = chrono::Utc::now().timestamp();
+    load().user_call.filter(|c| c.until > now)
+}
+
+pub fn set_user_call(call: Option<UserCall>) -> Result<(), String> {
+    update(|state| state.user_call = call)
+}
+
+fn user_state_line() -> String {
+    let now = chrono::Utc::now().timestamp();
+    if let Some(call) = user_call() {
+        let about = if call.about.is_empty() { String::new() } else { format!(" ({})", call.about) };
+        return format!(
+            " THE USER IS ON A CALL{about}, {} minutes in, held for {} more unless they say it ended (then user_on_call ended). Their speech reaches you only when they use your wake word, speak is off, pings wait unless urgent, and nothing new goes to a worker without their typed words.",
+            (now - call.since) / 60,
+            (call.until - now) / 60
+        );
+    }
+    match crate::ambient::seconds_since_user_turn().filter(|s| *s < 300) {
+        Some(secs) => format!(" A voice conversation is open (they last spoke {secs} seconds ago): they may still be thinking aloud, so talk it through and nothing goes to a worker without go_ahead."),
+        None => String::new(),
+    }
+}
+
+const STANDING_RULES: &str = "## Standing rules";
+
+/// The brief's standing rules, which travel in every briefing so a worker can't miss a correction.
+pub fn standing_rules_note() -> String {
+    let brief = read_brief();
+    let Some(start) = brief.find(STANDING_RULES) else {
+        return String::new();
+    };
+    let body = &brief[start + STANDING_RULES.len()..];
+    let body = body.split("\n## ").next().unwrap_or("").trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    let body: String = body.chars().take(2500).collect();
+    format!("\n\nThe user's standing rules (these apply to this work):\n{body}")
 }
 
 pub fn brief_path() -> PathBuf {
@@ -234,7 +287,8 @@ fn emit(title: &str, message: &str, kind: &str) {
 pub fn ping(title: &str, message: &str, kind: &str) -> Result<&'static str, String> {
     let now = chrono::Utc::now().timestamp();
     update(|state| {
-        if kind != "urgent" && in_quiet_hours(&state.settings) {
+        let call = state.user_call.as_ref().is_some_and(|c| c.until > now);
+        if kind != "urgent" && (call || in_quiet_hours(&state.settings)) {
             state.held_pings.push(HeldPing {
                 title: title.to_string(),
                 message: message.to_string(),
@@ -252,7 +306,8 @@ pub fn ping(title: &str, message: &str, kind: &str) -> Result<&'static str, Stri
 
 pub fn release_held_pings() {
     let state = load();
-    if state.held_pings.is_empty() || in_quiet_hours(&state.settings) {
+    let call = state.user_call.as_ref().is_some_and(|c| c.until > chrono::Utc::now().timestamp());
+    if state.held_pings.is_empty() || call || in_quiet_hours(&state.settings) {
         return;
     }
     let held = update(|state| std::mem::take(&mut state.held_pings)).unwrap_or_default();
@@ -332,11 +387,11 @@ fn next_wake_status(state: &AutonomyState) -> String {
 }
 
 pub fn mode_line() -> String {
-    format!("{}{} {COORDINATE}", mode_status(), crate::ambient::prompt_line())
+    format!("{}{}{} {COORDINATE}", mode_status(), user_state_line(), crate::ambient::prompt_line())
 }
 
 pub fn base_mode_line() -> String {
-    format!("{} {COORDINATE}", mode_status())
+    format!("{}{} {COORDINATE}", mode_status(), user_state_line())
 }
 
 const COORDINATE: &str = "You coordinate through sessions, tasks and agents; your bash is only for small read-only lookups (decoding a file, a quick df or git status), never for project work.";

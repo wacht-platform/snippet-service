@@ -56,12 +56,67 @@ pub struct Goal {
     pub plan: serde_json::Value,
 }
 
+/// What keeps a goal moving between tasks. Held in the goal's plan JSON.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Drive {
+    pub next_step: String,
+    pub waiting_on: String,
+    pub waiting_since: String,
+    pub due: String,
+    pub last_nudged_at: String,
+    pub nudges: u32,
+    pub snoozed_until: String,
+}
+
+const DAY_SECS: i64 = 86_400;
+
+fn epoch(stamp: &str) -> Option<i64> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(stamp) {
+        return Some(t.timestamp());
+    }
+    let date = chrono::NaiveDate::parse_from_str(stamp, "%Y-%m-%d").ok()?;
+    Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
+}
+
+impl Drive {
+    pub fn due_soon(&self, now: i64) -> bool {
+        epoch(&self.due).is_some_and(|due| due - now < 3 * DAY_SECS)
+    }
+
+    /// First nudge after a day of waiting, then every two days, every 12 hours near a due date.
+    pub fn nudge_due(&self, now: i64) -> bool {
+        if self.waiting_on.is_empty() || epoch(&self.snoozed_until).is_some_and(|until| until > now) {
+            return false;
+        }
+        let gap = if self.due_soon(now) { DAY_SECS / 2 } else if self.nudges == 0 { DAY_SECS } else { 2 * DAY_SECS };
+        let from = epoch(&self.last_nudged_at).or_else(|| epoch(&self.waiting_since));
+        from.is_none_or(|from| now - from >= gap)
+    }
+
+    pub fn waiting_days(&self, now: i64) -> Option<i64> {
+        epoch(&self.waiting_since).map(|since| (now - since) / DAY_SECS)
+    }
+
+    pub fn days_since_nudge(&self, now: i64) -> Option<i64> {
+        epoch(&self.last_nudged_at).map(|at| (now - at) / DAY_SECS)
+    }
+}
+
 fn clip(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max { flat } else { format!("{}…", flat.chars().take(max).collect::<String>()) }
 }
 
 impl Goal {
+    pub fn drive(&self) -> Drive {
+        serde_json::from_value(self.plan["drive"].clone()).unwrap_or_default()
+    }
+
+    pub fn set_drive(&mut self, drive: &Drive) {
+        self.plan["drive"] = serde_json::json!(drive);
+    }
+
     pub fn new(id: String, title: String, outcome: String, criteria: Vec<GoalCriterion>, requester: String, now: String) -> Self {
         Self {
             id,
@@ -130,6 +185,8 @@ pub enum Attention {
     Stalled,
     /// Every criterion has evidence and no task is open, yet the goal is open.
     ReadyToClose,
+    /// The next move is named as the user's.
+    Waiting,
 }
 
 impl Attention {
@@ -137,6 +194,7 @@ impl Attention {
         match self {
             Self::Stalled => "stalled",
             Self::ReadyToClose => "ready_to_close",
+            Self::Waiting => "waiting_on_user",
         }
     }
 }
@@ -153,6 +211,9 @@ pub fn attention(goal: &Goal, tasks: &[Task]) -> Option<Attention> {
     }
     if goal.fully_evidenced() && !tasks.iter().any(is_open) {
         return Some(Attention::ReadyToClose);
+    }
+    if !goal.drive().waiting_on.is_empty() {
+        return Some(Attention::Waiting);
     }
     let moving = tasks.iter().any(|t| matches!(t.status, TaskStatus::InProgress | TaskStatus::Todo | TaskStatus::InReview));
     (!moving).then_some(Attention::Stalled)
