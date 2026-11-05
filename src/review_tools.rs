@@ -131,38 +131,15 @@ fn post_room(ctx: &ToolContext, store: &Store, task: &Task, event_type: &str, bo
     }
 }
 
-/// Hand a review the reviewer cannot give to Mission Control: if a pending
-/// report is already on record (criteria and artifact paths verified by
-/// `gate_done`), complete the task so it never wedges in `in_review`.
+/// Hand a review the reviewer cannot give to Mission Control. The task stays in
+/// review with its report, because silence is not a verdict.
 pub fn escalate(store: &Store, task_id: &str, reason: &str, now: &str) {
-    let pending = store
-        .task_state(task_id)
-        .ok()
-        .flatten()
-        .and_then(|s| s.pending_report);
-    let _ = store.modify_task_state(task_id, now, |s| {
-        s.review_escalated = true;
-        s.pending_report = None;
-    });
-    if let Some(report) = pending
-        && store
-            .complete_task(
-                task_id,
-                TaskStatus::Done,
-                TaskResult {
-                    summary: report.summary,
-                    artifacts: report.artifacts.into_iter().map(Into::into).collect(),
-                    authoritative: true,
-                },
-                now,
-            )
-            .is_ok()
-    {
-        return;
-    }
+    let state = store.modify_task_state(task_id, now, |s| s.review_escalated = true).ok();
+    let report = state.and_then(|s| s.pending_report).map(|r| r.summary).unwrap_or_default();
+    let message = if report.is_empty() { reason.to_string() } else { format!("{reason}\nworker's report:\n{report}") };
     let _ = store.update_task_in(task_id, now, |t| {
         if t.status == TaskStatus::InReview {
-            t.notify_once("review_escalated", reason);
+            t.notify_once("review_escalated", &message);
         }
     });
 }
