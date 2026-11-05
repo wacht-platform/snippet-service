@@ -58,30 +58,6 @@ pub fn snapshot(workspace: &Path) -> Snapshot {
     Snapshot { head: head.trim().to_string(), files }
 }
 
-/// Files and commits that differ between two snapshots of one worktree.
-pub fn changes(from: &Snapshot, to: &Snapshot, workspace: &Path) -> (Vec<String>, Vec<String>) {
-    let mut files: Vec<String> = from
-        .files
-        .keys()
-        .chain(to.files.keys())
-        .filter(|path| from.files.get(*path) != to.files.get(*path))
-        .cloned()
-        .collect();
-    let mut commits = Vec::new();
-    if !from.head.is_empty() && !to.head.is_empty() && from.head != to.head {
-        let range = format!("{}..{}", from.head, to.head);
-        if let Some(listed) = git(workspace, &["diff", "--name-only", &from.head, &to.head]) {
-            files.extend(listed.lines().filter(|l| !l.starts_with(".snippet/")).map(str::to_string));
-        }
-        if let Some(listed) = git(workspace, &["log", "--format=%h %s", &range]) {
-            commits = listed.lines().map(str::to_string).collect();
-        }
-    }
-    files.sort();
-    files.dedup();
-    (files, commits)
-}
-
 pub fn task_workspace(store: &Store, task: &Task) -> Option<std::path::PathBuf> {
     // A task may name its session by the old `.json` path, which only some rows keep as legacy_id.
     [Some(task.session_id.as_str()), task.reporting_session.as_deref()]
@@ -148,16 +124,69 @@ pub fn open_first_turn(store: &Store, task: &Task, workspace: &Path, now: &str) 
 /// Files changed since the task was dispatched, not counting what was already
 /// uncommitted then. `None` when the task has no record yet.
 pub fn changed_since_dispatch(store: &Store, task: &Task, workspace: &Path) -> Option<Vec<String>> {
-    let first = store.list_turns(&task.id).ok()?.into_iter().next()?;
-    let from: Snapshot = serde_json::from_str(&first.snapshot).ok()?;
-    Some(changes(&from, &snapshot(workspace), workspace).0)
+    let turns = store.list_turns(&task.id).ok()?;
+    if turns.is_empty() {
+        return None;
+    }
+    let mut files: Vec<String> = Vec::new();
+    for turn in &turns {
+        if turn.ended_at.is_some() {
+            files.extend(turn.files.iter().cloned());
+        } else {
+            files.extend(attributed(store, turn, workspace).0);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Some(files)
+}
+
+/// What this turn's agent did, which a diff of the workspace alone can't say: other
+/// people commit to the same checkout, and an agent may commit from a worktree it
+/// made. A hash or path the agent merely saw proves nothing, as `git log` shows
+/// everyone's. So a commit needs its subject in the agent's own call or git's
+/// `[branch abc1234]` output, and an uncommitted edit needs its path in a call.
+fn attributed(store: &Store, turn: &crate::coordination::turns::Turn, workspace: &Path) -> (Vec<String>, Vec<String>) {
+    let from: Snapshot = serde_json::from_str(&turn.snapshot).unwrap_or_default();
+    let seen = |needle: &str, calls_only: bool| {
+        store.session_mentions(&turn.session_id, &turn.started_at, needle, calls_only).unwrap_or(false)
+    };
+    let now = snapshot(workspace);
+    let mut files: Vec<String> = from
+        .files
+        .keys()
+        .chain(now.files.keys())
+        .filter(|path| from.files.get(*path) != now.files.get(*path) && seen(path, true))
+        .cloned()
+        .collect();
+    let mut commits: Vec<(String, String)> = Vec::new();
+    if !from.head.is_empty() {
+        let since = format!("--since={}", turn.started_at);
+        let range = format!("{}..HEAD", from.head);
+        let listed = git(workspace, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+        let checkouts = listed.lines().filter_map(|l| l.strip_prefix("worktree ")).map(Path::new);
+        for checkout in checkouts.chain(std::iter::once(workspace)) {
+            let log = git(checkout, &["log", "-n", "200", &since, "--format=%H%x09%h%x09%s", &range]).unwrap_or_default();
+            for line in log.lines() {
+                let mut parts = line.splitn(3, '\t');
+                let (Some(full), Some(short), Some(subject)) = (parts.next(), parts.next(), parts.next()) else { continue };
+                if commits.iter().all(|(seen, _)| seen != full) && (seen(subject, true) || seen(&format!("{short}] "), false)) {
+                    commits.push((full.to_string(), format!("{short} {subject}")));
+                    let touched = git(checkout, &["show", "--name-only", "--format=", full]).unwrap_or_default();
+                    files.extend(touched.lines().filter(|l| !l.starts_with(".snippet/")).map(str::to_string));
+                }
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    (files, commits.into_iter().map(|(_, line)| line).collect())
 }
 
 /// Ends the open turn and records what it changed.
 pub fn close_turn(store: &Store, task: &Task, workspace: &Path, now: &str) -> (Vec<String>, Vec<String>) {
     let Ok(Some(turn)) = store.open_turn_of(&task.id) else { return Default::default() };
-    let from: Snapshot = serde_json::from_str(&turn.snapshot).unwrap_or_default();
-    let (files, commits) = changes(&from, &snapshot(workspace), workspace);
+    let (files, commits) = attributed(store, &turn, workspace);
     let _ = store.close_turn(turn.id, &files, &commits, now);
     (files, commits)
 }

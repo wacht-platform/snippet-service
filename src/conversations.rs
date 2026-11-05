@@ -643,6 +643,24 @@ impl Store {
         })
     }
 
+    /// Whether a session's transcript holds `needle` at or after `since`, optionally
+    /// only in what the session itself asked for rather than what it was shown.
+    pub fn session_mentions(&self, session_id: &str, since: &str, needle: &str, calls_only: bool) -> Result<bool, StoreError> {
+        let encoded = serde_json::to_string(needle).unwrap_or_default();
+        let encoded = encoded.trim_matches('"').to_string();
+        let row = self.get_session_row(session_id)?;
+        let id = row.map_or_else(|| session_id.to_string(), |row| row.id);
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_events
+                 WHERE session_id = ?1 AND created_at >= ?2 AND instr(payload_json, ?3) > 0
+                   AND (?4 = 0 OR payload_json LIKE '{\"kind\":\"tool_call\"%'))",
+                params![id, since, encoded, calls_only],
+                |row| row.get(0),
+            )
+        })
+    }
+
     /// Load a session's transcript in order.
     pub fn load_conversation_messages(
         &self,
