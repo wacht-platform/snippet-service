@@ -41,6 +41,9 @@ pub struct GoalCriterion {
     /// What was seen or run to show the criterion holds; empty until then.
     #[serde(default)]
     pub evidence: String,
+    /// Why this check no longer applies; a dropped check needs no evidence.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dropped: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -148,12 +151,42 @@ impl Goal {
         unknown
     }
 
+    /// Replace the checks when the scope moves. A check that goes stays on record
+    /// with the reason, so the owner can see what changed; evidence on unchanged
+    /// text is kept.
+    pub fn replace_acceptance(&mut self, new: Vec<GoalCriterion>, reason: &str) -> Result<(), String> {
+        let reason = reason.trim();
+        let (old_dropped, old): (Vec<_>, Vec<_>) = std::mem::take(&mut self.acceptance).into_iter().partition(|c| !c.dropped.is_empty());
+        let gone: Vec<GoalCriterion> = old.iter().filter(|o| !new.iter().any(|n| n.criterion == o.criterion)).cloned().collect();
+        if !gone.is_empty() && reason.is_empty() {
+            self.acceptance = old.into_iter().chain(old_dropped).collect();
+            return Err(format!("say why the scope changed: pass reason, since this removes {}", gone.iter().map(|c| clip(&c.criterion, 80)).collect::<Vec<_>>().join("; ")));
+        }
+        self.acceptance = new
+            .into_iter()
+            .map(|mut c| {
+                c.dropped.clear();
+                c.evidence = old.iter().find(|o| o.criterion == c.criterion).map(|o| o.evidence.clone()).unwrap_or_default();
+                c
+            })
+            .collect();
+        let kept_drops: Vec<GoalCriterion> = old_dropped.into_iter().filter(|d| !self.acceptance.iter().any(|c| c.criterion == d.criterion)).collect();
+        self.acceptance.extend(kept_drops);
+        self.acceptance.extend(gone.into_iter().map(|c| GoalCriterion { dropped: reason.to_string(), ..c }));
+        Ok(())
+    }
+
+    /// Checks dropped along the way, as `text: reason`.
+    pub fn dropped_checks(&self) -> Vec<String> {
+        self.acceptance.iter().filter(|c| !c.dropped.is_empty()).map(|c| format!("{}: {}", clip(&c.criterion, 120), clip(&c.dropped, 200))).collect()
+    }
+
     /// Criteria with no evidence, as `n. text`.
     pub fn unevidenced(&self) -> Vec<String> {
         self.acceptance
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.evidence.trim().is_empty())
+            .filter(|(_, c)| c.dropped.is_empty() && c.evidence.trim().is_empty())
             .map(|(i, c)| format!("{}. [{}] {}", i + 1, c.method.as_str(), clip(&c.criterion, 160)))
             .collect()
     }
@@ -255,7 +288,7 @@ pub fn goal_block(store: &Store, task: &Task, full: bool) -> String {
     };
     let mut out = format!("[goal]\ngoal: {}: {}\n", clip(&goal.title, 120), clip(&goal.outcome, if full { 500 } else { 200 }));
     if full && !goal.acceptance.is_empty() {
-        let checks: Vec<String> = goal.acceptance.iter().map(|c| clip(&c.criterion, 100)).collect();
+        let checks: Vec<String> = goal.acceptance.iter().filter(|c| c.dropped.is_empty()).map(|c| clip(&c.criterion, 100)).collect();
         out.push_str(&format!("goal acceptance: {}\n", checks.join("; ")));
     }
     out.push_str(&format!("this is {}: {}\n", label(task), clip(&task.title, 100)));
@@ -390,8 +423,8 @@ mod tests {
             "Ship it".into(),
             "Users can sign in".into(),
             vec![
-                GoalCriterion { criterion: "tests pass".into(), method: VerifyMethod::Command, evidence: String::new() },
-                GoalCriterion { criterion: "login screen looks right".into(), method: VerifyMethod::Visual, evidence: String::new() },
+                GoalCriterion { criterion: "tests pass".into(), method: VerifyMethod::Command, evidence: String::new(), dropped: String::new() },
+                GoalCriterion { criterion: "login screen looks right".into(), method: VerifyMethod::Visual, evidence: String::new(), dropped: String::new() },
             ],
             "user".into(),
             "2026-01-01T00:00:00Z".into(),

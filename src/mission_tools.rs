@@ -1259,8 +1259,6 @@ struct CreateTaskArgs {
     #[serde(default)]
     supersedes: Option<String>,
     /// How the work is judged done; required unless `read_only`.
-    #[serde(default, alias = "acceptance_criteria")]
-    acceptance: Vec<crate::coordination::Criterion>,
     #[serde(default)]
     verify_mode: Option<String>,
     #[serde(default)]
@@ -1291,7 +1289,7 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"go_ahead":{"type":"string","description":crate::routing_gate::GO_AHEAD_DESCRIPTION}, "title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "acceptance":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string"},"method":{"type":"string","enum":["command","artifact","visual","human"]}},"required":["criterion","method"]},"description":"how the work is judged done, each with how it is checked. Required unless read_only. The worker must report evidence for every one."}, "read_only":{"type":"boolean","description":"investigation that changes nothing; acceptance is then optional"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done; choose it per task. self skips review; reviewer has an agent review it read-only, on that agent's own profile (the one named in `reviewer`, otherwise the agent doing the work); mission_control and user keep the verdict with you. Omitted: reviewer (self when read_only)."}, "reviewer":{"type":"string","description":"optional; any agent id to review this work, on its own profile. Omitted, the agent doing the work reviews it in a fresh lane."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}, "goal":{"type":"string","description":"optional; id of the open goal this task serves"}, "expected_minutes":{"type":"integer","description":"optional; how long the work should take. The task is flagged stalled after twice this without progress (minimum 20 min). Defaults by verify_mode."}}), &["title","description","session"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing, and it sets the scope: what to do and what's out. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"go_ahead":{"type":"string","description":crate::routing_gate::GO_AHEAD_DESCRIPTION}, "title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "read_only":{"type":"boolean","description":"investigation that changes nothing"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done; choose it per task. self skips review; reviewer has an agent review it read-only, on that agent's own profile (the one named in `reviewer`, otherwise the agent doing the work); mission_control and user keep the verdict with you. Omitted: reviewer (self when read_only)."}, "reviewer":{"type":"string","description":"optional; any agent id to review this work, on its own profile. Omitted, the agent doing the work reviews it in a fresh lane."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}, "goal":{"type":"string","description":"optional; id of the open goal this task serves"}, "expected_minutes":{"type":"integer","description":"optional; how long the work should take. The task is flagged stalled after twice this without progress (minimum 20 min). Defaults by verify_mode."}}), &["title","description","session"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let mut args: CreateTaskArgs =
@@ -1300,11 +1298,6 @@ impl Tool for CreateMissionTask {
             })?;
         crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         args.description.push_str(&crate::mission_autonomy::standing_rules_note());
-        if !args.read_only && args.acceptance.is_empty() {
-            return Err(ToolError::msg(
-                "acceptance criteria are required: pass acceptance [{criterion, method: command|artifact|visual|human}], one per way the work is judged done, or read_only: true for an investigation that changes nothing",
-            ));
-        }
         create_task(ctx, args, ("agent", crate::mission_control::SESSION_ID)).await
     }
 }
@@ -1473,7 +1466,6 @@ async fn create_task(
             &args.description,
             args.audience.as_deref().unwrap_or(""),
             args.definition_of_good.as_deref().unwrap_or(""),
-            &args.acceptance,
         );
         let id = uuid::Uuid::new_v4().to_string();
         let handoff_mode = match args.handoff_mode.as_deref() {
@@ -1579,7 +1571,6 @@ async fn create_task(
                 .map_err(|e| ToolError::msg(format!("record supersedes: {e}")))?;
         }
         let ledger = crate::coordination::StatePatch {
-            criteria: Some(args.acceptance.clone()).filter(|c| !c.is_empty()),
             audience: args.audience.clone(),
             definition_of_good: args.definition_of_good.clone(),
             verify_mode: Some(verify_mode),
@@ -1671,8 +1662,6 @@ struct DeliverArgs {
     title: Option<String>,
     #[serde(default)]
     go_ahead: Option<String>,
-    #[serde(default, alias = "acceptance_criteria")]
-    acceptance: Vec<crate::coordination::Criterion>,
     #[serde(default)]
     verify_mode: Option<String>,
     #[serde(default)]
@@ -1685,7 +1674,7 @@ impl Tool for DeliverToSession {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "deliver_to_session".into(),
-            description: "Send a brief straight into an existing session: it starts a turn there now, with no offer step, and that session is bound to report the task. Pass task_id to hand over a queued task; otherwise a task is filed for the brief. With no acceptance and no verify_mode the session checks its own work, so pass both when judgement matters.".into(),
+            description: "Send a brief straight into an existing session: it starts a turn there now, with no offer step, and that session is bound to report the task. Pass task_id to hand over a queued task; otherwise a task is filed for the brief. With no verify_mode the session checks its own work, so pass one when judgement matters.".into(),
             input_schema: schema(
                 json!({
                     "session": {"type": "string", "description": "session id, or a title fragment or workspace path, optionally with `latest`"},
@@ -1693,7 +1682,6 @@ impl Tool for DeliverToSession {
                     "task_id": {"type": "string"},
                     "title": {"type": "string", "description": "optional; board title for a new task"},
                     "go_ahead": {"type": "string", "description": crate::routing_gate::GO_AHEAD_DESCRIPTION},
-                    "acceptance": {"type": "array", "items": {"type": "object"}, "description": "[{criterion, method: command|artifact|visual|human}], one per way the work is judged done; required with verify_mode reviewer on a new task"},
                     "verify_mode": {"type": "string", "description": "self, reviewer, mission_control or user"},
                     "reviewer": {"type": "string", "description": "any agent id to review this work, on its own profile; omitted, the agent doing the work reviews it in a fresh lane"}
                 }),
@@ -1717,10 +1705,6 @@ impl Tool for DeliverToSession {
             ),
             None => reviewer.is_some().then_some(crate::coordination::VerifyMode::Reviewer),
         };
-        let new_task = args.task_id.as_deref().is_none_or(|t| t.trim().is_empty());
-        if verify_mode == Some(crate::coordination::VerifyMode::Reviewer) && new_task && args.acceptance.is_empty() {
-            return Err(ToolError::msg("verify_mode reviewer needs acceptance criteria: the reviewer judges against them"));
-        }
         let brief = format!("{}{}", args.brief.trim(), crate::mission_autonomy::standing_rules_note());
         let brief = brief.as_str();
         let session_id = resolve_target_session(&args.session)?;
@@ -1759,7 +1743,6 @@ impl Tool for DeliverToSession {
             &now,
         )?;
         let check = crate::coordination::StatePatch {
-            criteria: Some(args.acceptance.clone()).filter(|c| !c.is_empty()),
             verify_mode,
             ..Default::default()
         };
@@ -1923,7 +1906,6 @@ impl Tool for FileFollowUpTask {
             blocked_by,
             crew: Vec::new(),
             supersedes: None,
-            acceptance: Vec::new(),
             verify_mode: None,
             reviewer: None,
             revises_task_id: None,
@@ -3038,17 +3020,44 @@ pub(crate) fn announce_report(
 struct ReportArgs {
     task_id: String,
     status: String,
+    #[serde(default)]
     summary: String,
     #[serde(default)]
-    artifacts: Vec<String>,
+    scope: String,
     #[serde(default)]
-    evidence: Vec<crate::coordination::Evidence>,
+    done: String,
+    #[serde(default)]
+    how: String,
+    #[serde(default)]
+    artifacts: Vec<String>,
+}
+
+const REPORT_PART_CHARS: usize = 400;
+
+/// A done report is its three short parts; blocked and failed reports, and
+/// Mission Control's own, may be a plain summary.
+fn report_text(args: &ReportArgs, status: &TaskStatus, is_mc: bool) -> Result<String, ToolError> {
+    let parts = [("Scope", args.scope.trim()), ("Done", args.done.trim()), ("How", args.how.trim())];
+    if parts.iter().all(|(_, text)| text.is_empty()) && (is_mc || *status != TaskStatus::Done) {
+        let summary = args.summary.trim();
+        if summary.is_empty() {
+            return Err(ToolError::msg("say what happened: blocked and failed reports need a summary"));
+        }
+        return Ok(summary.to_string());
+    }
+    if let Some((label, _)) = parts.iter().find(|(_, text)| text.is_empty()) {
+        return Err(ToolError::msg(format!("report refused: `{}` is missing. A done report needs scope, done and how, a sentence or two each.", label.to_lowercase())));
+    }
+    if let Some((label, text)) = parts.iter().find(|(_, text)| text.chars().count() > REPORT_PART_CHARS) {
+        return Err(ToolError::msg(format!("report refused: `{}` is {} characters; keep each part under {REPORT_PART_CHARS}. Changed files and commits are measured for you, so leave them out.", label.to_lowercase(), text.chars().count())));
+    }
+    Ok(parts.iter().map(|(label, text)| format!("{label}: {text}")).collect::<Vec<_>>().join("\n"))
 }
 pub struct ReportMissionTask;
 #[async_trait]
 impl Tool for ReportMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "report_mission_task".into(), description: "Report a Mission Control task's completion, failure, or blocker. Use only for the [mission_control_task] envelope delivered to this session. A done report must carry evidence for every acceptance criterion in the ledger; a task with a reviewer goes to review before it completes.".into(), input_schema: schema(json!({"task_id":{"type":"string"}, "status":{"type":"string","enum":["done","blocked","failed"]}, "summary":{"type":"string"}, "artifacts":{"type":"array","items":{"type":"string"}}, "evidence":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string","description":"the criterion's number or text"},"evidence":{"type":"string","description":"command and result, or what you saw"},"path":{"type":"string","description":"artifact or screenshot; required for artifact and visual criteria"}},"required":["criterion","evidence"]}}}), &["task_id","status","summary"]) }
+        NativeToolDefinition { name: "report_mission_task".into(), description: "Report a Mission Control task's completion, failure, or blocker. Use only for the [mission_control_task] envelope delivered to this session. A done report is three short parts: scope, done and how; a task with a reviewer goes to review before it completes.".into(), input_schema: schema(json!({"task_id":{"type":"string"}, "status":{"type":"string","enum":["done","blocked","failed"]}, "scope":{"type":"string","description":"done: what the scope was, and anything that changed and why"}, "done":{"type":"string","description":"done: how much got done, and anything left out and why"}, "how":{"type":"string","description":"done: how it was done and checked"}, "summary":{"type":"string","description":"blocked or failed: on what, and what would unblock it"}, "artifacts":{"type":"array","items":{"type":"string"}}}), &["task_id","status"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ReportArgs =
@@ -3103,17 +3112,14 @@ impl Tool for ReportMissionTask {
             }
         }
         let now = now_rfc3339();
+        let summary = report_text(&args, &status, is_mc)?;
         if status == TaskStatus::Done && !is_mc {
             let current = store
                 .get_task(&args.task_id)
                 .map_err(|e| ToolError::msg(format!("load task: {e}")))?
                 .ok_or_else(|| ToolError::msg("unknown task"))?;
-            let workspace = state_path_for_id(&current.session_id)
-                .and_then(|p| crate::session::read_session_meta(&p))
-                .map(|s| PathBuf::from(s.workspace))
-                .unwrap_or_else(|| ctx.workspace_root().to_path_buf());
-            if let Some(mode) = crate::review_tools::gate_done(&store, &current, &args.evidence, &workspace, &now)? {
-                let held = crate::review_tools::submit_for_review(ctx, &store, &current, mode, args.summary.trim(), &args.artifacts, &now)?;
+            if let Some(mode) = crate::review_tools::gate_done(&store, &current, &now)? {
+                let held = crate::review_tools::submit_for_review(ctx, &store, &current, mode, &summary, &args.artifacts, &now)?;
                 return Ok(ToolResult::success(json!({
                     "task": task_view(&held),
                     "in_review": mode.as_str(),
@@ -3121,7 +3127,7 @@ impl Tool for ReportMissionTask {
                 })));
             }
         }
-        let summary_for_board = args.summary.trim().to_string();
+        let summary_for_board = summary.clone();
         let status_for_board = status.clone();
         if status.is_terminal()
             && let Ok(Some(current)) = store.get_task(&args.task_id)
@@ -3135,7 +3141,7 @@ impl Tool for ReportMissionTask {
                     &args.task_id,
                     status,
                     TaskResult {
-                        summary: args.summary,
+                        summary,
                         artifacts: args.artifacts.into_iter().map(PathBuf::from).collect(),
                         authoritative: true,
                     },
@@ -3149,7 +3155,7 @@ impl Tool for ReportMissionTask {
                     task.notifications.push(NotificationMarker {
                         target: "mission_control".into(),
                         kind: "blocked".into(),
-                        message: args.summary,
+                        message: summary,
                         delivered: false,
                     });
                 })
@@ -3381,7 +3387,7 @@ mod tests {
         ReportMissionTask
             .execute(
                 &ctx,
-                json!({"task_id":"t-legacy","status":"done","summary":"finished"}),
+                json!({"task_id":"t-legacy","status":"done","scope":"s","done":"all","how":"finished"}),
             )
             .await
             .expect("a legacy-bound task must still accept its own session's report");
@@ -3428,7 +3434,7 @@ mod tests {
         ReportMissionTask
             .execute(
                 &ctx,
-                json!({"task_id":"t1","status":"done","summary":"all green"}),
+                json!({"task_id":"t1","status":"done","scope":"s","done":"all","how":"all green"}),
             )
             .await
             .unwrap();
@@ -3595,7 +3601,9 @@ mod tests {
             .execute(&ctx_worker, json!({
                 "task_id": "t-mc",
                 "status": "done",
-                "summary": "Review approved cleanly"
+                "scope": "the review",
+                "done": "all of it",
+                "how": "Review approved cleanly"
             }))
             .await
             .unwrap();

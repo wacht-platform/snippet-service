@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn goal_lines_name_stalled_and_ready_goals() {
         use crate::coordination::{Goal, GoalCriterion, Task, VerifyMethod};
-        let mut goal = Goal::new("g".into(), "Launch".into(), "Live".into(), vec![GoalCriterion { criterion: "ok".into(), method: VerifyMethod::Command, evidence: String::new() }], "u".into(), "2026-01-01T00:00:00Z".into());
+        let mut goal = Goal::new("g".into(), "Launch".into(), "Live".into(), vec![GoalCriterion { criterion: "ok".into(), method: VerifyMethod::Command, evidence: String::new(), dropped: String::new() }], "u".into(), "2026-01-01T00:00:00Z".into());
         let task = |id: &str, status| {
             let mut t = Task::filed_by_human(id.into(), format!("T{id}"), "d".into(), "s".into(), 0, "2026-01-01T00:00:00Z".into());
             t.status = status;

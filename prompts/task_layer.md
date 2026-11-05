@@ -16,4 +16,4 @@ You don't have to do it alone, and most of what follows only matters when a task
 
 When a peer disagrees, weigh it and settle it together. An answer Mission Control gives on the user's behalf counts as the user's.
 
-The task ends with `report_mission_task` from whoever holds the turn, once their lanes are back: `done`, `blocked` (on what, and what would unblock it) or `failed`. Write the summary for its reader: what was done, files changed, how it was verified, what's open, and the follow-ups you'd suggest.
+The task ends with `report_mission_task` from whoever holds the turn, once their lanes are back: `done`, `blocked` (on what, and what would unblock it) or `failed`. A done report is three short parts, a sentence or two each: `scope` (what it was, and anything that changed and why), `done` (how much got done, anything left out and why, follow-ups) and `how` (how it was done and checked). Changed files and commits are measured for you. Don't post it to the room as well; blocked and failed reports use `summary`.

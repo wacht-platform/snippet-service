@@ -1,13 +1,12 @@
-//! The verification gate: evidence a worker owes when it reports done, the
+//! The verification gate: where a done report goes, the
 //! hand-off to a reviewer, and the verdict that completes or reopens the task.
 
-use std::path::Path;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::coordination::{Evidence, PendingReport, Task, TaskResult, TaskStatus, VerifyMode};
+use crate::coordination::{PendingReport, Task, TaskResult, TaskStatus, VerifyMode};
 use crate::llm::NativeToolDefinition;
 use crate::store::Store;
 use crate::tools::{Tool, ToolContext, ToolError, ToolResult};
@@ -57,43 +56,17 @@ pub fn review_route(store: &Store, task: &Task, state: &crate::coordination::Tas
     if state.review_rounds >= SEATED_REVIEW_ROUNDS { VerifyMode::MissionControl } else { VerifyMode::Reviewer }
 }
 
-pub fn evidence_lines(state: &crate::coordination::TaskState) -> String {
-    state
-        .evidence
-        .iter()
-        .map(|e| {
-            let path = e.path.as_deref().map(|p| format!(" [{p}]")).unwrap_or_default();
-            format!("  - {}: {}{path}", clip(&e.criterion, 80), clip(&e.evidence, 400))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Check a done report against the ledger. `Ok(None)`: complete it now.
 /// `Ok(Some(mode))`: hold it for that verifier.
 pub fn gate_done(
     store: &Store,
     task: &Task,
-    evidence: &[Evidence],
-    workspace: &Path,
     now: &str,
 ) -> Result<Option<VerifyMode>, ToolError> {
     let state = store
         .task_state(&task.id)
         .map_err(|e| ToolError::msg(format!("read ledger: {e}")))?
         .ok_or_else(|| ToolError::msg("task has no ledger"))?;
-    if state.waiver.is_empty() {
-        let missing = state.uncovered(evidence, workspace);
-        if !missing.is_empty() {
-            return Err(ToolError::msg(format!(
-                "report refused: evidence does not cover every acceptance criterion. Uncovered:\n{}\nSend evidence[] with one entry per criterion ({{criterion: its number or text, evidence: the command and its result or what you saw, path: the artifact or screenshot for artifact and visual criteria}}).",
-                missing.join("\n")
-            )));
-        }
-    }
-    store
-        .modify_task_state(&task.id, now, |s| s.evidence = evidence.to_vec())
-        .map_err(|e| ToolError::msg(format!("record evidence: {e}")))?;
     crate::task_state_tools::sync_changed_files(store, task, now);
     let mode = review_route(store, task, &state);
     Ok((mode != VerifyMode::SelfCheck).then_some(mode))
@@ -109,7 +82,7 @@ pub fn submit_for_review(
     artifacts: &[String],
     now: &str,
 ) -> Result<Task, ToolError> {
-    let state = store
+    store
         .modify_task_state(&task.id, now, |s| {
             s.pending_report = Some(PendingReport { summary: summary.to_string(), artifacts: artifacts.to_vec() });
             s.review_started_at.clear();
@@ -122,15 +95,15 @@ pub fn submit_for_review(
         .update_task_in(&task.id, now, |t| {
             t.status = TaskStatus::InReview;
             if by_mc {
-                let ask = if mode == VerifyMode::User { "show it to the user and ask whether to accept" } else { "check the evidence against the criteria" };
+                let ask = if mode == VerifyMode::User { "show it to the user and ask whether to accept" } else { "check the work against the scope" };
                 t.notify_once(
                     "in_review",
-                    &format!("{summary}\nevidence:\n{}\nVerification is yours ({}): {ask}, then submit_review.", evidence_lines(&state), mode.as_str()),
+                    &format!("{summary}\nVerification is yours ({}): {ask}, then submit_review.", mode.as_str()),
                 );
             }
         })
         .map_err(|e| ToolError::msg(format!("update task: {e}")))?;
-    post_room(ctx, store, &updated, "task.in_review", &format!("Task submitted for review ({}): {}", mode.as_str(), clip(summary, 300)));
+    post_room(ctx, store, &updated, "task.in_review", &format!("Submitted for review ({}).", mode.as_str()));
     Ok(updated)
 }
 
@@ -242,7 +215,6 @@ pub fn revise_task(store: &Store, task_id: &str, feedback: &str, by: &str, now: 
             s.review_started_at.clear();
             s.review_escalated = false;
             s.pending_report = None;
-            s.evidence.clear();
         })
         .map_err(|e| ToolError::msg(e.to_string()))?;
     let patch = crate::coordination::StatePatch { add_decisions: vec![format!("revision {} requested: {}", state.revision, clip(feedback, 300))], ..Default::default() };
@@ -392,7 +364,7 @@ impl Tool for SubmitReview {
             .map_err(|e| ToolError::msg(e.to_string()))?;
         post_room(ctx, &store, &reopened, "task.review_findings", &format!("{reviewer} sent the work back (round {rounds}):\n{}", findings.join("\n")));
         let envelope = format!(
-            "[review_findings]\ntask_id: {}\ntitle: {}\nreviewer: {reviewer}\nround: {rounds}\nThe review sent this task back. Fix every finding, then report again with report_mission_task (task_id {}) and evidence for each acceptance criterion.\nfindings:\n{}\n{}\n[/review_findings]",
+            "[review_findings]\ntask_id: {}\ntitle: {}\nreviewer: {reviewer}\nround: {rounds}\nThe review sent this task back. Fix every finding, then report again with report_mission_task (task_id {}).\nfindings:\n{}\n{}\n[/review_findings]",
             task.id,
             task.title,
             task.id,
@@ -409,7 +381,8 @@ impl Tool for SubmitReview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordination::{Criterion, StatePatch, VerifyMethod};
+    use crate::coordination::StatePatch;
+    use std::path::Path;
 
     fn seed(root: &Path, session: &str) -> (Store, Task) {
         let store = Store::open(root.join("snippet.db")).unwrap();
@@ -417,40 +390,24 @@ mod tests {
         task.status = TaskStatus::InProgress;
         task.reporting_session = Some(session.into());
         store.create_task(&task).unwrap();
-        let patch = StatePatch {
-            criteria: Some(vec![
-                Criterion { criterion: "cargo test passes".into(), method: VerifyMethod::Command },
-                Criterion { criterion: "screenshot shows the page".into(), method: VerifyMethod::Visual },
-            ]),
-            ..Default::default()
-        };
+        let patch = StatePatch { verify_mode: Some(VerifyMode::Reviewer), ..Default::default() };
         store.patch_task_state("rv1", &patch, None, "mission-control", "2026-01-01T00:00:01Z").unwrap();
         (store, task)
     }
 
-    fn ev(criterion: &str, evidence: &str, path: Option<&str>) -> Evidence {
-        Evidence { criterion: criterion.into(), evidence: evidence.into(), path: path.map(Into::into) }
-    }
-
     #[test]
-    fn a_done_report_must_cover_every_criterion_and_names_the_gaps() {
+    fn a_done_report_goes_to_its_verifier() {
         let dir = tempfile::tempdir().unwrap();
         let (store, task) = seed(dir.path(), "s1");
-        let err = gate_done(&store, &task, &[ev("1", "cargo test: 12 passed", None)], dir.path(), "2026-01-02T00:00:00Z").unwrap_err().to_string();
-        assert!(err.contains("2. [visual] screenshot shows the page (no evidence)") && !err.contains("1. [command]"), "{err}");
-        let err = gate_done(&store, &task, &[ev("cargo test passes", "ok", None), ev("2", "looks right", Some("shot.png"))], dir.path(), "2026-01-02T00:00:00Z").unwrap_err().to_string();
-        assert!(err.contains("needs a path to an existing artifact"), "{err}");
-        std::fs::write(dir.path().join("shot.png"), "x").unwrap();
-        let mode = gate_done(&store, &task, &[ev("cargo test passes", "ok", None), ev("2", "looks right", Some("shot.png"))], dir.path(), "2026-01-02T00:00:00Z").unwrap();
-        assert_eq!(mode, Some(VerifyMode::Reviewer));
+        assert_eq!(gate_done(&store, &task, "2026-01-02T00:00:00Z").unwrap(), Some(VerifyMode::Reviewer));
     }
 
     #[test]
-    fn a_waiver_or_no_criteria_completes_without_review_and_one_round_escalates() {
+    fn a_waiver_completes_without_review_and_one_round_escalates() {
         let dir = tempfile::tempdir().unwrap();
         let (store, task) = seed(dir.path(), "s1");
         store.modify_task_state("rv1", "t", |s| s.waiver = "user said skip".into()).unwrap();
-        assert_eq!(gate_done(&store, &task, &[], dir.path(), "t").unwrap(), None);
+        assert_eq!(gate_done(&store, &task, "t").unwrap(), None);
         store.modify_task_state("rv1", "t", |s| { s.waiver.clear(); s.review_rounds = 1; }).unwrap();
         let state = store.task_state("rv1").unwrap().unwrap();
         assert_eq!(route(&state), VerifyMode::MissionControl);
@@ -463,20 +420,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (store, _) = seed(dir.path(), "s1");
         let worker = ToolContext::new(dir.path()).unwrap().with_durable_session_id("s1").with_store_path(dir.path().join("snippet.db"));
-        let report = |evidence: Value| json!({"task_id": "rv1", "status": "done", "summary": "all done", "evidence": evidence});
-        let refused = crate::mission_tools::ReportMissionTask.execute(&worker, report(json!([]))).await.unwrap_err().to_string();
-        assert!(refused.contains("1. [command] cargo test passes") && refused.contains("2. [visual]"), "{refused}");
-        std::fs::write(dir.path().join("shot.png"), "x").unwrap();
-        let held = crate::mission_tools::ReportMissionTask
-            .execute(&worker, report(json!([{"criterion": "1", "evidence": "12 passed"}, {"criterion": "2", "evidence": "page renders", "path": "shot.png"}])))
-            .await
-            .unwrap();
+        let report = |how: &str| json!({"task_id": "rv1", "status": "done", "scope": "fix a", "done": "all of it", "how": how});
+        let refused = crate::mission_tools::ReportMissionTask.execute(&worker, report(" ")).await.unwrap_err().to_string();
+        assert!(refused.contains("`how` is missing"), "{refused}");
+        let refused = crate::mission_tools::ReportMissionTask.execute(&worker, report(&"x".repeat(401))).await.unwrap_err().to_string();
+        assert!(refused.contains("`how` is 401 characters"), "{refused}");
+        let held = crate::mission_tools::ReportMissionTask.execute(&worker, report("ran the tests")).await.unwrap();
         assert_eq!(held.value["data"]["in_review"], "reviewer");
         assert_eq!(store.get_task("rv1").unwrap().unwrap().status, TaskStatus::InReview);
-        let again = crate::mission_tools::ReportMissionTask.execute(&worker, report(json!([]))).await.unwrap_err().to_string();
+        let again = crate::mission_tools::ReportMissionTask.execute(&worker, report("ran the tests")).await.unwrap_err().to_string();
         assert!(again.contains("is in review"), "{again}");
         let state = store.task_state("rv1").unwrap().unwrap();
-        assert_eq!((state.evidence.len(), state.pending_report.unwrap().summary.as_str()), (2, "all done"));
+        assert_eq!(state.pending_report.unwrap().summary, "Scope: fix a
+Done: all of it
+How: ran the tests");
     }
 
     #[test]
@@ -499,24 +456,6 @@ mod tests {
         }
         let _ = task;
         assert!(revise_task(&store, "rv1", "again", "mission-control", "t").is_err());
-    }
-
-    #[tokio::test]
-    async fn filing_a_task_without_acceptance_is_refused_unless_read_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let mc = ToolContext::new(dir.path()).unwrap().with_agent_id(crate::mission_control::SESSION_ID).with_store_path(dir.path().join("snippet.db"));
-        let err = crate::mission_tools::CreateMissionTask
-            .execute(&mc, json!({"title": "t", "description": "d", "session": "nope"}))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("acceptance criteria are required"), "{err}");
-        let err = crate::mission_tools::CreateMissionTask
-            .execute(&mc, json!({"title": "t", "description": "d", "session": "nope", "read_only": true}))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(!err.contains("acceptance"), "{err}");
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::coordination::goals::is_open;
-use crate::coordination::{Criterion, Goal, GoalStatus, Task, TaskLink, TaskLinkKind, TaskStatus, VerifyMethod};
+use crate::coordination::{Goal, GoalStatus, Task, TaskLink, TaskLinkKind, TaskStatus};
 use crate::llm::NativeToolDefinition;
 use crate::store::Store;
 use crate::tools::{Tool, ToolContext, ToolError, ToolResult};
@@ -18,8 +18,6 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolResult};
 struct SliceArg {
     title: String,
     brief: String,
-    #[serde(default)]
-    acceptance: Vec<Criterion>,
     #[serde(default)]
     depends_on: Vec<usize>,
     #[serde(default)]
@@ -40,13 +38,12 @@ fn slice_schema(what: &str) -> Value {
     json!({"type":"array","items":{"type":"object","properties":{
         "title":{"type":"string"},
         "brief":{"type":"string","description":"what this slice owns and delivers; the worker also sees the goal and the other slices"},
-        "acceptance":{"type":"array","items":{"type":"object","properties":{"criterion":{"type":"string"},"method":{"type":"string","enum":["command","artifact","visual","human"]}},"required":["criterion","method"]}},
         "depends_on":{"type":"array","items":{"type":"integer"},"description":what},
         "blocked_by":{"type":"array","items":{"type":"string"},"description":"ids of existing tasks this slice also waits on"},
         "suggested_agent":{"type":"string","description":"specialist from list_coordination_agents"},
         "session":{"type":"string","description":"session to run in; defaults to the plan's session"},
         "read_only":{"type":"boolean"},
-        "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"default: self if read_only, mission_control if every check is human, else a reviewer lane"},
+        "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"default: self if read_only, else a reviewer lane"},
         "owned_paths":{"type":"array","items":{"type":"string"}}
     },"required":["title","brief"],"additionalProperties":false}})
 }
@@ -54,8 +51,6 @@ fn slice_schema(what: &str) -> Value {
 fn default_verify(slice: &SliceArg) -> &'static str {
     if slice.read_only {
         "self"
-    } else if !slice.acceptance.is_empty() && slice.acceptance.iter().all(|c| c.method == VerifyMethod::Human) {
-        "mission_control"
     } else {
         "reviewer"
     }
@@ -137,9 +132,6 @@ async fn file_slices(ctx: &ToolContext, store: &Store, goal: &mut Goal, slices: 
         if !titles.insert(s.title.trim().to_lowercase()) {
             return Err(ToolError::msg(format!("slice {i}: titles must be distinct (\"{}\")", s.title.trim())));
         }
-        if !s.read_only && s.acceptance.is_empty() {
-            return Err(ToolError::msg(format!("slice {i}: acceptance is required unless read_only")));
-        }
         if let Some(bad) = s.depends_on.iter().find(|d| **d >= i) {
             return Err(ToolError::msg(format!("slice {i}: depends_on {bad} must be the index of an earlier slice (0-based, in this list)")));
         }
@@ -209,7 +201,7 @@ async fn file_slices(ctx: &ToolContext, store: &Store, goal: &mut Goal, slices: 
         blockers.dedup();
         let mut args = json!({
             "title": slice.title, "description": format!("{}{}", slice.brief, crate::mission_autonomy::standing_rules_note()), "session": session, "handoff_mode": "fresh",
-            "acceptance": slice.acceptance, "read_only": slice.read_only, "blocked_by": blockers,
+            "read_only": slice.read_only, "blocked_by": blockers,
             "owned_paths": slice.owned_paths, "goal": goal.id,
             "verify_mode": slice.verify_mode.as_deref().unwrap_or_else(|| default_verify(slice)),
         });
@@ -396,13 +388,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_mode_follows_what_the_checks_are() {
-        let slice = |read_only: bool, methods: &[&str]| -> SliceArg {
-            serde_json::from_value(json!({"title":"t","brief":"b","read_only":read_only,"acceptance":methods.iter().map(|m| json!({"criterion":"c","method":m})).collect::<Vec<_>>()})).unwrap()
+    fn verify_mode_defaults_to_a_reviewer_unless_read_only() {
+        let slice = |read_only: bool| -> SliceArg {
+            serde_json::from_value(json!({"title":"t","brief":"b","read_only":read_only})).unwrap()
         };
-        assert_eq!(default_verify(&slice(true, &[])), "self");
-        assert_eq!(default_verify(&slice(false, &["human", "human"])), "mission_control");
-        assert_eq!(default_verify(&slice(false, &["command", "human"])), "reviewer");
+        assert_eq!(default_verify(&slice(true)), "self");
+        assert_eq!(default_verify(&slice(false)), "reviewer");
     }
 
     async fn call(tool: &dyn Tool, ctx: &ToolContext, args: Value) -> Result<Value, String> {
@@ -416,18 +407,16 @@ mod tests {
         let store = ctx.store().unwrap();
         let mut goal = Goal::new("g".into(), "G".into(), "O".into(), vec![], "u".into(), "2026-01-01T00:00:00Z".into());
         store.create_goal(&goal).unwrap();
-        let ac = json!([{"criterion": "c", "method": "command"}]);
         let plan = |slices: Value| json!({"goal": "g", "session": "s", "slices": slices});
         let err = |slices: Value| async { call(&PlanGoal, &ctx, plan(slices)).await.unwrap_err() };
-        assert!(err(json!([{"title": "a", "brief": "b", "depends_on": [0], "acceptance": ac}])).await.contains("earlier slice"));
-        assert!(err(json!([{"title": "a", "brief": "b", "acceptance": ac}, {"title": "A", "brief": "b", "acceptance": ac}])).await.contains("distinct"));
-        assert!(err(json!([{"title": "a", "brief": "b"}])).await.contains("acceptance"));
-        assert!(call(&PlanGoal, &ctx, json!({"goal": "g", "slices": [{"title": "a", "brief": "b", "acceptance": ac}]})).await.unwrap_err().contains("name a session"));
+        assert!(err(json!([{"title": "a", "brief": "b", "depends_on": [0]}])).await.contains("earlier slice"));
+        assert!(err(json!([{"title": "a", "brief": "b"}, {"title": "A", "brief": "b"}])).await.contains("distinct"));
+        assert!(call(&PlanGoal, &ctx, json!({"goal": "g", "slices": [{"title": "a", "brief": "b"}]})).await.unwrap_err().contains("name a session"));
         assert!(call(&PlanGoal, &ctx, json!({"goal": "g", "slices": []})).await.unwrap_err().contains("not be empty"));
         assert!(store.goal_tasks("g").unwrap().is_empty());
         goal.plan = json!({"slices": [{"n": 0, "task_id": "x", "title": "x", "depends_on": []}]});
         store.save_goal(&goal).unwrap();
-        assert!(err(json!([{"title": "a", "brief": "b", "acceptance": ac}])).await.contains("replan_goal"));
+        assert!(err(json!([{"title": "a", "brief": "b"}])).await.contains("replan_goal"));
     }
 
     #[tokio::test]
@@ -460,7 +449,7 @@ mod tests {
     #[test]
     fn each_slice_sees_the_goal_its_neighbours_and_finished_reports() {
         let store = Store::open_in_memory().unwrap();
-        let mut goal = Goal::new("g".into(), "Launch".into(), "Site is live".into(), vec![crate::coordination::GoalCriterion { criterion: "loads".into(), method: VerifyMethod::Command, evidence: String::new() }], "u".into(), "2026-01-01T00:00:00Z".into());
+        let mut goal = Goal::new("g".into(), "Launch".into(), "Site is live".into(), vec![crate::coordination::GoalCriterion { criterion: "loads".into(), method: crate::coordination::VerifyMethod::Command, evidence: String::new(), dropped: String::new() }], "u".into(), "2026-01-01T00:00:00Z".into());
         goal.plan = json!({"slices": [{"n": 0, "task_id": "a"}, {"n": 1, "task_id": "b"}, {"n": 2, "task_id": "c"}]});
         store.create_goal(&goal).unwrap();
         for (id, status) in [("a", TaskStatus::Done), ("b", TaskStatus::InProgress), ("c", TaskStatus::Blocked)] {
@@ -512,12 +501,11 @@ mod tests {
             .unwrap();
         let goal = call(&crate::goal_tools::CreateGoal, &ctx, json!({"title": "Ship", "outcome": "Shipped", "acceptance": [{"criterion": "works", "method": "command"}]})).await.unwrap();
         let gid = goal["goal"]["id"].as_str().unwrap().to_string();
-        let ac = json!([{"criterion": "tests pass", "method": "command"}]);
         let out = call(&PlanGoal, &ctx, json!({"goal": gid, "session": info.id, "slices": [
-            {"title": "API", "brief": "build the api", "acceptance": ac},
-            {"title": "UI", "brief": "build the ui", "acceptance": ac},
+            {"title": "API", "brief": "build the api"},
+            {"title": "UI", "brief": "build the ui"},
             {"title": "Docs", "brief": "write docs", "read_only": true},
-            {"title": "Integrate", "brief": "wire them", "acceptance": [{"criterion": "looks right", "method": "human"}], "depends_on": [0, 1]}
+            {"title": "Integrate", "brief": "wire them", "verify_mode": "mission_control", "depends_on": [0, 1]}
         ]})).await.unwrap();
         let rows = out["slices"].as_array().unwrap();
         let sessions: Vec<&str> = rows.iter().map(|r| r["session"].as_str().unwrap()).collect();

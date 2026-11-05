@@ -165,7 +165,7 @@ impl Tool for CreateGoal {
         let acceptance = args
             .acceptance
             .into_iter()
-            .map(|c| GoalCriterion { evidence: String::new(), ..c })
+            .map(|c| GoalCriterion { evidence: String::new(), dropped: String::new(), ..c })
             .collect();
         let requester = args.requester.as_deref().map(str::trim).filter(|r| !r.is_empty()).unwrap_or("user");
         let mut goal = Goal::new(uuid::Uuid::new_v4().to_string(), args.title.trim().into(), args.outcome.trim().into(), acceptance, requester.into(), now());
@@ -185,6 +185,8 @@ struct UpdateGoalArgs {
     #[serde(default)]
     acceptance: Option<Vec<GoalCriterion>>,
     #[serde(default)]
+    reason: String,
+    #[serde(default)]
     evidence: Vec<EvidenceArg>,
     #[serde(default)]
     status: Option<String>,
@@ -198,9 +200,9 @@ impl Tool for UpdateGoal {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "update_goal".into(),
-            description: "Change a goal's title, outcome or acceptance (evidence on criteria whose text is unchanged is kept), record evidence for criteria, set what drives it (next_step, waiting_on, due), record a nudge you just gave (nudged) or their 'not now' (snooze_days), or cancel it (status cancelled; needs no open task) or reopen it. Closing is close_goal.".into(),
+            description: "Change a goal's title, outcome or acceptance. When the scope moves, change the checks to match: one you remove needs a reason, stays on record as dropped and no longer blocks closing; evidence on unchanged text is kept. Also record evidence for criteria, set what drives it (next_step, waiting_on, due), record a nudge you just gave (nudged) or their 'not now' (snooze_days), or cancel it (status cancelled; needs no open task) or reopen it. Closing is close_goal.".into(),
             input_schema: {
-                let mut properties = json!({"id":{"type":"string"},"title":{"type":"string"},"outcome":{"type":"string"},"acceptance":criteria_schema(),"evidence":evidence_schema(),"status":{"type":"string","enum":["open","cancelled"]},"nudged":{"type":"boolean","description":"you just nudged the user about what this waits on"},"snooze_days":{"type":"integer","description":"they said not now: no nudge for this many days"}});
+                let mut properties = json!({"id":{"type":"string"},"title":{"type":"string"},"outcome":{"type":"string"},"acceptance":criteria_schema(),"reason":{"type":"string","description":"why the scope changed; required when acceptance removes a check"},"evidence":evidence_schema(),"status":{"type":"string","enum":["open","cancelled"]},"nudged":{"type":"boolean","description":"you just nudged the user about what this waits on"},"snooze_days":{"type":"integer","description":"they said not now: no nudge for this many days"}});
                 properties.as_object_mut().unwrap().extend(drive_schema().as_object().unwrap().clone());
                 json!({"type":"object","properties":properties,"required":["id"],"additionalProperties":false})
             },
@@ -218,13 +220,7 @@ impl Tool for UpdateGoal {
             goal.outcome = o.into();
         }
         if let Some(new) = args.acceptance {
-            goal.acceptance = new
-                .into_iter()
-                .map(|mut c| {
-                    c.evidence = goal.acceptance.iter().find(|old| old.criterion == c.criterion).map(|old| old.evidence.clone()).unwrap_or_default();
-                    c
-                })
-                .collect();
+            goal.replace_acceptance(new, &args.reason).map_err(ToolError::msg)?;
         }
         let unknown = goal.attach_evidence(&pairs(&args.evidence));
         apply_drive(&mut goal, &args.drive)?;
@@ -266,7 +262,7 @@ impl Tool for CloseGoal {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "close_goal".into(),
-            description: "Close a goal once the user has the result. Refused, with the list, while any linked task is open or any acceptance criterion lacks evidence; pass evidence to record it in the same call.".into(),
+            description: "Close a goal once the user has the result. Refused, with the list, while any linked task is open or any check still in force lacks evidence; pass evidence to record it in the same call. The result lists dropped checks: tell the user about them.".into(),
             input_schema: json!({"type":"object","properties":{"id":{"type":"string"},"evidence":evidence_schema()},"required":["id"],"additionalProperties":false}),
         }
     }
@@ -288,6 +284,10 @@ impl Tool for CloseGoal {
         goal.closed_at = Some(now());
         save(&store, &goal)?;
         let mut out = json!({"closed": goal.id, "title": goal.title});
+        let dropped = goal.dropped_checks();
+        if !dropped.is_empty() {
+            out["dropped_checks"] = json!(dropped);
+        }
         if !unknown.is_empty() {
             out["unmatched_evidence"] = json!(unknown);
         }

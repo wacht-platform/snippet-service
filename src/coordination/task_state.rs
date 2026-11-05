@@ -1,5 +1,5 @@
 //! The task ledger: one versioned record per task holding what everyone on it
-//! needs to agree on (brief, acceptance criteria, decisions, changed files,
+//! needs to agree on (brief, decisions, changed files,
 //! open questions). Every envelope a worker receives renders from this record
 //! instead of re-deriving a one-line summary from the task row.
 
@@ -54,29 +54,11 @@ impl VerifyMode {
     }
 }
 
-/// What the worker offers for one criterion when it reports done.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Evidence {
-    /// The criterion's number (`1`) or its text.
-    pub criterion: String,
-    /// The command and its result, or what was seen.
-    pub evidence: String,
-    /// An artifact or screenshot; required for `artifact` and `visual` criteria.
-    #[serde(default)]
-    pub path: Option<String>,
-}
-
 /// The worker's report, held while the task is in review.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingReport {
     pub summary: String,
     pub artifacts: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Criterion {
-    pub criterion: String,
-    pub method: VerifyMethod,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,8 +78,6 @@ pub struct TaskState {
     pub updated_at: String,
     #[serde(default)]
     pub brief: String,
-    #[serde(default, alias = "acceptance")]
-    pub criteria: Vec<Criterion>,
     #[serde(default)]
     pub deliverables: Vec<String>,
     #[serde(default)]
@@ -116,13 +96,11 @@ pub struct TaskState {
     /// files and the review diff are measured from it. Daemon-set only.
     #[serde(default)]
     pub dispatch_rev: String,
-    /// Unset means: reviewer when the task has criteria, otherwise self.
+    /// Unset means self.
     #[serde(default)]
     pub verify_mode: Option<VerifyMode>,
     #[serde(default)]
     pub revises_task_id: String,
-    #[serde(default)]
-    pub evidence: Vec<Evidence>,
     #[serde(default)]
     pub pending_report: Option<PendingReport>,
     /// Reviews that sent the work back.
@@ -151,7 +129,6 @@ pub struct TaskState {
 pub struct StatePatch {
     pub brief: Option<String>,
     #[serde(alias = "acceptance")]
-    pub criteria: Option<Vec<Criterion>>,
     pub deliverables: Option<Vec<String>>,
     #[serde(default, alias = "decisions")]
     pub add_decisions: Vec<String>,
@@ -207,15 +184,6 @@ impl TaskState {
         set_text(&mut self.current_step, &patch.current_step, "current step", &mut changes);
         set_text(&mut self.audience, &patch.audience, "audience", &mut changes);
         set_text(&mut self.definition_of_good, &patch.definition_of_good, "definition of good", &mut changes);
-        if let Some(criteria) = patch.criteria.as_ref().filter(|c| **c != self.criteria) {
-            self.criteria = criteria.clone();
-            let lines: Vec<String> = criteria
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("  {}. [{}] {}", i + 1, c.method.as_str(), clip(&c.criterion, 200)))
-                .collect();
-            changes.push(format!("acceptance criteria are now:\n{}", lines.join("\n")));
-        }
         if let Some(items) = patch.deliverables.as_ref().filter(|d| **d != self.deliverables) {
             self.deliverables = items.clone();
             changes.push(format!("deliverables are now: {}", items.join("; ")));
@@ -262,39 +230,7 @@ impl TaskState {
         if !self.waiver.is_empty() {
             return VerifyMode::SelfCheck;
         }
-        self.verify_mode.unwrap_or(if self.criteria.is_empty() { VerifyMode::SelfCheck } else { VerifyMode::Reviewer })
-    }
-
-    /// Criteria the evidence does not cover, as `n. text (why)`. Artifact and
-    /// visual criteria need a `path` that exists (relative to `workspace`).
-    pub fn uncovered(&self, evidence: &[Evidence], workspace: &std::path::Path) -> Vec<String> {
-        let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
-        self.criteria
-            .iter()
-            .enumerate()
-            .filter_map(|(i, c)| {
-                let number = (i + 1).to_string();
-                let hits: Vec<&Evidence> = evidence
-                    .iter()
-                    .filter(|e| {
-                        let key = e.criterion.trim().trim_start_matches('#');
-                        key == number || norm(key) == norm(&c.criterion)
-                    })
-                    .collect();
-                let why = if hits.is_empty() {
-                    "no evidence"
-                } else if hits.iter().all(|e| e.evidence.trim().is_empty()) {
-                    "evidence is empty"
-                } else if matches!(c.method, VerifyMethod::Artifact | VerifyMethod::Visual)
-                    && !hits.iter().any(|e| e.path.as_deref().is_some_and(|p| !p.trim().is_empty() && workspace.join(p.trim()).exists()))
-                {
-                    "needs a path to an existing artifact or screenshot"
-                } else {
-                    return None;
-                };
-                Some(format!("{number}. [{}] {} ({why})", c.method.as_str(), clip(&c.criterion, 160)))
-            })
-            .collect()
+        self.verify_mode.unwrap_or(VerifyMode::SelfCheck)
     }
 
     /// The ledger as an envelope block. `full` lists everything; otherwise it is
@@ -310,14 +246,6 @@ impl TaskState {
             line("brief", &self.brief, &mut out);
         } else {
             line("brief", &clip(&self.brief, 300), &mut out);
-        }
-        if !self.criteria.is_empty() {
-            out.push_str("acceptance (report evidence for each):\n");
-            for (i, c) in self.criteria.iter().enumerate() {
-                let method = c.method.as_str();
-                let text = if full { c.criterion.trim().to_string() } else { clip(&c.criterion, 140) };
-                out.push_str(&format!("  {}. [{method}] {text}\n", i + 1));
-            }
         }
         line("audience", &self.audience, &mut out);
         line("definition of good", &self.definition_of_good, &mut out);
@@ -504,13 +432,12 @@ mod tests {
         let (db, _) = store_with_task();
         let (state, changes) = db
             .patch_task_state("t1", &patch(serde_json::json!({
-                "criteria": [{"criterion": "cargo test passes", "method": "command"}],
                 "add_decisions": ["use sqlite"],
                 "current_step": "writing tests",
             })), Some(1), "mission-control", "2026-01-02T00:00:00Z")
             .unwrap();
         assert_eq!(state.version, 2);
-        assert_eq!(changes.len(), 3);
+        assert_eq!(changes.len(), 2);
         assert!(changes.iter().any(|c| c.contains("decision by mission-control: use sqlite")));
         let (again, none) = db
             .patch_task_state("t1", &patch(serde_json::json!({"current_step": "writing tests"})), Some(2), "w", "2026-01-03T00:00:00Z")
@@ -545,6 +472,5 @@ mod tests {
     #[test]
     fn unknown_patch_fields_and_methods_are_rejected() {
         assert!(serde_json::from_value::<StatePatch>(serde_json::json!({"bogus": 1})).is_err());
-        assert!(serde_json::from_value::<StatePatch>(serde_json::json!({"criteria": [{"criterion": "x", "method": "vibes"}]})).is_err());
     }
 }

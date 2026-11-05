@@ -63,7 +63,6 @@ pub fn content_warnings(
     description: &str,
     audience: &str,
     definition_of_good: &str,
-    criteria: &[crate::coordination::Criterion],
 ) -> Vec<String> {
     let text = format!("{title} {description}").to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
@@ -84,8 +83,8 @@ pub fn content_warnings(
     if !said(&["tone", "voice", "formal", "casual", "friendly", "plain", "technical", "style"]) {
         out.push("content work with no tone: say how it should sound".to_string());
     }
-    if has(VISUAL) && !criteria.iter().any(|c| c.method == crate::coordination::VerifyMethod::Visual) {
-        out.push("visual work with no visual criterion: add an acceptance criterion with method visual (a screenshot or render someone looks at)".to_string());
+    if has(VISUAL) && !said(&["screenshot", "render", "look at"]) {
+        out.push("visual work with no look at the result: ask for a screenshot or render someone looks at".to_string());
     }
     out
 }
@@ -98,7 +97,6 @@ pub fn api_fields(store: &Store, task: &Task) -> serde_json::Map<String, Value> 
     let mode = state.as_ref().map(|s| s.effective_mode().as_str());
     out.insert("in_review".into(), json!(task.status == crate::coordination::TaskStatus::InReview));
     out.insert("verify_mode".into(), json!(mode));
-    out.insert("acceptance".into(), json!(state.as_ref().map(|s| s.criteria.clone()).unwrap_or_default()));
     out.insert("revision".into(), json!(state.as_ref().map_or(0, |s| s.revision)));
     out.insert(
         "review".into(),
@@ -107,7 +105,6 @@ pub fn api_fields(store: &Store, task: &Task) -> serde_json::Map<String, Value> 
             "findings": s.review_findings,
             "escalated": s.review_escalated,
             "waived": (!s.waiver.is_empty()).then(|| s.waiver.clone()),
-            "evidence": s.evidence,
         }))),
     );
     out.insert("goal_id".into(), json!(task.goal_id));
@@ -287,7 +284,7 @@ impl Tool for UpdateTaskState {
             input_schema: json!({"type":"object","properties":{
                 "task_id":{"type":"string","description":"Defaults to the task in progress in this session."},
                 "expected_version":{"type":"integer"},
-                "patch":{"type":"object","description":"Any of: brief, criteria [{criterion, method: command|artifact|visual|human}], deliverables [..], add_decisions [..], add_changed_files [..], open_questions [..] (replaces), current_step, audience, definition_of_good.","additionalProperties":false}
+                "patch":{"type":"object","description":"Any of: brief, deliverables [..], add_decisions [..], add_changed_files [..], open_questions [..] (replaces), current_step, audience, definition_of_good.","additionalProperties":false}
             },"required":["patch","expected_version"]}),
         }
     }
@@ -332,7 +329,7 @@ impl Tool for TaskLedger {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "task_ledger".into(),
-            description: "Read a task's ledger in full: brief, acceptance criteria, decisions, changed files (refreshed from git), open questions, current step. Gives the version update_task_state needs.".into(),
+            description: "Read a task's ledger in full: brief, decisions, changed files (refreshed from git), open questions, current step. Gives the version update_task_state needs.".into(),
             input_schema: json!({"type":"object","properties":{"task_id":{"type":"string","description":"Defaults to the task in progress in this session."}}}),
         }
     }
@@ -399,13 +396,13 @@ mod tests {
     }
 
     #[test]
-    fn content_briefs_are_checked_for_audience_length_tone_and_a_visual_criterion() {
-        let w = content_warnings("Write the launch blog post", "Announce the feature", "", "", &[]);
+    fn content_briefs_are_checked_for_audience_length_tone_and_a_look_at_the_result() {
+        let w = content_warnings("Write the launch blog post", "Announce the feature", "", "");
         assert_eq!(w.len(), 3, "{w:?}");
-        let ok = content_warnings("Build the sales deck", "for customers, 10 slides, plain tone", "buyers", "crisp", &[crate::coordination::Criterion { criterion: "slides render".into(), method: crate::coordination::VerifyMethod::Visual }]);
+        let ok = content_warnings("Build the sales deck", "for customers, 10 slides, plain tone, renders checked", "buyers", "crisp");
         assert!(ok.is_empty(), "{ok:?}");
-        assert!(content_warnings("Fix the parser bug", "off by one", "", "", &[]).is_empty());
-        assert!(content_warnings("Build the sales deck", "for customers, 10 slides, plain tone", "", "", &[]).iter().any(|w| w.contains("visual criterion")));
+        assert!(content_warnings("Fix the parser bug", "off by one", "", "").is_empty());
+        assert!(content_warnings("Build the sales deck", "for customers, 10 slides, plain tone", "", "").iter().any(|w| w.contains("no look at the result")));
     }
 
     #[test]

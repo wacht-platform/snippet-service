@@ -37,21 +37,19 @@ pub(super) fn review_brief(task: &Task, state: &TaskState, workspace: &std::path
         "Review task \"{title}\" (task {id}) before it is accepted. You are read-only: do not change files. The worker says it is done; your job is to find out whether that is true.\n\n\
          {ledger}\n\n\
          worker's report:\n{summary}\n\n\
-         evidence the worker gave:\n{evidence}\n\n\
          workspace: {workspace}\ncommits since dispatch ({base}):\n{commits}\nfiles changed:\n{stat}\nnew untracked files:\n{untracked}\n\n\
          Read the work yourself: `git -C {workspace} diff {base} -- <path>` for the changes, and read_coordination_thread with thread_id `task:{id}` for the conversation behind them, including decisions and clarifications made along the way. Don't rely on the report alone.\n\n\
          Checklist:\n\
-         1. For every acceptance criterion, check the evidence is real: re-run the command and compare, open the artifact, look at the screenshot with view_image.\n\
-         2. Does the diff do what the brief asks and only that? Flag unrelated files, scope creep, leftovers and anything half-done.\n\
+         1. Is the report true? Re-run what it cites and compare, open any artifact, look at any screenshot with view_image.\n\
+         2. Is the scope delivered, and only that? A scope change or something left out needs a good reason in the report or the room. Flag unrelated files, leftovers and anything half-done.\n\
          3. Are there tests for new behaviour, and do they pass?\n\
          4. Anything unsafe, hard-coded or fragile; any claim in the report the diff does not support.\n\
          5. Content work: does it fit the audience, length, tone and definition of good in the ledger? Would its real reader accept it? For ideas and proposals, is each one specific and worth paying for?\n\n\
-         Finish by calling submit_review (task_id {id}): verdict approve only if every criterion is met, otherwise changes with one finding per problem (file:line, what is wrong, what to do).",
+         Finish by calling submit_review (task_id {id}): verdict approve only if the scope is delivered and the report holds up, and say what you ran; otherwise changes with one finding per problem (file:line, what is wrong, what to do).",
         title = task.title,
         id = task.id,
         ledger = state.render(true),
         summary = report.summary,
-        evidence = crate::review_tools::evidence_lines(state),
         workspace = workspace.display(),
     )
 }

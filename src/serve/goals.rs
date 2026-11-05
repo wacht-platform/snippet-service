@@ -27,11 +27,12 @@ struct ListQuery {
 
 fn summary(goal: &Goal, tasks: &[Task]) -> Value {
     let (done, total) = progress(tasks);
+    let in_force = goal.acceptance.iter().filter(|c| c.dropped.is_empty()).count();
     json!({
         "id": goal.id, "title": goal.title, "outcome": goal.outcome, "status": goal.status,
         "requester": goal.requester, "created_at": goal.created_at, "closed_at": goal.closed_at,
         "progress": {"done": done, "total": total},
-        "evidence": {"have": goal.acceptance.len() - goal.unevidenced().len(), "total": goal.acceptance.len()},
+        "evidence": {"have": in_force - goal.unevidenced().len(), "total": in_force},
         "attention": attention(goal, tasks).map(goals::Attention::as_str),
     })
 }
@@ -120,7 +121,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let mut goal = Goal::new(
             "g".into(), "Launch".into(), "Live".into(),
-            vec![GoalCriterion { criterion: "loads".into(), method: VerifyMethod::Command, evidence: String::new() }],
+            vec![GoalCriterion { criterion: "loads".into(), method: VerifyMethod::Command, evidence: String::new(), dropped: String::new() }],
             "user".into(), "2026-01-01T00:00:00Z".into(),
         );
         goal.plan = json!({"slices": [{"n": 0, "task_id": "a", "title": "A", "depends_on": []}, {"n": 1, "task_id": "b", "title": "B", "depends_on": [0]}]});

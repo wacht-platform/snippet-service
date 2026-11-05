@@ -222,7 +222,7 @@ mod tests {
             "call `user_on_call` first",
             "A draft isn't done",
             "goes under `## Standing rules`",
-            "passing the criteria doesn't make it good",
+            "covering the scope doesn't make it good",
         ] {
             assert!(MISSION_CONTROL_LAYER.contains(guard), "missing: {guard}");
         }
