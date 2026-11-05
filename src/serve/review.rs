@@ -5,8 +5,6 @@ use crate::harness::{LaneSpawn, LoopInput};
 
 use super::Daemon;
 
-const DIFF_CHARS: usize = 40_000;
-
 /// With nobody seated to review, the agent doing the work checks it from a fresh
 /// read-only lane, which hasn't seen its reasoning.
 fn pick_reviewer(d: &Daemon, task: &Task) -> Option<String> {
@@ -27,15 +25,12 @@ fn git(workspace: &std::path::Path, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// The brief a reviewer lane starts from: the ledger, what the worker claims,
-/// the diff since dispatch and what to check.
+/// The brief a reviewer starts from: the ledger, what the worker claims, which
+/// commits and files changed, where to read the details and what to check.
 pub(super) fn review_brief(task: &Task, state: &TaskState, workspace: &std::path::Path) -> String {
     let base = if state.dispatch_rev.is_empty() { "HEAD" } else { state.dispatch_rev.as_str() };
     let stat = git(workspace, &["diff", "--stat", base]);
-    let mut diff = git(workspace, &["diff", base]);
-    if diff.chars().count() > DIFF_CHARS {
-        diff = format!("{}\n… diff clipped; run `git diff {base} -- <path>` for the rest", diff.chars().take(DIFF_CHARS).collect::<String>());
-    }
+    let commits = git(workspace, &["log", "--oneline", &format!("{base}..HEAD")]);
     let untracked = git(workspace, &["ls-files", "--others", "--exclude-standard"]);
     let report = state.pending_report.clone().unwrap_or_default();
     format!(
@@ -43,7 +38,8 @@ pub(super) fn review_brief(task: &Task, state: &TaskState, workspace: &std::path
          {ledger}\n\n\
          worker's report:\n{summary}\n\n\
          evidence the worker gave:\n{evidence}\n\n\
-         workspace: {workspace}\ndiff since dispatch ({base}):\n{stat}\nnew untracked files:\n{untracked}\n```diff\n{diff}\n```\n\n\
+         workspace: {workspace}\ncommits since dispatch ({base}):\n{commits}\nfiles changed:\n{stat}\nnew untracked files:\n{untracked}\n\n\
+         Read the work yourself: `git -C {workspace} diff {base} -- <path>` for the changes, and read_coordination_thread with thread_id `task:{id}` for the conversation behind them, including decisions and clarifications made along the way. Don't rely on the report alone.\n\n\
          Checklist:\n\
          1. For every acceptance criterion, check the evidence is real: re-run the command and compare, open the artifact, look at the screenshot with view_image.\n\
          2. Does the diff do what the brief asks and only that? Flag unrelated files, scope creep, leftovers and anything half-done.\n\
@@ -136,7 +132,7 @@ mod tests {
     use crate::coordination::PendingReport;
 
     #[test]
-    fn the_review_brief_carries_ledger_report_diff_and_checklist() {
+    fn the_review_brief_lists_files_and_points_at_the_diff_and_room() {
         let dir = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success());
         run(&["init", "-q", "-b", "main"]);
@@ -152,8 +148,9 @@ mod tests {
         state.dispatch_rev = base;
         state.pending_report = Some(PendingReport { summary: "changed a".into(), artifacts: vec![] });
         let brief = review_brief(&task, &state, dir.path());
-        for needle in ["[task_ledger v1]", "worker's report:\nchanged a", "-one", "+two", "submit_review (task_id r1)", "Checklist"] {
+        for needle in ["[task_ledger v1]", "worker's report:\nchanged a", "a.txt", "thread_id `task:r1`", "submit_review (task_id r1)", "Checklist"] {
             assert!(brief.contains(needle), "missing {needle}: {brief}");
         }
+        assert!(!brief.contains("+two"), "the diff itself stays out of the brief: {brief}");
     }
 }
