@@ -381,6 +381,7 @@ impl AgentRuntime {
             tools.remove(name);
         }
         tools.insert(crate::progress::ReportProgress);
+        tools.insert(crate::review_tools::SubmitReview);
 
         let prompt_ctx = i.prompt_ctx;
         let custom_section = custom_dir.as_deref().map(crate::agent_tools::prompt_section);

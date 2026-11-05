@@ -226,6 +226,20 @@ impl Store {
 
 impl Store {
     /// When the session last made a model call for a real turn (not keep-warm).
+    /// Tokens not served from cache, across these sessions since a unix time.
+    pub fn fresh_tokens_for_sessions(&self, sessions: &[String], since: i64) -> Result<u64, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(SUM(MAX(total_tokens - cache_read_tokens, 0)), 0) FROM usage_ledger WHERE session_id = ?1 AND at >= ?2",
+            )?;
+            let mut total: i64 = 0;
+            for session in sessions {
+                total += stmt.query_row(rusqlite::params![session, since], |row| row.get::<_, i64>(0))?;
+            }
+            Ok(total.max(0) as u64)
+        })
+    }
+
     pub fn last_turn_at(&self, session_id: &str) -> Result<Option<i64>, StoreError> {
         self.with_connection(|conn| {
             conn.query_row(

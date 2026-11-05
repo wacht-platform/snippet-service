@@ -15,6 +15,9 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolResult};
 /// Reviews that may send work back before every later report goes to Mission Control.
 pub const REVIEW_CHANGE_ROUNDS: u32 = 1;
 
+/// Rounds with a seated reviewer before the disagreement goes to Mission Control.
+pub const SEATED_REVIEW_ROUNDS: u32 = 4;
+
 /// A reviewer silent for this long is replaced by Mission Control.
 pub const REVIEW_TIMEOUT_SECS: i64 = 45 * 60;
 
@@ -29,6 +32,29 @@ pub fn route(state: &crate::coordination::TaskState) -> VerifyMode {
         VerifyMode::Reviewer if state.review_rounds >= REVIEW_CHANGE_ROUNDS => VerifyMode::MissionControl,
         mode => mode,
     }
+}
+
+/// The member seated to review this task, unless it holds the turn itself.
+pub fn seated_reviewer(store: &Store, task: &Task) -> Option<crate::coordination::TaskAgent> {
+    store
+        .list_task_agents(&task.id)
+        .ok()?
+        .into_iter()
+        .find(|m| m.role == "reviewer" && m.removed_at.is_none() && m.status != "active")
+}
+
+/// Who verifies this task's next report. A seated reviewer outranks the ledger's
+/// mode, because only its approval may end the work.
+pub fn review_route(store: &Store, task: &Task, state: &crate::coordination::TaskState) -> VerifyMode {
+    if seated_reviewer(store, task).is_none() {
+        let reviewer_reports = store
+            .list_task_agents(&task.id)
+            .unwrap_or_default()
+            .iter()
+            .any(|m| m.role == "reviewer" && m.status == "active" && m.removed_at.is_none());
+        return if reviewer_reports { VerifyMode::SelfCheck } else { route(state) };
+    }
+    if state.review_rounds >= SEATED_REVIEW_ROUNDS { VerifyMode::MissionControl } else { VerifyMode::Reviewer }
 }
 
 pub fn evidence_lines(state: &crate::coordination::TaskState) -> String {
@@ -69,7 +95,7 @@ pub fn gate_done(
         .modify_task_state(&task.id, now, |s| s.evidence = evidence.to_vec())
         .map_err(|e| ToolError::msg(format!("record evidence: {e}")))?;
     crate::task_state_tools::sync_changed_files(store, task, now);
-    let mode = route(&state);
+    let mode = review_route(store, task, &state);
     Ok((mode != VerifyMode::SelfCheck).then_some(mode))
 }
 
@@ -169,6 +195,9 @@ pub fn approve_pending(
     });
     let patch = crate::coordination::StatePatch { add_decisions: vec![decision.to_string()], ..Default::default() };
     let _ = store.patch_task_state(&task.id, &patch, None, by, &now);
+    if let Some(workspace) = crate::members::task_workspace(store, task) {
+        crate::members::close_turn(store, task, &workspace, &now);
+    }
     crate::mission_tools::announce_report(ctx, store, &done, TaskStatus::Done, &pending.summary, now);
     Ok(done)
 }
@@ -193,6 +222,16 @@ pub fn revise_task(store: &Store, task_id: &str, feedback: &str, by: &str, now: 
     }
     let before = store.get_task(task_id).map_err(|e| ToolError::msg(e.to_string()))?.ok_or_else(|| ToolError::msg(format!("no task `{task_id}`")))?;
     let reopened = store.reopen_for_revision(task_id, now).map_err(|e| ToolError::msg(e.to_string()))?;
+    let back = crate::members::working_session(store, &reopened);
+    let reopened = store
+        .update_task_in(task_id, now, |t| t.reporting_session = Some(back.clone()))
+        .map_err(|e| ToolError::msg(e.to_string()))?;
+    if let Some(holder) = reopened_holder(store, task_id)
+        && let Some(workspace) = crate::members::task_workspace(store, &reopened)
+    {
+        let snap = serde_json::to_string(&crate::members::snapshot(&workspace)).unwrap_or_default();
+        let _ = store.open_turn(task_id, &holder, &back, &snap, now);
+    }
     let previous = before.result.as_ref().map(|r| PendingReport { summary: r.summary.clone(), artifacts: r.artifacts.iter().map(|p| p.display().to_string()).collect() });
     let state = store
         .modify_task_state(task_id, now, |s| {
@@ -211,9 +250,18 @@ pub fn revise_task(store: &Store, task_id: &str, feedback: &str, by: &str, now: 
     let state = store.task_state(task_id).ok().flatten().unwrap_or(state);
     let envelope = revision_envelope(&reopened, &state, feedback, by);
     store
-        .send_task_notice(("agent", by), &reopened.session_id, &reopened.id, "task_brief", &envelope, now)
+        .send_task_notice(("agent", by), &back, &reopened.id, "task_brief", &envelope, now)
         .map_err(|e| ToolError::msg(format!("send revision: {e}")))?;
     Ok(reopened)
+}
+
+fn reopened_holder(store: &Store, task_id: &str) -> Option<String> {
+    store
+        .list_task_agents(task_id)
+        .ok()?
+        .into_iter()
+        .find(|m| m.status == "active" && m.removed_at.is_none())
+        .map(|m| m.agent_id)
 }
 
 #[derive(Deserialize)]
@@ -254,8 +302,17 @@ impl Tool for SubmitReview {
         let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
         let is_mc = ctx.agent_id() == Some(crate::mission_control::SESSION_ID)
             || ctx.durable_session_id().is_some_and(|s| canonical(s) == crate::mission_control::SESSION_ID);
+        let seat = ctx
+            .durable_session_id()
+            .filter(|_| ctx.lane_origin().is_none())
+            .and_then(|s| store.member_by_session(s).ok().flatten())
+            .filter(|m| m.role == "reviewer");
         let task = match args.task_id.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(id) => store.get_task(id).map_err(|e| ToolError::msg(e.to_string()))?.ok_or_else(|| ToolError::msg(format!("no task `{id}`")))?,
+            None if seat.is_some() => {
+                let id = seat.as_ref().map(|m| m.task_id.clone()).unwrap_or_default();
+                store.get_task(&id).map_err(|e| ToolError::msg(e.to_string()))?.ok_or_else(|| ToolError::msg(format!("no task `{id}`")))?
+            }
             None => {
                 let origin = ctx.lane_origin().map(|(s, _)| canonical(s)).ok_or_else(|| ToolError::msg("name a task_id"))?;
                 store
@@ -279,11 +336,17 @@ impl Tool for SubmitReview {
             }
             return Err(ToolError::msg(format!("task `{}` is {}, not in review", task.id, task.status)));
         }
+        let seated_here = seat.as_ref().filter(|m| m.task_id == task.id && m.status != "active");
         let reviewer = if is_mc {
             crate::mission_control::SESSION_ID.to_string()
+        } else if let Some(member) = seated_here {
+            if review_route(&store, &task, &state) != VerifyMode::Reviewer {
+                return Err(ToolError::msg("this review has used its rounds and is with Mission Control now"));
+            }
+            member.agent_id.clone()
         } else {
             let lane_of_worker = ctx.lane_origin().is_some_and(|(s, _)| canonical(s) == canonical(&task.session_id));
-            if !lane_of_worker || route(&state) != VerifyMode::Reviewer {
+            if !lane_of_worker || review_route(&store, &task, &state) != VerifyMode::Reviewer {
                 return Err(ToolError::msg("only the reviewer of this task, or Mission Control when it holds the verification, may give a verdict"));
             }
             ctx.agent_id().unwrap_or("reviewer").to_string()
@@ -327,6 +390,7 @@ impl Tool for SubmitReview {
                 t.reporting_session = Some(back);
             })
             .map_err(|e| ToolError::msg(e.to_string()))?;
+        post_room(ctx, &store, &reopened, "task.review_findings", &format!("{reviewer} sent the work back (round {rounds}):\n{}", findings.join("\n")));
         let envelope = format!(
             "[review_findings]\ntask_id: {}\ntitle: {}\nreviewer: {reviewer}\nround: {rounds}\nThe review sent this task back. Fix every finding, then report again with report_mission_task (task_id {}) and evidence for each acceptance criterion.\nfindings:\n{}\n{}\n[/review_findings]",
             task.id,
@@ -336,9 +400,9 @@ impl Tool for SubmitReview {
             state.render(false),
         );
         store
-            .send_task_notice(("agent", &reviewer), &task.session_id, &task.id, "task_brief", &envelope, &now)
+            .send_task_notice(("agent", &reviewer), reopened.reporting_session.as_deref().unwrap_or(&task.session_id), &task.id, "task_brief", &envelope, &now)
             .map_err(|e| ToolError::msg(format!("send findings: {e}")))?;
-        Ok(ToolResult::success(json!({"task_id": reopened.id, "status": "in_progress", "sent_back_to": reopened.session_id})))
+        Ok(ToolResult::success(json!({"task_id": reopened.id, "status": "in_progress", "sent_back_to": reopened.reporting_session})))
     }
 }
 

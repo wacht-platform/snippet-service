@@ -7,16 +7,12 @@ use super::Daemon;
 
 const DIFF_CHARS: usize = 40_000;
 
-/// The agent that reviews a task: the one seated, otherwise the agent doing the
-/// work, in a fresh read-only lane. Any agent can review.
+/// With nobody seated to review, the agent doing the work checks it from a fresh
+/// read-only lane, which hasn't seen its reasoning.
 fn pick_reviewer(d: &Daemon, task: &Task) -> Option<String> {
     let roster = d.store.list_task_agents(&task.id).unwrap_or_default();
     let live = || roster.iter().filter(|m| m.removed_at.is_none());
-    live()
-        .find(|m| m.role == "reviewer")
-        .or_else(|| live().find(|m| m.status == "active"))
-        .or_else(|| live().next())
-        .map(|m| m.agent_id.clone())
+    live().find(|m| m.status == "active").or_else(|| live().next()).map(|m| m.agent_id.clone())
 }
 
 fn git(workspace: &std::path::Path, args: &[&str]) -> String {
@@ -72,7 +68,7 @@ pub(super) async fn drive_reviews(d: &Daemon) {
     let stamp = now.to_rfc3339();
     for task in tasks {
         let Ok(Some(state)) = d.store.task_state(&task.id) else { continue };
-        if state.review_escalated || crate::review_tools::route(&state) != VerifyMode::Reviewer {
+        if state.review_escalated || crate::review_tools::review_route(&d.store, &task, &state) != VerifyMode::Reviewer {
             continue;
         }
         if state.review_started_at.is_empty() {
@@ -86,7 +82,8 @@ pub(super) async fn drive_reviews(d: &Daemon) {
             || crate::session::state_path_for_id(&task.session_id)
                 .and_then(|p| crate::session::read_session_meta(&p))
                 .is_some_and(|meta| meta.lanes.iter().any(|l| l.status == crate::lanes::LaneStatus::Running));
-        if elapsed_secs > crate::review_tools::REVIEW_TIMEOUT_SECS || !lane_alive {
+        let seated = crate::review_tools::seated_reviewer(&d.store, &task).is_some();
+        if elapsed_secs > crate::review_tools::REVIEW_TIMEOUT_SECS || (!seated && !lane_alive) {
             crate::review_tools::escalate(&d.store, &task.id, "the reviewer gave no verdict in time; check the work and submit_review yourself", &stamp);
         }
     }
@@ -100,6 +97,23 @@ async fn start_review(d: &Daemon, task: &Task, state: &TaskState, now: &str) {
         crate::review_tools::escalate(&d.store, &task.id, "no reviewer could start: the work session's workspace is gone", now);
         return;
     };
+    if let Some(member) = crate::review_tools::seated_reviewer(&d.store, task) {
+        crate::members::seat_holder(&d.store, task);
+        match crate::members::seat(&d.store, task, &member.agent_id, now) {
+            Ok(session) => {
+                let _ = d.store.modify_task_state(&task.id, now, |s| s.review_started_at = now.to_string());
+                let brief = review_brief(task, state, &workspace);
+                let envelope = format!(
+                    "[review_request]\ntask_id: {}\nround: {}\nYou are the reviewer seated on this task, in your own conversation. Only your approval finishes the work. Ask the worker anything you need in the room (post_task_coordination with `to`).\n\n{brief}\n[/review_request]",
+                    task.id,
+                    state.review_rounds + 1,
+                );
+                d.deliver(&session, LoopInput::UserMessage(envelope)).await;
+            }
+            Err(error) => crate::review_tools::escalate(&d.store, &task.id, &format!("the seated reviewer {} couldn't start: {error}; check the work and submit_review yourself.", member.agent_id), now),
+        }
+        return;
+    }
     let Some(reviewer) = pick_reviewer(d, task) else {
         crate::review_tools::escalate(&d.store, &task.id, "this task has no agent to review it; check the work and submit_review yourself", now);
         return;

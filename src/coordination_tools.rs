@@ -1132,6 +1132,10 @@ impl Tool for PostTaskCoordination {
             }) {
                 return Err(ToolError::msg(format!("`{stranger}` isn't on this task. Use invite_task_agent to bring them in.")));
             }
+            crate::members::seat_holder(&db, &task);
+            for agent in to.iter().filter(|a| a.as_str() != crate::mission_control::SESSION_ID) {
+                crate::members::seat(&db, &task, agent, &now_rfc3339()).map_err(ToolError::msg)?;
+            }
             payload["to"] = json!(to);
         }
         for (key, value) in crate::coordination::typed::payload_fields(kind, urgency, None) {

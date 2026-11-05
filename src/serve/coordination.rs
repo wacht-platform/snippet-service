@@ -738,12 +738,17 @@ pub fn board_message_envelope_with_task(
             task_meta.push_str(&format!("{ledger}\n"));
         }
     }
-    format!(
-        "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n{tags}{task_meta}\
-         note: a teammate posted on the shared task board; this isn't a turn in your own \
+    let note = if event.event_type == "task.lease_transferred" {
+        "the turn on this task has passed to you: it's yours to carry out here, and you may change files now."
+    } else {
+        "a teammate posted on the shared task board; this isn't a turn in your own \
          conversation. If it needs your input or changes what you're doing, reply (post_task_coordination on a task thread, \
          send_agent_message to the sender elsewhere) or act on it; if not, end your turn \
-         without a reply. inspect_task shows the task's plan and roster; only recent history is \
+         without a reply."
+    };
+    format!(
+        "[coordination_board_message]\nthread_id: {}\nfrom_id: {}\nfrom_kind: {}\n{tags}{task_meta}\
+         note: {note} inspect_task shows the task's plan and roster; only recent history is \
          shown here, and read_coordination_thread has more.\n{history}body: {body}\n\
          [/coordination_board_message]",
         event.thread_id,
@@ -763,6 +768,41 @@ pub(super) fn should_wake_mission_control(actor_id: &str) -> bool {
 /// Consecutive agent-to-agent messages after which a room stops waking anyone
 /// until a human posts. Without it two agents can answer each other forever.
 pub(super) const MAX_AGENT_CHAIN: usize = 8;
+
+/// Limits for a room of seated members, counted from the last human or Mission
+/// Control post. They stand in for the chain stop above, which would end real
+/// collaboration, and hitting one asks rather than going silent.
+const ROOM_TALK_BUDGET: usize = 40;
+const ROOM_TURN_BUDGET: usize = 20;
+const ROOM_HOURS_BUDGET: i64 = 12;
+const ROOM_TOKEN_BUDGET: u64 = 5_000_000;
+
+/// Why a room of seated members should stop waking anyone, if it should.
+pub(super) fn room_over_budget(events: &[CoordinationEvent], now: chrono::DateTime<chrono::Utc>, tokens: u64) -> Option<String> {
+    let mc = crate::mission_control::SESSION_ID;
+    let start = events
+        .iter()
+        .rposition(|e| e.actor_kind == "human" || (e.actor_id == mc && CHATTER_EVENTS.contains(&e.event_type.as_str())))
+        .map_or(0, |at| at + 1);
+    let run = &events[start..];
+    let turns = run.iter().filter(|e| e.event_type == "task.lease_transferred").count();
+    let last_pass = run.iter().rposition(|e| e.event_type == "task.lease_transferred").map_or(0, |at| at + 1);
+    let talk = run[last_pass..].iter().filter(|e| CHATTER_EVENTS.contains(&e.event_type.as_str())).count();
+    if talk >= ROOM_TALK_BUDGET {
+        return Some(format!("{talk} messages since the turn last moved, so they may be going in circles"));
+    }
+    if turns >= ROOM_TURN_BUDGET {
+        return Some(format!("the turn has passed {turns} times"));
+    }
+    if tokens >= ROOM_TOKEN_BUDGET {
+        return Some(format!("its members have used about {tokens} fresh tokens"));
+    }
+    let hours = run
+        .first()
+        .and_then(|e| chrono::DateTime::parse_from_rfc3339(&e.created_at).ok())
+        .map_or(0, |at| (now - at.with_timezone(&chrono::Utc)).num_hours());
+    (hours >= ROOM_HOURS_BUDGET).then(|| format!("they have been at it for {hours} hours"))
+}
 
 /// Events that are recorded on the room but are not worth a turn for anyone.
 const QUIET_EVENTS: &[&str] = &["task.agent_assigned", "task.dispatched"];
@@ -835,7 +875,8 @@ pub(super) fn wake_targets(
     human_at: Option<&str>,
 ) -> Vec<WakeTarget> {
     let mc = crate::mission_control::SESSION_ID;
-    if QUIET_EVENTS.contains(&event.event_type.as_str()) || agent_chain_exhausted(history, event, human_at) {
+    let seats = roster.iter().any(|m| m.removed_at.is_none() && m.work_session_id.as_deref().is_some_and(|s| !s.is_empty()));
+    if QUIET_EVENTS.contains(&event.event_type.as_str()) || (!seats && agent_chain_exhausted(history, event, human_at)) {
         return Vec::new();
     }
     let mut targets: Vec<WakeTarget> = Vec::new();
@@ -980,6 +1021,17 @@ pub async fn wake_coordination_thread_participants(
         .as_ref()
         .and_then(|t| d.store.list_task_agents(&t.id).ok())
         .unwrap_or_default();
+    if let Some(task) = task.as_ref().filter(|_| roster.iter().any(|m| m.removed_at.is_none() && m.work_session_id.as_deref().is_some_and(|s| !s.is_empty()))) {
+        let events = d.store.events_for_thread(&saved.thread_id, 0, 2000).unwrap_or_default();
+        let sessions: Vec<String> = roster.iter().filter_map(|m| m.work_session_id.clone()).collect();
+        let since = chrono::DateTime::parse_from_rfc3339(&task.created_at).map_or(0, |at| at.timestamp());
+        let tokens = d.store.fresh_tokens_for_sessions(&sessions, since).unwrap_or(0);
+        if let Some(reason) = room_over_budget(&events, chrono::Utc::now(), tokens) {
+            let note = format!("The room stopped waking its members: {reason}. Check the room; a post from you lets them carry on, or take it to the user.");
+            let _ = d.store.update_task_in(&task.id, &chrono::Utc::now().to_rfc3339(), |t| t.notify_once("room_limit", &note));
+            return;
+        }
+    }
     let idle_agents: Vec<String> = d
         .store
         .list_agents()
