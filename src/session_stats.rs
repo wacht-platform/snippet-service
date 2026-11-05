@@ -34,6 +34,20 @@ fn default_branch(dir: &Path) -> Option<String> {
     })
 }
 
+/// The commit the branch was created from, when that is later than `merge_base`. A branch cut from
+/// a line that diverged from the default branch would otherwise count that whole line as its work.
+/// After a rebase or a merge from the default branch the commit no longer qualifies.
+fn branch_start(root: &Path, merge_base: &str) -> Option<String> {
+    let branch = git_out(root, &["symbolic-ref", "--short", "HEAD"])?;
+    let log = git_out(root, &["reflog", "show", "--format=%H %gs", branch.trim()])?;
+    let (commit, subject) = log.lines().last()?.split_once(' ')?;
+    if !subject.contains("Created from") {
+        return None;
+    }
+    let is_ancestor = |older: &str, newer: &str| git_out(root, &["merge-base", "--is-ancestor", older, newer]).is_some();
+    (is_ancestor(commit, "HEAD") && is_ancestor(merge_base, commit)).then(|| commit.to_string())
+}
+
 const UNTRACKED_FILE_LIMIT: usize = 5000;
 const UNTRACKED_BYTES_LIMIT: u64 = 1024 * 1024;
 
@@ -58,8 +72,9 @@ pub fn worktree_changes(workspace: &Path) -> Option<Changes> {
     let root = git_out(workspace, &["rev-parse", "--show-toplevel"])?;
     let root = Path::new(root.trim());
     let base = default_branch(root)?;
-    let fork = git_out(root, &["merge-base", "HEAD", &base])?;
-    let fork = fork.trim();
+    let merge_base = git_out(root, &["merge-base", "HEAD", &base])?;
+    let fork = branch_start(root, merge_base.trim()).unwrap_or_else(|| merge_base.trim().to_string());
+    let fork = fork.as_str();
     let tracked = git_out(root, &["-c", "core.quotepath=off", "diff", "--numstat", "--no-renames", fork])?;
     let tracked = crate::checkpoint::parse_numstat(&tracked);
     let untracked = git_out(root, &["ls-files", "-z", "--others", "--exclude-standard"])?;
