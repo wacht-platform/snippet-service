@@ -420,6 +420,10 @@ fn ask_user_choice_question_takes_a_typed_answer() {
             title: title.into(),
             status: "idle".into(),
             last_active: at,
+            agent_id: None,
+            task_id: None,
+            parent_session_id: None,
+            members: None,
         }
     }
 

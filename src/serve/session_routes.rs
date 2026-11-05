@@ -405,6 +405,24 @@ pub(crate) async fn purge_session(d: &Shared, id: &str, keep_memory: bool) -> bo
         crate::memory::delete_session_memory(id);
     }
     crate::artifacts::delete_session(id);
+    if let Ok(members) = d.store.session_members(id) {
+        for m in members {
+            if let Some(ref child_id) = m.work_session_id {
+                if child_id != id {
+                    if let Some(s) = d.sessions.lock().await.remove(child_id) {
+                        s.join.abort();
+                    }
+                    if let Some(csp) = state_path_for_id(child_id) {
+                        crate::session::remove_session_files(&csp);
+                    }
+                    if !keep_memory {
+                        crate::memory::delete_session_memory(child_id);
+                    }
+                    crate::artifacts::delete_session(child_id);
+                }
+            }
+        }
+    }
     true
 }
 

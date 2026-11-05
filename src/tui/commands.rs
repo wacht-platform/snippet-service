@@ -409,6 +409,10 @@ impl App {
                     title: s.title,
                     status: s.status,
                     last_active: s.last_active,
+                    agent_id: s.agent_id,
+                    task_id: s.task_id,
+                    parent_session_id: s.parent_session_id,
+                    members: s.members,
                 })
                 .collect(),
         };

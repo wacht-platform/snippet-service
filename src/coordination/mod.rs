@@ -14,6 +14,7 @@ mod events;
 pub mod goals;
 pub mod handoffs;
 pub mod turns;
+pub use turns::SessionMember;
 mod identity;
 pub mod leases;
 pub mod schema;

@@ -302,7 +302,7 @@ pub async fn open_session(
 /// Mirrors `session::SessionInfo` — the TUI renders from this instead of walking
 /// the filesystem, so a conversation that lives in the database appears in the
 /// picker exactly like one on disk.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionRow {
     /// Stable id (path relative to the workspaces root). Used to attach.
     pub id: String,
@@ -323,6 +323,14 @@ pub struct SessionRow {
     pub status: String,
     #[serde(default)]
     pub last_active: i64,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub members: Option<Vec<crate::session::SessionMember>>,
 }
 
 /// GET /sessions[?folder=] — the daemon's session catalog.
@@ -356,6 +364,30 @@ pub async fn list_sessions(
     resp.json::<Vec<SessionRow>>()
         .await
         .map_err(|e| format!("list sessions body: {e}"))
+}
+
+/// GET /sessions/members?session_id= — fetch members of a session.
+pub async fn session_members(
+    info: &DaemonInfo,
+    session_id: &str,
+) -> Result<Vec<crate::session::SessionMember>, String> {
+    let url = format!("{}/sessions/members", info.api_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .query(&[("token", info.token.clone()), ("session_id", session_id.to_string())])
+        .send()
+        .await
+        .map_err(|e| format!("session members: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("session members failed: {}", resp.status()));
+    }
+    resp.json::<Vec<crate::session::SessionMember>>()
+        .await
+        .map_err(|e| format!("parse session members: {e}"))
 }
 
 /// POST /session/delete — remove a conversation from wherever it lives.

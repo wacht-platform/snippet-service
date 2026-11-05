@@ -13,6 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::builtins::coding_tools;
 use crate::config::{InferenceProfileConfig, SnippetConfig, workspaces_root};
 use crate::coordination::{AgentHome, IdentityError};
+pub use crate::coordination::SessionMember;
 use crate::harness::{CodingHarness, HarnessConfig, HarnessState, LoopInput};
 use crate::lanes::ModelFactory;
 use crate::llm::StreamHandle;
@@ -757,6 +758,15 @@ pub struct SessionInfo {
     pub idle_secs: i64,
     /// `warm` while the provider prompt cache is assumed alive, else `cold`.
     pub cache: &'static str,
+    /// The task this session is working on or seated in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    /// Set when this conversation is a member seat on a task, pointing to the parent task session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Members seated on this session's task (on the parent session).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<SessionMember>>,
 }
 
 /// The inbox session id for an agent: `inbox-<agent-id>`.
@@ -886,6 +896,7 @@ pub fn write_session_profile(state_path: &std::path::Path, profile: &str) {
 ///
 /// Built in one pass over the board so the session list stays a single query per
 /// table, rather than one per row.
+#[allow(dead_code)]
 fn working_agents_by_session() -> std::collections::HashMap<String, String> {
     match store_for_sessions() {
         Some(store) => working_agents_in(&store),
@@ -895,6 +906,7 @@ fn working_agents_by_session() -> std::collections::HashMap<String, String> {
 
 /// The mapping itself, against a given store — so it can be asserted directly
 /// rather than only through the global session path.
+#[allow(dead_code)]
 fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
     let Ok(tasks) = store.list_tasks(None, None) else {
@@ -920,6 +932,73 @@ fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<S
     out
 }
 
+#[derive(Debug, Default)]
+pub struct SessionTaskContexts {
+    pub seats: std::collections::HashMap<String, (String, String, Option<String>)>,
+    pub parent_tasks: std::collections::HashMap<String, String>,
+    pub workers: std::collections::HashMap<String, String>,
+    pub members: std::collections::HashMap<String, Vec<SessionMember>>,
+}
+
+pub fn session_task_contexts(store: &crate::store::Store) -> SessionTaskContexts {
+    let mut contexts = SessionTaskContexts::default();
+    let records = match store.task_seating_records() {
+        Ok(r) => r,
+        Err(_) => return contexts,
+    };
+    for (task_id, session_id, task_status, agent_id, role, member_status, work_session_id) in records {
+        let parent_canon = crate::conversations::canonical_session_id(&session_id).0;
+        if parent_canon.is_empty() || is_inbox_session_id(&parent_canon) || is_lane_session_id(&parent_canon) {
+            continue;
+        }
+        let is_terminal = matches!(task_status.as_str(), "done" | "failed" | "cancelled");
+
+        let is_primary_for_parent = match contexts.parent_tasks.get(&parent_canon) {
+            Some(existing) => existing == &task_id,
+            None => {
+                contexts.parent_tasks.insert(parent_canon.clone(), task_id.clone());
+                true
+            }
+        };
+
+        if let Some(agent) = agent_id {
+            let role_str = role.unwrap_or_else(|| "collaborator".to_string());
+            let status_str = member_status.unwrap_or_else(|| "waiting".to_string());
+            let is_holder = status_str == "active";
+
+            let work_canon = work_session_id.as_deref().map(|ws| crate::conversations::canonical_session_id(ws).0);
+
+            if is_holder && !is_terminal {
+                contexts.workers.entry(parent_canon.clone()).or_insert_with(|| agent.clone());
+                if let Some(ref ws) = work_canon {
+                    contexts.workers.entry(ws.clone()).or_insert_with(|| agent.clone());
+                }
+            }
+
+            if let Some(ref ws) = work_canon {
+                if ws != &parent_canon && !is_inbox_session_id(ws) && !is_lane_session_id(ws) {
+                    contexts.seats.entry(ws.clone()).or_insert_with(|| {
+                        (parent_canon.clone(), task_id.clone(), Some(agent.clone()))
+                    });
+                }
+            }
+
+            if is_primary_for_parent {
+                contexts.members.entry(parent_canon.clone()).or_default().push(SessionMember {
+                    task_id: task_id.clone(),
+                    session_id: parent_canon.clone(),
+                    agent_id: agent,
+                    role: role_str,
+                    status: status_str,
+                    work_session_id: work_canon,
+                    is_holder,
+                });
+            }
+        }
+    }
+    contexts
+}
+
 /// Every session the store holds, unfiltered — INCLUDING agent inboxes.
 ///
 /// Only usage accounting wants this. An inbox runs a real model, so its tokens
@@ -927,8 +1006,8 @@ fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<S
 /// device actually used. Everything that presents sessions to a person uses
 /// [`list_device_sessions`] instead.
 pub fn all_device_sessions() -> Vec<SessionInfo> {
-    let workers = working_agents_by_session();
     let store = store_for_sessions();
+    let contexts = store.as_ref().map(session_task_contexts).unwrap_or_default();
     let now = now_unix_secs();
     let mut out: Vec<SessionInfo> = store
         .as_ref()
@@ -944,19 +1023,28 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                         .and_then(|s| s.current_attention(&row.id).ok().flatten())
                 })
                 .flatten();
+            let (task_id, parent_session_id, agent_id, members) = if let Some((parent_id, task_id, seated_agent)) = contexts.seats.get(&row.id) {
+                (Some(task_id.clone()), Some(parent_id.clone()), row.agent_id.or_else(|| seated_agent.clone()), None)
+            } else {
+                (
+                    contexts.parent_tasks.get(&row.id).cloned(),
+                    None,
+                    row.agent_id,
+                    contexts.members.get(&row.id).cloned(),
+                )
+            };
+            let worker_agent_id = contexts.workers.get(&row.id).cloned();
             SessionInfo {
                 attention,
                 conversation: conversation_name_from_id(&row.id).to_string(),
-                // Read before `row.id` is moved out below — struct-literal
-                // fields evaluate in the order written.
-                worker_agent_id: workers.get(&row.id).cloned(),
+                worker_agent_id,
                 profile: row.profile.clone().filter(|p| !p.trim().is_empty()),
                 id: row.id,
                 folder: row.workspace,
                 title: row.title.unwrap_or_default(),
                 status: row.status,
                 last_active: row.last_active.unwrap_or(0),
-                agent_id: row.agent_id,
+                agent_id,
                 origin_folder: origin.as_ref().map(|o| o.folder.display().to_string()),
                 branch: origin.and_then(|o| o.branch),
                 settled: row.settled_at.is_some(),
@@ -968,6 +1056,9 @@ pub fn all_device_sessions() -> Vec<SessionInfo> {
                 running_since: None,
                 idle_secs: crate::settle::idle_secs(now, row.last_active.unwrap_or(0)),
                 cache: crate::settle::cache_state(crate::settle::idle_secs(now, row.last_active.unwrap_or(0))),
+                task_id,
+                parent_session_id,
+                members,
             }
         })
         .collect();
@@ -1023,11 +1114,12 @@ pub fn is_routable_target(id: &str) -> bool {
 }
 
 /// Same catalog as [`list_device_sessions`], without Mission Control itself and
-/// without agent inboxes — neither is a place work runs.
+/// without agent inboxes — neither is a place work runs. Seated member conversations
+/// are also excluded so work is not dispatched into a collaborator seat.
 pub fn list_routable_sessions() -> Vec<SessionInfo> {
     list_device_sessions()
         .into_iter()
-        .filter(|s| is_routable_target(&s.id))
+        .filter(|s| is_routable_target(&s.id) && s.parent_session_id.is_none())
         .collect()
 }
 
@@ -1736,6 +1828,9 @@ pub fn create_blank_session_in(
         running_since: None,
         idle_secs: 0,
         cache: "warm",
+        task_id: None,
+        parent_session_id: None,
+        members: None,
     })
 }
 

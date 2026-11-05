@@ -43,7 +43,7 @@ async fn gather(d: &Shared, id: &str) -> Option<Gathered> {
     let alive = d.sessions.lock().await.get(&row.id).is_some_and(|s| !s.join.is_finished());
     let busy_status = matches!(state.status, HarnessStatus::Running | HarnessStatus::WaitingForInput);
     let open_task = store
-        .list_tasks(Some(&row.id), None)
+        .tasks_worked_in(&row.id, None)
         .unwrap_or_default()
         .iter()
         .any(|t| !t.status.is_terminal());
@@ -141,8 +141,18 @@ async fn settle_locked(d: &Shared, g: Gathered) -> SettleOutcome {
     let Some(store) = crate::session::store_for_sessions() else {
         return SettleOutcome::Failed("session store unavailable".into());
     };
-    if let Err(e) = store.set_session_settled(&sid, Some(now())) {
+    let settled_at = now();
+    if let Err(e) = store.set_session_settled(&sid, Some(settled_at)) {
         return SettleOutcome::Failed(format!("record settled: {e}"));
+    }
+    if let Ok(members) = store.session_members(&sid) {
+        for m in members {
+            if let Some(ref child_id) = m.work_session_id {
+                if child_id != &sid {
+                    let _ = store.set_session_settled(child_id, Some(settled_at));
+                }
+            }
+        }
     }
     SettleOutcome::Settled(session_json(&sid))
 }
@@ -152,7 +162,17 @@ pub(crate) fn unsettle_session(id: &str) -> Option<serde_json::Value> {
     let store = crate::session::store_for_sessions()?;
     let row = store.get_session_row(id).ok()??;
     if row.settled_at.is_some() {
-        store.set_session_last_active(&row.id, now()).ok()?;
+        let t = now();
+        store.set_session_last_active(&row.id, t).ok()?;
+        if let Ok(members) = store.session_members(&row.id) {
+            for m in members {
+                if let Some(ref child_id) = m.work_session_id {
+                    if child_id != &row.id {
+                        let _ = store.set_session_last_active(child_id, t);
+                    }
+                }
+            }
+        }
     }
     Some(session_json(&row.id))
 }

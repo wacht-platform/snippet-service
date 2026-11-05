@@ -909,6 +909,8 @@ pub async fn run_serve(
         .route("/coordination/direct/read", post(direct::direct_mark_read))
         .route("/sessions", get(list_sessions).post(open_session))
         .route("/sessions/counts", get(session_counts))
+        .route("/sessions/members", get(session_members_by_query))
+        .route("/sessions/{session_id}/members", get(session_members_by_path))
         .route("/usage", get(usage_summary))
         .route("/notifications", get(notification_replay))
         .merge(recurring::router())
@@ -1215,11 +1217,55 @@ async fn session_counts(State(d): State<Shared>, Query(a): Query<Auth>) -> Respo
     }
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for s in list_device_sessions() {
+        if s.parent_session_id.is_some() {
+            continue;
+        }
         if !s.folder.is_empty() {
             *counts.entry(s.folder).or_insert(0) += 1;
         }
     }
     Json(counts).into_response()
+}
+
+#[derive(Deserialize)]
+struct SessionMembersQuery {
+    token: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+async fn session_members_by_query(
+    State(d): State<Shared>,
+    Query(q): Query<SessionMembersQuery>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let Some(session_id) = q.session_id.or(q.session).or(q.id) else {
+        return (StatusCode::BAD_REQUEST, "missing session_id parameter").into_response();
+    };
+    match d.store.session_members(&session_id) {
+        Ok(members) => Json(members).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn session_members_by_path(
+    State(d): State<Shared>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Query(q): Query<Auth>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.store.session_members(&session_id) {
+        Ok(members) => Json(members).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
