@@ -848,9 +848,37 @@ pub(super) fn wake_targets(
     let lease_to = (event.event_type == "task.lease_transferred")
         .then(|| event.payload.get("to_agent_id").and_then(|v| v.as_str()))
         .flatten();
+    let live = || roster.iter().filter(|m| m.removed_at.is_none());
+    let seated = live().any(|m| m.work_session_id.as_deref().is_some_and(|s| !s.is_empty()));
+    let addressed: Vec<&str> = event
+        .payload
+        .get("to")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .collect();
+    let holder = live().find(|m| m.status == "active").map(|m| m.agent_id.as_str());
+    let chatter = CHATTER_EVENTS.contains(&event.event_type.as_str());
+    let blocker = event.payload.get("kind").and_then(|v| v.as_str()) == Some("blocker");
     for (actor_id, actor_kind) in participants {
         if *actor_id == event.actor_id || lease_to.is_some_and(|to| to != actor_id) {
             continue;
+        }
+        // Waking costs a model turn per member, so once a task has seats a post
+        // reaches only who it names, or the holder when it names nobody.
+        if seated && lease_to.is_none() {
+            let is_mc = actor_id == mc || actor_kind == "system";
+            let wanted = if !chatter {
+                is_mc
+            } else if addressed.is_empty() {
+                holder == Some(actor_id.as_str()) || (is_mc && blocker)
+            } else {
+                addressed.contains(&actor_id.as_str()) || (is_mc && blocker)
+            };
+            if !wanted {
+                continue;
+            }
         }
         if actor_id == mc || actor_kind == "system" {
             if !NOTIFIED_EVENTS.contains(&event.event_type.as_str()) {
@@ -866,8 +894,12 @@ pub(super) fn wake_targets(
             continue;
         }
         let working = member
-            .filter(|m| m.status == "active")
-            .and_then(|m| m.work_session_id.clone().or_else(|| task_session.map(str::to_string)))
+            .and_then(|m| {
+                m.work_session_id
+                    .clone()
+                    .filter(|session| !session.is_empty())
+                    .or_else(|| (m.status == "active").then(|| task_session.map(str::to_string)).flatten())
+            })
             .filter(|session| !session.is_empty());
         targets.push(match working {
             Some(session) => WakeTarget { session, inbox_agent: None },
@@ -876,6 +908,9 @@ pub(super) fn wake_targets(
                 inbox_agent: Some(actor_id.clone()),
             },
         });
+    }
+    if seated && chatter && blocker && event.actor_id != mc {
+        targets.push(WakeTarget { session: mc.to_string(), inbox_agent: None });
     }
     let origin = event.payload.get("origin_session").and_then(|v| v.as_str());
     let from_session = (event.actor_kind == "session").then_some(event.actor_id.as_str());
@@ -966,7 +1001,11 @@ pub async fn wake_coordination_thread_participants(
     if targets.is_empty() {
         return;
     }
-    let ledger = task.as_ref().map(|t| crate::task_state_tools::ledger_block(&d.store, t, false));
+    let room = crate::members::room_line(&roster);
+    let ledger = task.as_ref().map(|t| {
+        let ledger = crate::task_state_tools::ledger_block(&d.store, t, false);
+        if room.is_empty() { ledger } else { format!("{room}\n{ledger}") }
+    });
     let envelope = board_message_envelope_with_task(saved, &history, task.as_ref(), ledger.as_deref());
     let incoming = (saved.event_type == "task.lease_transferred")
         .then(|| saved.payload.get("to_agent_id").and_then(|v| v.as_str()))

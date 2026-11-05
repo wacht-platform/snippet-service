@@ -2310,7 +2310,8 @@ impl Tool for InviteTaskAgent {
             .ok_or_else(|| ToolError::msg(format!("task `{task_id}` not found")))?;
         let canonical = |id: &str| crate::conversations::canonical_session_id(id).0;
         let caller = canonical(caller);
-        let works_it = match task.reporting_session.as_deref() {
+        let seated = store.member_by_session(&caller).ok().flatten().is_some_and(|m| m.task_id == task.id);
+        let works_it = seated || match task.reporting_session.as_deref() {
             Some(bound) => canonical(bound) == caller,
             None => canonical(&task.session_id) == caller,
         };
@@ -2330,8 +2331,10 @@ impl Tool for InviteTaskAgent {
                 .add_task_agent_full(task_id, agent_id, role, None, ask, "waiting", &now)
                 .map_err(|e| ToolError::msg(format!("invite agent: {e}")))?;
         }
-        let (actor_kind, actor_id) = match ctx.agent_id() {
-            Some(agent) => ("agent", agent.to_string()),
+        crate::members::seat_holder(&store, &task);
+        let seated = crate::members::seat(&store, &task, agent_id, &now);
+        let (actor_kind, actor_id) = match crate::coordination_tools::speaks_as(ctx) {
+            Some(speaker) => speaker,
             None => ("session", caller.clone()),
         };
         let event = CoordinationEvent {
@@ -2347,6 +2350,7 @@ impl Tool for InviteTaskAgent {
                 "body": format!("@{agent_id} joined as {role}. {ask}"),
                 "task_id": task_id,
                 "invited": agent_id,
+                "to": [agent_id],
             })),
             causation_id: None,
             correlation_id: Some(task_id.to_string()),
@@ -2362,7 +2366,8 @@ impl Tool for InviteTaskAgent {
             "invited": agent_id,
             "task_id": task_id,
             "role": role,
-            "note": "They are on the roster and woken with your ask; their reply arrives on the task room. You keep the session."
+            "seated": seated.is_ok(),
+            "note": "They have their own conversation on this task in the same worktree and are woken with your ask; they answer in the room. You keep the turn: pass_turn when it should move.",
         })))
     }
 }
@@ -2371,6 +2376,8 @@ impl Tool for InviteTaskAgent {
 struct TransferMissionTaskLeaseArgs {
     task_id: String,
     to_agent_id: String,
+    #[serde(default)]
+    next: String,
 }
 
 pub struct TransferMissionTaskLease;
@@ -2383,7 +2390,8 @@ impl Tool for TransferMissionTaskLease {
             input_schema: schema(
                 json!({
                     "task_id": {"type": "string"},
-                    "to_agent_id": {"type": "string"}
+                    "to_agent_id": {"type": "string"},
+                    "next": {"type": "string", "description": "What the agent taking over should do"}
                 }),
                 &["task_id", "to_agent_id"],
             ),
@@ -2414,10 +2422,21 @@ impl Tool for TransferMissionTaskLease {
                 .map_err(|e| ToolError::msg(format!("add agent to roster: {e}")))?;
         }
 
-        store.transfer_task_session_lease(task_id, current_active, to_agent)
-            .map_err(|e| ToolError::msg(format!("transfer lease: {e}")))?;
-
-        let body = format!("Session lease transferred to `{to_agent}` by Mission Control");
+        let handover = crate::coordination::handoffs::Handover {
+            id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            from_agent: current_active.to_string(),
+            to_agent: to_agent.to_string(),
+            done: "Mission Control moved the turn.".to_string(),
+            next: args.next.trim().to_string(),
+            risks: String::new(),
+            files: Vec::new(),
+            created_at: now.clone(),
+            acked_at: None,
+            escalated_at: None,
+        };
+        let passed = crate::members::pass_turn(&store, &task, to_agent, &handover, &now).map_err(ToolError::msg)?;
+        let body = crate::members::handover_body(&handover, &passed);
         let event = CoordinationEvent {
             event_id: uuid::Uuid::new_v4().to_string(),
             thread_id: task.thread_id.clone(),
@@ -3104,6 +3123,12 @@ impl Tool for ReportMissionTask {
         }
         let summary_for_board = args.summary.trim().to_string();
         let status_for_board = status.clone();
+        if status.is_terminal()
+            && let Ok(Some(current)) = store.get_task(&args.task_id)
+            && let Some(workspace) = crate::members::task_workspace(&store, &current)
+        {
+            crate::members::close_turn(&store, &current, &workspace, &now);
+        }
         let task = if status.is_terminal() {
             store
                 .complete_task(
@@ -3517,19 +3542,6 @@ mod tests {
 
         db.add_task_agent_full("t-mc", "snippet", "implementer", None, "", "active", &now_rfc3339()).unwrap();
         db.update_task_in("t-mc", &now_rfc3339(), |t| t.status = TaskStatus::InProgress).unwrap();
-        let res = TransferMissionTaskLease
-            .execute(&ctx, json!({"task_id": "t-mc", "to_agent_id": "reviewer"}))
-            .await
-            .unwrap();
-        assert_eq!(res.value["status"], "success");
-
-        let roster = db.list_task_agents("t-mc").unwrap();
-        let s = roster.iter().find(|m| m.agent_id == "snippet").unwrap();
-        let r = roster.iter().find(|m| m.agent_id == "reviewer").unwrap();
-        assert_eq!(s.status, "waiting");
-        assert_eq!(r.status, "active");
-
-        // Now reviewer reports task completion
         db.create_conversation(
             &crate::conversations::SessionRow {
                 id: "s-mc".into(),
@@ -3553,6 +3565,19 @@ mod tests {
             &[],
             "[]",
         ).unwrap();
+        let res = TransferMissionTaskLease
+            .execute(&ctx, json!({"task_id": "t-mc", "to_agent_id": "reviewer"}))
+            .await
+            .unwrap();
+        assert_eq!(res.value["status"], "success");
+
+        let roster = db.list_task_agents("t-mc").unwrap();
+        let s = roster.iter().find(|m| m.agent_id == "snippet").unwrap();
+        let r = roster.iter().find(|m| m.agent_id == "reviewer").unwrap();
+        assert_eq!(s.status, "waiting");
+        assert_eq!(r.status, "active");
+
+        // Now reviewer reports task completion
         db.set_session_role("s-mc", "specialized", Some("reviewer")).unwrap();
 
         db.update_task_in("t-mc", "2026-01-01T00:00:00Z", |t| {

@@ -187,6 +187,18 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
          );
          CREATE UNIQUE INDEX IF NOT EXISTS session_leases_open
              ON session_leases(task_id) WHERE released_at IS NULL;
+         CREATE TABLE IF NOT EXISTS task_turns (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+             agent_id TEXT NOT NULL,
+             session_id TEXT NOT NULL,
+             started_at TEXT NOT NULL,
+             ended_at TEXT,
+             snapshot TEXT NOT NULL DEFAULT '',
+             files_json TEXT NOT NULL DEFAULT '[]',
+             commits_json TEXT NOT NULL DEFAULT '[]'
+         );
+         CREATE INDEX IF NOT EXISTS task_turns_task ON task_turns(task_id, id);
          -- A handover is acknowledged by the incoming agent before the lease moves.
          CREATE TABLE IF NOT EXISTS handoffs (
              id TEXT PRIMARY KEY NOT NULL,
@@ -314,6 +326,7 @@ fn add_missing_columns(connection: &Connection) -> Result<(), rusqlite::Error> {
         connection.execute("ALTER TABLE tasks ADD COLUMN expected_minutes INTEGER", [])?;
     }
     connection.execute("CREATE INDEX IF NOT EXISTS tasks_goal ON tasks(goal_id)", [])?;
+    connection.execute("CREATE INDEX IF NOT EXISTS task_agents_session ON task_agents(work_session_id)", [])?;
     let task_agent_columns: Vec<String> = {
         let mut stmt = connection.prepare("PRAGMA table_info(task_agents)")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;

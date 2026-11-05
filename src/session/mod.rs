@@ -327,8 +327,7 @@ impl AgentRuntime {
         for name in [
             "message_mission_control",
             "claim_and_dispatch_task",
-            "transfer_task_session_lease",
-            "ack_handoff",
+            "pass_turn",
             "post_coordination_message",
             "read_coordination_board",
             "record_coordination_note",
@@ -373,7 +372,6 @@ impl AgentRuntime {
         crate::coordination_tools::add_coordination_tools(&mut tools);
         for name in [
             "message_mission_control",
-            "transfer_task_session_lease",
             "read_agent_inbox",
             "claim_and_dispatch_task",
             "post_coordination_message",
@@ -523,8 +521,7 @@ pub(crate) fn coordination_tool_registry() -> ToolRegistry {
     tools.insert(crate::builtins::read_only_shell::ReadOnlyBashTool);
     for name in [
         "message_mission_control",
-        "transfer_task_session_lease",
-        "ack_handoff",
+        "pass_turn",
         "post_coordination_message",
     ] {
         tools.remove(name);

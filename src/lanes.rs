@@ -1098,6 +1098,7 @@ async fn run_lane_once(
     tools.insert(crate::coordination_tools::SendAgentMessage);
     tools.insert(crate::review_tools::SubmitReview);
     tools.remove(crate::progress::TOOL_NAME);
+    tools.remove("pass_turn");
     if read_only {
         // Investigation lane: strip the file-mutation tools so a fan-out of
         // readers can't collide with the main agent's (or each other's) edits.

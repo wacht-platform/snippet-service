@@ -79,8 +79,16 @@ fn task_gate(ctx: &ToolContext, targets: &[PathBuf]) -> Gate {
     let Some(session) = ctx.durable_session_id().or(ctx.lane_origin().map(|(s, _)| s)) else { return Gate::Allow };
     let Some(path) = ctx.store_path() else { return Gate::Allow };
     let Ok(store) = crate::store::Store::open_cached(path) else { return Gate::Allow };
+    if let Ok(Some(member)) = store.member_by_session(session)
+        && member.status != "active"
+    {
+        return Gate::Refuse(format!(
+            "`{}` doesn't hold the turn on task `{}`; only the holder changes files. Say what you need in the room, or ask the holder to pass_turn to you.",
+            member.agent_id, member.task_id
+        ));
+    }
     let Some(task) = store
-        .list_tasks(Some(session), Some(&TaskStatus::InProgress))
+        .tasks_worked_in(session, Some(&TaskStatus::InProgress))
         .ok()
         .and_then(|t| t.into_iter().find(|t| t.reporting_session.as_deref() == Some(session)))
     else {
@@ -89,13 +97,7 @@ fn task_gate(ctx: &ToolContext, targets: &[PathBuf]) -> Gate {
     if let Ok(Some(lease)) = store.current_lease(&task.id) {
         let actor = if ctx.lane_origin().is_some() { ctx.agent_id().unwrap_or(&lease.agent_id) } else { &lease.agent_id };
         if actor != lease.agent_id {
-            let ack = store
-                .pending_handoff(&task.id)
-                .ok()
-                .flatten()
-                .filter(|h| h.to_agent == actor)
-                .map_or(String::new(), |_| " A handover to you is waiting: call ack_handoff first.".into());
-            return Gate::Refuse(format!("task `{}` is leased to `{}` (token {}), not `{actor}`; only the holder writes.{ack}", task.id, lease.agent_id, lease.fencing_token));
+            return Gate::Refuse(format!("task `{}` is leased to `{}` (token {}), not `{actor}`; only the holder writes.", task.id, lease.agent_id, lease.fencing_token));
         }
         if ctx.lease_token().is_some_and(|t| t != lease.fencing_token) {
             return Gate::Refuse(format!("the lease on task `{}` moved on to token {}; this lane started under an older one.", task.id, lease.fencing_token));

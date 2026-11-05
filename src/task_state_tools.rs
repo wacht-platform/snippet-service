@@ -47,6 +47,7 @@ pub fn dispatch_ledger(store: &Store, task: &Task, workspace: &Path, scope: &str
             }
         });
     }
+    crate::members::open_first_turn(store, task, workspace, now);
     let Ok(Some(mut state)) = store.task_state(&task.id) else {
         return String::new();
     };
@@ -152,7 +153,8 @@ pub fn sync_changed_files(store: &Store, task: &Task, now: &str) {
     let (Some(workspace), Ok(Some(state))) = (workspace_of(task), store.task_state(&task.id)) else {
         return;
     };
-    let files = git_changed_files(&workspace, &state.dispatch_rev);
+    let files = crate::members::changed_since_dispatch(store, task, &workspace)
+        .unwrap_or_else(|| git_changed_files(&workspace, &state.dispatch_rev));
     if files.is_empty() {
         return;
     }
@@ -165,7 +167,7 @@ pub fn note_changed_files(ctx: &ToolContext, paths: &[String]) {
     let Some(session) = ctx.durable_session_id().or(ctx.lane_origin().map(|(s, _)| s)) else { return };
     let Ok(store) = ctx.store() else { return };
     let Some(task) = store
-        .list_tasks(Some(session), Some(&crate::coordination::TaskStatus::InProgress))
+        .tasks_worked_in(session, Some(&crate::coordination::TaskStatus::InProgress))
         .ok()
         .and_then(|tasks| tasks.into_iter().find(|t| t.reporting_session.as_deref() == Some(session)))
     else {
@@ -253,7 +255,10 @@ fn target_task(ctx: &ToolContext, store: &Store, named: Option<&str>) -> Result<
         .map_err(|e| ToolError::msg(format!("load task: {e}")))?
         .ok_or_else(|| ToolError::msg(format!("no task `{id}`")))?;
     if !is_mission_control(ctx) {
-        let mine = session.is_some_and(|s| {
+        let seated = session.is_some_and(|s| {
+            store.member_by_session(s).ok().flatten().is_some_and(|m| m.task_id == task.id)
+        });
+        let mine = seated || session.is_some_and(|s| {
             canonical_task_session(s) == canonical_task_session(&task.session_id)
                 || task.reporting_session.as_deref().is_some_and(|r| canonical_task_session(r) == canonical_task_session(s))
         });

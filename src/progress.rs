@@ -85,6 +85,9 @@ fn open_store(ctx: &ToolContext) -> Option<Store> {
 /// The agent doing the work here and the task it counts towards. A plain
 /// conversation has no bound agent and runs as `snippet`.
 fn working_as(ctx: &ToolContext, session: &str) -> (String, Option<String>) {
+    if let Some(member) = open_store(ctx).and_then(|db| db.member_by_session(session).ok().flatten()) {
+        return (member.agent_id, Some(member.task_id));
+    }
     let task = open_store(ctx).and_then(|db| {
         let task = db
             .list_tasks(Some(session), Some(&TaskStatus::InProgress))

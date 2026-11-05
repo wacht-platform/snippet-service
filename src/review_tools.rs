@@ -320,10 +320,11 @@ impl Tool for SubmitReview {
                 s.review_started_at.clear();
             })
             .map_err(|e| ToolError::msg(e.to_string()))?;
+        let back = crate::members::working_session(&store, &task);
         let reopened = store
             .update_task_in(&task.id, &now, |t| {
                 t.status = TaskStatus::InProgress;
-                t.reporting_session = Some(t.session_id.clone());
+                t.reporting_session = Some(back);
             })
             .map_err(|e| ToolError::msg(e.to_string()))?;
         let envelope = format!(

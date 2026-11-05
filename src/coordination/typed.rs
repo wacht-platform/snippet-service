@@ -72,6 +72,10 @@ pub fn envelope_lines(payload: &Value) -> String {
     if let Some(kind) = payload.get("kind").and_then(Value::as_str) {
         out.push_str(&format!("kind: {kind}\n"));
     }
+    if let Some(to) = payload.get("to").and_then(Value::as_array) {
+        let names: Vec<&str> = to.iter().filter_map(Value::as_str).collect();
+        out.push_str(&format!("addressed_to: {}\n", names.join(", ")));
+    }
     if urgency_of(payload) == Urgency::Urgent {
         out.push_str("urgency: urgent (the sender interrupted your run for this; deal with it first)\n");
     }
