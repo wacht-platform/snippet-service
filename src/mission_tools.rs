@@ -522,7 +522,7 @@ impl Tool for UserOnCall {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "user_on_call".into(),
-            description: "Record that the user is on a call or in a meeting, the moment they say so, or that it ended. While it holds, what the microphone hears stays out of your turns unless they use the wake word, speak is off, pings wait unless urgent, and work going to a worker needs go_ahead. It survives across your turns, so you don't have to remember it.".into(),
+            description: "Record that the user is on a call or in a meeting, the moment they say so, or that it ended. While it holds, what the microphone hears stays out of your turns unless they use the wake word, speak is off, pings wait unless urgent. It survives across your turns, so you don't have to remember it.".into(),
             input_schema: schema(json!({
                 "state": {"type": "string", "enum": ["on_call", "ended"]},
                 "about": {"type": "string", "description": "Optional; who or what the call is, if they said."},
@@ -1275,8 +1275,6 @@ struct CreateTaskArgs {
     goal: Option<String>,
     #[serde(default)]
     expected_minutes: Option<u32>,
-    #[serde(default)]
-    go_ahead: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1289,14 +1287,13 @@ pub struct CreateMissionTask;
 #[async_trait]
 impl Tool for CreateMissionTask {
     fn definition(&self) -> NativeToolDefinition {
-        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing, and it sets the scope: what to do and what's out. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"go_ahead":{"type":"string","description":crate::routing_gate::GO_AHEAD_DESCRIPTION}, "title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "read_only":{"type":"boolean","description":"investigation that changes nothing"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done; choose it per task. self skips review; reviewer has an agent review it read-only, on that agent's own profile (the one named in `reviewer`, otherwise the agent doing the work); mission_control and user keep the verdict with you. Omitted: reviewer (self when read_only)."}, "reviewer":{"type":"string","description":"optional; any agent id to review this work, on its own profile. Omitted, the agent doing the work reviews it in a fresh lane."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}, "goal":{"type":"string","description":"optional; id of the open goal this task serves"}, "expected_minutes":{"type":"integer","description":"optional; how long the work should take. The task is flagged stalled after twice this without progress (minimum 20 min). Defaults by verify_mode."}}), &["title","description","session"]) }
+        NativeToolDefinition { name: "create_mission_task".into(), description: "Create one task routed to an existing session: the project work a user asked for, or the work an agent asked you for. For a plan of dependent steps, file every step now and link each to the ones it waits on with blocked_by. Agent builds, worker reports and notifications aren't tasks. The description is the worker's whole briefing, and it sets the scope: what to do and what's out. Use handoff_mode 'resume' when the target already has the context and 'fresh' otherwise; pass agent_id to offer it to the specialist whose job it is (omit it only when no specialist covers the work) and crew to seat reviewers or advisors on it from the start.".into(), input_schema: schema(json!({"title":{"type":"string"}, "description":{"type":"string"}, "session":{"type":"string","description":"session id, or a title fragment or workspace path, optionally with `latest`"}, "supersedes":{"type":"string","description":"optional; id of the cancelled task this one replaces"}, "handoff_mode":{"type":"string","enum":["resume","fresh"]}, "owned_paths":{"type":"array","items":{"type":"string"}}, "agent_id":{"type":"string","description":"optional; the specialist that will do the work, from list_coordination_agents. Without one the session's own agent or the general coding agent takes it. Recorded on the task so completion reports to that agent's own board."}, "crew":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"role":{"type":"string","description":"reviewer (default), advisor or tester"}},"required":["agent_id"]},"description":"optional; agents seated on the task beside the worker, who bring them in from the task room (a reviewer of the diff, a visual QA pass, an advisor). Each one is waiting until called."}, "profile":{"type":"string","description":"optional; an inference profile named exactly as list_profiles returns it. It moves the target session onto that model, restarting it and losing its prompt cache, so it's an override for rescuing a rate-limited session; the assigned agent's own profile already applies when this is omitted. Work that simply needs another model belongs in an agent or session already on it (list_sessions shows each session's profile; create_mission_session opens one)."}, "reply_to":{"type":"string","description":"optional; when the work was asked for in a message, that message's reply_to (session:<id> or agent:<id>). The outcome is sent back there when the task finishes."}, "blocked_by":{"type":"array","items":{"type":"string"},"description":"optional; ids of tasks that must finish first. The task waits and starts by itself once all of them are done, so a whole plan can be filed at once."}, "read_only":{"type":"boolean","description":"investigation that changes nothing"}, "verify_mode":{"type":"string","enum":["self","reviewer","mission_control","user"],"description":"who confirms it is done; choose it per task. self skips review; reviewer has an agent review it read-only, on that agent's own profile (the one named in `reviewer`, otherwise the agent doing the work); mission_control and user keep the verdict with you. Omitted: reviewer (self when read_only)."}, "reviewer":{"type":"string","description":"optional; any agent id to review this work, on its own profile. Omitted, the agent doing the work reviews it in a fresh lane."}, "revises_task_id":{"type":"string","description":"optional; the finished task this one revises"}, "audience":{"type":"string","description":"content work: who it is for"}, "definition_of_good":{"type":"string","description":"content work: what good looks like (length, tone, quality bar)"}, "goal":{"type":"string","description":"optional; id of the open goal this task serves"}, "expected_minutes":{"type":"integer","description":"optional; how long the work should take. The task is flagged stalled after twice this without progress (minimum 20 min). Defaults by verify_mode."}}), &["title","description","session"]) }
     }
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let mut args: CreateTaskArgs =
             serde_json::from_value(arguments).map_err(|_| ToolError::InvalidArguments {
                 tool: "create_mission_task".into(),
             })?;
-        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         args.description.push_str(&crate::mission_autonomy::standing_rules_note());
         create_task(ctx, args, ("agent", crate::mission_control::SESSION_ID)).await
     }
@@ -1661,8 +1658,6 @@ struct DeliverArgs {
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
-    go_ahead: Option<String>,
-    #[serde(default)]
     verify_mode: Option<String>,
     #[serde(default)]
     reviewer: Option<String>,
@@ -1681,7 +1676,6 @@ impl Tool for DeliverToSession {
                     "brief": {"type": "string", "description": "the self-contained ask"},
                     "task_id": {"type": "string"},
                     "title": {"type": "string", "description": "optional; board title for a new task"},
-                    "go_ahead": {"type": "string", "description": crate::routing_gate::GO_AHEAD_DESCRIPTION},
                     "verify_mode": {"type": "string", "description": "self, reviewer, mission_control or user"},
                     "reviewer": {"type": "string", "description": "any agent id to review this work, on its own profile; omitted, the agent doing the work reviews it in a fresh lane"}
                 }),
@@ -1693,7 +1687,6 @@ impl Tool for DeliverToSession {
         let _ = root(ctx)?;
         let args: DeliverArgs = serde_json::from_value(arguments)
             .map_err(|_| ToolError::InvalidArguments { tool: "deliver_to_session".into() })?;
-        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         if args.brief.trim().is_empty() {
             return Err(ToolError::msg("brief must be non-empty"));
         }
@@ -1894,7 +1887,6 @@ impl Tool for FileFollowUpTask {
         let speaker = crate::coordination_tools::speaks_as(ctx);
         let (kind, who) = speaker.unwrap_or(("session", own.clone()));
         let args = CreateTaskArgs {
-            go_ahead: None,
             title: text("title").unwrap_or_default(),
             description: text("description").unwrap_or_default(),
             session_id: text("session_id").unwrap_or(own),
@@ -1921,8 +1913,6 @@ impl Tool for FileFollowUpTask {
 
 #[derive(Deserialize)]
 struct UpdateMissionTaskArgs {
-    #[serde(default)]
-    go_ahead: Option<String>,
     task_id: String,
     #[serde(default)]
     title: Option<String>,
@@ -2016,8 +2006,7 @@ impl Tool for UpdateMissionTask {
                     "profile": {"type": "string"},
                     "context_note": {"type": "string", "description": "Optional context update posted to the task board thread for all assigned agents"},
 "revise": {"type": "object", "properties": {"feedback": {"type": "string"}}, "required": ["feedback"], "description": "On a done task: reopen it in the same session with this feedback and its previous result, instead of filing a new task."},
-                    "waive_verification": {"type": "string", "description": "Only when the user said to skip checking this task: their words. Drops review; a task waiting in review completes."},
-                    "go_ahead": {"type": "string", "description": crate::routing_gate::GO_AHEAD_DESCRIPTION}
+                    "waive_verification": {"type": "string", "description": "Only when the user said to skip checking this task: their words. Drops review; a task waiting in review completes."}
                 }),
                 &["task_id"],
             ),
@@ -2026,7 +2015,6 @@ impl Tool for UpdateMissionTask {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: UpdateMissionTaskArgs =
             serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        crate::routing_gate::check(ctx, args.go_ahead.as_deref())?;
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(ToolError::msg("task_id must not be empty"));

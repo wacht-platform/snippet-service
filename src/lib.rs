@@ -38,7 +38,6 @@ pub mod mission_control;
 pub mod mission_autonomy;
 pub mod members;
 pub mod progress;
-pub mod routing_gate;
 pub mod mission_tools;
 pub mod goal_plan;
 pub mod goal_tools;

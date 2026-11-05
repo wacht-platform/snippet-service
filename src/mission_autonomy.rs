@@ -155,13 +155,13 @@ fn user_state_line() -> String {
     if let Some(call) = user_call() {
         let about = if call.about.is_empty() { String::new() } else { format!(" ({})", call.about) };
         return format!(
-            " THE USER IS ON A CALL{about}, {} minutes in, held for {} more unless they say it ended (then user_on_call ended). Their speech reaches you only when they use your wake word, speak is off, pings wait unless urgent, and nothing new goes to a worker without their typed words.",
+            " THE USER IS ON A CALL{about}, {} minutes in, held for {} more unless they say it ended (then user_on_call ended). Their speech reaches you only when they use your wake word, speak is off, and pings wait unless urgent. Hold new work for a worker until they ask for it.",
             (now - call.since) / 60,
             (call.until - now) / 60
         );
     }
     match crate::ambient::seconds_since_user_turn().filter(|s| *s < 300) {
-        Some(secs) => format!(" A voice conversation is open (they last spoke {secs} seconds ago): they may still be thinking aloud, so talk it through and nothing goes to a worker without go_ahead."),
+        Some(secs) => format!(" A voice conversation is open (they last spoke {secs} seconds ago): they may still be thinking aloud, so talk it through and send work to a worker once they've asked for it."),
         None => String::new(),
     }
 }
