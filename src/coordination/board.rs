@@ -22,6 +22,8 @@ pub enum BoardEntryKind {
     Reported,
     /// The agent's own observation or conclusion.
     Noted,
+    /// A working session's account of its work so far.
+    Progress,
 }
 
 impl BoardEntryKind {
@@ -30,6 +32,7 @@ impl BoardEntryKind {
             Self::Dispatched => "dispatched",
             Self::Reported => "reported",
             Self::Noted => "noted",
+            Self::Progress => "progress",
         }
     }
 
@@ -38,6 +41,7 @@ impl BoardEntryKind {
             "dispatched" => Some(Self::Dispatched),
             "reported" => Some(Self::Reported),
             "noted" => Some(Self::Noted),
+            "progress" => Some(Self::Progress),
             _ => None,
         }
     }

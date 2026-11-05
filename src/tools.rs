@@ -463,6 +463,9 @@ impl ToolRegistry {
             map.insert("ownership_warning".into(), Value::String(note.clone()));
         }
         result.value = bound_tool_output(ctx, name, result.value);
+        if let (Some(note), Some(map)) = (crate::progress::note_tool_call(ctx, name), result.value.as_object_mut()) {
+            map.insert("harness_note".into(), Value::String(note));
+        }
         Ok(result)
     }
 

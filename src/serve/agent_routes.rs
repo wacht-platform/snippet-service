@@ -99,7 +99,7 @@ pub(crate) struct AgentBoardQuery {
     /// Substring to find in the recorded summaries.
     #[serde(default)]
     contains: Option<String>,
-    /// `dispatched`, `reported`, or `noted`.
+    /// `dispatched`, `reported`, `noted`, or `progress`.
     #[serde(default)]
     kind: Option<String>,
     #[serde(default = "default_agent_page_limit")]
@@ -126,7 +126,7 @@ pub(crate) async fn agent_board(
             None => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("unknown kind `{raw}` — use dispatched, reported, or noted"),
+                    format!("unknown kind `{raw}` — use dispatched, reported, noted, or progress"),
                 )
                     .into_response();
             }

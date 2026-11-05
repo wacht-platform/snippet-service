@@ -139,6 +139,14 @@ pub(crate) fn task_awareness(ctx: &ToolContext) -> String {
         .or(ctx.lane_origin().map(|(session, _)| session));
     let label = |status: &TaskStatus| status.as_str().replace('_', " ");
     let mut out: Vec<String> = Vec::new();
+    if let (Some(agent), Some(session)) = (ctx.agent_id(), session)
+        && crate::session::is_inbox_session_id(session)
+    {
+        let digest = crate::progress::inbox_digest(&db, agent);
+        if !digest.is_empty() {
+            out.push(digest);
+        }
+    }
 
     let current: Vec<crate::coordination::Task> = session
         .and_then(|session| db.list_tasks(Some(session), None).ok())
@@ -824,7 +832,7 @@ impl Tool for ReadCoordinationBoard {
                 json!({
                     "workspace":{"type":"string","description":"only rows about this folder"},
                     "contains":{"type":"string","description":"substring to find in summaries"},
-                    "kind":{"type":"string","enum":["dispatched","reported","noted"]},
+                    "kind":{"type":"string","enum":["dispatched","reported","noted","progress"]},
                     "outstanding_only":{"type":"boolean","description":"only dispatches with no report yet"},
                     "limit":{"type":"integer","minimum":1,"maximum":100}
                 }),
@@ -866,7 +874,7 @@ impl Tool for ReadCoordinationBoard {
             Some(raw) => Some(
                 crate::coordination::BoardEntryKind::parse(raw).ok_or_else(|| {
                     ToolError::msg(format!(
-                        "unknown kind `{raw}` — use dispatched, reported, or noted"
+                        "unknown kind `{raw}` — use dispatched, reported, noted, or progress"
                     ))
                 })?,
             ),
