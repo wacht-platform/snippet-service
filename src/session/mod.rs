@@ -884,54 +884,6 @@ pub fn write_session_profile(state_path: &std::path::Path, profile: &str) {
 /// The store IS the inventory. There is no filesystem walk: a session's row is
 /// the only thing that makes it a session, so a walk could only ever rediscover
 /// rows or resurrect sessions nothing owns.
-/// Which agent is dispatched to work in each session right now.
-///
-/// The TASK BOARD is the source, not `sessions.agent_id`. They answer different
-/// questions: `sessions.agent_id` is what a session IS (an inbox belongs to an
-/// agent, a specialized session runs as one), while this is who was sent to work
-/// there. A plain project session is nobody's — yet Mission Control can dispatch
-/// an agent into it, and that is precisely the case the session list needs to
-/// show. Reading only the binding made the badge invisible for the work the user
-/// actually dispatches.
-///
-/// Built in one pass over the board so the session list stays a single query per
-/// table, rather than one per row.
-#[allow(dead_code)]
-fn working_agents_by_session() -> std::collections::HashMap<String, String> {
-    match store_for_sessions() {
-        Some(store) => working_agents_in(&store),
-        None => std::collections::HashMap::new(),
-    }
-}
-
-/// The mapping itself, against a given store — so it can be asserted directly
-/// rather than only through the global session path.
-#[allow(dead_code)]
-fn working_agents_in(store: &crate::store::Store) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    let Ok(tasks) = store.list_tasks(None, None) else {
-        return out;
-    };
-    for task in tasks.iter().filter(|task| !task.status.is_terminal()) {
-        if task.session_id.trim().is_empty() {
-            continue;
-        }
-        let session = crate::conversations::canonical_session_id(&task.session_id).0;
-        let Ok(members) = store.list_task_agents(&task.id) else {
-            continue;
-        };
-        if let Some(agent) = members
-            .iter()
-            .find(|member| member.removed_at.is_none() && member.status == "active")
-            .or_else(|| members.iter().find(|member| member.removed_at.is_none()))
-            .map(|member| member.agent_id.clone())
-        {
-            out.entry(session).or_insert(agent);
-        }
-    }
-    out
-}
-
 #[derive(Debug, Default)]
 pub struct SessionTaskContexts {
     pub seats: std::collections::HashMap<String, (String, String, Option<String>)>,
@@ -953,13 +905,9 @@ pub fn session_task_contexts(store: &crate::store::Store) -> SessionTaskContexts
         }
         let is_terminal = matches!(task_status.as_str(), "done" | "failed" | "cancelled");
 
-        let is_primary_for_parent = match contexts.parent_tasks.get(&parent_canon) {
-            Some(existing) => existing == &task_id,
-            None => {
-                contexts.parent_tasks.insert(parent_canon.clone(), task_id.clone());
-                true
-            }
-        };
+        if !contexts.parent_tasks.contains_key(&parent_canon) {
+            contexts.parent_tasks.insert(parent_canon.clone(), task_id.clone());
+        }
 
         if let Some(agent) = agent_id {
             let role_str = role.unwrap_or_else(|| "collaborator".to_string());
@@ -968,10 +916,18 @@ pub fn session_task_contexts(store: &crate::store::Store) -> SessionTaskContexts
 
             let work_canon = work_session_id.as_deref().map(|ws| crate::conversations::canonical_session_id(ws).0);
 
-            if is_holder && !is_terminal {
-                contexts.workers.entry(parent_canon.clone()).or_insert_with(|| agent.clone());
+            if !is_terminal {
+                if is_holder {
+                    contexts.workers.insert(parent_canon.clone(), agent.clone());
+                } else {
+                    contexts.workers.entry(parent_canon.clone()).or_insert_with(|| agent.clone());
+                }
                 if let Some(ref ws) = work_canon {
-                    contexts.workers.entry(ws.clone()).or_insert_with(|| agent.clone());
+                    if is_holder {
+                        contexts.workers.insert(ws.clone(), agent.clone());
+                    } else {
+                        contexts.workers.entry(ws.clone()).or_insert_with(|| agent.clone());
+                    }
                 }
             }
 
@@ -983,17 +939,15 @@ pub fn session_task_contexts(store: &crate::store::Store) -> SessionTaskContexts
                 }
             }
 
-            if is_primary_for_parent {
-                contexts.members.entry(parent_canon.clone()).or_default().push(SessionMember {
-                    task_id: task_id.clone(),
-                    session_id: parent_canon.clone(),
-                    agent_id: agent,
-                    role: role_str,
-                    status: status_str,
-                    work_session_id: work_canon,
-                    is_holder,
-                });
-            }
+            contexts.members.entry(parent_canon.clone()).or_default().push(SessionMember {
+                task_id: task_id.clone(),
+                session_id: parent_canon.clone(),
+                agent_id: agent,
+                role: role_str,
+                status: status_str,
+                work_session_id: work_canon,
+                is_holder,
+            });
         }
     }
     contexts

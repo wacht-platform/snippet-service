@@ -160,7 +160,7 @@ impl Store {
         })
     }
 
-    /// All members seated on the task of this session (whether called with parent or child session).
+    /// All members seated on the tasks of this parent session.
     pub fn session_members(&self, session_id: &str) -> Result<Vec<SessionMember>, StoreError> {
         let canon = crate::conversations::canonical_session_id(session_id).0;
         self.with_connection(|c| {
@@ -168,13 +168,7 @@ impl Store {
                 "SELECT ta.task_id, t.session_id, ta.agent_id, ta.role, ta.status, ta.work_session_id
                  FROM tasks t
                  JOIN task_agents ta ON ta.task_id = t.id AND ta.removed_at IS NULL
-                 WHERE t.id = (
-                     SELECT t2.id FROM tasks t2
-                     LEFT JOIN task_agents ta2 ON ta2.task_id = t2.id AND ta2.removed_at IS NULL
-                     WHERE t2.session_id = ?1 OR t2.session_id = ?1 || '.json' OR t2.reporting_session = ?1 OR ta2.work_session_id = ?1
-                     ORDER BY CASE WHEN t2.status IN ('done', 'failed', 'cancelled') THEN 1 ELSE 0 END, t2.created_at DESC
-                     LIMIT 1
-                 )
+                 WHERE (t.session_id = ?1 OR t.session_id = ?1 || '.json')
                  ORDER BY ta.added_at ASC",
             )?;
             let rows = stmt.query_map(params![canon], |row| {

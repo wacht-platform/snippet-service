@@ -544,7 +544,7 @@ mod routable_target_tests {
 
 #[cfg(test)]
 mod working_agents_tests {
-    use crate::session::working_agents_in;
+    use crate::session::session_task_contexts;
     use crate::coordination::{HandoffMode, Task, TaskStatus};
     use crate::store::Store;
 
@@ -590,7 +590,7 @@ mod working_agents_tests {
         db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
             .unwrap();
 
-        let map = working_agents_in(&db);
+        let map = session_task_contexts(&db).workers;
         assert_eq!(
             map.get("proj-1").map(String::as_str),
             Some("snippet"),
@@ -608,7 +608,7 @@ mod working_agents_tests {
         db.create_task(&task).unwrap();
         db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
             .unwrap();
-        assert!(working_agents_in(&db).contains_key("proj-1"));
+        assert!(session_task_contexts(&db).workers.contains_key("proj-1"));
 
         for terminal in [TaskStatus::Done, TaskStatus::Failed, TaskStatus::Cancelled] {
             db.update_task_in("t1", "2026-01-02T00:00:00Z", |t| {
@@ -616,7 +616,7 @@ mod working_agents_tests {
             })
             .unwrap();
             assert!(
-                !working_agents_in(&db).contains_key("proj-1"),
+                !session_task_contexts(&db).workers.contains_key("proj-1"),
                 "a {terminal:?} task must not report a worker"
             );
         }
@@ -633,7 +633,7 @@ mod working_agents_tests {
             .unwrap();
 
         assert_eq!(
-            working_agents_in(&db).get("proj-1").map(String::as_str),
+            session_task_contexts(&db).workers.get("proj-1").map(String::as_str),
             Some("snippet"),
             "a target must key to the canonical session id"
         );
@@ -649,7 +649,7 @@ mod working_agents_tests {
         db.add_task_agent("t1", "snippet", "implementer", "2026-01-01T00:00:00Z")
             .unwrap();
 
-        assert!(working_agents_in(&db).is_empty());
+        assert!(session_task_contexts(&db).workers.is_empty());
     }
 }
 

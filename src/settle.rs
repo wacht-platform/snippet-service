@@ -43,6 +43,7 @@ pub struct SettleFacts {
     pub has_open_task: bool,
     pub has_lanes_or_watches: bool,
     pub has_queued_input: bool,
+    pub has_running_seat: bool,
 }
 
 /// Why a session must not be settled, or `None` when it may.
@@ -71,6 +72,9 @@ pub fn refusal(f: &SettleFacts) -> Option<String> {
     }
     if f.has_queued_input {
         return no("it has queued messages");
+    }
+    if f.has_running_seat {
+        return no("a seated conversation is running");
     }
     None
 }
@@ -130,6 +134,7 @@ mod tests {
             Box::new(|f| f.has_open_task = true),
             Box::new(|f| f.has_lanes_or_watches = true),
             Box::new(|f| f.has_queued_input = true),
+            Box::new(|f| f.has_running_seat = true),
         ];
         for (i, mutate) in cases.iter().enumerate() {
             let mut f = facts();

@@ -63,6 +63,28 @@ async fn gather(d: &Shared, id: &str) -> Option<Gathered> {
         has_lanes_or_watches: !state.watches.is_empty()
             || state.lanes.iter().any(|l| l.status == crate::lanes::LaneStatus::Running),
         has_queued_input: !state.queued_inputs.is_empty(),
+        has_running_seat: {
+            let mut running = false;
+            if let Ok(members) = store.session_members(&row.id) {
+                for m in members {
+                    if let Some(ref child_id) = m.work_session_id {
+                        if child_id != &row.id {
+                            let child_alive = d.sessions.lock().await.get(child_id).is_some_and(|s| !s.join.is_finished());
+                            let child_meta = state_path_for_id(child_id).and_then(|csp| read_session_meta(&csp));
+                            let child_row = store.get_session_row(child_id).ok().flatten();
+                            let child_running = (child_alive && child_meta.as_ref().is_some_and(|s| matches!(s.status, HarnessStatus::Running | HarnessStatus::WaitingForInput)))
+                                || child_meta.as_ref().is_some_and(|s| matches!(s.status, HarnessStatus::Running | HarnessStatus::WaitingForInput) || s.compacting || s.pending_question.is_some())
+                                || child_row.as_ref().is_some_and(|r| matches!(r.status.as_str(), "running" | "waiting_for_input"));
+                            if child_running {
+                                running = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            running
+        },
     };
     Some(Gathered { row, facts, state_path })
 }
