@@ -127,7 +127,11 @@ async fn status(State(d): State<Shared>, Query(q): Query<SessionQuery>) -> Respo
     .into_response()
 }
 
-const LIST_FIELDS: &str = "number,title,author,headRefName,baseRefName,isDraft,state,reviewDecision,statusCheckRollup,additions,deletions,updatedAt,url,labels,reviewRequests";
+// The per-check detail `gh pr list` asks for costs more than every other field
+// together on a busy repo; a row only shows the commit's overall state.
+const PR_ROW_FIELDS: &str = "number title author{login} headRefName baseRefName isDraft state reviewDecision additions deletions updatedAt url reviewRequests(first:10){nodes{requestedReviewer{...on User{login}...on Bot{login}...on Team{name}}}} commits(last:1){nodes{commit{statusCheckRollup{state}}}}";
+const LIST_PAGE: u32 = 25;
+const LIST_PAGE_MAX: u32 = 100;
 
 #[derive(Deserialize)]
 struct ListQuery {
@@ -135,6 +139,8 @@ struct ListQuery {
     session: String,
     /// open (default), mine, review, closed
     filter: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
 }
 
 async fn list(State(d): State<Shared>, Query(q): Query<ListQuery>) -> Response {
@@ -145,17 +151,76 @@ async fn list(State(d): State<Shared>, Query(q): Query<ListQuery>) -> Response {
         Ok(dir) => dir,
         Err(r) => return r,
     };
-    let mut args = vec!["pr", "list", "--limit", "60", "--json", LIST_FIELDS];
-    match q.filter.as_deref().unwrap_or("open") {
-        "mine" => args.extend(["--author", "@me"]),
-        "review" => args.extend(["--search", "review-requested:@me"]),
-        "closed" => args.extend(["--state", "closed"]),
-        _ => args.extend(["--state", "open"]),
+    let first = format!("first={}", q.limit.unwrap_or(LIST_PAGE).clamp(1, LIST_PAGE_MAX));
+    let filter = q.filter.as_deref().unwrap_or("open");
+    let search = match filter {
+        "mine" => Some("author:@me"),
+        "review" => Some("review-requested:@me"),
+        _ => None,
+    };
+    let query;
+    let search_field;
+    let mut args = vec!["api", "graphql", "-F", first.as_str()];
+    let pointer = if let Some(clause) = search {
+        let repo = match gh(&dir, &["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], None).await {
+            Ok(repo) => repo,
+            Err(e) => return fail(StatusCode::BAD_GATEWAY, e),
+        };
+        search_field = format!("q=repo:{} is:pr is:open {clause} sort:created-desc", repo.trim());
+        query = format!("query=query($q:String!,$first:Int!,$after:String){{search(query:$q,type:ISSUE,first:$first,after:$after){{pageInfo{{hasNextPage endCursor}}nodes{{...on PullRequest{{{PR_ROW_FIELDS}}}}}}}}}");
+        args.extend(["-f", search_field.as_str()]);
+        "/data/search"
+    } else {
+        let states = if filter == "closed" { "[CLOSED,MERGED]" } else { "[OPEN]" };
+        query = format!("query=query($owner:String!,$repo:String!,$first:Int!,$after:String){{repository(owner:$owner,name:$repo){{pullRequests(states:{states},first:$first,after:$after,orderBy:{{field:CREATED_AT,direction:DESC}}){{pageInfo{{hasNextPage endCursor}}nodes{{{PR_ROW_FIELDS}}}}}}}}}");
+        args.extend(["-F", "owner={owner}", "-F", "repo={repo}"]);
+        "/data/repository/pullRequests"
+    };
+    let after = q.cursor.as_deref().filter(|c| !c.is_empty()).map(|c| format!("after={c}"));
+    if let Some(after) = &after {
+        args.extend(["-f", after.as_str()]);
     }
-    match gh_json(&dir, &args).await {
-        Ok(prs) => Json(json!({ "prs": prs })).into_response(),
-        Err(e) => fail(StatusCode::BAD_GATEWAY, e),
+    args.extend(["-f", query.as_str()]);
+    let page = match gh_json(&dir, &args).await {
+        Ok(page) => page,
+        Err(e) => return fail(StatusCode::BAD_GATEWAY, e),
+    };
+    let Some(page) = page.pointer(pointer) else {
+        return fail(StatusCode::BAD_GATEWAY, "gh returned no pull requests");
+    };
+    let prs: Vec<Value> = page
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| nodes.iter().filter(|n| n.get("number").is_some()).map(pr_row).collect())
+        .unwrap_or_default();
+    let next = page
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        .then(|| page.pointer("/pageInfo/endCursor").cloned())
+        .flatten();
+    Json(json!({ "prs": prs, "next_cursor": next })).into_response()
+}
+
+/// A GraphQL row in the shape `gh pr view --json` gives, which the app parses.
+fn pr_row(node: &Value) -> Value {
+    let mut row = node.clone();
+    let reviewers: Vec<Value> = node
+        .pointer("/reviewRequests/nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| nodes.iter().filter_map(|n| n.get("requestedReviewer").cloned()).collect())
+        .unwrap_or_default();
+    let checks: Vec<Value> = node
+        .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
+        .map(|state| json!({ "state": state }))
+        .into_iter()
+        .collect();
+    if let Some(obj) = row.as_object_mut() {
+        obj.remove("commits");
+        obj.insert("reviewRequests".to_string(), Value::Array(reviewers));
+        obj.insert("statusCheckRollup".to_string(), Value::Array(checks));
     }
+    row
 }
 
 const DETAIL_FIELDS: &str = "number,title,body,author,state,isDraft,headRefName,baseRefName,additions,deletions,changedFiles,files,commits,reviews,comments,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus,url,createdAt,updatedAt,labels,reviewRequests,headRefOid,autoMergeRequest,isCrossRepository";
@@ -244,10 +309,36 @@ async fn diff(State(d): State<Shared>, Query(q): Query<PrQuery>) -> Response {
         Ok(dir) => dir,
         Err(r) => return r,
     };
-    match gh(&dir, &["pr", "diff", &q.number.to_string()], None).await {
+    let number = q.number.to_string();
+    let text = match gh(&dir, &["pr", "diff", &number], None).await {
+        Err(e) if e.contains("too_large") || e.contains("HTTP 406") => diff_from_files(&dir, &number).await,
+        other => other,
+    };
+    match text {
         Ok(text) => Json(json!({ "diff": text })).into_response(),
         Err(e) => fail(StatusCode::BAD_GATEWAY, e),
     }
+}
+
+/// GitHub refuses a whole diff past 300 files or 20,000 lines, but still lists
+/// each file's patch.
+async fn diff_from_files(dir: &Path, number: &str) -> Result<String, String> {
+    let path = format!("repos/{{owner}}/{{repo}}/pulls/{number}/files?per_page=100");
+    let lines = gh(dir, &["api", "--paginate", "--jq", ".[]", &path], None).await?;
+    let mut diff = String::new();
+    for line in lines.lines() {
+        let file: Value = serde_json::from_str(line).map_err(|e| format!("gh returned unreadable JSON: {e}"))?;
+        let Some(name) = file.get("filename").and_then(Value::as_str) else {
+            continue;
+        };
+        let old = file.get("previous_filename").and_then(Value::as_str).unwrap_or(name);
+        diff.push_str(&format!("diff --git a/{old} b/{name}\n--- a/{old}\n+++ b/{name}\n"));
+        if let Some(patch) = file.get("patch").and_then(Value::as_str) {
+            diff.push_str(patch);
+            diff.push('\n');
+        }
+    }
+    Ok(diff)
 }
 
 #[derive(Deserialize)]
