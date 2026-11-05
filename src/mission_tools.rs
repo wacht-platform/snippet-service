@@ -2876,7 +2876,7 @@ impl Tool for RegisterAgent {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "register_agent".into(),
-            description: "Create or rebuild a specialized agent: writes its identity.md into its agent home (~/.snippet/agents/<id>/) and registers it in the directory so it can be messaged, assigned and dispatched. The identity is the agent's whole persona and expertise, applied on top of the standard coding runtime in every session it works in. Call it once per build, after researching the role; calling it again with the same id replaces the identity.".into(),
+            description: "Create or rebuild a specialized agent: writes its identity.md into its agent home (~/.snippet/agents/<id>/) and registers it in the directory so it can be messaged, assigned and dispatched. The identity is the agent's whole persona and expertise, applied on top of the standard coding runtime in every session it works in. An agent is a lasting skill (a Rust expert, a motion designer), never one task or project. Call it once per build, after researching the role; calling it again with the same id replaces the identity.".into(),
             input_schema: schema(
                 json!({
                     "id": {"type": "string", "description": "kebab-case agent id, e.g. rust-pr-reviewer"},
