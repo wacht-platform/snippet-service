@@ -1337,7 +1337,6 @@ pub async fn dispatch_loop(daemon: Shared) {
         }
         super::review::drive_reviews(&daemon).await;
         super::stall::sweep(&daemon.store, chrono::Utc::now(), super::stall::probe_session);
-        super::stall::escalate_handoffs(&daemon.store, chrono::Utc::now());
         deliver_mission_control_reports(&daemon).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1396,7 +1395,7 @@ fn report_text(task: &Task, marker: &crate::coordination::NotificationMarker) ->
 
 /// Outcomes that must not wait behind a question to the user.
 fn is_outcome_report(kind: &str) -> bool {
-    matches!(kind, "done" | "failed" | "stalled" | "blocked" | "review_escalated" | "member_stopped" | "handover_unacked" | "room_limit")
+    matches!(kind, "done" | "failed" | "stalled" | "blocked" | "review_escalated" | "member_stopped" | "room_limit")
 }
 
 async fn deliver_mission_control_reports(daemon: &Daemon) {

@@ -603,7 +603,6 @@ async fn transfer_task_lease(
                 files: Vec::new(),
                 created_at: now.clone(),
                 acked_at: None,
-                escalated_at: None,
             };
             crate::members::pass_turn(&d.store, task, to_agent, &handover, &now).map(|passed| {
                 body = crate::members::handover_body(&handover, &passed);

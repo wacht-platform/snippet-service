@@ -1291,7 +1291,6 @@ impl Tool for PassTurn {
             files: args.files.clone(),
             created_at: now.clone(),
             acked_at: None,
-            escalated_at: None,
         };
         let passed = crate::members::pass_turn(&db, &task, to_agent, &handover, &now).map_err(ToolError::msg)?;
         let body = crate::members::handover_body(&handover, &passed);

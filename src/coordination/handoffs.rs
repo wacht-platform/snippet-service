@@ -4,8 +4,6 @@ use rusqlite::{OptionalExtension, params};
 
 use super::{Store, StoreError};
 
-pub const ESCALATE_AFTER_MINUTES: i64 = 10;
-
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct Handover {
     pub id: String,
@@ -18,7 +16,6 @@ pub struct Handover {
     pub files: Vec<String>,
     pub created_at: String,
     pub acked_at: Option<String>,
-    pub escalated_at: Option<String>,
 }
 
 impl Handover {
@@ -30,12 +27,12 @@ impl Handover {
     pub fn view(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id, "from": self.from_agent, "to": self.to_agent, "state": self.state(),
-            "created_at": self.created_at, "acked_at": self.acked_at, "escalated": self.escalated_at.is_some(),
+            "created_at": self.created_at, "acked_at": self.acked_at,
         })
     }
 }
 
-const COLUMNS: &str = "id, task_id, from_agent, to_agent, done, next, risks, files_json, created_at, acked_at, escalated_at";
+const COLUMNS: &str = "id, task_id, from_agent, to_agent, done, next, risks, files_json, created_at, acked_at";
 
 fn from_row(r: &rusqlite::Row<'_>) -> Result<Handover, rusqlite::Error> {
     Ok(Handover {
@@ -49,7 +46,6 @@ fn from_row(r: &rusqlite::Row<'_>) -> Result<Handover, rusqlite::Error> {
         files: serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default(),
         created_at: r.get(8)?,
         acked_at: r.get(9)?,
-        escalated_at: r.get(10)?,
     })
 }
 
@@ -64,7 +60,7 @@ impl Store {
         }
         self.with_connection(|c| {
             c.execute(
-                &format!("INSERT INTO handoffs ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,NULL)"),
+                &format!("INSERT INTO handoffs ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL)"),
                 params![
                     h.id, h.task_id, h.from_agent, h.to_agent, h.done, h.next, h.risks,
                     serde_json::to_string(&h.files).unwrap_or_else(|_| "[]".into()), h.created_at
@@ -110,21 +106,6 @@ impl Store {
         h.acked_at = Some(now.to_string());
         Ok(h)
     }
-
-    /// Unacknowledged handovers older than the escalation window, not yet escalated.
-    pub fn overdue_handoffs(&self, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<Handover>, StoreError> {
-        let cutoff = (now - chrono::Duration::minutes(ESCALATE_AFTER_MINUTES)).to_rfc3339();
-        self.with_connection(|c| {
-            let mut stmt = c.prepare(&format!(
-                "SELECT {COLUMNS} FROM handoffs WHERE acked_at IS NULL AND escalated_at IS NULL AND created_at <= ?1"
-            ))?;
-            stmt.query_map(params![cutoff], from_row)?.collect()
-        })
-    }
-
-    pub fn mark_handoff_escalated(&self, id: &str, now: &str) -> Result<(), StoreError> {
-        self.with_connection(|c| c.execute("UPDATE handoffs SET escalated_at = ?2 WHERE id = ?1", params![id, now]).map(|_| ()))
-    }
 }
 
 #[cfg(test)]
@@ -136,7 +117,7 @@ mod tests {
         Handover {
             id: format!("h-{task}-{to}"), task_id: task.into(), from_agent: "a".into(), to_agent: to.into(),
             done: "wrote it".into(), next: "review".into(), risks: "flaky".into(), files: vec!["src/a.rs".into()],
-            created_at: "2026-01-01T00:00:00Z".into(), acked_at: None, escalated_at: None,
+            created_at: "2026-01-01T00:00:00Z".into(), acked_at: None,
         }
     }
 
@@ -158,11 +139,6 @@ mod tests {
         db.create_handoff(&handover("t", "b")).unwrap();
         assert!(db.create_handoff(&handover("t", "b")).is_err(), "one open handover at a time");
         assert_eq!(db.current_lease("t").unwrap().unwrap().agent_id, "a");
-
-        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:11:00Z").unwrap().with_timezone(&chrono::Utc);
-        assert_eq!(db.overdue_handoffs(now).unwrap().len(), 1);
-        db.mark_handoff_escalated("h-t-b", "2026-01-01T00:11:00Z").unwrap();
-        assert!(db.overdue_handoffs(now).unwrap().is_empty());
 
         assert!(db.ack_handoff("t", "a", "2026-01-01T00:12:00Z").is_err(), "only the addressee acks");
         let acked = db.ack_handoff("t", "b", "2026-01-01T00:12:00Z").unwrap();
