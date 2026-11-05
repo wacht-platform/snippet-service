@@ -202,7 +202,8 @@ fn update_plan_tool() -> NativeToolDefinition {
         description: "Keep a short, visible plan for work with several distinct steps; the user \
             sees it as a checklist. Send the whole list every time: short concrete steps, each \
             `pending`, `in_progress` or `done`, with exactly one `in_progress` while you work. Mark \
-            a step done as soon as it is, and reshape the list when you learn something that \
+            a step done as soon as it is, in the same batch as the work, and finish with every \
+            step done or removed. Reshape the list when you learn something that \
             changes the work (say why in `explanation`). Skip it for small tasks. Updating the \
             plan is not progress by itself: after updating it, do the work."
             .to_string(),
