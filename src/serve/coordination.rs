@@ -66,6 +66,7 @@ pub fn router() -> Router<Shared> {
         .route("/coordination/tasks/{task_id}/status", post(set_task_status))
         .route("/coordination/tasks/{task_id}/links", get(task_links).post(link_tasks))
         .route("/coordination/tasks/{task_id}/links/{other_id}", delete(unlink_tasks))
+        .route("/coordination/tasks/{task_id}/turns", get(task_turns))
         .route("/coordination/tasks/{task_id}/agents", get(task_agents).post(add_task_agent))
         .route("/coordination/tasks/{task_id}/agents/{agent_id}", delete(remove_task_agent))
         .route("/coordination/tasks/{task_id}/agents/{agent_id}/lease", post(transfer_task_lease))
@@ -175,6 +176,8 @@ pub struct CoordinationMessageReq {
     pub body: String,
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub to: Vec<String>,
 }
 
 async fn list_tasks(
@@ -500,6 +503,24 @@ async fn task_agents(
     }
 }
 
+async fn task_turns(
+    State(d): State<Shared>,
+    Query(q): Query<Auth>,
+    Path(task_id): Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.store.list_turns(&task_id) {
+        Ok(turns) => Json(turns).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("task turns: {error}"),
+        )
+            .into_response(),
+    }
+}
+
 async fn add_task_agent(
     State(d): State<Shared>,
     Query(q): Query<Auth>,
@@ -564,10 +585,38 @@ async fn transfer_task_lease(
     if to_agent.is_empty() {
         return (StatusCode::BAD_REQUEST, "to_agent_id is required").into_response();
     }
-    match d.store.transfer_task_session_lease(&task_id, &agent_id, to_agent) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let live_task = d.store.get_task(&task_id).ok().flatten().filter(|task| {
+        task.status == TaskStatus::InProgress && crate::members::task_workspace(&d.store, task).is_some()
+    });
+    let mut body = format!("Session lease transferred from {agent_id} to {to_agent}");
+    let moved = match &live_task {
+        Some(task) => {
+            let handover = crate::coordination::handoffs::Handover {
+                id: uuid::Uuid::new_v4().to_string(),
+                task_id: task_id.clone(),
+                from_agent: agent_id.clone(),
+                to_agent: to_agent.to_string(),
+                done: "The user moved the turn.".to_string(),
+                next: String::new(),
+                risks: String::new(),
+                files: Vec::new(),
+                created_at: now.clone(),
+                acked_at: None,
+                escalated_at: None,
+            };
+            crate::members::pass_turn(&d.store, task, to_agent, &handover, &now).map(|passed| {
+                body = crate::members::handover_body(&handover, &passed);
+            })
+        }
+        None => d
+            .store
+            .transfer_task_session_lease(&task_id, &agent_id, to_agent)
+            .map_err(|e| e.to_string()),
+    };
+    match moved {
         Ok(()) => {
             if let Ok(Some(task)) = d.store.get_task(&task_id) {
-                let now = chrono::Utc::now().to_rfc3339();
                 let event = CoordinationEvent {
                     event_id: uuid::Uuid::new_v4().to_string(),
                     partition_key: format!("thread:{}", task.thread_id),
@@ -578,7 +627,7 @@ async fn transfer_task_lease(
                     actor_id: "coordination".to_string(),
                     payload_version: 1,
                     payload: serde_json::json!({
-                        "body": format!("Session lease transferred from {agent_id} to {to_agent}"),
+                        "body": body,
                         "task_id": task_id,
                         "from_agent_id": agent_id,
                         "to_agent_id": to_agent,
@@ -639,6 +688,32 @@ pub(super) async fn post_message(
         return (StatusCode::BAD_REQUEST, "body is required").into_response();
     }
     let now = chrono::Utc::now().to_rfc3339();
+    let mut payload = serde_json::json!({
+        "body": body,
+        "thread_id": thread_id,
+    });
+    let to: Vec<&str> = req.to.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
+    if !to.is_empty() {
+        let Ok(Some(task)) = d.store.get_task_by_thread(&thread_id) else {
+            return (StatusCode::BAD_REQUEST, "only a task's room can address its members").into_response();
+        };
+        let roster = d.store.list_task_agents(&task.id).unwrap_or_default();
+        if let Some(stranger) = to.iter().find(|a| {
+            **a != crate::mission_control::SESSION_ID
+                && !roster.iter().any(|m| m.agent_id == **a && m.removed_at.is_none())
+        }) {
+            return (StatusCode::BAD_REQUEST, format!("{stranger} isn't on this task")).into_response();
+        }
+        if crate::members::task_workspace(&d.store, &task).is_some() {
+            crate::members::seat_holder(&d.store, &task);
+            for agent in to.iter().filter(|a| **a != crate::mission_control::SESSION_ID) {
+                if let Err(error) = crate::members::seat(&d.store, &task, agent, &now) {
+                    return (StatusCode::CONFLICT, error).into_response();
+                }
+            }
+        }
+        payload["to"] = serde_json::json!(to);
+    }
     let event = CoordinationEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         partition_key: format!("thread:{thread_id}"),
@@ -648,10 +723,7 @@ pub(super) async fn post_message(
         actor_kind: "human".to_string(),
         actor_id: "human".to_string(),
         payload_version: 1,
-        payload: serde_json::json!({
-            "body": body,
-            "thread_id": thread_id,
-        }),
+        payload,
         causation_id: None,
         correlation_id: None,
         idempotency_key: req

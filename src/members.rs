@@ -83,8 +83,14 @@ pub fn changes(from: &Snapshot, to: &Snapshot, workspace: &Path) -> (Vec<String>
 }
 
 pub fn task_workspace(store: &Store, task: &Task) -> Option<std::path::PathBuf> {
-    let row = store.get_session_row(&task.session_id).ok().flatten()?;
-    Some(row.workspace.into()).filter(|p: &std::path::PathBuf| !p.as_os_str().is_empty())
+    // A task may name its session by the old `.json` path, which only some rows keep as legacy_id.
+    [Some(task.session_id.as_str()), task.reporting_session.as_deref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|id| [id, id.strip_suffix(".json").unwrap_or(id)])
+        .find_map(|id| store.get_session_row(id).ok().flatten())
+        .map(|row| std::path::PathBuf::from(row.workspace))
+        .filter(|p| !p.as_os_str().is_empty())
 }
 
 /// The conversation holding the turn on a task.
@@ -219,11 +225,11 @@ pub fn pass_turn(store: &Store, task: &Task, to: &str, handover: &Handover, now:
 /// reader can tell what the member said from what actually moved.
 pub fn handover_body(handover: &Handover, passed: &Passed) -> String {
     let mut body = format!(
-        "{} passed the turn to {}.\nDone: {}\nNext: {}\nRisks: {}",
+        "{} passed the turn to {}.\nDone: {}{}\nRisks: {}",
         handover.from_agent,
         handover.to_agent,
         handover.done,
-        handover.next,
+        if handover.next.is_empty() { String::new() } else { format!("\nNext: {}", handover.next) },
         if handover.risks.is_empty() { "none stated" } else { &handover.risks },
     );
     if !handover.files.is_empty() {

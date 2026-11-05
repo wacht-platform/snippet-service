@@ -175,6 +175,7 @@ use super::*;
             Query(with_token()),
             axum::extract::Path("t1".to_string()),
             Json(coordination::CoordinationMessageReq {
+                to: Vec::new(),
                 body: "   ".into(),
                 idempotency_key: None,
             }),
@@ -371,6 +372,7 @@ use super::*;
             Query(with_token()),
             axum::extract::Path("live".to_string()),
             Json(coordination::CoordinationMessageReq {
+                to: Vec::new(),
                 body: "hello live".into(),
                 idempotency_key: None,
             }),
@@ -394,6 +396,7 @@ use super::*;
                 Query(with_token()),
                 axum::extract::Path("t1".to_string()),
                 Json(coordination::CoordinationMessageReq {
+                    to: Vec::new(),
                     body: body.into(),
                     idempotency_key: None,
                 }),
