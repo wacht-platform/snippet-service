@@ -53,7 +53,16 @@ pub(super) fn sweep(store: &Store, now: DateTime<Utc>, probe: impl Fn(&str) -> O
             let _ = store.touch_task_progress(&task.id, &task.updated_at);
             continue;
         }
-        let session = probe(&task.session_id);
+        // After a pass_turn the main session is rightly quiet: watch the holder's.
+        let watched = store
+            .list_task_agents(&task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|m| m.status == "active" && m.removed_at.is_none())
+            .and_then(|m| m.work_session_id)
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| task.session_id.clone());
+        let session = probe(&watched);
         let question = session.as_ref().and_then(|s| s.question.clone());
         let idle = session.as_ref().is_some_and(|s| s.status == "idle");
         let Some(age) = stalled_minutes(&task, now, question.is_some() || idle) else { continue };
