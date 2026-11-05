@@ -7,6 +7,45 @@ use super::Daemon;
 
 const DIFF_CHARS: usize = 40_000;
 
+pub(super) const DEFAULT_REVIEWER: &str = "reviewer";
+
+/// Registers the reviewer agent once; an existing one keeps its identity and profile.
+pub(super) fn ensure_default_reviewer(d: &Daemon) {
+    if matches!(d.store.get_agent(DEFAULT_REVIEWER), Ok(Some(_))) {
+        return;
+    }
+    let home = crate::coordination::AgentHome::new(crate::coordination::agents_root(&d.mission_control_root), DEFAULT_REVIEWER);
+    if let Err(error) = home.and_then(|home| home.ensure_layout(include_str!("../../prompts/reviewer_identity.md"))) {
+        eprintln!("[review] reviewer agent home: {error}");
+        return;
+    }
+    let agent = crate::coordination::types::Agent {
+        id: DEFAULT_REVIEWER.to_string(),
+        display_name: "Reviewer".to_string(),
+        handle: DEFAULT_REVIEWER.to_string(),
+        kind: crate::coordination::types::AgentKind::Worker,
+        status: crate::coordination::types::AgentStatus::Active,
+        role: crate::coordination::types::AgentRole::Reviewer,
+        capabilities: Vec::new(),
+    };
+    if let Err(error) = d.store.create_agent(&agent) {
+        eprintln!("[review] register reviewer agent: {error}");
+    }
+}
+
+/// The agent that reviews a task: the one seated, otherwise the default. Never
+/// the worker, because a review by the agent that did the work checks nothing.
+fn pick_reviewer(d: &Daemon, task: &Task) -> Option<String> {
+    let roster = d.store.list_task_agents(&task.id).unwrap_or_default();
+    let live = || roster.iter().filter(|m| m.removed_at.is_none());
+    let seated = live().find(|m| m.role == "reviewer").map(|m| m.agent_id.clone());
+    let chosen = seated.or_else(|| {
+        matches!(d.store.get_agent(DEFAULT_REVIEWER), Ok(Some(_))).then(|| DEFAULT_REVIEWER.to_string())
+    })?;
+    let is_worker = live().any(|m| m.agent_id == chosen && m.role != "reviewer");
+    (!is_worker).then_some(chosen)
+}
+
 fn git(workspace: &std::path::Path, args: &[&str]) -> String {
     std::process::Command::new("git")
         .arg("-C")
@@ -88,19 +127,17 @@ async fn start_review(d: &Daemon, task: &Task, state: &TaskState, now: &str) {
         crate::review_tools::escalate(&d.store, &task.id, "no reviewer could start: the work session's workspace is gone", now);
         return;
     };
-    let seated = d
-        .store
-        .list_task_agents(&task.id)
-        .unwrap_or_default()
-        .into_iter()
-        .find(|m| m.removed_at.is_none() && m.role == "reviewer")
-        .map(|m| m.agent_id);
+    let Some(reviewer) = pick_reviewer(d, task) else {
+        crate::review_tools::escalate(&d.store, &task.id, "no reviewer agent other than the worker is available; check the work and submit_review yourself", now);
+        return;
+    };
+    let profile = d.store.agent_profile(&reviewer).ok().flatten();
     let spec = LaneSpawn {
         title: format!("Review: {}", task.title),
         brief: review_brief(task, state, &workspace),
         read_only: true,
-        agent: seated,
-        profile: Some(state.reviewer_profile.clone()).filter(|p| !p.is_empty()),
+        agent: Some(reviewer),
+        profile,
     };
     let _ = d.store.modify_task_state(&task.id, now, |s| s.review_started_at = now.to_string());
     d.deliver(&task.session_id, LoopInput::SpawnLane(spec)).await;

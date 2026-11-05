@@ -312,6 +312,21 @@ impl Tool for SubmitReview {
             ctx.agent_id().unwrap_or("reviewer").to_string()
         };
         let now = chrono::Utc::now().to_rfc3339();
+        if !is_mc {
+            let verdict = if approve { "approved" } else { "sent back" };
+            let summary = format!("{} {verdict}: {} {}", task.id, task.title, findings.join("; "));
+            let _ = store.record_board_entry(
+                &reviewer,
+                crate::coordination::BoardEntryKind::Noted,
+                &crate::coordination::NewBoardEntry {
+                    session_id: Some(&task.session_id),
+                    workspace: None,
+                    summary: summary.trim(),
+                    correlation_id: Some(&task.id),
+                    created_at: &now,
+                },
+            );
+        }
         if approve {
             let note = if findings.is_empty() { String::new() } else { format!(" Notes: {}", findings.join("; ")) };
             let done = approve_pending(ctx, &store, &task, &state, &reviewer, &format!("review approved.{note}"), now)?;

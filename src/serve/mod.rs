@@ -845,6 +845,7 @@ pub async fn run_serve(
         let d = daemon.clone();
         tokio::spawn(async move { config_watch_loop(d).await });
     }
+    review::ensure_default_reviewer(&daemon);
     {
         let d = daemon.clone();
         tokio::spawn(async move { mission_control::dispatch_loop(d).await });

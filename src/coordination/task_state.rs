@@ -121,9 +121,6 @@ pub struct TaskState {
     pub verify_mode: Option<VerifyMode>,
     #[serde(default)]
     pub revises_task_id: String,
-    /// Inference profile for the reviewer lane; empty means the lane default.
-    #[serde(default)]
-    pub reviewer_profile: String,
     #[serde(default)]
     pub evidence: Vec<Evidence>,
     #[serde(default)]
