@@ -88,6 +88,10 @@ pub struct BoardQuery<'a> {
     pub contains: Option<&'a str>,
     /// Only rows of this kind.
     pub kind: Option<BoardEntryKind>,
+    /// Only rows older than this id, to page past `limit`.
+    pub before_id: Option<i64>,
+    /// Only dispatches with no report yet.
+    pub outstanding: bool,
 }
 
 const ENTRY_COLUMNS: &str = "id, agent_id, kind, session_id, workspace, summary, \
@@ -163,7 +167,19 @@ impl Store {
                    AND (?2 IS NULL OR workspace = ?2)
                    AND (?3 IS NULL OR kind = ?3)
                    AND (?4 IS NULL OR summary LIKE ?4 ESCAPE '\\')
-                 ORDER BY created_at DESC, id DESC
+                   AND (?6 IS NULL OR id < ?6)
+                   AND (NOT ?7 OR (kind = 'dispatched'
+                        AND correlation_id IS NOT NULL AND correlation_id <> ''
+                        AND NOT EXISTS (
+                            SELECT 1 FROM agent_board r
+                            WHERE r.agent_id = agent_board.agent_id
+                              AND r.kind = 'reported'
+                              AND r.correlation_id = agent_board.correlation_id)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM tasks t
+                            WHERE t.id = agent_board.correlation_id
+                              AND t.status IN ('done', 'cancelled', 'failed'))))
+                 ORDER BY id DESC
                  LIMIT ?5"
             ))?;
             let rows = stmt.query_map(
@@ -172,7 +188,9 @@ impl Store {
                     query.workspace,
                     query.kind.map(|k| k.as_str()),
                     contains,
-                    limit
+                    limit,
+                    query.before_id,
+                    query.outstanding
                 ],
                 entry_from_row,
             )?;
@@ -198,7 +216,7 @@ impl Store {
     }
 
     /// The correlation ids this agent has dispatched but not yet seen a report
-    /// for — "what is still outstanding from my side".
+    /// for and whose task is still open: "what is still outstanding from my side".
     ///
     /// Derived rather than stored, so it can never disagree with the board.
     pub fn board_awaiting_report(&self, agent_id: &str) -> Result<Vec<String>, StoreError> {
@@ -213,6 +231,10 @@ impl Store {
                          AND r.kind = 'reported'
                          AND r.correlation_id = d.correlation_id
                    )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM tasks t
+                       WHERE t.id = d.correlation_id
+                         AND t.status IN ('done', 'cancelled', 'failed'))
                  ORDER BY d.created_at DESC",
             )?;
             let rows = stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))?;

@@ -3610,7 +3610,7 @@ mod tests {
         let reviewer_board = db
             .read_board(
                 "reviewer",
-                &crate::coordination::BoardQuery { workspace: None, contains: None, kind: None },
+                &crate::coordination::BoardQuery::default(),
                 10,
             )
             .unwrap();

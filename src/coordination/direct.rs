@@ -31,6 +31,103 @@ pub fn direct_thread_id(a: (&str, &str), b: (&str, &str)) -> String {
     format!("direct:{}", ends.join("|"))
 }
 
+/// Narrows an inbox read to one kind of arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxKind {
+    Offer,
+    Message,
+    Room,
+}
+
+impl InboxKind {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "offer" => Some(Self::Offer),
+            "message" => Some(Self::Message),
+            "room" => Some(Self::Room),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Offer => "offer",
+            Self::Message => "message",
+            Self::Room => "room",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InboxQuery<'a> {
+    pub contains: Option<&'a str>,
+    pub kind: Option<InboxKind>,
+    pub before_id: Option<i64>,
+}
+
+/// One arrival: a direct message delivered to the agent, or a room post that
+/// names it.
+#[derive(Debug, Clone, Serialize)]
+pub struct InboxEntry {
+    pub id: i64,
+    pub event_id: String,
+    /// `offer`, `message` or `room`.
+    pub source: &'static str,
+    pub thread_id: String,
+    pub from_kind: String,
+    pub from_id: String,
+    /// Who it was addressed to, which differs from the agent on the copy of what
+    /// its own session sent.
+    pub to_id: Option<String>,
+    /// The `[envelope]` the message arrived in, when it has one.
+    pub envelope: Option<String>,
+    /// The poster's own label: `question`, `blocker`, and so on.
+    pub post_kind: Option<String>,
+    pub task_id: Option<String>,
+    pub title: Option<String>,
+    pub text: String,
+    pub created_at: String,
+}
+
+/// Splits an envelope into its name, task, title and the text a person reads.
+fn parse_envelope(body: &str) -> (Option<String>, Option<String>, Option<String>, String) {
+    let body = body.trim();
+    let Some((first, rest)) = body.split_once('\n') else {
+        return (None, None, None, body.to_string());
+    };
+    let name = first.strip_prefix('[').and_then(|f| f.strip_suffix(']'));
+    let Some(name) = name.filter(|n| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    }) else {
+        return (None, None, None, body.to_string());
+    };
+    let (mut task_id, mut title) = (None, None);
+    let mut lines = rest.lines().peekable();
+    let mut text = String::new();
+    while let Some(line) = lines.peek().copied() {
+        let Some((key, value)) = line.split_once(':') else { break };
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            break;
+        }
+        lines.next();
+        match key {
+            "task_id" => task_id = Some(value.trim().to_string()),
+            "title" => title = Some(value.trim().to_string()),
+            "briefing" => break,
+            "scope" => {
+                text.push_str(value.trim());
+                text.push('\n');
+                break;
+            }
+            _ => {}
+        }
+    }
+    text.push_str(&lines.collect::<Vec<_>>().join("\n"));
+    let closing = format!("[/{name}]");
+    let text = text.split(closing.as_str()).next().unwrap_or_default().trim().to_string();
+    (Some(name.to_string()), task_id, title, text)
+}
+
 /// One message awaiting delivery to one recipient.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingDirectMessage {
@@ -293,6 +390,93 @@ impl Store {
         })?;
 
         Ok(saved)
+    }
+
+    /// What has reached an agent, newest first.
+    pub fn read_inbox(
+        &self,
+        agent_id: &str,
+        query: &InboxQuery<'_>,
+        limit: u32,
+    ) -> Result<Vec<InboxEntry>, StoreError> {
+        let contains = query.contains.map(|text| {
+            let escaped = text
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            format!("%{escaped}%")
+        });
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT e.rowid, e.event_id, e.thread_id, e.actor_kind, e.actor_id,
+                        e.event_type, e.payload_json, e.created_at, t.title
+                 FROM board_events e
+                 LEFT JOIN tasks t ON t.thread_id = e.thread_id
+                 WHERE ((e.event_type = 'direct_message.sent' AND EXISTS (
+                            SELECT 1 FROM message_deliveries d
+                            WHERE d.event_id = e.event_id
+                              AND d.recipient_kind = 'agent' AND d.recipient_id = ?1))
+                     OR (e.event_type = 'message.posted' AND EXISTS (
+                            SELECT 1 FROM json_each(e.payload_json, '$.to') j
+                            WHERE j.value = ?1)))
+                   AND (?2 IS NULL OR e.rowid < ?2)
+                   AND (?3 IS NULL OR json_extract(e.payload_json, '$.body') LIKE ?3 ESCAPE '\\')
+                   AND (?4 IS NULL
+                        OR (?4 = 'room' AND e.event_type = 'message.posted')
+                        OR (?4 = 'offer' AND e.event_type = 'direct_message.sent'
+                            AND json_extract(e.payload_json, '$.body') LIKE '[task\\_offer]%' ESCAPE '\\')
+                        OR (?4 = 'message' AND e.event_type = 'direct_message.sent'
+                            AND json_extract(e.payload_json, '$.body') NOT LIKE '[task\\_offer]%' ESCAPE '\\'))
+                 ORDER BY e.rowid DESC
+                 LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    agent_id,
+                    query.before_id,
+                    contains,
+                    query.kind.map(InboxKind::as_str),
+                    limit
+                ],
+                |row| {
+                    let thread_id: String = row.get(2)?;
+                    let event_type: String = row.get(5)?;
+                    let payload: String = row.get(6)?;
+                    let room_title: Option<String> = row.get(8)?;
+                    let payload: serde_json::Value =
+                        serde_json::from_str(&payload).unwrap_or_default();
+                    let body = payload["body"].as_str().unwrap_or_default();
+                    let (envelope, task_id, title, text) = parse_envelope(body);
+                    let room = event_type == "message.posted";
+                    Ok(InboxEntry {
+                        id: row.get(0)?,
+                        event_id: row.get(1)?,
+                        source: if room {
+                            "room"
+                        } else if envelope.as_deref() == Some("task_offer") {
+                            "offer"
+                        } else {
+                            "message"
+                        },
+                        task_id: task_id.or_else(|| {
+                            thread_id.strip_prefix("task:").map(str::to_string)
+                        }),
+                        title: title.or(room_title),
+                        thread_id,
+                        from_kind: row.get(3)?,
+                        from_id: row.get(4)?,
+                        to_id: payload["recipient"]
+                            .as_str()
+                            .map(|r| r.rsplit(':').next().unwrap_or(r).to_string()),
+                        envelope,
+                        post_kind: payload["kind"].as_str().map(str::to_string),
+                        text,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )?;
+            rows.collect()
+        })
     }
 
     /// Direct messages not yet handed to their recipient, oldest first.

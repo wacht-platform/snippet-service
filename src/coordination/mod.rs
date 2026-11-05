@@ -26,6 +26,7 @@ pub use board::{
     BoardEntry, BoardEntryKind, BoardQuery, NewBoardEntry,
 };
 pub use direct::{
+    InboxEntry, InboxKind, InboxQuery,
     DirectThreadSummary, LOCAL_HUMAN_ID, PendingDirectMessage, actor_ref, direct_thread_id,
 };
 pub use agents::AgentRemoval;

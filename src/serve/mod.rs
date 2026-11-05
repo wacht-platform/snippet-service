@@ -892,6 +892,7 @@ pub async fn run_serve(
         .route("/health", get(|| async { "ok" }))
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/{agent_id}/board", get(agent_board))
+        .route("/agents/{agent_id}/inbox", get(agent_inbox))
         .route("/agents/{agent_id}/status", post(set_agent_status))
         .route("/agents/{agent_id}/color", post(set_agent_color))
         .route("/agents/{agent_id}/shape", post(set_agent_shape))

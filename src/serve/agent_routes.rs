@@ -102,6 +102,12 @@ pub(crate) struct AgentBoardQuery {
     /// `dispatched`, `reported`, `noted`, or `progress`.
     #[serde(default)]
     kind: Option<String>,
+    /// Only rows older than this id.
+    #[serde(default)]
+    before: Option<i64>,
+    /// Only dispatches with no report yet.
+    #[serde(default)]
+    outstanding: bool,
     #[serde(default = "default_agent_page_limit")]
     limit: u32,
 }
@@ -136,11 +142,72 @@ pub(crate) async fn agent_board(
         workspace: q.workspace.as_deref().filter(|w| !w.trim().is_empty()),
         contains: q.contains.as_deref().filter(|c| !c.trim().is_empty()),
         kind,
+        before_id: q.before,
+        outstanding: q.outstanding,
     };
+    let awaiting = d.store.board_awaiting_report(&agent_id);
     match d
         .store
         .read_board(&agent_id, &query, q.limit.clamp(1, 200))
+        .and_then(|entries| Ok((entries, awaiting?)))
     {
+        Ok((entries, awaiting)) => Json(serde_json::json!({
+            "agent_id": agent_id,
+            "entries": entries,
+            "awaiting": awaiting,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("read board: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AgentInboxQuery {
+    token: Option<String>,
+    #[serde(default)]
+    contains: Option<String>,
+    /// `offer`, `message` or `room`.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Only rows older than this id.
+    #[serde(default)]
+    before: Option<i64>,
+    #[serde(default = "default_agent_page_limit")]
+    limit: u32,
+}
+
+/// GET /agents/{agent_id}/inbox: what has reached this agent, newest first.
+pub(crate) async fn agent_inbox(
+    State(d): State<Shared>,
+    Query(q): Query<AgentInboxQuery>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    let kind = match q.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        None => None,
+        Some(raw) => match crate::coordination::InboxKind::parse(raw) {
+            Some(kind) => Some(kind),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown kind `{raw}`: use offer, message or room"),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let query = crate::coordination::InboxQuery {
+        contains: q.contains.as_deref().filter(|c| !c.trim().is_empty()),
+        kind,
+        before_id: q.before,
+    };
+    match d.store.read_inbox(&agent_id, &query, q.limit.clamp(1, 200)) {
         Ok(entries) => Json(serde_json::json!({
             "agent_id": agent_id,
             "entries": entries,
@@ -148,7 +215,7 @@ pub(crate) async fn agent_board(
         .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("read board: {error}"),
+            format!("read inbox: {error}"),
         )
             .into_response(),
     }

@@ -848,6 +848,7 @@ impl Tool for ReadCoordinationBoard {
                     "contains":{"type":"string","description":"substring to find in summaries"},
                     "kind":{"type":"string","enum":["dispatched","reported","noted","progress"]},
                     "outstanding_only":{"type":"boolean","description":"only dispatches with no report yet"},
+                    "before_id":{"type":"integer","description":"only rows older than this id; pass the last id you got to read further back"},
                     "limit":{"type":"integer","minimum":1,"maximum":100}
                 }),
                 &[],
@@ -866,6 +867,8 @@ impl Tool for ReadCoordinationBoard {
             kind: Option<String>,
             #[serde(default)]
             outstanding_only: bool,
+            #[serde(default)]
+            before_id: Option<i64>,
             #[serde(default)]
             limit: Option<u32>,
         }
@@ -897,6 +900,8 @@ impl Tool for ReadCoordinationBoard {
             workspace: args.workspace.as_deref().filter(|w| !w.trim().is_empty()),
             contains: args.contains.as_deref().filter(|c| !c.trim().is_empty()),
             kind,
+            before_id: args.before_id,
+            outstanding: false,
         };
         let entries = db
             .read_board(&agent_id, &query, args.limit.unwrap_or(30).clamp(1, 100))
