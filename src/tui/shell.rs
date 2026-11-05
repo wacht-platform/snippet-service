@@ -198,28 +198,35 @@ pub(crate) fn render_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &A
         let selected = focused && i == app.shell.sidebar_index;
         let bg = if selected { surface3() } else if active { surface2() } else { surface1() };
         let age = compact_age(row.last_active);
-        let title = match &row.branch {
-            Some(branch) => format!("{} ⎇ {branch}", row.title),
-            None => row.title.clone(),
+        let is_member = row.parent_session_id.is_some();
+        let title = if is_member {
+            row.agent_id.as_deref().unwrap_or(&row.title).to_string()
+        } else {
+            match &row.branch {
+                Some(branch) => format!("{} ⎇ {branch}", row.title),
+                None => row.title.clone(),
+            }
         };
         let status = &row.status;
-        let title_w = w.saturating_sub(4 + age.chars().count() + 1);
+        let indent_w = if is_member { 2 } else { 0 };
+        let title_w = w.saturating_sub(4 + indent_w + age.chars().count() + 1);
         let title_style = if active {
             Style::default().fg(text()).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(soft())
         };
-        lines.push(
-            Line::from(vec![
-                Span::styled(if active { "▍" } else { " " }, Style::default().fg(accent())),
-                status_dot(status),
-                Span::raw(" "),
-                Span::styled(pad(&title, title_w), title_style),
-                Span::raw(" "),
-                Span::styled(age.clone(), Style::default().fg(faint())),
-            ])
-            .style(Style::default().bg(bg)),
-        );
+        let mut spans = vec![
+            Span::styled(if active { "▍" } else { " " }, Style::default().fg(accent())),
+        ];
+        if is_member {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(status_dot(status));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(pad(&title, title_w), title_style));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(age.clone(), Style::default().fg(faint())));
+        lines.push(Line::from(spans).style(Style::default().bg(bg)));
     }
     frame.render_widget(Paragraph::new(lines), Rect { height: area.height.saturating_sub(2), y: area.y + 1, ..inner });
     let hint = if focused { "↑↓ move · Enter open · n new · Esc back" } else { "Ctrl-F sessions" };

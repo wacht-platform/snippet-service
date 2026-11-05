@@ -417,7 +417,7 @@ impl App {
                 .collect(),
         };
         let home_str = home.display().to_string();
-        let mut list: Vec<_> = rows
+        let list: Vec<_> = rows
             .into_iter()
             .filter(|s| !home_only || s.folder == home_str || s.origin_folder.as_deref() == Some(home_str.as_str()))
             // A workspace's root `default` state exists before anyone uses it;
@@ -427,8 +427,56 @@ impl App {
                     && (s.conversation != "default" || !s.title.trim().is_empty())
             })
             .collect();
-        list.sort_by(|a, b| b.last_active.cmp(&a.last_active));
-        list.into_iter()
+        let (members, mut parents): (Vec<_>, Vec<_>) = list
+            .into_iter()
+            .partition(|s| s.parent_session_id.is_some());
+
+        let mut members_by_parent: std::collections::HashMap<String, Vec<_>> = std::collections::HashMap::new();
+        let mut orphan_members = Vec::new();
+        let parent_ids: std::collections::HashSet<String> = parents.iter().map(|p| p.id.clone()).collect();
+
+        for m in members {
+            if let Some(ref pid) = m.parent_session_id {
+                if parent_ids.contains(pid) {
+                    members_by_parent.entry(pid.clone()).or_default().push(m);
+                } else {
+                    orphan_members.push(m);
+                }
+            } else {
+                orphan_members.push(m);
+            }
+        }
+
+        for group in members_by_parent.values_mut() {
+            group.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        }
+
+        parents.extend(orphan_members);
+        parents.sort_by(|a, b| {
+            let a_max = members_by_parent
+                .get(&a.id)
+                .and_then(|ms| ms.iter().map(|m| m.last_active).max())
+                .unwrap_or(0)
+                .max(a.last_active);
+            let b_max = members_by_parent
+                .get(&b.id)
+                .and_then(|ms| ms.iter().map(|m| m.last_active).max())
+                .unwrap_or(0)
+                .max(b.last_active);
+            b_max.cmp(&a_max)
+        });
+
+        let mut ordered = Vec::with_capacity(parents.len());
+        for p in parents {
+            let pid = p.id.clone();
+            ordered.push(p);
+            if let Some(children) = members_by_parent.remove(&pid) {
+                ordered.extend(children);
+            }
+        }
+
+        ordered
+            .into_iter()
             .map(|s| {
                 let title = if s.title.trim().is_empty() {
                     "empty session".to_string()
@@ -444,6 +492,9 @@ impl App {
                     folder: PathBuf::from(s.folder),
                     name: s.conversation,
                     id: s.id,
+                    agent_id: s.agent_id,
+                    task_id: s.task_id,
+                    parent_session_id: s.parent_session_id,
                 }
             })
             .collect()
@@ -1297,6 +1348,9 @@ pub(crate) struct Conversation {
     pub(crate) last_active: i64,
     /// Set for a session in a git worktree of the home folder.
     pub(crate) branch: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) task_id: Option<String>,
+    pub(crate) parent_session_id: Option<String>,
 }
 
 /// Where a new session can work.

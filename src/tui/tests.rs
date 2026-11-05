@@ -429,19 +429,40 @@ fn ask_user_choice_question_takes_a_typed_answer() {
 
     /// A folder's picker holds its own sessions and those in worktrees made from
     /// it, and opening a worktree session moves the TUI into that worktree.
+    /// Seated member conversations are nested under their parent session row.
     #[test]
     fn the_picker_lists_worktree_sessions_under_their_folder() {
         let mut app = tui_app();
         app.options.config = app.options.config.for_workspace(PathBuf::from("/code/repo"));
+        let mut member = row("a/conversations/m1", "/code/repo", None, "m1", "Task (agent-tui)", 15);
+        member.parent_session_id = Some("a".into());
+        member.agent_id = Some("agent-tui".into());
         app.daemon_sessions = Some(vec![
             row("a", "/code/repo", None, "c1", "Root work", 10),
+            member,
             row("b", "/wt/repo/ab12", Some("/code/repo"), "default", "Isolated work", 20),
             row("c", "/code/other", None, "c2", "Elsewhere", 30),
         ]);
         let list = app.list_conversations();
-        assert_eq!(list.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["Isolated work", "Root work"]);
+        assert_eq!(
+            list.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(),
+            ["Isolated work", "Root work", "Task (agent-tui)"]
+        );
         assert_eq!(list[0].branch.as_deref(), Some("snippet/ab12"));
         assert_eq!(list[1].branch, None);
+        assert_eq!(list[2].parent_session_id.as_deref(), Some("a"));
+        assert_eq!(list[2].agent_id.as_deref(), Some("agent-tui"));
+
+        app.screen = Screen::ResumeSelection;
+        let picker_lines = snapshot_of(&mut app, 80, 24).join("\n");
+        assert!(picker_lines.contains("repo · 2 sessions"), "picker counts top-level sessions: {picker_lines}");
+        assert!(picker_lines.contains("● agent-tui"), "picker renders seated member: {picker_lines}");
+
+        app.screen = Screen::Main;
+        app.shell.sidebar = Some(true);
+        app.shell.focus = Focus::Sidebar;
+        let sidebar_lines = snapshot_of(&mut app, 80, 24).join("\n");
+        assert!(sidebar_lines.contains("agent-tui"), "sidebar renders seated member: {sidebar_lines}");
 
         app.open_conversation(&list[0]);
         assert_eq!(app.options.config.workspace, PathBuf::from("/wt/repo/ab12"));

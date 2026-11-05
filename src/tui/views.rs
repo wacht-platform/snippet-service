@@ -483,17 +483,29 @@ pub(crate) fn render_new_session(frame: &mut ratatui::Frame<'_>, area: Rect, app
                     lines.push(section("Existing sessions"));
                 }
                 let meta = c.branch.as_ref().map(|b| format!("⎇ {b}")).unwrap_or_default();
-                lines.push(
-                    Row {
+                let age = compact_secs(now - c.last_active);
+                if c.parent_session_id.is_some() {
+                    let agent = c.agent_id.as_deref().unwrap_or(&c.title);
+                    lines.push(render_nested_session_row(
                         selected,
-                        dot: Some(super::boards::status_color(&c.status)),
-                        title: &c.title,
-                        emphasis: false,
-                        meta: &meta,
-                        right: Some((compact_secs(now - c.last_active), faint())),
-                    }
-                    .line(width),
-                );
+                        super::boards::status_color(&c.status),
+                        agent,
+                        &age,
+                        width,
+                    ));
+                } else {
+                    lines.push(
+                        Row {
+                            selected,
+                            dot: Some(super::boards::status_color(&c.status)),
+                            title: &c.title,
+                            emphasis: false,
+                            meta: &meta,
+                            right: Some((age, faint())),
+                        }
+                        .line(width),
+                    );
+                }
             }
         }
     }
@@ -513,7 +525,8 @@ pub(crate) fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect
         .and_then(|n| n.to_str())
         .unwrap_or("workspace")
         .to_string();
-    let subtitle = format!("{folder} · {} session{}", convs.len(), if convs.len() == 1 { "" } else { "s" });
+    let top_count = convs.iter().filter(|c| c.parent_session_id.is_none()).count();
+    let subtitle = format!("{folder} · {} session{}", top_count, if top_count == 1 { "" } else { "s" });
     let hints: &[(&str, &str)] = if app.resume_rename.is_some() {
         &[("Enter", "save"), ("Esc", "cancel")]
     } else if app.resume_pending_delete {
@@ -547,17 +560,29 @@ pub(crate) fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect
         for (offset, c) in convs[start..end].iter().enumerate() {
             let meta = c.branch.as_ref().map(|b| format!("⎇ {b}")).unwrap_or_default();
             let age = compact_secs(chrono::Utc::now().timestamp() - c.last_active);
-            lines.push(
-                Row {
-                    selected: start + offset == selected_idx,
-                    dot: Some(super::boards::status_color(&c.status)),
-                    title: &c.title,
-                    emphasis: false,
-                    meta: &meta,
-                    right: Some((age, faint())),
-                }
-                .line(width),
-            );
+            let selected = start + offset == selected_idx;
+            if c.parent_session_id.is_some() {
+                let agent = c.agent_id.as_deref().unwrap_or(&c.title);
+                lines.push(render_nested_session_row(
+                    selected,
+                    super::boards::status_color(&c.status),
+                    agent,
+                    &age,
+                    width,
+                ));
+            } else {
+                lines.push(
+                    Row {
+                        selected,
+                        dot: Some(super::boards::status_color(&c.status)),
+                        title: &c.title,
+                        emphasis: false,
+                        meta: &meta,
+                        right: Some((age, faint())),
+                    }
+                    .line(width),
+                );
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines), body);
@@ -566,6 +591,34 @@ pub(crate) fn render_resume_selection(frame: &mut ratatui::Frame<'_>, area: Rect
 /// Models offered by the picker: the live-fetched list (uncapped) or the static
 /// fallback for the provider, filtered by the search query (case-insensitive).
 
+
+pub(crate) fn render_nested_session_row(
+    selected: bool,
+    dot_color: Color,
+    agent: &str,
+    age: &str,
+    width: usize,
+) -> Line<'static> {
+    use super::chrome::pad;
+    let right_w = age.chars().count() + 1;
+    let lead = 5;
+    let title_w = width.saturating_sub(lead + right_w + 1);
+    let mut title_style = Style::default().fg(if selected { text() } else { soft() });
+    if selected {
+        title_style = title_style.add_modifier(Modifier::BOLD);
+    }
+    let mut spans = vec![
+        Span::styled(if selected { "▍" } else { " " }, Style::default().fg(accent())),
+        Span::raw("  "),
+        Span::styled("● ", Style::default().fg(dot_color)),
+        Span::styled(pad(agent, title_w), title_style),
+        Span::styled(format!(" {age}"), Style::default().fg(faint())),
+    ];
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    let line = Line::from(spans);
+    if selected { line.style(Style::default().bg(surface3())) } else { line }
+}
 
 pub(crate) fn render_term(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
     // Never call open_term() here — it sends on the sidecar and panics
