@@ -1255,9 +1255,9 @@ mod tests {
     #[test]
     fn user_barge_in_after_long_agent_echo_is_kept_and_triggers_barge() {
         let replies = vec![
-            "Quick honest check, boss: I don't have a remote-control path to your Mac right now, I've only got the sandbox VMs. Setting up real control needs you there to grant permissions, and the Mac on the same network. I can't push a driver onto your Mac from here.".to_string(),
+            "Quick honest check: I don't have a remote-control path to your Mac right now, I've only got the sandbox VMs. Setting up real control needs you there to grant permissions, and the Mac on the same network. I can't push a driver onto your Mac from here.".to_string(),
         ];
-        let full = "Quick honest check, boss. I don't have a remote control pad to your Mac right now. I've only got the sandbox BMS. Setting up real control needs you there to grant permissions, and the Mac on the same network. I can't push a driver It is on the same tailscale network. Okay?";
+        let full = "Quick honest check. I don't have a remote control pad to your Mac right now. I've only got the sandbox BMS. Setting up real control needs you there to grant permissions, and the Mac on the same network. I can't push a driver It is on the same tailscale network. Okay?";
         let words = heard_words(full, true);
         let mask = echo_mask(&words, &replies, true);
         let (real, filtered, tail_real, max_real_run, echo_all) = echo_stats(&words, &mask, true);

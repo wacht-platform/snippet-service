@@ -1055,7 +1055,7 @@ mod voice_tests {
         assert_eq!(rules_json["include"][0]["label"], "Architecture notes");
 
         let mut v = Verdict { memorable: 0.9, ..classified(0.8) };
-        apply_policy(&mut v, "Hey YC, my name is Saurav, solo founder", &phrases(), &p, now);
+        apply_policy(&mut v, "Hey YC, my name is Sam, solo founder", &phrases(), &p, now);
         assert_eq!((v.intent.as_str(), v.addressed, v.memorable), ("ignore", 0.0, 0.0));
 
         let mut v_wake = Verdict { memorable: 0.9, ..classified(0.95) };

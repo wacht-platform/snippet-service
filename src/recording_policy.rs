@@ -524,8 +524,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.rules[0].mode, "never");
-        assert!(p.matches_never(NOW, at(2, 10, 0), "Hey YC, my name is Saurav"));
-        assert!(!p.matches_never(NOW + 60_000, at(2, 10, 0), "Hey YC, my name is Saurav"));
+        assert!(p.matches_never(NOW, at(2, 10, 0), "Hey YC, my name is Sam"));
+        assert!(!p.matches_never(NOW + 60_000, at(2, 10, 0), "Hey YC, my name is Sam"));
         assert!(p.prune(NOW + 60_000));
         assert!(p.rules.is_empty());
 

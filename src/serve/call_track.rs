@@ -1640,7 +1640,7 @@ mod tests {
         book.set_policy(p);
 
         let sig = Signal { at_ms: T0, words: 8, speaker: Some(super::super::speakers::Speaker::You), ..Signal::default() };
-        let h = Heard { at_ms: T0, ids: vec!["1".into()], text: "My name is Saurav, I am a solo founder".into(), memorable: true, speaker: Some("You".into()) };
+        let h = Heard { at_ms: T0, ids: vec!["1".into()], text: "My name is Sam, I am a solo founder".into(), memorable: true, speaker: Some("You".into()) };
         assert!(book.observe("mac", &sig, h, T0).is_empty());
         assert!(book.tick(T0 + WINDOW_MS + 1000).is_empty(), "ignored rule must not emit Effect::Note");
     }

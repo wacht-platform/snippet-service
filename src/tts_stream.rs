@@ -1198,8 +1198,8 @@ mod tests {
             "The deploy finished a minute ago and all three checks passed.",
             "I found two failing tests, both in the notification stack.",
             "Okay, done. The daemon is running the new build now.",
-            "Good morning boss. You have one approval waiting and two tasks in progress.",
-            "Heads up, the Technoxi sync is overdue by about an hour.",
+            "Good morning. You have one approval waiting and two tasks in progress.",
+            "Heads up, the nightly sync is overdue by about an hour.",
             "I have updated the playbook and saved the notes to memory.",
             "Understood. Starting the goal now and I will report back when it finishes.",
         ];

@@ -5,7 +5,8 @@ Thanks for your interest! Issues and pull requests are welcome.
 ## Getting started
 - Build/run and configuration: see [README.md](README.md).
 - `cargo build` compiles the single binary (TUI + `serve`); `cargo run` launches the TUI.
-- Run `cargo fmt` and `cargo clippy` if you have them; `cargo build` must pass before a PR.
+- Run `cargo fmt` and `cargo clippy` if you have them; `cargo test` must pass before a PR.
+- Report security problems privately, as described in [SECURITY.md](SECURITY.md).
 
 ## Style
 - Keep code comments lean and sparse; match the surrounding style.

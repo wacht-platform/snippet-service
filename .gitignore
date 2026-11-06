@@ -12,3 +12,18 @@ tmp_edit_*.txt
 # Release artifacts — deliverables, not source. Keep them out of the repo;
 # a 28 MB binary in history is not something a later clone should pay for.
 *.apk
+
+# Secrets and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p8
+*.p12
+*.jks
+*.keystore
+*.mobileprovision
+key.properties
+google-services.json
+GoogleService-Info.plist

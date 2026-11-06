@@ -13,7 +13,7 @@ A code-first agent for your terminal, with a phone and desktop app to steer it f
 
 ![The terminal UI answering a question about a repository](assets/tui.png)
 
-`snippet` runs on your machine, works in your project and keeps every session on disk. One Rust binary provides the terminal UI and the `serve` daemon that the [companion app](https://github.com/wacht-platform/snippet-mobile) connects to.
+`snippet` runs on your machine, works in your project and keeps every session on disk. One Rust binary provides the terminal UI and the `serve` daemon that the [companion app](https://github.com/intellinesia/snippet-app) connects to.
 
 ## Features
 
@@ -31,11 +31,11 @@ A code-first agent for your terminal, with a phone and desktop app to steer it f
 curl -fsSL https://snippet.fyi/install.sh | sh
 ```
 
-Or download a package from the [releases](https://github.com/wacht-platform/snippet-service/releases), or build from source with [Rust](https://rustup.rs):
+Or download a package from the [releases](https://github.com/intellinesia/snippet/releases), or build from source with [Rust](https://rustup.rs):
 
 ```sh
-git clone https://github.com/wacht-platform/snippet-service.git
-cd snippet-service
+git clone https://github.com/intellinesia/snippet.git
+cd snippet
 cargo build --release      # target/release/snippet
 ```
 
@@ -129,6 +129,8 @@ snippet history show 412 413
 - Secrets are stored with restricted permissions and never returned by the API.
 - `--no-tunnel` keeps the daemon local.
 
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
+
 ## Architecture
 
 ```text
@@ -150,7 +152,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Companion app
 
-Android, macOS, Linux and Windows builds are on the [app releases](https://github.com/wacht-platform/snippet-mobile/releases/tag/latest) page.
+Android, macOS, Linux and Windows builds are on the [app releases](https://github.com/intellinesia/snippet-app/releases/tag/latest) page.
 
 ## License
 

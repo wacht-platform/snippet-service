@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-const REPO: &str = "wacht-platform/snippet-service";
+const REPO: &str = "intellinesia/snippet";
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UA: &str = concat!("snippet/", env!("CARGO_PKG_VERSION"), " (self-update)");
 
