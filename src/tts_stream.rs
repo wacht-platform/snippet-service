@@ -450,6 +450,7 @@ pub fn find_recent(device: &str, text: &str, secs: u64) -> Option<Arc<StreamTurn
 
 pub fn start_turn(session: &Arc<Session>, device: &str, conversation: &str) -> Result<Arc<StreamTurn>, String> {
     let turn = crate::ambient::record_turn_status(conversation, "assistant", "", device, "speaking")?;
+    crate::speech::clear_interruption();
     crate::ambient::note_spoke();
     crate::ambient::hold(180);
     let dir = crate::tts::audio_dir().join(turn.to_string());

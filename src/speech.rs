@@ -9,7 +9,9 @@ struct FluxProvisional {
 }
 
 static FLUX_STREAMING: Mutex<Option<FluxProvisional>> = Mutex::new(None);
-static STREAM_INTERRUPTED: Mutex<Option<Interruption>> = Mutex::new(None);
+static STREAM_INTERRUPTED: Mutex<Option<(std::time::Instant, Interruption)>> = Mutex::new(None);
+// Older than this, the cut reply has been overtaken and resuming it would repeat stale speech.
+const INTERRUPTION_FRESH: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub struct Interruption {
     pub heard: String,
@@ -75,11 +77,22 @@ pub fn has_interruption() -> bool {
 }
 
 pub fn take_interruption() -> Option<Interruption> {
-    STREAM_INTERRUPTED.lock().unwrap().take()
+    STREAM_INTERRUPTED.lock().unwrap().take().filter(|(at, _)| at.elapsed() < INTERRUPTION_FRESH).map(|(_, cut)| cut)
+}
+
+pub(crate) fn clear_interruption() {
+    *STREAM_INTERRUPTED.lock().unwrap() = None;
+}
+
+/// Stop speech already streaming from a `speak` call that turned out not to be allowed.
+pub fn abandon_stream() {
+    if FLUX_STREAMING.lock().unwrap().take().is_some() {
+        cancel_all("withheld");
+    }
 }
 
 pub(crate) fn note_stream_interruption(cut: Interruption) {
-    *STREAM_INTERRUPTED.lock().unwrap() = Some(cut);
+    *STREAM_INTERRUPTED.lock().unwrap() = Some((std::time::Instant::now(), cut));
     crate::ambient::emit_state("interrupted");
 }
 
@@ -168,9 +181,11 @@ pub async fn speak(text: &str, expecting: Option<&str>, about: Option<&str>, rep
         return Err("nothing to say (bracketed notes are never spoken)".into());
     }
     if crate::ambient::call_quiet() {
+        abandon_stream();
         return Err("the user is on a call: speech is off until it ends, so reply in text".into());
     }
     if crate::ambient::room_busy() {
+        abandon_stream();
         return Err("people nearby are in a conversation or meeting, so speaking would talk over them: reply in the chat instead, and use ping_user if it cannot wait".into());
     }
     let (device, conversation) = prepare().await?;
@@ -411,7 +426,8 @@ enum Route {
 }
 
 fn fresh_route() -> Route {
-    if crate::tts_stream::enabled() && !crate::ambient::call_quiet() { Route::Pending } else { Route::Off }
+    let floor = crate::ambient::conversation().is_some() && crate::ambient::floor_held();
+    if crate::tts_stream::enabled() && !crate::ambient::call_quiet() && !crate::ambient::room_busy() && !floor { Route::Pending } else { Route::Off }
 }
 
 fn direct_claims(text: &str, done: bool) -> Option<Route> {

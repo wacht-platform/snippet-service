@@ -404,7 +404,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
         let go = wake
             || early.as_ref().is_some_and(|v| {
                 decide(live, pinned, v, wake, expecting).0
-                    && (!super::call_track::holds(device) || super::call_track::clearly_for_assistant(v, wake))
+                    && (!super::call_track::holds(device) || super::call_track::reaches_assistant(device, v, wake))
             });
         if go {
             let v = wake_verdict(early.as_ref());
@@ -443,7 +443,7 @@ async fn flush(d: &Shared, device: &str, parts: Vec<Part>, fast: bool, last: &mu
     let on_call = super::call_track::holds(device);
     if !delivered && routable {
         let (go, open) = decide(live, pinned, &verdict, wake, expecting);
-        if go && (!on_call || super::call_track::clearly_for_assistant(&verdict, wake)) {
+        if go && (!on_call || super::call_track::reaches_assistant(device, &verdict, wake)) {
             if open {
                 crate::ambient::open_conversation(device, ttl);
             }
@@ -687,7 +687,8 @@ async fn deliver(
         attrs.push_str(&format!(" user_voice=\"{uv:.2}\""));
     }
     let _ = crate::speech::interrupt(device);
-    crate::tts_stream::settle(Duration::from_millis(120)).await;
+    // Long enough for the phone's heard position, or the cut lands on some later turn.
+    crate::tts_stream::settle(Duration::from_millis(600)).await;
     if let Some(heard) = crate::speech::take_interruption() {
         attrs.push_str(&ambient_watch::interruption_attrs(&heard));
     }

@@ -91,7 +91,7 @@ impl Rule {
         if !self.when.keywords.is_empty() {
             return self.when.keywords.iter().any(|k| text_lower.contains(&k.to_lowercase()));
         }
-        self.about.is_empty()
+        self.about.is_empty() || self.mode == "auto"
     }
 }
 
@@ -179,6 +179,15 @@ impl RecordingPolicy {
             || self.rules.iter().any(|r| r.mode == "never" && r.matches_deterministic(&text, local, now_ms))
     }
 
+    /// The first address or meeting rule whose keywords appear in `heard`.
+    pub fn matches_steer(&self, now_ms: i64, local: NaiveDateTime, heard: &str) -> Option<&str> {
+        let text = heard.to_lowercase();
+        self.rules
+            .iter()
+            .find(|r| matches!(r.mode.as_str(), "address" | "meeting") && !r.when.keywords.is_empty() && r.matches_deterministic(&text, local, now_ms))
+            .map(|r| r.mode.as_str())
+    }
+
     pub fn matches_note_or_auto(&self, now_ms: i64, local: NaiveDateTime, heard: &str) -> bool {
         if self.matches_never(now_ms, local, heard) {
             return false;
@@ -191,22 +200,21 @@ impl RecordingPolicy {
         })
     }
 
-    /// Snooze or never beats auto beats ask. `cooled` suppresses auto after the user's own refusal.
-    pub fn decide(&self, now_ms: i64, local: NaiveDateTime, heard: &str, cooled: bool) -> Decision {
+    /// Snooze or never beats auto beats ask. A live refusal drops the call, unless the approval came after it.
+    pub fn decide(&self, now_ms: i64, local: NaiveDateTime, heard: &str, refused_at: Option<i64>) -> Decision {
         if self.matches_never(now_ms, local, heard) {
             return Decision::Drop;
         }
-        if cooled {
-            return Decision::Ask;
-        }
         let text = heard.to_lowercase();
+        let newer = |created_at: i64| refused_at.is_none_or(|t| created_at > t);
         let live = |w: &&Window| w.from_ms <= now_ms && now_ms < w.to_ms;
         let hit = |r: &&Rule| r.matches_deterministic(&text, local, now_ms);
-        if let Some(w) = self.windows.iter().filter(live).find(|w| w.mode == "auto") {
+        if let Some(w) = self.windows.iter().filter(live).find(|w| w.mode == "auto" && newer(w.created_at)) {
             return Decision::Auto { label: w.label.clone() };
         }
-        match self.rules.iter().filter(hit).find(|r| r.mode == "auto") {
+        match self.rules.iter().filter(hit).find(|r| r.mode == "auto" && newer(r.created_at)) {
             Some(r) => Decision::Auto { label: r.label.clone() },
+            None if refused_at.is_some() => Decision::Drop,
             None => Decision::Ask,
         }
     }
@@ -256,10 +264,17 @@ impl RecordingPolicy {
         let mode = match mode {
             "ignore" => "never",
             "include" => "note",
+            "for_assistant" => "address",
             other => other,
         };
-        if !matches!(mode, "auto" | "note" | "ask" | "never") {
-            return Err("mode must be auto, note (include), ask, or never (ignore)".into());
+        if !matches!(mode, "auto" | "note" | "ask" | "never" | "address" | "meeting") {
+            return Err("mode must be auto, note (include), ask, never (ignore), address (for_assistant) or meeting".into());
+        }
+        if mode == "auto" && !about.trim().is_empty() && when.keywords.is_empty() && when.weekdays.is_empty() && when.from_hhmm.is_none() {
+            return Err("an auto rule needs keywords or a schedule: `about` alone can't start a recording. To record the conversation happening now, use action start".into());
+        }
+        if matches!(mode, "address" | "meeting") && about.trim().is_empty() && when.keywords.is_empty() {
+            return Err("this rule needs `about` or `keywords` to say what speech it covers".into());
         }
         if mode != "ask" {
             need_basis(basis)?;
@@ -401,21 +416,23 @@ mod tests {
     #[test]
     fn snooze_and_never_beat_auto_beat_ask() {
         let mut p = RecordingPolicy::default();
-        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", false), Decision::Ask);
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", None), Decision::Ask);
         p.rules.push(rule("auto", kw("standup")));
-        assert_eq!(p.decide(NOW, at(2, 10, 0), "Daily STANDUP time", false), Decision::Auto { label: "auto rule".into() });
-        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", true), Decision::Ask);
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "Daily STANDUP time", None), Decision::Auto { label: "auto rule".into() });
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", Some(NOW - 1)), Decision::Drop);
+        p.rules[0].created_at = NOW;
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", Some(NOW - 1)), Decision::Auto { label: "auto rule".into() });
         p.rules.push(rule("never", kw("standup")));
-        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", false), Decision::Drop);
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", None), Decision::Drop);
         p.rules.pop();
         p.windows.push(Window { id: "w".into(), label: "retro".into(), from_ms: NOW - 1, to_ms: NOW + 1000, mode: "auto".into(), basis: "b".into(), created_at: 0 });
-        assert_eq!(p.decide(NOW, at(2, 10, 0), "unrelated", false), Decision::Auto { label: "retro".into() });
-        assert_eq!(p.decide(NOW + 1000, at(2, 10, 0), "unrelated", false), Decision::Ask);
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "unrelated", None), Decision::Auto { label: "retro".into() });
+        assert_eq!(p.decide(NOW + 1000, at(2, 10, 0), "unrelated", None), Decision::Ask);
         p.windows[0].mode = "never".into();
-        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", false), Decision::Drop);
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", None), Decision::Drop);
         p.windows[0].mode = "auto".into();
         p.snooze_until_ms = Some(NOW + 1);
-        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", false), Decision::Drop);
+        assert_eq!(p.decide(NOW, at(2, 10, 0), "standup", None), Decision::Drop);
         assert!(!p.snoozed(NOW + 1));
     }
 
@@ -475,6 +492,22 @@ mod tests {
         assert!(!toml::to_string_pretty(&crate::config::SnippetConfig::default()).unwrap().contains("recording"));
         assert_eq!(clamp_retention(99_999), 3650);
         assert!(parse_when("2026-11-02 09:30").is_ok() && parse_when("2026-11-02T09:30:00+00:00").is_ok() && parse_when("tomorrow").is_err());
+    }
+
+    #[test]
+    fn steering_rules_and_auto_rules_that_could_never_fire() {
+        let mut p = RecordingPolicy::default();
+        assert!(p.set_rule_with("Calls", "auto", "sales calls", When::default(), None, "b", NOW).is_err(), "about alone can't start a recording");
+        let weekdays = When { weekdays: vec![1, 2, 3], ..When::default() };
+        p.set_rule_with("Work calls", "auto", "work calls", weekdays, None, "b", NOW).unwrap();
+        assert!(matches!(p.decide(NOW, at(2, 10, 0), "anything", None), Decision::Auto { .. }));
+        assert!(p.set_rule_with("Empty", "address", "", When::default(), None, "b", NOW).is_err());
+        p.set_rule_with("Mine", "for_assistant", "", kw("okay so"), Some(NOW + 60_000), "b", NOW).unwrap();
+        p.set_rule_with("Standup", "meeting", "", kw("standup"), None, "b", NOW).unwrap();
+        assert_eq!(p.rules.iter().find(|r| r.label == "Mine").unwrap().mode, "address");
+        assert_eq!(p.matches_steer(NOW, at(2, 10, 0), "Okay so what next"), Some("address"));
+        assert_eq!(p.matches_steer(NOW + 60_000, at(2, 10, 0), "Okay so what next"), None, "a short-term rule lapses");
+        assert_eq!(p.matches_steer(NOW, at(2, 10, 0), "the standup ran over"), Some("meeting"));
     }
 
     #[test]

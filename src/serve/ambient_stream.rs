@@ -48,6 +48,7 @@ async fn run(socket: WebSocket, d: Shared, device: String) {
         }
     });
     let mut phone: Option<u64> = None;
+    let mut opened: Option<u32> = None;
     let mut open: HashMap<u32, Open> = HashMap::new();
     while let Some(Ok(msg)) = rx.next().await {
         match msg {
@@ -80,6 +81,7 @@ async fn run(socket: WebSocket, d: Shared, device: String) {
                         open.insert(h, Open { meta: v, pcm: Vec::new() });
                     }
                     Some("open") => {
+                        opened = Some(h);
                         let started = v.get("started_at").and_then(|x| x.as_str()).map(str::to_string);
                         let answer = match super::listener::open(&d, &device, h, started.as_deref()).await {
                             Ok(()) => serde_json::json!({"t":"opened","h":h}),
@@ -149,8 +151,9 @@ async fn run(socket: WebSocket, d: Shared, device: String) {
     if let Some(id) = phone {
         crate::tts_stream::unregister_phone(&device, id);
     }
-    if !device.is_empty() {
-        super::listener::close(&device, None);
+    // A reconnected socket may already own the stream, so only close what this one opened.
+    if let (false, Some(h)) = (device.is_empty(), opened) {
+        super::listener::close(&device, Some(h));
     }
     drop(out_tx);
     let _ = writer.await;

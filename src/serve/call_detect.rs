@@ -150,6 +150,17 @@ impl Detector {
         Observed { class, trigger }
     }
 
+    /// A call is held: no new trigger until it is released.
+    pub fn hold(&mut self) {
+        self.cooling = true;
+    }
+
+    /// The call is over, so the next conversation starts from a clean window.
+    pub fn release(&mut self) {
+        self.cooling = false;
+        self.window.clear();
+    }
+
     fn qualifies(&self) -> Option<i64> {
         let calls: Vec<&Seen> = self.window.iter().filter(|w| w.class.call_like()).collect();
         let meeting = calls.iter().filter(|w| w.class == Class::Meeting).count();

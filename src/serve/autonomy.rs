@@ -165,6 +165,8 @@ fn round_decision(i: RoundInputs) -> Round {
 static MC_INPUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEARD_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
+static LAST_RESUME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 pub(super) fn mission_control_inputs() -> u64 {
     MC_INPUTS.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -196,15 +198,21 @@ pub(super) fn resume_unless_heard(daemon: Shared) {
         if mission_control_busy() {
             return;
         }
+        // A resume that was itself cut with nothing said in between would loop on the same reply.
+        if LAST_RESUME.load(std::sync::atomic::Ordering::SeqCst) == mission_control_inputs() {
+            let _ = crate::speech::take_interruption();
+            return;
+        }
         eprintln!("[ambient-speech] no new turn followed the barge-in; resuming Mission Control");
         let heard = crate::speech::take_interruption()
             .map(|h| super::ambient_watch::interruption_attrs(&h))
             .unwrap_or_default();
         deliver_to_mission_control(
             &daemon,
-            format!("<ambient_resume{heard}>A sound cut your speech off but no new request followed. Carry on without mentioning it: if your last reply was cut short, say only the part that was never spoken (`unsaid`; `interrupted_reply` is what they heard), in a sentence or two; otherwise answer Chief's latest turn or continue what you were doing.</ambient_resume>"),
+            format!("<ambient_resume{heard}>A sound cut your speech off but no new request followed. Carry on without mentioning it: if your last reply was cut short, restate the sentence that was cut and finish what `unsaid` still holds, in a sentence or two, as whole sentences and never starting mid-phrase (`interrupted_reply` is what they heard); otherwise answer Chief's latest turn or continue what you were doing.</ambient_resume>"),
         )
         .await;
+        LAST_RESUME.store(mission_control_inputs(), std::sync::atomic::Ordering::SeqCst);
     });
 }
 

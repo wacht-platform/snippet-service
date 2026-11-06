@@ -196,6 +196,7 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
             "criteria": {
                 "true": [
                     "Uses the assistant's name, or `name_in_utterance` is not 'no'",
+                    "Matches a rule in `classifier_rules.address`",
                     "Asks whether the assistant can hear them or is there, whether or not the conversation is open",
                     "Directly asks the assistant a question or gives it an instruction that a personal AI coding/work assistant would handle (work, tasks, code, reminders, advice, or continuing the active topic in `assistant.last_said` / `mission_control.recent_chat`), unless `user_voice_likelihood` is below 0.1",
                     "Answers, confirms, refuses, thanks or picks an option after `assistant.last_said`",
@@ -204,7 +205,8 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
                 "false": [
                     "Played media, YouTube/TikTok/Reels videos, dramatic first-person storytelling ('I kissed my boyfriend...', 'last week a street interviewer asked me...', 'before I tell you the last one, drop a comment'), vlogs, or narration",
                     "Rehearsing, practising or recording a pitch, script, presentation or video take (e.g. 'Hey YC, my name is...', repeating or restarting lines for a take)",
-                    "Matches a rule in `classifier_rules.ignore` when `name_in_utterance` is 'no'",
+                    "Matches a rule in `classifier_rules.ignore` or `classifier_rules.meeting` when `name_in_utterance` is 'no'",
+                    "`live_conversation` is true and `name_in_utterance` is 'no': the user is talking to the other person, who may not be audible, even when it sounds like a question or an instruction",
                     "Thinking aloud, an exclamation, a filler sound, or a remark about the speaker's own life/past that asks nothing of the assistant",
                     "A stray 1-2 word fragment ('Guess what?', 'Hello', 'I mean...') without a wake word when `conversation` is 'closed' or `assistant.speaking_when_utterance_was_heard` is true",
                     "Clearly part of an exchange with someone else shown in `recent`, or third-person chatter ('he asked...', 'she said...', 'they said...')",
@@ -246,15 +248,15 @@ fn classifier_questions(with_pending: bool, expecting: bool) -> Value {
             "type": "choice",
             "instructions": "What is `utterance` for?",
             "criteria": {
-                "for_assistant": "Said to the assistant: a call, request, question, answer or reaction to it",
-                "note": "The speaker's own remark, plan, idea or commitment, not said to the assistant",
-                "meeting": "People talking with each other in person or on a call",
+                "for_assistant": "Said to the assistant: a call, request, question, answer or reaction to it, or speech matching `classifier_rules.address`",
+                "note": "The speaker's own remark, plan, idea or commitment, not said to the assistant, or speech matching `classifier_rules.include`",
+                "meeting": "People talking with each other in person or on a call, one side of a call when `live_conversation` is true, or speech matching `classifier_rules.meeting`",
                 "ignore": "Filler, noise, played media, the assistant's own echoed words, rehearsing/recording a script or video take, or speech matching `classifier_rules.ignore`"
             }
         },
         "worth_remembering": {
             "type": "noul",
-            "instructions": "`utterance` holds information the assistant should still have in future: a commitment, plan, deadline, decision, fact about the user, their health, family, finances, preferences, or work, or anything they would expect to be remembered (including anything matching `classifier_rules.include`). Rehearsing or recording a pitch/script/video take (e.g. 'Hey YC, my name is...', repeating takes), speech matching `classifier_rules.ignore`, venting, reactions, filler, jokes, commentary on what is on screen, and small talk are false."
+            "instructions": "`utterance` matches a rule in `classifier_rules.include`, or holds information the assistant should still have in future: a commitment, plan, deadline, decision, fact about the user, their health, family, finances, preferences, or work, or anything they would expect to be remembered (including anything matching `classifier_rules.include`). Rehearsing or recording a pitch/script/video take (e.g. 'Hey YC, my name is...', repeating takes), speech matching `classifier_rules.ignore`, venting, reactions, filler, jokes, commentary on what is on screen, and small talk are false."
         },
         "suggest_conversation": {
             "type": "noul",
@@ -347,6 +349,7 @@ pub(super) struct Moment {
     pub user_voice: Option<f64>,
     pub speakers_present: Vec<String>,
     pub classifier_rules: Option<Value>,
+    pub live_conversation: bool,
 }
 
 pub(super) fn policy_rules_json(policy: &crate::recording_policy::RecordingPolicy, now_ms: i64) -> Option<Value> {
@@ -354,6 +357,8 @@ pub(super) fn policy_rules_json(policy: &crate::recording_policy::RecordingPolic
     let active = policy.active_rules(now_ms, local);
     let mut include = Vec::new();
     let mut ignore = Vec::new();
+    let mut address = Vec::new();
+    let mut meeting = Vec::new();
     for r in active {
         let entry = json!({
             "label": r.label,
@@ -363,13 +368,15 @@ pub(super) fn policy_rules_json(policy: &crate::recording_policy::RecordingPolic
         match r.mode.as_str() {
             "never" => ignore.push(entry),
             "note" | "auto" => include.push(entry),
+            "address" => address.push(entry),
+            "meeting" => meeting.push(entry),
             _ => {}
         }
     }
-    if include.is_empty() && ignore.is_empty() {
+    if include.is_empty() && ignore.is_empty() && address.is_empty() && meeting.is_empty() {
         None
     } else {
-        Some(json!({ "include": include, "ignore": ignore }))
+        Some(json!({ "include": include, "ignore": ignore, "address": address, "meeting": meeting }))
     }
 }
 
@@ -393,6 +400,18 @@ pub(super) fn apply_policy(
         if verdict.intent == "ignore" {
             verdict.intent = "note".into();
         }
+    }
+    match policy.matches_steer(now_ms, local, text) {
+        Some("address") if !matches!(verdict.kind.as_str(), "media" | "noise") => {
+            verdict.intent = "for_assistant".into();
+            verdict.addressed = verdict.addressed.max(0.9);
+            verdict.out_of_context = 0.0;
+        }
+        Some("meeting") => {
+            verdict.intent = "meeting".into();
+            verdict.addressed = verdict.addressed.min(0.3);
+        }
+        _ => {}
     }
 }
 
@@ -473,6 +492,9 @@ pub(super) fn classifier_state(m: &Moment) -> Value {
     }
     if let Some(rules) = &m.classifier_rules {
         state["classifier_rules"] = rules.clone();
+    }
+    if m.live_conversation {
+        state["live_conversation"] = json!(true);
     }
     state
 }
@@ -734,6 +756,7 @@ pub(crate) async fn classify(d: &Shared, ids: &[String], text: &str, voices: Vec
         user_voice: early_voice.as_ref().filter(|v| v.neural).and_then(|v| v.likelihood),
         speakers_present: present,
         classifier_rules: policy_rules_json(&policy, now_ms),
+        live_conversation: super::call_track::holds(&device),
     };
     let classifier = ask_classifier(&key, classifier_state(&moment), with_pending, expecting);
     let (classified, late_voice) = tokio::join!(classifier, async {
@@ -859,6 +882,7 @@ pub(crate) async fn classify_live(d: &Shared, device: &str, text: &str, during_p
         user_voice: None,
         speakers_present: super::speakers::peek(device, now_ms, None).1,
         classifier_rules: policy_rules_json(&policy, now_ms),
+        live_conversation: super::call_track::holds(&device),
     };
     let legacy = user_voice.map(|l| {
         std::sync::Arc::new(VoiceScore { neural: false, similarity: None, likelihood: Some(l), voiced_secs: 0.0, embedding: None, ms: 0 })

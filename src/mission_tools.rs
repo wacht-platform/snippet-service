@@ -440,16 +440,16 @@ impl Tool for RecordingPolicyTool {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "recording_policy".into(),
-            description: "Tune the voice classifier and conversation recording policy for both short-term and long-term rules. `set_rule` creates or replaces by label a rule telling the classifier what speech to include (`note`/`include` to capture as context notes, `auto` to also auto-record conversations), ask about (`ask`), or ignore (`never`/`ignore` to suppress both classifier context notes and call recording unless a wake word is spoken). Pass `minutes` (e.g. 60) or `until` (RFC 3339 or `YYYY-MM-DD HH:MM`) for a short-term rule that expires automatically, or omit both for a long-term standing rule. Match by `keywords` (exact phrases), `about` (natural-language description passed to the classifier, e.g. 'rehearsing YC founder video pitch takes'), `weekdays` (0 is Sunday) and `from_hhmm`..`to_hhmm`. `expect` and `block` set a time window of at most 12 hours, and `snooze` pauses all recording and context notes for 1 to 720 minutes. Auto, note/include and never/ignore entries require a `basis`.".into(),
+            description: "Tune the voice classifier and conversation recording policy for both short-term and long-term rules. `set_rule` creates or replaces by label a rule telling the classifier what speech to include (`note`/`include` to capture as context notes, `auto` to also auto-record conversations), ask about (`ask`), or ignore (`never`/`ignore` to suppress both classifier context notes and call recording unless a wake word is spoken). Pass `minutes` (e.g. 60) or `until` (RFC 3339 or `YYYY-MM-DD HH:MM`) for a short-term rule that expires automatically, or omit both for a long-term standing rule. Match by `keywords` (exact phrases), `about` (natural-language description passed to the classifier, e.g. 'rehearsing YC founder video pitch takes'), `weekdays` (0 is Sunday) and `from_hhmm`..`to_hhmm`. `address` (alias `for_assistant`) tells the classifier the matching speech is meant for you, and `meeting` that it is people talking to each other. `expect` and `block` set a time window of at most 12 hours, and `snooze` pauses all recording and context notes for 1 to 720 minutes; both end what is being recorded now. `start` records the conversation happening now, including what was just said, and overrides an earlier refusal; use it whenever the user asks you to record, and `expect` only for a later time. `stop` ends the current recording and saves it. `get` shows `active_call`. Every entry except ask requires a `basis`.".into(),
             input_schema: schema(json!({
-                "action": {"type": "string", "enum": ["get", "expect", "block", "snooze", "set_rule", "remove_rule", "remove_window"]},
+                "action": {"type": "string", "enum": ["get", "start", "stop", "expect", "block", "snooze", "set_rule", "remove_rule", "remove_window"]},
                 "from": {"type": "string", "description": "expect, block"},
                 "to": {"type": "string", "description": "expect, block, or set_rule expiry time"},
                 "until": {"type": "string", "description": "set_rule: optional expiry time (RFC 3339 or local YYYY-MM-DD HH:MM) for a short-term rule."},
                 "label": {"type": "string", "description": "expect, block, set_rule: name shown to the user."},
                 "about": {"type": "string", "description": "set_rule: natural-language guidance for the voice classifier on what speech/topic this rule includes or ignores."},
                 "basis": {"type": "string", "description": "The user's words or the standing approval this rests on."},
-                "mode": {"type": "string", "enum": ["auto", "note", "include", "ask", "never", "ignore"], "description": "set_rule (`auto`, `note`/`include`, `ask`, `never`/`ignore`), or expect (`auto` or `never`). Default for expect: auto."},
+                "mode": {"type": "string", "enum": ["auto", "note", "include", "ask", "never", "ignore", "address", "for_assistant", "meeting"], "description": "set_rule (`auto`, `note`/`include`, `ask`, `never`/`ignore`, `address`/`for_assistant`, `meeting`), or expect (`auto` or `never`). Default for expect: auto."},
                 "minutes": {"type": "integer", "description": "snooze (1..720), or set_rule duration in minutes for a short-term rule (1..43200; omit for a long-term standing rule)."},
                 "keywords": {"type": "array", "items": {"type": "string"}, "description": "set_rule: phrases or keywords to match."},
                 "weekdays": {"type": "array", "items": {"type": "integer"}, "description": "set_rule: 0 (Sunday) to 6 (Saturday)."},
@@ -467,17 +467,30 @@ impl Tool for RecordingPolicyTool {
         let out = match a.action.as_str() {
             "get" => {
                 let p = rp::current().await;
-                json!({"retention_days": p.retention_days, "snooze_until_ms": p.snooze_until_ms, "rules": p.rules, "windows": p.windows})
+                json!({"retention_days": p.retention_days, "snooze_until_ms": p.snooze_until_ms, "rules": p.rules, "windows": p.windows, "active_call": crate::serve::call_track::active_summary()})
             }
+            "start" => {
+                rp::update(|p, _| {
+                    p.snooze_until_ms = None;
+                    Ok(())
+                })
+                .await
+                .map_err(err)?;
+                crate::serve::call_track::voice_start().await.map_err(err)?
+            }
+            "stop" => crate::serve::call_track::voice_stop().await,
             "expect" | "block" => {
                 let mode = if a.action == "block" { "never".to_string() } else { a.mode.clone().unwrap_or_else(|| "auto".into()) };
                 let (from, to) = (rp::parse_when(&a.from).map_err(err)?, rp::parse_when(&a.to).map_err(err)?);
                 let (id, _) = rp::update(|p, now| p.add_window(&a.label, from, to, &mode, &a.basis, now)).await.map_err(err)?;
-                json!({"id": id, "label": a.label, "mode": mode, "from_ms": from, "to_ms": to})
+                let started = from <= chrono::Utc::now().timestamp_millis();
+                let tracked = if started && mode == "auto" { crate::serve::call_track::approve_pending().await } else { None };
+                let stopped = if started && mode == "never" { crate::serve::call_track::voice_stop().await } else { Value::Null };
+                json!({"id": id, "label": a.label, "mode": mode, "from_ms": from, "to_ms": to, "tracking_call": tracked, "stopped": stopped})
             }
             "snooze" => {
                 let (until, _) = rp::update(|p, now| p.snooze(a.minutes, now)).await.map_err(err)?;
-                json!({"snooze_until_ms": until})
+                json!({"snooze_until_ms": until, "stopped": crate::serve::call_track::voice_stop().await})
             }
             "set_rule" => {
                 let mode = a.mode.clone().ok_or_else(|| err("mode is required"))?;
@@ -678,6 +691,7 @@ impl Tool for Speak {
     async fn execute(&self, _ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: SpeakArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         if crate::ambient::conversation().is_some() && crate::ambient::floor_held() {
+            crate::speech::abandon_stream();
             return Ok(ToolResult::success(json!({
                 "held": true,
                 "spoken": false,
