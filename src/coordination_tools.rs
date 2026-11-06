@@ -835,11 +835,11 @@ impl Tool for ReadCoordinationBoard {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "read_coordination_board".into(),
-            description: "Read your agent board: work you dispatched, what came back, progress you logged and notes you kept. Newest first. Search with contains; narrow with task_id, workspace or kind; group_by gives one row per task or folder; pass next_before_id as before_id for the next page.".into(),
+            description: "Read an agent board: work dispatched, what came back, progress logged and notes kept. Newest first, your own unless you name agent_id. Search with contains; narrow with task_id, workspace (a project, across its worktrees) or kind; group_by gives one row per task or folder; pass next_before_id as before_id for the next page. task_id on its own reads that task's log across everyone on it.".into(),
             input_schema: schema(
                 json!({
-                    "agent_id":{"type":"string","description":"Mission Control only: whose board to read"},
-                    "task_id":{"type":"string","description":"only rows linked to this task"},
+                    "agent_id":{"type":"string","description":"whose board to read; defaults to your own"},
+                    "task_id":{"type":"string","description":"only rows linked to this task; on its own, that task's log across everyone on it"},
                     "group_by":{"type":"string","enum":["task","folder"],"description":"one row per task or folder: its newest row and how many it holds"},
                     "workspace":{"type":"string","description":"only rows about this folder"},
                     "contains":{"type":"string","description":"substring to find in summaries"},
@@ -878,12 +878,32 @@ impl Tool for ReadCoordinationBoard {
         let args: Args =
             serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
         let named = args.agent_id.as_deref().map(str::trim).filter(|a| !a.is_empty());
+        let db = db(ctx)?;
+        let task_alone = args.task_id.as_deref().map(str::trim).filter(|t| !t.is_empty()).filter(|_| {
+            named.is_none()
+                && args.group_by.is_none()
+                && args.workspace.is_none()
+                && args.contains.is_none()
+                && args.kind.is_none()
+                && !args.outstanding_only
+        });
+        if let Some(task) = task_alone {
+            let limit = args.limit.unwrap_or(30).clamp(1, 100);
+            let rows = db
+                .task_log(task, args.before_id, limit)
+                .map_err(|e| ToolError::msg(format!("read task log: {e}")))?;
+            let next = rows.last().map(|r| r.id).filter(|_| rows.len() as u32 == limit);
+            return Ok(ToolResult::success(json!({
+                "task_id": task,
+                "count": rows.len(),
+                "entries": rows,
+                "next_before_id": next,
+            })));
+        }
         let agent_id = match named {
-            Some(agent) if ctx.is_mission_control() => agent.to_string(),
-            Some(_) => return Err(ToolError::msg("only Mission Control reads another agent's board")),
+            Some(agent) => agent.to_string(),
             None => board_agent_id(ctx)?,
         };
-        let db = db(ctx)?;
         if args.outstanding_only {
             let outstanding = db
                 .board_awaiting_report(&agent_id)
