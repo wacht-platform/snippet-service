@@ -1418,6 +1418,13 @@ fn emit_device_event_with_store(
                 };
                 notification["stop_identity"] = identity.into();
             }
+            if matches!(notification["kind"].as_str(), Some("idle" | "done" | "error"))
+                && notification["body"].as_str().is_none_or(|b| b.trim().is_empty())
+                && let Some(text) = notification["session"].as_str()
+                    .and_then(|id| store.last_assistant_excerpt(id).ok().flatten())
+            {
+                notification["body"] = text.into();
+            }
             if let Ok(settings) = store.load_control_settings()
                 && notification_allowed(&settings, &notification) {
                     match store.append_notification_event(notification, NOTIFICATION_RETENTION_SECS) {

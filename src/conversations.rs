@@ -1083,8 +1083,25 @@ impl Store {
                 });
                 let payload: serde_json::Value = serde_json::from_str(&payload).unwrap_or_default();
                 attention_detail(&mut attention, &payload);
+                approval_call_detail(conn, id, ordinal, &payload, &mut attention);
                 attention
             }))
+        })
+    }
+
+    /// The agent's last words this turn, for the notification when it stops.
+    pub fn last_assistant_excerpt(&self, id: &str) -> Result<Option<String>, StoreError> {
+        self.with_connection(|conn| {
+            let text = conn.query_row(
+                "SELECT json_extract(payload_json, '$.text') FROM session_events
+                 WHERE session_id = ?1 AND json_extract(payload_json, '$.kind') = 'assistant_text'
+                   AND ordinal > COALESCE((SELECT MAX(ordinal) FROM session_events
+                       WHERE session_id = ?1 AND json_extract(payload_json, '$.kind') IN ('user_input', 'steer')), -1)
+                 ORDER BY ordinal DESC LIMIT 1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            ).optional().map(Option::flatten)?;
+            Ok(text.map(|t| clip_keeping_lines(&t, 700)).filter(|t| !t.is_empty()))
         })
     }
 
@@ -1775,6 +1792,47 @@ fn clip(text: &str, max: usize) -> String {
         return text;
     }
     format!("{}…", text.chars().take(max).collect::<String>().trim_end())
+}
+
+fn clip_keeping_lines(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    format!("{}…", text.chars().take(max).collect::<String>().trim_end())
+}
+
+/// The label and real command of the call being approved. A lane's request or a
+/// parallel call has a different call before it, and a wrong one on an approval
+/// misleads, so the call must match the command in the summary.
+fn approval_call_detail(
+    conn: &rusqlite::Connection,
+    id: &str,
+    ordinal: i64,
+    payload: &serde_json::Value,
+    attention: &mut serde_json::Value,
+) -> Option<()> {
+    if payload["kind"] != "approval_request" || payload["tool_name"] != "bash" {
+        return None;
+    }
+    let call: String = conn.query_row(
+        "SELECT payload_json FROM session_events
+         WHERE session_id = ?1 AND ordinal = ?2 AND json_extract(payload_json, '$.kind') = 'tool_call'",
+        params![id, ordinal - 1],
+        |row| row.get(0),
+    ).ok()?;
+    let call: serde_json::Value = serde_json::from_str(&call).ok()?;
+    let command = call["arguments"]["command"].as_str()?;
+    let head = clip(command, 40);
+    if !payload["summary"].as_str()?.contains(head.trim_end_matches('…')) {
+        return None;
+    }
+    attention["command"] = clip_keeping_lines(command, 2000).into();
+    let label = call["arguments"]["label"].as_str().unwrap_or("").trim();
+    if !label.is_empty() {
+        attention["label"] = clip(label, 120).into();
+    }
+    Some(())
 }
 
 /// What a notification needs to show the request without opening the chat.
