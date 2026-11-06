@@ -65,6 +65,9 @@ pub struct BoardEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     pub created_at: String,
+    /// The project the workspace belongs to, the same for all its worktrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
 }
 
 /// What a board row records. Bundled so the recorder's signature does not grow a
@@ -92,10 +95,46 @@ pub struct BoardQuery<'a> {
     pub before_id: Option<i64>,
     /// Only dispatches with no report yet.
     pub outstanding: bool,
+    /// Only rows linked to this task.
+    pub correlation: Option<&'a str>,
+}
+
+/// How a board reads as groups rather than a flat list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardGrouping {
+    Task,
+    Folder,
+}
+
+impl BoardGrouping {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "task" => Some(Self::Task),
+            "folder" => Some(Self::Folder),
+            _ => None,
+        }
+    }
+}
+
+/// One group's newest row, how many rows it holds and the task it belongs to.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct BoardGroup {
+    #[serde(flatten)]
+    pub latest: BoardEntry,
+    pub group_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_status: Option<String>,
 }
 
 const ENTRY_COLUMNS: &str = "id, agent_id, kind, session_id, workspace, summary, \
-                             correlation_id, created_at";
+                             correlation_id, created_at, folder";
+
+// Stored rather than resolved on read: session worktrees are deleted when a session settles.
+fn project_of(workspace: &str) -> String {
+    crate::memory::repository_root(std::path::Path::new(workspace)).display().to_string()
+}
 
 fn entry_from_row(row: &rusqlite::Row<'_>) -> Result<BoardEntry, rusqlite::Error> {
     Ok(BoardEntry {
@@ -107,6 +146,7 @@ fn entry_from_row(row: &rusqlite::Row<'_>) -> Result<BoardEntry, rusqlite::Error
         summary: row.get(5)?,
         correlation_id: row.get(6)?,
         created_at: row.get(7)?,
+        folder: row.get(8)?,
     })
 }
 
@@ -121,11 +161,12 @@ impl Store {
         kind: BoardEntryKind,
         entry: &NewBoardEntry<'_>,
     ) -> Result<i64, StoreError> {
+        let folder = entry.workspace.filter(|w| !w.trim().is_empty()).map(project_of);
         self.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO agent_board
-                 (agent_id, kind, session_id, workspace, summary, correlation_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (agent_id, kind, session_id, workspace, summary, correlation_id, created_at, folder)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     agent_id,
                     kind.as_str(),
@@ -134,6 +175,7 @@ impl Store {
                     entry.summary,
                     entry.correlation_id,
                     entry.created_at,
+                    folder,
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -160,14 +202,19 @@ impl Store {
                 .replace('_', "\\_");
             format!("%{escaped}%")
         });
+        let project = query.workspace.map(project_of);
+        if project.is_some() {
+            self.fill_board_folders()?;
+        }
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ENTRY_COLUMNS} FROM agent_board
                  WHERE agent_id = ?1
-                   AND (?2 IS NULL OR workspace = ?2)
+                   AND (?2 IS NULL OR workspace = ?2 OR folder = ?9)
                    AND (?3 IS NULL OR kind = ?3)
                    AND (?4 IS NULL OR summary LIKE ?4 ESCAPE '\\')
                    AND (?6 IS NULL OR id < ?6)
+                   AND (?8 IS NULL OR correlation_id = ?8)
                    AND (NOT ?7 OR (kind = 'dispatched'
                         AND correlation_id IS NOT NULL AND correlation_id <> ''
                         AND NOT EXISTS (
@@ -190,10 +237,100 @@ impl Store {
                     contains,
                     limit,
                     query.before_id,
-                    query.outstanding
+                    query.outstanding,
+                    query.correlation,
+                    project
                 ],
                 entry_from_row,
             )?;
+            rows.collect()
+        })
+    }
+
+    /// The board as groups, newest activity first. Rows with no task or folder
+    /// form one group of their own, so nothing drops out of the view.
+    pub fn read_board_groups(
+        &self,
+        agent_id: &str,
+        grouping: BoardGrouping,
+        query: &BoardQuery<'_>,
+        limit: u32,
+    ) -> Result<Vec<BoardGroup>, StoreError> {
+        let key = match grouping {
+            BoardGrouping::Task => "COALESCE(correlation_id, '')",
+            BoardGrouping::Folder => "COALESCE(NULLIF(folder, ''), NULLIF(workspace, ''), '')",
+        };
+        if grouping == BoardGrouping::Folder {
+            self.fill_board_folders()?;
+        }
+        let contains = query.contains.map(|text| {
+            let escaped = text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+            format!("%{escaped}%")
+        });
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT b.id, b.agent_id, b.kind, b.session_id, b.workspace, b.summary,
+                        b.correlation_id, b.created_at, b.folder, g.n, t.title, t.status
+                 FROM (SELECT MAX(id) AS last, COUNT(*) AS n FROM agent_board
+                       WHERE agent_id = ?1
+                         AND (?2 IS NULL OR kind = ?2)
+                         AND (?3 IS NULL OR summary LIKE ?3 ESCAPE '\\')
+                       GROUP BY {key}) g
+                 JOIN agent_board b ON b.id = g.last
+                 LEFT JOIN tasks t ON t.id = b.correlation_id
+                 WHERE (?4 IS NULL OR b.id < ?4)
+                 ORDER BY b.id DESC
+                 LIMIT ?5"
+            ))?;
+            let rows = stmt.query_map(
+                params![agent_id, query.kind.map(|k| k.as_str()), contains, query.before_id, limit],
+                |row| {
+                    Ok(BoardGroup {
+                        latest: entry_from_row(row)?,
+                        group_count: row.get(9)?,
+                        task_title: row.get(10)?,
+                        task_status: row.get(11)?,
+                    })
+                },
+            )?;
+            rows.collect()
+        })
+    }
+
+    /// Rows from before `folder` existed get it once, on the first read that needs it.
+    fn fill_board_folders(&self) -> Result<(), StoreError> {
+        let pending: Vec<String> = self.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT workspace FROM agent_board
+                 WHERE folder IS NULL AND workspace IS NOT NULL AND workspace <> ''",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect()
+        })?;
+        for workspace in pending {
+            let folder = project_of(&workspace);
+            self.with_connection(|conn| {
+                conn.execute(
+                    "UPDATE agent_board SET folder = ?1 WHERE workspace = ?2 AND folder IS NULL",
+                    params![folder, workspace],
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// One task's running log across everyone who worked on it, newest first.
+    pub fn task_log(&self, task_id: &str, before_id: Option<i64>, limit: u32) -> Result<Vec<BoardEntry>, StoreError> {
+        self.with_connection(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {ENTRY_COLUMNS} FROM agent_board
+                 WHERE correlation_id = ?1
+                   AND kind IN ('progress', 'noted', 'reported')
+                   AND (?2 IS NULL OR id < ?2)
+                 ORDER BY id DESC
+                 LIMIT ?3"
+            ))?;
+            let rows = stmt.query_map(params![task_id, before_id, limit], entry_from_row)?;
             rows.collect()
         })
     }

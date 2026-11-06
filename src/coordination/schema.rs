@@ -282,6 +282,14 @@ pub fn ensure(connection: &Connection) -> Result<(), rusqlite::Error> {
 "#,
     )?;
     add_missing_columns(connection)?;
+    let board_columns: Vec<String> = {
+        let mut stmt = connection.prepare("PRAGMA table_info(agent_board)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    if !board_columns.iter().any(|column| column == "folder") {
+        connection.execute("ALTER TABLE agent_board ADD COLUMN folder TEXT", [])?;
+    }
     let delivery_columns: Vec<String> = {
         let mut stmt = connection.prepare("PRAGMA table_info(message_deliveries)")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;

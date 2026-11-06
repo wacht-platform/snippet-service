@@ -1096,6 +1096,7 @@ async fn run_lane_once(
         mailbox: link.mailbox.clone(),
     });
     tools.insert(crate::coordination_tools::SendAgentMessage);
+    tools.insert(crate::coordination_tools::ReadCoordinationBoard);
     tools.insert(crate::review_tools::SubmitReview);
     tools.remove(crate::progress::TOOL_NAME);
     tools.remove("pass_turn");

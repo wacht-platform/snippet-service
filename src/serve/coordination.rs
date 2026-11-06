@@ -67,6 +67,7 @@ pub fn router() -> Router<Shared> {
         .route("/coordination/tasks/{task_id}/links", get(task_links).post(link_tasks))
         .route("/coordination/tasks/{task_id}/links/{other_id}", delete(unlink_tasks))
         .route("/coordination/tasks/{task_id}/turns", get(task_turns))
+        .route("/coordination/tasks/{task_id}/log", get(task_log))
         .route("/coordination/tasks/{task_id}/agents", get(task_agents).post(add_task_agent))
         .route("/coordination/tasks/{task_id}/agents/{agent_id}", delete(remove_task_agent))
         .route("/coordination/tasks/{task_id}/agents/{agent_id}/lease", post(transfer_task_lease))
@@ -518,6 +519,29 @@ async fn task_turns(
             format!("task turns: {error}"),
         )
             .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskLogQuery {
+    token: Option<String>,
+    #[serde(default)]
+    before: Option<i64>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn task_log(
+    State(d): State<Shared>,
+    Query(q): Query<TaskLogQuery>,
+    Path(task_id): Path<String>,
+) -> Response {
+    if !d.authed(&q.token) {
+        return unauthorized();
+    }
+    match d.store.task_log(&task_id, q.before, q.limit.unwrap_or(50).clamp(1, 200)) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("task log: {error}")).into_response(),
     }
 }
 

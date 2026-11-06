@@ -835,14 +835,17 @@ impl Tool for ReadCoordinationBoard {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "read_coordination_board".into(),
-            description: "Read your own coordination memory: work you dispatched, what came back, and notes you recorded. Newest first. Filter with workspace to scope to one folder, contains to search the summaries, and kind to narrow to dispatched/reported/noted. Use it before dispatching to see whether you have done something similar, and what worked. Set outstanding_only to list dispatches that have not reported back yet.".into(),
+            description: "Read your agent board: work you dispatched, what came back, progress you logged and notes you kept. Newest first. Search with contains; narrow with task_id, workspace or kind; group_by gives one row per task or folder; pass next_before_id as before_id for the next page.".into(),
             input_schema: schema(
                 json!({
+                    "agent_id":{"type":"string","description":"Mission Control only: whose board to read"},
+                    "task_id":{"type":"string","description":"only rows linked to this task"},
+                    "group_by":{"type":"string","enum":["task","folder"],"description":"one row per task or folder: its newest row and how many it holds"},
                     "workspace":{"type":"string","description":"only rows about this folder"},
                     "contains":{"type":"string","description":"substring to find in summaries"},
                     "kind":{"type":"string","enum":["dispatched","reported","noted","progress"]},
                     "outstanding_only":{"type":"boolean","description":"only dispatches with no report yet"},
-                    "before_id":{"type":"integer","description":"only rows older than this id; pass the last id you got to read further back"},
+                    "before_id":{"type":"integer","description":"only rows older than this id; pass next_before_id to read further back"},
                     "limit":{"type":"integer","minimum":1,"maximum":100}
                 }),
                 &[],
@@ -853,6 +856,12 @@ impl Tool for ReadCoordinationBoard {
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         #[derive(Deserialize)]
         struct Args {
+            #[serde(default)]
+            agent_id: Option<String>,
+            #[serde(default)]
+            task_id: Option<String>,
+            #[serde(default)]
+            group_by: Option<String>,
             #[serde(default)]
             workspace: Option<String>,
             #[serde(default)]
@@ -868,7 +877,12 @@ impl Tool for ReadCoordinationBoard {
         }
         let args: Args =
             serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let agent_id = board_agent_id(ctx)?;
+        let named = args.agent_id.as_deref().map(str::trim).filter(|a| !a.is_empty());
+        let agent_id = match named {
+            Some(agent) if ctx.is_mission_control() => agent.to_string(),
+            Some(_) => return Err(ToolError::msg("only Mission Control reads another agent's board")),
+            None => board_agent_id(ctx)?,
+        };
         let db = db(ctx)?;
         if args.outstanding_only {
             let outstanding = db
@@ -896,14 +910,32 @@ impl Tool for ReadCoordinationBoard {
             kind,
             before_id: args.before_id,
             outstanding: false,
+            correlation: args.task_id.as_deref().filter(|t| !t.trim().is_empty()),
         };
-        let entries = db
-            .read_board(&agent_id, &query, args.limit.unwrap_or(30).clamp(1, 100))
-            .map_err(|e| ToolError::msg(format!("read board: {e}")))?;
+        let limit = args.limit.unwrap_or(30).clamp(1, 100);
+        let (entries, last_id) = match args.group_by.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+            Some(raw) => {
+                let grouping = crate::coordination::BoardGrouping::parse(raw)
+                    .ok_or_else(|| ToolError::msg(format!("unknown group_by `{raw}`: use task or folder")))?;
+                let groups = db
+                    .read_board_groups(&agent_id, grouping, &query, limit)
+                    .map_err(|e| ToolError::msg(format!("read board: {e}")))?;
+                let last = groups.last().map(|g| g.latest.id);
+                (json!(groups), last.filter(|_| groups.len() as u32 == limit))
+            }
+            None => {
+                let rows = db
+                    .read_board(&agent_id, &query, limit)
+                    .map_err(|e| ToolError::msg(format!("read board: {e}")))?;
+                let last = rows.last().map(|r| r.id);
+                (json!(rows), last.filter(|_| rows.len() as u32 == limit))
+            }
+        };
         Ok(ToolResult::success(json!({
             "agent_id": agent_id,
-            "count": entries.len(),
+            "count": entries.as_array().map_or(0, Vec::len),
             "entries": entries,
+            "next_before_id": last_id,
         })))
     }
 }
@@ -952,18 +984,26 @@ impl Tool for RecordCoordinationNote {
             return Err(ToolError::msg("summary must not be empty"));
         }
         let agent_id = board_agent_id(ctx)?;
+        let session = ctx.durable_session_id().filter(|id| !crate::session::is_inbox_session_id(id));
+        let here = ctx.workspace_root().display().to_string();
+        let on_task = session.and_then(|s| crate::progress::working_as(ctx, s).1);
         let id = db(ctx)?
             .record_board_entry(
                 &agent_id,
                 crate::coordination::BoardEntryKind::Noted,
                 &crate::coordination::NewBoardEntry {
-                    session_id: args.session_id.as_deref().filter(|s| !s.trim().is_empty()),
-                    workspace: args.workspace.as_deref().filter(|w| !w.trim().is_empty()),
+                    session_id: args.session_id.as_deref().filter(|s| !s.trim().is_empty()).or(session),
+                    workspace: args
+                        .workspace
+                        .as_deref()
+                        .filter(|w| !w.trim().is_empty())
+                        .or(session.map(|_| here.as_str())),
                     summary,
                     correlation_id: args
                         .correlation_id
                         .as_deref()
-                        .filter(|c| !c.trim().is_empty()),
+                        .filter(|c| !c.trim().is_empty())
+                        .or(on_task.as_deref()),
                     created_at: &now_rfc3339(),
                 },
             )
@@ -982,11 +1022,17 @@ fn board_agent_id(ctx: &ToolContext) -> Result<String, ToolError> {
         && kind == "agent" {
             return Ok(id);
         }
-    ctx.agent_id().map(str::to_string).ok_or_else(|| {
-        ToolError::msg(
-            "this session is not working as an agent — coordination memory requires an agent identity",
-        )
-    })
+    if let Some(agent_id) = ctx.agent_id() {
+        return Ok(agent_id.to_string());
+    }
+    // A plain conversation runs as `snippet` and logs there, so it reads there too.
+    ctx.durable_session_id()
+        .map(|session| crate::progress::working_as(ctx, session).0)
+        .ok_or_else(|| {
+            ToolError::msg(
+                "this session is not working as an agent, and coordination memory requires an agent identity",
+            )
+        })
 }
 #[derive(Deserialize)]
 struct MessageMissionControlArgs {

@@ -330,7 +330,6 @@ impl AgentRuntime {
             "claim_and_dispatch_task",
             "pass_turn",
             "post_coordination_message",
-            "read_coordination_board",
             "record_coordination_note",
             "read_agent_inbox",
         ] {
@@ -376,8 +375,6 @@ impl AgentRuntime {
             "read_agent_inbox",
             "claim_and_dispatch_task",
             "post_coordination_message",
-            "read_coordination_board",
-            "record_coordination_note",
         ] {
             tools.remove(name);
         }

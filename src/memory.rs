@@ -602,7 +602,7 @@ fn project_memory_dir(workspace: &Path) -> PathBuf {
         .join("memory")
 }
 
-fn repository_root(workspace: &Path) -> PathBuf {
+pub(crate) fn repository_root(workspace: &Path) -> PathBuf {
     let workspace = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
     let common = Command::new("git")
         .arg("-C")

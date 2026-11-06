@@ -27,6 +27,9 @@ const LABEL_CHARS: usize = 80;
 const INBOX_DIGEST_ROWS: usize = 6;
 const INBOX_DIGEST_SCAN: u32 = 30;
 const DIGEST_SUMMARY_CHARS: usize = 240;
+const LEDGER_LOG_ROWS: u32 = 12;
+const LEDGER_LOG_LINES: usize = 6;
+const AUTOMATIC_PREFIX: &str = "Automatic, the session wrote no report:";
 
 struct Clock {
     since: Instant,
@@ -93,7 +96,7 @@ pub fn note_tool_call(ctx: &ToolContext, tool: &str, label: String) -> Option<St
     // Some models pass over the note, and the inbox must still learn what happened.
     if ignored {
         let summary = format!(
-            "Automatic, the session wrote no report: {} tool calls over {} minutes. Recent: {}.",
+            "{AUTOMATIC_PREFIX} {} tool calls over {} minutes. Recent: {}.",
             clock.tool_calls,
             now.duration_since(clock.since).as_secs() / 60,
             clock.recent.iter().cloned().collect::<Vec<_>>().join("; "),
@@ -106,7 +109,7 @@ pub fn note_tool_call(ctx: &ToolContext, tool: &str, label: String) -> Option<St
         return None;
     }
     Some(format!(
-        "Progress report due: {} tool calls over {} minutes since your last one. Add {TOOL_NAME} to your next batch of tool calls rather than spending a turn on it.",
+        "Progress report due: {} tool calls over {} minutes since your last one. Add {TOOL_NAME} to your next batch of tool calls with what you did and why, rather than spending a turn on it.",
         clock.tool_calls,
         now.duration_since(clock.since).as_secs() / 60,
     ))
@@ -118,7 +121,7 @@ fn open_store(ctx: &ToolContext) -> Option<Store> {
 
 /// The agent doing the work here and the task it counts towards. A plain
 /// conversation has no bound agent and runs as `snippet`.
-fn working_as(ctx: &ToolContext, session: &str) -> (String, Option<String>) {
+pub(crate) fn working_as(ctx: &ToolContext, session: &str) -> (String, Option<String>) {
     if let Some(member) = open_store(ctx).and_then(|db| db.member_by_session(session).ok().flatten()) {
         return (member.agent_id, Some(member.task_id));
     }
@@ -166,6 +169,20 @@ fn record_progress(ctx: &ToolContext, session: &str, summary: &str) -> Result<St
 #[derive(Deserialize)]
 struct ReportArgs {
     summary: String,
+    #[serde(default)]
+    why: Option<String>,
+    #[serde(default)]
+    learned: Option<String>,
+}
+
+fn report_text(args: &ReportArgs) -> String {
+    let mut text = args.summary.trim().to_string();
+    for (label, part) in [("Why", &args.why), ("Learned", &args.learned)] {
+        if let Some(part) = part.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            text.push_str(&format!("\n{label}: {part}"));
+        }
+    }
+    text
 }
 
 pub struct ReportProgress;
@@ -175,11 +192,13 @@ impl Tool for ReportProgress {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: TOOL_NAME.into(),
-            description: "Tell your own inbox what this session has done so far. It records the report and wakes no one, so call it alongside your next tool calls when a progress report falls due. A question or blocker doesn't belong here: use send_agent_message for another agent, post_task_coordination for the task's room, ask_user for the user.".into(),
+            description: "Log what you did and why to your agent board, against this task and folder. It wakes no one, so call it alongside your other tool calls after each meaningful result. Your desk, the next agent on the task and the user read it, and you can read it back with read_coordination_board. A question or blocker doesn't belong here: use send_agent_message for another agent, post_task_coordination for the task's room, ask_user for the user.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "summary": {"type": "string", "description": "one to three sentences: what changed or what you found since your last report, and what comes next"}
+                    "summary": {"type": "string", "description": "one to three sentences: what you did or found since your last report"},
+                    "why": {"type": "string", "description": "why you did it that way, or why it mattered"},
+                    "learned": {"type": "string", "description": "what would help you or the next agent on similar work"}
                 },
                 "required": ["summary"],
                 "additionalProperties": false
@@ -189,15 +208,46 @@ impl Tool for ReportProgress {
 
     async fn execute(&self, ctx: &ToolContext, arguments: Value) -> Result<ToolResult, ToolError> {
         let args: ReportArgs = serde_json::from_value(arguments).map_err(|e| ToolError::msg(e.to_string()))?;
-        let summary = args.summary.trim();
-        if summary.is_empty() {
+        if args.summary.trim().is_empty() {
             return Err(ToolError::msg("summary must not be empty"));
         }
+        let summary = report_text(&args);
         let Some(session) = reporting_session(ctx) else {
             return Err(ToolError::msg("only a working session reports progress; a lane reports to the session that started it"));
         };
-        let agent = record_progress(ctx, session, summary).map_err(ToolError::msg)?;
+        let agent = record_progress(ctx, session, &summary).map_err(ToolError::msg)?;
         Ok(ToolResult::success(json!({"recorded": true, "agent": agent})))
+    }
+}
+
+/// The written log lines a ledger reader gets, oldest first. Empty when none.
+pub fn ledger_log(db: &Store, task_id: &str) -> String {
+    let rows = db.task_log(task_id, None, LEDGER_LOG_ROWS).unwrap_or_default();
+    let mut lines: Vec<String> = rows
+        .iter()
+        .filter(|row| row.kind == BoardEntryKind::Progress.as_str() && !row.summary.starts_with(AUTOMATIC_PREFIX))
+        .take(LEDGER_LOG_LINES)
+        .map(|row| {
+            format!(
+                "- {} {}: {}",
+                row.created_at.get(..16).unwrap_or(&row.created_at),
+                row.agent_id,
+                clip_summary(&row.summary),
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.reverse();
+    format!("\nprogress log so far (read_coordination_board with task_id for more):\n{}", lines.join("\n"))
+}
+
+fn clip_summary(summary: &str) -> String {
+    let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    match summary.char_indices().nth(DIGEST_SUMMARY_CHARS) {
+        Some((cut, _)) => format!("{}…", &summary[..cut]),
+        None => summary,
     }
 }
 
@@ -220,15 +270,11 @@ pub fn inbox_digest(db: &Store, agent: &str) -> String {
 }
 
 fn digest_line(row: &BoardEntry) -> String {
-    let summary = row.summary.split_whitespace().collect::<Vec<_>>().join(" ");
-    let summary = match summary.char_indices().nth(DIGEST_SUMMARY_CHARS) {
-        Some((cut, _)) => format!("{}…", &summary[..cut]),
-        None => summary,
-    };
     format!(
-        "- {} {} in {}: {summary}",
+        "- {} {} in {}: {}",
         row.created_at.get(..16).unwrap_or(&row.created_at),
         row.kind,
         row.session_id.as_deref().unwrap_or("no session"),
+        clip_summary(&row.summary),
     )
 }

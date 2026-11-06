@@ -108,6 +108,12 @@ pub(crate) struct AgentBoardQuery {
     /// Only dispatches with no report yet.
     #[serde(default)]
     outstanding: bool,
+    /// Only rows linked to this task.
+    #[serde(default)]
+    correlation_id: Option<String>,
+    /// `task` or `folder`: one row per group.
+    #[serde(default)]
+    group: Option<String>,
     #[serde(default = "default_agent_page_limit")]
     limit: u32,
 }
@@ -144,7 +150,17 @@ pub(crate) async fn agent_board(
         kind,
         before_id: q.before,
         outstanding: q.outstanding,
+        correlation: q.correlation_id.as_deref().filter(|c| !c.trim().is_empty()),
     };
+    if let Some(raw) = q.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
+        let Some(grouping) = crate::coordination::BoardGrouping::parse(raw) else {
+            return (StatusCode::BAD_REQUEST, format!("unknown group `{raw}`: use task or folder")).into_response();
+        };
+        return match d.store.read_board_groups(&agent_id, grouping, &query, q.limit.clamp(1, 200)) {
+            Ok(groups) => Json(serde_json::json!({"agent_id": agent_id, "entries": groups, "awaiting": []})).into_response(),
+            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, format!("agent board: {error}")).into_response(),
+        };
+    }
     let awaiting = d.store.board_awaiting_report(&agent_id);
     match d
         .store
