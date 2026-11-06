@@ -41,6 +41,8 @@ struct Live {
     turn: i64,
     seq: i64,
     announced: bool,
+    caption: String,
+    caption_at: Option<Instant>,
     interrupted: bool,
     classifying: bool,
     classified_words: usize,
@@ -161,6 +163,27 @@ fn tuning(flux: bool, active: bool) -> String {
         let (min, max) = silences(active);
         serde_json::json!({"type":"UpdateConfiguration","min_turn_silence":min,"max_turn_silence":max}).to_string()
     }
+}
+
+const CAPTION_EVERY: Duration = Duration::from_millis(200);
+const CAPTION_CHARS: usize = 240;
+
+/// The words being heard right now, for the on-screen caption. Never stored; the assistant's own voice and played media stay out.
+fn live_caption(words: &[Heard], mask: &[bool], transcript: &str, echo_all: bool) -> Option<String> {
+    if echo_all || (!words.is_empty() && words.iter().all(|w| w.media)) {
+        return None;
+    }
+    let text = if mask.iter().any(|echo| *echo) {
+        words.iter().zip(mask).filter(|(_, echo)| !**echo).map(|(w, _)| w.text.as_str()).collect::<Vec<_>>().join(" ")
+    } else {
+        transcript.to_string()
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let extra = text.chars().count().saturating_sub(CAPTION_CHARS);
+    Some(text.chars().skip(extra).collect())
 }
 
 fn flux_turn(v: &serde_json::Value) -> Option<serde_json::Value> {
@@ -495,7 +518,7 @@ impl Listener {
             if ended && words.is_empty() && transcript.is_empty() {
                 return;
             }
-            s.live = Some(Live { conn, turn: order, seq: next_seq(), announced: false, interrupted: false, classifying: false, classified_words: 0, event_id: None, done: false });
+            s.live = Some(Live { conn, turn: order, seq: next_seq(), announced: false, caption: String::new(), caption_at: None, interrupted: false, classifying: false, classified_words: 0, event_id: None, done: false });
         }
         let audible = s.audible || s.play_flag || live_audible;
         let during_playback = words.iter().any(|w| w.playing) || audible;
@@ -514,6 +537,18 @@ impl Listener {
             if !ended {
                 crate::ambient::hold_floor();
             }
+        }
+        if let Some(text) = live_caption(&words, &mask, &transcript, echo_all)
+            && (ended || live.caption_at.is_none_or(|t| t.elapsed() >= CAPTION_EVERY))
+            && (ended || text != live.caption)
+        {
+            let now = chrono::Utc::now().timestamp_millis();
+            let policy = crate::recording_policy::live_or(&self.d.config.lock().unwrap().recording);
+            if !policy.matches_never(now, crate::recording_policy::local_at(now), &text) {
+                crate::session::emit_device_event(serde_json::json!({"kind": "ambient_live", "device": self.device, "text": text, "final": ended}));
+            }
+            live.caption = text;
+            live.caption_at = Some(Instant::now());
         }
         let busy = crate::ambient::conversation().is_some() && super::autonomy::mission_control_busy();
         let instant_barge = !echo_all && (audible || busy) && !live.interrupted && has_barge_command(&words);
@@ -1203,6 +1238,11 @@ mod tests {
             "I've got key control over the Mac, but screen capture is failing, so I can't see the display.".to_string(),
             "Keyboard control works, but I still can't grab the screen.".to_string(),
         ];
+        let words = heard_words("stop the build now", false);
+        assert_eq!(live_caption(&words, &[false; 4], "Stop the build now.", false).as_deref(), Some("Stop the build now."));
+        assert_eq!(live_caption(&words, &[true, true, false, false], "Stop the build now.", false).as_deref(), Some("build now"));
+        assert_eq!(live_caption(&words, &[true; 4], "Stop the build now.", true), None);
+        assert_eq!(live_caption(&[], &[], "x".repeat(300).as_str(), false).map(|t| t.chars().count()), Some(CAPTION_CHARS));
         for partial in ["I've got key control over", "Screen capture is", "Keyboard control work."] {
             let words = heard_words(partial, false);
             let mask = echo_mask(&words, &replies, true);
