@@ -128,6 +128,9 @@ pub struct BoardGroup {
     pub task_status: Option<String>,
 }
 
+/// Pass as the agent to read every agent's board at once.
+pub const ALL_AGENTS: &str = "*";
+
 const ENTRY_COLUMNS: &str = "id, agent_id, kind, session_id, workspace, summary, \
                              correlation_id, created_at, folder";
 
@@ -209,7 +212,7 @@ impl Store {
         self.with_connection(|conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {ENTRY_COLUMNS} FROM agent_board
-                 WHERE agent_id = ?1
+                 WHERE (?1 = '*' OR agent_id = ?1)
                    AND (?2 IS NULL OR workspace = ?2 OR folder = ?9)
                    AND (?3 IS NULL OR kind = ?3)
                    AND (?4 IS NULL OR summary LIKE ?4 ESCAPE '\\')
@@ -272,7 +275,7 @@ impl Store {
                 "SELECT b.id, b.agent_id, b.kind, b.session_id, b.workspace, b.summary,
                         b.correlation_id, b.created_at, b.folder, g.n, t.title, t.status
                  FROM (SELECT MAX(id) AS last, COUNT(*) AS n FROM agent_board
-                       WHERE agent_id = ?1
+                       WHERE (?1 = '*' OR agent_id = ?1)
                          AND (?2 IS NULL OR kind = ?2)
                          AND (?3 IS NULL OR summary LIKE ?3 ESCAPE '\\')
                        GROUP BY {key}) g

@@ -835,10 +835,10 @@ impl Tool for ReadCoordinationBoard {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: "read_coordination_board".into(),
-            description: "Read an agent board: work dispatched, what came back, progress logged and notes kept. Newest first, your own unless you name agent_id. Search with contains; narrow with task_id, workspace (a project, across its worktrees) or kind; group_by gives one row per task or folder; pass next_before_id as before_id for the next page. task_id on its own reads that task's log across everyone on it.".into(),
+            description: "Read an agent board: work dispatched, what came back, progress logged and notes kept. Newest first, your own unless you name agent_id, or all to search everyone's. Search with contains; narrow with task_id, workspace (a project, across its worktrees) or kind; group_by gives one row per task or folder; pass next_before_id as before_id for the next page. task_id on its own reads that task's log across everyone on it.".into(),
             input_schema: schema(
                 json!({
-                    "agent_id":{"type":"string","description":"whose board to read; defaults to your own"},
+                    "agent_id":{"type":"string","description":"whose board to read, or all for every agent's; defaults to your own"},
                     "task_id":{"type":"string","description":"only rows linked to this task; on its own, that task's log across everyone on it"},
                     "group_by":{"type":"string","enum":["task","folder"],"description":"one row per task or folder: its newest row and how many it holds"},
                     "workspace":{"type":"string","description":"only rows about this folder"},
@@ -901,6 +901,12 @@ impl Tool for ReadCoordinationBoard {
             })));
         }
         let agent_id = match named {
+            Some("all") => {
+                if args.outstanding_only {
+                    return Err(ToolError::msg("outstanding_only reads one agent's board; name that agent"));
+                }
+                crate::coordination::ALL_AGENTS.to_string()
+            }
             Some(agent) => agent.to_string(),
             None => board_agent_id(ctx)?,
         };

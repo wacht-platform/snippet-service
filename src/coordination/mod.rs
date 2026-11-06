@@ -24,7 +24,7 @@ pub mod types;
 
 pub use crate::store::{Store, StoreError};
 pub use board::{
-    BoardEntry, BoardEntryKind, BoardGroup, BoardGrouping, BoardQuery, NewBoardEntry,
+    ALL_AGENTS, BoardEntry, BoardEntryKind, BoardGroup, BoardGrouping, BoardQuery, NewBoardEntry,
 };
 pub use direct::{
     InboxEntry, InboxKind, InboxQuery,
