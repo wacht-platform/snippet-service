@@ -316,6 +316,18 @@ impl Store {
                 )
             })?;
         }
+        // Dispatch and report rows name no workspace; their task or session does.
+        self.with_connection(|conn| {
+            conn.execute(
+                "UPDATE agent_board SET folder = COALESCE(
+                     (SELECT o.folder FROM agent_board o
+                      WHERE o.correlation_id = agent_board.correlation_id AND o.folder IS NOT NULL LIMIT 1),
+                     (SELECT o.folder FROM agent_board o
+                      WHERE o.session_id = agent_board.session_id AND o.folder IS NOT NULL LIMIT 1))
+                 WHERE folder IS NULL",
+                [],
+            )
+        })?;
         Ok(())
     }
 
