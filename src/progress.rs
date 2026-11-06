@@ -21,7 +21,7 @@ use crate::tools::{Tool, ToolContext, ToolError, ToolResult};
 
 pub const TOOL_NAME: &str = "report_progress";
 const REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const MIN_TOOL_CALLS: u32 = 8;
+const MIN_TOOL_CALLS: u32 = 20;
 const RECENT_LABELS: usize = 6;
 const LABEL_CHARS: usize = 80;
 const INBOX_DIGEST_ROWS: usize = 6;
@@ -46,7 +46,6 @@ impl Clock {
     fn note_call(&mut self, now: Instant) -> bool {
         self.tool_calls += 1;
         let due = self.tool_calls >= MIN_TOOL_CALLS
-            && now.duration_since(self.since) >= REPORT_INTERVAL
             && self.nudged_at.is_none_or(|at| now.duration_since(at) >= REPORT_INTERVAL);
         if due {
             self.nudged_at = Some(now);
@@ -192,7 +191,7 @@ impl Tool for ReportProgress {
     fn definition(&self) -> NativeToolDefinition {
         NativeToolDefinition {
             name: TOOL_NAME.into(),
-            description: "Log what you did and why to your agent board, against this task and folder. It wakes no one, so call it alongside your other tool calls after each meaningful result. Your desk, the next agent on the task and the user read it, and you can read it back with read_coordination_board. A question or blocker doesn't belong here: use send_agent_message for another agent, post_task_coordination for the task's room, ask_user for the user.".into(),
+            description: "Log what you did and why to your agent board, against this task and folder. It wakes no one, so call it alongside your other tool calls after an important event: a finding, an action done, a decision. Your desk, the next agent on the task and the user read it, and you can read it back with read_coordination_board. A question or blocker doesn't belong here: use send_agent_message for another agent, post_task_coordination for the task's room, ask_user for the user.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
